@@ -349,7 +349,10 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
             if fields.next().is_some() {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
             }
-            epoch = Some((seq, head));
+            // Keep the newest, whatever order the lines are in.
+            if epoch.is_none_or(|(s, _)| seq > s) {
+                epoch = Some((seq, head));
+            }
             continue;
         }
         let anchor = first.parse()?;

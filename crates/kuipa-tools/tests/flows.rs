@@ -752,6 +752,58 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
         check["servers"][0]["error"]
     );
 }
+#[test]
+fn a_long_anchor_log_is_read_page_by_page() {
+    // A server answers the anchor log a page at most (§4.8); a log
+    // longer than a page must still carry the watermark to the
+    // advertised head.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
+    let server = Arc::new(EnrollServer::new(keys, info, delegation));
+    let first = AnchorEpoch::new(REALM, 1, kuipa_enroll::epoch::GENESIS, [pin], []);
+    let mut head = first.head().unwrap();
+    let mut log = vec![SignedEpoch::issue(&anchor, &first).unwrap()];
+    server.publish_epoch(log.clone());
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    serve_as("ipa1.example.test", app(server, dir));
+    let paths = root("paging");
+    let mut s = string(&anchor, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    flows::enroll_online(
+        &paths,
+        s.realm(),
+        &[*s.anchor()],
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(std::slice::from_ref(&"ipa1.example.test".to_string())),
+    )
+    .unwrap();
+
+    // Past one page: every entry names the same anchor, so nothing but
+    // the length forces the client to keep fetching.
+    let target = kuipa_enroll::epoch::MAX_EPOCH_FETCH + 2;
+    while log.len() < target {
+        let entry = AnchorEpoch::new(REALM, log.len() as u64 + 1, head, [pin], []);
+        head = entry.head().unwrap();
+        log.push(SignedEpoch::issue(&anchor, &entry).unwrap());
+    }
+    let (keys2, info2, delegation2) = server_keys(&anchor, "ipa1.example.test");
+    let server2 = Arc::new(EnrollServer::new(keys2, info2, delegation2));
+    server2.publish_epoch(log.clone());
+    serve_as("ipa1.example.test", app(server2, Dir::default()));
+    let check = flows::check(&paths, None).unwrap();
+    assert_eq!(check["servers"][0]["ok"], true, "{check}");
+    assert_eq!(
+        kuipa_tools::paths::read_epoch_from(&paths.anchors()).unwrap(),
+        Some((target as u64, head)),
+        "the watermark followed every page of the log"
+    );
+}
 
 #[test]
 fn offline_enrollment_from_a_bundle() {
