@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use kuipa_enroll::bundle::{Bundle, Opener};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
+use kuipa_enroll::epoch::verify_chain;
 use kuipa_enroll::escrow::{EscrowRequest, SealedKeytab, Sealer};
 use kuipa_enroll::join::{
     AuthType, KERBEROS_BINDING_LEN, KerberosBinding, Operation, PendingJoin, Prepared, Request,
@@ -20,6 +21,9 @@ use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, unix_secon
 
 use crate::net::{Endpoint, NetError, Trust};
 use crate::paths::{self, Error, Holder, Paths, State};
+
+/// The anchor epoch watermark (§4.8): sequence number and head hash.
+type Epoch = (u64, [u8; 32]);
 
 /// How an online join is authorised.
 pub enum Auth {
@@ -110,25 +114,142 @@ fn check_deployment(
     })
 }
 
+/// The number of distinct pinned anchors that must be able to prove a
+/// realm's claim when the client knows at least that many (§4.4). A thief
+/// holding a single stolen anchor can vouch for itself and nothing else:
+/// a client that knows two of a realm's anchors refuses it.
+const MIN_PROVING_ANCHORS: usize = 2;
+
 /// Fetch and verify one server's advertisement.
 fn verified(
     server: &str,
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
-) -> Result<(Endpoint, VerifiedRealm), String> {
+    known: Option<Epoch>,
+) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), String> {
     let endpoint = Endpoint::new(server, trust).map_err(|e| e.to_string())?;
-    let adv = endpoint.advertisement(anchors).map_err(|e| e.to_string())?;
-    let realm =
-        VerifiedRealm::verify(&adv, realm, anchors, &Policy::default(), now()).map_err(|e| {
+    let mut pins: Vec<Thumbprint> = anchors.to_vec();
+    pins.sort_unstable();
+    pins.dedup();
+    let adv = endpoint.advertisement(&pins).map_err(|e| e.to_string())?;
+    let advertisement = VerifiedRealm::verify(&adv, realm, &pins, &Policy::default(), now())
+        .map_err(|e| {
             tracing::debug!(server = %server, "advertisement rejected: {e}");
             format!("advertisement: {e}")
         })?;
-    trace_advertisement(server, &realm);
-    for (old, new) in realm.succeeded() {
+    trace_advertisement(server, &advertisement);
+    for (old, new) in advertisement.succeeded() {
         tracing::debug!(server = %server, "pinned anchor {old} was rotated: succeeded by {new}");
     }
-    Ok((endpoint, realm))
+    let mut quorum = false;
+    // §4.4: with two or more anchors known, ask each remaining one for
+    // its own proof of the claim. Proofs reaching the same final anchor
+    // (a rotated one and its successor) count once. A realm whose
+    // anchors exchanged answers two; a claim vouched by a single key,
+    // stolen or not, answers one.
+    if pins.len() >= MIN_PROVING_ANCHORS {
+        let mut proven = vec![*advertisement.anchor()];
+        for a in &pins {
+            if proven.len() >= MIN_PROVING_ANCHORS {
+                break;
+            }
+            if proven.contains(a) {
+                continue;
+            }
+            match endpoint
+                .advertisement(std::slice::from_ref(a))
+                .map_err(|e| e.to_string())
+                .and_then(|adv| {
+                    VerifiedRealm::verify(
+                        &adv,
+                        realm,
+                        std::slice::from_ref(a),
+                        &Policy::default(),
+                        now(),
+                    )
+                    .map_err(|e| e.to_string())
+                }) {
+                Ok(proof) => {
+                    let by = *proof.anchor();
+                    if proven.contains(&by) {
+                        tracing::debug!(server = %server, "pinned anchor {a} proves the claim through {by}, already counted");
+                    } else {
+                        proven.push(by);
+                        tracing::debug!(server = %server, "claim also proven by pinned anchor {a}");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(server = %server, "pinned anchor {a} does not prove the claim: {e}");
+                }
+            }
+        }
+        if proven.len() < MIN_PROVING_ANCHORS {
+            return Err(format!(
+                "its claim is proven by {} of the {} anchors known here; the realm's anchors must vouch for it by two distinct ones, run kuipa check",
+                proven.len(),
+                pins.len(),
+            ));
+        }
+        quorum = true;
+    }
+    // §4.8: the anchor log must continue what this host knows.
+    let advanced = watermark_after(&advertisement, &endpoint, realm, anchors, known, quorum)?;
+    Ok((endpoint, advertisement, advanced))
+}
+
+/// §4.8: a host that has seen this realm's anchors before must see the
+/// anchor log continue what it knows: one anchor is enough to notice a
+/// server left behind on a stolen or frozen anchor key.
+fn watermark_after(
+    advertisement: &VerifiedRealm,
+    endpoint: &Endpoint,
+    realm: &str,
+    anchors: &[Thumbprint],
+    known: Option<Epoch>,
+    quorum: bool,
+) -> Result<Option<Epoch>, String> {
+    let Some((seq, hash)) = known else {
+        // The first sighting through a proved quorum (§4.4) is a safe
+        // watermark: from here on a frozen server fails below.
+        return Ok(if quorum { advertisement.epoch() } else { None });
+    };
+    match advertisement.epoch() {
+        None => {
+            return Err(format!(
+                "reports no anchor epoch log, but this host has seen the realm at sequence {seq}: this server's kuipad is too old, or its anchor exchange is not running",
+            ));
+        }
+        Some((theirs, _)) if theirs < seq => {
+            return Err(format!(
+                "its anchor log stops at sequence {theirs}, behind the {seq} this host verified: the anchor key may have been replaced and this server left behind",
+            ));
+        }
+        Some((theirs, theirs_head)) if theirs == seq && theirs_head != hash => {
+            return Err(format!(
+                "its anchor log at sequence {theirs} differs from the one this host verified: the two have forked, run kuipa check",
+            ));
+        }
+        Some((theirs, theirs_head)) if theirs > seq => {
+            let entries = endpoint.anchor_log(seq).map_err(|e| e.to_string())?;
+            let reached = verify_chain(
+                &entries,
+                realm,
+                anchors,
+                Some((seq, hash)),
+                &Policy::default(),
+            )?;
+            if reached != (theirs, theirs_head) {
+                return Err(format!(
+                    "its anchor log ends at sequence {} but its advertisement claims {}: inconsistent",
+                    reached.0, theirs,
+                ));
+            }
+            return Ok(Some(reached));
+        }
+        Some(_) => {}
+    }
+    Ok(None)
 }
 
 fn trace_advertisement(server: &str, adv: &VerifiedRealm) {
@@ -227,12 +348,13 @@ fn exchange(
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
+    known: Option<(u64, [u8; 32])>,
     op: Operation,
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
 ) -> Result<(Enrollment, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        let (endpoint, adv) = match verified(server, trust, realm, anchors) {
+        let (endpoint, adv, _) = match verified(server, trust, realm, anchors, known) {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(server = %server, "skipped, trying the next server: {e}");
@@ -317,7 +439,7 @@ fn merge_previous(mut new: Keytab, old: Option<Keytab>) -> Result<Keytab, Error>
 fn install(paths: &Paths, enrollment: &Enrollment, fqdn: &str) -> Result<(), Error> {
     paths::write_file(&paths.keytab(), enrollment.keytab.to_mit()?.as_ref(), 0o600)?;
     paths::write_pem(&paths.ca(), &enrollment.ca_certs)?;
-    paths::write_anchors(paths, &enrollment.anchors)?;
+    paths::write_anchors_epoch(paths, &enrollment.anchors, payload_epoch(enrollment))?;
     let config = &enrollment.config;
     let mut servers = vec![config.issuer.clone()];
     servers.extend(
@@ -451,9 +573,10 @@ pub fn check_string(string: &EnrollmentString) -> Result<(), Error> {
 }
 
 /// `kuipa enroll` (online): join `realm` through the first usable server
-/// of `deployment` whose advertisement verifies against one of `anchors`
-/// (the enrollment string's, or those pre-provisioned in
-/// `/etc/ipa/ku-anchors`) and describes `deployment`.
+/// of `deployment` whose advertisement verifies against `anchors` (the
+/// enrollment string's, or those pre-provisioned in `/etc/ipa/ku-anchors`
+/// — with two or more, its claim proven by two distinct ones, §4.4) and
+/// describes `deployment`.
 ///
 /// # Errors
 ///
@@ -487,6 +610,7 @@ pub fn enroll_online(
         &Trust::FirstContact,
         realm,
         anchors,
+        None,
         op,
         |adv| {
             // A ticket and the name to address the server by.
@@ -660,6 +784,12 @@ fn live_keytab(paths: &Paths, state: &State) -> std::path::PathBuf {
     }
 }
 
+/// The anchor epoch watermark sealed into an enrollment payload (§4.8),
+/// if the issuing server recorded one.
+fn payload_epoch(enrollment: &Enrollment) -> Option<Epoch> {
+    (enrollment.epoch_seq != 0).then_some((enrollment.epoch_seq, enrollment.epoch_head))
+}
+
 /// Advertisements of every server of the realm that answers and describes
 /// the stored deployment, for sealing.
 fn all_servers(state: &State, trust: &Trust, anchors: &[Thumbprint]) -> Vec<VerifiedRealm> {
@@ -668,9 +798,9 @@ fn all_servers(state: &State, trust: &Trust, anchors: &[Thumbprint]) -> Vec<Veri
         .servers
         .iter()
         .filter_map(|s| {
-            verified(s, trust, &state.realm, anchors)
+            verified(s, trust, &state.realm, anchors, None)
                 .ok()
-                .map(|(_, v)| v)
+                .map(|(_, v, _)| v)
                 .filter(|v| check_deployment(s, v, &deployment).is_ok())
         })
         .collect()
@@ -687,6 +817,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     let mut state = State::load(paths)?;
     let holder = protect.unwrap_or(state.holder);
     let anchors = paths::read_anchors(paths)?;
+    let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm);
     let keytab_path = live_keytab(paths, &state);
@@ -724,6 +855,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         &trust,
         &state.realm,
         &anchors,
+        known,
         Operation::Rekey,
         |adv| {
             let p = Prepared::new(
@@ -738,6 +870,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
             Ok(p.with_kerberos(binding).seal(&token, &registrations, &[])?)
         },
     )?;
+    let epoch = payload_epoch(&enrollment).or(known);
     let keytab = merge_previous(enrollment.keytab, old)?;
     match sealer {
         Some(sealer) => {
@@ -746,7 +879,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         }
         None => paths::write_file(&paths.keytab(), keytab.to_mit()?.as_ref(), 0o600)?,
     }
-    paths::write_anchors(paths, &enrollment.anchors)?;
+    paths::write_anchors_epoch(paths, &enrollment.anchors, epoch)?;
     let mut servers = vec![enrollment.config.issuer.clone()];
     servers.extend(
         state
@@ -906,22 +1039,27 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
 pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
     let state = State::load(paths)?;
     let anchors = paths::read_anchors(paths)?;
+    let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm).to_string();
     let keytab_path = live_keytab(paths, &state);
     let mut problems = Vec::new();
     let mut servers = Vec::new();
+    let mut advanced = None;
     for server in state
         .servers
         .iter()
         .filter(|s| only.is_none_or(|o| o == s.as_str()))
     {
-        match verified(server, &trust, &state.realm, &anchors).and_then(|(e, adv)| {
-            adv.check_deployment(&Deployment::servers(&state.servers))
-                .map(|()| (e, adv))
-                .map_err(|e| e.to_string())
-        }) {
-            Ok((_, adv)) => {
+        match verified(server, &trust, &state.realm, &anchors, known).and_then(
+            |(e, adv, advance)| {
+                adv.check_deployment(&Deployment::servers(&state.servers))
+                    .map(|()| (e, adv, advance))
+                    .map_err(|e| e.to_string())
+            },
+        ) {
+            Ok((_, adv, advance)) => {
+                advanced = advance;
                 let days = adv.delegation_expires().saturating_sub(unix_seconds(now())) / 86400;
                 let vouch_hours = adv.vouched_until().saturating_sub(unix_seconds(now())) / 3600;
                 if days < 14 {
@@ -949,6 +1087,18 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
                 servers.push(json!({ "server": server, "ok": false, "error": e }));
             }
         }
+    }
+
+    // Pins stay as they were (they are only rewritten from Kerberos-bound
+    // responses, §4.7); only the verified watermark moves.
+    if let Some((seq, head)) = advanced {
+        let pins = paths::read_anchor_pins(&paths.anchors())?;
+        paths::write_anchor_pins(
+            &paths.anchors(),
+            "kuipa realm anchors",
+            &pins,
+            Some((seq, head)),
+        )?;
     }
     let kinit = keytab_path
         .to_str()
@@ -993,8 +1143,8 @@ pub fn realm_info(
 ) -> Result<Value, Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        match verified(server, &Trust::FirstContact, realm, anchors) {
-            Ok((_, adv)) => {
+        match verified(server, &Trust::FirstContact, realm, anchors, None) {
+            Ok((_, adv, _)) => {
                 check_deployment(server, &adv, deployment)?;
                 let anchors_file = dir.join("pkinit-anchors.pem");
                 let conf =
@@ -1086,13 +1236,15 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
     let own = state
         .servers
         .iter()
-        .find_map(|s| match verified(s, &trust, &state.realm, &anchors) {
-            Ok((_, v)) => Some(v),
-            Err(e) => {
-                skipped.push(format!("{s}: {e}"));
-                None
-            }
-        })
+        .find_map(
+            |s| match verified(s, &trust, &state.realm, &anchors, None) {
+                Ok((_, v, _)) => Some(v),
+                Err(e) => {
+                    skipped.push(format!("{s}: {e}"));
+                    None
+                }
+            },
+        )
         .ok_or_else(|| {
             Outcome::RetryLater(format!(
                 "no usable server of {}: {}",
@@ -1117,8 +1269,8 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
         }
         let adv = if errors.is_empty() {
             t.servers.iter().find_map(|s| {
-                match verified(s, &Trust::FirstContact, &t.realm, &t.anchors) {
-                    Ok((_, v)) => Some(v),
+                match verified(s, &Trust::FirstContact, &t.realm, &t.anchors, None) {
+                    Ok((_, v, _)) => Some(v),
                     Err(e) => {
                         errors.push(format!("{s}: {e}"));
                         None

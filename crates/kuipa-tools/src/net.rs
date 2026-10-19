@@ -321,6 +321,24 @@ impl Endpoint {
             .map_err(|e| NetError::Unreachable(e.to_string()))
     }
 
+    /// The realm's anchor log: entries with sequence greater than
+    /// `from`, oldest first (§4.8).
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`].
+    pub fn anchor_log(&self, from: u64) -> Result<Vec<kuipa_enroll::epoch::SignedEpoch>, NetError> {
+        #[derive(serde::Deserialize)]
+        struct Log {
+            entries: Vec<kuipa_enroll::epoch::SignedEpoch>,
+        }
+        let url = format!("{}anchor-log?from={from}", self.base);
+        let body = self.send("GET", &url, self.client.get(&url), 0)?;
+        Ok(serde_json::from_slice::<Log>(&body)
+            .map_err(|e| NetError::Other(format!("anchor log: {e}")))?
+            .entries)
+    }
+
     /// `POST <path>` with a binary body.
     ///
     /// # Errors
