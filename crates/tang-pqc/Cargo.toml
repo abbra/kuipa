@@ -1,0 +1,18 @@
+[package]
+name = "tang-pqc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Post-quantum Tang/Clevis-style key escrow: ML-KEM recovery with RFC 9964 ML-DSA JWS advertisements"
+keywords = ["tang", "clevis", "ml-kem", "ml-dsa", "post-quantum"]
+categories = ["cryptography"]
+readme = "README.md"
+
+[dependencies]
+native-ossl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
