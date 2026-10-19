@@ -13,7 +13,7 @@ use kuipa_enroll::join::{
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::payload::Enrollment;
-use kuipa_enroll::realm::{TrustedRealm, VerifiedRealm, krb5_realm_section};
+use kuipa_enroll::realm::{Deployment, TrustedRealm, VerifiedRealm, krb5_realm_section};
 use kuipa_gssapi::GssClientCred;
 use serde_json::{Value, json};
 use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, unix_seconds};
@@ -95,6 +95,19 @@ fn ca_trust(paths: &Paths) -> Result<Trust, Error> {
         return Err(format!("no certificates in {}", paths.ca().display()).into());
     }
     Ok(Trust::Ca(certs))
+}
+
+/// Refuse `adv`, fetched from `server`, unless it describes `deployment`
+/// (§4.6): reported as needing an administrator.
+fn check_deployment(
+    server: &str,
+    adv: &VerifiedRealm,
+    deployment: &Deployment,
+) -> Result<(), Error> {
+    adv.check_deployment(deployment).map_err(|e| {
+        tracing::debug!(server = %server, "advertisement refused: {e}");
+        Outcome::NeedsAdmin(format!("{server}: {e}")).into()
+    })
 }
 
 /// Fetch and verify one server's advertisement.
@@ -203,11 +216,14 @@ fn path_for(op: Operation, request: &Request) -> String {
     format!("{name}/{}", request.kid())
 }
 
-/// Run one exchange against the first usable server, following §4.6:
-/// fail over only while nothing can have been processed; after an unknown
-/// outcome retry the same server once, then stop.
+/// Run one exchange against the first usable server of `deployment`,
+/// following §4.6: fail over only while nothing can have been processed;
+/// after an unknown outcome retry the same server once, then stop.  A
+/// server whose verified advertisement describes another deployment stops
+/// the exchange before anything is sent: that is an attack or a
+/// misconfiguration, and failing over would hide it.
 fn exchange(
-    servers: &[String],
+    deployment: &Deployment,
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
@@ -215,7 +231,7 @@ fn exchange(
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
 ) -> Result<(Enrollment, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
-    for server in servers {
+    for server in &deployment.servers {
         let (endpoint, adv) = match verified(server, trust, realm, anchors) {
             Ok(v) => v,
             Err(e) => {
@@ -224,6 +240,7 @@ fn exchange(
                 continue;
             }
         };
+        check_deployment(server, &adv, deployment)?;
         // Once the advertisement verified, its CA authenticates TLS too.
         let endpoint = if matches!(trust, Trust::FirstContact) && crate::net::uses_tls(server) {
             tracing::debug!(server = %server, "TLS from now on verified against the advertised IPA CA");
@@ -371,8 +388,8 @@ fn service_principal(adv: &VerifiedRealm) -> String {
 
 /// A credential with a ticket for the `kuipa` service of the server that
 /// `adv` describes, got as `principal` with `password` in an AS exchange
-/// armoured by anonymous PKINIT, with the KDCs and PKINIT anchors from the
-/// verified advertisement only (§5.4).  Nothing but the ticket outlives
+/// armoured by anonymous PKINIT, with the PKINIT anchors from the verified
+/// advertisement and only its KDCs that are in `deployment` (§4.6, §5.4).  Nothing but the ticket outlives
 /// this call: the configuration is written to a private directory that is
 /// removed again.
 ///
@@ -382,6 +399,7 @@ fn service_principal(adv: &VerifiedRealm) -> String {
 /// password): reported as needing an administrator.
 fn armoured_ticket(
     adv: &VerifiedRealm,
+    deployment: &Deployment,
     principal: &str,
     password: &[u8],
 ) -> Result<GssClientCred, Error> {
@@ -398,7 +416,8 @@ fn armoured_ticket(
         let anchors = dir.join("pkinit-anchors.pem");
         paths::write_pem(&anchors, &adv.info().pkinit_anchors)?;
         let config = dir.join("krb5.conf");
-        let conf = kdc_override(&adv.krb5_conf(anchors.to_str().ok_or("non-UTF-8 path")?));
+        let conf =
+            kdc_override(&adv.krb5_conf(anchors.to_str().ok_or("non-UTF-8 path")?, deployment));
         paths::write_file(&config, conf.as_bytes(), 0o600)?;
         let ccache = format!("MEMORY:kuipa-{}-{seq}", std::process::id());
         let service = service_principal(adv);
@@ -432,8 +451,9 @@ pub fn check_string(string: &EnrollmentString) -> Result<(), Error> {
 }
 
 /// `kuipa enroll` (online): join `realm` through the first usable server
-/// whose advertisement verifies against one of `anchors` (the enrollment
-/// string's, or those pre-provisioned in `/etc/ipa/ku-anchors`).
+/// of `deployment` whose advertisement verifies against one of `anchors`
+/// (the enrollment string's, or those pre-provisioned in
+/// `/etc/ipa/ku-anchors`) and describes `deployment`.
 ///
 /// # Errors
 ///
@@ -444,9 +464,9 @@ pub fn enroll_online(
     anchors: &[Thumbprint],
     auth: &Auth,
     fqdn: &str,
-    servers: &[String],
+    deployment: &Deployment,
 ) -> Result<Value, Error> {
-    if servers.is_empty() {
+    if deployment.servers.is_empty() {
         return Err("no server given (--server)".into());
     }
     if anchors.is_empty() {
@@ -462,64 +482,77 @@ pub fn enroll_online(
         Auth::Otp(_) => Operation::Rekey,
         _ => Operation::Join,
     };
-    let (enrollment, _) = exchange(servers, &Trust::FirstContact, realm, anchors, op, |adv| {
-        // A ticket and the name to address the server by.
-        let kerberos = match auth {
-            Auth::Ccache => ambient
-                .as_ref()
-                .map(|_| (None, format!("ipa-ku@{}", adv.server()))),
-            Auth::Otp(otp) => Some((
-                Some(armoured_ticket(
-                    adv,
-                    &Principal::host(fqdn, realm).to_string(),
-                    otp.as_bytes(),
-                )?),
-                service_principal(adv),
-            )),
-            Auth::Password {
-                principal,
-                password,
-            } => {
-                let principal = if principal.contains('@') {
-                    principal.clone()
-                } else {
-                    format!("{principal}@{realm}")
-                };
-                Some((
-                    Some(armoured_ticket(adv, &principal, password.as_bytes())?),
+    let (enrollment, _) = exchange(
+        deployment,
+        &Trust::FirstContact,
+        realm,
+        anchors,
+        op,
+        |adv| {
+            // A ticket and the name to address the server by.
+            let kerberos = match auth {
+                Auth::Ccache => ambient
+                    .as_ref()
+                    .map(|_| (None, format!("ipa-ku@{}", adv.server()))),
+                Auth::Otp(otp) => Some((
+                    Some(armoured_ticket(
+                        adv,
+                        deployment,
+                        &Principal::host(fqdn, realm).to_string(),
+                        otp.as_bytes(),
+                    )?),
                     service_principal(adv),
-                ))
+                )),
+                Auth::Password {
+                    principal,
+                    password,
+                } => {
+                    let principal = if principal.contains('@') {
+                        principal.clone()
+                    } else {
+                        format!("{principal}@{realm}")
+                    };
+                    Some((
+                        Some(armoured_ticket(
+                            adv,
+                            deployment,
+                            &principal,
+                            password.as_bytes(),
+                        )?),
+                        service_principal(adv),
+                    ))
+                }
+                Auth::LdapOtp(_) | Auth::Voucher { .. } => None,
+            };
+            let auth_type = match auth {
+                Auth::LdapOtp(_) => AuthType::Otp,
+                Auth::Voucher { .. } => AuthType::Voucher,
+                Auth::Otp(_) | Auth::Password { .. } | Auth::Ccache => AuthType::Kerberos,
+            };
+            let mut p = Prepared::new(adv, op, fqdn, auth_type, &Enctype::DEFAULT)?;
+            if let Auth::Voucher {
+                ephemeral: Some(key),
+                ..
+            } = auth
+            {
+                p = p.with_ephemeral(tang_pqc::ExchangeKeyPair::from_jwk(key.as_bytes())?)?;
             }
-            Auth::LdapOtp(_) | Auth::Voucher { .. } => None,
-        };
-        let auth_type = match auth {
-            Auth::LdapOtp(_) => AuthType::Otp,
-            Auth::Voucher { .. } => AuthType::Voucher,
-            Auth::Otp(_) | Auth::Password { .. } | Auth::Ccache => AuthType::Kerberos,
-        };
-        let mut p = Prepared::new(adv, op, fqdn, auth_type, &Enctype::DEFAULT)?;
-        if let Auth::Voucher {
-            ephemeral: Some(key),
-            ..
-        } = auth
-        {
-            p = p.with_ephemeral(tang_pqc::ExchangeKeyPair::from_jwk(key.as_bytes())?)?;
-        }
-        let authenticator = match (auth, kerberos) {
-            (Auth::LdapOtp(otp), _) => native_ossl::util::SecretBuf::from_slice(otp.as_bytes()),
-            (Auth::Voucher { voucher, .. }, _) => {
-                native_ossl::util::SecretBuf::from_slice(voucher.as_bytes())
-            }
-            (_, Some((own, target))) => {
-                let cred = own.as_ref().or(ambient.as_ref()).ok_or("no credential")?;
-                let (token, binding) = gss_token(cred, &target, &p.channel_binding()?)?;
-                p = p.with_kerberos(binding);
-                native_ossl::util::SecretBuf::new(token)
-            }
-            (_, None) => unreachable!("every Kerberos authenticator has a ticket"),
-        };
-        Ok(p.seal(authenticator.as_ref(), &[], &[])?)
-    })?;
+            let authenticator = match (auth, kerberos) {
+                (Auth::LdapOtp(otp), _) => native_ossl::util::SecretBuf::from_slice(otp.as_bytes()),
+                (Auth::Voucher { voucher, .. }, _) => {
+                    native_ossl::util::SecretBuf::from_slice(voucher.as_bytes())
+                }
+                (_, Some((own, target))) => {
+                    let cred = own.as_ref().or(ambient.as_ref()).ok_or("no credential")?;
+                    let (token, binding) = gss_token(cred, &target, &p.channel_binding()?)?;
+                    p = p.with_kerberos(binding);
+                    native_ossl::util::SecretBuf::new(token)
+                }
+                (_, None) => unreachable!("every Kerberos authenticator has a ticket"),
+            };
+            Ok(p.seal(authenticator.as_ref(), &[], &[])?)
+        },
+    )?;
     install(paths, &enrollment, fqdn)?;
     Ok(summary(&enrollment))
 }
@@ -627,8 +660,10 @@ fn live_keytab(paths: &Paths, state: &State) -> std::path::PathBuf {
     }
 }
 
-/// Advertisements of every server of the realm that answers, for sealing.
+/// Advertisements of every server of the realm that answers and describes
+/// the stored deployment, for sealing.
 fn all_servers(state: &State, trust: &Trust, anchors: &[Thumbprint]) -> Vec<VerifiedRealm> {
+    let deployment = Deployment::servers(&state.servers);
     state
         .servers
         .iter()
@@ -636,6 +671,7 @@ fn all_servers(state: &State, trust: &Trust, anchors: &[Thumbprint]) -> Vec<Veri
             verified(s, trust, &state.realm, anchors)
                 .ok()
                 .map(|(_, v)| v)
+                .filter(|v| check_deployment(s, v, &deployment).is_ok())
         })
         .collect()
 }
@@ -684,7 +720,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     };
 
     let (enrollment, _) = exchange(
-        &state.servers,
+        &Deployment::servers(&state.servers),
         &trust,
         &state.realm,
         &anchors,
@@ -880,7 +916,11 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         .iter()
         .filter(|s| only.is_none_or(|o| o == s.as_str()))
     {
-        match verified(server, &trust, &state.realm, &anchors) {
+        match verified(server, &trust, &state.realm, &anchors).and_then(|(e, adv)| {
+            adv.check_deployment(&Deployment::servers(&state.servers))
+                .map(|()| (e, adv))
+                .map_err(|e| e.to_string())
+        }) {
             Ok((_, adv)) => {
                 let days = adv.delegation_expires().saturating_sub(unix_seconds(now())) / 86400;
                 let vouch_hours = adv.vouched_until().saturating_sub(unix_seconds(now())) / 3600;
@@ -941,19 +981,24 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
 ///
 /// # Errors
 ///
-/// [`Outcome::RetryLater`] if no server verifies, or I/O errors.
+/// [`Outcome::RetryLater`] if no server verifies,
+/// [`Outcome::NeedsAdmin`] if one describes another deployment than
+/// `deployment` (its KDCs are narrowed to `deployment` too), or I/O
+/// errors.
 pub fn realm_info(
     realm: &str,
     anchors: &[Thumbprint],
-    servers: &[String],
+    deployment: &Deployment,
     dir: &std::path::Path,
 ) -> Result<Value, Error> {
     let mut skipped = Vec::new();
-    for server in servers {
+    for server in &deployment.servers {
         match verified(server, &Trust::FirstContact, realm, anchors) {
             Ok((_, adv)) => {
+                check_deployment(server, &adv, deployment)?;
                 let anchors_file = dir.join("pkinit-anchors.pem");
-                let conf = adv.krb5_conf(anchors_file.to_str().ok_or("non-UTF-8 path")?);
+                let conf =
+                    adv.krb5_conf(anchors_file.to_str().ok_or("non-UTF-8 path")?, deployment);
                 paths::write_pem(&anchors_file, &adv.info().pkinit_anchors)?;
                 paths::write_pem(&dir.join("ca.crt"), &adv.info().ca_certs)?;
                 paths::write_file(&dir.join("krb5.conf"), conf.as_bytes(), 0o644)?;

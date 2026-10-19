@@ -342,6 +342,44 @@ impl ServerKeys {
     }
 }
 
+/// The deployment a client was told to join, through channels other than
+/// the enrollment string and the advertisement (§4.6): the servers named
+/// with `--server`, found in DNS or stored at enrollment, and the DNS
+/// domain when one was given or used for discovery.  An advertisement
+/// names its realm, domain and servers itself, and verifying it only shows
+/// that an anchor the client trusts vouches for them; this is what they
+/// must also agree with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Deployment {
+    /// The servers the client was told to use.
+    pub servers: Vec<String>,
+    /// The realm's DNS domain, if the client knows it independently.
+    pub domain: Option<String>,
+}
+
+impl Deployment {
+    /// Servers only, no domain.
+    #[must_use]
+    pub fn servers(servers: &[String]) -> Self {
+        Self {
+            servers: servers.to_vec(),
+            domain: None,
+        }
+    }
+
+    /// Whether `name` is one of the servers.
+    #[must_use]
+    pub fn has_server(&self, name: &str) -> bool {
+        self.servers.iter().any(|s| same_name(s, name))
+    }
+}
+
+/// DNS names compare without case and without a trailing dot.
+fn same_name(a: &str, b: &str) -> bool {
+    a.trim_end_matches('.')
+        .eq_ignore_ascii_case(b.trim_end_matches('.'))
+}
+
 /// A verified advertisement of one server of a realm.
 #[derive(Clone, Debug)]
 pub struct VerifiedRealm {
@@ -505,16 +543,67 @@ impl VerifiedRealm {
         Ok(())
     }
 
-    /// A `krb5.conf` for bootstrapping Kerberos before enrollment (§5.3),
-    /// with this server first: see [`krb5_conf`].
+    /// Check that this advertisement describes `deployment` (§4.6): the
+    /// delegated server is one of its servers and lists itself among the
+    /// realm's servers, and the domain is the one the client knows, if it
+    /// knows one.  The realm was already checked by [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Deployment`], naming what was expected and what is
+    /// advertised.
+    pub fn check_deployment(&self, deployment: &Deployment) -> Result<()> {
+        let server = self.server();
+        if !deployment.has_server(server) {
+            return Err(Error::Deployment(format!(
+                "the advertisement is for server {server}, which is not one of the servers to use ({})",
+                deployment.servers.join(", ")
+            )));
+        }
+        if !self.info.servers.iter().any(|s| same_name(s, server)) {
+            return Err(Error::Deployment(format!(
+                "server {server} is not among the servers its advertisement lists ({})",
+                self.info.servers.join(", ")
+            )));
+        }
+        if let Some(domain) = &deployment.domain
+            && !same_name(domain, &self.info.domain)
+        {
+            return Err(Error::Deployment(format!(
+                "the advertisement is for domain {}, not {domain}",
+                self.info.domain
+            )));
+        }
+        Ok(())
+    }
+
+    /// The KDCs to use before enrollment: this server first, then the
+    /// other advertised servers that are also in `deployment`, so secrets
+    /// sent to a KDC (a password, an OTP) only go to hosts the client was
+    /// told to use.
     #[must_use]
-    pub fn krb5_conf(&self, pkinit_anchors_file: &str) -> String {
-        let mut kdcs = vec![self.server()];
-        kdcs.extend(self.info.servers.iter().map(String::as_str));
+    pub fn kdcs_within<'a>(&'a self, deployment: &Deployment) -> Vec<&'a str> {
+        let server = self.server();
+        let mut kdcs = vec![server];
+        kdcs.extend(
+            self.info
+                .servers
+                .iter()
+                .map(String::as_str)
+                .filter(|s| !same_name(s, server) && deployment.has_server(s)),
+        );
+        kdcs
+    }
+
+    /// A `krb5.conf` for bootstrapping Kerberos before enrollment (§5.3),
+    /// with the KDCs of [`Self::kdcs_within`] `deployment`: see
+    /// [`krb5_conf`].
+    #[must_use]
+    pub fn krb5_conf(&self, pkinit_anchors_file: &str, deployment: &Deployment) -> String {
         krb5_conf(
             &self.info.realm,
             &self.info.domain,
-            &kdcs,
+            &self.kdcs_within(deployment),
             pkinit_anchors_file,
         )
     }
@@ -696,6 +785,87 @@ pub(crate) mod tests {
         }
     }
 
+    fn verified(t: &TestRealm) -> VerifiedRealm {
+        VerifiedRealm::verify(
+            &t.signed(),
+            "EXAMPLE.TEST",
+            &[*t.anchor.public().thumbprint()],
+            &Policy::default(),
+            SystemTime::now(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn advertisement_must_describe_the_deployment() {
+        let mut t = test_realm("ipa1.example.test");
+        t.info.servers = vec!["ipa1.example.test".into(), "ipa2.example.test".into()];
+        let v = verified(&t);
+        let deployment = |servers: &[&str], domain: Option<&str>| Deployment {
+            servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+            domain: domain.map(str::to_owned),
+        };
+
+        // Names compare without case or a trailing dot; the domain is
+        // checked only when the client knows one.
+        for ok in [
+            deployment(&["ipa1.example.test"], None),
+            deployment(&["IPA1.Example.Test."], Some("Example.Test")),
+            deployment(
+                &["ipa2.example.test", "ipa1.example.test"],
+                Some("example.test"),
+            ),
+        ] {
+            v.check_deployment(&ok).unwrap();
+        }
+        for (bad, why) in [
+            (
+                deployment(&["ipa2.example.test"], None),
+                "not one of the servers to use",
+            ),
+            (deployment(&[], None), "not one of the servers to use"),
+            (
+                deployment(&["ipa1.example.test"], Some("other.test")),
+                "not other.test",
+            ),
+        ] {
+            let e = v.check_deployment(&bad).unwrap_err();
+            assert!(matches!(e, Error::Deployment(_)), "{e}");
+            assert!(e.to_string().contains(why), "{e}");
+        }
+
+        // A server that does not list itself among the realm's servers.
+        t.info.servers = vec!["ipa2.example.test".into()];
+        let e = verified(&t)
+            .check_deployment(&deployment(&["ipa1.example.test"], None))
+            .unwrap_err();
+        assert!(e.to_string().contains("not among the servers"), "{e}");
+    }
+
+    #[test]
+    fn kdcs_are_narrowed_to_the_deployment() {
+        let mut t = test_realm("ipa1.example.test");
+        t.info.servers = vec![
+            "ipa1.example.test".into(),
+            "ipa2.example.test".into(),
+            "kdc.elsewhere.test".into(),
+        ];
+        let v = verified(&t);
+        let d = Deployment::servers(&["ipa1.example.test".into(), "IPA2.example.test".into()]);
+        assert_eq!(
+            v.kdcs_within(&d),
+            ["ipa1.example.test", "ipa2.example.test"]
+        );
+        let conf = v.krb5_conf("/p.pem", &d);
+        assert!(conf.contains("kdc = ipa2.example.test:88"));
+        assert!(!conf.contains("elsewhere"), "{conf}");
+        let conf = v.krb5_conf(
+            "/p.pem",
+            &Deployment::servers(&["ipa1.example.test".into()]),
+        );
+        assert!(!conf.contains("ipa2"), "{conf}");
+    }
+
     #[test]
     fn realm_section_has_no_defaults() {
         let s = krb5_realm_section("B.TEST", "b.test", &["k1", "k2", "k1"], "/p.pem");
@@ -733,7 +903,10 @@ pub(crate) mod tests {
         v.check_ca_certs(std::slice::from_ref(&t.ca)).unwrap();
         assert!(v.check_ca_certs(&[b"other".to_vec()]).is_err());
         assert!(v.check_ca_certs(&[]).is_err());
-        let conf = v.krb5_conf("/tmp/anchors.pem");
+        let conf = v.krb5_conf(
+            "/tmp/anchors.pem",
+            &Deployment::servers(&["ipa1.example.test".into()]),
+        );
         assert!(conf.contains("default_realm = EXAMPLE.TEST"));
         assert!(conf.contains("        kdc = ipa1.example.test:88\n"));
         assert!(conf.contains("pkinit_anchors = FILE:/tmp/anchors.pem"));

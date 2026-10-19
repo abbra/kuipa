@@ -136,10 +136,37 @@ fn tls_config(trust: &Trust) -> Result<rustls::ClientConfig, NetError> {
     Ok(config.with_no_client_auth())
 }
 
-/// Where to reach `server` instead of `https://<server>/`, from
-/// `KUIPA_ENDPOINTS` (`fqdn=target,…`, target as for [`Endpoint::new`]):
-/// for talking to a daemon's socket directly, or to test servers.
+thread_local! {
+    /// Endpoint overrides for the current thread only, ahead of
+    /// `KUIPA_ENDPOINTS`: see [`set_thread_endpoint`].
+    static THREAD_ENDPOINTS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reach `server` at `target` (as for [`Endpoint::new`]) from the current
+/// thread, as `KUIPA_ENDPOINTS` does for the whole process.  For tests that
+/// run in parallel: each maps the server names of its deployment to its
+/// own test servers, which the environment cannot do safely.
+#[doc(hidden)]
+pub fn set_thread_endpoint(server: &str, target: &str) {
+    THREAD_ENDPOINTS.with_borrow_mut(|map| {
+        map.retain(|(name, _)| name != server);
+        map.push((server.to_owned(), target.to_owned()));
+    });
+}
+
+/// Where to reach `server` instead of `https://<server>/`: from
+/// [`set_thread_endpoint`], else `KUIPA_ENDPOINTS` (`fqdn=target,…`, target
+/// as for [`Endpoint::new`]), for talking to a daemon's socket directly, or
+/// to test servers.
 fn endpoint_override(server: &str) -> Option<String> {
+    if let Some(target) = THREAD_ENDPOINTS.with_borrow(|map| {
+        map.iter()
+            .find(|(name, _)| name == server)
+            .map(|(_, target)| target.clone())
+    }) {
+        return Some(target);
+    }
     let map = std::env::var("KUIPA_ENDPOINTS").ok()?;
     map.split(',')
         .filter_map(|e| e.split_once('='))
