@@ -10,6 +10,7 @@
 #   ./contrib/ci/local-ci.sh --no-color all      # disable ANSI colours
 #   ./contrib/ci/local-ci.sh --valgrind test     # run tests under Valgrind
 #   ./contrib/ci/local-ci.sh interactive         # throwaway realm + shell
+#   ./contrib/ci/local-ci.sh playground-test     # scripted, traced session + HTML report
 #   CARGO_TARGET_DIR=/tmp/kuipa-target ./contrib/ci/local-ci.sh all
 
 # Require bash 4+
@@ -175,7 +176,7 @@ declare -A JOB_STATUS=()
 declare -A JOB_SECS=()
 FAILED_JOBS=()
 
-ALL_JOBS=(build fmt lint-workflows deps clippy doc test kdc-test)
+ALL_JOBS=(build fmt lint-workflows deps clippy doc test kdc-test playground-test)
 # Opt-in jobs: not part of 'all' (need an extra toolchain).
 EXTRA_JOBS=(msrv)
 
@@ -187,6 +188,7 @@ declare -A JOB_DEPS=(
     [doc]="build"
     [test]="build"
     [kdc-test]="build"
+    [playground-test]="build"
 )
 
 # ── Utilities ───────────────────────────────────────────────────────────────
@@ -410,7 +412,7 @@ See docs/local-ci.md for a walkthrough.
 EOF
 }
 
-# The realm behind 'interactive'.  pg_start
+# The realm behind 'interactive' and the playground-test job.  pg_start
 # builds the binaries and starts it in the background; pg_stop tears it
 # down.  Globals, because cleanup also runs from the INT/TERM trap.
 PG_WORK="" PG_PID="" PG_ENV="" PG_LOG="" PG_BIN=""
@@ -513,6 +515,44 @@ run_interactive_playground() {
     trap - INT TERM
 }
 
+# A scripted session in the playground, with tracing on, rendered as an HTML
+# report (contrib/ci/playground/: session.sh runs it, report.py renders it).
+job_playground_test() {
+    require_cargo || return 1
+    if [[ $has_krb5kdc -eq 0 ]]; then
+        fail "playground-test requires krb5kdc, kdb5_util, kadmin.local and kinit (install krb5-server krb5-workstation krb5-pkinit)"
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        fail "playground-test requires python3 to render its report"
+        return 1
+    fi
+
+    local report="${KUIPA_PLAYGROUND_REPORT:-$REPO_ROOT/kuipa-playground-report.html}"
+    local out
+    out="$(mktemp -d /tmp/kuipa-playground-session.XXXXXXXXXX)"
+    pg_start 5 || { rm -rf "$out"; return 1; }
+
+    echo "Running the scripted session…"
+    local rc=0
+    PATH="$PG_BIN:$PG_BIN/examples:$PATH" \
+        bash "$SCRIPT_DIR/playground/session.sh" "$PG_ENV" "$PG_LOG" "$out" || rc=$?
+    cp "$PG_LOG" "$out/servers.log" 2>/dev/null || true
+    pg_stop
+
+    local commit
+    # GitHub's checkout has no .git without git in the container.
+    commit="${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)}"
+    python3 "$SCRIPT_DIR/playground/report.py" "$out" --html "$report" --commit "$commit" || rc=1
+    # Under GitHub Actions, also put the step table on the run's Summary tab.
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        python3 "$SCRIPT_DIR/playground/report.py" "$out" --summary >> "$GITHUB_STEP_SUMMARY" || true
+    fi
+    rm -rf "$out"
+    echo "Playground report: $report"
+    return $rc
+}
+
 dispatch_job() {
     case "$1" in
         build)          run_job build          job_build ;;
@@ -523,6 +563,7 @@ dispatch_job() {
         doc)            run_job doc            job_doc ;;
         test)           run_job test           job_test ;;
         kdc-test)       run_job kdc-test       job_kdc_test ;;
+        playground-test) run_job playground-test job_playground_test ;;
         msrv)           run_job msrv           job_msrv ;;
         *)
             echo "Unknown job: $1" >&2
@@ -609,6 +650,8 @@ Options:
 Environment:
   CARGO_TARGET_DIR    Redirect Cargo build output to an isolated directory.
   KUIPA_KEEP_REALM   Keep the kdc-test realm's files (/tmp/kuipa-kdc-<pid>).
+  KUIPA_PLAYGROUND_REPORT  Where playground-test writes its HTML report
+                      (default: kuipa-playground-report.html in the repository).
 
 Examples:
   $(basename "$0") all
