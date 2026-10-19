@@ -295,32 +295,77 @@ pub fn read_anchors_from(path: &Path) -> Result<Vec<tang_pqc::Thumbprint>, Error
 /// its expiry (Unix seconds) if it has one.  Lists written from server
 /// responses have none: they are refreshed at every rekey.  Pins
 /// provisioned by other means (images, configuration management) should,
-/// for the same reason enrollment strings do (§4.4).
+/// for the same reason enrollment strings do (§4.4).  An
+/// `epoch <seq> <hash>` line (§4.8) is skipped here; see
+/// [`read_epoch_from`].
 ///
 /// # Errors
 ///
 /// I/O errors or a malformed line.
 pub fn read_anchor_pins(path: &Path) -> Result<Vec<(tang_pqc::Thumbprint, Option<u64>)>, Error> {
+    Ok(read_anchors_file(path)?.0)
+}
+
+/// The anchor epoch watermark stored in an anchors file (§4.8): the
+/// `(seq, head)` of the last entry of the anchor log this host has
+/// verified, from the `epoch <seq> <hash>` line, if it has one.
+///
+/// # Errors
+///
+/// I/O errors or a malformed line.
+pub fn read_epoch_from(path: &Path) -> Result<Option<(u64, [u8; 32])>, Error> {
+    Ok(read_anchors_file(path)?.1)
+}
+
+/// What an anchors file holds: pins with optional expiries, and the
+/// optional epoch watermark (§4.8).
+type AnchorsFile = (
+    Vec<(tang_pqc::Thumbprint, Option<u64>)>,
+    Option<(u64, [u8; 32])>,
+);
+
+fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
     let text = fs::read_to_string(path)?;
-    text.lines()
+    let mut pins = Vec::new();
+    let mut epoch = None;
+    for l in text
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let mut fields = l.split_whitespace();
-            let anchor = fields.next().unwrap_or_default().parse()?;
-            let exp = fields
+    {
+        let mut fields = l.split_whitespace();
+        let first = fields.next().unwrap_or_default();
+        if first == "epoch" {
+            let seq = fields
                 .next()
-                .map(|e| {
-                    e.parse::<u64>()
-                        .map_err(|_| format!("{}: bad expiry {e:?}", path.display()))
-                })
-                .transpose()?;
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| format!("{}: bad epoch sequence in {l:?}", path.display()))?;
+            let head = fields
+                .next()
+                .map(str::parse)
+                .transpose()?
+                .map(|t: tang_pqc::Thumbprint| *t.as_bytes())
+                .ok_or_else(|| format!("{}: bad epoch hash in {l:?}", path.display()))?;
             if fields.next().is_some() {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
             }
-            Ok((anchor, exp))
-        })
-        .collect()
+            epoch = Some((seq, head));
+            continue;
+        }
+        let anchor = first.parse()?;
+        let exp = fields
+            .next()
+            .map(|e| {
+                e.parse::<u64>()
+                    .map_err(|_| format!("{}: bad expiry {e:?}", path.display()))
+            })
+            .transpose()?;
+        if fields.next().is_some() {
+            return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
+        }
+        pins.push((anchor, exp));
+    }
+    Ok((pins, epoch))
 }
 
 /// Write the pinned anchors.
@@ -330,6 +375,24 @@ pub fn read_anchor_pins(path: &Path) -> Result<Vec<(tang_pqc::Thumbprint, Option
 /// I/O errors.
 pub fn write_anchors(paths: &Paths, anchors: &[tang_pqc::Thumbprint]) -> Result<(), Error> {
     write_anchors_to(&paths.anchors(), "kuipa realm anchors", anchors)
+}
+
+/// Write the pinned anchors and the anchor epoch watermark (§4.8).
+///
+/// # Errors
+///
+/// I/O errors.
+pub fn write_anchors_epoch(
+    paths: &Paths,
+    anchors: &[tang_pqc::Thumbprint],
+    epoch: Option<(u64, [u8; 32])>,
+) -> Result<(), Error> {
+    write_anchor_pins(
+        &paths.anchors(),
+        "kuipa realm anchors",
+        &anchors.iter().map(|a| (*a, None)).collect::<Vec<_>>(),
+        epoch,
+    )
 }
 
 /// Write an anchors file with a `# comment` first line.
@@ -342,9 +405,41 @@ pub fn write_anchors_to(
     comment: &str,
     anchors: &[tang_pqc::Thumbprint],
 ) -> Result<(), Error> {
+    write_anchor_pins(
+        path,
+        comment,
+        &anchors.iter().map(|a| (*a, None)).collect::<Vec<_>>(),
+        None,
+    )
+}
+
+/// Write an anchors file with expiry-bearing pins and an optional epoch
+/// watermark (§4.8).
+///
+/// # Errors
+///
+/// I/O errors.
+pub fn write_anchor_pins(
+    path: &Path,
+    comment: &str,
+    pins: &[(tang_pqc::Thumbprint, Option<u64>)],
+    epoch: Option<(u64, [u8; 32])>,
+) -> Result<(), Error> {
+    use std::fmt::Write as _; // appending to a String cannot fail
     let mut text = format!("# {comment}\n");
-    for a in anchors {
+    if let Some((seq, head)) = epoch {
+        writeln!(
+            text,
+            "epoch {seq} {}",
+            tang_pqc::Thumbprint::from_bytes(head)
+        )
+        .expect("a String sink never fails");
+    }
+    for (a, exp) in pins {
         text.push_str(&a.to_string());
+        if let Some(e) = exp {
+            write!(text, " {e}").expect("a String sink never fails");
+        }
         text.push('\n');
     }
     write_file(path, text.as_bytes(), 0o644)
@@ -365,8 +460,9 @@ mod tests {
             tang_pqc::Thumbprint::from_bytes([3; 32]),
         );
         let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+        let head = tang_pqc::Thumbprint::from_bytes([9; 32]);
         let text = format!(
-            "# provisioned\n{a}\n\n{b} {}\n{c} {}\n",
+            "# provisioned\n{a}\n\n{b} {}\n{c} {}\nepoch 7 {head}\n",
             now + 3600,
             now - CLOCK_SKEW - 1
         );
@@ -380,6 +476,11 @@ mod tests {
             ]
         );
         assert_eq!(
+            read_epoch_from(&path).unwrap(),
+            Some((7, [9; 32])),
+            "the watermark rides with the pins"
+        );
+        assert_eq!(
             read_anchors_from(&path).unwrap(),
             vec![a, b],
             "expired pin left out"
@@ -389,6 +490,8 @@ mod tests {
             format!("{a} soon\n"),
             format!("{a} 1 2\n"),
             "short\n".into(),
+            "epoch nope xx\n".into(),
+            "epoch 7 notahash\n".into(),
         ] {
             fs::write(&path, bad).unwrap();
             assert!(read_anchor_pins(&path).is_err());
@@ -396,6 +499,17 @@ mod tests {
         // Written lists carry no expiry and read back unchanged.
         write_anchors_to(&path, "test", &[a, b]).unwrap();
         assert_eq!(read_anchors_from(&path).unwrap(), vec![a, b]);
+        assert_eq!(
+            read_epoch_from(&path).unwrap(),
+            None,
+            "no watermark written"
+        );
+        write_anchor_pins(&path, "test", &[(a, Some(now + 3600))], Some((3, [4; 32]))).unwrap();
+        assert_eq!(
+            read_anchor_pins(&path).unwrap(),
+            vec![(a, Some(now + 3600))]
+        );
+        assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 32])));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
