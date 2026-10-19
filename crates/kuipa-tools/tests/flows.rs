@@ -204,6 +204,17 @@ fn serve_as(name: &str, app: Arc<App<Dir>>) -> String {
     name.to_owned()
 }
 
+/// The bare enroll server behind an otherwise-empty app.
+fn app(server: Arc<EnrollServer>, directory: Dir) -> Arc<App<Dir>> {
+    Arc::new(App {
+        server,
+        peers: None,
+        limiter: kuipad::limit::Limiter::default(),
+        tang: None,
+        directory,
+    })
+}
+
 /// Make server `name` unreachable for this test's thread (nothing listens
 /// on port 9).
 fn down(name: &str) -> String {
@@ -261,13 +272,7 @@ fn online_enrollment_with_failover() {
         .insert(HOST.into(), b"Secret123".to_vec());
     let url = serve_as(
         "ipa2.example.test",
-        Arc::new(App {
-            server: Arc::new(EnrollServer::new(keys, info, delegation)),
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: dir,
-        }),
+        app(Arc::new(EnrollServer::new(keys, info, delegation)), dir),
     );
     let paths = root("online");
 
@@ -358,26 +363,20 @@ fn online_enrollment_with_failover() {
 #[test]
 fn advertisement_must_describe_the_deployment() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-    let app = |fqdn: &str, dir: Dir| {
+    let server = |fqdn: &str, dir: Dir| {
         let (keys, info, delegation) = server_keys(&anchor, fqdn);
-        Arc::new(App {
-            server: Arc::new(EnrollServer::new(keys, info, delegation)),
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: dir,
-        })
+        app(Arc::new(EnrollServer::new(keys, info, delegation)), dir)
     };
     let dir = Dir::default();
     dir.otps
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
-    let honest = app("ipa2.example.test", dir);
+    let honest = server("ipa2.example.test", dir);
     // Reached as ipa1, but delegated as a server of another name.
     serve_as(
         "ipa1.example.test",
-        app("rogue.example.test", Dir::default()),
+        server("rogue.example.test", Dir::default()),
     );
     serve_as("ipa2.example.test", honest.clone());
     let needs_admin = |err: &(dyn std::error::Error + Send + Sync + 'static), why: &str| {
@@ -505,13 +504,10 @@ fn wrong_anchor_is_not_a_usable_server() {
     let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
     let url = serve_as(
         "ipa1.example.test",
-        Arc::new(App {
-            server: Arc::new(EnrollServer::new(keys, info, delegation)),
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: Dir::default(),
-        }),
+        app(
+            Arc::new(EnrollServer::new(keys, info, delegation)),
+            Dir::default(),
+        ),
     );
     let other = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let mut s = string(&other, b"Secret123");
@@ -551,13 +547,7 @@ fn rotated_anchors_are_followed_and_old_strings_expire() {
         .insert(HOST.into(), b"Secret123".to_vec());
     let url = serve_as(
         "ipa1.example.test",
-        Arc::new(App {
-            server: Arc::new(EnrollServer::new(keys, info, delegation)),
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: dir,
-        }),
+        app(Arc::new(EnrollServer::new(keys, info, delegation)), dir),
     );
 
     // A string that still names the old anchor works through the
@@ -624,16 +614,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
     let head1 = first.head().unwrap();
     let first_signed = SignedEpoch::issue(&old, &first).unwrap();
     server.publish_epoch(vec![first_signed.clone()]);
-    serve_as(
-        "ipa1.example.test",
-        Arc::new(App {
-            server,
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: dir,
-        }),
-    );
+    serve_as("ipa1.example.test", app(server, dir));
 
     // The enrollment seals the log head, and the host stores it beside
     // its pin.
@@ -675,16 +656,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
         first_signed.clone(),
         SignedEpoch::issue(&new, &second).unwrap(),
     ]);
-    serve_as(
-        "ipa1.example.test",
-        Arc::new(App {
-            server: server2,
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: Dir::default(),
-        }),
-    );
+    serve_as("ipa1.example.test", app(server2, Dir::default()));
     let check = flows::check(&paths, None).unwrap();
     assert_eq!(check["servers"][0]["ok"], true, "{check}");
     assert_eq!(
@@ -698,16 +670,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
     let (keys3, info3, delegation3) = server_keys(&old, "ipa1.example.test");
     let server3 = Arc::new(EnrollServer::new(keys3, info3, delegation3));
     server3.publish_epoch(vec![first_signed]);
-    serve_as(
-        "ipa1.example.test",
-        Arc::new(App {
-            server: server3,
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: Dir::default(),
-        }),
-    );
+    serve_as("ipa1.example.test", app(server3, Dir::default()));
     let check = flows::check(&paths, None).unwrap();
     assert_eq!(check["servers"][0]["ok"], false);
     let error = check["servers"][0]["error"].as_str().unwrap();
@@ -731,16 +694,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
         SignedEpoch::issue(&old, &first).unwrap(),
         SignedEpoch::issue(&new, &forked).unwrap(),
     ]);
-    serve_as(
-        "ipa1.example.test",
-        Arc::new(App {
-            server: server4,
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            directory: Dir::default(),
-        }),
-    );
+    serve_as("ipa1.example.test", app(server4, Dir::default()));
     let check = flows::check(&paths, None).unwrap();
     assert_eq!(check["servers"][0]["ok"], false);
     assert!(
@@ -997,13 +951,10 @@ fn offline_enrollment_from_a_bundle() {
 fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
-    let app = Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        directory: Dir::default(),
-    });
+    let app = app(
+        Arc::new(EnrollServer::new(keys, info, delegation)),
+        Dir::default(),
+    );
     let url = serve_as("ipa1.example.test", app.clone());
     let otp = || {
         app.directory
@@ -1159,13 +1110,10 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
     )
     .unwrap();
     delegation.add(vouch.proof(&claim, other.public()).unwrap());
-    let ipa1_app = Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        directory: Dir::default(),
-    });
+    let ipa1_app = app(
+        Arc::new(EnrollServer::new(keys, info, delegation)),
+        Dir::default(),
+    );
     let ipa1 = serve_as("ipa1.example.test", ipa1_app.clone());
     ipa1_app
         .directory
@@ -1178,13 +1126,10 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
     // its own; only that one anchor vouches for it.
     let (keys, mut info, delegation) = server_keys(&anchor, "thief.example.test");
     info.servers.push("thief.example.test".into());
-    let thief_app = Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        directory: Dir::default(),
-    });
+    let thief_app = app(
+        Arc::new(EnrollServer::new(keys, info, delegation)),
+        Dir::default(),
+    );
     let thief = serve_as("thief.example.test", thief_app.clone());
 
     // Two anchors pinned: the thief is skipped before any secret leaves
