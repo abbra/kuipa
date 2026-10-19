@@ -1,0 +1,25 @@
+[package]
+name = "ml-dsa-blind"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license.workspace = true
+description = "Blind (message-hiding) signing with unmodified FIPS 204 ML-DSA via OpenSSL external-mu"
+keywords = ["ml-dsa", "blind-signature", "post-quantum", "openssl", "fips204"]
+categories = ["cryptography"]
+readme = "README.md"
+
+[dependencies]
+native-ossl.workspace = true
+
+[dev-dependencies]
+# Only used to cross-check our mu computation against OpenSSL's own
+# `ML-DSA-MU` digest, whose parameters native-ossl does not expose yet.
+native-ossl-sys = "0.3.2"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
