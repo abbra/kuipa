@@ -172,7 +172,16 @@ fn verified(
                 }) {
                 Ok(proof) => {
                     let by = *proof.anchor();
-                    if proven.contains(&by) {
+                    if proof.server() != advertisement.server()
+                        || proof.signer() != advertisement.signer()
+                        || proof.delegation_expires() != advertisement.delegation_expires()
+                    {
+                        // §4.4: a proof counts only for the claim it is
+                        // a proof of: the same server, the same key, the
+                        // same delegation — anything else proves a
+                        // different claim.
+                        tracing::debug!(server = %server, "pinned anchor {a} proved a different claim");
+                    } else if proven.contains(&by) {
                         tracing::debug!(server = %server, "pinned anchor {a} proves the claim through {by}, already counted");
                     } else {
                         proven.push(by);
