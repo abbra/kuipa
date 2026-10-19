@@ -350,6 +350,102 @@ fn online_enrollment_with_failover() {
     assert_eq!(flows::status(&paths).unwrap()["enrolled"], false);
 }
 
+/// The advertisement verifies (the anchor vouches for it), but describes
+/// another deployment than the client was told to join: refused before any
+/// request, without failing over, and before any secret leaves the host
+/// (DESIGN §4.6).
+#[test]
+fn advertisement_must_describe_the_deployment() {
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let app = |fqdn: &str, dir: Dir| {
+        let (keys, info, delegation) = server_keys(&anchor, fqdn);
+        Arc::new(App {
+            server: Arc::new(EnrollServer::new(keys, info, delegation)),
+            peers: None,
+            limiter: kuipad::limit::Limiter::default(),
+            tang: None,
+            directory: dir,
+        })
+    };
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let honest = app("ipa2.example.test", dir);
+    // Reached as ipa1, but delegated as a server of another name.
+    serve_as(
+        "ipa1.example.test",
+        app("rogue.example.test", Dir::default()),
+    );
+    serve_as("ipa2.example.test", honest.clone());
+    let needs_admin = |err: &(dyn std::error::Error + Send + Sync + 'static), why: &str| {
+        assert!(
+            matches!(err.downcast_ref::<Outcome>(), Some(Outcome::NeedsAdmin(m)) if m.contains(why)),
+            "{err}"
+        );
+    };
+    let ldap_otp = |deployment: &Deployment| {
+        let mut s = string(&anchor, b"Secret123");
+        let otp = s.take_secret().unwrap();
+        flows::enroll_online(
+            &root("deployment"),
+            s.realm(),
+            &[*s.anchor()],
+            &Auth::LdapOtp(otp),
+            HOST,
+            deployment,
+        )
+    };
+    let both = Deployment::servers(&["ipa1.example.test".into(), "ipa2.example.test".into()]);
+
+    // ipa1 answers as another server: stop, do not fail over to ipa2.
+    let (result, trace) = traced(|| ldap_otp(&both));
+    needs_admin(
+        &*result.unwrap_err(),
+        "ipa1.example.test: the advertisement is for server rogue.example.test",
+    );
+    assert!(!trace.contains("Join request"), "{trace}");
+
+    // Another domain than the one the client was given.
+    let elsewhere = Deployment {
+        servers: vec!["ipa2.example.test".into()],
+        domain: Some("example.org".into()),
+    };
+    needs_admin(&*ldap_otp(&elsewhere).unwrap_err(), "not example.org");
+
+    // A password is not sent to any KDC: refused before the armoured kinit.
+    let (result, trace) = traced(|| {
+        flows::enroll_online(
+            &root("deployment-password"),
+            REALM,
+            &[*anchor.public().thumbprint()],
+            &Auth::Password {
+                principal: "admin".into(),
+                password: Secret::new(b"Secret123"),
+            },
+            HOST,
+            &both,
+        )
+    });
+    needs_admin(&*result.unwrap_err(), "rogue.example.test");
+    assert!(!trace.contains("armoured AS exchange"), "{trace}");
+
+    // realm-info refuses too, and writes nothing.
+    let out = root("deployment-realm-info");
+    let krb5 = out.dir.join("krb5");
+    let err = flows::realm_info(REALM, &[*anchor.public().thumbprint()], &both, &krb5).unwrap_err();
+    needs_admin(&*err, "rogue.example.test");
+    assert!(!krb5.join("krb5.conf").exists());
+
+    // None of that used the OTP: the honest deployment still enrolls.
+    let ok = Deployment {
+        servers: vec!["ipa2.example.test".into()],
+        domain: Some("Example.Test".into()),
+    };
+    assert_eq!(ldap_otp(&ok).unwrap()["issuer"], "ipa2.example.test");
+}
+
 #[test]
 fn guessing_is_rate_limited_per_host() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
@@ -623,6 +719,8 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     assert_eq!(info["server"], "ipa1.example.test");
     let conf = std::fs::read_to_string(dir.join("krb5.conf")).unwrap();
     assert!(conf.contains("kdc = ipa1.example.test:88"));
+    // ipa2 is advertised too, but the client was told to use ipa1 only.
+    assert!(!conf.contains("ipa2"), "{conf}");
     assert!(conf.contains(&format!(
         "pkinit_anchors = FILE:{}",
         dir.join("pkinit-anchors.pem").display()

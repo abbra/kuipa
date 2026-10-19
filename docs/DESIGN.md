@@ -414,6 +414,12 @@ line, §10.2); lists written from server responses carry none, since every
 rekey refreshes them. There is still no trust on first use: without a
 pinned anchor the client would talk to a server nobody vouched for.
 
+An enrollment string together with `--realm` (`ipa-client-install -r`) is
+a cross-check: the string must be for that realm, compared exactly as
+Kerberos does, or `kuipa` stops before contacting a server. The realm,
+like the servers and the domain (§4.6), then comes from a channel other
+than the string.
+
 ### 4.5 Anchor lists on enrolled hosts
 
 Every join and rekey response carries the trusted anchors, authenticated
@@ -442,6 +448,38 @@ DNS only names candidates: names that are not safe host names are dropped,
 and every server must still present an advertisement that verifies against
 a pinned anchor.
 
+Verifying an advertisement only shows that an anchor the client trusts
+vouches for what it says, and it names its realm, domain and servers
+itself. A forged or misdirected enrollment string brings its own anchor,
+so every advertisement must also describe the deployment the client was
+told about through other channels: the servers to use (`--server`, the
+DNS SRV targets, or the stored list on an enrolled host) and, when given
+or used for the DNS lookup, the domain. Before any request is built:
+
+* the delegated server must be one of those servers, and among the
+  servers its own advertisement lists;
+* the advertised domain must be the client's, compared without case;
+* the realm is already checked by the verification itself, against the
+  string's realm, which `--realm` cross-checks (§4.4).
+
+A mismatch stops with exit 1 (needs an administrator), naming what was
+expected and what was advertised. It does not fail over to the next
+server: it is either an attack or a misconfiguration, and failing over
+would hide both. Before enrollment, the KDCs for the armoured AS
+exchanges of password and OTP joins (§5.3) and in `realm-info`'s
+`krb5.conf` (§5.4) are the delegated server and those advertised servers
+that are also among the servers to use, so a password or an OTP-derived
+exchange only reaches hosts the client was told to use. After enrollment
+the stored server list and `krb5.conf` hold every advertised server: they
+come from the authenticated response (§5.5).
+
+These checks are not authentication. An attacker who delivers the string
+and is on the path to the named servers can repeat the expected names;
+the string must still reach the host authentically (§13). What they add is
+that the enrollment must match the deployment the administrator described
+independently, which catches stale, mis-delivered or foreign strings and
+anchors, and keeps secrets away from hosts outside that deployment.
+
 A server whose
 advertisement cannot be fetched or does not verify (expired delegation, a
 server the pinned anchor does not vouch for yet, an impostor) is skipped.
@@ -452,6 +490,7 @@ the same OTP before replication — so:
 |---|---|
 | connection failure, `502`/`503`/`404`, `429` (rate limited), advertisement fetch or verification fails | try the next server |
 | request sent, then no answer (timeout, dropped connection) | retry the **same** server once with a fresh request; if that also fails, stop: "outcome unknown on `<server>`; do not retry elsewhere" (exit 1) |
+| the advertisement verifies but describes another deployment | stop: needs an administrator (exit 1), before anything is sent |
 | `403` | stop: refused (exit 1) |
 | no server usable | exit 75 (retry later) |
 
@@ -648,8 +687,9 @@ or passkey authentication needs FAST armour, i.e. anonymous PKINIT, which
 needs the KDC's PKINIT anchors. `kuipa realm-info --server … --krb5-dir DIR`
 verifies the advertisement and writes, from it:
 
-* `DIR/krb5.conf`: the realm, the advertised servers as KDCs (this server
-  first), no DNS lookups, `pkinit_anchors` and `pkinit_pool` pointing at:
+* `DIR/krb5.conf`: the realm, as KDCs this server first and then the
+  other advertised servers that are among the servers to use (§4.6), no
+  DNS lookups, `pkinit_anchors` and `pkinit_pool` pointing at:
 * `DIR/pkinit-anchors.pem`, and `DIR/ca.crt`.
 
 `ipa-client-install` then sets `KRB5_CONFIG` and a temporary `KRB5CCNAME`,
@@ -969,9 +1009,10 @@ Common rules:
   password from `--password-file` or standard input. From a pipe the
   enrollment string is the first line and the password the next; on a
   terminal each is prompted for, the password without echo. An empty value
-  is an error, never an empty secret. With `--realm` no enrollment string
-  is read (giving one too is an error), and an OTP join needs one. An
-  expired enrollment string, or `--realm` with only expired pins, is refused
+  is an error, never an empty secret. With `--realm` alone no enrollment
+  string is read, and an OTP join needs one; with `--realm` and an
+  enrollment file (`--enrollment-file` or `KUIPA_ENROLLMENT_FILE`), the
+  string must be for that realm (§4.4). An expired enrollment string, or `--realm` with only expired pins, is refused
   before anything is sent.
 * Commands that talk to servers use `--server`, else the stored server
   list, else DNS SRV records (§4.6).
@@ -1263,6 +1304,7 @@ authentically.
 |---|---|
 | records all traffic, quantum later | nothing: OTPs, passwords and keytabs are under `ss`/`ss_e`; the advertisement is public |
 | active network attacker, classical or quantum | cannot impersonate a server without a delegation signed by a pinned anchor; can block enrollment |
+| delivers a forged or misdirected enrollment string, with an anchor of its own | its advertisements verify, but must name the realm (`--realm`), domain (`--domain`, or the one used for DNS) and servers (`--server` or DNS) the host was given independently, before any request or secret leaves the host; KDCs for the armoured exchange are limited to those servers (§4.6); not stopped if it also controls those channels or the path to the named servers |
 | replays a recorded request | OTP consumed; Kerberos tokens bound to `cb` and the replay cache; the response is for an `ek_e` the attacker lacks |
 | guesses an OTP or password | online only, one guess per request, LDAP lockout per server |
 | compromises a join key later | opens recorded requests (consumed OTPs of `--ldap-otp` joins, expired tokens), not responses; passwords are never in them |
@@ -1552,7 +1594,8 @@ like an enrollment string.
 | `crates/kuipa-enroll/tests/end_to_end.rs` | every flow against an in-memory directory, with two servers that have exchanged anchors and a client pinning one: OTP join on either server, wrong OTP / wrong server, endpoint and response binding, field tampering, Kerberos join and rekey with channel bindings and the Kerberos binding (an impostor's response does not open), auth type 4 refused, staging modes A/B and first contact, staging authorisation, sealed keytab with registration, failover, revocation and rebinding, the `krb5.conf` generator |
 | `kuipad` unit tests | `KEYTAB_GET` DER against a hand encoding (with and without a password), `GeneralizedTime`, the key store (generation, rotation, retired keys still loaded, pruning by age, anchor rotation leaving a succession and no trace of the old key), the Tang key directory (generation, rotation, `adv/{thp}` with a retired key, recovery with a retired key), the rate limiter (bursts, refill, per-source limits, idle buckets dropped, `X-Forwarded-For`), `?anchor=` parsing |
 | `crates/ml-dsa-blind` | blind signing (results verify as stock ML-DSA, μ against OpenSSL's `ML-DSA-MU`, requests hide the message, bad responses, resumed state), crypto-policy enforcement |
-| `crates/kuipa-tools/tests/flows.rs` | the client flows against the daemon's router over HTTP: OTP enrollment with failover (and its trace: the steps are there, the OTP is not), refusal and retry-later exits, OTP guessing stopped by the per-host limit (`429`, exit 75), wrong anchor, the LDAP-checked OTP, `realm-info`, pre-provisioned pins, a string naming a rotated anchor verified through the succession, expired strings refused, offline bundles; the post-quantum Tang service with `tang-pqc`'s client (provision against the pinned thumbprint, recovery through `key/{kid}`, Tang's error statuses, rotation: the old binding still opens (its retired key still served at `key/{kid}`) and `adv/{old}` lets the old pin verify the new keys; no keys, no service), and the pin against it: encrypt and decrypt, a header pointing elsewhere refused, encryption with the old pin after a rotation |
+| `crates/kuipa-tools/tests/cli.rs` | the `kuipa` binary: `--realm` with an enrollment string for another realm (or another case) is an error before any server is contacted; with the same realm the join goes ahead |
+| `crates/kuipa-tools/tests/flows.rs` | the client flows against the daemon's router over HTTP: OTP enrollment with failover (and its trace: the steps are there, the OTP is not), refusal and retry-later exits, OTP guessing stopped by the per-host limit (`429`, exit 75), wrong anchor, the LDAP-checked OTP, `realm-info` (its KDCs limited to the servers to use), pre-provisioned pins, a string naming a rotated anchor verified through the succession, expired strings refused, offline bundles; advertisements for another server or domain than the deployment's refused (needs an administrator) without failing over, before any request, armoured kinit or `realm-info` file; the post-quantum Tang service with `tang-pqc`'s client (provision against the pinned thumbprint, recovery through `key/{kid}`, Tang's error statuses, rotation: the old binding still opens (its retired key still served at `key/{kid}`) and `adv/{old}` lets the old pin verify the new keys; no keys, no service), and the pin against it: encrypt and decrypt, a header pointing elsewhere refused, encryption with the old pin after a rotation |
 | `crates/tang-pqc-clevis` unit and `tests/pin.rs` | the binary as `tang-pqc` and as `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` against a `tang-pqc` server: `--summary`, `adv`, refusal without or with a wrong `thp` (naming the advertised keys), round trips, fresh bindings per encryption, tampered header or ciphertext refused, the `regen` configuration, usage exits; configuration parsing, foreign JWEs |
 | `crates/kuipa-tools/tests/dns.rs` | SRV discovery against a stub DNS server over UDP and TCP (truncated answers): priority and weight order, unsafe and duplicate names dropped, no records, no answer |
 | `crates/kuipa-tools/tests/voucher.rs` | against a real MIT KDC: issuer key and quota, blinded request (64 bytes), unblinding, the voucher key in the advertisement; a bearer voucher creates its host in its host group once and not another host; a bound voucher needs its ephemeral key; an unknown voucher key is refused; the quota runs out |
