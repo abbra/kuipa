@@ -5,11 +5,13 @@ Usage:
     report.py OUT --html REPORT.html [--summary] [--commit SHA]
 
 OUT is the directory session.sh wrote: session.env, steps/NNN/{meta.env,
-command, stdout, stderr, server.log} and, when local-ci.sh copied it,
-servers.log (the servers' whole log).  --html writes a self-contained page
-(no external assets, light and dark); --summary prints a Markdown fragment
-for the GitHub Actions job summary, which links to the HTML artifact for
-the traces.
+command, stdout, stderr, server.log, expect, missing} and, when
+local-ci.sh copied it, servers.log (the servers' whole log).  --html writes
+a self-contained page (no external assets, light and dark); --summary
+prints a Markdown fragment for the GitHub Actions job summary: the step
+table and the failed steps' output.  It names the artifact that holds the
+HTML report; the workflow adds the artifact's link after uploading it,
+since the URL only exists then.
 """
 
 import argparse
@@ -68,6 +70,10 @@ def load(out):
                 "stdout": read(os.path.join(d, "stdout")),
                 "stderr": read(os.path.join(d, "stderr")),
                 "server": read(os.path.join(d, "server.log")),
+                "expect": read(os.path.join(d, "expect")).splitlines(),
+                "missing": read(os.path.join(d, "missing")).splitlines(),
+                "timed_out": meta.get("timed_out") == "1",
+                "timeout": meta.get("timeout", ""),
             }
         )
     sections = []
@@ -127,13 +133,31 @@ def block(label, body, *, open_=False, raw=False, cls="", count=None):
     )
 
 
+def status_text(step):
+    """The exit status as the report shows it, with what was expected."""
+    if step["timed_out"]:
+        return f"timed out after {step['timeout']} s"
+    text = f"exit {step['status']}"
+    if not step["passed"] or step["expected"] != "0":
+        text += f" (expected {expected_text(step['expected'])})"
+    return text
+
+
+def expect_html(step):
+    """The output the step had to show, each marked found or missing."""
+    if not step["expect"]:
+        return ""
+    items = "".join(
+        f'<li class="{"missing" if text in step["missing"] else "found"}">'
+        f'<span class="mark">{"✗" if text in step["missing"] else "✓"}</span>'
+        f"<code>{esc(text)}</code></li>"
+        for text in step["expect"]
+    )
+    return f'<ul class="expect" aria-label="Expected in the output">{items}</ul>'
+
+
 def render_step(step):
     state = "pass" if step["passed"] else "fail"
-    status = step["status"]
-    exp = expected_text(step["expected"])
-    status_note = f"exit {esc(status)}"
-    if not step["passed"] or step["expected"] != "0":
-        status_note += f" (expected {esc(exp)})"
     trace = trace_html(step["stderr"]) if step["stderr"].strip() else ""
     return f"""
 <article class="step {state}" id="step-{step['n']}">
@@ -142,8 +166,9 @@ def render_step(step):
     <h3>{esc(step['title'])}</h3>
     <span class="badge {state}">{'PASS' if step['passed'] else 'FAIL'}</span>
   </header>
-  <div class="facts"><span>{status_note}</span><span>{seconds(step['ms'])}</span></div>
+  <div class="facts"><span>{esc(status_text(step))}</span><span>{seconds(step['ms'])}</span></div>
   <pre class="cmd"><span class="prompt">$</span> {esc(step['command'])}</pre>
+  {expect_html(step)}
   {block('Output', step['stdout'], open_=True)}
   {block('Trace (standard error)', trace, open_=not step['passed'], raw=True, cls='trace', count=len(step['stderr'].splitlines()))}
   {block('Server log during this step', step['server'], cls='server')}
@@ -218,6 +243,12 @@ details.trace .ln { display: block; padding-left: 10.5em; text-indent: -10.5em; 
 .lv.trace { color: var(--trace); } .lv.debug { color: var(--debug); } .lv.info { color: var(--info); }
 .lv.warn { color: var(--warn); } .lv.error { color: var(--error); }
 footer { color: var(--muted); font-size: .8rem; margin-top: 2rem; }
+ul.expect { list-style: none; margin: .3rem 0 .4rem; padding: 0; font-size: .82rem; }
+ul.expect li { display: flex; gap: .45rem; align-items: baseline; }
+ul.expect .mark { font-weight: 700; width: 1em; }
+ul.expect .found .mark { color: var(--pass); }
+ul.expect .missing .mark { color: var(--fail); }
+ul.expect .missing code { color: var(--fail); }
 """
 
 
@@ -314,22 +345,25 @@ def render_summary(data, artifact):
         "## kuipa playground session",
         "",
         f"**{'✅ All steps passed' if ok else '❌ ' + failed_text(len(steps) - passed)}**"
-        f" ({passed}/{len(steps)}). Traces and outputs are in the `{artifact}` artifact.",
+        f" ({passed}/{len(steps)}). The full report, with every step's output and trace,"
+        f" is this run's `{artifact}` artifact.",
         "",
-        "| # | Section | Step | Result | Exit | Time |",
+        "| # | Section | Step | Result | Status | Time |",
         "|---:|---|---|---|---:|---:|",
     ]
     for s in steps:
         mark = "✅" if s["passed"] else "❌"
-        exit_ = s["status"] if s["expected"] == "0" else f"{s['status']} (expected {expected_text(s['expected'])})"
         lines.append(
-            f"| {s['n']} | {md(s['section'])} | {md(s['title'])} | {mark} | {md(exit_)} | {seconds(s['ms'])} |"
+            f"| {s['n']} | {md(s['section'])} | {md(s['title'])} | {mark}"
+            f" | {md(status_text(s))} | {seconds(s['ms'])} |"
         )
     failed = [s for s in steps if not s["passed"]]
     for s in failed:
         lines += [
             "",
             f"<details><summary>❌ {md(s['title'])}</summary>",
+            "",
+            *(f"Missing from the output: `{md(t)}`" for t in s["missing"]),
             "",
             f"<pre>$ {esc(s['command'])}\n\n{esc(s['stdout'][-3000:])}\n{esc(s['stderr'][-3000:])}</pre>",
             "",
