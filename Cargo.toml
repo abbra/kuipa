@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/tang-pqc", "crates/kuipa-enroll", "crates/kuipa-gssapi", "crates/kuipa-ldap", "crates/kuipad", "crates/kuipa-tools", "crates/tang-pqc-clevis", "crates/ml-dsa-blind", "shims/rand"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+native-ossl = "0.3.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tang-pqc = { path = "crates/tang-pqc" }
+ml-dsa-blind = { path = "crates/ml-dsa-blind" }
+tang-pqc-clevis = { path = "crates/tang-pqc-clevis" }
+agirru-crdt = "0.1.2"
+agirru-engine = "0.1.2"
+kuipa-enroll = { path = "crates/kuipa-enroll" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+incompatible_msrv = "deny"
+
+# hickory's DNS client needs a random generator; take it from OpenSSL
+# instead of rand's RustCrypto ChaCha (see shims/rand).
+[patch.crates-io]
+rand = { path = "shims/rand" }
