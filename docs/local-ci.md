@@ -82,6 +82,13 @@ session uses the playground's helpers the way a person would, with
 
 Each step records its command, exit status (checked against the expected
 one), duration, output, trace and the lines the servers logged during it.
+A step can also name text its output must contain: the health check with
+both servers down must report each of them as unreachable, not just fail
+for any reason. A step that runs longer than `KUIPA_STEP_TIMEOUT` seconds
+(default 120) is stopped and fails, and the session goes on, so the
+playground is still torn down and the report still written. The
+playground itself gets `KUIPA_PLAYGROUND_START_TIMEOUT` seconds (default
+120) to start.
 `contrib/ci/playground/report.py` renders them as one self-contained HTML
 file: a summary, an index of the steps and, per step, the command and its
 output, with the trace and the server log in collapsed panels (open for a
@@ -90,10 +97,11 @@ system theme.
 
 The report goes to `kuipa-playground-report.html` in the repository, or
 wherever `KUIPA_PLAYGROUND_REPORT` names. In GitHub Actions the job uploads
-it as the `kuipa-playground-report` artifact and adds the step table to the
-run's Summary tab. The job fails when any step ends with an unexpected exit
-status. To add a step, add a `step EXPECTED "title" 'command'` line to
-`session.sh`, under the `section` it belongs to.
+it as the `kuipa-playground-report` artifact and adds the step table, the
+failed steps' output and a link to the artifact to the run's Summary tab. The job fails when any step ends with an unexpected exit
+status. To add a step, add a `step EXPECTED "title" 'command' ["text"...]` line to
+`session.sh`, under the `section` it belongs to; `EXPECTED` is an exit
+status or `fail` for any non-zero one.
 
 ## Options
 
