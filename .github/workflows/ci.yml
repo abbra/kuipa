@@ -241,6 +241,8 @@ jobs:
     name: Playground Session
     needs: [build]
     runs-on: ubuntu-latest
+    # Steps time out on their own (KUIPA_STEP_TIMEOUT); this bounds the rest.
+    timeout-minutes: 30
     container: quay.io/fedora/fedora:latest
     steps:
       - name: Install native dependencies
@@ -265,12 +267,19 @@ jobs:
       - name: Run a traced playground session
         run: ./contrib/ci/local-ci.sh --no-deps playground-test
       - name: Upload the playground report
+        id: report
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: kuipa-playground-report
           path: kuipa-playground-report.html
           if-no-files-found: warn
+      # The artifact's URL only exists once it is uploaded.
+      - name: Link the report from the summary
+        if: always() && steps.report.outputs.artifact-url != ''
+        env:
+          REPORT_URL: ${{ steps.report.outputs.artifact-url }}
+        run: echo "**[Download the playground report]($REPORT_URL)**" >> "$GITHUB_STEP_SUMMARY"
 
   # ── MSRV ───────────────────────────────────────────────────────────────────
   # Builds with the oldest supported Rust (rust-version in Cargo.toml), which
