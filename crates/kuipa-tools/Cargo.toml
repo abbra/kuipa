@@ -1,0 +1,48 @@
+[package]
+name = "kuipa-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "kuipa client tools for FreeIPA hosts: kuipa, kuipa-unseal and kuipa-voucher"
+
+[dependencies]
+kuipa-enroll.workspace = true
+kuipa-gssapi = { path = "../kuipa-gssapi" }
+native-ossl.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-native-ossl = "0.3.3"
+serde.workspace = true
+serde_json.workspace = true
+synta-certificate = { version = "0.5.1", default-features = false, features = ["std", "derive"] }
+tang-pqc.workspace = true
+# Voucher issuing and blinding (§9).
+ml-dsa-blind.workspace = true
+# DNS SRV discovery, as in akamu; default features only (no DNSSEC or
+# DNS-over-TLS backends, so no ring).
+hickory-resolver = "0.26"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
+
+[dev-dependencies]
+# Test certificates (CA + PKINIT KDC chain), as in kurbu5-pkinit.
+synta = { version = "0.5.1", default-features = false, features = ["std"] }
+synta-certificate = "0.5.1"
+synta-krb5 = "0.5.1"
+kuipad = { path = "../kuipad" }
+tang-pqc-clevis.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
+
+[lints.rust]
+# One documented exception: setting KRB5_CONFIG before any thread starts.
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+incompatible_msrv = "deny"
+
+[[example]]
+name = "kuipa-playground"

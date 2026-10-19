@@ -1,0 +1,312 @@
+//! HTTP transport: `reqwest` over rustls with the `rustls-native-ossl`
+//! provider (OpenSSL, FIPS-capable).
+//!
+//! The protocol does not rely on TLS (§11).  On first contact the client
+//! has no CA yet, so TLS only hides the host name from passive observers;
+//! after enrollment it verifies against the installed IPA CA.
+//!
+//! Errors are classified for the failover rules of §4.6.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use reqwest::StatusCode;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
+
+/// How to authenticate the server's TLS certificate.
+#[derive(Clone, Debug)]
+pub enum Trust {
+    /// First contact: any certificate (the protocol authenticates the
+    /// server through the realm anchor instead).
+    FirstContact,
+    /// The IPA CA chain (DER).
+    Ca(Vec<Vec<u8>>),
+}
+
+/// A transport error, classified for failover.
+#[derive(Debug)]
+pub enum NetError {
+    /// Nothing reached the server's protocol handler (connection refused,
+    /// DNS failure, `503`): safe to try another server.
+    Unreachable(String),
+    /// The request may have been processed (timeout, connection dropped
+    /// after sending): retry the same server only.
+    Unknown(String),
+    /// The server refused (`403`).
+    Refused,
+    /// Anything else.
+    Other(String),
+}
+
+impl std::fmt::Display for NetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(e) => write!(f, "server unreachable: {e}"),
+            Self::Unknown(e) => write!(f, "outcome unknown: {e}"),
+            Self::Refused => f.write_str("the server refused the request"),
+            Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for NetError {}
+
+/// Accepts any server certificate, but still checks handshake signatures.
+#[derive(Debug)]
+struct FirstContact(Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for FirstContact {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Make `rustls-native-ossl` the process-wide rustls provider, so nothing
+/// in the dependency tree falls back to another one.
+fn install_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls_native_ossl::default_provider().install_default();
+    });
+}
+
+fn tls_config(trust: &Trust) -> Result<rustls::ClientConfig, NetError> {
+    let provider = Arc::new(rustls_native_ossl::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| NetError::Other(format!("TLS versions: {e}")))?
+        .dangerous();
+    let config = match trust {
+        Trust::FirstContact => {
+            builder.with_custom_certificate_verifier(Arc::new(FirstContact(provider)))
+        }
+        Trust::Ca(certs) => {
+            let roots: Vec<_> = certs
+                .iter()
+                .map(|c| CertificateDer::from(c.as_slice()))
+                .collect();
+            let verifier = OsslServerCertVerifier::builder(&roots)
+                .map_err(|e| NetError::Other(format!("IPA CA: {e}")))?
+                .build();
+            builder.with_custom_certificate_verifier(Arc::new(verifier))
+        }
+    };
+    Ok(config.with_no_client_auth())
+}
+
+/// Where to reach `server` instead of `https://<server>/`, from
+/// `KUIPA_ENDPOINTS` (`fqdn=target,…`, target as for [`Endpoint::new`]):
+/// for talking to a daemon's socket directly, or to test servers.
+fn endpoint_override(server: &str) -> Option<String> {
+    let map = std::env::var("KUIPA_ENDPOINTS").ok()?;
+    map.split(',')
+        .filter_map(|e| e.split_once('='))
+        .find(|(name, _)| name.trim() == server)
+        .map(|(_, target)| target.trim().to_owned())
+}
+
+/// Is `server` reached over TLS (an FQDN or an `https://` URL)?
+#[must_use]
+pub fn uses_tls(server: &str) -> bool {
+    server.starts_with("https://") || !(server.contains("://") || server.starts_with("unix:"))
+}
+
+/// One server's `/ipa/ku/` endpoint.
+pub struct Endpoint {
+    client: reqwest::blocking::Client,
+    base: String,
+    name: String,
+}
+
+impl Endpoint {
+    /// Connect to `server`: an FQDN (`https://<fqdn>/ipa/ku/`), a URL
+    /// (used as the base, for tests), or `unix:/path` (plain HTTP over a
+    /// Unix socket, talking to the daemon directly).
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Other`] if the client cannot be built.
+    pub fn new(server: &str, trust: &Trust) -> Result<Self, NetError> {
+        let name = server;
+        let server = endpoint_override(server).unwrap_or_else(|| server.to_owned());
+        let server = server.as_str();
+        let mut builder = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60));
+        let base = if let Some(path) = server.strip_prefix("unix:") {
+            builder = builder.unix_socket(path);
+            "http://localhost/ipa/ku/".to_owned()
+        } else if server.contains("://") {
+            format!("{}/ipa/ku/", server.trim_end_matches('/'))
+        } else {
+            format!("https://{server}/ipa/ku/")
+        };
+        // Plain HTTP (tests, the daemon's own socket) never uses the TLS
+        // configuration, so it need not hold a usable CA.
+        let trust = if base.starts_with("https://") {
+            trust
+        } else {
+            &Trust::FirstContact
+        };
+        install_provider();
+        tracing::trace!(
+            server = name,
+            %base,
+            tls = match (base.starts_with("https://"), trust) {
+                (false, _) => "none",
+                (true, Trust::FirstContact) => "first contact: any certificate",
+                (true, Trust::Ca(_)) => "verified against the IPA CA",
+            },
+            "endpoint"
+        );
+        builder = builder.tls_backend_preconfigured(tls_config(trust)?);
+        let client = builder
+            .build()
+            .map_err(|e| NetError::Other(e.to_string()))?;
+        Ok(Self {
+            client,
+            base,
+            name: name.to_owned(),
+        })
+    }
+
+    /// The server as given.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn classify(e: &reqwest::Error) -> NetError {
+        if e.is_connect() || e.is_builder() {
+            NetError::Unreachable(e.to_string())
+        } else {
+            NetError::Unknown(e.to_string())
+        }
+    }
+
+    /// Send `request` and classify the answer, tracing both ends.
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        request: reqwest::blocking::RequestBuilder,
+        sent: usize,
+    ) -> Result<Vec<u8>, NetError> {
+        tracing::debug!(server = %self.name, "{method} {url} ({sent} bytes)");
+        let start = Instant::now();
+        let result = request
+            .send()
+            .map_err(|e| Self::classify(&e))
+            .and_then(Self::finish);
+        let ms = start.elapsed().as_millis();
+        match &result {
+            Ok(body) => {
+                tracing::debug!(server = %self.name, "200 OK: {} bytes in {ms} ms", body.len());
+            }
+            Err(e) => tracing::debug!(server = %self.name, "{method} failed after {ms} ms: {e}"),
+        }
+        result
+    }
+
+    fn finish(response: reqwest::blocking::Response) -> Result<Vec<u8>, NetError> {
+        match response.status() {
+            StatusCode::OK => response
+                .bytes()
+                .map(|b| b.to_vec())
+                .map_err(|e| NetError::Unknown(e.to_string())),
+            StatusCode::FORBIDDEN => Err(NetError::Refused),
+            // Rate limited before anything was processed: like an
+            // unreachable server, another one may be tried.
+            StatusCode::TOO_MANY_REQUESTS => {
+                Err(NetError::Unreachable("rate limited (HTTP 429)".into()))
+            }
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY | StatusCode::NOT_FOUND => {
+                Err(NetError::Unreachable(format!("HTTP {}", response.status())))
+            }
+            s => Err(NetError::Other(format!("unexpected HTTP {s}"))),
+        }
+    }
+
+    /// `GET adv`, asking for a delegation signature by one of `anchors`
+    /// (the pinned ones, in order of preference; at most 16 are sent).
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`].
+    pub fn advertisement(
+        &self,
+        anchors: &[tang_pqc::Thumbprint],
+    ) -> Result<tang_pqc::SignedAdvertisement, NetError> {
+        let query: Vec<String> = anchors
+            .iter()
+            .take(16)
+            .map(|a| format!("anchor={a}"))
+            .collect();
+        let url = if query.is_empty() {
+            format!("{}adv", self.base)
+        } else {
+            format!("{}adv?{}", self.base, query.join("&"))
+        };
+        let body = self.send("GET", &url, self.client.get(&url), 0)?;
+        tang_pqc::SignedAdvertisement::from_json(&body)
+            .map_err(|e| NetError::Unreachable(e.to_string()))
+    }
+
+    /// `POST <path>` with a binary body.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`].
+    pub fn post(&self, path: &str, body: Vec<u8>) -> Result<Vec<u8>, NetError> {
+        let url = format!("{}{path}", self.base);
+        let sent = body.len();
+        let request = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body);
+        self.send("POST", &url, request, sent)
+    }
+}

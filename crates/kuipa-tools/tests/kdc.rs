@@ -1,0 +1,552 @@
+//! Integration tests against a real MIT KDC (skipped when the KDC tools are
+//! not installed).  Everything runs in one test function: the Kerberos
+//! library reads `KRB5_CONFIG` and `KRB5CCNAME` from the environment, which
+//! is set once, before any thread exists.
+//!
+//! Two servers run the daemon's router and its anchor exchange, each with
+//! its own anchor, authenticating their syncs with their `ipa-ku/<fqdn>`
+//! keys.  The directory ([`KdcDirectory`]) accepts GSS-API tokens for real
+//! and gets keys from the KDC; only the LDAP side is simulated.
+
+mod support;
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use kuipa_enroll::EnrollServer;
+use kuipa_enroll::anchors::PeerSync;
+use kuipa_enroll::bundle::{Mode, StageParams};
+use kuipa_enroll::delegation::Delegation;
+use kuipa_enroll::enrollment::{EnrollmentString, Secret};
+use kuipa_enroll::join::{
+    AuthType, KERBEROS_BINDING_LEN, KerberosBinding, Operation, Prepared, Response,
+    kerberos_prf_input,
+};
+use kuipa_enroll::keytab::{Enctype, Keytab};
+use kuipa_enroll::realm::{RealmInfo, ServerKeys, VerifiedRealm};
+use kuipa_enroll::server::parse_stage_result;
+use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred, InitStep};
+use kuipa_tools::flows::{self, Auth, Outcome};
+use kuipa_tools::net::{Endpoint, Trust};
+use kuipa_tools::paths::Paths;
+use kuipad::http::{App, router};
+use kuipad::keystore::KeyStore;
+use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
+use support::directory::KdcDirectory;
+use support::kdc::Realm;
+use tang_pqc::{ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, unix_seconds};
+
+const REALM: &str = "EXAMPLE.TEST";
+const SERVER: &str = "ipa1.example.test";
+const SERVER2: &str = "ipa2.example.test";
+const ADMIN: &str = "admin@EXAMPLE.TEST";
+
+fn set_env(vars: &[(&str, String)]) {
+    for (k, v) in vars {
+        // SAFETY: the only test in this binary, before any thread starts.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
+fn token(cred: &GssClientCred, cb: &[u8]) -> Vec<u8> {
+    match kuipa_gssapi::init_token(cred, &format!("ipa-ku@{SERVER}"), Some(cb)).unwrap() {
+        InitStep::Complete(t) | InitStep::Continue { token: t, .. } => t,
+    }
+}
+
+fn now() -> u64 {
+    unix_seconds(SystemTime::now())
+}
+
+/// Serve the daemon's router on `listener`, and run its anchor exchange.
+fn spawn(listener: std::net::TcpListener, app: Arc<App<Arc<KdcDirectory>>>) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        rt.block_on(async move {
+            if let Some(peers) = app.peers.clone() {
+                tokio::spawn(peers.run());
+            }
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, router(app)).await.unwrap();
+        });
+    });
+}
+
+/// Wait until `done` holds, for at most 60 s.
+fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out: {what}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn root(realm: &Realm, name: &str) -> Paths {
+    let dir = realm.dir.join(format!("root-{name}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    Paths::new(dir)
+}
+
+fn kvnos(path: &Path) -> Vec<u32> {
+    let mut v: Vec<u32> = Keytab::from_mit(&std::fs::read(path).unwrap())
+        .unwrap()
+        .entries()
+        .iter()
+        .map(|e| e.kvno)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn against_a_real_kdc() {
+    let Some(realm) = Realm::start(REALM, "kdc") else {
+        return;
+    };
+    let realm = Arc::new(realm);
+    let admin_ccache = realm.dir.join("admin.ccache");
+    // The daemon listens on a fixed local port chosen before any thread
+    // starts, so KUIPA_ENDPOINTS can map the server's FQDN to it.
+    let listeners = [(); 2].map(|()| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let urls = listeners
+        .each_ref()
+        .map(|l| format!("http://{}", l.local_addr().unwrap()));
+    let mut env = realm.env();
+    env.push(("KRB5CCNAME", format!("FILE:{}", admin_ccache.display())));
+    env.push((
+        "KUIPA_ENDPOINTS",
+        format!("{SERVER}={},{SERVER2}={}", urls[0], urls[1]),
+    ));
+    // The KDC for the armoured exchanges kuipa makes itself.
+    env.push(("KUIPA_KDC", realm.socket.display().to_string()));
+    set_env(&env);
+    realm.add_user(ADMIN, "Admin123");
+
+    // ── GSS-API channel bindings, as the daemon and the client use them ──
+    let svc = realm.dir.join("kuipa.keytab");
+    std::fs::write(&svc, realm.new_keys(&format!("ipa-ku/{SERVER}@{REALM}"))).unwrap();
+    {
+        let probe = realm.dir.join("probe.keytab");
+        std::fs::write(
+            &probe,
+            realm.new_keys("host/probe.example.test@EXAMPLE.TEST"),
+        )
+        .unwrap();
+        let server =
+            GssServerCred::acquire(&format!("ipa-ku@{SERVER}"), svc.to_str().unwrap()).unwrap();
+        let client = GssClientCred::from_keytab_initiate(
+            probe.to_str().unwrap(),
+            "host/probe.example.test@EXAMPLE.TEST",
+        )
+        .unwrap();
+        assert!(matches!(
+            kuipa_gssapi::accept_token(&server, &token(&client, &[1; 32]), Some(&[1; 32])).unwrap(),
+            AcceptStep::Complete { principal, .. } if principal == "host/probe.example.test@EXAMPLE.TEST"
+        ));
+        assert!(
+            kuipa_gssapi::accept_token(&server, &token(&client, &[1; 32]), Some(&[2; 32])).is_err(),
+            "a token bound to another exchange is refused"
+        );
+
+        // One Kerberos message establishes both contexts: the acceptor
+        // derives the initiator's pseudo-random output (§5.1), and nothing
+        // else does.
+        let target = format!("ipa-ku@{SERVER}");
+        let (t, mine) = kuipa_gssapi::init_bound(&client, &target, &[3; 32], b"in", 32).unwrap();
+        let (who, theirs) = kuipa_gssapi::accept_bound(&server, &t, &[3; 32], b"in", 32).unwrap();
+        assert_eq!(who, "host/probe.example.test@EXAMPLE.TEST");
+        assert_eq!(mine, theirs);
+        let (t, mine) = kuipa_gssapi::init_bound(&client, &target, &[3; 32], b"in", 32).unwrap();
+        let (_, other) = kuipa_gssapi::accept_bound(&server, &t, &[3; 32], b"other", 32).unwrap();
+        assert_ne!(mine, other, "the output depends on the input");
+        let (_, again) = kuipa_gssapi::init_bound(&client, &target, &[3; 32], b"in", 32).unwrap();
+        assert_ne!(mine, again, "every context has its own key");
+        // An acceptor with another key cannot accept the token at all.
+        let elsewhere = GssServerCred::acquire(&format!("ipa-ku@{SERVER2}"), svc.to_str().unwrap());
+        if let Ok(elsewhere) = elsewhere {
+            assert!(kuipa_gssapi::accept_bound(&elsewhere, &t, &[3; 32], b"in", 32).is_err());
+        }
+    }
+
+    // ── Two IPA servers, each with its own anchor, realm info with the real CA ──
+    let names = [SERVER, SERVER2];
+    let directory = Arc::new(KdcDirectory::new(realm.clone(), &names, &[ADMIN]));
+    for host in ["web1", "web5"] {
+        directory
+            .otps
+            .lock()
+            .unwrap()
+            .insert(format!("{host}.example.test"), b"Secret123".to_vec());
+    }
+    let mut own_anchors = Vec::new();
+    let mut ipa = Vec::new();
+    for (i, listener) in listeners.into_iter().enumerate() {
+        let (fqdn, other) = (names[i], names[1 - i]);
+        let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let delegation = Delegation::issue(
+            &anchor,
+            REALM,
+            fqdn,
+            signing.public(),
+            now() - 60,
+            now() + 30 * 86400,
+        )
+        .unwrap();
+        let keys = ServerKeys {
+            signing,
+            join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+            escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+            trust: Vec::new(),
+            vouchers: Vec::new(),
+            retired: Vec::new(),
+        };
+        let info = RealmInfo {
+            realm: REALM.into(),
+            domain: "example.test".into(),
+            basedn: "dc=example,dc=test".into(),
+            server: fqdn.into(),
+            servers: names.map(String::from).to_vec(),
+            ca_certs: vec![realm.chain.ca_der.clone()],
+            pkinit_anchors: vec![realm.chain.ca_der.clone()],
+            anchors: vec![*anchor.public().thumbprint()],
+            trusts: Vec::new(),
+        };
+        own_anchors.push(*anchor.public().thumbprint());
+        let server = Arc::new(EnrollServer::new(keys, info, delegation));
+        let key_dir = realm.dir.join(format!("keys-{fqdn}"));
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let settings = Settings {
+            me: fqdn.into(),
+            realm: REALM.into(),
+            peers: vec![other.into()],
+            discover: false,
+            endpoints: [(other.to_owned(), urls[1 - i].clone())].into(),
+            interval: Duration::from_millis(500),
+            ca_certs: vec![realm.chain.ca_der.clone()],
+            vouch_interval: Duration::ZERO,
+        };
+        let initiator = Arc::new(KeytabInitiator::new(
+            realm
+                .dir
+                .join(format!("kuipa-{fqdn}.keytab"))
+                .display()
+                .to_string(),
+            format!("ipa-ku/{fqdn}@{REALM}"),
+        ));
+        let peers = Peers::new(
+            settings,
+            Some(anchor),
+            server.clone(),
+            directory.clone(),
+            initiator,
+            KeyStore::new(key_dir),
+        )
+        .unwrap();
+        spawn(
+            listener,
+            Arc::new(App {
+                server: server.clone(),
+                directory: directory.clone(),
+                peers: Some(peers),
+                limiter: kuipad::limit::Limiter::default(),
+                tang: None,
+            }),
+        );
+        ipa.push(server);
+    }
+
+    // ── Anchor exchange: Kerberos-authenticated syncs, then cosignatures ──
+    wait_for(
+        "both servers trust both anchors and both vouch for both claims",
+        || {
+            ipa.iter()
+                .all(|s| s.anchors().len() == 2 && s.delegation().proof_count() == 2)
+        },
+    );
+    for (i, s) in ipa.iter().enumerate() {
+        assert_eq!(s.anchors()[0], own_anchors[i], "own anchor first");
+        for a in &own_anchors {
+            s.delegation()
+                .verify_at(&[*a], &Policy::default(), now())
+                .unwrap();
+        }
+    }
+    let servers = [SERVER.to_owned()];
+    // Clients pin ipa1's anchor only.
+    let anchors = [own_anchors[0]];
+    let string = |secret: Option<&[u8]>| {
+        EnrollmentString::new(
+            REALM,
+            anchors[0],
+            tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+            secret.map(Secret::new),
+        )
+    };
+
+    // ── OTP enrollment, then key rotation authenticated by the host keys ──
+    // The OTP is also the host's temporary Kerberos key (FreeIPA's host-add
+    // sets it): the host gets a ticket with it and rekeys itself.
+    realm.add_user(&format!("host/web1.example.test@{REALM}"), "Secret123");
+    let a = root(&realm, "web1");
+    let mut s = string(Some(b"Secret123"));
+    let otp = s.take_secret().unwrap();
+    flows::enroll_online(
+        &a,
+        s.realm(),
+        &[*s.anchor()],
+        &Auth::Otp(otp),
+        "web1.example.test",
+        &servers,
+    )
+    .unwrap();
+    let first = kvnos(&a.keytab());
+    assert_eq!(first.len(), 1);
+    let rotated = flows::rotate_keys(&a, None).unwrap();
+    assert_eq!(
+        kvnos(&a.keytab()),
+        vec![first[0], first[0] + 1],
+        "new kvno plus the previous one: {rotated}"
+    );
+    let check = flows::check(&a, None).unwrap();
+    assert_eq!(check["ok"], true, "{check}");
+
+    // ── Keytab protection: rekey with escrow registration, unseal, undo ──
+    flows::protect(&a).unwrap();
+    assert!(
+        std::fs::symlink_metadata(a.keytab())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(flows::unseal(&a).unwrap().kvno(), Some(first[0] + 2));
+    assert_eq!(flows::check(&a, None).unwrap()["ok"], true);
+    flows::unprotect(&a).unwrap();
+    assert!(!a.sealed().exists());
+    flows::rotate_keys(&a, None).unwrap();
+
+    // ── An administrator's existing ticket ──
+    realm.kinit(ADMIN, "Admin123", &admin_ccache, None, None);
+    let b = root(&realm, "web2");
+    flows::enroll_online(
+        &b,
+        REALM,
+        &anchors,
+        &Auth::Ccache,
+        "web2.example.test",
+        &servers,
+    )
+    .unwrap();
+    assert_eq!(kvnos(&b.keytab()).len(), 1);
+
+    // ── 2FA bootstrap: the advertisement's PKINIT anchors give FAST armour ──
+    let boot = realm.dir.join("bootstrap");
+    flows::realm_info(REALM, &anchors, &servers, &boot).unwrap();
+    // The generated krb5.conf names KDCs by FQDN; this KDC is on a socket.
+    let conf = std::fs::read_to_string(boot.join("krb5.conf"))
+        .unwrap()
+        .replace(&format!("{SERVER}:88"), realm.socket.to_str().unwrap());
+    let conf_path = boot.join("krb5-test.conf");
+    std::fs::write(&conf_path, &conf).unwrap();
+    let armor = realm.dir.join("armor.ccache");
+    realm
+        .kinit_anonymous(&armor, &conf_path)
+        .expect("anonymous PKINIT with the advertised anchors");
+    // Without them it fails: the anchors really came from the advertisement.
+    let bare = conf
+        .lines()
+        .filter(|l| !l.contains("pkinit_anchors") && !l.contains("pkinit_pool"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bare_path = boot.join("krb5-no-anchors.conf");
+    std::fs::write(&bare_path, bare).unwrap();
+    assert!(
+        realm
+            .kinit_anonymous(&realm.dir.join("x.ccache"), &bare_path)
+            .is_err()
+    );
+    realm.kinit(
+        ADMIN,
+        "Admin123",
+        &admin_ccache,
+        Some(&armor),
+        Some(&conf_path),
+    );
+
+    // The rekey replaced web1's OTP-derived key: the OTP is spent.
+    assert!(
+        kuipa_gssapi::password_ticket(
+            &conf_path,
+            &format!("host/web1.example.test@{REALM}"),
+            b"Secret123",
+            &format!("ipa-ku/{SERVER}@{REALM}"),
+            "MEMORY:spent-otp",
+        )
+        .is_err()
+    );
+
+    // ── A user's password: an armoured kinit on the host, then Kerberos ──
+    let g = root(&realm, "web6");
+    let password = |p: &[u8]| Auth::Password {
+        principal: "admin".into(),
+        password: Secret::new(p),
+    };
+    let err = flows::enroll_online(
+        &g,
+        REALM,
+        &anchors,
+        &password(b"guess"),
+        "web6.example.test",
+        &servers,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.downcast_ref::<Outcome>(), Some(Outcome::NeedsAdmin(_))),
+        "{err}"
+    );
+    flows::enroll_online(
+        &g,
+        REALM,
+        &anchors,
+        &password(b"Admin123"),
+        "web6.example.test",
+        &servers,
+    )
+    .unwrap();
+    assert_eq!(kvnos(&g.keytab()).len(), 1);
+    let c = root(&realm, "web3");
+    flows::enroll_online(
+        &c,
+        REALM,
+        &anchors,
+        &Auth::Ccache,
+        "web3.example.test",
+        &servers,
+    )
+    .unwrap();
+
+    // ── Offline: prepare, stage (admin ticket), open the bundle, first contact ──
+    let d = root(&realm, "web4");
+    flows::prepare(&d, false, "web4.example.test").unwrap();
+    let recipient =
+        tang_pqc::ExchangeKey::from_jwk_json(&std::fs::read(d.recipient_public()).unwrap())
+            .unwrap();
+    let endpoint = Endpoint::new(SERVER, &Trust::FirstContact).unwrap();
+    let adv = VerifiedRealm::verify(
+        &endpoint.advertisement(&anchors).unwrap(),
+        REALM,
+        &anchors,
+        &Policy::default(),
+        SystemTime::now(),
+    )
+    .unwrap();
+    let admin = GssClientCred::ambient().unwrap();
+    let p = Prepared::new(
+        &adv,
+        Operation::Stage,
+        "web4.example.test",
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (t, derived) = kuipa_gssapi::init_bound(
+        &admin,
+        &format!("ipa-ku@{SERVER}"),
+        &cb,
+        &kerberos_prf_input(&cb),
+        KERBEROS_BINDING_LEN,
+    )
+    .unwrap();
+    let params = StageParams {
+        mode: Mode::MachineKey,
+        recipient: Some(recipient),
+        not_after: now() + 3600,
+    };
+    let (request, pending) = p
+        .with_kerberos(KerberosBinding::new(&derived).unwrap())
+        .seal(&t, &[], &params.to_bytes())
+        .unwrap();
+    let body = endpoint
+        .post(&format!("stage/{}", request.kid()), request.to_bytes())
+        .unwrap();
+    let payload = pending.open(&Response::from_bytes(&body).unwrap()).unwrap();
+    let (bundle, _) = parse_stage_result(payload.as_ref()).unwrap();
+    flows::enroll_bundle(
+        &d,
+        &bundle.to_bytes(),
+        Some(&string(None)),
+        false,
+        Some("web4.example.test"),
+    )
+    .unwrap();
+    let staged = kvnos(&d.keytab());
+    let completed = flows::complete(&d).unwrap();
+    assert!(!d.pending().exists(), "{completed}");
+    assert_eq!(kvnos(&d.keytab()), vec![staged[0], staged[0] + 1]);
+
+    // ── Realm-wide strings: ipa1's anchor, enrollment through ipa2 alone ──
+    let e = root(&realm, "web5");
+    let mut s5 = string(Some(b"Secret123"));
+    let otp = s5.take_secret().unwrap();
+    let result = flows::enroll_online(
+        &e,
+        s5.realm(),
+        &[*s5.anchor()],
+        &Auth::LdapOtp(otp),
+        "web5.example.test",
+        &[SERVER2.to_owned()],
+    )
+    .unwrap();
+    assert_eq!(result["issuer"], SERVER2);
+    let stored = kuipa_tools::paths::read_anchors(&e).unwrap();
+    assert_eq!(
+        stored,
+        [own_anchors[1], own_anchors[0]],
+        "issuer's anchor first"
+    );
+
+    // ── Syncs that do not authenticate their sender are refused ──
+    let post = |sync: &PeerSync| {
+        reqwest::blocking::Client::new()
+            .post(format!("{}/ipa/ku/peer/sync", urls[1]))
+            .body(sync.to_bytes())
+            .send()
+            .unwrap()
+            .status()
+    };
+    let own = ipa[0].delegation().select(&[own_anchors[0]]);
+    let own = Delegation::from_json(own.to_json().as_bytes()).unwrap();
+    let ipa2_key = KeytabInitiator::new(
+        realm
+            .dir
+            .join(format!("kuipa-{SERVER2}.keytab"))
+            .display()
+            .to_string(),
+        format!("ipa-ku/{SERVER2}@{REALM}"),
+    );
+    let cb = PeerSync::channel_binding(SERVER, SERVER2, &own, b"").unwrap();
+    let forged = PeerSync {
+        sender: SERVER.into(),
+        receiver: SERVER2.into(),
+        own: own.clone(),
+        envelope: Vec::new(),
+        token: ipa2_key.token(SERVER2, &cb).unwrap(),
+    };
+    assert_eq!(post(&forged), 403, "a token from another server's key");
+    let garbage = PeerSync {
+        token: b"not a token".to_vec(),
+        ..forged.clone()
+    };
+    assert_eq!(post(&garbage), 403, "no valid token");
+}
