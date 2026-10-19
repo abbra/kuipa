@@ -1,0 +1,15 @@
+[package]
+name = "kuipa-gssapi"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "GSSAPI bindings (from ahdapa-gssapi): accept/init contexts with channel bindings, keytab and S4U2Proxy credentials"
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+thiserror = "2"
+tracing = "0.1"
+
+[build-dependencies]
+pkg-config = "0.3"
