@@ -34,6 +34,11 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       `keytab_loader` (§7.4).
 - [ ] MTC: anchors issued as Merkle Tree Certificates and pre-distributed
       tree heads (§16).
+- [x] Notice a stolen anchor where the host knows only one: done as the
+      anchor epoch log (§4.8) — canonical per-sequence entries signed by
+      the current anchors, a `(sequence, head)` in every advertisement,
+      a public `anchor-log` route, and an `epoch` watermark line in
+      `/etc/ipa/ku-anchors`.
 - [ ] S4U2Proxy with the caller's evidence ticket instead of protocol
       transition (§16).
 
