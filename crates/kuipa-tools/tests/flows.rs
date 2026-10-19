@@ -631,6 +631,8 @@ fn offline_enrollment_from_a_bundle() {
         ca_certs: vec![CA.to_vec()],
         pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
+        epoch_seq: 0,
+        epoch_head: [0; 32],
     };
     let (bundle, _) = Bundle::create(
         &keys,

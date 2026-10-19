@@ -31,6 +31,10 @@ const MEMBER_DELEGATION: &str = "delegation";
 /// Set entries, which Tang takes for advertisement signers.
 const MEMBER_VOUCHERS: &str = "kuipa_vouchers";
 
+/// The head of this server's anchor epoch log (§4.8): what any host
+/// that has looked before must see extended.
+const MEMBER_EPOCH: &str = "epoch";
+
 /// Realm metadata published by every server (§4.3, `"ipa"` member).
 ///
 /// It carries certificates, not just their hashes: a host that is not
@@ -282,6 +286,7 @@ impl ServerKeys {
         delegation: &Delegation,
         iat: u64,
         exp: u64,
+        epoch: Option<(u64, [u8; 32])>,
     ) -> Result<SignedAdvertisement> {
         let signing = [&self.signing];
         let mut builder = AdvertisementBuilder::new(&signing);
@@ -306,6 +311,12 @@ impl ServerKeys {
                 })
                 .collect::<Result<Vec<_>>>()?;
             builder = builder.member(MEMBER_VOUCHERS, keys.into());
+        }
+        if let Some((seq, head)) = epoch {
+            builder = builder.member(
+                MEMBER_EPOCH,
+                serde_json::json!({ "seq": seq, "head": b64::encode(&head) }),
+            );
         }
         Ok(builder
             .member(MEMBER_IPA, info.to_value())
@@ -386,6 +397,7 @@ pub struct VerifiedRealm {
     info: RealmInfo,
     delegation: VerifiedDelegation,
     adv: Advertisement,
+    epoch: Option<(u64, [u8; 32])>,
 }
 
 impl VerifiedRealm {
@@ -425,10 +437,22 @@ impl VerifiedRealm {
         if info.realm != delegation.realm || info.server != delegation.server {
             return Err(Error::Mismatch("server identity"));
         }
+        // The epoch head is advisory here: an older server names none,
+        // and a mismatch with what the client stored is the flow's
+        // discovery, not a reason to reject this advertisement.
+        let epoch = adv.member(MEMBER_EPOCH).and_then(|v| {
+            let seq = v.get("seq")?.as_u64()?;
+            let head = b64::decode(v.get("head")?.as_str()?).ok()?;
+            <[u8; 32]>::try_from(head.as_slice())
+                .ok()
+                .filter(|_| seq > 0)
+                .map(|h| (seq, h))
+        });
         Ok(Self {
             info,
             delegation,
             adv,
+            epoch,
         })
     }
 
@@ -468,6 +492,13 @@ impl VerifiedRealm {
     #[must_use]
     pub fn succeeded(&self) -> &[(Thumbprint, Thumbprint)] {
         &self.delegation.succeeded
+    }
+
+    /// The head of the server's anchor epoch log, if it named one
+    /// (§4.8).
+    #[must_use]
+    pub fn epoch(&self) -> Option<(u64, [u8; 32])> {
+        self.epoch
     }
 
     /// When the delegation's claim expires (Unix seconds).
@@ -728,7 +759,7 @@ pub(crate) mod tests {
     impl TestRealm {
         pub(crate) fn signed(&self) -> SignedAdvertisement {
             self.keys
-                .advertisement(&self.info, &self.delegation, now() - 10, now() + 3600)
+                .advertisement(&self.info, &self.delegation, now() - 10, now() + 3600, None)
                 .unwrap()
         }
     }

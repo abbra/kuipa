@@ -486,6 +486,8 @@ mod tests {
             ca_certs: vec![b"ca".to_vec()],
             pkinit_anchors: Vec::new(),
             anchors: Vec::new(),
+            epoch_seq: 0,
+            epoch_head: [0; 32],
         }
     }
 
@@ -533,7 +535,7 @@ mod tests {
                 trusts: Vec::new(),
             };
             let adv = keys
-                .advertisement(&info, &delegation, now(), now() + 3600)
+                .advertisement(&info, &delegation, now(), now() + 3600, None)
                 .unwrap()
                 .to_json();
             let machine = ExchangeKeyPair::generate(kem).unwrap();

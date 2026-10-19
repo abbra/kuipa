@@ -14,6 +14,7 @@ use tang_pqc::{RecoveryResponse, SignedAdvertisement, Thumbprint, unix_seconds};
 
 use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::Delegation;
+use crate::epoch::{MAX_EPOCH_FETCH, SignedEpoch};
 use crate::error::Error;
 use crate::escrow::{self, EscrowRequest};
 use crate::join::{AuthType, KerberosBinding, Operation, Request, Response, channel_binding};
@@ -343,6 +344,15 @@ impl From<Error> for Refusal {
 /// Default advertisement validity (7 days), re-signed at half life.
 pub const ADVERTISEMENT_VALIDITY: u64 = 7 * 24 * 3600;
 
+/// Cache key of a signed advertisement: the anchor whose proof it
+/// carries, the anchor its succession chain starts from, and the epoch
+/// head it names (§4.8).
+type AdvKey = (
+    Option<Thumbprint>,
+    Option<Thumbprint>,
+    Option<(u64, [u8; 32])>,
+);
+
 /// What the anchor exchange decides (§4.2): this server's delegation, with
 /// every trusted anchor's signature, and the trusted anchors.
 #[derive(Clone, Debug)]
@@ -351,9 +361,12 @@ struct Published {
     anchors: Vec<Thumbprint>,
     /// Trusted realms (§17).
     trusts: Vec<TrustedRealm>,
-    /// Signed advertisements by the anchor whose proof they carry and the
-    /// anchor their chain of successions starts from, if any.
-    advertisements: HashMap<(Option<Thumbprint>, Option<Thumbprint>), (SignedAdvertisement, u64)>,
+    /// The anchor epoch log (§4.8), oldest first.
+    epoch: Vec<SignedEpoch>,
+    /// Signed advertisements by the anchor whose proof they carry, the
+    /// anchor their chain of successions starts from, and the epoch head
+    /// they name.
+    advertisements: HashMap<AdvKey, (SignedAdvertisement, u64)>,
 }
 
 /// One IPA server.
@@ -380,6 +393,7 @@ impl EnrollServer {
                 anchors,
                 trusts,
                 advertisements: HashMap::new(),
+                epoch: Vec::new(),
             }),
         }
     }
@@ -418,6 +432,42 @@ impl EnrollServer {
             .unwrap_or_else(PoisonError::into_inner)
             .trusts
             .clone()
+    }
+
+    /// Replace the anchor epoch log (§4.8): the whole chain, oldest
+    /// first, as maintained by the anchor exchange.
+    pub fn publish_epoch(&self, chain: Vec<SignedEpoch>) {
+        let mut p = self
+            .published
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if p.epoch != chain {
+            p.epoch = chain;
+            p.advertisements.clear();
+        }
+    }
+
+    /// The head of this server's anchor epoch log, if it has one.
+    #[must_use]
+    pub fn epoch_head(&self) -> Option<(u64, [u8; 32])> {
+        self.published()
+            .epoch
+            .last()
+            .and_then(|e| e.statement().ok())
+            .and_then(|s| Some((s.seq(), s.head().ok()?)))
+    }
+
+    /// The chain entries after sequence number `from`, at most
+    /// [`MAX_EPOCH_FETCH`]: the answer to `GET anchor-log` (§4.8).
+    #[must_use]
+    pub fn epoch_log(&self, from: u64) -> Vec<SignedEpoch> {
+        let p = self.published();
+        p.epoch
+            .iter()
+            .skip_while(|e| e.statement().is_ok_and(|s| s.seq() <= from))
+            .take(MAX_EPOCH_FETCH)
+            .cloned()
+            .collect()
     }
 
     /// The current delegation, with every signature.
@@ -463,6 +513,11 @@ impl EnrollServer {
     pub fn advertisement(&self, wanted: &[Thumbprint]) -> crate::Result<SignedAdvertisement> {
         let now = unix_seconds(SystemTime::now());
         let published = self.published();
+        let epoch = published
+            .epoch
+            .last()
+            .and_then(|e| e.statement().ok())
+            .and_then(|s| Some((s.seq(), s.head().ok()?)));
         let delegation = published.delegation.select(wanted);
         let signer = (
             delegation
@@ -474,6 +529,7 @@ impl EnrollServer {
                 .first()
                 .and_then(|s| s.statement().ok())
                 .map(|s| s.old),
+            epoch,
         );
         if let Some((adv, iat)) = published.advertisements.get(&signer)
             && now.saturating_sub(*iat) < ADVERTISEMENT_VALIDITY / 2
@@ -485,9 +541,13 @@ impl EnrollServer {
             trusts: published.trusts.clone(),
             ..self.info.clone()
         };
-        let adv = self
-            .keys
-            .advertisement(&info, &delegation, now, now + ADVERTISEMENT_VALIDITY)?;
+        let adv = self.keys.advertisement(
+            &info,
+            &delegation,
+            now,
+            now + ADVERTISEMENT_VALIDITY,
+            epoch,
+        )?;
         let mut p = self
             .published
             .write()
@@ -495,6 +555,7 @@ impl EnrollServer {
         if p.delegation == published.delegation
             && p.anchors == published.anchors
             && p.trusts == published.trusts
+            && p.epoch == published.epoch
         {
             p.advertisements.insert(signer, (adv.clone(), now));
         }
@@ -614,6 +675,7 @@ impl EnrollServer {
 
     fn enrollment(&self, keytab: Keytab, directory: &dyn Directory) -> Result<Enrollment, Refusal> {
         let anchors = self.anchors();
+        let epoch = self.epoch_head();
         Ok(Enrollment {
             config: RealmConfig {
                 realm: self.info.realm.clone(),
@@ -626,6 +688,8 @@ impl EnrollServer {
             ca_certs: directory.ca_certificates().map_err(Refusal)?,
             pkinit_anchors: self.info.pkinit_anchors.clone(),
             anchors,
+            epoch_seq: epoch.map_or(0, |(seq, _)| seq),
+            epoch_head: epoch.map_or([0; 32], |(_, head)| head),
         })
     }
 
