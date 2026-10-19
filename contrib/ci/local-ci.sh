@@ -423,18 +423,23 @@ pg_start() {
     PG_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
     PG_WORK="$(mktemp -d /tmp/kuipa-playground.XXXXXXXXXX)"
     PG_ENV="$PG_WORK/env.sh" PG_LOG="$PG_WORK/servers.log"
-    # The servers run in the background; they write the env file when ready.
+    # The servers run in the background; they write the env file when
+    # ready, which takes a few seconds (two realms, keys, the anchor
+    # exchange) and longer on a slow runner.
+    local wait="${KUIPA_PLAYGROUND_START_TIMEOUT:-120}"
     "$PG_BIN/examples/kuipa-playground" run --env-file "$PG_ENV" --hosts "$hosts" >"$PG_LOG" 2>&1 </dev/null &
     PG_PID=$!
-    for _ in $(seq 1 100); do
-        [[ -f "$PG_ENV" ]] && break
+    local deadline=$((SECONDS + wait))
+    while [[ ! -f "$PG_ENV" && $SECONDS -lt $deadline ]]; do
         kill -0 "$PG_PID" 2>/dev/null || break
         sleep 0.1
     done
     if [[ ! -f "$PG_ENV" ]]; then
         cat "$PG_LOG" 2>/dev/null || true
+        local why="exited"
+        kill -0 "$PG_PID" 2>/dev/null && why="was not ready after ${wait}s (KUIPA_PLAYGROUND_START_TIMEOUT)"
         pg_stop
-        fail "the playground did not start; see the log above"
+        fail "the playground $why; see the log above"
         return 1
     fi
 }
@@ -652,6 +657,9 @@ Environment:
   KUIPA_KEEP_REALM   Keep the kdc-test realm's files (/tmp/kuipa-kdc-<pid>).
   KUIPA_PLAYGROUND_REPORT  Where playground-test writes its HTML report
                       (default: kuipa-playground-report.html in the repository).
+  KUIPA_PLAYGROUND_START_TIMEOUT  Seconds to wait for the playground to start
+                      (interactive, playground-test; default 120).
+  KUIPA_STEP_TIMEOUT  Seconds each playground-test step may take (default 120).
 
 Examples:
   $(basename "$0") all
