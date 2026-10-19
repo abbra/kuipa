@@ -1,0 +1,33 @@
+[package]
+name = "kuipad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "kuipa server daemon: serves /ipa/ku/ behind httpd, talks to 389-ds over LDAPI"
+
+[dependencies]
+agirru-crdt.workspace = true
+agirru-engine.workspace = true
+kuipa-enroll.workspace = true
+kuipa-gssapi = { path = "../kuipa-gssapi" }
+kuipa-ldap = { path = "../kuipa-ldap" }
+native-ossl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+synta = { version = "0.5.1", default-features = false, features = ["std"] }
+synta-certificate = { version = "0.5.1", default-features = false, features = ["std", "derive"] }
+tang-pqc.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-native-ossl = "0.3.3"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+listenfd = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+incompatible_msrv = "deny"
