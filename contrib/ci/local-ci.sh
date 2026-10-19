@@ -410,6 +410,42 @@ See docs/local-ci.md for a walkthrough.
 EOF
 }
 
+# The realm behind 'interactive'.  pg_start
+# builds the binaries and starts it in the background; pg_stop tears it
+# down.  Globals, because cleanup also runs from the INT/TERM trap.
+PG_WORK="" PG_PID="" PG_ENV="" PG_LOG="" PG_BIN=""
+
+pg_start() {
+    local hosts="$1"
+    cargo build -p kuipa-tools -p tang-pqc-clevis --bins --example kuipa-playground || return 1
+    PG_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
+    PG_WORK="$(mktemp -d /tmp/kuipa-playground.XXXXXXXXXX)"
+    PG_ENV="$PG_WORK/env.sh" PG_LOG="$PG_WORK/servers.log"
+    # The servers run in the background; they write the env file when ready.
+    "$PG_BIN/examples/kuipa-playground" run --env-file "$PG_ENV" --hosts "$hosts" >"$PG_LOG" 2>&1 </dev/null &
+    PG_PID=$!
+    for _ in $(seq 1 100); do
+        [[ -f "$PG_ENV" ]] && break
+        kill -0 "$PG_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [[ ! -f "$PG_ENV" ]]; then
+        cat "$PG_LOG" 2>/dev/null || true
+        pg_stop
+        fail "the playground did not start; see the log above"
+        return 1
+    fi
+}
+
+pg_stop() {
+    if [[ -n "$PG_PID" ]]; then
+        kill "$PG_PID" 2>/dev/null || true
+        wait "$PG_PID" 2>/dev/null || true
+    fi
+    [[ -n "$PG_WORK" ]] && rm -rf "$PG_WORK"
+    PG_PID="" PG_WORK=""
+}
+
 run_interactive_playground() {
     require_cargo || return 1
     if [[ $has_krb5kdc -eq 0 ]]; then
@@ -428,51 +464,21 @@ run_interactive_playground() {
     done
 
     step "[interactive] building kuipa, kuipa-unseal and the playground"
-    cargo build -p kuipa-tools -p tang-pqc-clevis --bins --example kuipa-playground || return 1
-    local bin="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
-
-    # Cleanup runs explicitly at every exit point (the function's locals are
-    # gone by the time a script-level EXIT trap would fire); INT/TERM are
-    # trapped for signals that arrive while the playground is starting.
-    local work="" pg_pid="" cleaned=0
-    playground_cleanup() {
-        [[ "$cleaned" == 1 ]] && return
-        cleaned=1
-        echo
-        echo "Tearing down the playground…"
-        [[ -n "$pg_pid" ]] && { kill "$pg_pid" 2>/dev/null || true; wait "$pg_pid" 2>/dev/null || true; }
-        [[ -n "$work" ]] && rm -rf "$work"
-    }
-    trap playground_cleanup INT TERM
-
-    work="$(mktemp -d /tmp/kuipa-playground.XXXXXXXXXX)"
-    local env_file="$work/env.sh" log="$work/servers.log"
-    # The servers run in the background; the shell below owns the terminal.
-    "$bin/examples/kuipa-playground" run --env-file "$env_file" --hosts "$hosts" >"$log" 2>&1 </dev/null &
-    pg_pid=$!
-    for _ in $(seq 1 100); do
-        [[ -f "$env_file" ]] && break
-        kill -0 "$pg_pid" 2>/dev/null || break
-        sleep 0.1
-    done
-    if [[ ! -f "$env_file" ]]; then
-        cat "$log" 2>/dev/null || true
-        playground_cleanup
-        fail "the playground did not start; see the log above"
-        return 1
-    fi
+    trap 'echo; echo "Tearing down the playground…"; pg_stop; exit 130' INT TERM
+    pg_start "$hosts" || return 1
+    local bin="$PG_BIN"
 
     {
         echo '[ -f ~/.bashrc ] && . ~/.bashrc'
-        echo ". '$env_file'"
+        echo ". '$PG_ENV'"
         echo "export PATH='$bin:$bin/examples':\"\$PATH\""
-        echo "export PQ_SERVER_LOG='$log'"
+        echo "export PQ_SERVER_LOG='$PG_LOG'"
         echo 'pq_log() { tail -n "${1:-20}" "$PQ_SERVER_LOG"; }'
         echo 'pq_host web1'
-    } >"$work/rc"
+    } >"$PG_WORK/rc"
 
     # shellcheck disable=SC1090
-    source "$env_file"
+    source "$PG_ENV"
     echo
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BOLD}kuipa playground ready${NC}"
@@ -499,9 +505,11 @@ run_interactive_playground() {
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo
 
-    bash --rcfile "$work/rc" -i || true
+    bash --rcfile "$PG_WORK/rc" -i || true
 
-    playground_cleanup
+    echo
+    echo "Tearing down the playground…"
+    pg_stop
     trap - INT TERM
 }
 
