@@ -32,60 +32,88 @@ use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
 use kuipa_enroll::voucher::{Claims, Voucher};
 use kuipa_tools::paths::Error;
 use kuipa_tools::voucher;
 use native_ossl::util::SecretBuf;
 use tang_pqc::{SignatureAlg, b64, unix_seconds};
 
-const USAGE: &str = "usage: kuipa-voucher {keygen|quota|sign|request|finish|show} [options]";
-
-const VALUED: &[&str] = &[
-    "key",
-    "alg",
-    "quota",
-    "limit",
-    "public",
-    "realm",
-    "fqdn",
-    "hostgroup",
-    "days",
-    "binding",
-    "state",
-];
-
-struct Args {
-    command: String,
-    options: Vec<(String, String)>,
+#[derive(Parser)]
+#[command(
+    about = "Issue enrollment vouchers with blind signatures.",
+    after_help = "--binding is what `kuipa voucher-key` printed on the host: the \
+voucher then works only with that host's ephemeral key.  Without it the voucher \
+is a bearer credential until used.  Exit status: 0 success, 1 error, 2 usage."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-impl Args {
-    fn parse() -> Result<Self, String> {
-        let mut it = std::env::args().skip(1);
-        let command = it.next().ok_or(USAGE)?;
-        let mut options = Vec::new();
-        while let Some(arg) = it.next() {
-            let name = arg
-                .strip_prefix("--")
-                .filter(|n| VALUED.contains(n))
-                .ok_or_else(|| format!("unexpected argument {arg:?}\n{USAGE}"))?;
-            let value = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
-            options.push((name.to_owned(), value));
-        }
-        Ok(Self { command, options })
-    }
-
-    fn get(&self, name: &str) -> Option<&str> {
-        self.options
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
-    }
-
-    fn need(&self, name: &str) -> Result<&str, Error> {
-        self.get(name)
-            .ok_or_else(|| format!("--{name} is required").into())
-    }
+#[derive(Subcommand)]
+enum Command {
+    /// Write a new voucher key and print its public JWK, for kuipad's
+    /// add-voucher-key.
+    Keygen {
+        /// Key file to write.
+        #[arg(long, value_name = "FILE")]
+        key: String,
+        /// Signature algorithm: ml-dsa-44, ml-dsa-65 or ml-dsa-87.
+        #[arg(long, value_name = "ALG", default_value = "ml-dsa-65")]
+        alg: String,
+    },
+    /// Set how many vouchers may be issued in all.
+    Quota {
+        /// Quota file to update.
+        #[arg(long, value_name = "FILE")]
+        quota: String,
+        /// Maximum number of vouchers.
+        #[arg(long, value_name = "N")]
+        limit: String,
+    },
+    /// Sign the blinded request on standard input; print the response.
+    Sign {
+        /// The voucher key.
+        #[arg(long, value_name = "FILE")]
+        key: String,
+        /// The quota file to count against.
+        #[arg(long, value_name = "FILE")]
+        quota: String,
+    },
+    /// Blind a voucher for a host; print the request for `sign`.
+    Request {
+        /// The issuer's public JWK (printed by `keygen`).
+        #[arg(long, value_name = "FILE")]
+        public: String,
+        /// The realm the voucher admits a host to.
+        #[arg(long, value_name = "REALM")]
+        realm: String,
+        /// The host the voucher admits.
+        #[arg(long, value_name = "FQDN")]
+        fqdn: String,
+        /// Only hosts of this IPA host group.
+        #[arg(long, value_name = "GROUP")]
+        hostgroup: Option<String>,
+        /// Days the voucher is valid from now.
+        #[arg(long, value_name = "N", default_value = "7")]
+        days: String,
+        /// Binding from `kuipa voucher-key`, base64.
+        #[arg(long, value_name = "BASE64")]
+        binding: Option<String>,
+        /// State file `finish` needs: the unblinding is kept there, not
+        /// on the issuer.
+        #[arg(long, value_name = "FILE")]
+        state: String,
+    },
+    /// Unblind the response on standard input; print the voucher.
+    Finish {
+        /// The state file written by `request`.
+        #[arg(long, value_name = "FILE")]
+        state: String,
+    },
+    /// Print the claims of the voucher on standard input, as JSON.
+    Show,
 }
 
 fn stdin() -> Result<SecretBuf, Error> {
@@ -107,51 +135,53 @@ fn alg(name: &str) -> Result<SignatureAlg, Error> {
     }
 }
 
-fn run(args: &Args) -> Result<(), Error> {
-    match args.command.as_str() {
-        "keygen" => {
-            let alg = alg(args.get("alg").unwrap_or("ml-dsa-65"))?;
-            println!("{}", voucher::keygen(Path::new(args.need("key")?), alg)?);
+fn run(command: Command) -> Result<(), Error> {
+    match command {
+        Command::Keygen { key, alg: name } => {
+            let alg = alg(&name)?;
+            println!("{}", voucher::keygen(Path::new(&key), alg)?);
         }
-        "quota" => {
-            let q =
-                voucher::set_quota(Path::new(args.need("quota")?), args.need("limit")?.parse()?)?;
+        Command::Quota { quota, limit } => {
+            let q = voucher::set_quota(Path::new(&quota), limit.parse()?)?;
             println!("{} of {} issued", q.issued, q.limit);
         }
-        "sign" => {
-            let response = voucher::sign(
-                Path::new(args.need("key")?),
-                Path::new(args.need("quota")?),
-                &stdin_text()?,
-            )?;
+        Command::Sign { key, quota } => {
+            let response = voucher::sign(Path::new(&key), Path::new(&quota), &stdin_text()?)?;
             println!("{response}");
         }
-        "request" => {
-            let days: u64 = args.get("days").unwrap_or("7").parse()?;
-            let binding = match args.get("binding") {
-                Some(b) => b64::decode(b)?
+        Command::Request {
+            public,
+            realm,
+            fqdn,
+            hostgroup,
+            days,
+            binding,
+            state,
+        } => {
+            let days: u64 = days.parse()?;
+            let binding = match binding {
+                Some(b) => b64::decode(&b)?
                     .try_into()
                     .map_err(|_| "--binding is not a binding")?,
                 None => [0; 32],
             };
             let now = unix_seconds(std::time::SystemTime::now());
             let claims = Claims {
-                realm: args.need("realm")?.to_owned(),
-                fqdn: args.need("fqdn")?.to_ascii_lowercase(),
-                hostgroup: args.get("hostgroup").unwrap_or_default().to_owned(),
+                realm,
+                fqdn: fqdn.to_ascii_lowercase(),
+                hostgroup: hostgroup.unwrap_or_default(),
                 not_before: now.saturating_sub(300),
                 not_after: now + days * 86400,
                 binding,
             };
-            let public = std::fs::read(args.need("public")?)?;
-            let request = voucher::request(&public, &claims, Path::new(args.need("state")?))?;
+            let request = voucher::request(&std::fs::read(&public)?, &claims, Path::new(&state))?;
             println!("{request}");
         }
-        "finish" => {
-            let v = voucher::finish(Path::new(args.need("state")?), &stdin_text()?)?;
+        Command::Finish { state } => {
+            let v = voucher::finish(Path::new(&state), &stdin_text()?)?;
             println!("{}", String::from_utf8_lossy(v.encode().as_ref()));
         }
-        "show" => {
+        Command::Show => {
             let v = Voucher::parse(stdin()?.as_ref())?;
             let c = v.claims();
             println!(
@@ -167,20 +197,13 @@ fn run(args: &Args) -> Result<(), Error> {
                 })
             );
         }
-        other => return Err(format!("unknown command {other:?}\n{USAGE}").into()),
     }
     Ok(())
 }
 
 fn main() -> ExitCode {
-    let args = match Args::parse() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("kuipa-voucher: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    match run(&args) {
+    let cli = Cli::parse();
+    match run(cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kuipa-voucher: {e}");
