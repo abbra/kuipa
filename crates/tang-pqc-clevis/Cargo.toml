@@ -1,0 +1,32 @@
+[package]
+name = "tang-pqc-clevis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Post-quantum Tang (tang-pqc) client and Clevis pin"
+
+[[bin]]
+name = "tang-pqc"
+path = "src/main.rs"
+
+[dependencies]
+native-ossl.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-native-ossl = "0.3.3"
+serde.workspace = true
+serde_json.workspace = true
+synta-certificate = { version = "0.5.1", default-features = false, features = ["std", "derive"] }
+tang-pqc.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+incompatible_msrv = "deny"
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
