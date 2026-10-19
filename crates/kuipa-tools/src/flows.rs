@@ -1131,6 +1131,152 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
     )
 }
 
+/// `kuipa advertisement`: what each server of `deployment` advertises,
+/// verified against `anchors` as enrollment verifies (§4.4, §4.6), and the
+/// anchor log behind the head the advertisement names: the landmark chain
+/// (§4.8). Reads and verifies; writes nothing.  Like `enroll` before the
+/// first enrollment, the transport is trust-on-first-use: what is
+/// believed comes from the anchors, not the server certificate.
+#[must_use]
+pub fn advertisements(realm: &str, anchors: &[Thumbprint], deployment: &Deployment) -> Value {
+    let trust = Trust::FirstContact;
+    let mut servers = Vec::new();
+    for server in &deployment.servers {
+        let detail =
+            match verified(server, &trust, realm, anchors, None).and_then(|(endpoint, adv, _)| {
+                adv.check_deployment(deployment)
+                    .map(|()| (endpoint, adv))
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok((endpoint, adv)) => {
+                    advertisement_detail(server, &endpoint, &adv, realm, anchors)
+                }
+                Err(e) => Err(e),
+            };
+        match detail {
+            Ok(value) => servers.push(value),
+            Err(e) => servers.push(json!({ "server": server, "ok": false, "error": e })),
+        }
+    }
+    json!({
+        "ok": servers.iter().all(|s| s["ok"] == Value::Bool(true)),
+        "servers": servers,
+    })
+}
+
+/// One server's verified advertisement as the user can see it.
+fn advertisement_detail(
+    server: &str,
+    endpoint: &Endpoint,
+    adv: &VerifiedRealm,
+    realm: &str,
+    anchors: &[Thumbprint],
+) -> Result<Value, String> {
+    let landmarks = landmark_chain(endpoint, adv, realm, anchors)?;
+    let info = adv.info();
+    let now = unix_seconds(now());
+    let kid = |k: Result<&tang_pqc::ExchangeKey, _>| {
+        k.map_or_else(|_| "-".into(), |k| k.kid().to_string())
+    };
+    Ok(json!({
+        "server": server,
+        "ok": true,
+        "realm": info.realm,
+        "domain": info.domain,
+        "kdcs": info.servers,
+        "signer": adv.signer().to_string(),
+        "proven_by": adv.anchor().to_string(),
+        "delegation_days_left": adv.delegation_expires().saturating_sub(now) / 86400,
+        "vouch_hours_left": adv.vouched_until().saturating_sub(now) / 3600,
+        "rotated_anchors": adv
+            .succeeded()
+            .iter()
+            .map(|(old, new)| format!("{old} -> {new}"))
+            .collect::<Vec<_>>(),
+        "join_key": kid(adv.join_key()),
+        "escrow_key": kid(adv.escrow_key()),
+        "ca_certs": info.ca_certs.len(),
+        "pkinit_anchors": info.pkinit_anchors.len(),
+        "anchors": info
+            .anchors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "trusts": info
+            .trusts
+            .iter()
+            .map(|t| t.realm.as_str())
+            .collect::<Vec<_>>(),
+        // §4.8: the head the advertisement names, in the `epoch` line's
+        // `<seq> <hash>` form.
+        "anchor_log_head": adv
+            .epoch()
+            .map_or_else(String::new, |(seq, head)| format!("{seq} {}", Thumbprint::from_bytes(head))),
+        "landmarks": landmarks,
+    }))
+}
+
+/// Fetch and verify the whole anchor log behind the advertised head,
+/// page by page from the first entry (§4.8): every entry is a landmark —
+/// the realm's anchors and successions at that sequence, committed by its
+/// head to the one before it. Verified from `anchors` alone, the way a
+/// fetched continuation is verified in §4.8; a log that does not end at
+/// the advertised head is a fork or a server left behind.
+fn landmark_chain(
+    endpoint: &Endpoint,
+    adv: &VerifiedRealm,
+    realm: &str,
+    anchors: &[Thumbprint],
+) -> Result<Vec<Value>, String> {
+    let Some((head_seq, head)) = adv.epoch() else {
+        return Ok(Vec::new());
+    };
+    let policy = Policy::default();
+    let mut out = Vec::new();
+    let mut reached: Option<(u64, [u8; 32])> = None;
+    while reached != Some((head_seq, head)) {
+        let page = endpoint
+            .anchor_log(reached.map_or(0, |(seq, _)| seq))
+            .map_err(|e| e.to_string())?;
+        if page.is_empty() {
+            return Err(format!(
+                "its anchor log ends at sequence {}, not the {head_seq} its advertisement names",
+                reached.map_or(0, |(seq, _)| seq),
+            ));
+        }
+        reached = Some(verify_chain(&page, realm, anchors, reached, &policy)?);
+        for signed in &page {
+            let epoch = signed
+                .statement()
+                .map_err(|_| "the anchor log is malformed".to_string())?;
+            out.push(json!({
+                "seq": epoch.seq(),
+                "head": Thumbprint::from_bytes(
+                    epoch.head().map_err(|_| "cannot hash the anchor log".to_string())?,
+                )
+                .to_string(),
+                "prev": Thumbprint::from_bytes(epoch.prev()).to_string(),
+                "anchors": epoch
+                    .anchors()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "successions": epoch
+                    .successions()
+                    .iter()
+                    .map(|s| {
+                        let st = s.statement().map_err(
+                            |_| "a succession in the anchor log is malformed".to_string(),
+                        )?;
+                        Ok(format!("{} -> {}", st.old, st.new))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            }));
+        }
+    }
+    Ok(out)
+}
+
 /// `kuipa realm-info`: verify the realm through the first usable server
 /// and write what Kerberos needs before enrollment into `dir`: a
 /// `krb5.conf`, the PKINIT anchors and the IPA CA.  `ipa-client-install`
