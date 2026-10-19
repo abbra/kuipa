@@ -231,6 +231,47 @@ jobs:
       - name: Run the client flows against a real KDC
         run: ./contrib/ci/local-ci.sh --no-deps kdc-test
 
+  # ── Playground session ─────────────────────────────────────────────────────
+  # Starts the interactive playground (two realms, two IPA servers), runs a
+  # scripted session through its helpers with KUIPA_TRACE on, and renders
+  # every step's command, output, trace and server log as an HTML report.
+  # The step table also goes to this run's Summary tab; the uploaded
+  # artifact has the full report.
+  playground-test:
+    name: Playground Session
+    needs: [build]
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES $KDC_TEST_PACKAGES python3
+      - uses: actions/checkout@v7
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v1-
+      - name: Run a traced playground session
+        run: ./contrib/ci/local-ci.sh --no-deps playground-test
+      - name: Upload the playground report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kuipa-playground-report
+          path: kuipa-playground-report.html
+          if-no-files-found: warn
+
   # ── MSRV ───────────────────────────────────────────────────────────────────
   # Builds with the oldest supported Rust (rust-version in Cargo.toml), which
   # catches language features clippy's incompatible_msrv lint cannot.
