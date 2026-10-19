@@ -408,7 +408,16 @@ an expired string makes an honest host refuse them.
 Enrollments without a secret in the string (a user's password, a ticket, a
 voucher) and `realm-info` can take `--realm R` instead: the advertisement is
 then verified against the anchors pre-provisioned in `/etc/ipa/ku-anchors`
-(an image, configuration management; any one of them suffices). Such pins
+(an image, configuration management). Listing two or more changes what the
+host demands: the claim must be provable by two distinct listed anchors,
+each asked for its own proof (`?anchor=`, §4.3), and pins that resolve
+through a succession to the same current key count once. That is the
+second anchor's purpose: a realm whose anchors exchanged (§4.3) answers
+for both, a host vouched by a single key — a stolen one included —
+answers with one, and the theft surfaces as a refusal (§4.7, §13). A
+realm with one anchor server is pinned with exactly one anchor; a second
+pin there only breaks enrollment. Enrolled hosts' stored lists (§4.5)
+meet the same rule on rekeys and checks. Such pins
 should carry an expiry for the same reason (`<thumbprint> <expiry>` per
 line, §10.2); lists written from server responses carry none, since every
 rekey refreshes them. There is still no trust on first use: without a
@@ -547,11 +556,82 @@ verified only through a succession.
 * A succession is a hand-over, not a revocation. Whoever stole the old
   anchor's key before the rotation can still vouch with it, and sign a
   conflicting succession.
+* Two known anchors are what make a stolen one visible (§4.4). A host
+  that pins only that anchor cannot tell its thief from the realm; a
+  realm with one anchor server can offer no second proof, so keep at
+  least two anchor servers, or pin only one and keep watching what
+  the realm serves (§4.8).
 * Flows with a Kerberos root (§5.3) are still protected.
 * Anchor-only flows are bounded by the expiry of the string or pin they
   start from (§4.4): `--ldap-otp`, vouchers, bundles, and `--use-ccache`
   with IdP or passkey tickets.
 * There is no revocation list.
+
+### 4.8 The anchor epoch log
+
+§4.4 notices a replaced anchor only when two anchors are known at the
+same moment. This needs only one known anchor and two *lookings*: the
+realm keeps an append-only record of its anchor history, and a host
+remembers what it last saw.
+
+**The log.** Entry `n` states the realm's anchor set and the
+succession proofs behind it, and is signed by the current anchors'
+keys; each signature carries its key, as a `Proof` does. Entries are
+numbered from 1. They are canonical — the anchor and succession lists
+sorted and deduplicated — so the same state produces the same bytes,
+the same hash, the same entry on every server. Each anchor server
+mints the next entry when the anchors it trusts or the proofs it has
+change, and exchanges the log with the other servers over the anchor
+exchange, under the same channel binding as the rest of it. Two
+servers that reach the same state by different paths therefore
+converge on one log instead of forking it: an entry records state,
+not a path. The log is not part of the CRDT state; each server
+keeps it as its own record.
+
+**Publishing.** Every realm advertisement names the head of the log:
+`(n, H(entry n bytes))`. `GET /ipa/ku/anchor-log?from=n` answers
+publicly with the entries after `n`, at most `MAX_EPOCH_FETCH` of
+them.
+
+**Watermark.** A host that verifies a realm stores that pair as an
+`epoch <n> <hash>` line in `/etc/ipa/ku-anchors`, next to the pins.
+Enrollment, rekey and `kuipa check` consult it and move it forward
+only after a verified continuation.
+
+**Belief.** A fetched continuation is verified from the pins alone:
+every entry must continue the numbering and be signed by a *proven*
+key — a pinned one, or the new end of a succession the entries list
+whose old end is proven, at most `MAX_SUCCESSION_HOPS` deep, with
+those succession signatures checked but not their expiry: a
+historical record stays a record. That is §4.2's rule transplanted.
+The fetched log's end must equal the advertised head. A host with a
+watermark refuses a server whose advertisement carries no log at all.
+
+**What a host sees.**
+
+| the server's head against the watermark | the host's response |
+|---|---|
+| a lower `n` | refused: this server has been left behind; its anchor key may have been replaced elsewhere |
+| the same `n`, same hash | fine |
+| the same `n`, other hash | refused: the log has forked |
+| a higher `n` | the continuation must verify and end at the advertised head; the watermark moves |
+| no watermark yet | stored from the advertisement, under §4.4's rule |
+
+`check` reports this per server; join and rekey stop. A temporary
+disagreement between servers during a rotation heals by the next
+exchange round, because entries are derived from state and identical
+entries merge their signatures.
+
+**Limits.**
+
+* A thief holding the old key can extend the log — it can sign its
+  own succession into the new key — exactly the case §4.4 already
+  cannot distinguish. What the log catches is the *stale* server:
+  one still built on what the realm left behind, and a log that
+  contradicts another server's.
+* A host that never looks again notices nothing; the watermark is
+  only as fresh as the last verification.
+* Nothing here revokes; §4.7's limits stand.
 
 ## 5. Join protocol
 
@@ -1310,7 +1390,8 @@ authentically.
 | compromises a join key later | opens recorded requests (consumed OTPs of `--ldap-otp` joins, expired tokens), not responses; passwords are never in them |
 | records a password or OTP join | the armoured AS exchange allows offline guessing once its classical PKINIT key exchange falls, as for any IPA `kinit`; harmless for `--random` OTPs |
 | compromises a server signing key | impersonates that server to new clients until its delegation lapses |
-| compromises one server's anchor | can sign delegations for any server name, to clients that pin it, but cannot answer a Kerberos-bound request (§5.1): OTP, password, ticket and every enrolled host's operations stay safe; `--ldap-otp`, voucher, bundle and IdP/passkey `--use-ccache` joins are exposed until the strings and pins naming that anchor expire (§4.4); rotate it (§4.7) and remove nothing else |
+| compromises one server's anchor | can sign delegations for any server name, to clients that pin it, but cannot answer a Kerberos-bound request (§5.1): OTP, password, ticket and every enrolled host's operations stay safe; `--ldap-otp`, voucher, bundle and IdP/passkey `--use-ccache` joins are exposed until the strings and pins naming that anchor expire (§4.4); a client that knows two of the realm's anchors asks each for its own proof and refuses a server that only one can give (§4.4), so the impostor passes only where the host knows that anchor alone; rotate it (§4.7) and remove nothing else |
+| knows two anchors and one of them was stolen | refuses every server that cannot produce two proofs from distinct anchors: the thief holding the stolen key is skipped like a bad advertisement, and enrollment goes to the server the other anchor vouches for, or stops at exit 75 when none can (§4.4, §4.6) |
 | obtains a server's `ipa-ku/<fqdn>` Kerberos key | can get an anchor of its choice trusted for that member's name; needs the realm's Kerberos keys, which also protect every host key in LDAP |
 | sends syncs without a member's `kuipa` key | refused (`403`); forged or replayed entries fail their signatures or lose to newer ones |
 | strips kuipa or blocks `/ipa/ku/` | enrollment fails; `kuipa` never falls back to classical enrollment |
@@ -1332,8 +1413,8 @@ existing proofs stop verifying when the vouches they come from expire
 (7 days).
 
 Still classical: TLS server authentication (an RSA IPA CA, now reached
-authentically), PKINIT and its anonymous armour, Custodia (which protects
-the KDC master key on replica installation), DNSSEC.
+authentically), PKINIT and its anonymous armour, Custodia (which escrows
+CA storage keys in non-HSM deployments), DNSSEC.
 
 FIPS: every primitive is approved; HKDF over `ss ‖ ss_e` is an SP 800-56C
 rev. 2 derivation over two approved KEM secrets.
@@ -1590,17 +1671,17 @@ like an enrollment string.
 | suite | covers |
 |---|---|
 | `crates/tang-pqc` unit and `tests/{escrow,extensions,system_policy}.rs` | Tang escrow, sealed recovery requests (no binding ciphertext on the wire, fresh requests for a static binding, wrong key, tampering), the extension points (domains, contexts, opening requests, roles, signed members), crypto-policy enforcement |
-| `kuipa-enroll` unit tests | trust establishment between two in-memory realms (same secret on both sides, single-use invitations, foreign signer, tampering, wrong realm), vouchers (encoding, realm, host, validity, binding, tampering, key), Merkle trees (synta-mtc's roots and inclusion proofs against an independent RFC 9162 reference, for every leaf of trees of 1–33 leaves, and tampered paths), delegations (one vouch covering several claims, proofs per anchor and selection, vouch expiry, tampering, policy), successions (one and two hops, expiry, wrong realm, forged statements and keys, cycles, the hop limit, chains kept by selection, the JSON shape without them), the anchor exchange (trust from Kerberos attestation spreading through vouches, untrusted and removed servers, renewal, an anchor rotated and succeeded, merge/delta/admission/encoding, linear growth, the sync message and attestation), realm verification, trusted-realm validation (own realm, duplicates, shared anchors, unsafe names) and the realm-section generator, enrollment strings (expiry mandatory, decimal, before the secret; expired strings refused), MIT keytabs, payloads, bundles (all modes, wrong recipient, tampering, `iat` checks) |
+| `kuipa-enroll` unit tests | trust establishment between two in-memory realms (same secret on both sides, single-use invitations, foreign signer, tampering, wrong realm), vouchers (encoding, realm, host, validity, binding, tampering, key), Merkle trees (synta-mtc's roots and inclusion proofs against an independent RFC 9162 reference, for every leaf of trees of 1–33 leaves, and tampered paths), delegations (one vouch covering several claims, proofs per anchor and selection, vouch expiry, tampering, policy), successions (one and two hops, expiry, wrong realm, forged statements and keys, cycles, the hop limit, chains kept by selection, the JSON shape without them), the anchor exchange (trust from Kerberos attestation spreading through vouches, untrusted and removed servers, renewal, an anchor rotated and succeeded, merge/delta/admission/encoding, linear growth, the sync message and attestation), the anchor epoch log (canonical entries, the numbering rule, gaps and forks against a watermark, proven and self-asserted signers, a forged continuation, the wire), realm verification, trusted-realm validation (own realm, duplicates, shared anchors, unsafe names) and the realm-section generator, enrollment strings (expiry mandatory, decimal, before the secret; expired strings refused), MIT keytabs, payloads, bundles (all modes, wrong recipient, tampering, `iat` checks) |
 | `crates/kuipa-enroll/tests/end_to_end.rs` | every flow against an in-memory directory, with two servers that have exchanged anchors and a client pinning one: OTP join on either server, wrong OTP / wrong server, endpoint and response binding, field tampering, Kerberos join and rekey with channel bindings and the Kerberos binding (an impostor's response does not open), auth type 4 refused, staging modes A/B and first contact, staging authorisation, sealed keytab with registration, failover, revocation and rebinding, the `krb5.conf` generator |
 | `kuipad` unit tests | `KEYTAB_GET` DER against a hand encoding (with and without a password), `GeneralizedTime`, the key store (generation, rotation, retired keys still loaded, pruning by age, anchor rotation leaving a succession and no trace of the old key), the Tang key directory (generation, rotation, `adv/{thp}` with a retired key, recovery with a retired key), the rate limiter (bursts, refill, per-source limits, idle buckets dropped, `X-Forwarded-For`), `?anchor=` parsing |
 | `crates/ml-dsa-blind` | blind signing (results verify as stock ML-DSA, μ against OpenSSL's `ML-DSA-MU`, requests hide the message, bad responses, resumed state), crypto-policy enforcement |
 | `crates/kuipa-tools/tests/cli.rs` | the `kuipa` binary: `--realm` with an enrollment string for another realm (or another case) is an error before any server is contacted; with the same realm the join goes ahead |
-| `crates/kuipa-tools/tests/flows.rs` | the client flows against the daemon's router over HTTP: OTP enrollment with failover (and its trace: the steps are there, the OTP is not), refusal and retry-later exits, OTP guessing stopped by the per-host limit (`429`, exit 75), wrong anchor, the LDAP-checked OTP, `realm-info` (its KDCs limited to the servers to use), pre-provisioned pins, a string naming a rotated anchor verified through the succession, expired strings refused, offline bundles; advertisements for another server or domain than the deployment's refused (needs an administrator) without failing over, before any request, armoured kinit or `realm-info` file; the post-quantum Tang service with `tang-pqc`'s client (provision against the pinned thumbprint, recovery through `key/{kid}`, Tang's error statuses, rotation: the old binding still opens (its retired key still served at `key/{kid}`) and `adv/{old}` lets the old pin verify the new keys; no keys, no service), and the pin against it: encrypt and decrypt, a header pointing elsewhere refused, encryption with the old pin after a rotation |
+| `crates/kuipa-tools/tests/flows.rs` | the client flows against the daemon's router over HTTP: OTP enrollment with failover (and its trace: the steps are there, the OTP is not), refusal and retry-later exits, OTP guessing stopped by the per-host limit (`429`, exit 75), wrong anchor, a stolen anchor: two pinned anchors demand two distinct proofs, so the single-vouched server is skipped and the exchange-vouched one serves the join, alone it stops at exit 75 naming the reason, and one pinned anchor takes it (§4.4), the anchor epoch watermark: a proper rotation moves it forward through the public anchor log, and one pinned anchor refuses both a server whose log stops behind it (naming both sequences) and a log forked at it (§4.8), the LDAP-checked OTP, `realm-info` (its KDCs limited to the servers to use), pre-provisioned pins (one is enough; a second unrelated one makes the host refuse the realm), a string naming a rotated anchor verified through the succession, expired strings refused, offline bundles; advertisements for another server or domain than the deployment's refused (needs an administrator) without failing over, before any request, armoured kinit or `realm-info` file; the post-quantum Tang service with `tang-pqc`'s client (provision against the pinned thumbprint, recovery through `key/{kid}`, Tang's error statuses, rotation: the old binding still opens (its retired key still served at `key/{kid}`) and `adv/{old}` lets the old pin verify the new keys; no keys, no service), and the pin against it: encrypt and decrypt, a header pointing elsewhere refused, encryption with the old pin after a rotation |
 | `crates/tang-pqc-clevis` unit and `tests/pin.rs` | the binary as `tang-pqc` and as `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` against a `tang-pqc` server: `--summary`, `adv`, refusal without or with a wrong `thp` (naming the advertised keys), round trips, fresh bindings per encryption, tampered header or ciphertext refused, the `regen` configuration, usage exits; configuration parsing, foreign JWEs |
 | `crates/kuipa-tools/tests/dns.rs` | SRV discovery against a stub DNS server over UDP and TCP (truncated answers): priority and weight order, unsafe and duplicate names dropped, no records, no answer |
 | `crates/kuipa-tools/tests/voucher.rs` | against a real MIT KDC: issuer key and quota, blinded request (64 bytes), unblinding, the voucher key in the advertisement; a bearer voucher creates its host in its host group once and not another host; a bound voucher needs its ephemeral key; an unknown voucher key is refused; the quota runs out |
 | `crates/kuipa-tools/tests/trust.rs` | against two real MIT KDCs, realms A and B: B invites A and A's server establishes the trust over HTTP (both directories record it, the invitation is single use, A publishes B refreshed from B's advertisement); a host of A installs B from A's `trusts` (B's anchors apart from A's, B's chain, a `krb5.conf.d` snippet without `[libdefaults]`), gets anonymous-PKINIT armour from B's KDC, and gets none without B's chain or with A's chain instead; with the cross-realm keys the establishment created in both KDCs, a user of B logs in with that armour and gets a ticket for the A host; refresh, an unreachable B keeping its files, a trust entry with A's own anchor refused, removal, `leave` |
-| `crates/kuipa-tools/tests/kdc.rs` | against a real MIT KDC with PKINIT, two servers running the router and the anchor exchange: both converge to both anchors and claims proven by both anchors; GSS-API channel bindings, OTP join → `rotate-keys` → `check`, `protect` → unseal → `unprotect`, one-message krb5 contexts deriving the same PRF output on both sides, the OTP as a temporary Kerberos key → armoured AS exchange → rekey (and the OTP spent after it), admin-ticket join, armoured password joins (wrong and right password), `realm-info` anchors → anonymous PKINIT (and its failure without them) → armoured `kinit` → `--use-ccache` join, staging → bundle → `complete`; an OTP join through ipa2 alone with ipa1's anchor pinned, storing both anchors; syncs with another server's token or no valid token refused |
+| `crates/kuipa-tools/tests/kdc.rs` | against a real MIT KDC with PKINIT, two servers running the router and the anchor exchange: both converge to both anchors and claims proven by both anchors; the two anchor logs converge to the same head and `check` moves the host's watermark to it (§4.8); GSS-API channel bindings, OTP join → `rotate-keys` → `check`, `protect` → unseal → `unprotect`, one-message krb5 contexts deriving the same PRF output on both sides, the OTP as a temporary Kerberos key → armoured AS exchange → rekey (and the OTP spent after it), admin-ticket join, armoured password joins (wrong and right password), `realm-info` anchors → anonymous PKINIT (and its failure without them) → armoured `kinit` → `--use-ccache` join, staging → bundle → `complete`; an OTP join through ipa2 alone with ipa1's anchor pinned, storing both anchors; syncs with another server's token or no valid token refused |
 
 `contrib/ci/local-ci.sh` runs these as CI jobs (the real-KDC tests as
 `kdc-test`, failing rather than skipping when the KDC tools are missing),

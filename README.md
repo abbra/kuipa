@@ -30,7 +30,11 @@ creates keys.
   access.
 * **No single point of trust:** each server holds its own anchor. The
   servers vouch for each other through an exchange authenticated with
-  their Kerberos keys, and anchors can be rotated.
+  their Kerberos keys, and anchors can be rotated. A host that knows two
+  of a realm's anchors demands the claim proven by two distinct ones, so
+  a server built on a single stolen anchor is refused. A host that has
+  seen the realm once also keeps a watermark over the realm's anchor
+  history, and refuses a server that record leaves behind.
 * **Trusted realms:** a host can accept users from realms its realm
   trusts, with their KDCs and PKINIT anchors verified.
 * **Post-quantum Tang:** the server can also act as a general
