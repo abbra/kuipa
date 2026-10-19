@@ -69,6 +69,7 @@
 use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::realm::Deployment;
 use kuipa_tools::flows::{self, Auth, Outcome};
@@ -78,74 +79,251 @@ use native_ossl::util::SecretBuf;
 use serde_json::Value;
 use tang_pqc::Thumbprint;
 
-const USAGE: &str = "usage: kuipa {prepare|enroll|voucher-key|realm-info|complete|rotate-keys|protect|unprotect|trusted-realms|status|check|leave} [options]";
+#[derive(Parser)]
+#[command(
+    about = "Manage this host's post-quantum identity in an IPA realm.",
+    after_help = "Secrets are never taken from the command line: the enrollment \
+string comes from --enrollment-file, $KUIPA_ENROLLMENT_FILE or standard input, the \
+password from --password-file or standard input; on a terminal each is prompted for. \
+Without --server, servers are found in DNS (_ldap._tcp.<domain> SRV records). \
+Exit status: 0 success, 75 retry later, 1 needs an administrator or another error, \
+2 usage."
+)]
+struct Cli {
+    /// Print the result as one JSON object instead of text.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Trace each request, decision and file written on standard error.
+    #[arg(long, global = true)]
+    verbose: bool,
+    /// Trace with wire details (`$KUIPA_TRACE` overrides with `tracing`
+    /// filter directives).
+    #[arg(long, global = true)]
+    trace: bool,
+    #[command(subcommand)]
+    command: Command,
+}
 
+/// How to reach the deployment: servers given directly, or found in DNS
+/// for `--domain` or the host's domain.  Every advertisement must
+/// describe this deployment (§4.6).
+#[derive(clap::Args)]
+struct DeploymentInput {
+    /// IPA server host; repeat for each server.  Found in DNS otherwise.
+    #[arg(long, value_name = "HOST")]
+    server: Vec<String>,
+    /// Domain to look servers up in (default: this host's domain).
+    #[arg(long, value_name = "DOMAIN")]
+    domain: Option<String>,
+    /// The host being enrolled (default: this host's FQDN).
+    #[arg(long, value_name = "FQDN")]
+    hostname: Option<String>,
+}
+
+/// What to verify the servers against: an enrollment string, or `--realm`
+/// with anchors pre-provisioned in /etc/ipa/ku-anchors (§4.6).
+#[derive(clap::Args)]
+struct RealmInput {
+    /// Enrollment string file; '-' reads standard input.  Defaults to
+    /// `$KUIPA_ENROLLMENT_FILE`.
+    #[arg(long, value_name = "FILE")]
+    enrollment_file: Option<String>,
+    /// Verify realm R against its pinned anchors instead of an enrollment
+    /// string; with one given as well, R is a cross-check of its realm.
+    #[arg(long, value_name = "REALM")]
+    realm: Option<String>,
+    /// Read the password from this file instead of standard input.
+    #[arg(long, value_name = "FILE")]
+    password_file: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Get ready to be enrolled offline; print the host's FQDN.
+    Prepare {
+        /// The host to prepare (default: this host's FQDN).
+        #[arg(long, value_name = "FQDN")]
+        hostname: Option<String>,
+        /// Create a new machine key, replacing the existing one.
+        #[arg(long)]
+        new: bool,
+    },
+    /// Enroll online: OTP (default), a user's password, an existing
+    /// Kerberos ticket, or a voucher; or offline from a prepared bundle.
+    Enroll {
+        #[command(flatten)]
+        realm: RealmInput,
+        #[command(flatten)]
+        deployment: DeploymentInput,
+        /// Enroll offline from a prepared bundle instead of online.
+        #[arg(long, value_name = "FILE")]
+        bundle: Option<String>,
+        /// Enroll with a user's password (armoured kinit on this host).
+        #[arg(long, value_name = "PRINCIPAL")]
+        principal: Option<String>,
+        /// Enroll with the ticket in $KRB5CCNAME as it is.
+        #[arg(long)]
+        use_ccache: bool,
+        /// Enroll with this voucher (see kuipa-voucher).
+        #[arg(long, value_name = "FILE")]
+        voucher_file: Option<String>,
+        /// The ephemeral key written by `kuipa voucher-key`.
+        #[arg(long, value_name = "FILE")]
+        ephemeral_key: Option<String>,
+        /// Check the OTP through LDAP (anchor servers only).
+        #[arg(long)]
+        ldap_otp: bool,
+        /// Accept a bundle that is only signed, not sealed.
+        #[arg(long)]
+        insecure_signed_only: bool,
+    },
+    /// Write the ephemeral key that binds a voucher to this host; print
+    /// its binding, for kuipa-voucher's --binding.
+    VoucherKey {
+        /// Where to write the key.
+        #[arg(long, value_name = "FILE")]
+        out: String,
+    },
+    /// Print Kerberos configuration for enrolling with an existing ticket.
+    RealmInfo {
+        #[command(flatten)]
+        realm: RealmInput,
+        #[command(flatten)]
+        deployment: DeploymentInput,
+        /// Directory to write the realm's Kerberos configuration to.
+        #[arg(long, value_name = "DIR")]
+        krb5_dir: String,
+    },
+    /// Finish an offline enrollment.
+    Complete,
+    /// New host keys; re-seals the keytab where needed.
+    RotateKeys,
+    /// Seal the keytab on disk.
+    Protect,
+    /// Unseal the keytab on disk.
+    Unprotect,
+    /// Print the realms this realm trusts (their KDCs and PKINIT anchors,
+    /// verified), so their users can log in here.
+    TrustedRealms,
+    /// Is this host healthy?
+    Status,
+    /// Check this host's enrollment against the realm.
+    Check {
+        /// Server to check (default: those recorded at enrollment).
+        #[arg(long, value_name = "HOST")]
+        server: Vec<String>,
+    },
+    /// Remove kuipa's state from this host.
+    Leave,
+}
+
+impl Cli {
+    /// Rebuild the loose option bag `run` reads, so the command handlers
+    /// do not change with the parser.
+    fn args(&self) -> Args {
+        let mut args = Args {
+            command: self.command.name().to_owned(),
+            ..Args::default()
+        };
+        self.command.collect(&mut args);
+        args
+    }
+}
+
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Prepare { .. } => "prepare",
+            Command::Enroll { .. } => "enroll",
+            Command::VoucherKey { .. } => "voucher-key",
+            Command::RealmInfo { .. } => "realm-info",
+            Command::Complete => "complete",
+            Command::RotateKeys => "rotate-keys",
+            Command::Protect => "protect",
+            Command::Unprotect => "unprotect",
+            Command::TrustedRealms => "trusted-realms",
+            Command::Status => "status",
+            Command::Check { .. } => "check",
+            Command::Leave => "leave",
+        }
+    }
+
+    fn collect(&self, a: &mut Args) {
+        match self {
+            Command::Prepare { hostname, new } => {
+                a.set("hostname", hostname.as_deref());
+                a.mark("new", *new);
+            }
+            Command::Enroll {
+                realm,
+                deployment,
+                bundle,
+                principal,
+                use_ccache,
+                voucher_file,
+                ephemeral_key,
+                ldap_otp,
+                insecure_signed_only,
+            } => {
+                a.set("enrollment-file", realm.enrollment_file.as_deref());
+                a.set("realm", realm.realm.as_deref());
+                a.set("password-file", realm.password_file.as_deref());
+                a.set_all("server", &deployment.server);
+                a.set("domain", deployment.domain.as_deref());
+                a.set("hostname", deployment.hostname.as_deref());
+                a.set("bundle", bundle.as_deref());
+                a.set("principal", principal.as_deref());
+                a.set("voucher-file", voucher_file.as_deref());
+                a.set("ephemeral-key", ephemeral_key.as_deref());
+                a.mark("use-ccache", *use_ccache);
+                a.mark("ldap-otp", *ldap_otp);
+                a.mark("insecure-signed-only", *insecure_signed_only);
+            }
+            Command::VoucherKey { out } => a.set("out", Some(out.as_str())),
+            Command::RealmInfo {
+                realm,
+                deployment,
+                krb5_dir,
+            } => {
+                a.set("enrollment-file", realm.enrollment_file.as_deref());
+                a.set("realm", realm.realm.as_deref());
+                a.set("password-file", realm.password_file.as_deref());
+                a.set_all("server", &deployment.server);
+                a.set("domain", deployment.domain.as_deref());
+                a.set("hostname", deployment.hostname.as_deref());
+                a.set("krb5-dir", Some(krb5_dir.as_str()));
+            }
+            Command::Check { server } => a.set_all("server", server),
+            _ => {}
+        }
+    }
+}
+
+/// The command and the options and flags as named strings.
 #[derive(Default)]
 struct Args {
     command: String,
-    json: bool,
-    flags: Vec<String>,
     options: Vec<(String, String)>,
-}
-
-const COMMANDS: &[&str] = &[
-    "prepare",
-    "enroll",
-    "voucher-key",
-    "realm-info",
-    "complete",
-    "rotate-keys",
-    "protect",
-    "unprotect",
-    "trusted-realms",
-    "status",
-    "check",
-    "leave",
-];
-
-/// Options that take a value; everything else starting with `--` is a flag.
-const VALUED: &[&str] = &[
-    "password-file",
-    "krb5-dir",
-    "server",
-    "hostname",
-    "principal",
-    "enrollment-file",
-    "domain",
-    "bundle",
-    "voucher-file",
-    "ephemeral-key",
-    "out",
-    "realm",
-];
-
-fn parse_args() -> Result<Args, String> {
-    let mut it = std::env::args().skip(1);
-    let command = it.next().ok_or(USAGE)?;
-    if !COMMANDS.contains(&command.as_str()) {
-        return Err(format!("unknown command {command:?}\n{USAGE}"));
-    }
-    let mut args = Args {
-        command,
-        ..Args::default()
-    };
-    while let Some(arg) = it.next() {
-        let name = arg
-            .strip_prefix("--")
-            .ok_or_else(|| format!("unexpected argument {arg:?}"))?;
-        if name == "json" {
-            args.json = true;
-        } else if VALUED.contains(&name) {
-            let value = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
-            args.options.push((name.into(), value));
-        } else {
-            args.flags.push(name.into());
-        }
-    }
-    Ok(args)
+    flags: Vec<String>,
 }
 
 impl Args {
+    fn set(&mut self, name: &str, value: Option<&str>) {
+        if let Some(v) = value {
+            self.options.push((name.into(), v.to_owned()));
+        }
+    }
+
+    fn set_all(&mut self, name: &str, values: &[String]) {
+        self.options
+            .extend(values.iter().map(|v| (name.into(), v.clone())));
+    }
+
+    fn mark(&mut self, name: &str, on: bool) {
+        if on {
+            self.flags.push(name.into());
+        }
+    }
     fn option(&self, name: &str) -> Option<&str> {
         self.options
             .iter()
@@ -459,7 +637,7 @@ fn run(args: &Args) -> Result<Value, Error> {
         "status" => flows::status(&paths),
         "check" => flows::check(&paths, args.option("server")),
         "leave" => flows::leave(&paths),
-        other => Err(format!("unknown command {other:?}\n{USAGE}").into()),
+        other => Err(format!("unknown command {other:?}").into()),
     }
 }
 
@@ -517,25 +695,20 @@ fn krb5_config_fallback(paths: &Paths) {
 }
 
 fn main() -> ExitCode {
+    let cli = Cli::parse();
     krb5_config_fallback(&Paths::from_env());
-    let args = match parse_args() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-    };
-    trace::init(if args.flag("trace") {
+    trace::init(if cli.trace {
         trace::Level::Details
-    } else if args.flag("verbose") {
+    } else if cli.verbose {
         trace::Level::Steps
     } else {
         trace::Level::Off
     });
+    let args = cli.args();
     tracing::debug!("kuipa {}", args.command);
     match run(&args) {
         Ok(value) => {
-            if args.json {
+            if cli.json {
                 println!("{value}");
             } else {
                 print_human(&value, 0);

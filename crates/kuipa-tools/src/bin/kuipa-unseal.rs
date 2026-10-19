@@ -19,9 +19,34 @@
 use std::io::Write;
 use std::process::ExitCode;
 
+use clap::Parser;
 use kuipa_tools::flows::{self, Outcome};
 use kuipa_tools::paths::{self, Error, Paths};
 use kuipa_tools::trace;
+
+#[derive(Parser)]
+#[command(
+    about = "Unseal the machine keytab without a human: the unattended unseal \
+path used at boot and by gssproxy's keytab_loader.",
+    after_help = "This runs in its own SELinux domain: it only reads the sealed \
+keytab, anchors and CA, talks to the IPA servers, and writes the result.  It has \
+no Kerberos client rights, so it never rebinds; `kuipa rotate-keys` (on a timer) \
+refreshes the bindings.  Exit status: 0 success, 75 no server could unseal (retry \
+later), 1 error, 2 usage."
+)]
+struct Args {
+    /// Write the keytab to the memfd inherited as file descriptor 3
+    /// (`gssproxy keytab_loader`) instead of `/run/ipa/krb5.keytab`.
+    #[arg(long)]
+    memfd: bool,
+    /// Trace each request and decision on standard error.
+    #[arg(long)]
+    verbose: bool,
+    /// Trace with wire details (`$KUIPA_TRACE` overrides with `tracing`
+    /// filter directives).
+    #[arg(long)]
+    trace: bool,
+}
 
 fn run(memfd: bool) -> Result<(), Error> {
     let paths = Paths::from_env();
@@ -40,16 +65,15 @@ fn run(memfd: bool) -> Result<(), Error> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let memfd = args.iter().any(|a| a == "--memfd");
-    trace::init(if args.iter().any(|a| a == "--trace") {
+    let args = Args::parse();
+    trace::init(if args.trace {
         trace::Level::Details
-    } else if args.iter().any(|a| a == "--verbose") {
+    } else if args.verbose {
         trace::Level::Steps
     } else {
         trace::Level::Off
     });
-    match run(memfd) {
+    match run(args.memfd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kuipa-unseal: {e}");
