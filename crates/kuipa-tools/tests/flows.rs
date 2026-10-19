@@ -806,6 +806,108 @@ fn a_long_anchor_log_is_read_page_by_page() {
 }
 
 #[test]
+fn advertisement_lists_details_and_landmarks() {
+    // A realm with no anchor log yet: the advertisement carries no head,
+    // so there are no landmarks, but its details still show. Then the
+    // same realm through a proper rotation: the whole landmark chain is
+    // listed and verified from the one pinned anchor (§4.8).
+    let (old, new) = (
+        SigningKey::generate(SignatureAlg::MlDsa65).unwrap(),
+        SigningKey::generate(SignatureAlg::MlDsa65).unwrap(),
+    );
+    let (old_pin, new_pin) = (*old.public().thumbprint(), *new.public().thumbprint());
+    let deployment = Deployment::servers(&["ipa1.example.test".to_string()]);
+    let (keys, info, delegation) = server_keys(&old, "ipa1.example.test");
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    serve_as(
+        "ipa1.example.test",
+        app(Arc::new(EnrollServer::new(keys, info, delegation)), dir),
+    );
+    let paths = root("advert");
+    let mut s = string(&old, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    flows::enroll_online(
+        &paths,
+        s.realm(),
+        &[*s.anchor()],
+        &Auth::LdapOtp(otp),
+        HOST,
+        &deployment,
+    )
+    .unwrap();
+    let out = flows::advertisements(REALM, &[old_pin], &deployment);
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(out["servers"][0]["realm"], REALM);
+    assert_eq!(out["servers"][0]["anchor_log_head"], "", "no log, no head");
+    assert!(
+        out["servers"][0]["landmarks"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{out}"
+    );
+
+    // The anchor rotates properly; the log is published through entry 2.
+    let first = AnchorEpoch::new(REALM, 1, kuipa_enroll::epoch::GENESIS, [old_pin], []);
+    let head1 = first.head().unwrap();
+    let first_signed = SignedEpoch::issue(&old, &first).unwrap();
+    let (keys2, info2, mut delegation2) = server_keys(&new, "ipa1.example.test");
+    let succession = kuipa_enroll::delegation::SignedSuccession::issue(
+        &old,
+        REALM,
+        &new_pin,
+        now() - 60,
+        now() + 86400,
+    )
+    .unwrap();
+    delegation2.add_successions([succession.clone()]);
+    let second = AnchorEpoch::new(REALM, 2, head1, [new_pin], [succession]);
+    let head2 = second.head().unwrap();
+    let server2 = Arc::new(EnrollServer::new(keys2, info2, delegation2));
+    server2.publish_epoch(vec![
+        first_signed,
+        SignedEpoch::issue(&new, &second).unwrap(),
+    ]);
+    serve_as("ipa1.example.test", app(server2, Dir::default()));
+    let out = flows::advertisements(REALM, &[old_pin], &deployment);
+    assert_eq!(out["ok"], true, "{out}");
+    let adv = &out["servers"][0];
+    assert_eq!(
+        adv["anchor_log_head"],
+        format!("2 {}", tang_pqc::Thumbprint::from_bytes(head2)),
+        "the head the advertisement names"
+    );
+    assert_eq!(
+        adv["rotated_anchors"].as_array().unwrap().len(),
+        1,
+        "verification ran through the succession: {adv}"
+    );
+    let landmarks = adv["landmarks"].as_array().unwrap();
+    assert_eq!(landmarks.len(), 2, "{adv}");
+    let thp = |h: [u8; 32]| tang_pqc::Thumbprint::from_bytes(h).to_string();
+    assert_eq!(landmarks[0]["seq"], 1);
+    assert_eq!(
+        landmarks[0]["prev"],
+        thp([0; 32]),
+        "the first entry commits to nothing"
+    );
+    assert_eq!(
+        landmarks[1]["prev"],
+        thp(head1),
+        "committed to the landmark before it"
+    );
+    assert_eq!(landmarks[1]["head"], thp(head2), "each landmark's head");
+    assert_eq!(
+        landmarks[1]["successions"][0],
+        format!("{old_pin} -> {new_pin}"),
+        "the rotation the entry records"
+    );
+}
+
+#[test]
 fn offline_enrollment_from_a_bundle() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, _, delegation) = server_keys(&anchor, "ipa1.example.test");
