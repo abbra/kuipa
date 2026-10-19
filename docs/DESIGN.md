@@ -579,10 +579,15 @@ succession proofs behind it, and is signed by the current anchors'
 keys; each signature carries its key, as a `Proof` does. Entries are
 numbered from 1. They are canonical — the anchor and succession lists
 sorted and deduplicated — so the same state produces the same bytes,
-the same hash, the same entry on every server. Each anchor server
+the same hash, the same entry on every server. Each entry names the
+head of the entry before it — `0…0` for the first — so entries bind to
+each other, not to a number line. Each anchor server
 mints the next entry when the anchors it trusts or the proofs it has
-change, and exchanges the log with the other servers over the anchor
-exchange, under the same channel binding as the rest of it. Two
+change — but only once the state the entry would carry has stood
+unchanged for a full exchange round, so servers that learn of a change
+at different moments extend the same entry, not divergent ones neither
+can rejoin — and exchanges the log with the other servers over the
+anchor exchange, under the same channel binding as the rest of it. Two
 servers that reach the same state by different paths therefore
 converge on one log instead of forking it: an entry records state,
 not a path. The log is not part of the CRDT state; each server
@@ -591,7 +596,8 @@ keeps it as its own record.
 **Publishing.** Every realm advertisement names the head of the log:
 `(n, H(entry n bytes))`. `GET /ipa/ku/anchor-log?from=n` answers
 publicly with the entries after `n`, at most `MAX_EPOCH_FETCH` of
-them.
+them. A host follows a longer log page by page: it asks `from=` its
+last verified entry and advances to the advertised head.
 
 **Watermark.** A host that verifies a realm stores that pair as an
 `epoch <n> <hash>` line in `/etc/ipa/ku-anchors`, next to the pins.
@@ -603,7 +609,12 @@ every entry must continue the numbering and be signed by a *proven*
 key — a pinned one, or the new end of a succession the entries list
 whose old end is proven, at most `MAX_SUCCESSION_HOPS` deep, with
 those succession signatures checked but not their expiry: a
-historical record stays a record. That is §4.2's rule transplanted.
+historical record stays a record. Every entry's `prev` must be the
+head of the entry before it, so a fetched page binds to a head the
+host already knows; and an anchor listed by an entry that verified so
+far becomes proven itself for the entries after it — an anchor added
+behind a signature already believed is believed with the chain.
+That is §4.2's rule transplanted.
 The fetched log's end must equal the advertised head. A host with a
 watermark refuses a server whose advertisement carries no log at all.
 
@@ -621,6 +632,16 @@ watermark refuses a server whose advertisement carries no log at all.
 disagreement between servers during a rotation heals by the next
 exchange round, because entries are derived from state and identical
 entries merge their signatures.
+
+**Merging on the servers.** An exchange carries a bounded tail window of
+the log, not all of it. Entries both servers hold merge signature sets.
+A window is adopted when it vouches for itself — contiguous numbering,
+each entry signed by an anchor it names, each committing to its
+predecessor — and continues our log at our own head; a window that
+leaves a gap the server fills by fetching the peer's public anchor log.
+If the two disagree on a statement at a sequence both hold, the log has
+forked: neither server appends further until an operator reconciles
+them.
 
 **Limits.**
 
@@ -1431,7 +1452,7 @@ IPSQ  same fields                                                               
 IPRB  auth_type(1) n(1) [registration(32)] extra authenticator                  sealed request body
 IPJS  ct_e sealed                                                                response
 IPJP  realm domain basedn issuer n[server] n[ca_cert] n[pkinit_anchor]
-      n[anchor(32)] keytab                                                       enrollment payload
+      n[anchor(32)] epoch_seq(u64) epoch_head(32) keytab                   enrollment payload
 IPSX  mode(1) alg(1) ek_m not_after(u64)                                         staging parameters
 IPSP  bundle secret                                                              stage result
 IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)
@@ -1444,6 +1465,8 @@ IPVH  realm anchor(32) iat(u64) exp(u64) size(u64) root(32)                     
 IPSV  vouch(IPVH) signature n(u64) [leaf(32)]                                    signed vouch with leaves
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
+IPAE  realm seq(u64) prev(32) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-256` of them under a domain-separation context; `prev` is the previous entry's head, `0…0` for the first)
+IEPS  entry(IPAE) signature n(u64) [key(JWK) signature]                    signed anchor epoch entry
 IPAS  n(u64) [tag(1) value]                                                      exchange state (1 key, 2 claim, 3 vouch, 4 succession)
 IPVM  realm fqdn hostgroup not_before(u64) not_after(u64) binding(32)          voucher message (no version)
 IPVO  key(32) realm fqdn hostgroup not_before(u64) not_after(u64) binding(32)
@@ -1671,12 +1694,12 @@ like an enrollment string.
 | suite | covers |
 |---|---|
 | `crates/tang-pqc` unit and `tests/{escrow,extensions,system_policy}.rs` | Tang escrow, sealed recovery requests (no binding ciphertext on the wire, fresh requests for a static binding, wrong key, tampering), the extension points (domains, contexts, opening requests, roles, signed members), crypto-policy enforcement |
-| `kuipa-enroll` unit tests | trust establishment between two in-memory realms (same secret on both sides, single-use invitations, foreign signer, tampering, wrong realm), vouchers (encoding, realm, host, validity, binding, tampering, key), Merkle trees (synta-mtc's roots and inclusion proofs against an independent RFC 9162 reference, for every leaf of trees of 1–33 leaves, and tampered paths), delegations (one vouch covering several claims, proofs per anchor and selection, vouch expiry, tampering, policy), successions (one and two hops, expiry, wrong realm, forged statements and keys, cycles, the hop limit, chains kept by selection, the JSON shape without them), the anchor exchange (trust from Kerberos attestation spreading through vouches, untrusted and removed servers, renewal, an anchor rotated and succeeded, merge/delta/admission/encoding, linear growth, the sync message and attestation), the anchor epoch log (canonical entries, the numbering rule, gaps and forks against a watermark, proven and self-asserted signers, a forged continuation, the wire), realm verification, trusted-realm validation (own realm, duplicates, shared anchors, unsafe names) and the realm-section generator, enrollment strings (expiry mandatory, decimal, before the secret; expired strings refused), MIT keytabs, payloads, bundles (all modes, wrong recipient, tampering, `iat` checks) |
+| `kuipa-enroll` unit tests | trust establishment between two in-memory realms (same secret on both sides, single-use invitations, foreign signer, tampering, wrong realm), vouchers (encoding, realm, host, validity, binding, tampering, key), Merkle trees (synta-mtc's roots and inclusion proofs against an independent RFC 9162 reference, for every leaf of trees of 1–33 leaves, and tampered paths), delegations (one vouch covering several claims, proofs per anchor and selection, vouch expiry, tampering, policy), successions (one and two hops, expiry, wrong realm, forged statements and keys, cycles, the hop limit, chains kept by selection, the JSON shape without them), the anchor exchange (trust from Kerberos attestation spreading through vouches, untrusted and removed servers, renewal, an anchor rotated and succeeded, merge/delta/admission/encoding, linear growth, the sync message and attestation), the anchor epoch log (canonical entries, the numbering rule, an entry that does not commit to the entry before it, gaps and forks against a watermark, proven and self-asserted signers, trust carried forward through the chain, a forged continuation, the wire), realm verification, trusted-realm validation (own realm, duplicates, shared anchors, unsafe names) and the realm-section generator, enrollment strings (expiry mandatory, decimal, before the secret; expired strings refused), MIT keytabs, payloads, bundles (all modes, wrong recipient, tampering, `iat` checks) |
 | `crates/kuipa-enroll/tests/end_to_end.rs` | every flow against an in-memory directory, with two servers that have exchanged anchors and a client pinning one: OTP join on either server, wrong OTP / wrong server, endpoint and response binding, field tampering, Kerberos join and rekey with channel bindings and the Kerberos binding (an impostor's response does not open), auth type 4 refused, staging modes A/B and first contact, staging authorisation, sealed keytab with registration, failover, revocation and rebinding, the `krb5.conf` generator |
-| `kuipad` unit tests | `KEYTAB_GET` DER against a hand encoding (with and without a password), `GeneralizedTime`, the key store (generation, rotation, retired keys still loaded, pruning by age, anchor rotation leaving a succession and no trace of the old key), the Tang key directory (generation, rotation, `adv/{thp}` with a retired key, recovery with a retired key), the rate limiter (bursts, refill, per-source limits, idle buckets dropped, `X-Forwarded-For`), `?anchor=` parsing |
+| `kuipad` unit tests | `KEYTAB_GET` DER against a hand encoding (with and without a password), `GeneralizedTime`, the key store (generation, rotation, retired keys still loaded, pruning by age, anchor rotation leaving a succession and no trace of the old key), the Tang key directory (generation, rotation, `adv/{thp}` with a retired key, recovery with a retired key), the rate limiter (bursts, refill, per-source limits, idle buckets dropped, `X-Forwarded-For`), `?anchor=` parsing, the anchor epoch merge (a continuing window adopted and both signature sets kept, a shorter window only adds signatures, a different statement at a shared sequence is a fork, a window naming another head is a fork, a gap is fetched not assumed, the sync window is a bounded recent tail) |
 | `crates/ml-dsa-blind` | blind signing (results verify as stock ML-DSA, μ against OpenSSL's `ML-DSA-MU`, requests hide the message, bad responses, resumed state), crypto-policy enforcement |
 | `crates/kuipa-tools/tests/cli.rs` | the `kuipa` binary: `--realm` with an enrollment string for another realm (or another case) is an error before any server is contacted; with the same realm the join goes ahead |
-| `crates/kuipa-tools/tests/flows.rs` | the client flows against the daemon's router over HTTP: OTP enrollment with failover (and its trace: the steps are there, the OTP is not), refusal and retry-later exits, OTP guessing stopped by the per-host limit (`429`, exit 75), wrong anchor, a stolen anchor: two pinned anchors demand two distinct proofs, so the single-vouched server is skipped and the exchange-vouched one serves the join, alone it stops at exit 75 naming the reason, and one pinned anchor takes it (§4.4), the anchor epoch watermark: a proper rotation moves it forward through the public anchor log, and one pinned anchor refuses both a server whose log stops behind it (naming both sequences) and a log forked at it (§4.8), the LDAP-checked OTP, `realm-info` (its KDCs limited to the servers to use), pre-provisioned pins (one is enough; a second unrelated one makes the host refuse the realm), a string naming a rotated anchor verified through the succession, expired strings refused, offline bundles; advertisements for another server or domain than the deployment's refused (needs an administrator) without failing over, before any request, armoured kinit or `realm-info` file; the post-quantum Tang service with `tang-pqc`'s client (provision against the pinned thumbprint, recovery through `key/{kid}`, Tang's error statuses, rotation: the old binding still opens (its retired key still served at `key/{kid}`) and `adv/{old}` lets the old pin verify the new keys; no keys, no service), and the pin against it: encrypt and decrypt, a header pointing elsewhere refused, encryption with the old pin after a rotation |
+| `crates/kuipa-tools/tests/flows.rs` | the client flows against the daemon's router over HTTP: OTP enrollment with failover (and its trace: the steps are there, the OTP is not), refusal and retry-later exits, OTP guessing stopped by the per-host limit (`429`, exit 75), wrong anchor, a stolen anchor: two pinned anchors demand two distinct proofs, so the single-vouched server is skipped and the exchange-vouched one serves the join, alone it stops at exit 75 naming the reason, and one pinned anchor takes it (§4.4), the anchor epoch watermark: a proper rotation moves it forward through the public anchor log, a log longer than one page is followed to the advertised head, and one pinned anchor refuses both a server whose log stops behind it (naming both sequences) and a log forked at it (§4.8), the LDAP-checked OTP, `realm-info` (its KDCs limited to the servers to use), pre-provisioned pins (one is enough; a second unrelated one makes the host refuse the realm), a string naming a rotated anchor verified through the succession, expired strings refused, offline bundles; advertisements for another server or domain than the deployment's refused (needs an administrator) without failing over, before any request, armoured kinit or `realm-info` file; the post-quantum Tang service with `tang-pqc`'s client (provision against the pinned thumbprint, recovery through `key/{kid}`, Tang's error statuses, rotation: the old binding still opens (its retired key still served at `key/{kid}`) and `adv/{old}` lets the old pin verify the new keys; no keys, no service), and the pin against it: encrypt and decrypt, a header pointing elsewhere refused, encryption with the old pin after a rotation |
 | `crates/tang-pqc-clevis` unit and `tests/pin.rs` | the binary as `tang-pqc` and as `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` against a `tang-pqc` server: `--summary`, `adv`, refusal without or with a wrong `thp` (naming the advertised keys), round trips, fresh bindings per encryption, tampered header or ciphertext refused, the `regen` configuration, usage exits; configuration parsing, foreign JWEs |
 | `crates/kuipa-tools/tests/dns.rs` | SRV discovery against a stub DNS server over UDP and TCP (truncated answers): priority and weight order, unsafe and duplicate names dropped, no records, no answer |
 | `crates/kuipa-tools/tests/voucher.rs` | against a real MIT KDC: issuer key and quota, blinded request (64 bytes), unblinding, the voucher key in the advertisement; a bearer voucher creates its host in its host group once and not another host; a bound voucher needs its ephemeral key; an unknown voucher key is refused; the quota runs out |
