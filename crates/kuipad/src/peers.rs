@@ -20,11 +20,14 @@ use agirru_engine::{
 };
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::anchors::{self, AnchorState, Entry, PeerSync, Trust};
-use kuipa_enroll::delegation::{Claim, DEFAULT_VALIDITY, Delegation, SignedVouch, VOUCH_VALIDITY};
+use kuipa_enroll::delegation::{
+    Claim, DEFAULT_VALIDITY, Delegation, SignedSuccession, SignedVouch, VOUCH_VALIDITY,
+};
+use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
 use kuipa_enroll::server::Directory;
 use rustls::pki_types::CertificateDer;
 use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
-use tang_pqc::{Policy, SigningKey, unix_seconds};
+use tang_pqc::{Policy, SigningKey, Thumbprint, unix_seconds};
 use tokio::sync::{Notify, RwLock};
 
 use crate::keystore::KeyStore;
@@ -153,6 +156,8 @@ pub struct Exchange {
     members: Mutex<(BTreeSet<String>, Option<Instant>)>,
     /// Peers' own delegations from authenticated syncs.
     attested: Mutex<BTreeMap<String, Delegation>>,
+    /// The anchor epoch log (§4.8).
+    epoch: Mutex<Vec<SignedEpoch>>,
     changed: Notify,
     client: reqwest::Client,
     /// The last failure per peer, so each is logged once.
@@ -254,6 +259,7 @@ impl Peers {
     ) -> Result<Arc<Self>, Error> {
         let clock = GenerationClock::new();
         let state = Arc::new(RwLock::new(store.peer_state()?));
+        let chain = store.epoch()?;
         let mut members: BTreeSet<String> = settings.peers.iter().cloned().collect();
         members.insert(settings.me.clone());
         let exchange = Arc::new(Exchange {
@@ -269,9 +275,11 @@ impl Peers {
             clock: clock.clone(),
             members: Mutex::new((members, None)),
             attested: Mutex::new(BTreeMap::new()),
+            epoch: Mutex::new(chain.clone()),
             changed: Notify::new(),
             failures: Mutex::new(BTreeMap::new()),
         });
+        exchange.server.publish_epoch(chain);
         let config = GossipConfig {
             round_interval: exchange.settings.interval,
             ..GossipConfig::default()
@@ -366,6 +374,7 @@ impl Peers {
             }
         }
         let candidate = trust.own_delegation(&state)?;
+        let epoch_successions: Vec<SignedSuccession> = state.successions().cloned().collect();
         if wrote || state.len() != before {
             x.store.store_peer_state(&state)?;
         }
@@ -386,7 +395,11 @@ impl Peers {
                 trusted.len(),
                 advertised.proof_count()
             );
-            x.server.publish(advertised, trusted);
+            x.server.publish(advertised, trusted.clone());
+        }
+        // §4.8: with the anchor role, keep the anchor epoch log current.
+        if let Some(anchor) = &x.anchor {
+            mint_epoch(x, realm, anchor, &trusted, &epoch_successions)?;
         }
         Ok(())
     }
@@ -401,8 +414,13 @@ impl Peers {
     pub async fn handle(&self, body: &[u8]) -> Result<Vec<u8>, Error> {
         let x = &self.exchange;
         let sync = PeerSync::from_bytes(body)?;
-        let cb =
-            PeerSync::channel_binding(&sync.sender, &sync.receiver, &sync.own, &sync.envelope)?;
+        let cb = PeerSync::channel_binding(
+            &sync.sender,
+            &sync.receiver,
+            &sync.own,
+            &sync.envelope,
+            &sync.chain,
+        )?;
         let directory = x.directory.clone();
         let token = sync.token.clone();
         let principal =
@@ -419,6 +437,25 @@ impl Peers {
         let fresh = lock(&x.attested).insert(sync.sender.clone(), own.clone()) != Some(own);
         if fresh {
             x.changed.notify_one();
+        }
+        // §4.8: adopt the peer's anchor epoch log when it is the longer
+        // valid one, and keep both signature sets on shared entries.
+        let theirs: Vec<SignedEpoch> = sync
+            .chain
+            .iter()
+            .filter_map(|b| epoch::decode(b).ok())
+            .collect();
+        if !theirs.is_empty() {
+            let mut chain = lock(&x.epoch);
+            let merged = merge_chain(&x.settings.realm, &x.policy, &chain, &theirs);
+            if merged != *chain {
+                *chain = merged;
+                if let Err(e) = x.store.store_epoch(&chain) {
+                    eprintln!("kuipad: anchor exchange: cannot store the anchor log: {e}");
+                }
+                x.server.publish_epoch(chain.clone());
+                x.changed.notify_one();
+            }
         }
         // The engine answers an envelope it cannot decode with nothing; a
         // real answer is never empty.
@@ -509,7 +546,8 @@ impl Exchange {
             }
         }
         .ok_or_else(|| failed("no own claim yet"))?;
-        let cb = PeerSync::channel_binding(&me, peer, &own, &envelope).map_err(failed)?;
+        let chain = self.epoch_bytes();
+        let cb = PeerSync::channel_binding(&me, peer, &own, &envelope, &chain).map_err(failed)?;
         let initiator = self.initiator.clone();
         let target = peer.to_owned();
         let token = tokio::task::spawn_blocking(move || initiator.token(&target, &cb))
@@ -522,6 +560,7 @@ impl Exchange {
             own,
             envelope,
             token,
+            chain,
         }
         .to_bytes();
         let response = self
@@ -545,6 +584,14 @@ impl Exchange {
             }
             status => Err(PeerError::Failed(format!("HTTP {status}"))),
         }
+    }
+
+    /// The chain entries, encoded for the wire (§4.8).
+    fn epoch_bytes(&self) -> Vec<Vec<u8>> {
+        lock(&self.epoch)
+            .iter()
+            .filter_map(|e| epoch::encode(e).ok())
+            .collect()
     }
 }
 
@@ -610,6 +657,82 @@ impl GossipHooks<String, AnchorState> for Exchange {
     async fn on_auth_rejected(&self, peer: &String) {
         eprintln!("kuipad: anchor exchange: {peer} refused our sync");
     }
+}
+
+/// §4.8: mint the next entry of the anchor epoch log when the trusted
+/// anchor keys or their proofs change, and publish the log.  Entries
+/// compare in their canonical form: the state's own order says nothing,
+/// only the entry's does.
+fn mint_epoch(
+    x: &Exchange,
+    realm: &str,
+    anchor: &SigningKey,
+    trusted: &[Thumbprint],
+    successions: &[SignedSuccession],
+) -> Result<(), Error> {
+    let mut chain = lock(&x.epoch);
+    let current = chain.last().and_then(|e| e.statement().ok());
+    let seq = current.as_ref().map_or(0, AnchorEpoch::seq);
+    let entry = AnchorEpoch::new(
+        realm,
+        seq + 1,
+        trusted.iter().copied(),
+        successions.iter().cloned(),
+    );
+    let fresh = current
+        .as_ref()
+        .is_none_or(|s| s.anchors() != entry.anchors() || s.successions() != entry.successions());
+    if fresh {
+        eprintln!(
+            "kuipad: anchor exchange: recording anchor epoch {}",
+            seq + 1
+        );
+        chain.push(SignedEpoch::issue(anchor, &entry)?);
+        x.store.store_epoch(&chain)?;
+        x.server.publish_epoch(chain.clone());
+    }
+    Ok(())
+}
+
+/// Merge a peer's anchor epoch log with ours (§4.8): the longer valid
+/// chain wins, entries both servers signed keep both signature sets, and
+/// a chain that does not continue itself or fails to vouch for itself is
+/// ignored.
+fn merge_chain(
+    realm: &str,
+    policy: &Policy,
+    ours: &[SignedEpoch],
+    theirs: &[SignedEpoch],
+) -> Vec<SignedEpoch> {
+    let valid = |chain: &[SignedEpoch]| {
+        let mut seq = 0;
+        chain.iter().all(|e| {
+            e.statement().is_ok_and(|ep| {
+                ep.realm() == realm
+                    && ep.seq() == seq + 1
+                    && e.verify(&ep, policy).is_ok_and(|v| !v.is_empty())
+                    && {
+                        seq = ep.seq();
+                        true
+                    }
+            })
+        })
+    };
+    let mut chain = ours.to_vec();
+    if valid(theirs) && theirs.len() > chain.len() {
+        chain = theirs.to_vec();
+        for e in &mut chain {
+            for o in ours {
+                let _ = e.merge(o);
+            }
+        }
+    }
+    for e in &mut chain {
+        for t in theirs {
+            let _ = e.merge(t);
+        }
+    }
+    chain
 }
 
 /// The agirru runtime: every part is the [`Exchange`].
@@ -687,5 +810,61 @@ mod tests {
         let bytes = CborCodec.encode(&envelope).unwrap();
         let back: Envelope<AnchorState> = CborCodec.decode(&bytes).unwrap();
         assert_eq!(back.state, state);
+    }
+
+    fn epoch_of(signers: &[&SigningKey], seq: u64) -> kuipa_enroll::epoch::SignedEpoch {
+        let named: Vec<tang_pqc::Thumbprint> =
+            signers.iter().map(|k| *k.public().thumbprint()).collect();
+        let entry = kuipa_enroll::epoch::AnchorEpoch::new("R", seq, named.iter().copied(), []);
+        kuipa_enroll::epoch::SignedEpoch::issue(signers[0], &entry).unwrap()
+    }
+
+    #[test]
+    fn the_longer_valid_chain_wins_and_keeps_both_signatures() {
+        let (a, b) = (
+            SigningKey::generate_preferred().unwrap(),
+            SigningKey::generate_preferred().unwrap(),
+        );
+        let ours = vec![epoch_of(&[&a, &b], 1)];
+        let mut e1b = epoch_of(&[&b, &a], 1);
+        assert!(e1b.merge(&epoch_of(&[&a, &b], 1)));
+        let theirs = vec![e1b, epoch_of(&[&b, &a], 2)];
+        let merged = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert_eq!(merged.len(), 2, "the longer chain is adopted");
+        let ep = merged[0].statement().unwrap();
+        assert_eq!(
+            merged[0].verify(&ep, &Policy::default()).unwrap(),
+            [a.public().thumbprint(), b.public().thumbprint()]
+                .into_iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "our signature survives the adoption"
+        );
+    }
+
+    #[test]
+    fn a_shorter_chain_only_adds_signatures() {
+        let (a, b) = (
+            SigningKey::generate_preferred().unwrap(),
+            SigningKey::generate_preferred().unwrap(),
+        );
+        let ours = vec![epoch_of(&[&a, &b], 1), epoch_of(&[&a, &b], 2)];
+        let theirs = vec![epoch_of(&[&b, &a], 1)];
+        let merged = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert_eq!(merged.len(), 2, "our longer chain stays");
+        let ep = merged[0].statement().unwrap();
+        assert_eq!(merged[0].verify(&ep, &Policy::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_chain_that_does_not_start_at_one_is_ignored() {
+        let a = SigningKey::generate_preferred().unwrap();
+        let ours = vec![epoch_of(&[&a], 1)];
+        let theirs = vec![epoch_of(&[&a], 2), epoch_of(&[&a], 3)];
+        let merged = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert_eq!(
+            merged, ours,
+            "a piece that does not start at the start proves nothing"
+        );
     }
 }
