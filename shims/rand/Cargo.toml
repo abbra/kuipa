@@ -1,0 +1,30 @@
+[package]
+name = "rand"
+# Stays 0.10-compatible so consumers' `rand = "0.10"` requirements match the
+# patch in the workspace Cargo.toml.
+version = "0.10.3"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The part of the rand 0.10 API that hickory uses, backed by OpenSSL's RAND_bytes through native-ossl"
+
+[dependencies]
+native-ossl.workspace = true
+
+# Mirror rand's feature surface so consumers' feature requests resolve; all
+# are no-ops: every value comes from OpenSSL's DRBG.
+[features]
+default = ["std", "std_rng", "sys_rng", "thread_rng"]
+alloc = []
+std = ["alloc"]
+std_rng = []
+sys_rng = []
+thread_rng = ["std", "std_rng", "sys_rng"]
+chacha = []
+log = []
+serde = []
+simd_support = []
+unbiased = []
+
+[lints]
+workspace = true
