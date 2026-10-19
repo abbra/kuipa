@@ -620,7 +620,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
     // The realm on `old`, its anchor log just started.
     let (keys, info, delegation) = server_keys(&old, "ipa1.example.test");
     let server = Arc::new(EnrollServer::new(keys, info, delegation));
-    let first = AnchorEpoch::new(REALM, 1, [old_pin], []);
+    let first = AnchorEpoch::new(REALM, 1, kuipa_enroll::epoch::GENESIS, [old_pin], []);
     let head1 = first.head().unwrap();
     let first_signed = SignedEpoch::issue(&old, &first).unwrap();
     server.publish_epoch(vec![first_signed.clone()]);
@@ -668,7 +668,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
     )
     .unwrap();
     delegation2.add_successions([succession.clone()]);
-    let second = AnchorEpoch::new(REALM, 2, [new_pin], [succession.clone()]);
+    let second = AnchorEpoch::new(REALM, 2, head1, [new_pin], [succession.clone()]);
     let head2 = second.head().unwrap();
     let server2 = Arc::new(EnrollServer::new(keys2, info2, delegation2));
     server2.publish_epoch(vec![
@@ -725,7 +725,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
     // different entries; the host sees the fork.
     let (keys4, info4, mut delegation4) = server_keys(&new, "ipa1.example.test");
     delegation4.add_successions([succession]);
-    let forked = AnchorEpoch::new(REALM, 2, [new_pin, alien_pin], []);
+    let forked = AnchorEpoch::new(REALM, 2, head1, [new_pin, alien_pin], []);
     let server4 = Arc::new(EnrollServer::new(keys4, info4, delegation4));
     server4.publish_epoch(vec![
         SignedEpoch::issue(&old, &first).unwrap(),

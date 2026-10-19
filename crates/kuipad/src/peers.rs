@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -158,6 +159,12 @@ pub struct Exchange {
     attested: Mutex<BTreeMap<String, Delegation>>,
     /// The anchor epoch log (§4.8).
     epoch: Mutex<Vec<SignedEpoch>>,
+    /// The log of another server disagrees with ours at a sequence both
+    /// have: appending is paused until the two are reconciled.
+    forked: AtomicBool,
+    /// The contents the next epoch entry would carry and when they
+    /// were first seen: minting waits for a full round of stability.
+    settling: Mutex<Option<([u8; 32], Instant)>>,
     changed: Notify,
     client: reqwest::Client,
     /// The last failure per peer, so each is logged once.
@@ -276,6 +283,8 @@ impl Peers {
             members: Mutex::new((members, None)),
             attested: Mutex::new(BTreeMap::new()),
             epoch: Mutex::new(chain.clone()),
+            forked: AtomicBool::new(false),
+            settling: Mutex::new(None),
             changed: Notify::new(),
             failures: Mutex::new(BTreeMap::new()),
         });
@@ -438,24 +447,52 @@ impl Peers {
         if fresh {
             x.changed.notify_one();
         }
-        // §4.8: adopt the peer's anchor epoch log when it is the longer
-        // valid one, and keep both signature sets on shared entries.
+        // §4.8: merge the peer's window of the anchor epoch log:
+        // shared entries keep both signature sets, a window that
+        // continues our log is adopted, a window that jumps past our
+        // end is fetched, and a disagreement on a sequence both have
+        // pauses appending — two servers must not keep extending
+        // divergent histories.
         let theirs: Vec<SignedEpoch> = sync
             .chain
             .iter()
             .filter_map(|b| epoch::decode(b).ok())
             .collect();
+        let mut gap = false;
         if !theirs.is_empty() {
             let mut chain = lock(&x.epoch);
-            let merged = merge_chain(&x.settings.realm, &x.policy, &chain, &theirs);
+            let (merged, outcome) = merge_chain(&x.settings.realm, &x.policy, &chain, &theirs);
             if merged != *chain {
-                *chain = merged;
-                if let Err(e) = x.store.store_epoch(&chain) {
+                // Store before committing in memory: an unstored log is
+                // not a record, and a failed write then retries next
+                // round instead of advertising from memory alone.
+                if let Err(e) = x.store.store_epoch(&merged) {
                     eprintln!("kuipad: anchor exchange: cannot store the anchor log: {e}");
+                } else {
+                    *chain = merged;
+                    x.server.publish_epoch(chain.clone());
+                    x.changed.notify_one();
                 }
-                x.server.publish_epoch(chain.clone());
-                x.changed.notify_one();
             }
+            drop(chain);
+            match outcome {
+                Merge::Conflict => {
+                    if !x.forked.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "kuipad: anchor exchange: {}'s anchor log disagrees with ours at a sequence both have; this server will not extend its own until they are reconciled",
+                            sync.sender
+                        );
+                    }
+                }
+                Merge::Gap => gap = true,
+                Merge::Kept | Merge::Extended => {}
+            }
+        }
+        if gap && let Err(e) = x.catch_up(&sync.sender).await {
+            eprintln!(
+                "kuipad: anchor exchange: cannot fetch the anchor log from {}: {e}",
+                sync.sender
+            );
         }
         // The engine answers an envelope it cannot decode with nothing; a
         // real answer is never empty.
@@ -507,12 +544,16 @@ impl Exchange {
         }
     }
 
-    fn url(&self, peer: &str) -> String {
-        let base = self.settings.endpoints.get(peer).map_or_else(
+    fn base(&self, peer: &str) -> String {
+        let origin = self.settings.endpoints.get(peer).map_or_else(
             || format!("https://{peer}"),
             |b| b.trim_end_matches('/').to_owned(),
         );
-        format!("{base}/ipa/ku/peer/sync")
+        format!("{origin}/ipa/ku")
+    }
+
+    fn url(&self, peer: &str) -> String {
+        format!("{}/peer/sync", self.base(peer))
     }
 }
 
@@ -586,12 +627,50 @@ impl Exchange {
         }
     }
 
-    /// The chain entries, encoded for the wire (§4.8).
+    /// A bounded tail window of the chain, encoded for the wire (§4.8).
     fn epoch_bytes(&self) -> Vec<Vec<u8>> {
-        lock(&self.epoch)
-            .iter()
-            .filter_map(|e| epoch::encode(e).ok())
-            .collect()
+        epoch_window(&lock(&self.epoch))
+    }
+
+    /// §4.8: our sync window left a gap for this peer: page the
+    /// missing entries from its public anchor log and append them,
+    /// storing each page before publishing it.
+    async fn catch_up(&self, peer: &str) -> Result<(), Error> {
+        let (mut seq, mut head) = lock(&self.epoch)
+            .last()
+            .and_then(|t| t.statement().ok())
+            .map_or((0, epoch::GENESIS), |t| {
+                (t.seq(), t.head().unwrap_or(epoch::GENESIS))
+            });
+        loop {
+            let response = self
+                .client
+                .get(format!("{}/anchor-log?from={}", self.base(peer), seq))
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(format!("HTTP {}", response.status()).into());
+            }
+            let body: serde_json::Value = serde_json::from_str(&response.text().await?)?;
+            let entries: Vec<SignedEpoch> = serde_json::from_value(body["entries"].clone())?;
+            if entries.is_empty() {
+                return Ok(()); // they hold nothing past our head after all
+            }
+            let reached = epoch::verify_chain(
+                &entries,
+                &self.settings.realm,
+                &self.server.anchors(),
+                Some((seq, head)),
+                &self.policy,
+            )
+            .map_err(|e| format!("{peer}: {e}"))?;
+            let mut chain = lock(&self.epoch).clone();
+            chain.extend(entries);
+            self.store.store_epoch(&chain)?;
+            self.server.publish_epoch(chain);
+            self.changed.notify_one();
+            (seq, head) = reached;
+        }
     }
 }
 
@@ -662,7 +741,9 @@ impl GossipHooks<String, AnchorState> for Exchange {
 /// §4.8: mint the next entry of the anchor epoch log when the trusted
 /// anchor keys or their proofs change, and publish the log.  Entries
 /// compare in their canonical form: the state's own order says nothing,
-/// only the entry's does.
+/// only the entry's does.  A fresh entry commits to the head of its
+/// predecessor; while a fork with a peer is unreconciled the log is
+/// left alone.
 fn mint_epoch(
     x: &Exchange,
     realm: &str,
@@ -670,69 +751,180 @@ fn mint_epoch(
     trusted: &[Thumbprint],
     successions: &[SignedSuccession],
 ) -> Result<(), Error> {
+    if x.forked.load(Ordering::Relaxed) {
+        return Ok(()); // handle() said why; reconciling is an operator's job
+    }
     let mut chain = lock(&x.epoch);
     let current = chain.last().and_then(|e| e.statement().ok());
+    let prev = match current.as_ref() {
+        None => epoch::GENESIS,
+        Some(last) => last.head()?,
+    };
     let seq = current.as_ref().map_or(0, AnchorEpoch::seq);
     let entry = AnchorEpoch::new(
         realm,
         seq + 1,
+        prev,
         trusted.iter().copied(),
         successions.iter().cloned(),
     );
     let fresh = current
         .as_ref()
         .is_none_or(|s| s.anchors() != entry.anchors() || s.successions() != entry.successions());
-    if fresh {
-        eprintln!(
-            "kuipad: anchor exchange: recording anchor epoch {}",
-            seq + 1
-        );
-        chain.push(SignedEpoch::issue(anchor, &entry)?);
-        x.store.store_epoch(&chain)?;
-        x.server.publish_epoch(chain.clone());
+    if !fresh {
+        *lock(&x.settling) = None;
+        return Ok(());
     }
+    // Mint only once the state an entry would carry has stood unchanged
+    // for a full exchange round: two servers that hear about a change
+    // at different moments then extend the same entry, not divergent
+    // ones that neither can rejoin.
+    let head = entry.head()?;
+    let seen = {
+        let mut settling = lock(&x.settling);
+        match settling.as_ref() {
+            Some((h, t)) if *h == head => Some(*t),
+            _ => {
+                *settling = Some((head, Instant::now()));
+                None
+            }
+        }
+    };
+    let Some(seen) = seen else {
+        return Ok(());
+    };
+    if seen.elapsed() < x.settings.interval {
+        return Ok(());
+    }
+    eprintln!(
+        "kuipad: anchor exchange: recording anchor epoch {}",
+        seq + 1
+    );
+    let mut candidate = chain.clone();
+    candidate.push(SignedEpoch::issue(anchor, &entry)?);
+    // Store before committing in memory: a log that was not written
+    // down is not a record, and a failed write then retries next
+    // round rather than being advertised from memory alone.
+    x.store.store_epoch(&candidate)?;
+    chain.clone_from(&candidate);
+    *lock(&x.settling) = None;
+    x.server.publish_epoch(candidate);
     Ok(())
 }
 
-/// Merge a peer's anchor epoch log with ours (§4.8): the longer valid
-/// chain wins, entries both servers signed keep both signature sets, and
-/// a chain that does not continue itself or fails to vouch for itself is
-/// ignored.
+/// What a peer's window of the anchor epoch log means for ours.
+enum Merge {
+    /// Nothing to adopt; shared entries, if any, merged signatures.
+    Kept,
+    /// The window vouched for itself and continued our log: adopted.
+    Extended,
+    /// The window jumps past our end; fetch what lies between first.
+    Gap,
+    /// At a sequence both hold, the statements differ: the logs have
+    /// forked, and appending must pause until an operator reconciles.
+    Conflict,
+}
+
+/// Merge a peer's window of the anchor epoch log with ours (§4.8).
+/// Entries both servers hold merge signature sets whatever follows.  A
+/// window is adopted only when it vouches for itself — signatures from
+/// the anchors each entry names, contiguous sequences, and every entry
+/// committing to the one before it — and continues our log: at the
+/// junction its entry's predecessor must be our head.  A window that
+/// reaches past our end without a shared entry leaves a gap for the
+/// caller to fetch; a statement that disagrees with a sequence we
+/// already have is a fork, and our log stands.
 fn merge_chain(
     realm: &str,
     policy: &Policy,
     ours: &[SignedEpoch],
     theirs: &[SignedEpoch],
-) -> Vec<SignedEpoch> {
-    let valid = |chain: &[SignedEpoch]| {
-        let mut seq = 0;
-        chain.iter().all(|e| {
-            e.statement().is_ok_and(|ep| {
-                ep.realm() == realm
-                    && ep.seq() == seq + 1
-                    && e.verify(&ep, policy).is_ok_and(|v| !v.is_empty())
-                    && {
-                        seq = ep.seq();
-                        true
-                    }
-            })
-        })
-    };
+) -> (Vec<SignedEpoch>, Merge) {
+    // Check the whole window before trusting any of it: a half-vouched
+    // chain proves nothing, and a window that breaks inside cannot link.
+    let mut window: Vec<(u64, AnchorEpoch, &SignedEpoch)> = Vec::new();
+    let mut expect = None; // (next sequence, head the next entry must name)
+    for signed in theirs {
+        let Ok(epoch) = signed.statement() else {
+            return (ours.to_vec(), Merge::Kept);
+        };
+        if epoch.realm() != realm || !signed.verify(&epoch, policy).is_ok_and(|v| !v.is_empty()) {
+            return (ours.to_vec(), Merge::Kept);
+        }
+        if let Some((seq, head)) = expect
+            && (epoch.seq() != seq || epoch.prev() != head)
+        {
+            return (ours.to_vec(), Merge::Kept);
+        }
+        let Ok(head) = epoch.head() else {
+            return (ours.to_vec(), Merge::Kept);
+        };
+        expect = Some((epoch.seq() + 1, head));
+        window.push((epoch.seq(), epoch, signed));
+    }
+    // Shared range: signatures always merge; a different statement at
+    // the same sequence is the fork itself.
     let mut chain = ours.to_vec();
-    if valid(theirs) && theirs.len() > chain.len() {
-        chain = theirs.to_vec();
-        for e in &mut chain {
-            for o in ours {
-                let _ = e.merge(o);
+    let mut conflict = false;
+    for (seq, epoch, signed) in &window {
+        let Some(pos) = chain
+            .iter()
+            .position(|o| o.statement().is_ok_and(|s| s.seq() == *seq))
+        else {
+            continue;
+        };
+        if chain[pos].statement().is_ok_and(|s| s == *epoch) {
+            let _ = chain[pos].merge(signed);
+        } else {
+            conflict = true;
+        }
+    }
+    if conflict {
+        return (chain, Merge::Conflict);
+    }
+    // Past our end: link or leave a gap.
+    let (last_seq, last_head) = match chain.last().and_then(|t| t.statement().ok()) {
+        None => (0, epoch::GENESIS),
+        Some(t) => (t.seq(), t.head().unwrap_or(epoch::GENESIS)),
+    };
+    match window.iter().find(|(seq, _, _)| *seq > last_seq) {
+        None => (chain, Merge::Kept), // the window is fully shared
+        Some((first, _, _)) if *first > last_seq + 1 => (chain, Merge::Gap),
+        Some((_, epoch, _)) if epoch.prev() != last_head => (chain, Merge::Conflict),
+        Some(_) => {
+            for (_, _, signed) in window.iter().filter(|(seq, _, _)| *seq > last_seq) {
+                chain.push((*signed).clone());
             }
+            (chain, Merge::Extended)
         }
     }
-    for e in &mut chain {
-        for t in theirs {
-            let _ = e.merge(t);
+}
+
+/// The most chain bytes a sync carries; a receiver left further behind
+/// catches up through the public anchor log ([`Exchange::catch_up`]).
+const MAX_SYNC_EPOCH_BYTES: usize = 32 * 1024;
+
+/// A bounded window of the chain for the wire: the newest entries, in
+/// order, up to the byte budget and one page of the anchor log, and
+/// always the newest entry itself.
+fn epoch_window(chain: &[SignedEpoch]) -> Vec<Vec<u8>> {
+    let mut window: Vec<Vec<u8>> = Vec::new();
+    let mut bytes = 0;
+    for entry in chain.iter().rev() {
+        let Ok(encoded) = epoch::encode(entry) else {
+            continue;
+        };
+        if !window.is_empty()
+            && (bytes + encoded.len() > MAX_SYNC_EPOCH_BYTES
+                || window.len() >= epoch::MAX_EPOCH_FETCH)
+        {
+            break;
         }
+        bytes += encoded.len();
+        window.push(encoded);
     }
-    chain
+    window.reverse();
+    window
 }
 
 /// The agirru runtime: every part is the [`Exchange`].
@@ -812,25 +1004,39 @@ mod tests {
         assert_eq!(back.state, state);
     }
 
-    fn epoch_of(signers: &[&SigningKey], seq: u64) -> kuipa_enroll::epoch::SignedEpoch {
+    fn epoch_at(
+        prev: [u8; 32],
+        seq: u64,
+        signers: &[&SigningKey],
+    ) -> kuipa_enroll::epoch::SignedEpoch {
         let named: Vec<tang_pqc::Thumbprint> =
             signers.iter().map(|k| *k.public().thumbprint()).collect();
-        let entry = kuipa_enroll::epoch::AnchorEpoch::new("R", seq, named.iter().copied(), []);
+        let entry =
+            kuipa_enroll::epoch::AnchorEpoch::new("R", seq, prev, named.iter().copied(), []);
         kuipa_enroll::epoch::SignedEpoch::issue(signers[0], &entry).unwrap()
     }
 
+    fn head_of(signed: &kuipa_enroll::epoch::SignedEpoch) -> [u8; 32] {
+        signed.statement().unwrap().head().unwrap()
+    }
+
     #[test]
-    fn the_longer_valid_chain_wins_and_keeps_both_signatures() {
+    fn a_longer_window_that_continues_the_log_is_adopted_and_keeps_both_signatures() {
         let (a, b) = (
             SigningKey::generate_preferred().unwrap(),
             SigningKey::generate_preferred().unwrap(),
         );
-        let ours = vec![epoch_of(&[&a, &b], 1)];
-        let mut e1b = epoch_of(&[&b, &a], 1);
-        assert!(e1b.merge(&epoch_of(&[&a, &b], 1)));
-        let theirs = vec![e1b, epoch_of(&[&b, &a], 2)];
-        let merged = merge_chain("R", &Policy::default(), &ours, &theirs);
-        assert_eq!(merged.len(), 2, "the longer chain is adopted");
+        let ours = vec![epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&a, &b])];
+        // the same entry, signed by b: named anchors are sorted, so
+        // order says nothing
+        let e1b = epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&b, &a]);
+        let theirs = vec![e1b.clone(), epoch_at(head_of(&e1b), 2, &[&b, &a])];
+        let (merged, outcome) = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert!(
+            matches!(outcome, Merge::Extended),
+            "the window continues ours"
+        );
+        assert_eq!(merged.len(), 2, "the longer window is adopted");
         let ep = merged[0].statement().unwrap();
         assert_eq!(
             merged[0].verify(&ep, &Policy::default()).unwrap(),
@@ -843,28 +1049,98 @@ mod tests {
     }
 
     #[test]
-    fn a_shorter_chain_only_adds_signatures() {
+    fn a_shorter_window_only_adds_signatures() {
         let (a, b) = (
             SigningKey::generate_preferred().unwrap(),
             SigningKey::generate_preferred().unwrap(),
         );
-        let ours = vec![epoch_of(&[&a, &b], 1), epoch_of(&[&a, &b], 2)];
-        let theirs = vec![epoch_of(&[&b, &a], 1)];
-        let merged = merge_chain("R", &Policy::default(), &ours, &theirs);
+        let e1 = epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&a, &b]);
+        let ours = vec![e1.clone(), epoch_at(head_of(&e1), 2, &[&a, &b])];
+        let theirs = vec![epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&b, &a])];
+        let (merged, outcome) = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert!(matches!(outcome, Merge::Kept), "nothing past our head");
         assert_eq!(merged.len(), 2, "our longer chain stays");
         let ep = merged[0].statement().unwrap();
         assert_eq!(merged[0].verify(&ep, &Policy::default()).unwrap().len(), 2);
     }
 
     #[test]
-    fn a_chain_that_does_not_start_at_one_is_ignored() {
+    fn a_different_statement_at_a_sequence_we_hold_is_a_fork() {
+        let (a, b) = (
+            SigningKey::generate_preferred().unwrap(),
+            SigningKey::generate_preferred().unwrap(),
+        );
+        let ours = vec![epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&a])];
+        let e1b = epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&b]);
+        let theirs = vec![e1b.clone(), epoch_at(head_of(&e1b), 2, &[&b])];
+        let (merged, outcome) = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert!(
+            matches!(outcome, Merge::Conflict),
+            "the longer divergent chain is not adopted"
+        );
+        assert_eq!(merged, ours, "our log stands");
+    }
+
+    #[test]
+    fn a_window_that_does_not_commit_to_our_head_is_a_fork() {
         let a = SigningKey::generate_preferred().unwrap();
-        let ours = vec![epoch_of(&[&a], 1)];
-        let theirs = vec![epoch_of(&[&a], 2), epoch_of(&[&a], 3)];
-        let merged = merge_chain("R", &Policy::default(), &ours, &theirs);
+        let ours = vec![epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&a])];
+        let e2 = epoch_at([9; 32], 2, &[&a]);
+        let theirs = vec![e2.clone(), epoch_at(head_of(&e2), 3, &[&a])];
+        let (merged, outcome) = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert!(
+            matches!(outcome, Merge::Conflict),
+            "an entry naming another predecessor forks from our head"
+        );
+        assert_eq!(merged, ours);
+    }
+
+    #[test]
+    fn a_window_past_our_end_without_a_shared_entry_leaves_a_gap() {
+        let a = SigningKey::generate_preferred().unwrap();
+        let ours = vec![epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&a])];
+        let e5 = epoch_at([7; 32], 5, &[&a]);
+        let theirs = vec![e5.clone(), epoch_at(head_of(&e5), 6, &[&a])];
+        let (merged, outcome) = merge_chain("R", &Policy::default(), &ours, &theirs);
+        assert!(
+            matches!(outcome, Merge::Gap),
+            "what lies between is fetched, not assumed"
+        );
+        assert_eq!(merged, ours);
+    }
+
+    #[test]
+    fn the_sync_window_is_a_recent_tail_within_budget() {
+        let a = SigningKey::generate_preferred().unwrap();
+        let mut chain = Vec::new();
+        let mut prev = kuipa_enroll::epoch::GENESIS;
+        for seq in 1..=8 {
+            let entry = epoch_at(prev, seq, &[&a]);
+            prev = head_of(&entry);
+            chain.push(entry);
+        }
+        let full: Vec<Vec<u8>> = chain
+            .iter()
+            .map(|e| kuipa_enroll::epoch::encode(e).unwrap())
+            .collect();
+        assert!(
+            full.iter().map(Vec::len).sum::<usize>() > MAX_SYNC_EPOCH_BYTES,
+            "the fixture must be long enough to cut"
+        );
+        let window = epoch_window(&chain);
+        assert!(
+            !window.is_empty() && window.len() < chain.len(),
+            "a bounded tail"
+        );
         assert_eq!(
-            merged, ours,
-            "a piece that does not start at the start proves nothing"
+            window,
+            full[full.len() - window.len()..],
+            "the window is the newest suffix, in order"
+        );
+        let bytes: usize = window.iter().map(Vec::len).sum();
+        assert!(
+            bytes <= MAX_SYNC_EPOCH_BYTES + full.last().unwrap().len(),
+            "the newest entry is always carried; nothing else overruns the budget"
         );
     }
 }

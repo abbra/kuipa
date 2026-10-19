@@ -8,9 +8,7 @@ use tang_pqc::wire::{Reader, Writer};
 use crate::error::{Error, Result};
 use crate::keytab::Keytab;
 
-const MAGIC: [u8; 4] = *b"IPJQ";
-/// Enrollments from before the anchor epoch log (§4.8).
-const LEGACY_MAGIC: [u8; 4] = *b"IPJP";
+const MAGIC: [u8; 4] = *b"IPJP";
 
 /// The realm configuration a host needs, beyond its keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,9 +89,7 @@ impl Enrollment {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let with_epoch = bytes.starts_with(&MAGIC);
-        let magic = if with_epoch { MAGIC } else { LEGACY_MAGIC };
-        let mut r = Reader::new(bytes, magic, "enrollment")?;
+        let mut r = Reader::new(bytes, MAGIC, "enrollment")?;
         let realm = r.str()?.to_owned();
         let domain = r.str()?.to_owned();
         let basedn = r.str()?.to_owned();
@@ -110,11 +106,7 @@ impl Enrollment {
         let anchors = (0..r.u8()?)
             .map(|_| r.fixed().map(Thumbprint::from_bytes))
             .collect::<Result<_, _>>()?;
-        let (epoch_seq, epoch_head) = if with_epoch {
-            (r.u64()?, r.fixed()?)
-        } else {
-            (0, [0; 32])
-        };
+        let (epoch_seq, epoch_head) = (r.u64()?, r.fixed()?);
         let keytab = Keytab::from_mit(r.bytes()?)?;
         r.finish()?;
         if keytab.principal().realm() != realm {
@@ -181,22 +173,5 @@ pub(crate) mod tests {
         assert_eq!((back.epoch_seq, back.epoch_head), (7, [9; 32]));
         assert_eq!(back.keytab.kvno(), Some(1));
         assert!(Enrollment::from_bytes(&bytes.as_ref()[..bytes.len() - 1]).is_err());
-    }
-
-    #[test]
-    fn a_payload_from_an_older_server_carries_no_epoch() {
-        let mut w = Writer::new(LEGACY_MAGIC);
-        let c = RealmConfig {
-            realm: "EXAMPLE.TEST".into(),
-            domain: "example.test".into(),
-            basedn: "dc=example,dc=test".into(),
-            issuer: "ipa1.example.test".into(),
-            servers: vec![],
-        };
-        w.str(&c.realm).str(&c.domain).str(&c.basedn).str(&c.issuer);
-        w.u8(0).u8(0).u8(0).u8(0);
-        w.bytes(keytab("a.example.test", 1).to_mit().unwrap().as_ref());
-        let back = Enrollment::from_bytes(&w.finish()).unwrap();
-        assert_eq!((back.epoch_seq, back.epoch_head), (0, [0; 32]));
     }
 }
