@@ -1101,6 +1101,7 @@ rebinding, resealing, anchor refresh) happen inside them.
 | `trusted-realms` | install, refresh and remove the trusted realms the host's realm advertises: their anchors, PKINIT anchors, CA and `krb5.conf.d` snippets (§17.3) |
 | `status` | local state: realm, principal, kvno, servers, anchors, trusted realms, protection, pending steps, which ML-KEM sets the system policy allows |
 | `check [--server S]` | for each server: advertisement and delegation (warns under 14 days, and when only a succession of rotated anchors verifies it, §4.7), a `kinit` with the host keys, and a test unseal when protected; each problem with the fix |
+| `advertisement [--server S… \| --domain D] [--enrollment-file F \| --realm R]` | for each server: its verified advertisement — realm, domain, KDCs, signing key and which anchor proves it, delegation and vouch lifetimes, join/escrow keys, CA and PKINIT anchors, trusted realms — and the anchor log behind its head: every entry with its landmark head and successions (§4.8); reads and verifies, writes nothing |
 | `leave` | remove what kuipa installed besides the keytab (sealed file, anchors, generated Kerberos files, machine key, state); a sealed keytab is first written back in plain form for `ipa-join --unenroll` |
 
 Common rules:
