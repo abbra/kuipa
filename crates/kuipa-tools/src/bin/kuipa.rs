@@ -26,6 +26,12 @@
 //! kuipa trusted-realms                      accept users of the realms this
 //!                                            realm trusts (their KDCs and
 //!                                            PKINIT anchors, verified)
+//! kuipa advertisement [--server S... | --domain D]
+//!                     [--enrollment-file F | --realm R]
+//!                                            what each server
+//!                                            advertises, verified, and the
+//!                                            realm's anchor log: its
+//!                                            landmark chain (§4.8)
 //! kuipa status | check [--server S]         is this host healthy?
 //! kuipa leave                               remove kuipa state
 //! ```
@@ -205,6 +211,15 @@ enum Command {
     /// Print the realms this realm trusts (their KDCs and PKINIT anchors,
     /// verified), so their users can log in here.
     TrustedRealms,
+    /// Print what each server of the deployment advertises, verified
+    /// against the enrollment string's anchor or the pre-provisioned
+    /// pins, and the realm's anchor log (landmarks) it names (§4.8).
+    Advertisement {
+        #[command(flatten)]
+        realm: RealmInput,
+        #[command(flatten)]
+        deployment: DeploymentInput,
+    },
     /// Is this host healthy?
     Status,
     /// Check this host's enrollment against the realm.
@@ -242,6 +257,7 @@ impl Command {
             Command::Protect => "protect",
             Command::Unprotect => "unprotect",
             Command::TrustedRealms => "trusted-realms",
+            Command::Advertisement { .. } => "advertisement",
             Command::Status => "status",
             Command::Check { .. } => "check",
             Command::Leave => "leave",
@@ -292,6 +308,14 @@ impl Command {
                 a.set("domain", deployment.domain.as_deref());
                 a.set("hostname", deployment.hostname.as_deref());
                 a.set("krb5-dir", Some(krb5_dir.as_str()));
+            }
+            Command::Advertisement { realm, deployment } => {
+                a.set("enrollment-file", realm.enrollment_file.as_deref());
+                a.set("realm", realm.realm.as_deref());
+                a.set("password-file", realm.password_file.as_deref());
+                a.set_all("server", &deployment.server);
+                a.set("domain", deployment.domain.as_deref());
+                a.set("hostname", deployment.hostname.as_deref());
             }
             Command::Check { server } => a.set_all("server", server),
             _ => {}
@@ -634,6 +658,15 @@ fn run(args: &Args) -> Result<Value, Error> {
         "protect" => flows::protect(&paths),
         "unprotect" => flows::unprotect(&paths),
         "trusted-realms" => flows::trusted_realms(&paths),
+        "advertisement" => {
+            let deployment = args.deployment()?;
+            let (pins, _) = args.pins(&paths, false)?;
+            Ok(flows::advertisements(
+                &pins.realm,
+                &pins.anchors,
+                &deployment,
+            ))
+        }
         "status" => flows::status(&paths),
         "check" => flows::check(&paths, args.option("server")),
         "leave" => flows::leave(&paths),
