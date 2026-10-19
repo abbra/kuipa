@@ -33,6 +33,9 @@ pub enum Error {
     /// A peer sync is not for this server, or its token does not
     /// authenticate the sender it names (§4.2).
     PeerSync(&'static str),
+    /// The advertisement verifies but describes another deployment than
+    /// the client was told to join (§4.6): the message names both.
+    Deployment(String),
 }
 
 impl fmt::Display for Error {
@@ -50,6 +53,7 @@ impl fmt::Display for Error {
             Self::Missing(what) => write!(f, "missing {what}"),
             Self::Insecure(what) => write!(f, "{what} requires an explicit opt-in"),
             Self::PeerSync(what) => write!(f, "peer sync refused: {what}"),
+            Self::Deployment(why) => f.write_str(why),
         }
     }
 }

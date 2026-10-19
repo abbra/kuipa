@@ -14,7 +14,7 @@ use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::payload::{Enrollment, RealmConfig};
-use kuipa_enroll::realm::{RealmInfo, ServerKeys};
+use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys};
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::Paths;
@@ -195,6 +195,21 @@ fn spawn(app: Arc<App<Dir>>) -> String {
     url
 }
 
+/// Serve `app` as server `name` for this test's thread: the client dials
+/// `name`, as it would in a real deployment, and reaches the test server.
+fn serve_as(name: &str, app: Arc<App<Dir>>) -> String {
+    let url = spawn(app);
+    kuipa_tools::net::set_thread_endpoint(name, &url);
+    name.to_owned()
+}
+
+/// Make server `name` unreachable for this test's thread (nothing listens
+/// on port 9).
+fn down(name: &str) -> String {
+    kuipa_tools::net::set_thread_endpoint(name, "http://127.0.0.1:9");
+    name.to_owned()
+}
+
 /// A client root in a temporary directory, removed when dropped.
 struct TempRoot {
     dir: PathBuf,
@@ -243,17 +258,20 @@ fn online_enrollment_with_failover() {
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
-    let url = spawn(Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        directory: dir,
-    }));
+    let url = serve_as(
+        "ipa2.example.test",
+        Arc::new(App {
+            server: Arc::new(EnrollServer::new(keys, info, delegation)),
+            peers: None,
+            limiter: kuipad::limit::Limiter::default(),
+            tang: None,
+            directory: dir,
+        }),
+    );
     let paths = root("online");
 
     // ipa1 is down (nothing listens on port 9): fail over to ipa2.
-    let dead = "http://127.0.0.1:9".to_owned();
+    let dead = down("ipa1.example.test");
     let mut s = string(&anchor, b"Secret123");
     let otp = s.take_secret().unwrap();
     let (result, trace) = traced(|| {
@@ -263,7 +281,7 @@ fn online_enrollment_with_failover() {
             &[*s.anchor()],
             &Auth::LdapOtp(otp),
             HOST,
-            &[dead.clone(), url.clone()],
+            &Deployment::servers(&[dead.clone(), url.clone()]),
         )
     });
     let result = result.unwrap();
@@ -303,7 +321,7 @@ fn online_enrollment_with_failover() {
         &[*s.anchor()],
         &Auth::LdapOtp(otp),
         HOST,
-        &[url],
+        &Deployment::servers(&[url]),
     )
     .unwrap_err();
     assert!(
@@ -320,7 +338,7 @@ fn online_enrollment_with_failover() {
         &[*s.anchor()],
         &Auth::LdapOtp(otp),
         HOST,
-        &[dead],
+        &Deployment::servers(&[dead]),
     )
     .unwrap_err();
     assert!(
@@ -341,19 +359,22 @@ fn guessing_is_rate_limited_per_host() {
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
-    let url = spawn(Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        directory: dir,
-        peers: None,
-        limiter: Limiter::new(Limits {
-            per_host: Rate {
-                burst: 1.0,
-                per_minute: 0.01,
-            },
-            ..Limits::default()
+    let url = serve_as(
+        "ipa1.example.test",
+        Arc::new(App {
+            server: Arc::new(EnrollServer::new(keys, info, delegation)),
+            directory: dir,
+            peers: None,
+            limiter: Limiter::new(Limits {
+                per_host: Rate {
+                    burst: 1.0,
+                    per_minute: 0.01,
+                },
+                ..Limits::default()
+            }),
+            tang: None,
         }),
-        tang: None,
-    }));
+    );
     let guess = |otp: &[u8]| {
         let mut s = string(&anchor, otp);
         let otp = s.take_secret().unwrap();
@@ -363,7 +384,7 @@ fn guessing_is_rate_limited_per_host() {
             &[*s.anchor()],
             &Auth::LdapOtp(otp),
             HOST,
-            std::slice::from_ref(&url),
+            &Deployment::servers(std::slice::from_ref(&url)),
         )
         .unwrap_err()
     };
@@ -385,13 +406,16 @@ fn guessing_is_rate_limited_per_host() {
 fn wrong_anchor_is_not_a_usable_server() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
-    let url = spawn(Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        directory: Dir::default(),
-    }));
+    let url = serve_as(
+        "ipa1.example.test",
+        Arc::new(App {
+            server: Arc::new(EnrollServer::new(keys, info, delegation)),
+            peers: None,
+            limiter: kuipad::limit::Limiter::default(),
+            tang: None,
+            directory: Dir::default(),
+        }),
+    );
     let other = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let mut s = string(&other, b"Secret123");
     let otp = s.take_secret().unwrap();
@@ -401,7 +425,7 @@ fn wrong_anchor_is_not_a_usable_server() {
         &[*s.anchor()],
         &Auth::LdapOtp(otp),
         HOST,
-        &[url],
+        &Deployment::servers(&[url]),
     )
     .unwrap_err();
     assert!(err.to_string().contains("anchor"), "{err}");
@@ -428,13 +452,16 @@ fn rotated_anchors_are_followed_and_old_strings_expire() {
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
-    let url = spawn(Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        directory: dir,
-    }));
+    let url = serve_as(
+        "ipa1.example.test",
+        Arc::new(App {
+            server: Arc::new(EnrollServer::new(keys, info, delegation)),
+            peers: None,
+            limiter: kuipad::limit::Limiter::default(),
+            tang: None,
+            directory: dir,
+        }),
+    );
 
     // A string that still names the old anchor works through the
     // succession, and the host stores the realm's current anchors.
@@ -449,7 +476,7 @@ fn rotated_anchors_are_followed_and_old_strings_expire() {
             &[*s.anchor()],
             &Auth::LdapOtp(otp),
             HOST,
-            std::slice::from_ref(&url),
+            &Deployment::servers(std::slice::from_ref(&url)),
         )
     });
     result.unwrap();
@@ -567,7 +594,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
         tang: None,
         directory: Dir::default(),
     });
-    let url = spawn(app.clone());
+    let url = serve_as("ipa1.example.test", app.clone());
     let otp = || {
         app.directory
             .otps
@@ -589,7 +616,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     let info = flows::realm_info(
         REALM,
         &[*anchor.public().thumbprint()],
-        std::slice::from_ref(&url),
+        &Deployment::servers(std::slice::from_ref(&url)),
         &dir,
     )
     .unwrap();
@@ -611,7 +638,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
         &[*s.anchor()],
         &Auth::LdapOtp(Secret::new(b"guess")),
         HOST,
-        std::slice::from_ref(&url),
+        &Deployment::servers(std::slice::from_ref(&url)),
     )
     .unwrap_err();
     assert!(matches!(
@@ -625,7 +652,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
             &[*s.anchor()],
             &otp(),
             HOST,
-            std::slice::from_ref(&url),
+            &Deployment::servers(std::slice::from_ref(&url)),
         )
     });
     result.unwrap();
@@ -654,14 +681,20 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     )
     .unwrap();
     let pinned = kuipa_tools::paths::read_anchors(&paths).unwrap();
-    flows::realm_info(REALM, &pinned, std::slice::from_ref(&url), &dir).unwrap();
+    flows::realm_info(
+        REALM,
+        &pinned,
+        &Deployment::servers(std::slice::from_ref(&url)),
+        &dir,
+    )
+    .unwrap();
     flows::enroll_online(
         &paths,
         REALM,
         &pinned,
         &otp(),
         HOST,
-        std::slice::from_ref(&url),
+        &Deployment::servers(std::slice::from_ref(&url)),
     )
     .unwrap();
     // Only the unrelated anchor pinned: no server verifies.
@@ -671,7 +704,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
         &[*stranger.public().thumbprint()],
         &otp(),
         HOST,
-        &[url],
+        &Deployment::servers(&[url]),
     )
     .unwrap_err();
     assert!(

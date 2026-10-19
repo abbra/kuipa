@@ -24,7 +24,7 @@ use kuipa_enroll::join::{
     kerberos_prf_input,
 };
 use kuipa_enroll::keytab::{Enctype, Keytab};
-use kuipa_enroll::realm::{RealmInfo, ServerKeys, VerifiedRealm};
+use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::parse_stage_result;
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred, InitStep};
 use kuipa_tools::flows::{self, Auth, Outcome};
@@ -282,7 +282,7 @@ fn against_a_real_kdc() {
                 .unwrap();
         }
     }
-    let servers = [SERVER.to_owned()];
+    let servers = Deployment::servers(&[SERVER.to_owned()]);
     // Clients pin ipa1's anchor only.
     let anchors = [own_anchors[0]];
     let string = |secret: Option<&[u8]>| {
@@ -505,7 +505,7 @@ fn against_a_real_kdc() {
         &[*s5.anchor()],
         &Auth::LdapOtp(otp),
         "web5.example.test",
-        &[SERVER2.to_owned()],
+        &Deployment::servers(&[SERVER2.to_owned()]),
     )
     .unwrap();
     assert_eq!(result["issuer"], SERVER2);

@@ -47,7 +47,15 @@
 //! `--realm R` replaces the enrollment string for `enroll` with a password,
 //! ticket or voucher and for `realm-info`: the advertisement is verified
 //! against the anchors pre-provisioned in `/etc/ipa/ku-anchors` (an image,
-//! configuration management), and nothing but the password is read.
+//! configuration management), and nothing but the password is read.  With
+//! an enrollment file as well (`ipa-client-install -r`), `--realm` is a
+//! cross-check instead: the string must be for realm R.
+//!
+//! Every advertisement must describe the deployment given here: its server
+//! one of `--server` (or the servers found in DNS), its domain `--domain`
+//! (or the one used for DNS), its realm the string's.  Otherwise `kuipa`
+//! stops before sending anything (exit 1); it does not fail over.  Before
+//! enrollment, only those servers are used as KDCs.
 //!
 //! With `--use-ccache`, the ticket in `KRB5CCNAME` is used as is; the caller
 //! (normally `ipa-client-install`) prepares `KRB5_CONFIG` from
@@ -62,6 +70,7 @@ use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
+use kuipa_enroll::realm::Deployment;
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::{self, Error, Paths};
 use kuipa_tools::trace;
@@ -227,29 +236,39 @@ impl Args {
         }
     }
 
-    /// What to verify the realm against, with the secrets: `--realm` and
-    /// the pre-provisioned `/etc/ipa/ku-anchors`, or else the enrollment
-    /// string's realm and anchor.
+    /// What to verify the realm against, with the secrets: the enrollment
+    /// string's realm and anchor, or else `--realm` and the pre-provisioned
+    /// `/etc/ipa/ku-anchors`.  With both an enrollment string and
+    /// `--realm` (`ipa-client-install -r`), the string must be for that
+    /// realm: the realm then comes from two channels (§4.6).
     fn pins(&self, paths: &Paths, want_password: bool) -> Result<(Pins, Secrets), Error> {
-        let Some(realm) = self.option("realm") else {
+        let realm = self.option("realm");
+        if realm.is_some_and(str::is_empty) {
+            return Err("--realm needs a realm".into());
+        }
+        if realm.is_none() || self.enrollment_file().is_some() {
             let secrets = self.secrets(true, want_password)?;
             let string = secrets
                 .string
                 .as_ref()
                 .ok_or("enrollment string required")?;
+            if let Some(realm) = realm
+                && string.realm() != realm
+            {
+                return Err(format!(
+                    "the enrollment string is for realm {}, not {realm} (--realm)",
+                    string.realm()
+                )
+                .into());
+            }
             flows::check_string(string)?;
             let pins = Pins {
                 realm: string.realm().to_owned(),
                 anchors: vec![*string.anchor()],
             };
             return Ok((pins, secrets));
-        };
-        if realm.is_empty() {
-            return Err("--realm needs a realm".into());
         }
-        if self.enrollment_file().is_some() {
-            return Err("--realm and an enrollment string are exclusive".into());
-        }
+        let realm = realm.unwrap_or_default();
         let file = paths.anchors();
         let pinned = paths::read_anchor_pins(&file)
             .map_err(|e| format!("--realm: no pinned anchors in {}: {e}", file.display()))?;
@@ -269,13 +288,18 @@ impl Args {
         Ok((pins, self.secrets(false, want_password)?))
     }
 
-    /// At least one `--server`, checked before any input is read.
+    /// The deployment to join, checked before any input is read: the
     /// `--server`s, or the realm's servers from DNS SRV records for
-    /// `--domain`, else the host's domain.
-    fn servers(&self) -> Result<Vec<String>, Error> {
+    /// `--domain`, else the host's domain.  The domain is part of it when
+    /// given or used for the lookup: every advertisement must describe it
+    /// (§4.6).
+    fn deployment(&self) -> Result<Deployment, Error> {
         let servers = self.all("server");
         if !servers.is_empty() {
-            return Ok(servers);
+            return Ok(Deployment {
+                servers,
+                domain: self.option("domain").map(str::to_owned),
+            });
         }
         let host = match self.option("hostname") {
             Some(h) => h.to_owned(),
@@ -287,8 +311,12 @@ impl Args {
                 .ok_or("no --server, and no --domain to find servers in DNS")?
                 .to_owned(),
         };
-        kuipa_tools::dns::ipa_servers(&domain)
-            .map_err(|e| format!("no --server given and none found in DNS: {e}").into())
+        let servers = kuipa_tools::dns::ipa_servers(&domain)
+            .map_err(|e| format!("no --server given and none found in DNS: {e}"))?;
+        Ok(Deployment {
+            servers,
+            domain: Some(domain),
+        })
     }
 }
 
@@ -360,7 +388,7 @@ fn run(args: &Args) -> Result<Value, Error> {
                     args.option("hostname"),
                 )
             } else {
-                let servers = args.servers()?;
+                let deployment = args.deployment()?;
                 let principal = args.option("principal");
                 let ccache = args.flag("use-ccache");
                 let (pins, secrets) = args.pins(&paths, principal.is_some() && !ccache)?;
@@ -397,7 +425,14 @@ fn run(args: &Args) -> Result<Value, Error> {
                 let fqdn = args
                     .option("hostname")
                     .map_or_else(flows::hostname, |h| Ok(h.to_owned()))?;
-                flows::enroll_online(&paths, &pins.realm, &pins.anchors, &auth, &fqdn, &servers)
+                flows::enroll_online(
+                    &paths,
+                    &pins.realm,
+                    &pins.anchors,
+                    &auth,
+                    &fqdn,
+                    &deployment,
+                )
             }
         }
         "voucher-key" => {
@@ -407,12 +442,12 @@ fn run(args: &Args) -> Result<Value, Error> {
         }
         "realm-info" => {
             let dir = args.option("krb5-dir").ok_or("--krb5-dir is required")?;
-            let servers = args.servers()?;
+            let deployment = args.deployment()?;
             let (pins, _) = args.pins(&paths, false)?;
             flows::realm_info(
                 &pins.realm,
                 &pins.anchors,
-                &servers,
+                &deployment,
                 std::path::Path::new(dir),
             )
         }

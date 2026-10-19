@@ -13,7 +13,7 @@ use kuipa_enroll::join::{
     AuthType, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
-use kuipa_enroll::realm::{RealmInfo, ServerKeys, VerifiedRealm};
+use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::{Directory, DirectoryError, Staged, parse_stage_result};
 use kuipa_enroll::{EnrollServer, Error};
 use native_ossl::util::SecretBuf;
@@ -805,10 +805,16 @@ fn advertisement_bootstraps_kerberos() {
     let r = realm();
     let adv = r.verify(1);
     assert_eq!(adv.info().pkinit_anchors, vec![CA.to_vec()]);
-    let conf = adv.krb5_conf("/var/lib/ipa-client/ku/pkinit-anchors.pem");
+    let both = Deployment::servers(&["ipa1.example.test".into(), "ipa2.example.test".into()]);
+    let conf = adv.krb5_conf("/var/lib/ipa-client/ku/pkinit-anchors.pem", &both);
     // The issuing server first, then the others.
     let first = conf.find("kdc = ipa2.example.test").unwrap();
     let second = conf.find("kdc = ipa1.example.test").unwrap();
     assert!(first < second);
     assert!(conf.contains("dns_lookup_kdc = false"));
+    // Told to use only the issuing server: the other is not a KDC either.
+    let only = Deployment::servers(&["ipa2.example.test".into()]);
+    let conf = adv.krb5_conf("/var/lib/ipa-client/ku/pkinit-anchors.pem", &only);
+    assert!(conf.contains("kdc = ipa2.example.test"));
+    assert!(!conf.contains("ipa1.example.test"));
 }

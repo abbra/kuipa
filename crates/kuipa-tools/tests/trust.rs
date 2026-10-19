@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
-use kuipa_enroll::realm::{RealmInfo, ServerKeys, TrustedRealm};
+use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, TrustedRealm};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::Invitation;
 use kuipa_tools::flows::{self, Auth, Outcome};
@@ -230,7 +230,7 @@ fn trusted_realm_against_real_kdcs() {
         &[*s.anchor()],
         &Auth::LdapOtp(otp),
         HOST,
-        &[SERVER_A.to_owned()],
+        &Deployment::servers(&[SERVER_A.to_owned()]),
     )
     .unwrap();
     assert_eq!(p.trusted_realms().len(), 0);

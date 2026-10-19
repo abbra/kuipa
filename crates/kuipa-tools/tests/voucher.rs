@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
-use kuipa_enroll::realm::{RealmInfo, ServerKeys, VerifiedRealm};
+use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::voucher::{Claims, Voucher};
 use kuipa_tools::flows::{self, Auth};
 use kuipa_tools::paths::Paths;
@@ -162,7 +162,7 @@ fn vouchers_against_a_real_kdc() {
             &[*string.anchor()],
             &auth,
             host,
-            &[SERVER.into()],
+            &Deployment::servers(&[SERVER.into()]),
         )
     };
 
