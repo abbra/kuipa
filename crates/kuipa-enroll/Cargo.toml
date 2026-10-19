@@ -1,0 +1,21 @@
+[package]
+name = "kuipa-enroll"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "kuipa protocol and key schedule: post-quantum enrollment and keytab protection for FreeIPA"
+keywords = ["freeipa", "kerberos", "ml-kem", "ml-dsa", "post-quantum"]
+categories = ["cryptography"]
+
+[dependencies]
+agirru-crdt.workspace = true
+# MTC trees; its OpenSSL backend is native-ossl (and brings PKCS#11 support).
+synta-mtc = { version = "0.5.1", default-features = false, features = ["std", "derive", "openssl"] }
+native-ossl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tang-pqc.workspace = true
+
+[lints]
+workspace = true
