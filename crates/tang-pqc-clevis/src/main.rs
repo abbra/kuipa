@@ -18,11 +18,50 @@
 //! Exit status: 0 success, 1 error, 2 usage.
 
 use std::io::{IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
 use tang_pqc_clevis::{Config, Error};
 
-const USAGE: &str = "usage: tang-pqc {adv URL [--ca FILE] | encrypt CONFIG | decrypt}";
+#[derive(Parser)]
+#[command(
+    about = "Post-quantum Tang from the command line (the Tang side of the \
+tang-pqc Clevis pin).",
+    long_about = "Installed (or linked) as clevis-encrypt-tang-pqc and \
+clevis-decrypt-tang-pqc, the same binary is the Clevis pin `tang-pqc`:\n  \
+clevis encrypt tang-pqc '{\"url\":…,\"thp\":…}' < IN > JWE\n  clevis decrypt < JWE \
+> OUT\n  clevis luks bind -d /dev/vda2 tang-pqc '{\"url\":…,\"thp\":…}'",
+    after_help = "Exit status: 0 success, 1 error, 2 usage."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List the thumbprints of the signing keys URL advertises.
+    Adv {
+        /// Tang server base URL, e.g.
+        /// `<https://ipa1.example.test/ipa/ku/tang>`.
+        url: String,
+        /// A PEM file to verify an https server against.
+        #[arg(long, value_name = "FILE")]
+        ca: Option<String>,
+    },
+    /// Encrypt standard input for a Tang server; print the JWE.
+    ///
+    /// CONFIG is JSON:
+    /// {"url":"https://…","thp":"…","adv":"…","ca":"…"}; thp must be a
+    /// thumbprint listed by `adv`.
+    Encrypt {
+        /// The server pin configuration, as JSON.
+        config: String,
+    },
+    /// Recover the key from the JWE on standard input; print the plaintext.
+    Decrypt,
+}
 const ENCRYPT_USAGE: &str = r"Usage: clevis encrypt tang-pqc CONFIG < PLAINTEXT > JWE
 
 Encrypts using a post-quantum Tang (tang-pqc) binding server policy
@@ -59,18 +98,12 @@ fn decrypt() -> Result<(), Error> {
     Ok(())
 }
 
-fn adv(args: &[String]) -> Result<(), Error> {
-    let url = args.first().ok_or(USAGE)?;
-    let ca = match args.get(1..) {
-        Some([flag, file]) if flag == "--ca" => Some(file.into()),
-        Some([]) | None => None,
-        _ => return Err(USAGE.into()),
-    };
+fn adv(url: &str, ca: Option<&str>) -> Result<(), Error> {
     let config = Config {
-        url: url.clone(),
+        url: url.to_owned(),
         thp: None,
         adv: None,
-        ca,
+        ca: ca.map(PathBuf::from),
     };
     for thp in tang_pqc_clevis::signing_keys(&config)? {
         println!("{thp}");
@@ -100,14 +133,11 @@ fn main() -> ExitCode {
         }
         "clevis-decrypt-tang-pqc" => (name.clone(), decrypt()),
         _ => {
-            let result = match args.first().map(String::as_str) {
-                Some("adv") => adv(&args[1..]),
-                Some("encrypt") if args.len() == 2 => encrypt(&args[1]),
-                Some("decrypt") if args.len() == 1 => decrypt(),
-                _ => {
-                    eprintln!("{USAGE}");
-                    return ExitCode::from(2);
-                }
+            let cli = Cli::parse();
+            let result = match cli.command {
+                Command::Adv { url, ca } => adv(&url, ca.as_deref()),
+                Command::Encrypt { config } => encrypt(&config),
+                Command::Decrypt => decrypt(),
             };
             ("tang-pqc".to_owned(), result)
         }
