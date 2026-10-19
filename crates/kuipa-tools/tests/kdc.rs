@@ -282,6 +282,14 @@ fn against_a_real_kdc() {
                 .unwrap();
         }
     }
+
+    // The anchor log converges through the same exchange; a host that
+    // checks before it does sees one server behind (exit 75 territory,
+    // §4.8), so wait for the two logs to be in step.
+    wait_for("both servers carry the same anchor log", || {
+        let first = ipa[0].epoch_head();
+        first.is_some() && ipa.iter().all(|s| s.epoch_head() == first)
+    });
     let servers = Deployment::servers(&[SERVER.to_owned()]);
     // Clients pin ipa1's anchor only.
     let anchors = [own_anchors[0]];
@@ -535,13 +543,14 @@ fn against_a_real_kdc() {
             .to_string(),
         format!("ipa-ku/{SERVER2}@{REALM}"),
     );
-    let cb = PeerSync::channel_binding(SERVER, SERVER2, &own, b"").unwrap();
+    let cb = PeerSync::channel_binding(SERVER, SERVER2, &own, b"", &[]).unwrap();
     let forged = PeerSync {
         sender: SERVER.into(),
         receiver: SERVER2.into(),
         own: own.clone(),
         envelope: Vec::new(),
         token: ipa2_key.token(SERVER2, &cb).unwrap(),
+        chain: vec![],
     };
     assert_eq!(post(&forged), 403, "a token from another server's key");
     let garbage = PeerSync {

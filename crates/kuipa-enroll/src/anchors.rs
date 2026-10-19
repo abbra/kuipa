@@ -741,9 +741,10 @@ const SYNC_MAGIC: [u8; 4] = *b"IPPS";
 const SYNC_LABEL: &[u8] = b"ipa-ku-enroll/v1 peer";
 
 /// A gossip request from one server to another (`POST /ipa/ku/peer/sync`):
-/// the agirru envelope, the sender's own delegation, and a GSS-API token
-/// from the sender's `ipa-ku/<fqdn>` key whose channel binding covers
-/// everything else.
+/// the agirru envelope, the sender's own delegation, the tail of the
+/// sender's anchor epoch log (§4.8), and a GSS-API token from the
+/// sender's `ipa-ku/<fqdn>` key whose channel binding covers everything
+/// else.
 #[derive(Clone, Debug)]
 pub struct PeerSync {
     /// The sending server.
@@ -756,6 +757,9 @@ pub struct PeerSync {
     pub envelope: Vec<u8>,
     /// The GSS-API token.
     pub token: Vec<u8>,
+    /// The sender's chain entries, oldest first, each encoded by
+    /// [`crate::epoch::encode`].
+    pub chain: Vec<Vec<u8>>,
 }
 
 impl PeerSync {
@@ -769,27 +773,35 @@ impl PeerSync {
         receiver: &str,
         own: &Delegation,
         envelope: &[u8],
+        chain: &[Vec<u8>],
     ) -> Result<[u8; 32]> {
-        let fields = Writer::new(SYNC_MAGIC)
-            .str(sender)
+        let mut w = Writer::new(SYNC_MAGIC);
+        w.str(sender)
             .str(receiver)
             .str(&own.to_json())
             .bytes(envelope)
-            .finish();
-        Ok(primitives::sha256(&[SYNC_LABEL, &fields])?)
+            .u64(chain.len() as u64);
+        for c in chain {
+            w.bytes(c);
+        }
+        Ok(primitives::sha256(&[SYNC_LABEL, &w.finish()])?)
     }
 
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        Writer::new(SYNC_MAGIC)
-            .u8(1)
+        let mut w = Writer::new(SYNC_MAGIC);
+        w.u8(2)
             .str(&self.sender)
             .str(&self.receiver)
             .str(&self.own.to_json())
             .bytes(&self.envelope)
             .bytes(&self.token)
-            .finish()
+            .u64(self.chain.len() as u64);
+        for c in &self.chain {
+            w.bytes(c);
+        }
+        w.finish()
     }
 
     /// Decode.
@@ -799,18 +811,28 @@ impl PeerSync {
     /// [`Error::Malformed`].
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, SYNC_MAGIC, "peer sync")?;
-        if r.u8()? != 1 {
+        if r.u8()? != 2 {
             return Err(Error::Malformed("peer sync version"));
         }
-        let sync = Self {
-            sender: r.str()?.into(),
-            receiver: r.str()?.into(),
-            own: Delegation::from_json(r.str()?.as_bytes())?,
-            envelope: r.bytes()?.into(),
-            token: r.bytes()?.into(),
-        };
+        let sender = r.str()?.into();
+        let receiver = r.str()?.into();
+        let own = Delegation::from_json(r.str()?.as_bytes())?;
+        let envelope = r.bytes()?.into();
+        let token = r.bytes()?.into();
+        let n = r.u64()?;
+        let mut chain = Vec::new();
+        for _ in 0..n.min(1024) {
+            chain.push(r.bytes()?.into());
+        }
         r.finish()?;
-        Ok(sync)
+        Ok(Self {
+            sender,
+            receiver,
+            own,
+            envelope,
+            token,
+            chain,
+        })
     }
 
     /// Check a sync received by `me` whose token authenticated `principal`,
@@ -1452,19 +1474,40 @@ mod tests {
         a.step(&mut state, NOW, &[], &all, &clock);
         b.step(&mut state, NOW, &[], &all, &clock);
         let own = b.own(&state, NOW);
-        let cb = PeerSync::channel_binding("b", "a", &own, b"env").unwrap();
+        let cb = PeerSync::channel_binding("b", "a", &own, b"env", &[b"entry".to_vec()]).unwrap();
         let sync = PeerSync {
             sender: "b".into(),
             receiver: "a".into(),
             own,
             envelope: b"env".to_vec(),
             token: b"token".to_vec(),
+            chain: vec![b"entry".to_vec()],
         };
         let back = PeerSync::from_bytes(&sync.to_bytes()).unwrap();
         assert_eq!(
-            PeerSync::channel_binding(&back.sender, &back.receiver, &back.own, &back.envelope)
-                .unwrap(),
+            PeerSync::channel_binding(
+                &back.sender,
+                &back.receiver,
+                &back.own,
+                &back.envelope,
+                &back.chain,
+            )
+            .unwrap(),
             cb
+        );
+        let mut moved = back.clone();
+        moved.chain[0][0] ^= 1;
+        assert_ne!(
+            PeerSync::channel_binding(
+                &moved.sender,
+                &moved.receiver,
+                &moved.own,
+                &moved.envelope,
+                &moved.chain,
+            )
+            .unwrap(),
+            cb,
+            "the chain is covered by the channel binding"
         );
         let policy = Policy::default();
         back.attest("ipa-ku/b@R", "a", &all, REALM, &policy, NOW)

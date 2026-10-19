@@ -18,6 +18,7 @@ use kuipa_enroll::escrow::EscrowRequest;
 use kuipa_enroll::join::{Operation, Request};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::TrustRequest;
+use serde_json::json;
 use tang_pqc::Thumbprint;
 
 use crate::limit::{self, Limiter};
@@ -68,6 +69,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/stage/{kid}", post(stage::<D>))
         .route("/ipa/ku/rec/{kid}", post(recover::<D>))
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
+        .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
         .route("/ipa/ku/trust/{kid}", post(establish_trust::<D>))
         .route("/ipa/ku/tang/adv", get(tang_advertisement::<D>))
         .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for::<D>))
@@ -110,6 +112,28 @@ async fn advertisement<D: Directory + Send + Sync + 'static>(
         Err(e) => {
             eprintln!("kuipad: advertisement: {e}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+/// A fetched piece of the anchor epoch log (§4.8): `?from=<seq>`, the
+/// entries after that sequence number, oldest first.  Public, like the
+/// advertisement.
+async fn anchor_log<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let from = query
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|p| p.strip_prefix("from="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    match serde_json::to_vec(&json!({ "entries": app.server.epoch_log(from) })) {
+        Ok(body) => binary(body, "application/json"),
+        Err(e) => {
+            eprintln!("kuipad: anchor log: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }

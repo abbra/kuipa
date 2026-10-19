@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use kuipa_enroll::anchors::AnchorState;
 use kuipa_enroll::delegation::{Delegation, SignedSuccession};
+use kuipa_enroll::epoch::SignedEpoch;
 use kuipa_enroll::realm::ServerKeys;
 use tang_pqc::{ExchangeKeyPair, SigningKey, Thumbprint, VerifyingKey};
 
@@ -381,6 +382,28 @@ impl KeyStore {
     /// I/O errors.
     pub fn store_peer_state(&self, state: &AnchorState) -> Result<(), Error> {
         self.replace("peers.state", &state.to_bytes())
+    }
+
+    /// The anchor epoch log (§4.8); empty if none was stored.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors other than a missing file, or a malformed chain.
+    pub fn epoch(&self) -> Result<Vec<SignedEpoch>, Error> {
+        match fs::read(self.path("epoch.json")) {
+            Ok(json) => Ok(serde_json::from_slice(&json)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Store the anchor epoch log.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors.
+    pub fn store_epoch(&self, chain: &[SignedEpoch]) -> Result<(), Error> {
+        self.replace("epoch.json", serde_json::to_vec(chain)?.as_slice())
     }
 
     fn replace(&self, name: &str, data: &[u8]) -> Result<(), Error> {
