@@ -150,7 +150,9 @@ To try every flow by hand, run:
 
 It starts a throwaway environment (an MIT KDC, two IPA servers, a
 trusted realm and a voucher issuer) and opens a shell where `kuipa` and
-helper commands are ready to use.
+helper commands are ready to use. `./contrib/ci/local-ci.sh
+playground-test` runs a scripted session in the same environment, with
+tracing on, and writes it to `kuipa-playground-report.html`.
 [docs/walkthrough.md](docs/walkthrough.md) explains a traced session step
 by step.
 

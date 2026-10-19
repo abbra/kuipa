@@ -15,7 +15,8 @@ printing `✓` for what it found and `○` for what is missing:
 | `cargo` | everything |
 | `rustfmt`, `clippy` | the `fmt` and `clippy` jobs |
 | OpenSSL ≥ 3.5, krb5 and OpenLDAP development files | building (Fedora: `openssl-devel krb5-devel openldap-devel clang-devel`) |
-| `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` (MIT krb5 1.22 or later), MIT `pkinit.so` | `kdc-test` (Fedora: `krb5-server krb5-workstation krb5-pkinit`) |
+| `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` (MIT krb5 1.22 or later), MIT `pkinit.so` | `kdc-test`, `playground-test` and `interactive` (Fedora: `krb5-server krb5-workstation krb5-pkinit`) |
+| `python3` | `playground-test`, to render its report |
 | `rustup` with the MSRV toolchain | `msrv` (`rustup toolchain install 1.88`) |
 | `valgrind` | `--valgrind` only |
 | `actionlint` (or `yamllint` as a fallback) | `lint-workflows`; skipped with a warning if neither is installed |
@@ -38,6 +39,7 @@ printing `✓` for what it found and `○` for what is missing:
 | `doc` | `cargo doc --workspace --no-deps --all-features`, with `RUSTDOCFLAGS=-D warnings` | `build` |
 | `test` | `cargo test --workspace --all-features`, without the real-KDC tests | `build` |
 | `kdc-test` | `cargo test -p kuipa-tools --test kdc --test trust --test voucher` with `KUIPA_REQUIRE_KDC=1`, so missing KDC tools fail the job instead of skipping the tests | `build` |
+| `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report.html` (see below) | `build` |
 | `msrv` (opt-in) | `cargo build --workspace --all-targets` with the `rust-version` toolchain | |
 
 Dependencies are run on demand: `local-ci.sh clippy` builds first. Inside
@@ -62,6 +64,36 @@ only with the PKINIT chain `kuipa trusted-realms` installed for B. The
 
 Set `KUIPA_KEEP_REALM=1` to keep the realm's files (configuration,
 `kdc.log`, keytabs, ccaches) after the run.
+
+## The playground session report
+
+`playground-test` starts the same playground as `interactive` (below) and,
+instead of a shell, runs `contrib/ci/playground/session.sh` in it. The
+session uses the playground's helpers the way a person would, with
+`KUIPA_TRACE=kuipa_tools=trace,kuipa_gssapi=debug`:
+
+* an OTP join, `status`, a rekey and `check`;
+* `protect`, `kuipa-unseal` and `unprotect`;
+* failover to ipa2;
+* password, ticket, offline and voucher joins;
+* the trusted realm B.TEST, with a ticket across the trust;
+* the post-quantum Tang pin;
+* a health check that must fail with both servers down.
+
+Each step records its command, exit status (checked against the expected
+one), duration, output, trace and the lines the servers logged during it.
+`contrib/ci/playground/report.py` renders them as one self-contained HTML
+file: a summary, an index of the steps and, per step, the command and its
+output, with the trace and the server log in collapsed panels (open for a
+failed step). It has no external assets and follows the light or dark
+system theme.
+
+The report goes to `kuipa-playground-report.html` in the repository, or
+wherever `KUIPA_PLAYGROUND_REPORT` names. In GitHub Actions the job uploads
+it as the `kuipa-playground-report` artifact and adds the step table to the
+run's Summary tab. The job fails when any step ends with an unexpected exit
+status. To add a step, add a `step EXPECTED "title" 'command'` line to
+`session.sh`, under the `section` it belongs to.
 
 ## Options
 
