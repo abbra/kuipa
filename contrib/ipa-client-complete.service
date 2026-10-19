@@ -1,0 +1,15 @@
+[Unit]
+Description=Finish an offline FreeIPA enrollment at first contact
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/ipa-client/ku/pending.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/kuipa complete
+RestartForceExitStatus=75
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

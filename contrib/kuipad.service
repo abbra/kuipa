@@ -1,0 +1,14 @@
+[Unit]
+Description=kuipa post-quantum enrollment daemon
+Requires=kuipad.socket
+After=kuipad.socket dirsrv.target
+
+[Service]
+ExecStart=/usr/libexec/kuipad serve --config /etc/ipa/kuipad.json
+# Keys in /var/lib/ipa/ku; LDAPI and the daemon keytab only.
+ProtectSystem=strict
+ReadOnlyPaths=/etc/ipa /var/lib/ipa/ku
+PrivateTmp=true
+NoNewPrivileges=true
+LimitCORE=0
+Restart=on-failure

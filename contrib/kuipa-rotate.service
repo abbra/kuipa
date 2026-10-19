@@ -1,0 +1,8 @@
+[Unit]
+Description=Rotate the FreeIPA host keys (and rebind a sealed keytab)
+After=network-online.target
+ConditionPathExists=/var/lib/ipa-client/ku/state.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/kuipa rotate-keys

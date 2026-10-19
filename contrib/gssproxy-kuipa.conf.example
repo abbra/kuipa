@@ -1,0 +1,7 @@
+# /etc/gssproxy/50-nfs-server.conf — needs the keytab_loader extension (§7.5),
+# which is not in gssproxy yet.
+[service/nfs-server]
+  mechs = krb5
+  cred_store = keytab:MEMORY:nfs-server
+  keytab_loader = /usr/libexec/kuipa-unseal --memfd
+  cred_usage = accept

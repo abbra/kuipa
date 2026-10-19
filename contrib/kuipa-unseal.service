@@ -1,0 +1,17 @@
+[Unit]
+Description=Unseal the FreeIPA host keytab (file mode)
+After=network-online.target
+Wants=network-online.target
+Before=sssd.service gssproxy.service certmonger.service
+ConditionPathExists=/etc/ipa/krb5.keytab.sealed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/kuipa-unseal
+# 75: no server reachable yet; the timer retries.
+RestartForceExitStatus=75
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

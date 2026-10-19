@@ -1,0 +1,10 @@
+[Unit]
+Description=Rotate the FreeIPA host keys monthly
+
+[Timer]
+OnCalendar=monthly
+RandomizedDelaySec=1d
+Persistent=true
+
+[Install]
+WantedBy=timers.target

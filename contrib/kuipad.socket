@@ -1,0 +1,11 @@
+[Unit]
+Description=kuipa post-quantum enrollment daemon socket
+
+[Socket]
+ListenStream=/run/ipa/kuipad.sock
+SocketMode=0660
+SocketGroup=apache
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,24 @@
+{
+  "realm": "EXAMPLE.TEST",
+  "domain": "example.test",
+  "basedn": "dc=example,dc=test",
+  "server": "ipa1.example.test",
+  "ldap_uri": "ldapi://%2Frun%2Fslapd-EXAMPLE-TEST.socket",
+  "principal": "ipa-ku/ipa1.example.test@EXAMPLE.TEST",
+  "service": "ipa-ku@ipa1.example.test",
+  "keytab": "/var/lib/ipa/ku/kuipa.keytab",
+  "ca_file": "/etc/ipa/ca.crt",
+  "pkinit_anchors_file": "/var/lib/ipa-client/pki/kdc-ca-bundle.pem",
+  "key_dir": "/var/lib/ipa/ku",
+  "peers": [],
+  "discover_peers": true,
+  "peer_interval": 60,
+  "anchor": true,
+  "vouch_interval": 60,
+  "rate_limit": {
+    "per_host": { "burst": 10, "per_minute": 2 },
+    "per_source": { "burst": 60, "per_minute": 30 }
+  },
+  "trusts": [],
+  "enctypes": [20, 19, 18, 17]
+}
