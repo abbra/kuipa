@@ -1,0 +1,50 @@
+# Valgrind suppressions for Rust standard library false positives.
+#
+# These are well-known Rust runtime allocations that are intentionally not
+# freed before program exit and are safe to ignore:
+#
+#   rust_main_thread_arc  — The main thread's Arc<Inner> (48 bytes) is
+#     allocated once and held for the lifetime of the process.  Rust does not
+#     free it on exit because the thread is still "running" when the allocator
+#     tears down.
+#
+#   rust_stack_overflow_btree  — A BTreeMap (544 bytes) used by Rust's stack
+#     overflow detection is inserted into on startup and left reachable through
+#     a global; the OS reclaims it at exit.
+#
+# Pattern notes:
+#   Non-inlined Rust symbols carry a compilation-hash suffix that changes
+#   between builds (e.g. _ZN3std6thread…17h<HASH>E), so we match on the
+#   surrounding inlined frames whose demangled names are stable across builds.
+
+{
+   rust_main_thread_arc
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:malloc
+   ...
+   fun:new_uninit_in<std::thread::thread::Inner, std::alloc::System>
+   ...
+}
+
+{
+   rust_stack_overflow_btree
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   fun:malloc
+   ...
+   fun:new_leaf<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo, alloc::alloc::Global>
+   ...
+}
+
+{
+   async_io_driver_thread_tls
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   ...
+   fun:pthread_create@@GLIBC_2.34
+   ...
+   fun:unparker
+   ...
+}

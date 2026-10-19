@@ -1,0 +1,257 @@
+# Adapted from kurbu5-pkinit's .github/workflows/ci.yml.  Every job runs a
+# job of contrib/ci/local-ci.sh, so CI and local runs stay identical.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # System packages required to build the workspace and to run JavaScript-based
+  # GitHub Actions (actions/checkout, actions/cache) inside the container.
+  #   tar, gzip               — archive tools needed by actions/checkout and actions/cache
+  #   gcc, make               — C toolchain for the -sys build scripts
+  #   openssl-devel           — libssl/libcrypto headers + .pc file for native-ossl-sys (OpenSSL >= 3.5)
+  #   krb5-devel              — GSSAPI/krb5 headers + .pc files for kuipa-gssapi
+  #   openldap-devel          — libldap headers for kuipa-ldap
+  #   clang-libs, clang-devel — libclang.so + built-in headers for bindgen
+  #   pkgconf-pkg-config      — pkg-config used by the build scripts
+  #   nodejs, npm, node       — required by actions/checkout and actions/cache
+  #   cargo, rust, rustfmt, cargo-clippy — Rust toolchain (not bundled in the base image)
+  # (update key suffix when changing packages)
+  DNF_PACKAGES: >-
+    tar gzip gcc make openssl-devel krb5-devel openldap-devel clang-libs clang-devel
+    pkgconf-pkg-config nodejs /usr/bin/npm /usr/bin/node
+    cargo rust rustfmt cargo-clippy
+  # Additional packages needed only by the kdc-test job: a real MIT KDC and
+  # its admin tools (krb5-server), kinit (krb5-workstation) and MIT's
+  # pkinit.so for anonymous PKINIT (krb5-pkinit).
+  KDC_TEST_PACKAGES: >-
+    krb5-server krb5-workstation krb5-pkinit
+
+jobs:
+  # ── Build ──────────────────────────────────────────────────────────────────
+  # Compiles the full workspace (debug, all targets) once and saves the
+  # artifacts to cache; downstream jobs restore them instead of recompiling.
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore cargo git cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/git
+          key: cargo-git-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-git-v1-
+      - name: Restore debug build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v1-
+      - name: Build workspace
+        run: ./contrib/ci/local-ci.sh --no-deps build
+      - name: Prune incremental artifacts before caching
+        run: rm -rf target/debug/incremental
+
+  # ── Format ─────────────────────────────────────────────────────────────────
+  # Runs in parallel with build — rustfmt needs no compiled artifacts.
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Check formatting
+        run: ./contrib/ci/local-ci.sh --no-deps fmt
+
+  # ── Workflow linting ────────────────────────────────────────────────────────
+  # Validates GitHub Actions workflow YAML; runs in parallel with build.
+  lint-workflows:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES yamllint
+      - uses: actions/checkout@v7
+      - name: Validate GitHub Actions workflow files
+        run: ./contrib/ci/local-ci.sh --no-deps lint-workflows
+
+  # ── Dependencies ───────────────────────────────────────────────────────────
+  # No RustCrypto crates: cryptography comes from OpenSSL (native-ossl).
+  deps:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Check that no RustCrypto crate is a dependency
+        run: ./contrib/ci/local-ci.sh --no-deps deps
+
+  # ── Clippy ─────────────────────────────────────────────────────────────────
+  # Includes clippy::incompatible_msrv (denied in the workspace).
+  clippy:
+    name: Clippy
+    needs: [build]
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore debug build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v1-
+      - name: Run clippy
+        run: ./contrib/ci/local-ci.sh --no-deps clippy
+
+  # ── Documentation ──────────────────────────────────────────────────────────
+  doc:
+    name: Documentation
+    needs: [build]
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore debug build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v1-
+      - name: Build documentation
+        run: ./contrib/ci/local-ci.sh --no-deps doc
+
+  # ── Test suite ─────────────────────────────────────────────────────────────
+  # Unit, end-to-end and HTTP flow tests; the real-KDC test has its own job.
+  test:
+    name: Test Suite
+    needs: [build]
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v1-
+      - name: Run tests
+        run: ./contrib/ci/local-ci.sh --no-deps test
+
+  # ── Real-KDC test ──────────────────────────────────────────────────────────
+  # Spins up an ephemeral MIT realm with PKINIT on a Unix socket and runs the
+  # client flows against it (GSS channel bindings, rekey, sealing, admin
+  # ccache, anonymous PKINIT with advertised anchors, offline enrollment).
+  kdc-test:
+    name: Real-KDC Test
+    needs: [build]
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES $KDC_TEST_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Restore build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/deps
+            target/debug/build
+            target/debug/examples
+          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v1-
+      - name: Run the client flows against a real KDC
+        run: ./contrib/ci/local-ci.sh --no-deps kdc-test
+
+  # ── MSRV ───────────────────────────────────────────────────────────────────
+  # Builds with the oldest supported Rust (rust-version in Cargo.toml), which
+  # catches language features clippy's incompatible_msrv lint cannot.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies and rustup
+        run: dnf install -y $DNF_PACKAGES rustup
+      - uses: actions/checkout@v7
+      - name: Install the MSRV toolchain
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          rustup-init -y --profile minimal --default-toolchain "$msrv"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Build with the MSRV
+        run: ./contrib/ci/local-ci.sh --no-deps msrv
