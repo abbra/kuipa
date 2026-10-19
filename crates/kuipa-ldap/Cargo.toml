@@ -1,0 +1,17 @@
+[package]
+name = "kuipa-ldap"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+description = "Synchronous LDAP client (from ahdapa-ldap): simple, GSSAPI and S4U binds, search, modify, extended operations"
+
+[dependencies]
+kuipa-gssapi = { path = "../kuipa-gssapi" }
+libc = "0.2"
+native-ossl.workspace = true
+thiserror = "2"
+tracing = "0.1"
+
+[build-dependencies]
+pkg-config = "0.3"
