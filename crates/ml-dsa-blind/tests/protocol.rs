@@ -38,8 +38,11 @@ fn openssl_pure_verify(pk: &VerifyingKey, ctx: &Context, msg: &[u8], sig: &[u8])
     verifier.verify(msg, sig).unwrap()
 }
 
-/// μ computed by OpenSSL's own `ML-DSA-MU` digest (see EVP_MD-ML-DSA-MU(7)).
-fn openssl_mu(pk: &VerifyingKey, ctx: &Context, message: &[u8]) -> [u8; 64] {
+/// μ computed by OpenSSL's own `ML-DSA-MU` digest (see EVP_MD-ML-DSA-MU(7)),
+/// or `None` where OpenSSL does not provide that digest (3.5 has the `mu`
+/// signing parameter this crate needs, but not the digest).
+fn openssl_mu(pk: &VerifyingKey, ctx: &Context, message: &[u8]) -> Option<[u8; 64]> {
+    let alg = DigestAlg::fetch(c"ML-DSA-MU", None).ok()?;
     let params = ParamBuilder::new()
         .unwrap()
         .push_octet_slice(c"pub", pk.as_bytes())
@@ -48,7 +51,6 @@ fn openssl_mu(pk: &VerifyingKey, ctx: &Context, message: &[u8]) -> [u8; 64] {
         .unwrap()
         .build()
         .unwrap();
-    let alg = DigestAlg::fetch(c"ML-DSA-MU", None).unwrap();
     let mut md = alg.new_context().unwrap();
     // native-ossl cannot pass init params to a digest yet, so re-initialise
     // the context with them.
@@ -59,7 +61,7 @@ fn openssl_mu(pk: &VerifyingKey, ctx: &Context, message: &[u8]) -> [u8; 64] {
     md.update(message).unwrap();
     let mut mu = [0u8; 64];
     md.finish_xof(&mut mu).unwrap();
-    mu
+    Some(mu)
 }
 
 #[test]
@@ -103,7 +105,13 @@ fn request_matches_openssl_ml_dsa_mu() {
         let pk = sk.verifying_key();
         for ctx in [Context::default(), Context::new(vec![0xa5; 255]).unwrap()] {
             let (request, _, sig) = issue(&sk, &ctx, MSG);
-            let expected = openssl_mu(pk, &ctx, &sig.signed_message(MSG));
+            let Some(expected) = openssl_mu(pk, &ctx, &sig.signed_message(MSG)) else {
+                // The signatures still verify with OpenSSL's pure ML-DSA
+                // (output_is_a_standard_ml_dsa_signature), which needs
+                // the same μ.
+                eprintln!("skipped: this OpenSSL has no ML-DSA-MU digest");
+                return;
+            };
             assert_eq!(request.as_bytes(), &expected);
         }
     }

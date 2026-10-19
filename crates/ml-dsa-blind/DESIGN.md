@@ -220,7 +220,10 @@ signer.
   It is equivalent to pure ML-DSA verification of `salt ‖ m`, and the tests
   check that against OpenSSL's pure-mode verifier.
 * The tests cross-check the crate's μ against OpenSSL's own `ML-DSA-MU`
-  digest for all parameter sets and for empty and 255-byte contexts.
+  digest for all parameter sets and for empty and 255-byte contexts, where
+  OpenSSL provides that digest (OpenSSL 3.5 does not; the crate itself
+  needs only the `mu` signing parameter, which 3.5 has). Without it, the
+  pure-mode verification above still checks μ indirectly.
 
 ## 8. Uses in kuipa
 
