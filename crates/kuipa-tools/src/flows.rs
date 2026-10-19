@@ -231,18 +231,18 @@ fn watermark_after(
             ));
         }
         Some((theirs, theirs_head)) if theirs > seq => {
-            let entries = endpoint.anchor_log(seq).map_err(|e| e.to_string())?;
-            let reached = verify_chain(
-                &entries,
-                realm,
-                anchors,
-                Some((seq, hash)),
-                &Policy::default(),
-            )?;
+            // §4.8: follow the log page by page — a server answers at
+            // most `MAX_EPOCH_FETCH` entries — until reaching the head
+            // the advertisement claims.
+            let mut reached = (seq, hash);
+            while reached.0 < theirs {
+                let entries = endpoint.anchor_log(reached.0).map_err(|e| e.to_string())?;
+                reached =
+                    verify_chain(&entries, realm, anchors, Some(reached), &Policy::default())?;
+            }
             if reached != (theirs, theirs_head) {
                 return Err(format!(
-                    "its anchor log ends at sequence {} but its advertisement claims {}: inconsistent",
-                    reached.0, theirs,
+                    "its anchor log at sequence {theirs} commits to an entry its advertisement does not name: the two have forked",
                 ));
             }
             return Ok(Some(reached));
