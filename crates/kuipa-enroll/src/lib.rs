@@ -16,6 +16,7 @@ pub mod anchors;
 pub mod bundle;
 pub mod delegation;
 pub mod enrollment;
+pub mod epoch;
 pub mod error;
 pub mod escrow;
 pub mod join;

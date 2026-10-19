@@ -487,6 +487,13 @@ impl SignedSuccession {
         Succession::from_bytes(&b64::decode(&self.statement)?)
     }
 
+    /// The base64 statement: the ordering key for canonical succession
+    /// lists (the anchor epoch, §4.8).
+    #[must_use]
+    pub fn order_key(&self) -> &str {
+        &self.statement
+    }
+
     /// Check it: the embedded key is the old anchor's, its algorithm is
     /// allowed, the signature verifies, and it is for `realm` and valid at
     /// `at`.
@@ -496,6 +503,21 @@ impl SignedSuccession {
     /// [`Error::Malformed`], [`Error::WrongRealm`], [`Error::Expired`], or
     /// [`Error::UntrustedAnchor`] for another key or a bad signature.
     pub fn check(&self, realm: &str, policy: &Policy, at: u64) -> Result<Succession> {
+        let succession = self.check_signature(realm, policy)?;
+        if !succession.valid_at(at) {
+            return Err(Error::Expired);
+        }
+        Ok(succession)
+    }
+
+    /// [`check`](Self::check) without the validity period: a record of a
+    /// rotation outlives the succession itself (the anchor epoch, §4.8).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`], [`Error::WrongRealm`], or
+    /// [`Error::UntrustedAnchor`] for another key or a bad signature.
+    pub fn check_signature(&self, realm: &str, policy: &Policy) -> Result<Succession> {
         let statement = b64::decode(&self.statement)?;
         let succession = Succession::from_bytes(&statement)?;
         let key = VerifyingKey::from_jwk_json(self.from.to_string().as_bytes())?;
@@ -510,9 +532,6 @@ impl SignedSuccession {
         .map_err(|_| Error::UntrustedAnchor)?;
         if succession.realm != realm {
             return Err(Error::WrongRealm);
-        }
-        if !succession.valid_at(at) {
-            return Err(Error::Expired);
         }
         Ok(succession)
     }
