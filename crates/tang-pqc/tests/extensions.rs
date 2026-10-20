@@ -158,3 +158,44 @@ fn default_context_matches_tang() {
     let response = server.recover(&request).unwrap();
     assert_eq!(pending.finish(&response).unwrap().as_ref(), key.as_ref());
 }
+
+#[test]
+fn commitments_bind_application_data() {
+    let s = setup();
+    let adv = signed(&s)
+        .verify_with(s.signing.public().thumbprint(), &Policy::default())
+        .unwrap();
+    let ctx = BindingContext::new(ESCROW, b"alice@EXAMPLE.TEST");
+    let (binding, key, tag) = adv
+        .provision_committed(&ctx, Some(s.escrow.public().kid()), b"vault A")
+        .unwrap();
+    let (request, pending) = binding.recovery_request(s.escrow.public()).unwrap();
+    let opened = request.open(&s.escrow, ESCROW).unwrap();
+
+    // The server can check the claim, and only the claim committed to.
+    opened.verify_commitment(b"vault A", &tag).unwrap();
+    assert!(matches!(
+        opened.verify_commitment(b"vault B", &tag),
+        Err(Error::CommitmentMismatch)
+    ));
+    let mut forged = tag;
+    forged[0] ^= 1;
+    assert!(matches!(
+        opened.verify_commitment(b"vault A", &forged),
+        Err(Error::CommitmentMismatch)
+    ));
+    assert_eq!(
+        pending.finish(&opened.respond().unwrap()).unwrap().as_ref(),
+        key.as_ref()
+    );
+
+    // A tag from another binding does not carry over, even for the same data.
+    let (other, _, other_tag) = adv
+        .provision_committed(&ctx, Some(s.escrow.public().kid()), b"vault A")
+        .unwrap();
+    assert_ne!(other_tag, tag);
+    let (request, _) = other.recovery_request(s.escrow.public()).unwrap();
+    let opened = request.open(&s.escrow, ESCROW).unwrap();
+    assert!(opened.verify_commitment(b"vault A", &tag).is_err());
+    opened.verify_commitment(b"vault A", &other_tag).unwrap();
+}
