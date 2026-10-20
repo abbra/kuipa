@@ -2,8 +2,11 @@
 
 This chapter is for anyone deciding whether, and where, to rely on kuipa.
 It states what each attacker gets, in plain words. The full analysis, with
-its assumptions, is in the design's security analysis (§13) and the
-tables of §7.3, §7.5 and §7.6.10.
+its assumptions, is in the design's
+[security analysis](reference/design.md#13-security-analysis), and in its
+tables for [a sealed host keytab](reference/design.md#73-file-mode-implemented),
+[other sealed keytabs and files](reference/design.md#75-other-keytabs-and-any-file-implemented)
+and [users' vaults](reference/design.md#7610-what-each-attacker-gets).
 
 Assumptions throughout: ML-KEM and ML-DSA are as strong as their standards
 claim, including against quantum computers, and the enrollment string (or
