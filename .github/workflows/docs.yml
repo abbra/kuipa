@@ -1,0 +1,77 @@
+# Build the user documentation (docs/, an mdBook with Mermaid diagrams)
+# and publish it on GitHub Pages.  Pull requests build it without
+# publishing, so a broken book is caught before it merges.
+#
+# Pages must be set to "GitHub Actions" as its source (repository
+# Settings → Pages → Build and deployment).
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time; a newer push supersedes a queued one, but a
+# deployment in progress finishes.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # The versions the book is written against (`mdbook build docs` locally).
+  MDBOOK_VERSION: 0.5.4
+  MDBOOK_MERMAID_VERSION: 0.17.1
+
+jobs:
+  build:
+    name: Build the book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Restore mdbook binaries
+        id: tools
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/mdbook
+            ~/.cargo/bin/mdbook-mermaid
+          key: mdbook-${{ env.MDBOOK_VERSION }}-mermaid-${{ env.MDBOOK_MERMAID_VERSION }}
+      - name: Install mdbook and mdbook-mermaid
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked "mdbook@$MDBOOK_VERSION"
+          cargo install --locked "mdbook-mermaid@$MDBOOK_MERMAID_VERSION"
+      - name: Build
+        run: mdbook build docs
+      - name: Upload the book
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/book
+
+  deploy:
+    name: Publish to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
