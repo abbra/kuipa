@@ -167,7 +167,7 @@ when standard input is a terminal.
 
 ### Recipes
 
-[walkthrough.md](walkthrough.md) follows one session — OTP enrollment,
+[A traced session](../scenarios/walkthrough.md) follows one session — OTP enrollment,
 installing the trusted realm, a `B.TEST` user's login and a ticket across
 the trust — with `KUIPA_TRACE` on, and explains every traced step.
 

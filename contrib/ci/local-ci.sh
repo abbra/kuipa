@@ -86,6 +86,8 @@ has_actionlint=0
 has_yamllint=0
 has_krb5kdc=0
 has_msrv=0
+has_mdbook=0
+has_mdbook_mermaid=0
 
 detect_tools() {
     echo -e "${BOLD}${CYAN}Tool availability check:${NC}"
@@ -136,6 +138,20 @@ detect_tools() {
         echo -e "  ${GREEN}✓${NC} krb5kdc, kdb5_util, kadmin.local, kinit (kdc-test)"
     else
         echo -e "  ${YELLOW}○${NC} MIT KDC tools (optional, needed for kdc-test; install krb5-server krb5-workstation krb5-pkinit)"
+    fi
+
+    if command -v mdbook >/dev/null 2>&1; then
+        has_mdbook=1
+        echo -e "  ${GREEN}✓${NC} mdbook $(mdbook --version | cut -d' ' -f2)"
+    else
+        echo -e "  ${YELLOW}○${NC} mdbook (optional, for the user documentation; cargo install mdbook)"
+    fi
+
+    if command -v mdbook-mermaid >/dev/null 2>&1; then
+        has_mdbook_mermaid=1
+        echo -e "  ${GREEN}✓${NC} mdbook-mermaid (found)"
+    else
+        echo -e "  ${YELLOW}○${NC} mdbook-mermaid (optional, for diagrams in the book; cargo install mdbook-mermaid)"
     fi
 
     if [[ -n "$MSRV" ]] && command -v rustup >/dev/null 2>&1 \
@@ -349,7 +365,17 @@ job_doc() {
     require_cargo || return 1
 
     echo "Building documentation…"
-    cargo doc --workspace --no-deps --all-features
+    cargo doc --workspace --no-deps --all-features || return 1
+
+    if [[ "$has_mdbook" -eq 0 ]]; then
+        warn "mdbook not found — skipping the book (install with: cargo install mdbook)"
+        return 0
+    fi
+    echo "Building the book…"
+    if [[ "$has_mdbook_mermaid" -eq 0 ]]; then
+        warn "mdbook-mermaid not found — diagrams will not render (install with: cargo install mdbook-mermaid)"
+    fi
+    mdbook build docs/
 }
 
 job_test() {
@@ -408,7 +434,7 @@ Options:
   --hosts N    OTP enrollment strings to create (default: 5)
   --keep       Keep the realm's files after exit (KUIPA_KEEP_REALM)
 
-See docs/local-ci.md for a walkthrough.
+See docs/src/development/local-ci.md for a walkthrough.
 EOF
 }
 
@@ -632,7 +658,7 @@ Special targets:
   interactive  Start a throwaway realm (MIT KDC + two IPA servers) and drop
                you into a shell inside it; torn down when the shell exits.
                Run '$(basename "$0") interactive --help' for its options,
-               and see docs/local-ci.md for a walkthrough.
+               and see docs/src/development/local-ci.md for a walkthrough.
 
 Available jobs:
 $(printf '  %s\n' "${ALL_JOBS[@]}")

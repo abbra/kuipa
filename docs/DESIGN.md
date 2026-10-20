@@ -1,7 +1,7 @@
 # kuipa — post-quantum FreeIPA enrollment and keytab protection
 
 This document describes the protocol and its implementation in this
-workspace. [local-ci.md](local-ci.md) covers CI and the interactive
+workspace. the local CI guide (`docs/src/development/local-ci.md`) covers CI and the interactive
 playground. §18 lists what is implemented, what is tested
 where, and what is not built yet.
 
@@ -131,7 +131,7 @@ Outside `crates/`:
 * `contrib/` holds the systemd units, the httpd snippet, a daemon
   configuration example and a gssproxy example; `contrib/clevis/` the pin's
   installer and dracut module; `contrib/ci/` the local CI and playground
-  script ([local-ci.md](local-ci.md)).
+  script (the local CI guide (`docs/src/development/local-ci.md`)).
 
 All cryptography is OpenSSL (≥ 3.5) through `native-ossl`; TLS uses rustls
 with the `rustls-native-ossl` provider.
@@ -2224,4 +2224,4 @@ plus formatting, clippy (including the MSRV lint), documentation, workflow
 lint, the dependency policy (`deps`: no RustCrypto crates) and an opt-in
 MSRV build. `local-ci.sh interactive` runs a realm with
 two servers that exchange their anchors, and a trusted realm `B.TEST`
-with its own KDC, for manual use. See [local-ci.md](local-ci.md).
+with its own KDC, for manual use. See the local CI guide (`docs/src/development/local-ci.md`).

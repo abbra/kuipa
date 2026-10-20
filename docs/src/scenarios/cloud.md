@@ -12,8 +12,8 @@ Each use case says how far along it is:
 * **available**: implemented and tested in this repository;
 * **needs FreeIPA**: implemented here, but the administrator's side waits
   for the FreeIPA integration (schema, framework commands; see
-  [TODO.md](../TODO.md));
-* **planned**: designed in [DESIGN.md](DESIGN.md), not implemented yet.
+  [TODO.md](https://github.com/abbra/kuipa/blob/main/TODO.md));
+* **planned**: designed in [the design](../reference/design.md), not implemented yet.
 
 Throughout, the realm is `EXAMPLE.TEST` with servers `ipa1` and `ipa2`, and
 the instances live in a cloud network that can reach them over HTTPS.
@@ -302,7 +302,7 @@ open it. This closes the gap described under snapshots above.
 
 ### Your own secrets on a cloud development VM
 
-**planned** (`kuipa seal`, see [sealing.md](sealing.md))
+**planned** (`kuipa seal`, see [Sealing your own files](../user/sealing.md))
 
 Users of a shared development or bastion VM can seal their own files with
 `kuipa seal`, without root. On a cloud VM there is no USB, so a passkey on
