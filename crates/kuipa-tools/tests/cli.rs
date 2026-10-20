@@ -132,3 +132,53 @@ fn status_names_its_subject_and_where_each_value_lives() {
     assert_eq!(json["servers"][0], "ipa1.example.test", "{json}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// What `kuipa` prints is for a person at a terminal: help text, rendered
+/// results, error messages.  Design section numbers belong in DESIGN.md and
+/// the source, not in any of that.
+#[test]
+fn output_never_cites_design_sections() {
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
+            .args(args)
+            .env_remove("KUIPA_ROOT")
+            .env_remove("KUIPA_ENROLLMENT_FILE")
+            .env_remove("KUIPA_TRACE")
+            .output()
+            .unwrap();
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        text
+    };
+
+    // Every subcommand's own help, named from the top-level help so a new
+    // command is covered without editing this test.
+    let help = run(&["--help"]);
+    let commands: Vec<&str> = help
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|line| !line.starts_with("Options:"))
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .map(|line| line.trim().split(' ').next().unwrap_or_default())
+        .collect();
+    assert!(commands.contains(&"advertisement"), "{help}");
+    let mut printed = vec![help.clone()];
+    for &command in &commands {
+        printed.push(run(&[command, "--help"]));
+    }
+    printed.push(help);
+
+    // Rendered output and an error message, with no realm reachable.
+    printed.push(run(&["status"]));
+    printed.push(run(&["status", "--json"]));
+    printed.push(run(&[
+        "advertisement",
+        "--realm",
+        "EXAMPLE.TEST",
+        "--server",
+        "ipa1.example.test",
+    ]));
+    for text in &printed {
+        assert!(!text.contains('§'), "{text}");
+    }
+}
