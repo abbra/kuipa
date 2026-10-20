@@ -49,8 +49,11 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] 7. Re-authentication sessions; the unlock counter (per-server
         values on the vault entry).
   - [x] 8. Offline sessions.
-  - [ ] 9. Passkeys (libfido2 FFI, relying-party verifier from ahdapa) and
-        PKCS#11 devices.
+  - [x] 9a. PKCS#11 devices: an ML-KEM key on a token through
+        pkcs11-provider (no attestation yet: registered at `any`).
+  - [ ] 9b. Passkeys (libfido2 FFI, relying-party verifier from ahdapa).
+  - [ ] Registered sealing (`sealing = registered`).
+  - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
 - [ ] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
       `keytab_loader` is merged (§7.4): write the service's gssproxy

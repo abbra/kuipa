@@ -2,12 +2,13 @@
 
 > **Status: partly implemented.** This guide describes `kuipa seal` as
 > designed in [DESIGN.md §7.6](DESIGN.md). Working today: `create`,
-> `policy`, `device add|remove` with passphrase-protected device keys,
-> `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
+> `policy`, `device add|remove` with passphrase-protected device keys or
+> an ML-KEM key on a PKCS#11 token (`--pkcs11 URI`, registered at level
+> `any` until attestation is checked), `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
 > with the `device` and `ticket` factors, re-authentication sessions
 > (`--session-hours`), offline sessions (`--offline-hours`, where the realm
 > allows them) and unlock limits (`--max-unlocks`). Not yet: passkeys,
-> smart cards and tokens, `--sealing registered`, and refusing or
+> the attested `hardware-*` levels, `--sealing registered`, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
 > only the default `allow` is accepted). A vault policy asking for any of
 > those is refused.

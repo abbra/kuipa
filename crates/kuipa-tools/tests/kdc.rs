@@ -98,6 +98,52 @@ fn root(realm: &Realm, name: &str) -> Paths {
     Paths::new(dir)
 }
 
+/// Make a kryoptic token (`KRYOPTIC_CONF` is set) with an ML-KEM-768 key,
+/// PIN 1234, label `dev`; the module, or `None` without the tools.
+fn token_with_ml_kem_key() -> Option<std::path::PathBuf> {
+    let module = std::path::PathBuf::from("/usr/lib64/pkcs11/libkryoptic_pkcs11.so");
+    if !module.exists() || !Path::new("/usr/lib64/ossl-modules/pkcs11.so").exists() {
+        return None;
+    }
+    // With the tools installed, a failure here is a failure, not a skip.
+    let tool = |args: &[&str]| {
+        let out = std::process::Command::new("pkcs11-tool")
+            .arg("--module")
+            .arg(&module)
+            .args(args)
+            .output()
+            .expect("pkcs11-tool");
+        assert!(out.status.success(), "pkcs11-tool {args:?}: {out:?}");
+        Some(())
+    };
+    tool(&["--init-token", "--label", "kuipa", "--so-pin", "12345678"])?;
+    tool(&[
+        "--token-label",
+        "kuipa",
+        "--login",
+        "--so-pin",
+        "12345678",
+        "--init-pin",
+        "--pin",
+        "1234",
+    ])?;
+    tool(&[
+        "--token-label",
+        "kuipa",
+        "--login",
+        "--pin",
+        "1234",
+        "--keypairgen",
+        "--key-type",
+        "ML-KEM-768",
+        "--label",
+        "dev",
+        "--id",
+        "01",
+    ])?;
+    Some(module)
+}
+
 fn kvnos(path: &Path) -> Vec<u32> {
     let mut v: Vec<u32> = Keytab::from_mit(&std::fs::read(path).unwrap())
         .unwrap()
@@ -137,6 +183,17 @@ fn against_a_real_kdc() {
         "KUIPA_RUNTIME_DIR",
         realm.dir.join("run-user").display().to_string(),
     ));
+    // A software token (kryoptic) for a PKCS#11 device, when installed.
+    let token_conf = realm.dir.join("kryoptic.conf");
+    std::fs::write(
+        &token_conf,
+        format!(
+            "[[slots]]\nslot = 42\ndbtype = \"sqlite\"\ndbargs = \"{}\"\n",
+            realm.dir.join("token.sql").display()
+        ),
+    )
+    .unwrap();
+    env.push(("KRYOPTIC_CONF", token_conf.display().to_string()));
     set_env(&env);
     realm.add_user(ADMIN, "Admin123");
 
@@ -567,6 +624,39 @@ fn against_a_real_kdc() {
     assert_eq!(seal.open(&pass, None).unwrap().as_ref(), b"boarding pass");
     seal.lock("travel").unwrap();
     assert!(seal.open(&pass, None).is_err(), "locked");
+
+    // A device on a token: an ML-KEM key that never leaves it, used through
+    // pkcs11-provider; the PIN takes the passphrase's place.
+    if let Some(module) = token_with_ml_kem_key() {
+        let home = UserPaths::new(realm.dir.join("alice-token-home"));
+        let seal = Seal::new(&a, &home, Some(&alice_cc));
+        let policy = vault::Policy {
+            factors: vault::Factors {
+                device: Some(vault::Level::Any),
+                ticket: true,
+                passkey: false,
+            },
+            ..vault::Policy::default()
+        };
+        seal.create("token", policy).unwrap();
+        let added = seal
+            .add_token_device("token", &module, "pkcs11:token=kuipa;object=dev", b"1234")
+            .unwrap();
+        assert_eq!(
+            added["vaults"][0]["devices"][0]["type"], "pkcs11",
+            "{added}"
+        );
+        assert!(
+            !home.device_key().exists(),
+            "no key file: the key stays on the token"
+        );
+        let sealed = seal.seal("token", b"on the token").unwrap();
+        assert!(Seal::needs_secret(&sealed));
+        assert_eq!(
+            seal.open(&sealed, Some(b"1234")).unwrap().as_ref(),
+            b"on the token"
+        );
+    }
 
     flows::unprotect(&a, &Target::Host).unwrap();
     assert!(!a.sealed().exists());
