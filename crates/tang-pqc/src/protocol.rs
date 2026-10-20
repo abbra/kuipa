@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use native_ossl::util::SecretBuf;
+use native_ossl::util::{SecretBuf, ct_eq};
 
 use crate::alg::KemAlg;
 use crate::error::{Error, Result};
@@ -156,6 +156,34 @@ fn transport_keys(
     ))
 }
 
+/// `HKDF(ss, "<domain> commit" ‖ alg ‖ kid ‖ H(ct) ‖ data)`: a commitment
+/// to `data` that only the binding's creator (who held `ss` once) and the
+/// holder of the exchange key can compute.
+pub(crate) fn commitment(
+    domain: Domain,
+    alg: KemAlg,
+    kid: &Thumbprint,
+    ciphertext: &[u8],
+    shared_secret: &[u8],
+    data: &[u8],
+) -> Result<[u8; 32]> {
+    let hash = alg.hash();
+    let mut tag = [0u8; 32];
+    domain.hkdf(
+        hash,
+        &[shared_secret],
+        "commit",
+        &[
+            &[alg.id()],
+            kid.as_bytes(),
+            &primitives::digest(hash, &[ciphertext])?,
+            data,
+        ],
+        &mut tag,
+    )?;
+    Ok(tag)
+}
+
 /// Client: seal the binding's ciphertext to the server's exchange key.
 /// Returns the request and the key that opens the response.
 pub(crate) fn seal_request(
@@ -225,6 +253,7 @@ impl RecoveryRequest {
         }
         Ok(OpenedRequest {
             key,
+            domain,
             ciphertext: ciphertext.as_ref().into(),
             response_key,
         })
@@ -247,6 +276,7 @@ impl RecoveryRequest {
 /// known, and the response is not yet sent.
 pub struct OpenedRequest<'k> {
     key: &'k ExchangeKeyPair,
+    domain: Domain,
     ciphertext: Box<[u8]>,
     response_key: SecretBuf,
 }
@@ -261,6 +291,35 @@ impl OpenedRequest<'_> {
     /// An OpenSSL error.
     pub fn ciphertext_hash(&self) -> Result<[u8; 32]> {
         primitives::sha256(&[&self.ciphertext])
+    }
+
+    /// Check that `tag` commits this binding to `data`: the tag
+    /// [`Advertisement::provision_committed`](crate::Advertisement::provision_committed)
+    /// returned for the same data.  Without it a server that authorises by
+    /// application data (a vault, a principal) sees only the ciphertext, and
+    /// a client could present someone else's binding under data it is
+    /// authorised for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CommitmentMismatch`], [`Error::DisabledBySystemPolicy`] or
+    /// an OpenSSL error.
+    pub fn verify_commitment(&self, data: &[u8], tag: &[u8; 32]) -> Result<()> {
+        let alg = self.key.public().alg();
+        let shared_secret = self.key.decapsulate(&self.ciphertext)?;
+        let expected = commitment(
+            self.domain,
+            alg,
+            self.key.public().kid(),
+            &self.ciphertext,
+            shared_secret.as_ref(),
+            data,
+        )?;
+        if ct_eq(&expected, tag) {
+            Ok(())
+        } else {
+            Err(Error::CommitmentMismatch)
+        }
     }
 
     /// Decapsulate the binding ciphertext and seal the shared secret for the

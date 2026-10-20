@@ -34,6 +34,9 @@ pub enum Error {
     RecoveryFailed,
     /// The exchange key offered for recovery is not the binding's key.
     KeyMismatch,
+    /// A recovery request's commitment does not match the data it is said
+    /// to commit to.
+    CommitmentMismatch,
     /// The system crypto policy (OpenSSL's `system_default` configuration,
     /// e.g. Fedora/RHEL crypto-policies) disables this algorithm.
     DisabledBySystemPolicy(&'static str),
@@ -65,6 +68,7 @@ impl fmt::Display for Error {
             Self::UnknownKey(kid) => write!(f, "no exchange key with id {kid}"),
             Self::RecoveryFailed => f.write_str("key recovery failed"),
             Self::KeyMismatch => f.write_str("exchange key does not match the binding"),
+            Self::CommitmentMismatch => f.write_str("commitment does not match"),
             Self::SeedUnavailable => f.write_str("private key seed is not available"),
             Self::DisabledBySystemPolicy(alg) => {
                 write!(f, "{alg} is disabled by the system crypto policy")

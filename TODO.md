@@ -29,11 +29,23 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 
 ## Protocol and implementation
 
-- [ ] User vaults (`kuipa seal`) and the unified recovery request (§7.6):
-      `tang-pqc` commitments, the `IPSV` format,
-      machine vaults in place of the §7.2 escrow check, the vault container,
-      device keys (PBKDF2 file, passkey PRF, PKCS#11), WebAuthn/MDS
-      verification copied from ahdapa, sessions and the unlock counter.
+- [ ] User vaults (`kuipa seal`) and the unified recovery request (§7.6),
+      in phases:
+  - [x] 1. `tang-pqc` commitments (`provision_committed`,
+        `OpenedRequest::verify_commitment`).
+  - [ ] 2. Unified recovery request; host and service escrow as machine
+        vaults carrying the commitment.
+  - [ ] 3. Vault model: policy, limits, devices, signed descriptor, `IPSV`
+        two-share format, answers encrypted to the device, server vault
+        operations and the ticket factor.
+  - [ ] 4. The vault container in LDAP, HTTP routes, test directories.
+  - [ ] 5. Delegated tickets: PAC S4U delegation info, `ticket.delegation`.
+  - [ ] 6. `kuipa seal` with passphrase file devices and per-user state.
+  - [ ] 7. Re-authentication sessions; the unlock counter in the anchor
+        exchange's CRDT.
+  - [ ] 8. Offline sessions.
+  - [ ] 9. Passkeys (libfido2 FFI, relying-party verifier from ahdapa) and
+        PKCS#11 devices.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
 - [ ] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
       `keytab_loader` is merged (§7.4): write the service's gssproxy

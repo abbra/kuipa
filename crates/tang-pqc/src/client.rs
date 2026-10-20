@@ -119,6 +119,34 @@ impl Advertisement {
         context: &BindingContext,
         kid: Option<&Thumbprint>,
     ) -> Result<(Binding, Key)> {
+        let (binding, key, _) = self.provision_inner(context, kid, None)?;
+        Ok((binding, key))
+    }
+
+    /// As [`provision_with`](Self::provision_with), and commit the binding
+    /// to `data`: the returned tag, sent with a recovery request, lets the
+    /// server check the request's claim to `data` with
+    /// [`OpenedRequest::verify_commitment`](crate::OpenedRequest::verify_commitment).
+    ///
+    /// # Errors
+    ///
+    /// As for [`provision`](Self::provision).
+    pub fn provision_committed(
+        &self,
+        context: &BindingContext,
+        kid: Option<&Thumbprint>,
+        data: &[u8],
+    ) -> Result<(Binding, Key, [u8; 32])> {
+        let (binding, key, tag) = self.provision_inner(context, kid, Some(data))?;
+        Ok((binding, key, tag.unwrap_or_default()))
+    }
+
+    fn provision_inner(
+        &self,
+        context: &BindingContext,
+        kid: Option<&Thumbprint>,
+        commit: Option<&[u8]>,
+    ) -> Result<(Binding, Key, Option<[u8; 32]>)> {
         let exchange = match kid {
             Some(kid) => self.exchange_key(kid).ok_or(Error::UnknownKey(*kid))?,
             None => self.exchange_keys().first().ok_or(Error::NoExchangeKey)?,
@@ -138,7 +166,19 @@ impl Advertisement {
         };
         let (key, confirm) = derive(shared_secret.as_ref(), &binding)?;
         binding.confirm = confirm;
-        Ok((binding, key))
+        let tag = commit
+            .map(|data| {
+                protocol::commitment(
+                    context.domain,
+                    binding.alg,
+                    &binding.kid,
+                    &binding.ciphertext,
+                    shared_secret.as_ref(),
+                    data,
+                )
+            })
+            .transpose()?;
+        Ok((binding, key, tag))
     }
 }
 

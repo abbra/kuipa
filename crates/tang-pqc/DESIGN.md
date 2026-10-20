@@ -576,6 +576,15 @@ derivations are the `Domain::TANG` case, byte for byte.
   steps, and `Server::recover` is the Tang case. A request sealed in
   another domain does not open. Opening costs a decapsulation before the
   check, so rate-limit before it.
+* **Commitments:** `Advertisement::provision_committed(context, kid, data)`
+  also returns `tag = HKDF(ss, "<domain> commit" ‖ alg ‖ kid ‖ H(ct) ‖
+  data)`, and `OpenedRequest::verify_commitment(data, tag)` checks it after
+  opening (`Error::CommitmentMismatch` otherwise). A server that authorises
+  by application data the binding context carries (kuipa: a principal and a
+  vault) cannot see that context, since it is mixed in on the client only;
+  the commitment lets it check that the binding really was made for the
+  data the request claims, which only the binding's creator and the
+  exchange key's holder can compute. The Tang wire format is unchanged.
 * **Recovery with a stored key:** `Binding::recovery_request` takes the
   exchange key, so a protocol can keep it next to the binding (`Binding::alg`
   and `kid` identify it) instead of fetching `GET /key/{kid}`.
@@ -601,5 +610,6 @@ derivations are the `Domain::TANG` case, byte for byte.
   `unix_seconds`.
 
 `tests/extensions.rs` covers these: role-tagged keys invisible to plain
-Tang, signed members, binding context (domain and info), and the default
-context matching Tang.
+Tang, signed members, binding context (domain and info), commitments (the
+committed data verifies, other data or a tag of another binding does not),
+and the default context matching Tang.
