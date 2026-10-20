@@ -1,6 +1,7 @@
 //! The user-level tasks behind `kuipa` commands (§10.1).  Each one runs
 //! every protocol step it needs; none exposes a step on its own.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::SystemTime;
 
@@ -1130,13 +1131,14 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         json!({ "ok": problems.is_empty(), "servers": servers, "kinit": kinit.is_ok(), "problems": problems }),
     )
 }
-
 /// `kuipa advertisement`: what each server of `deployment` advertises,
-/// verified against `anchors` as enrollment verifies (§4.4, §4.6), and the
+/// verified against `anchors` as enrollment verifies (§4.4, §4.6), the
 /// anchor log behind the head the advertisement names: the landmark chain
-/// (§4.8). Reads and verifies; writes nothing.  Like `enroll` before the
-/// first enrollment, the transport is trust-on-first-use: what is
-/// believed comes from the anchors, not the server certificate.
+/// (§4.8), and a per-key index of the same facts — for every anchor or
+/// signing key these servers name, what it belongs to and where it appears.
+/// Reads and verifies; writes nothing.  Like `enroll` before the first
+/// enrollment, the transport is trust-on-first-use: what is believed comes
+/// from the anchors, not the server certificate.
 #[must_use]
 pub fn advertisements(realm: &str, anchors: &[Thumbprint], deployment: &Deployment) -> Value {
     let trust = Trust::FirstContact;
@@ -1158,10 +1160,130 @@ pub fn advertisements(realm: &str, anchors: &[Thumbprint], deployment: &Deployme
             Err(e) => servers.push(json!({ "server": server, "ok": false, "error": e })),
         }
     }
+    // Inverse index of the same verified facts, keyed by thumbprint: one
+    // entry per key this deployment names, so `grep <thumbprint>` answers
+    // where it belongs without reading every server block.  Derived from
+    // the details above — the log is not fetched twice, and a landmark
+    // head is a tree hash, never an anchor key, so heads stay in each
+    // server's log lines.
+    let index = anchor_index(&servers, anchors);
     json!({
         "ok": servers.iter().all(|s| s["ok"] == Value::Bool(true)),
         "servers": servers,
+        "pinned": anchors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "anchors": index,
     })
+}
+
+/// Where each key named by the verified advertisements belongs.
+#[derive(Default)]
+struct AnchorRoles {
+    /// Pinned on this host.
+    pinned: bool,
+    /// Servers whose claim its vouch proves (§4.2).
+    proves: Vec<String>,
+    /// Servers that name it as a current anchor of their realm (§4.6).
+    current_of: Vec<String>,
+    /// `server` names it as the key that signs its advertisements.
+    signer_of: Vec<String>,
+    /// Realms whose anchors it is, as vouched for here (§17).
+    trust_of: Vec<String>,
+    /// Anchor-log entries it is current in (§4.8).
+    log_sequences: Vec<u64>,
+    /// `old -> new`: another anchor replaces it (§4.7).
+    replaced_by: Vec<String>,
+    /// `old -> new`: it replaces another anchor.
+    replaces: Vec<String>,
+}
+
+impl AnchorRoles {
+    /// JSON form, keyed by the thumbprint so `grep <thumbprint>` finds the
+    /// whole record on one line.  Each list is sorted and deduplicated:
+    /// several servers of one deployment name the same anchor.
+    fn into_json(self, key: &str) -> Value {
+        fn unique(mut names: Vec<String>) -> Vec<String> {
+            names.sort();
+            names.dedup();
+            names
+        }
+        let mut sequences = self.log_sequences;
+        sequences.sort_unstable();
+        sequences.dedup();
+        json!({
+            "key": key,
+            "pinned": self.pinned,
+            "proves": unique(self.proves),
+            "current_of": unique(self.current_of),
+            "signer_of": unique(self.signer_of),
+            "trust_of": unique(self.trust_of),
+            "log_sequences": sequences,
+            "replaces": unique(self.replaces),
+            "replaced_by": unique(self.replaced_by),
+        })
+    }
+}
+
+/// Build the per-key index from the per-server details already built:
+/// nothing is refetched, and every fact here came from an advertisement
+/// that verified against `anchors`.  A landmark head is a tree hash over
+/// an epoch entry (§4.8), not a key, so heads are not indexed — they stay
+/// in each server's log lines.
+fn anchor_index(servers: &[Value], anchors: &[Thumbprint]) -> Vec<Value> {
+    fn items(v: &Value) -> &[Value] {
+        v.as_array().map_or(&[][..], Vec::as_slice)
+    }
+    fn text(v: &Value) -> &str {
+        v.as_str().unwrap_or_default()
+    }
+    // One entry per key, created on first mention.  A closure would have
+    // to return a borrow of `roles` that outlives its own body, so this is
+    // a plain function.
+    fn note<'a>(roles: &'a mut BTreeMap<String, AnchorRoles>, key: &str) -> &'a mut AnchorRoles {
+        roles.entry(key.to_string()).or_default()
+    }
+    let mut roles: BTreeMap<String, AnchorRoles> = BTreeMap::new();
+    let pinned: Vec<String> = anchors.iter().map(ToString::to_string).collect();
+    for server in servers.iter().filter(|s| s["ok"] == Value::Bool(true)) {
+        let name = text(&server["server"]);
+        note(&mut roles, text(&server["proven_by"]))
+            .proves
+            .push(name.into());
+        note(&mut roles, text(&server["signer"]))
+            .signer_of
+            .push(name.into());
+        for key in items(&server["anchors"]) {
+            note(&mut roles, text(key)).current_of.push(name.into());
+        }
+        for t in items(&server["trusts"]) {
+            let realm = text(&t["realm"]);
+            for key in items(&t["anchors"]) {
+                note(&mut roles, text(key)).trust_of.push(realm.into());
+            }
+        }
+        // `old -> new`, the form the details render successions in (§4.7):
+        // a claim is proven only through the chain the advertisement names.
+        for s in items(&server["rotated_anchors"]) {
+            if let Some((old, new)) = text(s).split_once(" -> ") {
+                note(&mut roles, old).replaced_by.push(new.into());
+                note(&mut roles, new).replaces.push(old.into());
+            }
+        }
+        for entry in items(&server["landmarks"]) {
+            let seq = entry["seq"].as_u64().unwrap_or_default();
+            for key in items(&entry["anchors"]) {
+                note(&mut roles, text(key)).log_sequences.push(seq);
+            }
+        }
+    }
+    // Whether this host pins the key is a fact about this host, which no
+    // advertisement can tell us.
+    for anchor in &pinned {
+        note(&mut roles, anchor).pinned = true;
+    }
+    roles
+        .into_iter()
+        .map(|(key, roles)| roles.into_json(&key))
+        .collect()
 }
 
 /// One server's verified advertisement as the user can see it.
@@ -1205,7 +1327,12 @@ fn advertisement_detail(
         "trusts": info
             .trusts
             .iter()
-            .map(|t| t.realm.as_str())
+            .map(|t| json!({
+                "realm": t.realm,
+                // §17: the anchors the advertising realm vouches for; without
+                // them an anchor in the picture has no realm.
+                "anchors": t.anchors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            }))
             .collect::<Vec<_>>(),
         // §4.8: the head the advertisement names, in the `epoch` line's
         // `<seq> <hash>` form.

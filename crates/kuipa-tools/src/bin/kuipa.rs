@@ -29,9 +29,13 @@
 //! kuipa advertisement [--server S... | --domain D]
 //!                     [--enrollment-file F | --realm R]
 //!                                            what each server
-//!                                            advertises, verified, and the
+//!                                            advertises, verified, the
 //!                                            realm's anchor log: its
-//!                                            landmark chain (§4.8)
+//!                                            landmark chain (§4.8), and a
+//!                                            per-key index: for every
+//!                                            anchor or signing key seen,
+//!                                            what it belongs to and where
+//!                                            it appears
 //! kuipa status | check [--server S]         is this host healthy?
 //! kuipa leave                               remove kuipa state
 //! ```
