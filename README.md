@@ -159,20 +159,18 @@ trusted realm and a voucher issuer) and opens a shell where `kuipa` and
 helper commands are ready to use. `./contrib/ci/local-ci.sh
 playground-test` runs a scripted session in the same environment, with
 tracing on, and writes it to `kuipa-playground-report.html`.
-[docs/walkthrough.md](docs/walkthrough.md) explains a traced session step
+[A traced session](docs/src/scenarios/walkthrough.md) explains one step
 by step.
 
 ## Documentation
 
+The user documentation is an mdBook in [`docs/`](docs/src/SUMMARY.md):
+guides for realm administrators, host administrators and users, scenarios,
+and reference. Build it with `mdbook build docs` (and `mdbook-mermaid`
+for the diagrams); the HTML lands in `docs/book/`.
+
 * [docs/DESIGN.md](docs/DESIGN.md): the protocol, the implementation and
-  its status (§18)
-* [docs/walkthrough.md](docs/walkthrough.md): a traced session in the
-  playground
-* [docs/local-ci.md](docs/local-ci.md): the CI jobs and the playground
-* [docs/sealing.md](docs/sealing.md): sealing your own files with
-  `kuipa seal`, by use case (planned)
-* [docs/machines.md](docs/machines.md): kuipa on cloud virtual machines,
-  by use case
+  its status (§18); the book includes it as its reference
 * [TODO.md](TODO.md): planned work
 
 ## Contributing

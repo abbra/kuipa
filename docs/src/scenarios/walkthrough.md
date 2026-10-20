@@ -1,11 +1,11 @@
 # A traced session in the playground
 
 This session runs in the interactive playground (`contrib/ci/local-ci.sh
-interactive`, see [local-ci.md](local-ci.md)). Host `web1` enrolls in
+interactive`, see [Local CI and the playground](../development/local-ci.md)). Host `web1` enrolls in
 `EXAMPLE.TEST`. It then installs the trusted realm `B.TEST`, a user of
 `B.TEST` logs in on it, and that user gets a ticket for `web1` across the
 trust. With tracing on, every request, answer, decision and file write
-appears on standard error ([DESIGN.md](DESIGN.md) §10.4); the command's
+appears on standard error ([the design](../reference/design.md) §10.4); the command's
 result follows on standard output.
 
 Thumbprints, ports, timings and paths differ in every playground.

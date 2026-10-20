@@ -1,0 +1,22 @@
+[book]
+title = "kuipa documentation"
+authors = ["Alexander Bokovoy"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+no-section-label = true
+git-repository-url = "https://github.com/abbra/kuipa"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/synta.css"]
+additional-js  = ["mermaid.min.js", "mermaid-init.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+optional = true
