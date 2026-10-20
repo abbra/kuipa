@@ -35,9 +35,10 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         `OpenedRequest::verify_commitment`).
   - [x] 2. Unified recovery request; host and service escrow as machine
         vaults carrying the commitment.
-  - [ ] 3. Vault model: policy, limits, devices, signed descriptor, `IPSV`
+  - [x] 3. Vault model: policy, limits, devices, signed descriptor, `IPUF`
         two-share format, answers encrypted to the device, server vault
-        operations and the ticket factor.
+        operations and the ticket factor (with `ticket.delegation` checked
+        against whatever the directory reports as transited services).
   - [ ] 4. The vault container in LDAP, HTTP routes, test directories.
   - [ ] 5. Delegated tickets: PAC S4U delegation info, `ticket.delegation`.
   - [ ] 6. `kuipa seal` with passphrase file devices and per-user state.

@@ -1018,7 +1018,7 @@ kuipa protect --file F --keytab K                  sealed for K's principal
 | an image from before the last reseal or `unprotect` | that version | nothing (binding retired) |
 | root on the running host | its contents | its contents |
 
-### 7.6 User vaults (designed)
+### 7.6 User vaults (being implemented)
 
 A user seals their own files with `kuipa seal`, without root, so that a copy opens only under
 a policy the user chose within limits the realm sets. The realm's servers
@@ -1149,7 +1149,7 @@ for each server i:   (B_i, ss_i) = tang-pqc provision to ek_i under ctx
                      t_i = HMAC(HKDF(ss_i, "commit"), "vault" ‖ P ‖ V)
 for each device j:   (c_j, s_j) = ML-KEM.Encaps(dpk_j)
                      L_j = HKDF(s_j, "ipa-ku-enroll/v1 vault device" ‖ V ‖ id_j);  U_j = GCM_{L_j}(B)
-IPSV = P ‖ V ‖ mode ‖ [(server_i, B_i, ek_i, t_i, W_i)] ‖ [(id_j, c_j, U_j)] ‖ GCM_DEK(file)
+IPUF = P ‖ V ‖ [(server_i, B_i, ek_i, t_i, W_i)] ‖ [(id_j, c_j, U_j)] ‖ GCM_DEK(file)
 ```
 
 * **Two shares.** The server share `A` comes back only through a server,
@@ -1165,9 +1165,9 @@ IPSV = P ‖ V ‖ mode ‖ [(server_i, B_i, ek_i, t_i, W_i)] ‖ [(id_j, c_j, U
   ciphertext, and a client could present someone else's binding under a
   vault whose policy it satisfies, receive `ss_i`, and derive `K_i` from
   the context stored in the file.
-* **`mode`** is `per-file` or `session-epoch e`. A session-mode file
-  replaces the per-server slots by one slot sealed to the vault's epoch-`e`
-  session key (§7.6.6).
+* **Session-mode files** (§7.6.6), when built, replace the per-server
+  slots by one slot sealed to the vault's epoch-`e` session key, in a
+  format of their own.
 
 #### 7.6.5 Unlock and the unified recovery request
 
@@ -1322,7 +1322,7 @@ only when it is not a terminal, unless `--force`.
 
 * `tang-pqc`: `OpenedRequest::verify_commitment` and a client-side
   `Binding::commitment` (extension points, §8 of its DESIGN).
-* `kuipa-enroll`: the `IPSV` format, the unified `IPEQ`, encrypted
+* `kuipa-enroll`: the `IPUF` format, the unified `IPEQ`, encrypted
   answers, session tokens, signed descriptors; machine vaults replacing the
   escrow check of §7.2.
 * `kuipad`: the vault container and limits, vault and device operations
@@ -1909,7 +1909,12 @@ IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)
 IPSK  principal n(1) [server binding(TQBD) ek commitment(32) wrapped] sealed     sealed keytab
 IPSF  same fields                                                                sealed file
 IPCV  principal vault(16)                                                        what a binding commits to (commitment input, never sent)
-IPEQ  principal vault(16) commitment(32) recovery(TQRQ)                          escrow request
+IPEQ  principal vault(16) commitment(32) recovery(TQRQ) device ticket             escrow request (device: empty or a 32-byte thumbprint; ticket: empty or a GSS-API token)
+IPUF  principal vault(16) n(1) [server binding(TQBD) ek commitment(32) wrapped]
+      m(1) [device(32) ct wrapped] sealed                                        file sealed to a user vault
+IPVD  body(JSON) delegation(JSON) signer_key(JWK) signature                      vault descriptor (signed: IPVD without the signature)
+IPVR  n(u64) [descriptor(IPVD)]                                                  vault operation answer
+IPVA  ct sealed                                                                  recovery answer encrypted to a device
 IPRP  principal kind(1) n(1) [retire(32)]                                        registration parameters
 IPRA  principal                                                                  registration answer
 IPPS  sender receiver delegation(JSON) envelope token                           peer sync request

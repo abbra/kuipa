@@ -26,6 +26,7 @@ pub mod payload;
 pub mod realm;
 pub mod server;
 pub mod trust;
+pub mod vault;
 pub mod voucher;
 
 pub use error::{Error, Result};
