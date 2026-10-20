@@ -9,7 +9,7 @@
 //!   exchange between servers (§4.2).
 //! * [`realm`]: realm advertisements and their verification (§4).
 //! * [`join`]: join, rekey and stage requests (§5, §6).
-//! * [`bundle`]: offline enrollment bundles (§9).
+//! * [`bundle`]: offline enrollment bundles (§8).
 //! * [`escrow`]: sealed keytabs (§7).
 
 pub mod anchors;

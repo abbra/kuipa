@@ -1,4 +1,4 @@
-//! `kuipa-unseal`: the unattended unseal path (§3, §7.3, §7.5).
+//! `kuipa-unseal`: the unattended unseal path (§10.5, §7.3, §7.4).
 //!
 //! ```text
 //! kuipa-unseal            file mode: write /run/ipa/krb5.keytab

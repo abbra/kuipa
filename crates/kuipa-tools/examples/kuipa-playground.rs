@@ -546,7 +546,7 @@ pq_tang() {{
         "$(cat "$KUIPA_PLAYGROUND/tang/$s.thp")"
 }}
 # pq_voucher NAME [--bound] [kuipa enroll options]: enroll a new host NAME
-# with a voucher (§9) in host group webservers: blind it, have the issuer
+# with a voucher in host group webservers: blind it, have the issuer
 # ($KUIPA_PLAYGROUND/voucher, quota 100) sign it, unblind it, enroll.
 # With --bound, the voucher works only with the host's ephemeral key.
 pq_voucher() {{
@@ -588,7 +588,7 @@ pq_voucher() {{
     Ok(env)
 }
 
-/// `ipa host-add --pq-stage`, the administrator side of §9.3.
+/// `ipa host-add --pq-stage`, the administrator side of §8.3.
 fn stage(args: &[String]) -> Result<(), Error> {
     let host = option(args, "--host").ok_or("--host is required")?;
     let out = PathBuf::from(option(args, "--out").ok_or("--out is required")?);

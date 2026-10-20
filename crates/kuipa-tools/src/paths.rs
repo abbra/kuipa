@@ -94,7 +94,7 @@ impl Paths {
         self.at("etc/krb5.conf")
     }
 
-    /// The mode A recipient key (§9.2).
+    /// The mode A recipient key (§8.2).
     #[must_use]
     pub fn recipient(&self) -> PathBuf {
         self.state_dir().join("recipient.jwk")
@@ -106,7 +106,7 @@ impl Paths {
         self.state_dir().join("recipient.pub.jwk")
     }
 
-    /// Steps left after an offline enrollment (§9.4).
+    /// Steps left after an offline enrollment (§8.4).
     #[must_use]
     pub fn pending(&self) -> PathBuf {
         self.state_dir().join("pending.json")
@@ -203,7 +203,7 @@ pub fn remove(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Where the unsealed keytab lives (§7.3, §7.5).
+/// Where the unsealed keytab lives (§7.3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Holder {
