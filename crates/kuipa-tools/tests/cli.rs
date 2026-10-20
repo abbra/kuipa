@@ -132,6 +132,55 @@ fn status_names_its_subject_and_where_each_value_lives() {
     assert_eq!(json["servers"][0], "ipa1.example.test", "{json}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// On a terminal the labels are emphasised, as `clap` emphasises its help,
+/// and the escape codes must not disturb the aligned column: stripped, the
+/// output is byte-for-byte the plain one a pipe or `$NO_COLOR` gets.
+#[test]
+fn emphasised_labels_keep_the_same_column() {
+    let dir = host_state("emphasis");
+    let status = |env: &[(&str, &str)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuipa"));
+        cmd.args(["status"])
+            .env("KUIPA_ROOT", &dir)
+            .env_remove("KUIPA_ENROLLMENT_FILE")
+            .env_remove("KUIPA_TRACE")
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove("CLICOLOR")
+            .env_remove("NO_COLOR");
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // Output is captured here, so it is a pipe: plain, as it is for
+    // `kuipa status | grep` and for the playground's recorded session.
+    let plain = status(&[]);
+    assert!(!plain.contains('\x1b'), "{plain}");
+
+    // `$CLICOLOR_FORCE` is how `clap` itself is told to colour piped
+    // output; the labels are the only thing that changes.
+    let colour = status(&[("CLICOLOR_FORCE", "1")]);
+    let bold = colour.matches("\x1b[1m").count();
+    assert!(bold > 5, "{colour}");
+    assert_eq!(
+        colour.matches("\x1b[1m").count(),
+        colour.matches("\x1b[0m").count()
+    );
+    assert_eq!(colour.replace("\x1b[1m", "").replace("\x1b[0m", ""), plain);
+
+    // `$NO_COLOR` wins over a forced terminal, as everywhere else.
+    let uncached = status(&[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")]);
+    assert_eq!(uncached, plain);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What `kuipa` prints is for a person at a terminal: help text, rendered
 /// results, error messages.  Design section numbers belong in DESIGN.md and
 /// the source, not in any of that.

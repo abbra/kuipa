@@ -779,18 +779,40 @@ impl Rows {
     }
 
     /// Rows are only printed once the block is complete: the column width
-    /// is the widest label it holds.
+    /// is the widest label it holds.  On a terminal the labels are
+    /// emphasised, as `clap` emphasises its help; the padding is written
+    /// before the escape codes, so the column is identical either way.
     fn print(&self) {
-        for (label, value) in &self.lines {
-            println!(
-                "{:>indent$}{:>width$}: {value}",
-                "",
-                label,
-                indent = self.indent,
-                width = self.width,
-            );
+        if emphasise() {
+            for (label, value) in &self.lines {
+                println!(
+                    "{:>indent$}{}\x1b[1m{label}\x1b[0m: {value}",
+                    "",
+                    " ".repeat(self.width - label.len()),
+                    indent = self.indent,
+                );
+            }
+        } else {
+            for (label, value) in &self.lines {
+                println!(
+                    "{:>indent$}{:>width$}: {value}",
+                    "",
+                    label,
+                    indent = self.indent,
+                    width = self.width,
+                );
+            }
         }
     }
+}
+
+/// Whether to emphasise labels: `anstream`'s decision, the same one `clap`
+/// applies to its own help (`$NO_COLOR`, `$CLICOLOR`, `$CLICOLOR_FORCE`,
+/// `$TERM`, whether standard output is a terminal), so `kuipa --help` and a
+/// rendered block agree on where emphasis goes.  Anything that is not an
+/// ANSI terminal — a pipe, a Windows wincon console — gets plain labels.
+fn emphasise() -> bool {
+    anstream::AutoStream::choice(&std::io::stdout()) == anstream::ColorChoice::Always
 }
 
 /// Strings a flow collected, one per line under `heading`'s indent.
