@@ -2,6 +2,10 @@
 
 [Introduction](introduction.md)
 
+- [Concepts](concepts.md)
+- [What kuipa protects](security.md)
+- [Quick start](quickstart.md)
+
 # Users
 
 - [Sealing your own files](user/sealing.md)

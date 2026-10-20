@@ -154,6 +154,7 @@ live in one shell; nothing touches the real system.
 | `pq_trust` | `kuipa trusted-realms` for the current host: install `B.TEST`'s anchors, PKINIT chain, CA and `krb5.conf.d` snippet, verified through `EXAMPLE.TEST` |
 | `pq_trusted_kinit [USER]` | log in a `B.TEST` user on the current host (default `alice@B.TEST`; a bare name means `USER@B.TEST`): anonymous PKINIT armour from B's KDC with the installed chain, then an armoured `kinit`; refuses before `pq_trust`. The ticket and the configuration (the realm's plus the installed snippet, B's KDC pointed at its socket) stay in `$KUIPA_ROOT/trusted-login` |
 | `pq_trusted CMD…` | run `CMD` with that user's ticket and configuration, e.g. `pq_trusted klist` or `pq_trusted kvno host/$PQ_HOST` (a ticket for this `EXAMPLE.TEST` host over the trust) |
+| `pq_admin_kinit` | log in as the administrator with a kuipa data directory and runtime directory of their own, for `kuipa seal` |
 | `pq_down SERVER` / `pq_up` | make a server unreachable from this shell, and back (for failover) |
 | `pq_log [N]` | the servers' log |
 
