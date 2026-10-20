@@ -32,6 +32,9 @@
 
 # Reference
 
+- [Commands](reference/commands.md)
+- [Configuration](reference/configuration.md)
+- [Files and environment](reference/files.md)
 - [Design](reference/design.md)
 
 # Development
