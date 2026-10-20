@@ -625,6 +625,38 @@ fn against_a_real_kdc() {
     seal.lock("travel").unwrap();
     assert!(seal.open(&pass, None).is_err(), "locked");
 
+    // Registered sealing: a reseal or a retire makes old copies unopenable.
+    let kept = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        sealing: vault::Sealing::Registered,
+        ..vault::Policy::default()
+    };
+    seal.create("kept", kept).unwrap();
+    seal.add_device("kept", b"correct horse").unwrap();
+    let first = seal.seal("kept", b"v1").unwrap();
+    assert_eq!(
+        seal.open(&first, Some(b"correct horse")).unwrap().as_ref(),
+        b"v1"
+    );
+    let second = seal.reseal("kept", &first, Some(b"correct horse")).unwrap();
+    assert!(
+        seal.open(&first, Some(b"correct horse")).is_err(),
+        "the old copy"
+    );
+    assert_eq!(
+        seal.open(&second, Some(b"correct horse")).unwrap().as_ref(),
+        b"v1"
+    );
+    seal.retire("kept", &second).unwrap();
+    assert!(
+        seal.open(&second, Some(b"correct horse")).is_err(),
+        "retired"
+    );
+
     // A device on a token: an ML-KEM key that never leaves it, used through
     // pkcs11-provider; the PIN takes the passphrase's place.
     if let Some(module) = token_with_ml_kem_key() {

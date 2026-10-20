@@ -7,8 +7,9 @@
 > `any` until attestation is checked), `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
 > with the `device` and `ticket` factors, re-authentication sessions
 > (`--session-hours`), offline sessions (`--offline-hours`, where the realm
-> allows them) and unlock limits (`--max-unlocks`). Not yet: passkeys,
-> the attested `hardware-*` levels, `--sealing registered`, and refusing or
+> allows them), unlock limits (`--max-unlocks`) and registered sealing
+> (`--sealing registered`, `kuipa seal retire`). Not yet: passkeys,
+> the attested `hardware-*` levels, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
 > only the default `allow` is accepted). A vault policy asking for any of
 > those is refused.

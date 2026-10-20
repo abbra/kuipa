@@ -221,9 +221,6 @@ impl Policy {
         if self.sessions.epoch == Some(0) {
             return Err(Self::refuse("an epoch of no length"));
         }
-        if self.sealing == Sealing::Registered {
-            return Err(Self::refuse("registered sealing is not supported yet"));
-        }
         if let TicketDelegation::Via(list) = &self.ticket_delegation
             && list.is_empty()
         {
@@ -405,6 +402,23 @@ pub struct Vault {
     /// Offline-session keys, one per epoch, oldest first (§7.6.6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_keys: Vec<SessionKey>,
+    /// With `sealing = registered`: the `H(ct)` (hex) of every binding of
+    /// a file sealed and not yet retired; left out of descriptors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<String>,
+}
+
+/// The most bindings a vault keeps registered.
+pub const MAX_BINDINGS: usize = 4096;
+
+/// A binding hash as the vault stores it.
+#[must_use]
+pub fn binding_hex(hash: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    hash.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// One server's way into a session key: the key's private JWK sealed to
@@ -1103,6 +1117,16 @@ pub enum VaultOp {
     },
     /// Describe every vault of the owner.
     List,
+    /// With `sealing = registered`: register the bindings of a newly sealed
+    /// file, and retire those of files it replaces or that are given up.
+    Register {
+        /// The vault.
+        name: String,
+        /// Binding hashes (hex) to register.
+        add: Vec<String>,
+        /// Binding hashes (hex) to retire.
+        retire: Vec<String>,
+    },
     /// Start a session for one of the vault's devices: re-authentication,
     /// or with `offline`, the release of the vault's session keys.
     Unlock {
@@ -1612,6 +1636,19 @@ impl SealedVaultFile {
     #[must_use]
     pub fn vault(&self) -> &VaultId {
         &self.vault
+    }
+
+    /// `H(ct)` of each server slot's binding: what registered sealing
+    /// registers.
+    ///
+    /// # Errors
+    ///
+    /// A crypto error.
+    pub fn bindings(&self) -> Result<Vec<[u8; 32]>> {
+        self.servers
+            .iter()
+            .map(|s| Ok(s.binding.ciphertext_hash()?))
+            .collect()
     }
 
     /// The servers that can release the server share, in order.

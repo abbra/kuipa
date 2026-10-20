@@ -342,6 +342,14 @@ enum SealAction {
         /// The vault.
         vault: String,
     },
+    /// With registered sealing: make sealed files, and every copy of
+    /// them, unopenable.
+    Retire {
+        /// The vault.
+        vault: String,
+        /// The sealed files.
+        sealed: Vec<String>,
+    },
     /// Describe a vault.
     Show {
         /// The vault.
@@ -419,6 +427,10 @@ struct PolicyInput {
     /// How many days one offline-session key serves new files.
     #[arg(long, value_name = "DAYS", requires = "offline_hours")]
     epoch_days: Option<u64>,
+    /// `registered`: sealing needs a server, and resealing or `kuipa seal
+    /// retire` makes old copies unopenable (default: `offline`).
+    #[arg(long, value_name = "offline|registered")]
+    sealing: Option<String>,
 }
 
 impl PolicyInput {
@@ -449,17 +461,22 @@ impl PolicyInput {
         let not_after = self
             .expires
             .map(|days| tang_pqc::unix_seconds(std::time::SystemTime::now()) + days * 86_400);
+        let sealing = match self.sealing.as_deref() {
+            None | Some("offline") => kuipa_enroll::vault::Sealing::Offline,
+            Some("registered") => kuipa_enroll::vault::Sealing::Registered,
+            Some(other) => return Err(format!("--sealing {other:?}: offline or registered").into()),
+        };
         Ok(Policy {
             factors,
             ticket_delegation,
             not_after,
+            sealing,
             max_unlocks: self.max_unlocks,
             sessions: kuipa_enroll::vault::Sessions {
                 reauth: self.session_hours.map(|h| h * 3600),
                 offline: self.offline_hours.map(|h| h * 3600),
                 epoch: self.epoch_days.map(|d| d * 86_400),
             },
-            ..Policy::default()
         })
     }
 }
@@ -1721,6 +1738,12 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             seal.unlock(vault, pass.as_ref(), *offline)
         }
         SealAction::Lock { vault } => seal.lock(vault),
+        SealAction::Retire { vault, sealed } => {
+            for path in sealed {
+                seal.retire(vault, &std::fs::read(path)?)?;
+            }
+            Ok(serde_json::json!({ "vault": vault, "retired": sealed }))
+        }
         SealAction::Show { vault } => seal.show(vault),
         SealAction::List => seal.list(),
         SealAction::Revoke { vault } => seal.revoke(vault),
@@ -1800,6 +1823,9 @@ fn render_seal(value: &Value) {
             get(value, "sealed").as_str().unwrap_or("The file"),
             get(value, "written").as_str().unwrap_or("?")
         );
+    } else if get(value, "retired").is_array() {
+        println!("No copy of these opens any more:");
+        items(get(value, "retired"), "  ");
     } else if let Some(name) = get(value, "locked").as_str() {
         println!("Vault {name}'s session on this host has ended.");
     } else if get(value, "resealed").is_array() {

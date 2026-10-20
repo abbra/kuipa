@@ -1676,6 +1676,106 @@ fn offline_sessions_release_epoch_keys_to_the_device() {
 }
 
 #[test]
+fn registered_sealing_opens_only_registered_files() {
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let anchors = r.all_anchors();
+    let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let registered = vault::Policy {
+        factors: Factors {
+            device: Some(Level::Any),
+            ticket: false,
+            passkey: false,
+        },
+        sealing: vault::Sealing::Registered,
+        ..vault::Policy::default()
+    };
+    let op = |o: &VaultOp| vault_reply_at(&r, 0, &advs[0], ALICE, o);
+    op(&VaultOp::Create {
+        name: "r".into(),
+        policy: registered.clone(),
+    })
+    .unwrap();
+    let reply = op(&VaultOp::AddDevice {
+        name: "r".into(),
+        label: "d".into(),
+        kind: DeviceType::File,
+        alg: device.public().alg().id(),
+        key: tang_pqc::b64::encode(device.public().as_bytes()),
+    })
+    .unwrap();
+    let d = reply.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    let sealed = SealedVaultFile::seal(&d, &[&advs[0], &advs[1]], b"r").unwrap();
+    let hashes: Vec<String> = sealed
+        .bindings()
+        .unwrap()
+        .iter()
+        .map(vault::binding_hex)
+        .collect();
+    let ask = |s: &str, req: &EscrowRequest| {
+        let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+        r.servers[usize::from(s == "ipa2.example.test")]
+            .recover(&req, &r.dir)
+            .ok()
+            .map(|a| a.to_bytes())
+    };
+    let open = || {
+        sealed.open(
+            Unlock {
+                device: Some(&device),
+                session: None,
+                ticket: None,
+            },
+            ask,
+        )
+    };
+    // Not registered yet: no server opens it.
+    assert!(open().is_err());
+    let register = |add: &[String], retire: &[String]| {
+        op(&VaultOp::Register {
+            name: "r".into(),
+            add: add.to_vec(),
+            retire: retire.to_vec(),
+        })
+    };
+    let shown = register(&hashes, &[]).unwrap();
+    assert!(
+        shown.descriptors[0]
+            .verify(REALM, &anchors, &Policy::default())
+            .unwrap()
+            .vault()
+            .bindings
+            .is_empty(),
+        "descriptors leave the registered bindings out"
+    );
+    assert_eq!(open().unwrap().as_ref(), b"r");
+    // Retired: no copy of it opens any more.
+    register(&[], &hashes).unwrap();
+    assert!(open().is_err());
+    assert!(register(&["not hex".into()], &[]).is_err());
+
+    // A vault that seals offline does not register.
+    op(&VaultOp::Create {
+        name: "o".into(),
+        policy: vault::Policy {
+            sealing: vault::Sealing::Offline,
+            ..registered
+        },
+    })
+    .unwrap();
+    assert!(
+        op(&VaultOp::Register {
+            name: "o".into(),
+            add: hashes,
+            retire: Vec::new(),
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn sealed_passwords_are_gone() {
     // Auth type 4 carried a user's password to the server; password joins
     // now get a ticket on the host and use Kerberos (§5.3).
