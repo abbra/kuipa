@@ -1,19 +1,24 @@
 //! Sealed keytabs and files (§7.1, §7.5), their registration (§7.5) and
-//! escrow recovery requests (§7.2).
+//! the unified escrow recovery request (§7.2, §7.6.5).
 //!
 //! ```text
 //! DEK ←$ 32 bytes                         (fresh on every seal)
-//! for each server i:  (B_i, K_i) = tang-pqc provision to its escrow key,
-//!                     domain "ipa-ku-enroll/v1 escrow", info = principal
+//! V = machine vault of (principal, kind)  (§7.6.8)
+//! for each server i:  (B_i, K_i, t_i) = tang-pqc provision to its escrow key,
+//!                     domain "ipa-ku-enroll/v1 escrow", info = principal,
+//!                     committed to (principal, V)
 //!                     W_i = GCM_{K_i}(DEK)
-//! IPSK = principal ‖ [(server_i, B_i, ek_i, W_i)] ‖ GCM_DEK(MIT keytab)
-//! IPSF = principal ‖ [(server_i, B_i, ek_i, W_i)] ‖ GCM_DEK(file)
+//! IPSK = principal ‖ [(server_i, B_i, ek_i, t_i, W_i)] ‖ GCM_DEK(MIT keytab)
+//! IPSF = principal ‖ [(server_i, B_i, ek_i, t_i, W_i)] ‖ GCM_DEK(file)
 //! ```
 //!
-//! Any one server can unseal.  Each server answers only for bindings
-//! registered on the enabled directory entry of the principal (`H(ct_i)`,
-//! see [`Binding::ciphertext_hash`]), which it learns by opening the sealed
-//! recovery request.  Each slot keeps the server's public escrow key, so
+//! Any one server can unseal.  A recovery request names the principal and
+//! the vault and carries the slot's commitment `t_i`, which the server
+//! checks after opening the request, so a binding cannot be presented under
+//! another principal or vault than it was made for.  For a machine vault
+//! the server then answers only for bindings registered in that kind's set
+//! on the enabled directory entry of the principal (`H(ct_i)`, see
+//! [`Binding::ciphertext_hash`]).  Each slot keeps the server's public escrow key, so
 //! unsealing needs no extra round trip to seal the request.  The key is
 //! authenticated by the binding's `kid`.
 
@@ -35,6 +40,7 @@ const SEALED_FILE_MAGIC: [u8; 4] = *b"IPSF";
 const REQUEST_MAGIC: [u8; 4] = *b"IPEQ";
 const REGISTER_MAGIC: [u8; 4] = *b"IPRP";
 const REGISTERED_MAGIC: [u8; 4] = *b"IPRA";
+const COMMIT_MAGIC: [u8; 4] = *b"IPCV";
 
 fn context(principal: &Principal) -> BindingContext {
     BindingContext::new(DOMAIN, principal.to_string().as_bytes())
@@ -75,12 +81,85 @@ impl Kind {
     }
 }
 
+/// A vault: a user vault's random id, or the id a machine vault derives
+/// from its principal and kind (§7.6.8).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VaultId([u8; 16]);
+
+impl VaultId {
+    /// From its bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// The machine vault of `principal`'s `kind` set:
+    /// `SHA-256("ipa-ku-enroll/v1 machine vault" ‖ kind ‖ principal)`,
+    /// truncated.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn machine(principal: &Principal, kind: Kind) -> Result<Self> {
+        let digest = primitives::sha256(&[
+            b"ipa-ku-enroll/v1 machine vault",
+            &[kind.id()],
+            principal.to_string().as_bytes(),
+        ])?;
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&digest[..16]);
+        Ok(Self(id))
+    }
+
+    /// Which machine vault of `principal` this is, if it is one.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn machine_kind(&self, principal: &Principal) -> Result<Option<Kind>> {
+        for kind in [Kind::Keytab, Kind::File] {
+            if Self::machine(principal, kind)? == *self {
+                return Ok(Some(kind));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl std::fmt::Display for VaultId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+impl std::fmt::Debug for VaultId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VaultId({self})")
+    }
+}
+
+/// What a binding commits to: its principal and vault.
+#[must_use]
+pub fn commitment_data(principal: &Principal, vault: &VaultId) -> Vec<u8> {
+    Writer::new(COMMIT_MAGIC)
+        .str(&principal.to_string())
+        .fixed(vault.as_bytes())
+        .finish()
+}
+
 /// One server's way into the sealed object.
 #[derive(Clone, PartialEq, Eq)]
 struct Slot {
     server: String,
     binding: Binding,
     escrow_key: ExchangeKey,
+    commitment: [u8; 32],
     wrapped: Box<[u8]>,
 }
 
@@ -117,6 +196,7 @@ pub struct Registration {
 /// that delivers the new keys (§7.2); otherwise in a registration of their
 /// own (§7.5).
 pub struct Sealer {
+    kind: Kind,
     principal: Principal,
     dek: SecretBuf,
     slots: Vec<Slot>,
@@ -132,7 +212,8 @@ impl std::fmt::Debug for Sealer {
 
 impl Sealer {
     /// Bind a fresh data key to the escrow key of every server in
-    /// `servers` (each verified for `principal`'s realm).
+    /// `servers` (each verified for `principal`'s realm), committed to
+    /// `principal`'s machine vault for `kind`.
     ///
     /// Returns the sealer and the registrations to send.
     ///
@@ -143,12 +224,14 @@ impl Sealer {
     /// error.
     pub fn prepare(
         principal: &Principal,
+        kind: Kind,
         servers: &[&VerifiedRealm],
     ) -> Result<(Self, Vec<Registration>)> {
         if servers.is_empty() {
             return Err(Error::Missing("escrow servers"));
         }
         let ctx = context(principal);
+        let committed = commitment_data(principal, &VaultId::machine(principal, kind)?);
         let mut dek = SecretBuf::with_len(32);
         Rand::fill_private(dek.as_mut_slice())?;
         let mut slots = Vec::with_capacity(servers.len());
@@ -158,9 +241,11 @@ impl Sealer {
                 return Err(Error::WrongRealm);
             }
             let escrow_key = realm.escrow_key()?.clone();
-            let (binding, key) = realm
-                .advertisement()
-                .provision_with(&ctx, Some(escrow_key.kid()))?;
+            let (binding, key, commitment) = realm.advertisement().provision_committed(
+                &ctx,
+                Some(escrow_key.kid()),
+                &committed,
+            )?;
             registrations.push(Registration {
                 server: realm.server().into(),
                 binding: binding.ciphertext_hash()?,
@@ -170,10 +255,12 @@ impl Sealer {
                 wrapped: primitives::seal(key.as_ref(), dek.as_ref())?.into(),
                 binding,
                 escrow_key,
+                commitment,
             });
         }
         Ok((
             Self {
+                kind,
                 principal: principal.clone(),
                 dek,
                 slots,
@@ -219,6 +306,9 @@ impl Sealer {
     }
 
     fn seal_as(self, kind: Kind, plain: &[u8]) -> Result<Sealed> {
+        if kind != self.kind {
+            return Err(Error::Mismatch("prepared for another kind"));
+        }
         let ciphertext = primitives::seal(self.dek.as_ref(), plain)?.into();
         Ok(Sealed {
             kind,
@@ -237,7 +327,7 @@ impl Sealed {
     ///
     /// As for those.
     pub fn seal(keytab: &Keytab, servers: &[&VerifiedRealm]) -> Result<(Self, Vec<Registration>)> {
-        let (sealer, registrations) = Sealer::prepare(keytab.principal(), servers)?;
+        let (sealer, registrations) = Sealer::prepare(keytab.principal(), Kind::Keytab, servers)?;
         Ok((sealer.seal(keytab)?, registrations))
     }
 
@@ -320,10 +410,13 @@ impl Sealed {
         &self,
         mut recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
     ) -> Result<SecretBuf> {
+        let vault = VaultId::machine(&self.principal, self.kind)?;
         for slot in &self.slots {
             let (request, pending) = slot.binding.recovery_request(&slot.escrow_key)?;
             let request = EscrowRequest {
                 principal: self.principal.clone(),
+                vault,
+                commitment: slot.commitment,
                 request,
             };
             let Some(response) = recover(&slot.server, &request) else {
@@ -354,6 +447,7 @@ impl Sealed {
             w.str(&s.server)
                 .bytes(&s.binding.to_bytes())
                 .bytes(s.escrow_key.as_bytes())
+                .fixed(&s.commitment)
                 .bytes(&s.wrapped);
         }
         w.bytes(&self.ciphertext).finish()
@@ -385,6 +479,7 @@ impl Sealed {
                     server,
                     binding,
                     escrow_key,
+                    commitment: r.fixed()?,
                     wrapped: r.bytes()?.into(),
                 })
             })
@@ -475,11 +570,14 @@ impl RegisterParams {
     }
 }
 
-/// `POST /ipa/ku/rec/{kid}`: a `tang-pqc` recovery request naming the
-/// principal, so the server can check the binding is registered.
+/// `POST /ipa/ku/rec/{kid}`: the unified recovery request (§7.6.5): a
+/// `tang-pqc` recovery request naming the principal and the vault, with the
+/// binding's commitment to both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscrowRequest {
     principal: Principal,
+    vault: VaultId,
+    commitment: [u8; 32],
     request: RecoveryRequest,
 }
 
@@ -488,6 +586,19 @@ impl EscrowRequest {
     #[must_use]
     pub fn principal(&self) -> &Principal {
         &self.principal
+    }
+
+    /// The vault.
+    #[must_use]
+    pub fn vault(&self) -> &VaultId {
+        &self.vault
+    }
+
+    /// The binding's commitment to [`commitment_data`] of the principal and
+    /// vault.
+    #[must_use]
+    pub fn commitment(&self) -> &[u8; 32] {
+        &self.commitment
     }
 
     /// The recovery request.
@@ -501,6 +612,8 @@ impl EscrowRequest {
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(REQUEST_MAGIC)
             .str(&self.principal.to_string())
+            .fixed(self.vault.as_bytes())
+            .fixed(&self.commitment)
             .bytes(&self.request.to_bytes())
             .finish()
     }
@@ -513,8 +626,15 @@ impl EscrowRequest {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, REQUEST_MAGIC, "escrow request")?;
         let principal = r.str()?.parse()?;
+        let vault = VaultId::from_bytes(r.fixed()?);
+        let commitment = r.fixed()?;
         let request = RecoveryRequest::from_bytes(r.bytes()?)?;
         r.finish()?;
-        Ok(Self { principal, request })
+        Ok(Self {
+            principal,
+            vault,
+            commitment,
+            request,
+        })
     }
 }

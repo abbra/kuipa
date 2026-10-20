@@ -33,7 +33,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       in phases:
   - [x] 1. `tang-pqc` commitments (`provision_committed`,
         `OpenedRequest::verify_commitment`).
-  - [ ] 2. Unified recovery request; host and service escrow as machine
+  - [x] 2. Unified recovery request; host and service escrow as machine
         vaults carrying the commitment.
   - [ ] 3. Vault model: policy, limits, devices, signed descriptor, `IPSV`
         two-share format, answers encrypted to the device, server vault

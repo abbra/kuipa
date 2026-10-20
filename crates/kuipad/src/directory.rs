@@ -463,12 +463,17 @@ impl Directory for LdapDirectory {
     fn escrow_allowed(
         &self,
         principal: &Principal,
+        kind: Kind,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError> {
+        let attr = match kind {
+            Kind::Keytab => ESCROW_ATTR,
+            Kind::File => ESCROW_FILE_ATTR,
+        };
         let Some(entry) = self.principal_entry(
             &mut self.service_conn()?,
             principal,
-            &[ESCROW_ATTR, ESCROW_FILE_ATTR, "nsAccountLock"],
+            &[attr, "nsAccountLock"],
         )?
         else {
             return Ok(false);
@@ -477,12 +482,10 @@ impl Directory for LdapDirectory {
             .attrs
             .get("nsaccountlock")
             .is_some_and(|v| v.iter().any(|s| s.eq_ignore_ascii_case("true")));
-        let registered = [ESCROW_ATTR, ESCROW_FILE_ATTR].iter().any(|attr| {
-            entry
-                .bin_attrs
-                .get(&attr.to_lowercase())
-                .is_some_and(|v| v.iter().any(|b| b.as_slice() == binding))
-        });
+        let registered = entry
+            .bin_attrs
+            .get(&attr.to_lowercase())
+            .is_some_and(|v| v.iter().any(|b| b.as_slice() == binding));
         Ok(!locked && registered)
     }
 

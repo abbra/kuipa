@@ -114,8 +114,8 @@ pub trait Directory {
         bindings: &[[u8; 32]],
     ) -> Result<(), DirectoryError>;
 
-    /// Is `binding` registered for `principal`, in its keytab or its file
-    /// set, and is the principal's entry enabled?
+    /// Is `binding` registered for `principal` in its `kind` set, and is
+    /// the principal's entry enabled (not locked)?
     ///
     /// # Errors
     ///
@@ -123,6 +123,7 @@ pub trait Directory {
     fn escrow_allowed(
         &self,
         principal: &Principal,
+        kind: escrow::Kind,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError>;
 
@@ -292,9 +293,10 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn escrow_allowed(
         &self,
         principal: &Principal,
+        kind: escrow::Kind,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError> {
-        (**self).escrow_allowed(principal, binding)
+        (**self).escrow_allowed(principal, kind, binding)
     }
     fn register_with_gss(
         &self,
@@ -835,9 +837,21 @@ impl EnrollServer {
         let opened = recovery
             .open(key, escrow::DOMAIN)
             .map_err(|_| Refusal::because("request does not open"))?;
+        opened
+            .verify_commitment(
+                &escrow::commitment_data(request.principal(), request.vault()),
+                request.commitment(),
+            )
+            .map_err(|_| Refusal::because("the binding is not committed to this vault"))?;
+        let Some(kind) = request.vault().machine_kind(request.principal())? else {
+            return Err(Refusal::because(format!(
+                "unknown vault {}",
+                request.vault()
+            )));
+        };
         let binding = opened.ciphertext_hash().map_err(Error::from)?;
         if !directory
-            .escrow_allowed(request.principal(), &binding)
+            .escrow_allowed(request.principal(), kind, &binding)
             .map_err(Refusal)?
         {
             return Err(Refusal::because(

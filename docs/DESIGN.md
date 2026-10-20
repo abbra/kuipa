@@ -844,11 +844,13 @@ re-registers fresh escrow bindings in the same request (§7.2).
 
 ```
 DEK ←$ 32 bytes                                   fresh on every seal
+V = machine vault of (host/<fqdn>@REALM, keytab)                       §7.6.8
 for each reachable server i with an escrow key:
-    (B_i, K_i) = tang-pqc provision to server i's escrow key,
-                 domain "ipa-ku-enroll/v1 escrow", info = "host/<fqdn>@REALM"
+    (B_i, K_i, t_i) = tang-pqc provision to server i's escrow key,
+                      domain "ipa-ku-enroll/v1 escrow", info = "host/<fqdn>@REALM",
+                      committed to IPCV(principal, V)
     W_i = GCM_{K_i}(DEK)
-/etc/ipa/krb5.keytab.sealed = IPSK(principal, [(server_i, B_i, ek_i, W_i)], GCM_DEK(MIT keytab))
+/etc/ipa/krb5.keytab.sealed = IPSK(principal, [(server_i, B_i, ek_i, t_i, W_i)], GCM_DEK(MIT keytab))
 ```
 
 Each slot keeps server `i`'s public escrow key `ek_i` beside its binding,
@@ -870,16 +872,20 @@ state, so escrow uses it:
   rekey body and stored in `ipaKUEscrowBinding` on the host entry, replacing
   the previous set. Other keytabs and files register in a request of their
   own (§7.5).
-* **Recovery:** `POST /ipa/ku/rec/{kid}` carries the principal and a
-  `tang-pqc` recovery request, whose binding ciphertext is sealed to the
-  escrow key (`tang-pqc` DESIGN §3.3). The server opens it in the escrow
-  domain, then answers only for an enabled entry of the principal
-  (`nsAccountLock` not true) whose registered bindings, in either set
-  (§7.5), include the opened `H(ct)`. The principal
-  is also bound into `K_i`, so naming another principal yields a wrong key.
-* **Planned:** recovery moves to the unified request of §7.6.5, with a
-  commitment the server verifies; host and service escrow become machine
-  vaults (§7.6.8) with the behaviour described here.
+* **Recovery:** `POST /ipa/ku/rec/{kid}` carries the unified request of
+  §7.6.5: the principal, the vault (for host and service escrow, the
+  machine vault derived from the principal and the kind, §7.6.8), the
+  slot's commitment `t_i`, and a `tang-pqc` recovery request, whose binding
+  ciphertext is sealed to the escrow key (`tang-pqc` DESIGN §3.3). The
+  server opens it in the escrow domain and **checks the commitment** to
+  `IPCV(principal, vault)`, so a binding cannot be presented under another
+  principal or vault than it was made for, even where it is registered.
+  It then answers only for an enabled entry of the principal
+  (`nsAccountLock` not true) whose bindings registered for that kind
+  (`ipaKUEscrowBinding` for keytabs, `ipaKUEscrowFileBinding` for files,
+  §7.5) include the opened `H(ct)`. The principal is also bound into
+  `K_i`. Before commitments, that client-side binding was all that stopped
+  a principal on whose entry someone registered the same binding hash.
 * **Revocation:** deleting the host, locking it (`nsAccountLock`), or
   clearing the attribute stops unsealing at once. `ipa host-disable` and
   `ipa service-disable` today only remove keys and certificates: the entry
@@ -1259,13 +1265,14 @@ overshoot is bounded by the releases made during one gossip interval on
 the other servers. Expiry, revocation, the factors and the device checks
 are exact; the count is the only approximate limit.
 
-#### 7.6.8 Machine vaults: host and service escrow on the same path
+#### 7.6.8 Machine vaults: host and service escrow on the same path (implemented)
 
 Host and service keytabs and files sealed for machines (§7.1, §7.5) keep
 their behaviour, but their bindings carry the commitment and their recovery
 uses the request of §7.6.5:
 
-* `V` is derived, `H("machine" ‖ P ‖ kind)`, and has no entry; its policy
+* `V` is derived, the first 16 bytes of `SHA-256("ipa-ku-enroll/v1
+  machine vault" ‖ kind ‖ P)`, and has no entry; its policy
   is fixed: server share only, `sealing = registered` (each seal's binding
   registered, as `ipaKUEscrowBinding` and `ipaKUEscrowFileBinding` are
   today, so an old image stops opening), no sessions, no count.
@@ -1899,8 +1906,12 @@ IPSX  mode(1) alg(1) ek_m not_after(u64)                                        
 IPSP  bundle secret                                                              stage result
 IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)
       signer(32) ct sealed delegation(JSON) signer_key(JWK) signature            offline bundle
-IPSK  principal n(1) [server binding(TQBD) ek wrapped] sealed                    sealed keytab
-IPEQ  principal recovery(TQRQ)                                                   escrow request
+IPSK  principal n(1) [server binding(TQBD) ek commitment(32) wrapped] sealed     sealed keytab
+IPSF  same fields                                                                sealed file
+IPCV  principal vault(16)                                                        what a binding commits to (commitment input, never sent)
+IPEQ  principal vault(16) commitment(32) recovery(TQRQ)                          escrow request
+IPRP  principal kind(1) n(1) [retire(32)]                                        registration parameters
+IPRA  principal                                                                  registration answer
 IPPS  sender receiver delegation(JSON) envelope token                           peer sync request
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
 IPVH  realm anchor(32) iat(u64) exp(u64) size(u64) root(32)                      vouch (signed)
@@ -1937,7 +1948,7 @@ recovery request and response.
 | `primitives::Domain` (labelled HKDF), `seal`/`open`, `digest` | every derivation and encryption |
 | `ExchangeKey::encapsulate`, `ExchangeKeyPair::decapsulate` | the KEM steps |
 | `SigningKey::sign_with_context`, `VerifyingKey::verify_with_context` | bundle and vouch signatures |
-| `BindingContext`, `provision_with`, `Binding::{from_bytes_with, ciphertext_hash, recovery_request}`, `RecoveryRequest::open`, `OpenedRequest::{ciphertext_hash, respond}` | sealed keytabs and escrow |
+| `BindingContext`, `provision_committed`, `Binding::{from_bytes_with, ciphertext_hash, recovery_request}`, `RecoveryRequest::open`, `OpenedRequest::{verify_commitment, ciphertext_hash, respond}` | sealed keytabs and files, escrow, vaults |
 | `Policy`, `wire`, `b64`, seed JWKs, thumbprints, system-policy checks | throughout |
 
 `tang-pqc`'s own DESIGN.md §8 describes these extension points.

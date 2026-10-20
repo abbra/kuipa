@@ -8,7 +8,7 @@ use agirru_crdt::GenerationClock;
 use kuipa_enroll::anchors::{AnchorState, Entry, Trust};
 use kuipa_enroll::bundle::{Bundle, Mode, Opener, StageParams};
 use kuipa_enroll::delegation::{Claim, Delegation, SignedVouch, VOUCH_VALIDITY};
-use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer};
+use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer, VaultId};
 use kuipa_enroll::join::{
     AuthType, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
 };
@@ -171,13 +171,16 @@ impl Directory for MemoryDirectory {
     fn escrow_allowed(
         &self,
         principal: &Principal,
+        kind: Kind,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError> {
         let p = principal.to_string();
+        let set = match kind {
+            Kind::Keytab => &self.escrow,
+            Kind::File => &self.escrow_files,
+        };
         Ok(!self.disabled.borrow().contains(&p)
-            && [&self.escrow, &self.escrow_files]
-                .iter()
-                .any(|set| set.borrow().get(&p).is_some_and(|b| b.contains(binding))))
+            && set.borrow().get(&p).is_some_and(|b| b.contains(binding)))
     }
 
     fn register_with_gss(
@@ -839,7 +842,8 @@ fn sealed_file_registered_by_its_principal() {
             .ok()
     };
     let seal = |contents: &[u8], retire: Vec<[u8; 32]>| {
-        let (sealer, registrations) = Sealer::prepare(&service, &[&advs[0], &advs[1]]).unwrap();
+        let (sealer, registrations) =
+            Sealer::prepare(&service, Kind::File, &[&advs[0], &advs[1]]).unwrap();
         let bindings: Vec<_> = registrations.iter().map(|g| g.binding).collect();
         let params = RegisterParams {
             principal: service.clone(),
@@ -880,6 +884,71 @@ fn sealed_file_registered_by_its_principal() {
     // Nor can a registration be sent to the rekey endpoint.
     let (request, _) = register_request(&advs[0], &service.to_string(), &params, &[]);
     assert!(r.send(0, Operation::Rekey, &request).is_err());
+}
+
+/// `req` presented under another principal and vault, with its own
+/// commitment.
+fn renamed(req: &EscrowRequest, principal: &Principal, vault: &VaultId) -> EscrowRequest {
+    let bytes = tang_pqc::wire::Writer::new(*b"IPEQ")
+        .str(&principal.to_string())
+        .fixed(vault.as_bytes())
+        .fixed(req.commitment())
+        .bytes(&req.recovery().to_bytes())
+        .finish();
+    EscrowRequest::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn bindings_open_only_under_what_they_commit_to() {
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let host = Principal::host(HOST, REALM);
+    let eve = Principal::host("evil.example.test", REALM);
+    let keys = Keytab::new(
+        host.clone(),
+        vec![KeytabEntry {
+            kvno: 1,
+            enctype: Enctype::AES256_CTS_HMAC_SHA1_96,
+            key: SecretBuf::from_slice(&[7; 32]),
+            timestamp: 1,
+        }],
+    );
+    let (sealed, registrations) = Sealed::seal(&keys, &[&advs[0], &advs[1]]).unwrap();
+    let hashes: Vec<_> = registrations.iter().map(|g| g.binding).collect();
+    // The same bindings registered on the host's entry and on Eve's, in
+    // both sets: before commitments, only the binding context (mixed in on
+    // the client) stood between Eve's claim and the host's key.
+    for p in [&host, &eve] {
+        r.dir.register_escrow(p, &hashes).unwrap();
+        r.dir
+            .escrow_files
+            .borrow_mut()
+            .insert(p.to_string(), hashes.clone());
+    }
+    let answer = |req: &EscrowRequest| {
+        let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+        r.servers[0].recover(&req, &r.dir)
+    };
+
+    let mut seen = Vec::new();
+    sealed
+        .unseal(|_, req| {
+            seen.push(req.clone());
+            answer(req).ok()
+        })
+        .unwrap();
+    let req = &seen[0];
+    assert_eq!(req.vault(), &VaultId::machine(&host, Kind::Keytab).unwrap());
+
+    // Eve's own principal and machine vault, where the binding is registered.
+    let eves = renamed(req, &eve, &VaultId::machine(&eve, Kind::Keytab).unwrap());
+    assert!(answer(&eves).is_err());
+    // The host's file vault, where the binding is registered too.
+    let file = renamed(req, &host, &VaultId::machine(&host, Kind::File).unwrap());
+    assert!(answer(&file).is_err());
+    // A vault that does not exist.
+    let none = renamed(req, &host, &VaultId::from_bytes([9; 16]));
+    assert!(answer(&none).is_err());
 }
 
 #[test]

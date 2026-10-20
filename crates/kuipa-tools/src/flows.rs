@@ -870,7 +870,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     } else {
         let servers = all_servers(&state, &trust, &anchors);
         let refs: Vec<_> = servers.iter().collect();
-        let (sealer, registered) = Sealer::prepare(&principal, &refs)?;
+        let (sealer, registered) = Sealer::prepare(&principal, Kind::Keytab, &refs)?;
         tracing::debug!(
             "sealing to the escrow keys of {:?}; {} binding(s) to register with the rekey",
             servers
@@ -1250,7 +1250,7 @@ fn protect_other(
     let trust = ca_trust(paths)?;
     let servers = all_servers(&state, &trust, &anchors);
     let refs: Vec<_> = servers.iter().collect();
-    let (sealer, registrations) = Sealer::prepare(&principal, &refs)?;
+    let (sealer, registrations) = Sealer::prepare(&principal, kind_of(contents), &refs)?;
     let bindings: Vec<_> = registrations.iter().map(|r| r.binding).collect();
     let params = RegisterParams {
         principal: principal.clone(),

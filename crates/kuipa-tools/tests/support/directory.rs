@@ -222,15 +222,18 @@ impl Directory for KdcDirectory {
     fn escrow_allowed(
         &self,
         principal: &Principal,
+        kind: Kind,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError> {
-        let p = principal.to_string();
-        Ok([&self.escrow, &self.escrow_files].iter().any(|set| {
-            set.lock()
-                .unwrap()
-                .get(&p)
-                .is_some_and(|b| b.contains(binding))
-        }))
+        let set = match kind {
+            Kind::Keytab => &self.escrow,
+            Kind::File => &self.escrow_files,
+        };
+        Ok(set
+            .lock()
+            .unwrap()
+            .get(&principal.to_string())
+            .is_some_and(|b| b.contains(binding)))
     }
 
     fn register_with_gss(
