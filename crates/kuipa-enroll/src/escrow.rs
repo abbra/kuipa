@@ -611,6 +611,7 @@ pub struct EscrowRequest {
     commitment: [u8; 32],
     request: RecoveryRequest,
     device: Option<tang_pqc::Thumbprint>,
+    session: Vec<u8>,
     ticket: Vec<u8>,
 }
 
@@ -630,8 +631,22 @@ impl EscrowRequest {
             commitment,
             request,
             device,
+            session: Vec::new(),
             ticket: Vec::new(),
         }
+    }
+
+    /// The same request carrying a re-authentication session token.
+    #[must_use]
+    pub fn with_session(mut self, token: Vec<u8>) -> Self {
+        self.session = token;
+        self
+    }
+
+    /// The session token, empty without one.
+    #[must_use]
+    pub fn session(&self) -> &[u8] {
+        &self.session
     }
 
     /// The same request carrying the owner's GSS-API `token`, made with
@@ -705,6 +720,7 @@ impl EscrowRequest {
             .fixed(&self.commitment)
             .bytes(&self.request.to_bytes())
             .bytes(self.device.as_ref().map_or(&[][..], |d| d.as_bytes()))
+            .bytes(&self.session)
             .bytes(&self.ticket)
             .finish()
     }
@@ -726,6 +742,7 @@ impl EscrowRequest {
                 id.try_into().map_err(|_| Error::Malformed("device id"))?,
             )),
         };
+        let session = r.bytes()?.to_vec();
         let ticket = r.bytes()?.to_vec();
         r.finish()?;
         Ok(Self {
@@ -734,6 +751,7 @@ impl EscrowRequest {
             commitment,
             request,
             device,
+            session,
             ticket,
         })
     }

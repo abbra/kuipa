@@ -41,10 +41,14 @@ pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 vault");
 /// ML-DSA context of descriptor signatures.
 pub const DESCRIPTOR_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault descriptor";
 
+/// ML-DSA context of session token signatures.
+pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault session";
+
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
+const SESSION_MAGIC: [u8; 4] = *b"IPST";
 
 const HASH: &std::ffi::CStr = c"SHA2-256";
 
@@ -192,11 +196,16 @@ impl Policy {
         if f.passkey {
             return Err(Self::refuse("the passkey factor is not supported yet"));
         }
-        if self.max_unlocks.is_some() {
-            return Err(Self::refuse("unlock limits are not supported yet"));
+        if self.max_unlocks == Some(0) {
+            return Err(Self::refuse("a vault that never unlocks"));
         }
-        if self.sessions.reauth.is_some() || self.sessions.offline.is_some() {
-            return Err(Self::refuse("sessions are not supported yet"));
+        if self.sessions.reauth.is_some() && f.device.is_none() {
+            return Err(Self::refuse(
+                "re-authentication sessions need the device factor: a session token alone would open the vault",
+            ));
+        }
+        if self.sessions.offline.is_some() {
+            return Err(Self::refuse("offline sessions are not supported yet"));
         }
         if self.sealing == Sealing::Registered {
             return Err(Self::refuse("registered sealing is not supported yet"));
@@ -375,6 +384,10 @@ pub struct Vault {
     /// Enabled or revoked.
     #[serde(default)]
     pub state: State,
+    /// Releases so far, summed over the servers (§7.6.7); kept by the
+    /// directory, not by the owner.
+    #[serde(default)]
+    pub unlocks: u64,
 }
 
 impl Vault {
@@ -623,6 +636,13 @@ pub enum VaultOp {
     },
     /// Describe every vault of the owner.
     List,
+    /// Start a re-authentication session for one of the vault's devices.
+    Unlock {
+        /// The vault.
+        name: String,
+        /// The device's id.
+        device: String,
+    },
 }
 
 impl VaultOp {
@@ -642,35 +662,209 @@ impl VaultOp {
     }
 }
 
-/// Encode the descriptors a vault operation answers with.
-///
-/// # Panics
-///
-/// Never for fewer than 2³² descriptors.
-#[must_use]
-pub fn reply_to_bytes(descriptors: &[Descriptor]) -> Vec<u8> {
-    let mut w = Writer::new(REPLY_MAGIC);
-    w.u64(u64::try_from(descriptors.len()).expect("few descriptors"));
-    for d in descriptors {
-        w.bytes(&d.to_bytes());
-    }
-    w.finish()
+/// What a vault operation answers with: descriptors, and for
+/// [`VaultOp::Unlock`] a session token.
+#[derive(Clone, Debug, Default)]
+pub struct Reply {
+    /// The vaults the operation concerned.
+    pub descriptors: Vec<Descriptor>,
+    /// A new session.
+    pub session: Option<SessionToken>,
 }
 
-/// Decode a vault operation's answer.
-///
-/// # Errors
-///
-/// [`Error::Malformed`].
-pub fn reply_from_bytes(bytes: &[u8]) -> Result<Vec<Descriptor>> {
-    let mut r = Reader::new(bytes, REPLY_MAGIC, "vault reply")?;
-    let n = r.u64()?;
-    let mut out = Vec::new();
-    for _ in 0..n {
-        out.push(Descriptor::from_bytes(r.bytes()?)?);
+impl Reply {
+    /// Encode: `IPVR n(u64) [descriptor] session` (session empty without
+    /// one).
+    ///
+    /// # Panics
+    ///
+    /// Never for fewer than 2⁶⁴ descriptors.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new(REPLY_MAGIC);
+        w.u64(u64::try_from(self.descriptors.len()).expect("few descriptors"));
+        for d in &self.descriptors {
+            w.bytes(&d.to_bytes());
+        }
+        w.bytes(
+            &self
+                .session
+                .as_ref()
+                .map(SessionToken::to_bytes)
+                .unwrap_or_default(),
+        );
+        w.finish()
     }
-    r.finish()?;
-    Ok(out)
+
+    /// Decode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, REPLY_MAGIC, "vault reply")?;
+        let n = r.u64()?;
+        let mut descriptors = Vec::new();
+        for _ in 0..n {
+            descriptors.push(Descriptor::from_bytes(r.bytes()?)?);
+        }
+        let session = match r.bytes()? {
+            [] => None,
+            b => Some(SessionToken::from_bytes(b)?),
+        };
+        r.finish()?;
+        Ok(Self {
+            descriptors,
+            session,
+        })
+    }
+}
+
+/// A re-authentication session (§7.6.6): for `device` of `owner`'s vault,
+/// until `not_after`, signed by a server under its delegation so any
+/// server can check it.  It stands in for the ticket and passkey factors;
+/// the answer is still encrypted to the device.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionToken {
+    vault: VaultId,
+    owner: String,
+    device: Thumbprint,
+    not_after: u64,
+    delegation: Box<[u8]>,
+    signer_key: Box<[u8]>,
+    signature: Box<[u8]>,
+}
+
+impl fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionToken")
+            .field("vault", &self.vault)
+            .field("not_after", &self.not_after)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionToken {
+    /// Sign a session.
+    ///
+    /// # Errors
+    ///
+    /// A crypto error.
+    pub fn sign(
+        signing: &SigningKey,
+        delegation: &Delegation,
+        vault: VaultId,
+        owner: &str,
+        device: Thumbprint,
+        not_after: u64,
+    ) -> Result<Self> {
+        let mut t = Self {
+            vault,
+            owner: owner.to_owned(),
+            device,
+            not_after,
+            delegation: delegation.to_json().into_bytes().into(),
+            signer_key: signing.public().to_jwk_json().into_bytes().into(),
+            signature: Box::default(),
+        };
+        t.signature = signing
+            .sign_with_context(&t.signed_part(), SESSION_CONTEXT)?
+            .into();
+        Ok(t)
+    }
+
+    fn signed_part(&self) -> Vec<u8> {
+        Writer::new(SESSION_MAGIC)
+            .fixed(self.vault.as_bytes())
+            .str(&self.owner)
+            .fixed(self.device.as_bytes())
+            .u64(self.not_after)
+            .bytes(&self.delegation)
+            .bytes(&self.signer_key)
+            .finish()
+    }
+
+    /// Check the signature and its delegation against `anchors` of
+    /// `realm`, and that the session is for `vault`, `owner` and `device`
+    /// and lasts past `now`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Expired`], [`Error::Mismatch`], [`Error::UntrustedAnchor`],
+    /// [`Error::WrongRealm`] or a crypto error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check(
+        &self,
+        realm: &str,
+        anchors: &[Thumbprint],
+        policy: &CryptoPolicy,
+        vault: &VaultId,
+        owner: &str,
+        device: &Thumbprint,
+        now: u64,
+    ) -> Result<()> {
+        if &self.vault != vault || self.owner != owner || &self.device != device {
+            return Err(Error::Mismatch("session"));
+        }
+        if now > self.not_after {
+            return Err(Error::Expired);
+        }
+        let delegation =
+            Delegation::from_json(&self.delegation)?.verify_at(anchors, policy, now)?;
+        if delegation.realm != realm {
+            return Err(Error::WrongRealm);
+        }
+        let key = VerifyingKey::from_jwk_json(&self.signer_key)?;
+        if key.thumbprint() != &delegation.key {
+            return Err(Error::Mismatch("session signer"));
+        }
+        key.verify_with_context(&self.signed_part(), SESSION_CONTEXT, &self.signature)?;
+        Ok(())
+    }
+
+    /// The vault.
+    #[must_use]
+    pub fn vault(&self) -> &VaultId {
+        &self.vault
+    }
+
+    /// When the session ends.
+    #[must_use]
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+
+    /// Encode.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new(SESSION_MAGIC);
+        w.bytes(&self.signed_part()).bytes(&self.signature);
+        w.finish()
+    }
+
+    /// Decode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut outer = Reader::new(bytes, SESSION_MAGIC, "vault session")?;
+        let signed = outer.bytes()?;
+        let signature = outer.bytes()?.into();
+        outer.finish()?;
+        let mut r = Reader::new(signed, SESSION_MAGIC, "vault session")?;
+        let t = Self {
+            vault: VaultId::from_bytes(r.fixed()?),
+            owner: r.str()?.to_owned(),
+            device: Thumbprint::from_bytes(r.fixed()?),
+            not_after: r.u64()?,
+            delegation: r.bytes()?.into(),
+            signer_key: r.bytes()?.into(),
+            signature,
+        };
+        r.finish()?;
+        Ok(t)
+    }
 }
 
 /// A device key that can decapsulate: an [`ExchangeKeyPair`] in memory, or
@@ -860,6 +1054,8 @@ pub type TicketSource<'a> = &'a mut dyn FnMut(&str, &[u8; 32]) -> Option<Vec<u8>
 pub struct Unlock<'a> {
     /// The device to answer to, and whose share to open.
     pub device: Option<&'a dyn DeviceKey>,
+    /// A re-authentication session, in place of the ticket.
+    pub session: Option<&'a SessionToken>,
     /// A GSS-API token for `ipa-ku@<server>` bound to the request's
     /// [`EscrowRequest::ticket_binding`], when the vault needs a ticket.
     pub ticket: Option<TicketSource<'a>>,
@@ -1003,6 +1199,9 @@ impl SealedVaultFile {
                 recovery,
                 unlock.device.map(DeviceKey::id),
             );
+            if let Some(session) = unlock.session {
+                request = request.with_session(session.to_bytes());
+            }
             if let Some(ticket) = unlock.ticket.as_mut() {
                 let Some(token) = ticket(&slot.server, &request.ticket_binding()?) else {
                     continue;

@@ -505,6 +505,8 @@ pq_offline() {{
 pq_admin_kinit() {{
     echo {password} | kinit {admin} >/dev/null || return
     export KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin"
+    # Sessions stay inside the playground, not in the real runtime directory.
+    export KUIPA_RUNTIME_DIR="$KUIPA_PLAYGROUND/run-user/admin"
     klist
 }}
 pq_trust() {{ kuipa trusted-realms "$@"; }}

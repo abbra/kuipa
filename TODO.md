@@ -46,8 +46,8 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         with `samba-ndr` as the dependency). Until then kuipad reports the
         delegation as unknown, which only `allow` accepts.
   - [x] 6. `kuipa seal` with passphrase file devices and per-user state.
-  - [ ] 7. Re-authentication sessions; the unlock counter in the anchor
-        exchange's CRDT.
+  - [x] 7. Re-authentication sessions; the unlock counter (per-server
+        values on the vault entry).
   - [ ] 8. Offline sessions.
   - [ ] 9. Passkeys (libfido2 FFI, relying-party verifier from ahdapa) and
         PKCS#11 devices.
@@ -72,6 +72,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 - [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
       the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
       `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
+      `ipaKUVaultUnlocks`,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
       `ipaKUTrustedRealm`) and
       the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs for the daemon's identity

@@ -50,6 +50,7 @@ struct MemoryDirectory {
     disabled: RefCell<HashSet<String>>,
     staged: RefCell<HashMap<String, Staged>>,
     vaults: RefCell<HashMap<VaultId, Vault>>,
+    unlocks: RefCell<HashMap<(VaultId, String), u64>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -246,17 +247,50 @@ impl Directory for MemoryDirectory {
 
     fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
         let owner = owner.to_string();
+        let unlocks = self.unlocks.borrow();
         Ok(self
             .vaults
             .borrow()
             .values()
             .filter(|v| v.owner == owner)
             .cloned()
+            .map(|mut v| {
+                v.unlocks = unlocks
+                    .iter()
+                    .filter(|((id, _), _)| *id == v.id)
+                    .map(|(_, n)| n)
+                    .sum();
+                v
+            })
             .collect())
     }
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.disabled.borrow().contains(&principal.to_string()))
+    }
+
+    fn vault_unlock(
+        &self,
+        id: &VaultId,
+        server: &str,
+        limit: Option<u64>,
+    ) -> Result<bool, DirectoryError> {
+        let total: u64 = self
+            .unlocks
+            .borrow()
+            .iter()
+            .filter(|((v, _), _)| v == id)
+            .map(|(_, n)| n)
+            .sum();
+        if limit.is_some_and(|l| total >= l) {
+            return Ok(false);
+        }
+        *self
+            .unlocks
+            .borrow_mut()
+            .entry((*id, server.to_owned()))
+            .or_default() += 1;
+        Ok(true)
     }
 
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
@@ -948,6 +982,7 @@ fn renamed(req: &EscrowRequest, principal: &Principal, vault: &VaultId) -> Escro
         .fixed(req.commitment())
         .bytes(&req.recovery().to_bytes())
         .bytes(req.device().map_or(&[][..], |d| d.as_bytes()))
+        .bytes(req.session())
         .bytes(req.ticket())
         .finish();
     EscrowRequest::from_bytes(&bytes).unwrap()
@@ -1033,7 +1068,9 @@ fn vault_op(
         .unwrap();
     let response = r.send(0, Operation::Vault, &request)?;
     let payload = pending.open(&response).map_err(|_| ())?;
-    vault::reply_from_bytes(payload.as_ref()).map_err(|_| ())
+    vault::Reply::from_bytes(payload.as_ref())
+        .map(|r| r.descriptors)
+        .map_err(|_| ())
 }
 
 #[test]
@@ -1065,7 +1102,10 @@ fn user_vault_seals_and_opens_under_its_policy() {
     for bad in [
         vault::Policy::default(),
         vault::Policy {
-            max_unlocks: Some(3),
+            sessions: vault::Sessions {
+                reauth: None,
+                offline: Some(600),
+            },
             ..policy.clone()
         },
     ] {
@@ -1127,6 +1167,7 @@ fn user_vault_seals_and_opens_under_its_policy() {
         sealed.open(
             Unlock {
                 device: key.map(|k| k as &dyn vault::DeviceKey),
+                session: None,
                 ticket: Some(&mut ticket),
             },
             ask,
@@ -1146,6 +1187,7 @@ fn user_vault_seals_and_opens_under_its_policy() {
     let no_ticket = sealed.open(
         Unlock {
             device: Some(&device),
+            session: None,
             ticket: None,
         },
         ask,
@@ -1212,6 +1254,7 @@ fn user_vault_seals_and_opens_under_its_policy() {
         .open(
             Unlock {
                 device: Some(&device),
+                session: None,
                 ticket: Some(&mut |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb))),
             },
             |s, req| {
@@ -1268,6 +1311,186 @@ fn user_vault_seals_and_opens_under_its_policy() {
     assert!(open_as(ALICE, Some(&device)).is_err());
     let listed = vault_op(&r, adv, ALICE, &VaultOp::List).unwrap();
     assert_eq!(listed.len(), 1);
+}
+
+/// Run a vault operation as `caller` and keep the whole reply.
+fn vault_reply(r: &Realm, adv: &VerifiedRealm, caller: &str, op: &VaultOp) -> vault::Reply {
+    let p = Prepared::new(
+        adv,
+        Operation::Vault,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
+        .unwrap();
+    let response = r.send(0, Operation::Vault, &request).unwrap();
+    vault::Reply::from_bytes(pending.open(&response).unwrap().as_ref()).unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn vault_sessions_and_unlock_limits() {
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let adv = &advs[0];
+    let anchors = r.all_anchors();
+    let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let other = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let factors = Factors {
+        device: Some(Level::Any),
+        ticket: true,
+        passkey: false,
+    };
+
+    // A session without the device factor would be a bearer token.
+    let bearer = vault::Policy {
+        factors: Factors {
+            device: None,
+            ticket: true,
+            passkey: false,
+        },
+        sessions: vault::Sessions {
+            reauth: Some(600),
+            offline: None,
+        },
+        ..vault::Policy::default()
+    };
+    assert!(
+        vault_op(
+            &r,
+            adv,
+            ALICE,
+            &VaultOp::Create {
+                name: "b".into(),
+                policy: bearer
+            }
+        )
+        .is_err()
+    );
+
+    let policy = vault::Policy {
+        factors,
+        max_unlocks: Some(3),
+        sessions: vault::Sessions {
+            reauth: Some(600),
+            offline: None,
+        },
+        ..vault::Policy::default()
+    };
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Create {
+            name: "s".into(),
+            policy: policy.clone(),
+        },
+    )
+    .unwrap();
+    for key in [&device, &other] {
+        vault_op(
+            &r,
+            adv,
+            ALICE,
+            &VaultOp::AddDevice {
+                name: "s".into(),
+                label: "d".into(),
+                kind: DeviceType::File,
+                alg: key.public().alg().id(),
+                key: tang_pqc::b64::encode(key.public().as_bytes()),
+            },
+        )
+        .unwrap();
+    }
+    let reply = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Unlock {
+            name: "s".into(),
+            device: device.public().kid().to_string(),
+        },
+    );
+    let session = reply.session.unwrap();
+    let v = reply.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"s").unwrap();
+    let ask = |s: &str, req: &EscrowRequest| {
+        let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+        r.servers[usize::from(s == "ipa2.example.test")]
+            .recover(&req, &r.dir)
+            .ok()
+            .map(|a| a.to_bytes())
+    };
+    let with_session = |key: &ExchangeKeyPair| {
+        sealed.open(
+            Unlock {
+                device: Some(key),
+                session: Some(&session),
+                ticket: None,
+            },
+            ask,
+        )
+    };
+
+    // The session stands in for the ticket, for its own device only.
+    assert_eq!(with_session(&device).unwrap().as_ref(), b"s");
+    assert!(with_session(&other).is_err());
+    // Two more releases reach the limit; the third is refused, and the
+    // vault reports what was counted.
+    assert!(with_session(&device).is_ok());
+    assert!(with_session(&device).is_ok());
+    assert!(matches!(with_session(&device), Err(Error::Refused)));
+    let shown = vault_op(&r, adv, ALICE, &VaultOp::Show { name: "s".into() }).unwrap();
+    assert_eq!(
+        shown[0]
+            .verify(REALM, &anchors, &Policy::default())
+            .unwrap()
+            .vault()
+            .unlocks,
+        3
+    );
+
+    // A policy without sessions stops accepting them, and starting one.
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::SetPolicy {
+            name: "s".into(),
+            policy: vault::Policy {
+                max_unlocks: None,
+                sessions: vault::Sessions::default(),
+                ..policy
+            },
+        },
+    )
+    .unwrap();
+    assert!(with_session(&device).is_err());
+    let p = Prepared::new(
+        adv,
+        Operation::Vault,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let op = VaultOp::Unlock {
+        name: "s".into(),
+        device: device.public().kid().to_string(),
+    };
+    let (request, _) = p
+        .with_kerberos(fake_binding(ALICE, &cb))
+        .seal(&gss_token(ALICE, &cb), &[], &op.to_bytes())
+        .unwrap();
+    assert!(r.send(0, Operation::Vault, &request).is_err());
 }
 
 #[test]

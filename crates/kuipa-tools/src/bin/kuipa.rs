@@ -320,6 +320,20 @@ enum SealAction {
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
     },
+    /// Start a session: until it ends, files of the vault open on this
+    /// host without the passphrase or a ticket.
+    Unlock {
+        /// The vault.
+        vault: String,
+        /// Read the device key's passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// End the vault's session on this host.
+    Lock {
+        /// The vault.
+        vault: String,
+    },
     /// Describe a vault.
     Show {
         /// The vault.
@@ -372,6 +386,12 @@ struct PolicyInput {
     /// Accept delegated tickets only through these services.
     #[arg(long, value_name = "SERVICE")]
     ticket_via: Vec<String>,
+    /// How many times, in all, the servers may open files of the vault.
+    #[arg(long, value_name = "N")]
+    max_unlocks: Option<u64>,
+    /// Allow sessions of up to this many hours (`kuipa seal unlock`).
+    #[arg(long, value_name = "HOURS")]
+    session_hours: Option<u64>,
 }
 
 impl PolicyInput {
@@ -406,6 +426,11 @@ impl PolicyInput {
             factors,
             ticket_delegation,
             not_after,
+            max_unlocks: self.max_unlocks,
+            sessions: kuipa_enroll::vault::Sessions {
+                reauth: self.session_hours.map(|h| h * 3600),
+                offline: None,
+            },
             ..Policy::default()
         })
     }
@@ -1620,7 +1645,7 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             let needs_device = !kuipa_enroll::vault::SealedVaultFile::from_bytes(&bytes)?
                 .devices()
                 .is_empty();
-            let pass = needs_device
+            let pass = (needs_device && !kuipa_tools::seal::Seal::in_session(&bytes))
                 .then(|| passphrase(passphrase_file.as_deref(), false))
                 .transpose()?;
             let plain = seal.open(&bytes, pass.as_ref().map(AsRef::as_ref))?;
@@ -1644,6 +1669,14 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             }
             Ok(serde_json::json!({ "vault": vault, "resealed": sealed }))
         }
+        SealAction::Unlock {
+            vault,
+            passphrase_file,
+        } => {
+            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            seal.unlock(vault, pass.as_ref())
+        }
+        SealAction::Lock { vault } => seal.lock(vault),
         SealAction::Show { vault } => seal.show(vault),
         SealAction::List => seal.list(),
         SealAction::Revoke { vault } => seal.revoke(vault),
@@ -1651,6 +1684,11 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
 }
 
 fn render_seal(value: &Value) {
+    if let Some(until) = get(value, "session_until").as_u64() {
+        println!(
+            "Session started: files open on this host without the passphrase or a ticket until {until} (Unix time), or `kuipa seal lock`."
+        );
+    }
     if let Some(vaults) = get(value, "vaults").as_array() {
         if vaults.is_empty() {
             println!("No vaults.");
@@ -1675,6 +1713,12 @@ fn render_seal(value: &Value) {
             }
             rows.row("opening needs", needs.join(" and "));
             rows.field("expires (Unix time)", get(policy, "not_after"));
+            rows.field("unlocks so far", get(v, "unlocks"));
+            rows.field("unlocks allowed", get(policy, "max_unlocks"));
+            rows.field(
+                "longest session (seconds)",
+                get(get(policy, "sessions"), "reauth"),
+            );
             rows.field("delegated tickets", get(policy, "ticket_delegation"));
             let devices: Vec<Value> = list(get(v, "devices"))
                 .into_iter()
@@ -1706,6 +1750,8 @@ fn render_seal(value: &Value) {
             get(value, "sealed").as_str().unwrap_or("The file"),
             get(value, "written").as_str().unwrap_or("?")
         );
+    } else if let Some(name) = get(value, "locked").as_str() {
+        println!("Vault {name}'s session on this host has ended.");
     } else if get(value, "resealed").is_array() {
         println!("Sealed again to the vault's current devices:");
         items(get(value, "resealed"), "  ");

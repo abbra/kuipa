@@ -40,6 +40,8 @@ pub struct KdcDirectory {
     pub vaults: Mutex<HashMap<VaultId, Vault>>,
     /// Locked principals (`nsAccountLock`).
     pub locked: Mutex<HashSet<String>>,
+    /// Releases per vault and server.
+    pub unlocks: Mutex<HashMap<(VaultId, String), u64>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -71,6 +73,7 @@ impl KdcDirectory {
             trusts: Mutex::new(Vec::new()),
             vaults: Mutex::new(HashMap::new()),
             locked: Mutex::new(HashSet::new()),
+            unlocks: Mutex::new(HashMap::new()),
             creds,
         }
     }
@@ -111,6 +114,16 @@ impl KdcDirectory {
             }
         }
         Err(last.map_or_else(|| "no acceptor".into(), Into::into))
+    }
+
+    fn total(&self, id: &VaultId) -> u64 {
+        self.unlocks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((v, _), _)| v == id)
+            .map(|(_, n)| n)
+            .sum()
     }
 
     fn keys(&self, fqdn: &str) -> Result<Keytab, DirectoryError> {
@@ -300,7 +313,28 @@ impl Directory for KdcDirectory {
     }
 
     fn vault_get(&self, id: &VaultId) -> Result<Option<Vault>, DirectoryError> {
-        Ok(self.vaults.lock().unwrap().get(id).cloned())
+        Ok(self.vaults.lock().unwrap().get(id).cloned().map(|mut v| {
+            v.unlocks = self.total(id);
+            v
+        }))
+    }
+
+    fn vault_unlock(
+        &self,
+        id: &VaultId,
+        server: &str,
+        limit: Option<u64>,
+    ) -> Result<bool, DirectoryError> {
+        if limit.is_some_and(|l| self.total(id) >= l) {
+            return Ok(false);
+        }
+        *self
+            .unlocks
+            .lock()
+            .unwrap()
+            .entry((*id, server.to_owned()))
+            .or_default() += 1;
+        Ok(true)
     }
 
     fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
@@ -310,13 +344,20 @@ impl Directory for KdcDirectory {
 
     fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
         let owner = owner.to_string();
-        Ok(self
+        let vaults: Vec<Vault> = self
             .vaults
             .lock()
             .unwrap()
             .values()
             .filter(|v| v.owner == owner)
             .cloned()
+            .collect();
+        Ok(vaults
+            .into_iter()
+            .map(|mut v| {
+                v.unlocks = self.total(&v.id);
+                v
+            })
             .collect())
     }
 

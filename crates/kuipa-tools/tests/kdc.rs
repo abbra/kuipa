@@ -132,6 +132,11 @@ fn against_a_real_kdc() {
     ));
     // The KDC for the armoured exchanges kuipa makes itself.
     env.push(("KUIPA_KDC", realm.socket.display().to_string()));
+    // Vault sessions live in a runtime directory of their own.
+    env.push((
+        "KUIPA_RUNTIME_DIR",
+        realm.dir.join("run-user").display().to_string(),
+    ));
     set_env(&env);
     realm.add_user(ADMIN, "Admin123");
 
@@ -491,6 +496,46 @@ fn against_a_real_kdc() {
     assert_eq!(listed["vaults"].as_array().unwrap().len(), 1);
     seal.revoke("personal").unwrap();
     assert!(seal.open(&sealed, Some(b"correct horse")).is_err());
+
+    // A session: one passphrase and ticket, then files open without either;
+    // the servers count every release against the limit.
+    let daily = vault::Policy {
+        max_unlocks: Some(4),
+        sessions: vault::Sessions {
+            reauth: Some(3600),
+            offline: None,
+        },
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    seal.create("daily", daily).unwrap();
+    seal.add_device("daily", b"correct horse").unwrap();
+    let note = seal.seal("daily", b"daily note").unwrap();
+    assert!(seal.open(&note, None).is_err(), "no session yet");
+    let started = seal.unlock("daily", b"correct horse").unwrap();
+    assert!(started["session_until"].as_u64().is_some(), "{started}");
+    assert!(Seal::in_session(&note));
+    // In the session neither the passphrase nor Alice's ticket is used:
+    // Bob's ticket next to it changes nothing.
+    assert_eq!(seal.open(&note, None).unwrap().as_ref(), b"daily note");
+    assert_eq!(as_bob.open(&note, None).unwrap().as_ref(), b"daily note");
+    seal.lock("daily").unwrap();
+    assert!(!Seal::in_session(&note));
+    assert!(seal.open(&note, None).is_err(), "locked");
+    assert_eq!(
+        seal.open(&note, Some(b"correct horse")).unwrap().as_ref(),
+        b"daily note"
+    );
+    assert_eq!(seal.show("daily").unwrap()["vaults"][0]["unlocks"], 3);
+    seal.open(&note, Some(b"correct horse")).unwrap();
+    assert!(
+        seal.open(&note, Some(b"correct horse")).is_err(),
+        "the fifth unlock is over the limit"
+    );
 
     flows::unprotect(&a, &Target::Host).unwrap();
     assert!(!a.sealed().exists());

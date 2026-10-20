@@ -652,11 +652,11 @@ impl PendingJoin {
         self,
         response: &Response,
         realm: &VerifiedRealm,
-    ) -> Result<Vec<crate::vault::Descriptor>> {
+    ) -> Result<crate::vault::Reply> {
         if realm.signer() != &self.signer {
             return Err(Error::Mismatch("server"));
         }
-        crate::vault::reply_from_bytes(self.open(response)?.as_ref())
+        crate::vault::Reply::from_bytes(self.open(response)?.as_ref())
     }
 
     /// Finish a join or rekey: decrypt the enrollment, and check it is for

@@ -12,6 +12,12 @@
 //! servers.json          the servers' signed advertisements, with when they
 //!                       were fetched, for sealing offline
 //! ```
+//!
+//! A re-authentication session (`kuipa seal unlock`) lives in the runtime
+//! directory (`$KUIPA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/kuipa`: tmpfs,
+//! the user's own, gone at logout): `sessions/<vault id>` holds the
+//! server's session token and the unwrapped device key until the session
+//! ends or `kuipa seal lock`.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -21,8 +27,8 @@ use kuipa_enroll::join::{AuthType, Operation, Prepared};
 use kuipa_enroll::keytab::Enctype;
 use kuipa_enroll::realm::{Deployment, VerifiedRealm};
 use kuipa_enroll::vault::{
-    Descriptor, DeviceKey, DeviceType, Policy, SealedVaultFile, TicketSource, Unlock, VaultOp,
-    VerifiedDescriptor,
+    Descriptor, DeviceKey, DeviceType, Policy, SealedVaultFile, SessionToken, TicketSource, Unlock,
+    VaultOp, VerifiedDescriptor,
 };
 use kuipa_gssapi::GssClientCred;
 use native_ossl::digest::DigestAlg;
@@ -40,6 +46,7 @@ use crate::net::Endpoint;
 use crate::paths::{self, Error, Paths, PublicState};
 
 const DEVICE_KEY_MAGIC: [u8; 4] = *b"IPDK";
+const SESSION_FILE_MAGIC: [u8; 4] = *b"IPSS";
 /// KDF id 1: PBKDF2-HMAC-SHA-512.
 const KDF_PBKDF2_SHA512: u8 = 1;
 const PBKDF2_ITERATIONS: u64 = 600_000;
@@ -99,6 +106,21 @@ impl UserPaths {
 
     fn servers(&self) -> PathBuf {
         self.dir.join("servers.json")
+    }
+
+    /// The runtime directory for sessions: `$KUIPA_RUNTIME_DIR`, else
+    /// `$XDG_RUNTIME_DIR/kuipa`.
+    fn runtime() -> Result<PathBuf, Error> {
+        if let Some(d) = std::env::var_os("KUIPA_RUNTIME_DIR") {
+            return Ok(PathBuf::from(d));
+        }
+        let d = std::env::var_os("XDG_RUNTIME_DIR")
+            .ok_or("no $XDG_RUNTIME_DIR to keep a session in (it must not touch a disk)")?;
+        Ok(PathBuf::from(d).join("kuipa"))
+    }
+
+    fn session(id: &kuipa_enroll::escrow::VaultId) -> Result<PathBuf, Error> {
+        Ok(Self::runtime()?.join("sessions").join(id.to_string()))
     }
 
     /// Write `data` (0600) in the directory, kept at 0700.
@@ -199,13 +221,20 @@ impl<'a> Seal<'a> {
     /// Run `op` against the realm, authenticated by the user's ticket, and
     /// keep the descriptors it answers with.
     fn op(&self, op: &VaultOp) -> Result<Vec<VerifiedDescriptor>, Error> {
+        Ok(self.op_with_session(op)?.0)
+    }
+
+    fn op_with_session(
+        &self,
+        op: &VaultOp,
+    ) -> Result<(Vec<VerifiedDescriptor>, Option<SessionToken>), Error> {
         let public = self.public()?;
         let anchors = paths::read_anchors(self.host)?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
         let extra = op.to_bytes();
-        let (descriptors, _) = flows::exchange_with(
+        let (reply, _) = flows::exchange_with(
             &Deployment::servers(&public.servers),
             &trust,
             &public.realm,
@@ -226,14 +255,93 @@ impl<'a> Seal<'a> {
             },
             |pending, response, adv| Ok(pending.finish_vault(response, adv)?),
         )?;
-        let mut verified = Vec::with_capacity(descriptors.len());
-        for d in descriptors {
+        let mut verified = Vec::with_capacity(reply.descriptors.len());
+        for d in reply.descriptors {
             let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::default())?;
             self.user
                 .write(&self.user.vault(&v.vault().name)?, &d.to_bytes())?;
             verified.push(v);
         }
-        Ok(verified)
+        Ok((verified, reply.session))
+    }
+
+    /// `kuipa seal unlock`: start a re-authentication session for this
+    /// host's device in vault `name`: until it ends, files open without
+    /// the passphrase or a ticket.
+    ///
+    /// # Errors
+    ///
+    /// A wrong passphrase, a policy without sessions, no runtime
+    /// directory, or any other error.
+    pub fn unlock(&self, name: &str, passphrase: &[u8]) -> Result<Value, Error> {
+        let key = read_device_key(self.user, passphrase)?;
+        let (vaults, session) = self.op_with_session(&VaultOp::Unlock {
+            name: name.into(),
+            device: key.public().kid().to_string(),
+        })?;
+        let session = session.ok_or("the server started no session")?;
+        let path = UserPaths::session(session.vault())?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+            for d in [dir, dir.parent().unwrap_or(dir)] {
+                fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let bytes = Writer::new(SESSION_FILE_MAGIC)
+            .bytes(&session.to_bytes())
+            .bytes(key.to_jwk()?.as_ref())
+            .finish();
+        paths::write_file(&path, &bytes, 0o600)?;
+        Ok(json!({
+            "vaults": vaults.iter().map(describe).collect::<Vec<_>>(),
+            "session_until": session.not_after(),
+        }))
+    }
+
+    /// `kuipa seal lock`: end vault `name`'s session on this host.
+    ///
+    /// # Errors
+    ///
+    /// No stored descriptor of the vault, or I/O errors.
+    pub fn lock(&self, name: &str) -> Result<Value, Error> {
+        let id = self
+            .stored(name)?
+            .ok_or_else(|| format!("no vault {name:?} known here"))?
+            .vault()
+            .id;
+        paths::remove(&UserPaths::session(&id)?)?;
+        Ok(json!({ "locked": name }))
+    }
+
+    /// The live session of vault `id`, if any; an ended one is removed.
+    fn session_for(id: &kuipa_enroll::escrow::VaultId) -> Option<(SessionToken, ExchangeKeyPair)> {
+        let path = UserPaths::session(id).ok()?;
+        let bytes = fs::read(&path).ok()?;
+        let parsed = (|| -> Result<_, Error> {
+            let mut r = Reader::new(&bytes, SESSION_FILE_MAGIC, "session")?;
+            let token = SessionToken::from_bytes(r.bytes()?)?;
+            let key = ExchangeKeyPair::from_jwk(r.bytes()?)?;
+            r.finish()?;
+            Ok((token, key))
+        })();
+        match parsed {
+            Ok((token, key)) if token.not_after() >= unix_seconds(flows::now()) => {
+                Some((token, key))
+            }
+            _ => {
+                let _ = paths::remove(&path);
+                None
+            }
+        }
+    }
+
+    /// Whether `sealed` can open in a live session, without a passphrase.
+    #[must_use]
+    pub fn in_session(sealed: &[u8]) -> bool {
+        SealedVaultFile::from_bytes(sealed)
+            .ok()
+            .and_then(|f| Self::session_for(f.vault()))
+            .is_some()
     }
 
     /// The stored descriptor of vault `name`, verified.
@@ -455,12 +563,17 @@ impl<'a> Seal<'a> {
     /// server would open it, or a malformed file.
     pub fn open(&self, sealed: &[u8], passphrase: Option<&[u8]>) -> Result<SecretBuf, Error> {
         let file = SealedVaultFile::from_bytes(sealed)?;
-        let device = if file.devices().is_empty() {
+        let session = Self::session_for(file.vault());
+        let unwrapped;
+        let device = if let Some((_, key)) = &session {
+            Some(key)
+        } else if file.devices().is_empty() {
             None
         } else {
             let passphrase =
                 passphrase.ok_or("the file needs this host's device key: give its passphrase")?;
-            Some(read_device_key(self.user, passphrase)?)
+            unwrapped = read_device_key(self.user, passphrase)?;
+            Some(&unwrapped)
         };
         let trust = flows::ca_trust(self.host)?;
         // A ticket is sent whenever one is available: vaults that do not
@@ -472,14 +585,15 @@ impl<'a> Seal<'a> {
                 .ok()
                 .map(|(t, _)| t)
         };
-        let ticket: Option<TicketSource<'_>> = if cred.is_some() {
+        let ticket: Option<TicketSource<'_>> = if cred.is_some() && session.is_none() {
             Some(&mut make_token)
         } else {
             None
         };
         file.open(
             Unlock {
-                device: device.as_ref().map(|k| k as &dyn DeviceKey),
+                device: device.map(|k| k as &dyn DeviceKey),
+                session: session.as_ref().map(|(t, _)| t),
                 ticket,
             },
             |server, request| {
@@ -537,6 +651,7 @@ pub fn describe(v: &VerifiedDescriptor) -> Value {
         "devices": vault.devices.iter().map(|d| json!({
             "id": d.id, "label": d.label, "type": d.kind, "level": d.level,
         })).collect::<Vec<_>>(),
+        "unlocks": vault.unlocks,
         "signed_by": v.server(),
         "signed_at": v.iat(),
     })

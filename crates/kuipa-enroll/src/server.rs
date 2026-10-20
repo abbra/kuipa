@@ -24,7 +24,9 @@ use crate::keytab::{Enctype, Keytab, Principal};
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::trust::{self, TrustRequest, TrustResponse};
-use crate::vault::{self, Descriptor, Limits, Recovered, State, Vault, VaultAnswer, VaultOp};
+use crate::vault::{
+    Descriptor, Limits, Recovered, Reply, SessionToken, State, Vault, VaultAnswer, VaultOp,
+};
 use crate::voucher::Voucher;
 
 /// Errors from a [`Directory`], kept for the log.
@@ -237,6 +239,26 @@ pub trait Directory {
         Ok(Vec::new())
     }
 
+    /// Count one release of vault `id` by `server` (§7.6.7), unless the
+    /// vault's releases, summed over all servers, have reached `limit`:
+    /// then count nothing and answer `false`.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default only vaults without a limit are supported.
+    fn vault_unlock(
+        &self,
+        id: &escrow::VaultId,
+        server: &str,
+        limit: Option<u64>,
+    ) -> Result<bool, DirectoryError> {
+        let _ = (id, server);
+        match limit {
+            None => Ok(true),
+            Some(_) => Err("unlock limits are not supported by this directory".into()),
+        }
+    }
+
     /// Is `principal`'s entry locked (`nsAccountLock`), or gone?
     ///
     /// # Errors
@@ -421,6 +443,14 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         (**self).principal_locked(principal)
+    }
+    fn vault_unlock(
+        &self,
+        id: &escrow::VaultId,
+        server: &str,
+        limit: Option<u64>,
+    ) -> Result<bool, DirectoryError> {
+        (**self).vault_unlock(id, server, limit)
     }
     fn join_with_voucher(
         &self,
@@ -882,8 +912,14 @@ impl EnrollServer {
         }
         let op = VaultOp::from_bytes(&body.extra)?;
         let now = unix_seconds(SystemTime::now());
-        let vaults = Self::apply_vault_op(&owner, op, now, directory)?;
         let delegation = self.delegation();
+        let (vaults, session) = match op {
+            VaultOp::Unlock { name, device } => {
+                let (vault, token) = self.start_session(&owner, &name, &device, now, directory)?;
+                (vec![vault], Some(token))
+            }
+            op => (Self::apply_vault_op(&owner, op, now, directory)?, None),
+        };
         let max_age = directory.vault_limits().map_err(Refusal)?.descriptor_age;
         let descriptors = vaults
             .iter()
@@ -898,12 +934,60 @@ impl EnrollServer {
                 )
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        Ok(request.respond(
-            ss,
-            t,
-            Some(&accepted.binding),
-            &vault::reply_to_bytes(&descriptors),
-        )?)
+        let reply = Reply {
+            descriptors,
+            session,
+        };
+        Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
+    }
+
+    /// Sign a re-authentication session for `device` of `owner`'s vault
+    /// `name`, as long as its policy allows (and no longer than the vault).
+    fn start_session(
+        &self,
+        owner: &Principal,
+        name: &str,
+        device: &str,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vault, SessionToken), Refusal> {
+        let vault = directory
+            .vaults_of(owner)
+            .map_err(Refusal)?
+            .into_iter()
+            .find(|v| v.name == name)
+            .ok_or_else(|| Refusal::because(format!("{owner} has no vault {name:?}")))?;
+        if vault.state != State::Enabled {
+            return Err(Refusal::because("the vault is revoked"));
+        }
+        let length = vault
+            .policy
+            .sessions
+            .reauth
+            .ok_or_else(|| Refusal::because("the vault's policy allows no sessions"))?;
+        let device = vault
+            .devices
+            .iter()
+            .find(|d| d.id == device)
+            .ok_or_else(|| Refusal::because("the device is not registered"))?
+            .thumbprint()?;
+        let not_after = vault
+            .policy
+            .not_after
+            .map_or(now + length, |end| end.min(now + length));
+        let token = SessionToken::sign(
+            &self.keys.signing,
+            &self.delegation(),
+            vault.id,
+            &vault.owner,
+            device,
+            not_after,
+        )?;
+        eprintln!(
+            "kuipad: {owner} started a session for vault {} until {not_after}",
+            vault.id
+        );
+        Ok((vault, token))
     }
 
     fn apply_vault_op(
@@ -922,6 +1006,7 @@ impl EnrollServer {
         };
         let vault = match op {
             VaultOp::List => return Ok(mine),
+            VaultOp::Unlock { .. } => unreachable!("sessions are started by vault_op"),
             VaultOp::Show { name } => return Ok(vec![named(&name)?]),
             VaultOp::Create { name, mut policy } => {
                 if mine.iter().any(|v| v.name == name) {
@@ -940,6 +1025,7 @@ impl EnrollServer {
                     policy,
                     devices: Vec::new(),
                     state: State::Enabled,
+                    unlocks: 0,
                 };
                 directory.vault_add(&vault).map_err(Refusal)?;
                 return Ok(vec![vault]);
@@ -967,7 +1053,7 @@ impl EnrollServer {
                 )
                 .map_err(Error::from)?;
                 // No attestation is verified yet: every device is `any`.
-                let device = vault::Device::new(&public, &label, kind, now);
+                let device = crate::vault::Device::new(&public, &label, kind, now);
                 if vault.devices.iter().any(|d| d.id == device.id) {
                     return Err(Refusal::because("device already registered"));
                 }
@@ -1104,7 +1190,7 @@ impl EnrollServer {
             )
             .map_err(|_| Refusal::because("the binding is not committed to this vault"))?;
         let Some(kind) = request.vault().machine_kind(request.principal())? else {
-            return Self::recover_vault(request, opened, directory);
+            return self.recover_vault(request, opened, directory);
         };
         let binding = opened.ciphertext_hash().map_err(Error::from)?;
         if !directory
@@ -1121,6 +1207,7 @@ impl EnrollServer {
     /// The vault half of [`recover`](Self::recover): check the vault and
     /// its owner, then the policy's factors, and answer to the device.
     fn recover_vault(
+        &self,
         request: &EscrowRequest,
         opened: tang_pqc::OpenedRequest<'_>,
         directory: &dyn Directory,
@@ -1147,7 +1234,28 @@ impl EnrollServer {
         if factors.passkey {
             return Err(Refusal::because("the passkey factor is not supported yet"));
         }
-        if factors.ticket {
+        let in_session = !request.session().is_empty();
+        if in_session {
+            // A session stands in for the ticket: checked here, with the
+            // device it is bound to checked below.
+            if vault.policy.sessions.reauth.is_none() {
+                return Err(Refusal::because("the vault's policy allows no sessions"));
+            }
+            let device = request
+                .device()
+                .ok_or_else(|| Refusal::because("a session needs its device"))?;
+            SessionToken::from_bytes(request.session())?
+                .check(
+                    &self.info.realm,
+                    &self.anchors(),
+                    &tang_pqc::Policy::default(),
+                    request.vault(),
+                    &vault.owner,
+                    device,
+                    now,
+                )
+                .map_err(|e| Refusal::because(format!("session: {e}")))?;
+        } else if factors.ticket {
             if request.ticket().is_empty() {
                 return Err(Refusal::because("the vault needs the owner's ticket"));
             }
@@ -1182,6 +1290,12 @@ impl EnrollServer {
             if device.level < level {
                 return Err(Refusal::because("the device's level is too low"));
             }
+        }
+        if !directory
+            .vault_unlock(request.vault(), &self.info.server, vault.policy.max_unlocks)
+            .map_err(Refusal)?
+        {
+            return Err(Refusal::because("the vault's unlock limit is reached"));
         }
         let response = opened.respond().map_err(Error::from)?;
         Ok(match device {
