@@ -169,6 +169,8 @@ by step.
 * [docs/walkthrough.md](docs/walkthrough.md): a traced session in the
   playground
 * [docs/local-ci.md](docs/local-ci.md): the CI jobs and the playground
+* [docs/sealing.md](docs/sealing.md): sealing your own files with
+  `kuipa seal`, by use case (planned)
 * [TODO.md](TODO.md): planned work
 
 ## Contributing
