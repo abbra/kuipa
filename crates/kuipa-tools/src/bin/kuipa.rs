@@ -43,6 +43,10 @@
 //!                                            what it belongs to and where
 //!                                            it appears
 //! kuipa status | check [--server S]         is this host healthy?
+//! kuipa seal …                              a user's own vaults: create,
+//!                                            devices, seal and open files
+//!                                            (runs as the user, with their
+//!                                            ticket)
 //! kuipa leave                               remove kuipa state
 //! ```
 //!
@@ -249,6 +253,162 @@ enum Command {
     },
     /// Remove kuipa's state from this host.
     Leave,
+    /// Seal your own files to a vault of yours: runs as you, with your
+    /// Kerberos ticket.
+    Seal {
+        #[command(subcommand)]
+        action: SealAction,
+    },
+}
+
+/// `kuipa seal` subcommands.
+#[derive(Subcommand)]
+enum SealAction {
+    /// Create a vault.
+    Create {
+        /// The vault's name.
+        vault: String,
+        #[command(flatten)]
+        policy: PolicyInput,
+    },
+    /// Replace a vault's policy.
+    Policy {
+        /// The vault.
+        vault: String,
+        #[command(flatten)]
+        policy: PolicyInput,
+    },
+    /// Register or remove this host's device key.
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+    /// Seal a file to a vault (offline when this host has a recent
+    /// description of the vault).
+    File {
+        /// The vault.
+        vault: String,
+        /// The file to seal.
+        file: String,
+        /// Where to write the sealed file (default: FILE.sealed).
+        #[arg(long, value_name = "FILE")]
+        out: Option<String>,
+    },
+    /// Open a sealed file.
+    Open {
+        /// The sealed file.
+        sealed: String,
+        /// Where to write the plaintext: a file, or `-` for standard output.
+        #[arg(long, value_name = "FILE")]
+        out: String,
+        /// With `--out -`, write to standard output even when it is a
+        /// terminal.
+        #[arg(long)]
+        force: bool,
+        /// Read the device key's passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Open sealed files and seal them again to the vault's current
+    /// devices.
+    Reseal {
+        /// The vault.
+        vault: String,
+        /// The sealed files, rewritten in place.
+        sealed: Vec<String>,
+        /// Read the device key's passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Describe a vault.
+    Show {
+        /// The vault.
+        vault: String,
+    },
+    /// Describe all your vaults.
+    List,
+    /// Revoke a vault: no file sealed to it opens any more.
+    Revoke {
+        /// The vault.
+        vault: String,
+    },
+}
+
+/// `kuipa seal device` subcommands.
+#[derive(Subcommand)]
+enum DeviceAction {
+    /// Register this host's device key in a vault, making it (under a
+    /// passphrase) if this host has none.
+    Add {
+        /// The vault.
+        vault: String,
+        /// Read the passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Remove a device from a vault.
+    Remove {
+        /// The vault.
+        vault: String,
+        /// The device's id (see `kuipa seal show`).
+        id: String,
+    },
+}
+
+/// A vault policy on the command line.
+#[derive(clap::Args)]
+struct PolicyInput {
+    /// Factors an unlock needs besides the server: `device` (or
+    /// `device=hardware-wrapped`, `device=hardware-bound`), `ticket`;
+    /// comma-separated or repeated.
+    #[arg(long, value_name = "FACTORS", value_delimiter = ',', required = true)]
+    require: Vec<String>,
+    /// How many days the vault lives (default: the realm's limit).
+    #[arg(long, value_name = "DAYS")]
+    expires: Option<u64>,
+    /// Which delegated tickets satisfy `ticket`: `allow` or `refuse`.
+    #[arg(long, value_name = "allow|refuse", conflicts_with = "ticket_via")]
+    ticket_delegation: Option<String>,
+    /// Accept delegated tickets only through these services.
+    #[arg(long, value_name = "SERVICE")]
+    ticket_via: Vec<String>,
+}
+
+impl PolicyInput {
+    fn policy(&self) -> Result<kuipa_enroll::vault::Policy, Error> {
+        use kuipa_enroll::vault::{Factors, Level, Policy, TicketDelegation};
+        let mut factors = Factors::default();
+        for f in &self.require {
+            match f.trim() {
+                "device" | "device=any" => factors.device = Some(Level::Any),
+                "device=hardware-wrapped" => factors.device = Some(Level::HardwareWrapped),
+                "device=hardware-bound" => factors.device = Some(Level::HardwareBound),
+                "ticket" => factors.ticket = true,
+                "passkey" => factors.passkey = true,
+                other => return Err(format!("unknown factor {other:?}").into()),
+            }
+        }
+        let ticket_delegation = match (
+            self.ticket_delegation.as_deref(),
+            self.ticket_via.is_empty(),
+        ) {
+            (_, false) => TicketDelegation::Via(self.ticket_via.clone()),
+            (None | Some("allow"), true) => TicketDelegation::Allow,
+            (Some("refuse"), true) => TicketDelegation::Refuse,
+            (Some(other), true) => {
+                return Err(format!("--ticket-delegation {other:?}: allow or refuse").into());
+            }
+        };
+        let not_after = self
+            .expires
+            .map(|days| tang_pqc::unix_seconds(std::time::SystemTime::now()) + days * 86_400);
+        Ok(Policy {
+            factors,
+            ticket_delegation,
+            not_after,
+            ..Policy::default()
+        })
+    }
 }
 
 /// What `protect` and `unprotect` act on: the host keytab by default.
@@ -293,6 +453,7 @@ impl Command {
             Command::Status => "status",
             Command::Check { .. } => "check",
             Command::Leave => "leave",
+            Command::Seal { .. } => "seal",
         }
     }
 
@@ -1405,6 +1566,154 @@ fn list(value: &Value) -> Vec<&Value> {
         .map_or_else(Vec::new, |a| a.iter().collect())
 }
 
+/// A passphrase from `file`, or asked for on the terminal (twice when
+/// `confirm`).
+fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
+    let value = match file {
+        Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
+        None if std::io::stdin().is_terminal() => {
+            let first = prompt("device key passphrase", true)?;
+            if confirm && prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
+                return Err("the passphrases differ".into());
+            }
+            first
+        }
+        None => return Err("no passphrase: give --passphrase-file or run on a terminal".into()),
+    };
+    if value.as_ref().is_empty() {
+        return Err("missing passphrase".into());
+    }
+    Ok(value)
+}
+
+/// `kuipa seal …`: as the user, with their ticket.
+fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
+    let user = kuipa_tools::seal::UserPaths::from_env()?;
+    let seal = kuipa_tools::seal::Seal::new(paths, &user, None);
+    match action {
+        SealAction::Create { vault, policy } => seal.create(vault, policy.policy()?),
+        SealAction::Policy { vault, policy } => seal.set_policy(vault, policy.policy()?),
+        SealAction::Device { action } => match action {
+            DeviceAction::Add {
+                vault,
+                passphrase_file,
+            } => {
+                let pass = passphrase(passphrase_file.as_deref(), !user.device_key().exists())?;
+                seal.add_device(vault, pass.as_ref())
+            }
+            DeviceAction::Remove { vault, id } => seal.remove_device(vault, id),
+        },
+        SealAction::File { vault, file, out } => {
+            let out = out.clone().unwrap_or_else(|| format!("{file}.sealed"));
+            let sealed = seal.seal(vault, &std::fs::read(file)?)?;
+            paths::write_file(std::path::Path::new(&out), &sealed, 0o600)?;
+            Ok(serde_json::json!({ "vault": vault, "file": file, "sealed": out }))
+        }
+        SealAction::Open {
+            sealed,
+            out,
+            force,
+            passphrase_file,
+        } => {
+            let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
+            let bytes = std::fs::read(sealed)?;
+            let needs_device = !kuipa_enroll::vault::SealedVaultFile::from_bytes(&bytes)?
+                .devices()
+                .is_empty();
+            let pass = needs_device
+                .then(|| passphrase(passphrase_file.as_deref(), false))
+                .transpose()?;
+            let plain = seal.open(&bytes, pass.as_ref().map(AsRef::as_ref))?;
+            target.write(plain.as_ref())?;
+            Ok(serde_json::json!({
+                "sealed": sealed,
+                "written": out,
+                // Standard output holds the plaintext: print nothing else.
+                "quiet": matches!(target, kuipa_tools::output::Output::Stdout),
+            }))
+        }
+        SealAction::Reseal {
+            vault,
+            sealed,
+            passphrase_file,
+        } => {
+            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            for path in sealed {
+                let again = seal.reseal(vault, &std::fs::read(path)?, Some(pass.as_ref()))?;
+                paths::write_file(std::path::Path::new(path), &again, 0o600)?;
+            }
+            Ok(serde_json::json!({ "vault": vault, "resealed": sealed }))
+        }
+        SealAction::Show { vault } => seal.show(vault),
+        SealAction::List => seal.list(),
+        SealAction::Revoke { vault } => seal.revoke(vault),
+    }
+}
+
+fn render_seal(value: &Value) {
+    if let Some(vaults) = get(value, "vaults").as_array() {
+        if vaults.is_empty() {
+            println!("No vaults.");
+        }
+        for v in vaults {
+            println!(
+                "Vault {} ({}), {}:",
+                get(v, "name").as_str().unwrap_or("?"),
+                get(v, "owner").as_str().unwrap_or("?"),
+                get(v, "state").as_str().unwrap_or("?")
+            );
+            let mut rows = Rows::default();
+            rows.field("id", get(v, "id"));
+            let policy = get(v, "policy");
+            let factors = get(policy, "factors");
+            let mut needs = Vec::new();
+            if let Some(level) = get(factors, "device").as_str() {
+                needs.push(format!("a registered device ({level})"));
+            }
+            if get(factors, "ticket").as_bool().unwrap_or(false) {
+                needs.push("your Kerberos ticket".to_owned());
+            }
+            rows.row("opening needs", needs.join(" and "));
+            rows.field("expires (Unix time)", get(policy, "not_after"));
+            rows.field("delegated tickets", get(policy, "ticket_delegation"));
+            let devices: Vec<Value> = list(get(v, "devices"))
+                .into_iter()
+                .map(|d| {
+                    Value::String(format!(
+                        "{} ({}, {}): {}",
+                        get(d, "label").as_str().unwrap_or("?"),
+                        get(d, "type").as_str().unwrap_or("?"),
+                        get(d, "level").as_str().unwrap_or("?"),
+                        get(d, "id").as_str().unwrap_or("?"),
+                    ))
+                })
+                .collect();
+            rows.field("devices", &Value::Array(devices));
+            rows.field("described by", get(v, "signed_by"));
+            rows.print();
+        }
+    } else if let Some(out) = get(value, "sealed").as_str()
+        && get(value, "file").is_string()
+    {
+        println!(
+            "{} is sealed to vault {} as {out}.",
+            get(value, "file").as_str().unwrap_or("The file"),
+            get(value, "vault").as_str().unwrap_or("?")
+        );
+    } else if get(value, "written").is_string() {
+        println!(
+            "{} is open in {}.",
+            get(value, "sealed").as_str().unwrap_or("The file"),
+            get(value, "written").as_str().unwrap_or("?")
+        );
+    } else if get(value, "resealed").is_array() {
+        println!("Sealed again to the vault's current devices:");
+        items(get(value, "resealed"), "  ");
+    } else {
+        println!("{value}");
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let paths = Paths::from_env();
@@ -1418,10 +1727,18 @@ fn main() -> ExitCode {
     });
     let args = cli.args();
     tracing::debug!("kuipa {}", args.command);
-    match run(&args) {
+    let result = match &cli.command {
+        Command::Seal { action } => run_seal(&paths, action),
+        _ => run(&args),
+    };
+    match result {
         Ok(value) => {
-            if cli.json {
+            if value.get("quiet") == Some(&Value::Bool(true)) {
+                // Standard output carries a secret; nothing else goes there.
+            } else if cli.json {
                 println!("{value}");
+            } else if args.command == "seal" {
+                render_seal(&value);
             } else {
                 render(&args.command, &args, &value, &paths);
             }

@@ -392,6 +392,9 @@ struct DescriptorBody {
     realm: String,
     vault: Vault,
     iat: u64,
+    /// The realm's `descriptor_age` limit: how long a client may seal with
+    /// this descriptor.
+    max_age: u64,
 }
 
 /// A vault as a server describes it, signed under its delegation, so a
@@ -422,11 +425,13 @@ impl Descriptor {
         realm: &str,
         vault: &Vault,
         iat: u64,
+        max_age: u64,
     ) -> Result<Self> {
         let body = serde_json::to_vec(&DescriptorBody {
             realm: realm.to_owned(),
             vault: vault.clone(),
             iat,
+            max_age,
         })
         .map_err(|_| Error::Malformed("vault descriptor"))?;
         let mut d = Self {
@@ -482,6 +487,7 @@ impl Descriptor {
             vault: body.vault,
             owner,
             iat: body.iat,
+            max_age: body.max_age,
             delegation,
         })
     }
@@ -521,6 +527,7 @@ pub struct VerifiedDescriptor {
     vault: Vault,
     owner: Principal,
     iat: u64,
+    max_age: u64,
     delegation: VerifiedDelegation,
 }
 
@@ -547,6 +554,20 @@ impl VerifiedDescriptor {
     #[must_use]
     pub fn server(&self) -> &str {
         &self.delegation.server
+    }
+
+    /// How long after `iat` a client may seal with it: the realm's
+    /// `descriptor_age`.
+    #[must_use]
+    pub fn max_age(&self) -> u64 {
+        self.max_age
+    }
+
+    /// Whether a client may still seal with it at `now`: at most the
+    /// realm's `descriptor_age` after it was signed.
+    #[must_use]
+    pub fn fresh_at(&self, now: u64) -> bool {
+        now.saturating_sub(self.iat) <= self.max_age
     }
 }
 

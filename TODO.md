@@ -45,7 +45,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         `vault-pac-delegation`: generated NDR from pidl-rs, committed,
         with `samba-ndr` as the dependency). Until then kuipad reports the
         delegation as unknown, which only `allow` accepts.
-  - [ ] 6. `kuipa seal` with passphrase file devices and per-user state.
+  - [x] 6. `kuipa seal` with passphrase file devices and per-user state.
   - [ ] 7. Re-authentication sessions; the unlock counter in the anchor
         exchange's CRDT.
   - [ ] 8. Offline sessions.

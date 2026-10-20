@@ -97,6 +97,13 @@ impl Paths {
         self.state_dir().join("state.json")
     }
 
+    /// `realm.json`: the public part of the state (realm, FQDN, servers),
+    /// world-readable, for users' `kuipa seal` (§7.6.9).
+    #[must_use]
+    pub fn public_state(&self) -> PathBuf {
+        self.state_dir().join("realm.json")
+    }
+
     /// PKINIT anchors from the realm (PEM), for anonymous PKINIT armour.
     #[must_use]
     pub fn pkinit_anchors(&self) -> PathBuf {
@@ -278,6 +285,30 @@ pub struct Protected {
     pub gid: u32,
 }
 
+/// What any user of the host may know: realm, FQDN and servers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PublicState {
+    /// Kerberos realm.
+    pub realm: String,
+    /// This host's FQDN.
+    pub fqdn: String,
+    /// Servers, issuing server first.
+    pub servers: Vec<String>,
+}
+
+impl PublicState {
+    /// Load `realm.json`.
+    ///
+    /// # Errors
+    ///
+    /// "not enrolled" when missing, or a parse error.
+    pub fn load(paths: &Paths) -> Result<Self, Error> {
+        let bytes = fs::read(paths.public_state())
+            .map_err(|_| "this host is not enrolled with kuipa (no realm.json)")?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
 /// Persistent client state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -318,6 +349,16 @@ impl State {
             &paths.state(),
             &serde_json::to_vec_pretty(self).expect("serialisable"),
             0o600,
+        )?;
+        let public = PublicState {
+            realm: self.realm.clone(),
+            fqdn: self.fqdn.clone(),
+            servers: self.servers.clone(),
+        };
+        write_file(
+            &paths.public_state(),
+            &serde_json::to_vec_pretty(&public).expect("serialisable"),
+            0o644,
         )
     }
 }

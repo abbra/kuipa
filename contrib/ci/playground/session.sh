@@ -184,6 +184,25 @@ step 0 "Write the plain file back and retire its bindings" \
     'kuipa unprotect --file "$KUIPA_ROOT/etc/app/secret.conf"' \
     "are retired"
 
+section "Sealing your own files" \
+    "A user seals files of their own to a vault of theirs: opening needs this host's device key (under a passphrase), the user's Kerberos ticket, and a server that agrees. Nothing here runs as root."
+step 0 "Log in as the administrator" 'pq_admin_kinit'
+step 0 "Create a vault that needs a device and the ticket" \
+    'kuipa seal create personal --require device,ticket' \
+    "opening needs: a registered device (any) and your Kerberos ticket"
+step 0 "Register this host's device key, made under a passphrase" \
+    'echo "correct horse" > "$KUIPA_PLAYGROUND/pass" && kuipa seal device add personal --passphrase-file "$KUIPA_PLAYGROUND/pass"'
+step 0 "Seal a file, offline once the vault is described" \
+    'echo "token=playground-user" > "$KUIPA_PLAYGROUND/notes.txt" && kuipa seal file personal "$KUIPA_PLAYGROUND/notes.txt"'
+step 0 "Open it to standard output: only the plaintext arrives" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" | cat' \
+    "token=playground-user"
+step 1 "A wrong passphrase does not open the device key" \
+    'echo wrong > "$KUIPA_PLAYGROUND/wrong" && kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong"'
+step 0 "Revoke the vault" 'kuipa seal revoke personal' "revoked"
+step 75 "No server opens a file of a revoked vault" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
+
 section "Failover" \
     "With ipa1 unreachable, web2 enrolls through ipa2: every server presents an advertisement that ipa1's anchor vouches for."
 step 0 "Make ipa1 unreachable" 'pq_down ipa1'

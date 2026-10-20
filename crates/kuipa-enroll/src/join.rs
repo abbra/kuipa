@@ -641,6 +641,24 @@ impl PendingJoin {
         params.check_acknowledgement(self.open(response)?.as_ref())
     }
 
+    /// Finish a vault operation (§7.6): decrypt the descriptors the server
+    /// answered with.  Each still needs [`Descriptor::verify`](crate::vault::Descriptor::verify).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], or [`Error::Mismatch`]
+    /// for another server.
+    pub fn finish_vault(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+    ) -> Result<Vec<crate::vault::Descriptor>> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        crate::vault::reply_from_bytes(self.open(response)?.as_ref())
+    }
+
     /// Finish a join or rekey: decrypt the enrollment, and check it is for
     /// this host and that its CA chain is the one `realm` advertises.
     ///
