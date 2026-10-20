@@ -1,7 +1,8 @@
 # Sealing your own files with `kuipa seal`
 
 > **Status: partly implemented.** This guide describes `kuipa seal` as
-> designed in [the design, §7.6](../reference/design.md). Working today: `create`,
+> the design's [user vaults](../reference/design.md#76-user-vaults-being-implemented)
+> section has it. Working today: `create`,
 > `policy`, `device add|remove` with passphrase-protected device keys or
 > an ML-KEM key on a PKCS#11 token (`--pkcs11 URI`, registered at level
 > `any` until attestation is checked), `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,

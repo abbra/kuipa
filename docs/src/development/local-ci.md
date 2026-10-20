@@ -127,13 +127,13 @@ the shell (`exit`, Ctrl-D) tears everything down: servers, KDC, files.
 | --- | --- |
 | KDC | MIT `krb5kdc`, realm `EXAMPLE.TEST`, on a Unix socket (`$PQ_KDC_SOCKET`), PKINIT with a generated test CA, so anonymous PKINIT works |
 | IPA servers | `ipa1.example.test` and `ipa2.example.test`: the daemon's real HTTP router (`kuipad::http`) and anchor exchange on local ports, each with its own anchor, ML-DSA signing key and ML-KEM join and escrow keys; they exchange anchors with their `ipa-ku/<fqdn>` keys before the shell starts, and the log shows each step; `KUIPA_ENDPOINTS` maps their names to the ports |
-| DNS | a stub nameserver (`KUIPA_DNS`) with `_ldap._tcp.example.test` and `_ldap._tcp.b.test` SRV records, as FreeIPA publishes them, so `kuipa` commands find the servers without `--server` (§4.6) |
+| DNS | a stub nameserver (`KUIPA_DNS`) with `_ldap._tcp.example.test` and `_ldap._tcp.b.test` SRV records, as FreeIPA publishes them, so `kuipa` commands find the servers without `--server` ([Servers and failover](../reference/design.md#46-servers-and-failover)) |
 | Directory | shared by both servers: GSS-API tokens are accepted for real, passwords are checked against the KDC, keys come from the KDC (`kadmin.local ktadd`, standing in for `KEYTAB_GET`); OTPs, escrow registrations and staging are kept in memory |
 | Pinned anchor | `$PQ_ANCHOR`, ipa1's anchor; every enrollment string pins it, and it vouches for ipa2's claim |
 | Administrator | `admin@EXAMPLE.TEST`, password `Secret123` |
-| Trusted realm | `B.TEST` (`$PQ_TRUSTED_REALM`): its own KDC on `$PQ_TRUSTED_KDC_SOCKET` with its own test CA, one server `ipa1.b.test` with its own anchor, and a user `alice@B.TEST` (password `Secret123`); `B.TEST` invites `EXAMPLE.TEST` and ipa1 establishes the trust before the shell starts (§17.4): both KDCs get the cross-realm `krbtgt` keys from the derived secret, and both `EXAMPLE.TEST` servers list `B.TEST` in `trusts` with its anchor |
-| Tang | every server also serves post-quantum Tang (§11.5): its URL and pinned thumbprint are in `$KUIPA_PLAYGROUND/tang/<server>.url` and `.thp`, e.g. `curl -s "$(cat $KUIPA_PLAYGROUND/tang/ipa1.example.test.url)/adv"` |
-| Voucher issuer | a voucher key and a quota of 100 in `$KUIPA_PLAYGROUND/voucher`; both servers accept the key (§9) |
+| Trusted realm | `B.TEST` (`$PQ_TRUSTED_REALM`): its own KDC on `$PQ_TRUSTED_KDC_SOCKET` with its own test CA, one server `ipa1.b.test` with its own anchor, and a user `alice@B.TEST` (password `Secret123`); `B.TEST` invites `EXAMPLE.TEST` and ipa1 establishes the trust before the shell starts ([Establishing the trust](../reference/design.md#174-establishing-the-trust)): both KDCs get the cross-realm `krbtgt` keys from the derived secret, and both `EXAMPLE.TEST` servers list `B.TEST` in `trusts` with its anchor |
+| Tang | every server also serves post-quantum Tang ([Post-quantum Tang](../reference/design.md#115-post-quantum-tang)): its URL and pinned thumbprint are in `$KUIPA_PLAYGROUND/tang/<server>.url` and `.thp`, e.g. `curl -s "$(cat $KUIPA_PLAYGROUND/tang/ipa1.example.test.url)/adv"` |
+| Voucher issuer | a voucher key and a quota of 100 in `$KUIPA_PLAYGROUND/voucher`; both servers accept the key ([Vouchers](../reference/design.md#9-vouchers)) |
 | Hosts | OTP enrollment strings for `web1`…`webN.example.test` in `$KUIPA_PLAYGROUND/enroll/webN`; `$KUIPA_PLAYGROUND/enroll/realm` is the string without a secret |
 | Tools | `kuipa`, `kuipa-unseal`, `kuipa-voucher`, `tang-pqc` and `kuipa-playground` on `PATH` |
 

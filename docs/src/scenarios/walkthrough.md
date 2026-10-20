@@ -5,7 +5,8 @@ interactive`, see [Local CI and the playground](../development/local-ci.md)). Ho
 `EXAMPLE.TEST`. It then installs the trusted realm `B.TEST`, a user of
 `B.TEST` logs in on it, and that user gets a ticket for `web1` across the
 trust. With tracing on, every request, answer, decision and file write
-appears on standard error ([the design](../reference/design.md) §10.4); the command's
+appears on standard error (see the design's
+[tracing](../reference/design.md#104-tracing) section); the command's
 result follows on standard output.
 
 Thumbprints, ports, timings and paths differ in every playground.
@@ -27,9 +28,9 @@ keys, GSS-API tokens), only their sizes and thumbprints.
 `pq_enroll web1` runs `kuipa enroll --server ipa1.example.test --server
 ipa2.example.test --hostname web1.example.test` with web1's enrollment
 string, `ipa-ku1:EXAMPLE.TEST:<anchor>:<expiry>:<OTP>`, as `ipa host-add
---random` would print it (§4.4). The string expires a day after the
+--random` would print it ([The enrollment string](../reference/design.md#44-the-enrollment-string)). The string expires a day after the
 playground starts. As `host-add` does, the playground also made the OTP the
-host's temporary Kerberos key (§5.3).
+host's temporary Kerberos key ([Authenticators](../reference/design.md#53-authenticators)).
 
 ### Fetch and verify the realm advertisement
 
@@ -43,10 +44,10 @@ host's temporary Kerberos key (§5.3).
   `KUIPA_ENDPOINTS` maps the name to a local port over plain HTTP, hence
   `tls="none"`. On a real host this is `https://ipa1.example.test/ipa/ku/`,
   and on first contact TLS accepts any certificate: the host has no CA yet,
-  and the advertisement, not TLS, authenticates the server (§10.3).
+  and the advertisement, not TLS, authenticates the server ([Transport](../reference/design.md#103-transport)).
 * `?anchor=pjLV…` names the anchor pinned by the enrollment string: ipa1's
   own anchor, since ipa1 issued the string. The server answers with an
-  advertisement whose delegation carries that anchor's proof (§4.3).
+  advertisement whose delegation carries that anchor's proof ([The realm advertisement](../reference/design.md#43-the-realm-advertisement)).
 * About 25 KB: ML-DSA-65 signatures and keys, base64-encoded inside JSON,
   plus the CA certificate and the PKINIT anchors.
 
@@ -54,7 +55,7 @@ host's temporary Kerberos key (§5.3).
    0.017085387s DEBUG advertisement verified: ipa1.example.test of EXAMPLE.TEST, signed by 0hznLdS2gMlbsHVPD5MjxvyQqox9Sw6wAp8a8mNgLbg, delegation by anchor pjLVUZeo5CYHWwNIxNTa1uAyFIRS9Z6NVW7X2h_qgOQ (claim: 89 days left, vouch: 7 days left) server=ipa1.example.test
 ```
 
-Verification (§4.3) runs in three steps:
+Verification ([The realm advertisement](../reference/design.md#43-the-realm-advertisement)) runs in three steps:
 
 1. The delegation's claim names realm `EXAMPLE.TEST`, server
    `ipa1.example.test` and its signing key, and is valid now. Its proof by
@@ -67,7 +68,7 @@ Verification (§4.3) runs in three steps:
 "claim: 89 days left, vouch: 7 days left": claims last 90 days, and each
 server renews its own at two thirds of the lifetime; a vouch lasts 7 days,
 and each anchor vouches again at half life or whenever the claims it
-trusts change (§4.2).
+trusts change ([Delegations and the anchor exchange](../reference/design.md#42-delegations-and-the-anchor-exchange)).
 
 ```
    0.017132035s TRACE advertisement contents server=ipa1.example.test domain=example.test servers=["ipa1.example.test", "ipa2.example.test"] join_key=4zRtyVcF9IQNUKBEAcIzyjFTHc9O584n-0PydLfSS-0 escrow_key=KkVcqIPOzuFGEZKNRHQyV0hnHFi8bVWS1UBm2tL6kgc ca_certs=1 pkinit_anchors=1 anchors=["pjLVUZeo5CYHWwNIxNTa1uAyFIRS9Z6NVW7X2h_qgOQ", "WdR5rAyr1-fDWTwzIRofwxAsBo_PtvKCw0aOVufgkOk"] trusts=["B.TEST"]
@@ -76,14 +77,14 @@ trusts change (§4.2).
 What the verified advertisement provides:
 
 * **`join_key`**: the ML-KEM-768 key the join request is sealed to.
-* **`escrow_key`**: the key for sealed keytabs (§7).
+* **`escrow_key`**: the key for sealed keytabs ([Keytab protection](../reference/design.md#7-keytab-protection)).
 * **`ca_certs`, `pkinit_anchors`**: the IPA CA and the KDC's PKINIT chain,
   authenticated here before enrollment.
 * **`anchors`**: the realm's trusted anchors. There are two because ipa1
   (`pjLV…`) and ipa2 (`WdR5…`) each have their own anchor and exchanged
-  them over Kerberos-authenticated syncs before the shell started (§4.2).
+  them over Kerberos-authenticated syncs before the shell started ([Delegations and the anchor exchange](../reference/design.md#42-delegations-and-the-anchor-exchange)).
   ipa1's own comes first.
-* **`trusts`**: the trusted realms, here `B.TEST` (§17).
+* **`trusts`**: the trusted realms, here `B.TEST` ([Trusted IPA realms](../reference/design.md#17-trusted-ipa-realms)).
 
 ```
    0.017159105s DEBUG TLS from now on verified against the advertised IPA CA server=ipa1.example.test
@@ -108,11 +109,11 @@ CA`.
 1. **A ticket with the OTP.** The client writes the advertisement's KDCs
    and PKINIT anchors into a private `krb5.conf`. It gets anonymous PKINIT
    armour, then a ticket as `host/web1` for `ipa-ku/ipa1`, with the OTP as
-   the key, in a FAST exchange (§5.3). The OTP never leaves the host. A
+   the key, in a FAST exchange ([Authenticators](../reference/design.md#53-authenticators)). The OTP never leaves the host. A
    fake KDC could only answer by knowing the OTP-derived key.
 2. **One Kerberos token.** The token for that ticket is a single Kerberos
    V5 message bound to this KEM exchange by `cb`. Both ends derive the same
-   32 bytes `kb` from its session key (§5.1), and only the real
+   32 bytes `kb` from its session key ([Key schedule](../reference/design.md#51-key-schedule)), and only the real
    `ipa-ku/ipa1` can.
 3. **A rekey as the host itself.** The OTP-derived key already makes the
    host a Kerberos principal, so the request is a rekey, which accepts only
@@ -134,12 +135,12 @@ endpoint.
 * **The server's side:** it decapsulated and accepted the token as
   `host/web1` with the same `cb`. It had new keys created, which replace
   the OTP-derived key, and deleted the host's `userPassword`, so the OTP is
-  spent for both paths (§11.4).
+  spent for both paths ([Directory over LDAPI and GSSAPI](../reference/design.md#114-directory-over-ldapi-and-gssapi)).
 * **The response:** an encapsulation to the client's ephemeral key and the
   payload, sealed under a key derived from both KEM secrets and `kb`.
   Recording it and later breaking the join key reveals nothing. A server
   whose anchor verified but that cannot accept the ticket cannot produce it
-  (§5.1).
+  ([Key schedule](../reference/design.md#51-key-schedule)).
 * **What it holds:**
   * **The keytab:** the host's new keys. The client proposed four enctypes;
     the KDC allowed `aes256-cts-hmac-sha384-192` (20) and
@@ -147,9 +148,9 @@ endpoint.
     kvno 1, and the rekey had the KDC generate new keys, standing in for
     `KEYTAB_GET`.
   * **The CA chain:** installed only because it matches the advertisement
-    (§5.5).
+    ([Response payload](../reference/design.md#55-response-payload)).
   * **The anchors:** both of the realm's, which the host pins from now on
-    (§4.5).
+    ([Anchor lists on enrolled hosts](../reference/design.md#45-anchor-lists-on-enrolled-hosts)).
   * **The realm configuration:** realm, domain and servers; the issuer comes
     first.
 
@@ -165,7 +166,7 @@ endpoint.
 ```
 
 Each host in the playground has its own root (`KUIPA_ROOT`); on a real
-host these paths start at `/` (§10.2). Every file is written atomically:
+host these paths start at `/` ([Files and environment](../reference/files.md)). Every file is written atomically:
 
 | file | contents |
 |---|---|
@@ -199,7 +200,7 @@ same values as one JSON object.
 
 ## 3. Install the trusted realm: `pq_trust`
 
-`pq_trust` runs `kuipa trusted-realms` (§17.3).
+`pq_trust` runs [`kuipa trusted-realms`](../reference/design.md#173-kuipa-trusted-realms).
 
 ```
    0.003737495s TRACE endpoint server="ipa1.example.test" base=http://127.0.0.1:42923/ipa/ku/ tls="none"
@@ -232,7 +233,7 @@ The host is enrolled now, so this time:
 * **Which anchor it pins:** `LkmL…`, the anchor EXAMPLE.TEST vouches for.
   That anchor verifies objects of realm `B.TEST` only, and B's advertisement
   must claim that realm. B's anchors never join the host's own list, and a
-  trust entry sharing an anchor with the host's realm is refused (§17.1).
+  trust entry sharing an anchor with the host's realm is refused ([Domain separation](../reference/design.md#171-domain-separation)).
 * **TLS to B:** it accepts any certificate, as on first contact; the
   advertisement authenticates B.
 * **What B provides:** its domain, KDCs, CA and PKINIT chain. B's own
@@ -313,7 +314,7 @@ in `EXAMPLE.TEST`:
 kvno 2 is the key from step 2, now in web1's keytab. The playground
 created the cross-realm keys in both KDCs from a random shared secret,
 standing in for FreeIPA's `trust-add --trust_secret`; establishing the
-trust through kuipa is designed in §17.4.
+trust through kuipa is designed in [Establishing the trust](../reference/design.md#174-establishing-the-trust).
 
 ## 6. Two credential caches
 
