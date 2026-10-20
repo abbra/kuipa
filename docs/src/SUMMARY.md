@@ -6,6 +6,14 @@
 - [What kuipa protects](security.md)
 - [Quick start](quickstart.md)
 
+# Realm administrators
+
+- [Deploying kuipad](realm/deploy.md)
+- [Letting hosts join](realm/enrollment.md)
+- [Keys and rotation](realm/keys.md)
+- [Trusted realms](realm/trusts.md)
+- [Limits and revocation](realm/limits.md)
+
 # Users
 
 - [Sealing your own files](user/sealing.md)
