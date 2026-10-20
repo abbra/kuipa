@@ -14,6 +14,13 @@
 - [Trusted realms](realm/trusts.md)
 - [Limits and revocation](realm/limits.md)
 
+# Host administrators
+
+- [Enrolling a host](host/enroll.md)
+- [Day-to-day host care](host/care.md)
+- [Protecting keytabs and files](host/protect.md)
+- [Troubleshooting](host/troubleshooting.md)
+
 # Users
 
 - [Sealing your own files](user/sealing.md)
