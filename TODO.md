@@ -39,7 +39,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         two-share format, answers encrypted to the device, server vault
         operations and the ticket factor (with `ticket.delegation` checked
         against whatever the directory reports as transited services).
-  - [ ] 4. The vault container in LDAP, HTTP routes, test directories.
+  - [x] 4. The vault container in LDAP, HTTP routes, test directories.
   - [ ] 5. Delegated tickets: PAC S4U delegation info, `ticket.delegation`.
   - [ ] 6. `kuipa seal` with passphrase file devices and per-user state.
   - [ ] 7. Re-authentication sessions; the unlock counter in the anchor
@@ -66,7 +66,9 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 ## Outside this workspace
 
 - [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
-      `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
+      the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
+      `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
+      `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
       `ipaKUTrustedRealm`) and
       the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs for the daemon's identity
       (including adding hosts and host-group members for vouchers, and

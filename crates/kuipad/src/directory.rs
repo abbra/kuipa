@@ -19,6 +19,10 @@
 //!   host entry (as `ipa host-add` lays it out) with the spent salt in
 //!   `ipaKUVoucherSpent`, so an existing host or a spent salt fails, add it
 //!   to the voucher's host group, and create keys with `KEYTAB_GET`.
+//! * Vaults (§7.6), as the daemon once the owner's ticket is accepted: one
+//!   entry per vault under `cn=vaults,cn=kuipa,cn=etc,$SUFFIX` (owner, name,
+//!   policy and devices as JSON, state), the realm limits as JSON on
+//!   `cn=vault-limits,cn=kuipa,cn=etc,$SUFFIX`.
 //! * Trusts (§17.4), as the daemon: invitations and partners are values on
 //!   `cn=trusts,cn=kuipa,cn=etc,$SUFFIX`; an invitation is used up by
 //!   deleting its exact value, which only one server can do.  The
@@ -28,10 +32,12 @@
 
 use std::time::SystemTime;
 
-use kuipa_enroll::escrow::{Kind, RegisterParams};
+use kuipa_enroll::escrow::{Kind, RegisterParams, VaultId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
+use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
+use kuipa_enroll::vault::{Device, Limits, State, Vault};
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
 use native_ossl::util::SecretBuf;
@@ -48,8 +54,19 @@ const STAGED_ATTR: &str = "ipaKUStaged";
 
 /// LDAP result code 16: the attribute to delete is not there.
 const NO_SUCH_ATTRIBUTE: std::ffi::c_int = 16;
+/// LDAP result code 32: the entry is not there.
+const NO_SUCH_OBJECT: std::ffi::c_int = 32;
 /// Spent voucher salts on created hosts (new schema).
 const VOUCHER_SPENT_ATTR: &str = "ipaKUVoucherSpent";
+/// Vault entries and their attributes (new schema, §7.6.2).
+const VAULT_CLASS: &str = "ipaKUVault";
+const VAULT_OWNER_ATTR: &str = "ipaKUVaultOwner";
+const VAULT_NAME_ATTR: &str = "ipaKUVaultName";
+const VAULT_POLICY_ATTR: &str = "ipaKUVaultPolicy";
+const VAULT_DEVICE_ATTR: &str = "ipaKUVaultDevice";
+const VAULT_STATE_ATTR: &str = "ipaKUVaultState";
+/// The realm's vault limits, JSON (new schema).
+const VAULT_LIMITS_ATTR: &str = "ipaKUVaultLimits";
 /// Trust invitations, `<hex secret hash> <not after>` (new schema).
 const INVITATION_ATTR: &str = "ipaKUTrustInvitation";
 /// Trusted realms, JSON (new schema).
@@ -216,6 +233,64 @@ impl LdapDirectory {
                 })
                 .collect(),
         ))
+    }
+
+    fn vaults_dn(&self) -> String {
+        format!("cn=vaults,cn=kuipa,cn=etc,{}", self.cfg.basedn)
+    }
+
+    fn vault_dn(&self, id: &VaultId) -> String {
+        format!("cn={id},{}", self.vaults_dn())
+    }
+
+    /// A vault from its entry.
+    fn vault_from(entry: &kuipa_ldap::SearchEntry) -> Result<Vault, DirectoryError> {
+        let one = |attr: &str| -> Result<String, DirectoryError> {
+            entry
+                .attrs
+                .get(&attr.to_lowercase())
+                .and_then(|v| v.first().cloned())
+                .ok_or_else(|| format!("vault entry {} has no {attr}", entry.dn).into())
+        };
+        let id = entry
+            .dn
+            .strip_prefix("cn=")
+            .and_then(|r| r.split(',').next())
+            .ok_or("vault entry without cn")?
+            .parse()?;
+        let devices = entry
+            .attrs
+            .get(&VAULT_DEVICE_ATTR.to_lowercase())
+            .into_iter()
+            .flatten()
+            .map(|d| serde_json::from_str::<Device>(d))
+            .collect::<Result<_, _>>()?;
+        let state = match one(VAULT_STATE_ATTR)?.as_str() {
+            "enabled" => State::Enabled,
+            _ => State::Revoked,
+        };
+        Ok(Vault {
+            id,
+            owner: one(VAULT_OWNER_ATTR)?,
+            name: one(VAULT_NAME_ATTR)?,
+            policy: serde_json::from_str(&one(VAULT_POLICY_ATTR)?)?,
+            devices,
+            state,
+        })
+    }
+
+    fn vault_attrs(vault: &Vault) -> Result<(String, Vec<String>, &'static str), DirectoryError> {
+        let policy = serde_json::to_string(&vault.policy)?;
+        let devices = vault
+            .devices
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
+        let state = match vault.state {
+            State::Enabled => "enabled",
+            State::Revoked => "revoked",
+        };
+        Ok((policy, devices, state))
     }
 
     fn trusts_dn(&self) -> String {
@@ -562,6 +637,156 @@ impl Directory for LdapDirectory {
 
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         self.accept(token, cb)
+    }
+
+    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+        let (principal, binding) = self.accept_bound(token, cb)?;
+        Ok(Accepted {
+            principal,
+            binding,
+            transited: Vec::new(),
+        })
+    }
+
+    fn vault_limits(&self) -> Result<Limits, DirectoryError> {
+        let dn = format!("cn=vault-limits,cn=kuipa,cn=etc,{}", self.cfg.basedn);
+        let entries = match self.service_conn()?.search(
+            &dn,
+            Scope::Base,
+            "(objectClass=*)",
+            &[VAULT_LIMITS_ATTR],
+        ) {
+            Ok(e) => e,
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => return Ok(Limits::default()),
+            Err(e) => return Err(e.into()),
+        };
+        match entries
+            .first()
+            .and_then(|e| e.attrs.get(&VAULT_LIMITS_ATTR.to_lowercase()))
+            .and_then(|v| v.first())
+        {
+            Some(json) => Ok(serde_json::from_str(json)?),
+            None => Ok(Limits::default()),
+        }
+    }
+
+    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        let (policy, devices, state) = Self::vault_attrs(vault)?;
+        let id = vault.id.to_string();
+        self.service_conn()?.add_s(
+            &self.vault_dn(&vault.id),
+            &[
+                (
+                    "objectClass",
+                    vec![b"top".as_slice(), VAULT_CLASS.as_bytes()],
+                ),
+                ("cn", vec![id.as_bytes()]),
+                (VAULT_OWNER_ATTR, vec![vault.owner.as_bytes()]),
+                (VAULT_NAME_ATTR, vec![vault.name.as_bytes()]),
+                (VAULT_POLICY_ATTR, vec![policy.as_bytes()]),
+                (
+                    VAULT_DEVICE_ATTR,
+                    devices.iter().map(String::as_bytes).collect(),
+                ),
+                (VAULT_STATE_ATTR, vec![state.as_bytes()]),
+            ]
+            .into_iter()
+            .filter(|(_, v)| !v.is_empty())
+            .collect::<Vec<_>>(),
+        )?;
+        eprintln!(
+            "kuipad: {} created vault {id} ({})",
+            vault.owner, vault.name
+        );
+        Ok(())
+    }
+
+    fn vault_get(&self, id: &VaultId) -> Result<Option<Vault>, DirectoryError> {
+        match self.service_conn()?.search(
+            &self.vault_dn(id),
+            Scope::Base,
+            &format!("(objectClass={VAULT_CLASS})"),
+            &[
+                VAULT_OWNER_ATTR,
+                VAULT_NAME_ATTR,
+                VAULT_POLICY_ATTR,
+                VAULT_DEVICE_ATTR,
+                VAULT_STATE_ATTR,
+            ],
+        ) {
+            Ok(entries) => entries.first().map(Self::vault_from).transpose(),
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        let (policy, devices, state) = Self::vault_attrs(vault)?;
+        self.service_conn()?.modify_s(
+            &self.vault_dn(&vault.id),
+            &[
+                (ModOp::Replace, VAULT_POLICY_ATTR, vec![policy.as_bytes()]),
+                (
+                    ModOp::Replace,
+                    VAULT_DEVICE_ATTR,
+                    devices.iter().map(String::as_bytes).collect(),
+                ),
+                (ModOp::Replace, VAULT_STATE_ATTR, vec![state.as_bytes()]),
+            ],
+        )?;
+        eprintln!(
+            "kuipad: {} updated vault {} ({}): {state}, {} device(s)",
+            vault.owner,
+            vault.id,
+            vault.name,
+            devices.len()
+        );
+        Ok(())
+    }
+
+    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+        let filter = format!(
+            "(&(objectClass={VAULT_CLASS})({VAULT_OWNER_ATTR}={}))",
+            filter_escape(&owner.to_string())
+        );
+        let entries = match self.service_conn()?.search(
+            &self.vaults_dn(),
+            Scope::OneLevel,
+            &filter,
+            &[
+                VAULT_OWNER_ATTR,
+                VAULT_NAME_ATTR,
+                VAULT_POLICY_ATTR,
+                VAULT_DEVICE_ATTR,
+                VAULT_STATE_ATTR,
+            ],
+        ) {
+            Ok(e) => e,
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        entries.iter().map(Self::vault_from).collect()
+    }
+
+    fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        let Some(entry) =
+            self.principal_entry(&mut self.service_conn()?, principal, &["nsAccountLock"])?
+        else {
+            return Ok(true);
+        };
+        Ok(entry
+            .attrs
+            .get("nsaccountlock")
+            .is_some_and(|v| v.iter().any(|s| s.eq_ignore_ascii_case("true"))))
     }
 
     fn join_with_voucher(
