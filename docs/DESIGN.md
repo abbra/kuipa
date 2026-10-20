@@ -1055,7 +1055,7 @@ The **policy**:
 | `not_after` | no unlock after this time | by the server |
 | `max_unlocks` | releases over the vault's life | by the server, approximately across replicas (§7.6.7) |
 | `sessions.reauth` | the longest re-authentication session, or off | by the server (§7.6.6) |
-| `sessions.offline` | the longest offline session and the key epoch, or off | release by the server; the session's end only by the client (§7.6.6) |
+| `sessions.offline` | the longest offline session and the key epoch, or off (the default) | release by the server; the session's end only by the client (§7.6.6) |
 | `sealing` | `offline` (the default: commitment only, no network) or `registered` (each seal's binding is registered online, so a reseal retires the old copy) | by the server |
 
 A policy needs **at least one factor besides the server share** (any
@@ -1066,7 +1066,8 @@ than host escrow (§7.5), whose files open without a human.
 **Realm limits** (`cn=vault-limits,cn=kuipa,cn=etc`, set by administrators,
 later per group): the furthest `not_after`, the largest `max_unlocks`,
 vaults per user, devices per vault, the longest sessions, whether offline
-sessions are allowed, and the factor shapes allowed (for example: `ticket`
+sessions are allowed at all (by default they are not: an administrator
+opts the realm in), and the factor shapes allowed (for example: `ticket`
 alone not allowed). Users create and change their own vaults (self-service)
 within these limits; the server refuses a policy outside them.
 
@@ -1187,7 +1188,9 @@ The device share `B` is the part that keeps the server's operators out.
 
 #### 7.6.6 Sessions
 
-The policy enables either kind, both or neither.
+The policy enables either kind, both or neither. Offline sessions are off
+unless both the vault's policy and the realm limits turn them on: they are
+the one place where a limit stops being the server's to enforce.
 
 * **Re-authentication session.** After an unlock that satisfied the
   ticket or passkey factor, the server returns a **session token**:
@@ -1209,7 +1212,8 @@ The policy enables either kind, both or neither.
   courtesy, not a guarantee, and the server no longer sees individual
   opens. A new epoch starts every policy period; files sealed in an earlier
   epoch need a release of that epoch's key, so an old leak does not open
-  new files. Realms can forbid offline sessions.
+  new files. A vault without offline sessions has no session key, no
+  `ipaKUVaultSessionKey`, and no session-mode files.
 
 **Passkeys without a browser.** The client is `kuipa`, not a browser, so it
 talks to the authenticator through libfido2 at the CTAP level, as SSSD's
@@ -1311,7 +1315,8 @@ sealing with a server-checked commitment, `registered` sealing as a policy
 option; device levels `any` / `hardware-wrapped` / `hardware-bound`, with
 file (PBKDF2 everywhere, for FIPS), passkey-wrapped, PKCS#11-wrapped and
 PKCS#11-native keys; files sealed to every registered device; both session
-kinds as separate policy options; the unlock counter in the anchor
+kinds as separate policy options, offline sessions off by default in each
+vault and in the realm limits; the unlock counter in the anchor
 exchange's CRDT; self-service within realm limits; vault entries in a
 central container; passkeys as both an unlock factor (any of the owner's)
 and a key wrapper; ahdapa's relying-party code copied into kuipa; one
