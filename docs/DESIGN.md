@@ -1254,7 +1254,9 @@ unrestricted credential on the host. The KDC records the delegation in the
 ticket's PAC: the S4U delegation info lists the services the ticket passed
 through to get here. kuipad reads it from the accepted context's PAC and
 applies `ticket.delegation`: with `refuse`, any delegation info refuses the
-ticket; with `via`, every transited service must be on the list.
+ticket; with `via`, every transited service must be on the list. A ticket whose delegation the directory cannot tell (no PAC, or a
+directory that does not read it yet: kuipad until the PAC work lands) is
+accepted only under `allow`.
 
 #### 7.6.7 Counting unlocks
 

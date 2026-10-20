@@ -47,8 +47,10 @@ pub struct Accepted {
     /// The binding both ends derive from the context.
     pub binding: KerberosBinding,
     /// The services a delegated ticket passed through (the PAC's S4U
-    /// delegation info), empty for a ticket the principal obtained itself.
-    pub transited: Vec<String>,
+    /// delegation info), empty for a ticket the principal obtained itself;
+    /// `None` when the directory cannot tell (no PAC, or not read), which
+    /// only `ticket.delegation = allow` accepts.
+    pub transited: Option<Vec<String>>,
 }
 
 /// The directory operations behind the protocol, implemented by the daemon
@@ -1146,11 +1148,15 @@ impl EnrollServer {
             if accepted.principal != vault.owner {
                 return Err(Refusal::because("the ticket is not the owner's"));
             }
-            if !vault.policy.ticket_delegation.accepts(&accepted.transited) {
-                return Err(Refusal::because(format!(
-                    "a ticket delegated through {:?} is not accepted",
-                    accepted.transited
-                )));
+            if !vault
+                .policy
+                .ticket_delegation
+                .accepts(accepted.transited.as_deref())
+            {
+                return Err(Refusal::because(match &accepted.transited {
+                    Some(t) => format!("a ticket delegated through {t:?} is not accepted"),
+                    None => "the ticket's delegation cannot be checked".to_owned(),
+                }));
             }
         }
         let device = match request.device() {

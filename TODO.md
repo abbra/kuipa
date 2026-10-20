@@ -40,7 +40,11 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         operations and the ticket factor (with `ticket.delegation` checked
         against whatever the directory reports as transited services).
   - [x] 4. The vault container in LDAP, HTTP routes, test directories.
-  - [ ] 5. Delegated tickets: PAC S4U delegation info, `ticket.delegation`.
+  - [ ] 5. Delegated tickets: PAC S4U delegation info for
+        `ticket.delegation` (deferred; work in progress on branch
+        `vault-pac-delegation`: generated NDR from pidl-rs, committed,
+        with `samba-ndr` as the dependency). Until then kuipad reports the
+        delegation as unknown, which only `allow` accepts.
   - [ ] 6. `kuipa seal` with passphrase file devices and per-user state.
   - [ ] 7. Re-authentication sessions; the unlock counter in the anchor
         exchange's CRDT.

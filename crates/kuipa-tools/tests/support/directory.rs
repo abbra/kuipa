@@ -289,7 +289,8 @@ impl Directory for KdcDirectory {
         Ok(Accepted {
             principal,
             binding,
-            transited: Vec::new(),
+            // The PAC's delegation info is not read yet.
+            transited: None,
         })
     }
 
