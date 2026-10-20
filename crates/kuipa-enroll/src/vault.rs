@@ -49,6 +49,11 @@ const REPLY_MAGIC: [u8; 4] = *b"IPVR";
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
 const SESSION_MAGIC: [u8; 4] = *b"IPST";
+const SESSION_FILE_MAGIC: [u8; 4] = *b"IPUS";
+const EPOCH_KEYS_MAGIC: [u8; 4] = *b"IPEK";
+
+/// How long an offline-session epoch lasts unless the policy says.
+pub const DEFAULT_EPOCH: u64 = 30 * 86_400;
 
 const HASH: &std::ffi::CStr = c"SHA2-256";
 
@@ -151,6 +156,10 @@ pub struct Sessions {
     /// The longest offline session, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offline: Option<u64>,
+    /// How long one session key lasts before the next epoch's replaces it
+    /// for new files, in seconds (default [`DEFAULT_EPOCH`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 /// A vault's policy (§7.6.2).
@@ -204,8 +213,13 @@ impl Policy {
                 "re-authentication sessions need the device factor: a session token alone would open the vault",
             ));
         }
-        if self.sessions.offline.is_some() {
-            return Err(Self::refuse("offline sessions are not supported yet"));
+        if self.sessions.offline.is_some() && f.device.is_none() {
+            return Err(Self::refuse(
+                "offline sessions need the device factor: the released key is encrypted to a device",
+            ));
+        }
+        if self.sessions.epoch == Some(0) {
+            return Err(Self::refuse("an epoch of no length"));
         }
         if self.sealing == Sealing::Registered {
             return Err(Self::refuse("registered sealing is not supported yet"));
@@ -388,6 +402,459 @@ pub struct Vault {
     /// directory, not by the owner.
     #[serde(default)]
     pub unlocks: u64,
+    /// Offline-session keys, one per epoch, oldest first (§7.6.6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_keys: Vec<SessionKey>,
+}
+
+/// One server's way into a session key: the key's private JWK sealed to
+/// the server's escrow key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionKeySlot {
+    /// The server.
+    pub server: String,
+    /// Its escrow key's id.
+    pub kid: String,
+    /// The encapsulation to it, base64url.
+    pub ct: String,
+    /// The sealed private JWK, base64url.
+    pub wrapped: String,
+}
+
+/// A vault's offline-session key for one epoch: the public half for
+/// sealing, the private half sealed to each server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionKey {
+    /// The epoch's number, from 1.
+    pub epoch: u64,
+    /// When the epoch began.
+    pub started: u64,
+    /// KEM id.
+    pub alg: u8,
+    /// The public key, base64url.
+    pub key: String,
+    /// The private key's slots; left out of descriptors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<SessionKeySlot>,
+}
+
+fn session_slot_key(
+    secret: &[u8],
+    vault: &VaultId,
+    epoch: u64,
+    server: &str,
+    ct: &[u8],
+) -> Result<SecretBuf> {
+    Ok(DOMAIN.derive_key(
+        HASH,
+        &[secret],
+        "session key",
+        &[
+            vault.as_bytes(),
+            &epoch.to_be_bytes(),
+            server.as_bytes(),
+            &primitives::digest(HASH, &[ct])?,
+        ],
+    )?)
+}
+
+impl SessionKey {
+    /// A new epoch's key for `vault`, sealed to each `(server, escrow key)`.
+    ///
+    /// # Errors
+    ///
+    /// A crypto error.
+    pub fn generate(
+        vault: &VaultId,
+        epoch: u64,
+        started: u64,
+        servers: &[(String, ExchangeKey)],
+    ) -> Result<Self> {
+        let pair = ExchangeKeyPair::generate(KemAlg::MlKem768)?;
+        let mut key = Self {
+            epoch,
+            started,
+            alg: pair.public().alg().id(),
+            key: b64::encode(pair.public().as_bytes()),
+            slots: Vec::new(),
+        };
+        key.add_slots(vault, &pair, servers)?;
+        Ok(key)
+    }
+
+    /// Seal the private key to each server in `servers` it has no slot for
+    /// yet.  Returns whether a slot was added.
+    ///
+    /// # Errors
+    ///
+    /// A crypto error.
+    pub fn add_slots(
+        &mut self,
+        vault: &VaultId,
+        pair: &ExchangeKeyPair,
+        servers: &[(String, ExchangeKey)],
+    ) -> Result<bool> {
+        let jwk = pair.to_jwk()?;
+        let mut added = false;
+        for (server, ek) in servers {
+            let kid = ek.kid().to_string();
+            if self.slots.iter().any(|s| s.kid == kid) {
+                continue;
+            }
+            let (ct, secret) = ek.encapsulate()?;
+            let k = session_slot_key(secret.as_ref(), vault, self.epoch, server, &ct)?;
+            self.slots.push(SessionKeySlot {
+                server: server.clone(),
+                kid,
+                ct: b64::encode(&ct),
+                wrapped: b64::encode(&primitives::seal(k.as_ref(), jwk.as_ref())?),
+            });
+            added = true;
+        }
+        Ok(added)
+    }
+
+    /// Open the private key with one of `escrow` (a server's own keys).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Missing`] when no slot is for any of them, or a crypto
+    /// error.
+    pub fn open(&self, vault: &VaultId, escrow: &[ExchangeKeyPair]) -> Result<ExchangeKeyPair> {
+        for slot in &self.slots {
+            let Some(own) = escrow
+                .iter()
+                .find(|k| k.public().kid().to_string() == slot.kid)
+            else {
+                continue;
+            };
+            let ct = b64::decode(&slot.ct)?;
+            let secret = own.decapsulate(&ct)?;
+            let k = session_slot_key(secret.as_ref(), vault, self.epoch, &slot.server, &ct)?;
+            let jwk = primitives::open(k.as_ref(), &b64::decode(&slot.wrapped)?)
+                .map_err(|_| Error::Malformed("session key slot"))?;
+            return Ok(ExchangeKeyPair::from_jwk(jwk.as_ref())?);
+        }
+        Err(Error::Missing("a session key slot for this server"))
+    }
+
+    /// The public key.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn public(&self) -> Result<ExchangeKey> {
+        Ok(ExchangeKey::from_bytes(
+            KemAlg::from_id(self.alg)?,
+            &b64::decode(&self.key)?,
+        )?)
+    }
+}
+
+/// Session keys released by an offline unlock, encrypted to the device:
+/// `IPEK(ct, GCM_k([epoch, private JWK]…))`, `k` from the device's
+/// decapsulation of `ct`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleasedKeys {
+    ciphertext: Box<[u8]>,
+    sealed: Box<[u8]>,
+}
+
+fn released_key(secret: &[u8], vault: &VaultId, ct: &[u8]) -> Result<SecretBuf> {
+    Ok(DOMAIN.derive_key(
+        HASH,
+        &[secret],
+        "released keys",
+        &[vault.as_bytes(), &primitives::digest(HASH, &[ct])?],
+    )?)
+}
+
+impl ReleasedKeys {
+    /// Encrypt `keys` (epoch, key) of `vault` to `device`.
+    ///
+    /// # Errors
+    ///
+    /// A crypto error.
+    ///
+    /// # Panics
+    ///
+    /// Never for fewer than 2⁶⁴ keys.
+    pub fn seal(
+        device: &ExchangeKey,
+        vault: &VaultId,
+        keys: &[(u64, ExchangeKeyPair)],
+    ) -> Result<Self> {
+        let mut plain = Writer::new(EPOCH_KEYS_MAGIC);
+        plain.u64(u64::try_from(keys.len()).expect("few epochs"));
+        for (epoch, key) in keys {
+            plain.u64(*epoch).bytes(key.to_jwk()?.as_ref());
+        }
+        let plain = SecretBuf::new(plain.finish());
+        let (ct, secret) = device.encapsulate()?;
+        let k = released_key(secret.as_ref(), vault, &ct)?;
+        Ok(Self {
+            sealed: primitives::seal(k.as_ref(), plain.as_ref())?.into(),
+            ciphertext: ct.into(),
+        })
+    }
+
+    /// Open with the device.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`] or [`Error::Malformed`].
+    pub fn open(
+        &self,
+        device: &dyn DeviceKey,
+        vault: &VaultId,
+    ) -> Result<Vec<(u64, ExchangeKeyPair)>> {
+        let secret = device.decapsulate(&self.ciphertext)?;
+        let k = released_key(secret.as_ref(), vault, &self.ciphertext)?;
+        let plain = primitives::open(k.as_ref(), &self.sealed).map_err(|_| Error::BadResponse)?;
+        let mut r = Reader::new(plain.as_ref(), EPOCH_KEYS_MAGIC, "released keys")?;
+        let n = r.u64()?;
+        let mut keys = Vec::new();
+        for _ in 0..n {
+            let epoch = r.u64()?;
+            keys.push((epoch, ExchangeKeyPair::from_jwk(r.bytes()?)?));
+        }
+        r.finish()?;
+        Ok(keys)
+    }
+
+    /// Encode: `ct sealed`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Writer::new(EPOCH_KEYS_MAGIC)
+            .bytes(&self.ciphertext)
+            .bytes(&self.sealed)
+            .finish()
+    }
+
+    /// Decode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, EPOCH_KEYS_MAGIC, "released keys")?;
+        let k = Self {
+            ciphertext: r.bytes()?.into(),
+            sealed: r.bytes()?.into(),
+        };
+        r.finish()?;
+        Ok(k)
+    }
+}
+
+/// A file sealed for offline sessions (§7.6.6): the server share sealed to
+/// the vault's epoch key instead of through the servers' escrow keys.
+///
+/// ```text
+/// IPUS = P ‖ V ‖ epoch ‖ c_e ‖ GCM_{HKDF(Decaps(dk_e, c_e))}(A) ‖ [(id_j, c_j, U_j)] ‖ GCM_DEK(file)
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionSealedFile {
+    principal: Principal,
+    vault: VaultId,
+    epoch: u64,
+    ciphertext_e: Box<[u8]>,
+    wrapped_a: Box<[u8]>,
+    devices: Vec<DeviceSlot>,
+    ciphertext: Box<[u8]>,
+}
+
+impl fmt::Debug for SessionSealedFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionSealedFile")
+            .field("vault", &self.vault)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+fn epoch_share_key(secret: &[u8], committed: &[u8], epoch: u64, ct: &[u8]) -> Result<SecretBuf> {
+    Ok(DOMAIN.derive_key(
+        HASH,
+        &[secret],
+        "epoch share",
+        &[
+            committed,
+            &epoch.to_be_bytes(),
+            &primitives::digest(HASH, &[ct])?,
+        ],
+    )?)
+}
+
+impl SessionSealedFile {
+    /// Seal `contents` to the vault's current epoch key and its devices.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Policy`] for a revoked vault or one without offline
+    /// sessions, [`Error::Missing`] without devices, or a crypto error.
+    pub fn seal(descriptor: &VerifiedDescriptor, contents: &[u8]) -> Result<Self> {
+        let vault = descriptor.vault();
+        if vault.state != State::Enabled {
+            return Err(Error::Policy("the vault is revoked".into()));
+        }
+        let current = vault
+            .session_keys
+            .last()
+            .filter(|_| vault.policy.sessions.offline.is_some())
+            .ok_or_else(|| Error::Policy("the vault has no offline sessions".into()))?;
+        let principal = descriptor.owner().clone();
+        let committed = commitment_data(&principal, &vault.id);
+        let mut a = SecretBuf::with_len(32);
+        Rand::fill_private(a.as_mut_slice())?;
+        let (ct_e, secret_e) = current.public()?.encapsulate()?;
+        let k_e = epoch_share_key(secret_e.as_ref(), &committed, current.epoch, &ct_e)?;
+        let (devices, b) = device_slots(vault, &committed)?;
+        let dek = data_key(a.as_ref(), b.as_ref(), &committed)?;
+        Ok(Self {
+            wrapped_a: primitives::seal(k_e.as_ref(), a.as_ref())?.into(),
+            ciphertext_e: ct_e.into(),
+            principal,
+            vault: vault.id,
+            epoch: current.epoch,
+            devices,
+            ciphertext: primitives::seal(dek.as_ref(), contents)?.into(),
+        })
+    }
+
+    /// The vault.
+    #[must_use]
+    pub fn vault(&self) -> &VaultId {
+        &self.vault
+    }
+
+    /// The epoch whose key opens the server share.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Open with the epoch's key (from an offline unlock) and the device.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`] for the wrong keys, or a crypto error.
+    pub fn open(&self, epoch_key: &ExchangeKeyPair, device: &dyn DeviceKey) -> Result<SecretBuf> {
+        let committed = commitment_data(&self.principal, &self.vault);
+        let secret_e = epoch_key.decapsulate(&self.ciphertext_e)?;
+        let k_e = epoch_share_key(
+            secret_e.as_ref(),
+            &committed,
+            self.epoch,
+            &self.ciphertext_e,
+        )?;
+        let a = primitives::open(k_e.as_ref(), &self.wrapped_a).map_err(|_| Error::BadResponse)?;
+        let b = open_device_share(&self.devices, device, &committed)?;
+        let dek = data_key(a.as_ref(), b.as_ref(), &committed)?;
+        primitives::open(dek.as_ref(), &self.ciphertext).map_err(|_| Error::BadResponse)
+    }
+
+    /// Encode.
+    ///
+    /// # Panics
+    ///
+    /// Never for files sealed by this crate (at most 255 devices).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new(SESSION_FILE_MAGIC);
+        w.str(&self.principal.to_string())
+            .fixed(self.vault.as_bytes())
+            .u64(self.epoch)
+            .bytes(&self.ciphertext_e)
+            .bytes(&self.wrapped_a)
+            .u8(u8::try_from(self.devices.len()).expect("at most 255 devices"));
+        for d in &self.devices {
+            w.fixed(d.id.as_bytes())
+                .bytes(&d.ciphertext)
+                .bytes(&d.wrapped);
+        }
+        w.bytes(&self.ciphertext).finish()
+    }
+
+    /// Decode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, SESSION_FILE_MAGIC, "session-sealed file")?;
+        let principal = r.str()?.parse()?;
+        let vault = VaultId::from_bytes(r.fixed()?);
+        let epoch = r.u64()?;
+        let ciphertext_e = r.bytes()?.into();
+        let wrapped_a = r.bytes()?.into();
+        let devices = (0..r.u8()?)
+            .map(|_| {
+                Ok(DeviceSlot {
+                    id: Thumbprint::from_bytes(r.fixed()?),
+                    ciphertext: r.bytes()?.into(),
+                    wrapped: r.bytes()?.into(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        let ciphertext = r.bytes()?.into();
+        r.finish()?;
+        Ok(Self {
+            principal,
+            vault,
+            epoch,
+            ciphertext_e,
+            wrapped_a,
+            devices,
+            ciphertext,
+        })
+    }
+}
+
+/// The device share `B` and a slot per registered device, or nothing
+/// without the device factor.
+fn device_slots(vault: &Vault, committed: &[u8]) -> Result<(Vec<DeviceSlot>, SecretBuf)> {
+    if vault.policy.factors.device.is_none() {
+        return Ok((Vec::new(), SecretBuf::with_len(0)));
+    }
+    if vault.devices.is_empty() {
+        return Err(Error::Missing("registered devices"));
+    }
+    let mut b = SecretBuf::with_len(32);
+    Rand::fill_private(b.as_mut_slice())?;
+    let mut devices = Vec::new();
+    for d in &vault.devices {
+        let public = d.public()?;
+        let (ct, secret) = public.encapsulate()?;
+        let key = device_key(secret.as_ref(), committed, public.kid(), &ct)?;
+        devices.push(DeviceSlot {
+            id: *public.kid(),
+            wrapped: primitives::seal(key.as_ref(), b.as_ref())?.into(),
+            ciphertext: ct.into(),
+        });
+    }
+    Ok((devices, b))
+}
+
+/// Open the device share with `device`, or nothing when there are no
+/// device slots.
+fn open_device_share(
+    slots: &[DeviceSlot],
+    device: &dyn DeviceKey,
+    committed: &[u8],
+) -> Result<SecretBuf> {
+    if slots.is_empty() {
+        return Ok(SecretBuf::with_len(0));
+    }
+    let slot = slots
+        .iter()
+        .find(|s| s.id == device.id())
+        .ok_or(Error::Missing(
+            "a device registered when the file was sealed",
+        ))?;
+    let secret = device.decapsulate(&slot.ciphertext)?;
+    let key = device_key(secret.as_ref(), committed, &slot.id, &slot.ciphertext)?;
+    primitives::open(key.as_ref(), &slot.wrapped).map_err(|_| Error::BadResponse)
 }
 
 impl Vault {
@@ -636,12 +1103,16 @@ pub enum VaultOp {
     },
     /// Describe every vault of the owner.
     List,
-    /// Start a re-authentication session for one of the vault's devices.
+    /// Start a session for one of the vault's devices: re-authentication,
+    /// or with `offline`, the release of the vault's session keys.
     Unlock {
         /// The vault.
         name: String,
         /// The device's id.
         device: String,
+        /// An offline session (§7.6.6).
+        #[serde(default)]
+        offline: bool,
     },
 }
 
@@ -663,13 +1134,15 @@ impl VaultOp {
 }
 
 /// What a vault operation answers with: descriptors, and for
-/// [`VaultOp::Unlock`] a session token.
+/// [`VaultOp::Unlock`] a session token and, offline, the session keys.
 #[derive(Clone, Debug, Default)]
 pub struct Reply {
     /// The vaults the operation concerned.
     pub descriptors: Vec<Descriptor>,
     /// A new session.
     pub session: Option<SessionToken>,
+    /// The vault's session keys, released to the device.
+    pub released: Option<ReleasedKeys>,
 }
 
 impl Reply {
@@ -692,6 +1165,13 @@ impl Reply {
                 .as_ref()
                 .map(SessionToken::to_bytes)
                 .unwrap_or_default(),
+        )
+        .bytes(
+            &self
+                .released
+                .as_ref()
+                .map(ReleasedKeys::to_bytes)
+                .unwrap_or_default(),
         );
         w.finish()
     }
@@ -712,10 +1192,15 @@ impl Reply {
             [] => None,
             b => Some(SessionToken::from_bytes(b)?),
         };
+        let released = match r.bytes()? {
+            [] => None,
+            b => Some(ReleasedKeys::from_bytes(b)?),
+        };
         r.finish()?;
         Ok(Self {
             descriptors,
             session,
+            released,
         })
     }
 }
@@ -1106,25 +1591,7 @@ impl SealedVaultFile {
                 commitment,
             });
         }
-        let mut devices = Vec::new();
-        let mut b = SecretBuf::with_len(0);
-        if vault.policy.factors.device.is_some() {
-            if vault.devices.is_empty() {
-                return Err(Error::Missing("registered devices"));
-            }
-            b = SecretBuf::with_len(32);
-            Rand::fill_private(b.as_mut_slice())?;
-            for d in &vault.devices {
-                let public = d.public()?;
-                let (ct, secret) = public.encapsulate()?;
-                let key = device_key(secret.as_ref(), &committed, public.kid(), &ct)?;
-                devices.push(DeviceSlot {
-                    id: *public.kid(),
-                    wrapped: primitives::seal(key.as_ref(), b.as_ref())?.into(),
-                    ciphertext: ct.into(),
-                });
-            }
-        }
+        let (devices, b) = device_slots(vault, &committed)?;
         let dek = data_key(a.as_ref(), b.as_ref(), &committed)?;
         Ok(Self {
             principal,
@@ -1173,22 +1640,14 @@ impl SealedVaultFile {
         mut recover: impl FnMut(&str, &EscrowRequest) -> Option<Vec<u8>>,
     ) -> Result<SecretBuf> {
         let committed = commitment_data(&self.principal, &self.vault);
-        let b = if self.devices.is_empty() {
-            SecretBuf::with_len(0)
-        } else {
-            let device = unlock.device.ok_or(Error::Missing(
-                "a device registered when the file was sealed",
-            ))?;
-            let slot = self
-                .devices
-                .iter()
-                .find(|s| s.id == device.id())
-                .ok_or(Error::Missing(
+        let b = match unlock.device {
+            Some(device) => open_device_share(&self.devices, device, &committed)?,
+            None if self.devices.is_empty() => SecretBuf::with_len(0),
+            None => {
+                return Err(Error::Missing(
                     "a device registered when the file was sealed",
-                ))?;
-            let secret = device.decapsulate(&slot.ciphertext)?;
-            let key = device_key(secret.as_ref(), &committed, &slot.id, &slot.ciphertext)?;
-            primitives::open(key.as_ref(), &slot.wrapped).map_err(|_| Error::BadResponse)?
+                ));
+            }
         };
         for slot in &self.servers {
             let (recovery, pending) = slot.binding.recovery_request(&slot.escrow_key)?;

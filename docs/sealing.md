@@ -5,9 +5,9 @@
 > `policy`, `device add|remove` with passphrase-protected device keys,
 > `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
 > with the `device` and `ticket` factors, re-authentication sessions
-> (`--session-hours`) and unlock limits (`--max-unlocks`). Not yet:
-> passkeys, smart cards and tokens, offline sessions,
-> `--sealing registered`, and refusing or
+> (`--session-hours`), offline sessions (`--offline-hours`, where the realm
+> allows them) and unlock limits (`--max-unlocks`). Not yet: passkeys,
+> smart cards and tokens, `--sealing registered`, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
 > only the default `allow` is accepted). A vault policy asking for any of
 > those is refused.
@@ -190,8 +190,11 @@ unlock gives your device the key to open the vault's session files offline
 for a set time.
 
 ```sh
-kuipa seal file work --session notes.md      # sealed for offline sessions
-kuipa seal unlock work --offline             # before you leave
+kuipa seal create travel --require device,ticket --offline-hours 48
+kuipa seal file travel notes.md --session    # sealed for offline sessions
+kuipa seal unlock travel --offline           # before you leave
+kuipa seal open notes.md.sealed --out notes.md   # on the plane: no server needed
+kuipa seal lock travel                       # when you are back
 ```
 
 Offline sessions are off unless your administrators enable them for the

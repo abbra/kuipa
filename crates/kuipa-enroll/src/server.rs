@@ -25,7 +25,8 @@ use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
-    Descriptor, Limits, Recovered, Reply, SessionToken, State, Vault, VaultAnswer, VaultOp,
+    DEFAULT_EPOCH, Descriptor, Limits, Recovered, ReleasedKeys, Reply, SessionKey, SessionToken,
+    State, Vault, VaultAnswer, VaultOp,
 };
 use crate::voucher::Voucher;
 
@@ -259,6 +260,31 @@ pub trait Directory {
         }
     }
 
+    /// Every server's current escrow key, as each published it, for
+    /// sealing vault session keys to all of them (§7.6.6).
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
+        Ok(Vec::new())
+    }
+
+    /// Publish `server`'s current escrow key, replacing what it published
+    /// before.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn publish_escrow_key(
+        &self,
+        server: &str,
+        key: &tang_pqc::ExchangeKey,
+    ) -> Result<(), DirectoryError> {
+        let _ = (server, key);
+        Ok(())
+    }
+
     /// Is `principal`'s entry locked (`nsAccountLock`), or gone?
     ///
     /// # Errors
@@ -451,6 +477,16 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         limit: Option<u64>,
     ) -> Result<bool, DirectoryError> {
         (**self).vault_unlock(id, server, limit)
+    }
+    fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
+        (**self).escrow_servers()
+    }
+    fn publish_escrow_key(
+        &self,
+        server: &str,
+        key: &tang_pqc::ExchangeKey,
+    ) -> Result<(), DirectoryError> {
+        (**self).publish_escrow_key(server, key)
     }
     fn join_with_voucher(
         &self,
@@ -913,22 +949,41 @@ impl EnrollServer {
         let op = VaultOp::from_bytes(&body.extra)?;
         let now = unix_seconds(SystemTime::now());
         let delegation = self.delegation();
-        let (vaults, session) = match op {
-            VaultOp::Unlock { name, device } => {
-                let (vault, token) = self.start_session(&owner, &name, &device, now, directory)?;
-                (vec![vault], Some(token))
+        let (mut vaults, session, released) = match op {
+            VaultOp::Unlock {
+                name,
+                device,
+                offline,
+            } => {
+                let (vault, token, released) =
+                    self.start_session(&owner, &name, &device, offline, now, directory)?;
+                (vec![vault], Some(token), released)
             }
-            op => (Self::apply_vault_op(&owner, op, now, directory)?, None),
+            op => (
+                Self::apply_vault_op(&owner, op, now, directory)?,
+                None,
+                None,
+            ),
         };
+        for v in &mut vaults {
+            if self.maintain_epochs(v, now, directory)? {
+                directory.vault_update(v).map_err(Refusal)?;
+            }
+        }
         let max_age = directory.vault_limits().map_err(Refusal)?.descriptor_age;
         let descriptors = vaults
             .iter()
             .map(|v| {
+                // Descriptors carry each epoch's public key, never its slots.
+                let mut public = v.clone();
+                for k in &mut public.session_keys {
+                    k.slots.clear();
+                }
                 Descriptor::sign(
                     &self.keys.signing,
                     &delegation,
                     &self.info.realm,
-                    v,
+                    &public,
                     now,
                     max_age,
                 )
@@ -937,21 +992,83 @@ impl EnrollServer {
         let reply = Reply {
             descriptors,
             session,
+            released,
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
     }
 
-    /// Sign a re-authentication session for `device` of `owner`'s vault
-    /// `name`, as long as its policy allows (and no longer than the vault).
+    /// Every server's escrow key, this one's own current key included
+    /// (and published, when the directory did not have it yet).
+    fn escrow_servers(
+        &self,
+        directory: &dyn Directory,
+    ) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, Refusal> {
+        let mut servers = directory.escrow_servers().map_err(Refusal)?;
+        let own = self
+            .keys
+            .escrow
+            .first()
+            .ok_or_else(|| Refusal::because("no escrow key"))?
+            .public()
+            .clone();
+        if !servers.iter().any(|(_, k)| k.kid() == own.kid()) {
+            directory
+                .publish_escrow_key(&self.info.server, &own)
+                .map_err(Refusal)?;
+            servers.retain(|(s, _)| s != &self.info.server);
+            servers.push((self.info.server.clone(), own));
+        }
+        Ok(servers)
+    }
+
+    /// For a vault with offline sessions: start the next epoch when the
+    /// current one has run its length, and seal every key this server can
+    /// open to servers that have no slot yet.  Returns whether it changed.
+    fn maintain_epochs(
+        &self,
+        vault: &mut Vault,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<bool, Refusal> {
+        if vault.state != State::Enabled || vault.policy.sessions.offline.is_none() {
+            return Ok(false);
+        }
+        let servers = self.escrow_servers(directory)?;
+        let mut changed = false;
+        for key in &mut vault.session_keys {
+            if let Ok(pair) = key.open(&vault.id, &self.keys.escrow) {
+                changed |= key.add_slots(&vault.id, &pair, &servers)?;
+            }
+        }
+        let length = vault.policy.sessions.epoch.unwrap_or(DEFAULT_EPOCH);
+        let due = vault
+            .session_keys
+            .last()
+            .is_none_or(|k| now >= k.started.saturating_add(length));
+        if due {
+            let epoch = vault.session_keys.last().map_or(1, |k| k.epoch + 1);
+            vault
+                .session_keys
+                .push(SessionKey::generate(&vault.id, epoch, now, &servers)?);
+            eprintln!("kuipad: vault {} starts session epoch {epoch}", vault.id);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Start a session for `device` of `owner`'s vault `name`, as long as
+    /// its policy allows (and no longer than the vault): a re-authentication
+    /// token, or offline the vault's session keys released to the device.
     fn start_session(
         &self,
         owner: &Principal,
         name: &str,
         device: &str,
+        offline: bool,
         now: u64,
         directory: &dyn Directory,
-    ) -> Result<(Vault, SessionToken), Refusal> {
-        let vault = directory
+    ) -> Result<(Vault, SessionToken, Option<ReleasedKeys>), Refusal> {
+        let mut vault = directory
             .vaults_of(owner)
             .map_err(Refusal)?
             .into_iter()
@@ -960,17 +1077,43 @@ impl EnrollServer {
         if vault.state != State::Enabled {
             return Err(Refusal::because("the vault is revoked"));
         }
-        let length = vault
-            .policy
-            .sessions
-            .reauth
-            .ok_or_else(|| Refusal::because("the vault's policy allows no sessions"))?;
-        let device = vault
+        let sessions = &vault.policy.sessions;
+        let length = if offline {
+            if !directory.vault_limits().map_err(Refusal)?.offline_sessions {
+                return Err(Refusal::because(
+                    "the realm does not allow offline sessions",
+                ));
+            }
+            sessions.offline
+        } else {
+            sessions.reauth
+        }
+        .ok_or_else(|| Refusal::because("the vault's policy allows no such session"))?;
+        if offline && self.maintain_epochs(&mut vault, now, directory)? {
+            directory.vault_update(&vault).map_err(Refusal)?;
+        }
+        let registered = vault
             .devices
             .iter()
             .find(|d| d.id == device)
-            .ok_or_else(|| Refusal::because("the device is not registered"))?
-            .thumbprint()?;
+            .ok_or_else(|| Refusal::because("the device is not registered"))?;
+        let device = registered.thumbprint()?;
+        let released = if offline {
+            if !directory
+                .vault_unlock(&vault.id, &self.info.server, vault.policy.max_unlocks)
+                .map_err(Refusal)?
+            {
+                return Err(Refusal::because("the vault's unlock limit is reached"));
+            }
+            let keys = vault
+                .session_keys
+                .iter()
+                .map(|k| Ok((k.epoch, k.open(&vault.id, &self.keys.escrow)?)))
+                .collect::<crate::Result<Vec<_>>>()?;
+            Some(ReleasedKeys::seal(&registered.public()?, &vault.id, &keys)?)
+        } else {
+            None
+        };
         let not_after = vault
             .policy
             .not_after
@@ -984,10 +1127,11 @@ impl EnrollServer {
             not_after,
         )?;
         eprintln!(
-            "kuipad: {owner} started a session for vault {} until {not_after}",
+            "kuipad: {owner} started {} session for vault {} until {not_after}",
+            if offline { "an offline" } else { "a" },
             vault.id
         );
-        Ok((vault, token))
+        Ok((vault, token, released))
     }
 
     fn apply_vault_op(
@@ -1026,6 +1170,7 @@ impl EnrollServer {
                     devices: Vec::new(),
                     state: State::Enabled,
                     unlocks: 0,
+                    session_keys: Vec::new(),
                 };
                 directory.vault_add(&vault).map_err(Refusal)?;
                 return Ok(vec![vault]);

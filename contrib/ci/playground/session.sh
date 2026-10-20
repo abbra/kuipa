@@ -210,6 +210,16 @@ step 0 "Open without the passphrase while the session lasts" \
     'kuipa seal open "$KUIPA_PLAYGROUND/daily.txt.sealed" --out - </dev/null | cat' "daily note"
 step 0 "End the session" 'kuipa seal lock daily' "has ended"
 step 0 "The servers counted the releases" 'kuipa seal show daily' "unlocks so far: 1"
+step 0 "Offline sessions (this realm allows them): a vault opts in" \
+    'kuipa seal create travel --require device,ticket --offline-hours 2 && kuipa seal device add travel --passphrase-file "$KUIPA_PLAYGROUND/pass"'
+step 0 "Seal a file for offline use" \
+    'echo "boarding pass" > "$KUIPA_PLAYGROUND/pass.txt" && kuipa seal file travel "$KUIPA_PLAYGROUND/pass.txt" --session'
+step 0 "Release the vault's session key to this device" \
+    'kuipa seal unlock travel --offline --passphrase-file "$KUIPA_PLAYGROUND/pass"' "Offline session started"
+step 0 "With every server down, the file still opens" \
+    'pq_down ipa1 >/dev/null && pq_down ipa2 >/dev/null && kuipa seal open "$KUIPA_PLAYGROUND/pass.txt.sealed" --out - </dev/null | cat; pq_up' \
+    "boarding pass"
+step 0 "End the offline session" 'kuipa seal lock travel' "has ended"
 step 0 "Revoke the vault" 'kuipa seal revoke personal' "revoked"
 step 75 "No server opens a file of a revoked vault" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'

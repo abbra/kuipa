@@ -51,6 +51,8 @@ struct MemoryDirectory {
     staged: RefCell<HashMap<String, Staged>>,
     vaults: RefCell<HashMap<VaultId, Vault>>,
     unlocks: RefCell<HashMap<(VaultId, String), u64>>,
+    escrow_keys: RefCell<Vec<(String, tang_pqc::ExchangeKey)>>,
+    limits: RefCell<vault::Limits>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -267,6 +269,25 @@ impl Directory for MemoryDirectory {
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.disabled.borrow().contains(&principal.to_string()))
+    }
+
+    fn vault_limits(&self) -> Result<vault::Limits, DirectoryError> {
+        Ok(self.limits.borrow().clone())
+    }
+
+    fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
+        Ok(self.escrow_keys.borrow().clone())
+    }
+
+    fn publish_escrow_key(
+        &self,
+        server: &str,
+        key: &tang_pqc::ExchangeKey,
+    ) -> Result<(), DirectoryError> {
+        let mut keys = self.escrow_keys.borrow_mut();
+        keys.retain(|(s, _)| s != server);
+        keys.push((server.to_owned(), key.clone()));
+        Ok(())
     }
 
     fn vault_unlock(
@@ -1105,6 +1126,7 @@ fn user_vault_seals_and_opens_under_its_policy() {
             sessions: vault::Sessions {
                 reauth: None,
                 offline: Some(600),
+                epoch: None,
             },
             ..policy.clone()
         },
@@ -1357,6 +1379,7 @@ fn vault_sessions_and_unlock_limits() {
         sessions: vault::Sessions {
             reauth: Some(600),
             offline: None,
+            epoch: None,
         },
         ..vault::Policy::default()
     };
@@ -1379,6 +1402,7 @@ fn vault_sessions_and_unlock_limits() {
         sessions: vault::Sessions {
             reauth: Some(600),
             offline: None,
+            epoch: None,
         },
         ..vault::Policy::default()
     };
@@ -1414,6 +1438,7 @@ fn vault_sessions_and_unlock_limits() {
         &VaultOp::Unlock {
             name: "s".into(),
             device: device.public().kid().to_string(),
+            offline: false,
         },
     );
     let session = reply.session.unwrap();
@@ -1485,12 +1510,169 @@ fn vault_sessions_and_unlock_limits() {
     let op = VaultOp::Unlock {
         name: "s".into(),
         device: device.public().kid().to_string(),
+        offline: false,
     };
     let (request, _) = p
         .with_kerberos(fake_binding(ALICE, &cb))
         .seal(&gss_token(ALICE, &cb), &[], &op.to_bytes())
         .unwrap();
     assert!(r.send(0, Operation::Vault, &request).is_err());
+}
+
+/// Run a vault operation as `caller` against server `i`.
+fn vault_reply_at(
+    r: &Realm,
+    i: usize,
+    adv: &VerifiedRealm,
+    caller: &str,
+    op: &VaultOp,
+) -> Result<vault::Reply, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Vault,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
+        .unwrap();
+    let response = r.send(i, Operation::Vault, &request)?;
+    vault::Reply::from_bytes(pending.open(&response).map_err(|_| ())?.as_ref()).map_err(|_| ())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn offline_sessions_release_epoch_keys_to_the_device() {
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let anchors = r.all_anchors();
+    let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let other = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let policy = vault::Policy {
+        factors: Factors {
+            device: Some(Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        sessions: vault::Sessions {
+            reauth: None,
+            offline: Some(3600),
+            epoch: None,
+        },
+        ..vault::Policy::default()
+    };
+    let create = VaultOp::Create {
+        name: "travel".into(),
+        policy,
+    };
+    // The realm allows no offline sessions until an administrator says so.
+    assert!(vault_reply_at(&r, 0, &advs[0], ALICE, &create).is_err());
+    r.dir.limits.borrow_mut().offline_sessions = true;
+    vault_reply_at(&r, 0, &advs[0], ALICE, &create).unwrap();
+    vault_reply_at(
+        &r,
+        0,
+        &advs[0],
+        ALICE,
+        &VaultOp::AddDevice {
+            name: "travel".into(),
+            label: "laptop".into(),
+            kind: DeviceType::File,
+            alg: device.public().alg().id(),
+            key: tang_pqc::b64::encode(device.public().as_bytes()),
+        },
+    )
+    .unwrap();
+
+    // ipa2 publishes its escrow key on its first operation; ipa1 then seals
+    // the epoch key to it too, so ipa2 can release it.
+    let show = VaultOp::Show {
+        name: "travel".into(),
+    };
+    vault_reply_at(&r, 1, &advs[1], ALICE, &show).unwrap();
+    let shown = vault_reply_at(&r, 0, &advs[0], ALICE, &show).unwrap();
+    let d = shown.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_eq!(d.vault().session_keys.len(), 1);
+    assert!(d.vault().session_keys[0].slots.is_empty(), "public only");
+    let stored = r.dir.vaults.borrow()[&d.vault().id].clone();
+    assert_eq!(
+        stored.session_keys[0].slots.len(),
+        2,
+        "sealed to both servers"
+    );
+
+    let sealed = vault::SessionSealedFile::seal(&d, b"boarding pass").unwrap();
+    let sealed = vault::SessionSealedFile::from_bytes(&sealed.to_bytes()).unwrap();
+    assert_eq!(sealed.epoch(), 1);
+
+    let unlock = |i: usize| {
+        vault_reply_at(
+            &r,
+            i,
+            &advs[i],
+            ALICE,
+            &VaultOp::Unlock {
+                name: "travel".into(),
+                device: device.public().kid().to_string(),
+                offline: true,
+            },
+        )
+    };
+    let released = unlock(1).unwrap().released.unwrap();
+    assert!(
+        released.open(&other, &d.vault().id).is_err(),
+        "only the device opens it"
+    );
+    let keys = released.open(&device, &d.vault().id).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        sealed.open(&keys[0].1, &device).unwrap().as_ref(),
+        b"boarding pass"
+    );
+    assert!(
+        sealed.open(&keys[0].1, &other).is_err(),
+        "the device share too"
+    );
+    let counted = vault_reply_at(&r, 0, &advs[0], ALICE, &show).unwrap();
+    assert_eq!(
+        counted.descriptors[0]
+            .verify(REALM, &anchors, &Policy::default())
+            .unwrap()
+            .vault()
+            .unlocks,
+        1
+    );
+
+    // The epoch turns: new files use epoch 2, which the old release lacks.
+    r.dir
+        .vaults
+        .borrow_mut()
+        .get_mut(&d.vault().id)
+        .unwrap()
+        .session_keys[0]
+        .started -= vault::DEFAULT_EPOCH + 1;
+    let turned = vault_reply_at(&r, 0, &advs[0], ALICE, &show).unwrap();
+    let d2 = turned.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_eq!(d2.vault().session_keys.len(), 2);
+    let newer = vault::SessionSealedFile::seal(&d2, b"later").unwrap();
+    assert_eq!(newer.epoch(), 2);
+    assert!(!keys.iter().any(|(e, _)| *e == 2));
+    let again = unlock(0).unwrap().released.unwrap();
+    let keys = again.open(&device, &d.vault().id).unwrap();
+    let (_, k2) = keys.iter().find(|(e, _)| *e == 2).unwrap();
+    assert_eq!(newer.open(k2, &device).unwrap().as_ref(), b"later");
+
+    // Without the realm's permission no offline session starts.
+    r.dir.limits.borrow_mut().offline_sessions = false;
+    assert!(unlock(0).is_err());
 }
 
 #[test]

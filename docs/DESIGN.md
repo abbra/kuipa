@@ -713,8 +713,10 @@ kb = GSS_Pseudo_random(ctx, GSS_C_PRF_KEY_FULL, "ipa-ku-enroll/v1 rsp" ‖ cb, 3
 Every failure after decapsulation is the same empty `403`; the reason goes
 to the server log only. Before decapsulation or any LDAP work, requests are
 rate-limited with token buckets per host FQDN (joins, rekeys, staging; the
-principal for recovery, the realm for trust requests) and per client
-address, which httpd passes as the last `X-Forwarded-For` entry: by default
+principal for recovery, the realm for trust requests; none for
+registrations and vault operations, which are only ever Kerberos-
+authenticated, so there is nothing to guess, and whose many users on one
+host must not share that host's allowance) and per client address, which httpd passes as the last `X-Forwarded-For` entry: by default
 a burst of 10 and 2 a minute per host, a burst of 60 and 30 a minute per
 address (`rate_limit`, §11.1). An exceeded limit is an empty `429`, which
 the client treats like an unreachable server.
@@ -1230,14 +1232,26 @@ the one place where a limit stops being the server's to enforce.
   tmpfs, the user's own, 0600, gone at logout) until the session ends or
   `kuipa seal lock`, so a session spares the passphrase as well as the
   ticket; the key never touches a disk unwrapped.
-* **Offline session.** The vault has a **session key** per epoch: an
-  ML-KEM pair `(vk_e, dk_e)` made by the server; `dk_e` is stored in
-  `ipaKUVaultSessionKey`, sealed to each server's escrow key, and resealed
-  when servers are added (the anchor exchange's server list, §4.2).
-  Session-mode files seal `A` to `vk_e` in place of the per-server slots.
-  An unlock with `offline` releases `dk_e`, encrypted to the device; the
-  client keeps it in the kernel keyring with a timeout of at most
-  `sessions.offline` and opens epoch-`e` files offline until then.
+* **Offline session** (implemented). A vault whose policy has
+  `sessions.offline` (and which the realm limits allow; both off by
+  default) has a **session key** per epoch: an ML-KEM pair `(vk_e, dk_e)`
+  made by a server. Each epoch's public half goes into the descriptor;
+  `dk_e`'s private JWK is stored in `ipaKUVaultSessionKey` (one JSON value
+  per epoch), sealed to every server's escrow key: each kuipad publishes
+  its current escrow public key on its `cn=masters` entry
+  (`ipaKUServerEscrowKey`), and a server that can open an epoch key seals
+  it to every published key without a slot, at every vault operation, so a
+  replica that joins later can release older epochs once any server has
+  seen the vault. A server starts epoch `e+1` when `sessions.epoch`
+  (default 30 days) has passed since epoch `e` began. Session-mode files
+  (`kuipa seal file --session`, `IPUS`) seal `A` to `vk_e` in place of the
+  per-server slots, with the device slots as usual. The vault operation
+  `unlock` with `offline`, authenticated by the owner's ticket and
+  counted as one unlock, releases every epoch's key so far, encrypted to
+  the device (`IPEK`); the client keeps them with the unwrapped device key
+  in the user's runtime directory until the session ends (at most
+  `sessions.offline`) or `kuipa seal lock`, and opens session-mode files
+  without any server meanwhile.
   **Once released, `dk_e` can be kept**: the timeout is the client's
   courtesy, not a guarantee, and the server no longer sees individual
   opens. A new epoch starts every policy period; files sealed in an earlier
@@ -1813,7 +1827,7 @@ runs on tokio's blocking pool.
 | rekey | as Kerberos join, caller must be `host/<fqdn>`; then, as the daemon, delete `ipaKUStaged` and `krbPrincipalExpiration` if staged, and `userPassword` if present (first contact with the OTP as Kerberos key) |
 | stage | as the caller: join, `KEYTAB_GET`, replace `ipaKUStaged` and `krbPrincipalExpiration` |
 | escrow | as the daemon, on the principal's entry (a host's by FQDN, others by `krbPrincipalName`/`krbCanonicalName` under `cn=accounts`): replace `ipaKUEscrowBinding`; read it and `ipaKUEscrowFileBinding` with `nsAccountLock` |
-| vaults (§7.6) | accept the owner's token with `cb`; as the daemon: one entry `cn=<vault id>` under `cn=vaults,cn=kuipa,cn=etc` (`objectClass: ipaKUVault`, owner, name, policy JSON, one JSON value per device, state), searched one level by `ipaKUVaultOwner`; limits from `ipaKUVaultLimits` (JSON) on `cn=vault-limits,cn=kuipa,cn=etc`, defaults when absent; the owner's lock from `nsAccountLock` on their entry. Names are unique per owner as checked before the add; two servers creating the same name at once can both succeed |
+| vaults (§7.6) | accept the owner's token with `cb`; as the daemon: one entry `cn=<vault id>` under `cn=vaults,cn=kuipa,cn=etc` (`objectClass: ipaKUVault`, owner, name, policy JSON, one JSON value per device, state, `ipaKUVaultUnlocks` per server, `ipaKUVaultSessionKey` per epoch); each server's escrow public key as `ipaKUServerEscrowKey` on its `cn=masters` entry; searched one level by `ipaKUVaultOwner`; limits from `ipaKUVaultLimits` (JSON) on `cn=vault-limits,cn=kuipa,cn=etc`, defaults when absent; the owner's lock from `nsAccountLock` on their entry. Names are unique per owner as checked before the add; two servers creating the same name at once can both succeed |
 | registration (§7.5) | accept the token with `cb`, caller must be the principal; as the daemon: replace `ipaKUEscrowBinding`, or delete each retired value of `ipaKUEscrowFileBinding` (an absent one is no error) and add the new ones |
 | voucher join | as the daemon, after the voucher verified: search `ipaKUVoucherSpent` for the salt; add the host entry (as `host-add` lays it out) with it; add it as `member` of `cn=<group>,cn=hostgroups,cn=accounts`; `KEYTAB_GET` |
 | trust invitation | as the daemon: add `ipaKUTrustInvitation: <hex SHA-256 of the secret> <not after>` to `cn=trusts,cn=kuipa,cn=etc,<suffix>`; using it deletes that exact value, which only one server can do |
@@ -1946,8 +1960,10 @@ IPUF  principal vault(16) n(1) [server binding(TQBD) ek commitment(32) wrapped]
 IPVD  body(JSON) delegation(JSON) signer_key(JWK) signature                      vault descriptor (signed: IPVD without the signature)
 IPVR  n(u64) [descriptor(IPVD)] session                                          vault operation answer (session: empty or IPST)
 IPST  signed(IPST: vault(16) owner device(32) not_after(u64) delegation signer_key) signature   re-authentication session token
-IPSS  token(IPST) device_key(private JWK)                                       a client's session file in its runtime directory (never sent)
+IPSS  token(IPST) device_key(private JWK) n(u64) [epoch(u64) private JWK]       a client's session file in its runtime directory (never sent)
 IPDK  kdf(1) iterations(u64) salt(16) sealed                                    a user's device key file (never sent)
+IPUS  principal vault(16) epoch(u64) ct_e wrapped_A m(1) [device(32) ct wrapped] sealed   file sealed for offline sessions
+IPEK  ct sealed(IPEK n(u64) [epoch(u64) private JWK])                          session keys released to a device
 IPVA  ct sealed                                                                  recovery answer encrypted to a device
 IPRP  principal kind(1) n(1) [retire(32)]                                        registration parameters
 IPRA  principal                                                                  registration answer

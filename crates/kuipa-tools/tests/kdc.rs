@@ -504,6 +504,7 @@ fn against_a_real_kdc() {
         sessions: vault::Sessions {
             reauth: Some(3600),
             offline: None,
+            epoch: None,
         },
         factors: vault::Factors {
             device: Some(vault::Level::Any),
@@ -516,7 +517,7 @@ fn against_a_real_kdc() {
     seal.add_device("daily", b"correct horse").unwrap();
     let note = seal.seal("daily", b"daily note").unwrap();
     assert!(seal.open(&note, None).is_err(), "no session yet");
-    let started = seal.unlock("daily", b"correct horse").unwrap();
+    let started = seal.unlock("daily", b"correct horse", false).unwrap();
     assert!(started["session_until"].as_u64().is_some(), "{started}");
     assert!(Seal::in_session(&note));
     // In the session neither the passphrase nor Alice's ticket is used:
@@ -536,6 +537,36 @@ fn against_a_real_kdc() {
         seal.open(&note, Some(b"correct horse")).is_err(),
         "the fifth unlock is over the limit"
     );
+
+    // An offline session, once the realm allows them: files sealed with
+    // --session open from the released key and the device, on this host.
+    directory.limits.lock().unwrap().offline_sessions = true;
+    let travel = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        sessions: vault::Sessions {
+            reauth: None,
+            offline: Some(3600),
+            epoch: None,
+        },
+        ..vault::Policy::default()
+    };
+    seal.create("travel", travel).unwrap();
+    seal.add_device("travel", b"correct horse").unwrap();
+    let pass = seal.seal_session("travel", b"boarding pass").unwrap();
+    assert!(
+        seal.open(&pass, Some(b"correct horse")).is_err(),
+        "no session yet"
+    );
+    let started = seal.unlock("travel", b"correct horse", true).unwrap();
+    assert_eq!(started["offline"], true);
+    assert!(Seal::in_session(&pass));
+    assert_eq!(seal.open(&pass, None).unwrap().as_ref(), b"boarding pass");
+    seal.lock("travel").unwrap();
+    assert!(seal.open(&pass, None).is_err(), "locked");
 
     flows::unprotect(&a, &Target::Host).unwrap();
     assert!(!a.sealed().exists());

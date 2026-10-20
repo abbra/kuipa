@@ -293,6 +293,10 @@ enum SealAction {
         /// Where to write the sealed file (default: FILE.sealed).
         #[arg(long, value_name = "FILE")]
         out: Option<String>,
+        /// Seal for offline sessions: opens without a server while one
+        /// lasts, and only then.
+        #[arg(long)]
+        session: bool,
     },
     /// Open a sealed file.
     Open {
@@ -328,6 +332,10 @@ enum SealAction {
         /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
+        /// An offline session: files sealed with --session open without a
+        /// server until it ends.
+        #[arg(long)]
+        offline: bool,
     },
     /// End the vault's session on this host.
     Lock {
@@ -392,6 +400,13 @@ struct PolicyInput {
     /// Allow sessions of up to this many hours (`kuipa seal unlock`).
     #[arg(long, value_name = "HOURS")]
     session_hours: Option<u64>,
+    /// Allow offline sessions of up to this many hours (`kuipa seal unlock
+    /// --offline`), where the realm allows them.
+    #[arg(long, value_name = "HOURS")]
+    offline_hours: Option<u64>,
+    /// How many days one offline-session key serves new files.
+    #[arg(long, value_name = "DAYS", requires = "offline_hours")]
+    epoch_days: Option<u64>,
 }
 
 impl PolicyInput {
@@ -429,7 +444,8 @@ impl PolicyInput {
             max_unlocks: self.max_unlocks,
             sessions: kuipa_enroll::vault::Sessions {
                 reauth: self.session_hours.map(|h| h * 3600),
-                offline: None,
+                offline: self.offline_hours.map(|h| h * 3600),
+                epoch: self.epoch_days.map(|d| d * 86_400),
             },
             ..Policy::default()
         })
@@ -1628,9 +1644,19 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             }
             DeviceAction::Remove { vault, id } => seal.remove_device(vault, id),
         },
-        SealAction::File { vault, file, out } => {
+        SealAction::File {
+            vault,
+            file,
+            out,
+            session,
+        } => {
             let out = out.clone().unwrap_or_else(|| format!("{file}.sealed"));
-            let sealed = seal.seal(vault, &std::fs::read(file)?)?;
+            let contents = std::fs::read(file)?;
+            let sealed = if *session {
+                seal.seal_session(vault, &contents)?
+            } else {
+                seal.seal(vault, &contents)?
+            };
             paths::write_file(std::path::Path::new(&out), &sealed, 0o600)?;
             Ok(serde_json::json!({ "vault": vault, "file": file, "sealed": out }))
         }
@@ -1642,9 +1668,10 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
         } => {
             let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
             let bytes = std::fs::read(sealed)?;
-            let needs_device = !kuipa_enroll::vault::SealedVaultFile::from_bytes(&bytes)?
-                .devices()
-                .is_empty();
+            let needs_device = bytes.starts_with(b"IPUS")
+                || !kuipa_enroll::vault::SealedVaultFile::from_bytes(&bytes)?
+                    .devices()
+                    .is_empty();
             let pass = (needs_device && !kuipa_tools::seal::Seal::in_session(&bytes))
                 .then(|| passphrase(passphrase_file.as_deref(), false))
                 .transpose()?;
@@ -1672,9 +1699,10 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
         SealAction::Unlock {
             vault,
             passphrase_file,
+            offline,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
-            seal.unlock(vault, pass.as_ref())
+            seal.unlock(vault, pass.as_ref(), *offline)
         }
         SealAction::Lock { vault } => seal.lock(vault),
         SealAction::Show { vault } => seal.show(vault),
@@ -1685,9 +1713,15 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
 
 fn render_seal(value: &Value) {
     if let Some(until) = get(value, "session_until").as_u64() {
-        println!(
-            "Session started: files open on this host without the passphrase or a ticket until {until} (Unix time), or `kuipa seal lock`."
-        );
+        if get(value, "offline").as_bool().unwrap_or(false) {
+            println!(
+                "Offline session started: files sealed with --session open on this host without any server until {until} (Unix time), or `kuipa seal lock`."
+            );
+        } else {
+            println!(
+                "Session started: files open on this host without the passphrase or a ticket until {until} (Unix time), or `kuipa seal lock`."
+            );
+        }
     }
     if let Some(vaults) = get(value, "vaults").as_array() {
         if vaults.is_empty() {
