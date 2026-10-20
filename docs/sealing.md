@@ -41,6 +41,11 @@ Each vault chooses its factors from:
 A vault needs at least one of them; the server's agreement alone is never
 enough.
 
+A ticket that a machine obtained for you (sshd does after a public-key
+login) records which machines it went through. A vault accepts such
+tickets by default; it can refuse them (`--ticket-delegation refuse`), or
+accept them only through named machines (`--ticket-via host/devvm1…`).
+
 ## Use cases
 
 ### Keep secrets in your home directory safe in backups

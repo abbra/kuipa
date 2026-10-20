@@ -1057,6 +1057,7 @@ The **policy**:
 |---|---|---|
 | `factors.device` | `none`, or the least device-key level: `any`, `hardware-wrapped`, `hardware-bound` | by the server: the answer is encrypted to a registered device key of that level, and the file's device share needs it (§7.6.4) |
 | `factors.ticket` | an unlock needs a ticket naming the owner as client: one from the owner's login (PAM through SSSD, `kinit`) or obtained for them by the host through protocol transition and S4U2Proxy (sshd on Fedora and RHEL after a public-key login), which then attests the host's vouch, not the owner's credentials | by the server |
+| `ticket.delegation` | `allow` (the default), `refuse` (only tickets from the owner's own credentials), or `via` a list of services a delegated ticket may have passed through (e.g. only `host/devvm1.example.test`) | by the server, from the PAC's S4U delegation info |
 | `factors.passkey` | an unlock needs a passkey assertion from any of the owner's IPA passkeys (`ipaPassKey`): managing a user's passkeys in IPA manages their vault access too | by the server |
 | `not_after` | no unlock after this time | by the server |
 | `max_unlocks` | releases over the vault's life | by the server, approximately across replicas (§7.6.7) |
@@ -1243,8 +1244,11 @@ delegation rules cover. The realm's delegation rules decide which hosts may
 act for users towards `ipa-ku/<server>`; a host whose keytab is sealed
 (§7.3) cannot be cloned from a snapshot to mint them. Forwarding a
 ticket-granting ticket (`ssh -K`) is not the intended path: it puts an
-unrestricted credential on the host. Whether a policy can refuse delegated
-tickets (where the KDC records the delegation in the ticket's PAC) is open.
+unrestricted credential on the host. The KDC records the delegation in the
+ticket's PAC: the S4U delegation info lists the services the ticket passed
+through to get here. kuipad reads it from the accepted context's PAC and
+applies `ticket.delegation`: with `refuse`, any delegation info refuses the
+ticket; with `via`, every transited service must be on the list.
 
 #### 7.6.7 Counting unlocks
 
@@ -1281,6 +1285,7 @@ descriptors, device key files or URIs) lives in `~/.local/share/kuipa/`
 ```
 kuipa seal create VAULT [--expires D] [--max-unlocks N]
                         [--require device=LEVEL,ticket,passkey]
+                        [--ticket-delegation allow|refuse | --ticket-via SERVICE…]
                         [--sessions reauth=T,offline=T/EPOCH] [--sealing registered]
 kuipa seal device add VAULT (--passphrase | --passkey | --pkcs11 URI | --pkcs11-wrap URI)
 kuipa seal device remove VAULT ID
@@ -1337,7 +1342,9 @@ option; device levels `any` / `hardware-wrapped` / `hardware-bound`, with
 file (PBKDF2 everywhere, for FIPS), passkey-wrapped, PKCS#11-wrapped and
 PKCS#11-native keys; files sealed to every registered device; both session
 kinds as separate policy options, offline sessions off by default in each
-vault and in the realm limits; the unlock counter in the anchor
+vault and in the realm limits; delegated tickets allowed by default,
+refusable or limited to the services they passed through
+(`ticket.delegation`); the unlock counter in the anchor
 exchange's CRDT; self-service within realm limits; vault entries in a
 central container; passkeys as both an unlock factor (any of the owner's)
 and a key wrapper; ahdapa's relying-party code copied into kuipa; one
