@@ -29,8 +29,8 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 
 ## Protocol and implementation
 
-- [ ] User vaults and the unified recovery request (§7.6): settle the open
-      questions of §7.6.12, then `tang-pqc` commitments, the `IPSV` format,
+- [ ] User vaults (`kuipa seal`) and the unified recovery request (§7.6):
+      `tang-pqc` commitments, the `IPSV` format,
       machine vaults in place of the §7.2 escrow check, the vault container,
       device keys (PBKDF2 file, passkey PRF, PKCS#11), WebAuthn/MDS
       verification copied from ahdapa, sessions and the unlock counter.

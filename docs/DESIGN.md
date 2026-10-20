@@ -1008,7 +1008,7 @@ kuipa protect --file F --keytab K                  sealed for K's principal
 
 ### 7.6 User vaults (designed)
 
-A user seals their own files, without root, so that a copy opens only under
+A user seals their own files with `kuipa seal`, without root, so that a copy opens only under
 a policy the user chose within limits the realm sets. The realm's servers
 hold the rule for releasing a key share, never the data: this is
 client-side encryption with server-mediated key release, not a store of
@@ -1051,12 +1051,12 @@ The **policy**:
 |---|---|---|
 | `factors.device` | `none`, or the least device-key level: `any`, `hardware-wrapped`, `hardware-bound` | by the server: the answer is encrypted to a registered device key of that level, and the file's device share needs it (§7.6.4) |
 | `factors.ticket` | an unlock needs the owner's Kerberos ticket | by the server |
-| `factors.passkey` | an unlock needs a WebAuthn assertion from one of the owner's IPA passkeys (`ipaPassKey`) | by the server |
+| `factors.passkey` | an unlock needs a passkey assertion from any of the owner's IPA passkeys (`ipaPassKey`): managing a user's passkeys in IPA manages their vault access too | by the server |
 | `not_after` | no unlock after this time | by the server |
 | `max_unlocks` | releases over the vault's life | by the server, approximately across replicas (§7.6.7) |
 | `sessions.reauth` | the longest re-authentication session, or off | by the server (§7.6.6) |
 | `sessions.offline` | the longest offline session and the key epoch, or off | release by the server; the session's end only by the client (§7.6.6) |
-| `sealing` | `offline` (commitment only) or `registered` (each seal's binding is registered, so a reseal or `close` retires a copy) | by the server |
+| `sealing` | `offline` (the default: commitment only, no network) or `registered` (each seal's binding is registered online, so a reseal retires the old copy) | by the server |
 
 A policy needs **at least one factor besides the server share** (any
 non-empty combination of `device`, `ticket`, `passkey`): a copy plus network
@@ -1139,7 +1139,7 @@ IPSV = P ‖ V ‖ mode ‖ [(server_i, B_i, ek_i, t_i, W_i)] ‖ [(id_j, c_j, U
   keys, cannot read a user's files without the user's device.
 * **Any registered device.** The file has one slot per device registered
   when it was sealed; a device added later opens only files sealed or
-  resealed after it (`kuipa vault reseal`).
+  resealed after it (`kuipa seal reseal`).
 * **The commitment `t_i`** ties the binding to `(P, V)` in a way the server
   can check (§7.6.5). Without it the server sees only the binding's
   ciphertext, and a client could present someone else's binding under a
@@ -1173,6 +1173,7 @@ The server:
    bindings, and the factors: the ticket (accepted with `cb`, caller must
    be `P`), the assertion (verified against `ipaPassKey`, ML-DSA or the
    classical algorithms the realm allows), or a valid session token;
+   kuipad acts as the relying party here;
 4. answers with `ss`, encrypted to the named device's `dpk` when
    `factors.device` is set (a fresh ML-KEM encapsulation to `dpk`, then
    GCM under a key derived from it and the request hash), else under the
@@ -1210,6 +1211,16 @@ The policy enables either kind, both or neither.
   epoch need a release of that epoch's key, so an old leak does not open
   new files. Realms can forbid offline sessions.
 
+**Passkeys without a browser.** The client is `kuipa`, not a browser, so it
+talks to the authenticator through libfido2 at the CTAP level, as SSSD's
+`passkey_child` does for passkey logins: the challenge is the CTAP
+`clientDataHash`, set to the request hash directly, with no
+`clientDataJSON` around it, and the RP ID is the one the realm's passkeys
+are registered under (the IPA domain, as `ipa passkeyconfig` and SSSD use
+it), with user verification as that configuration requires. The same
+libfido2 calls give the `hmac-secret` output for passkey-wrapped device
+keys.
+
 #### 7.6.7 Counting unlocks
 
 `max_unlocks` is a grow-only counter per vault and server, replicated by
@@ -1236,23 +1247,23 @@ uses the request of §7.6.5:
 
 #### 7.6.9 Client
 
-Users run `kuipa vault` with their own ticket (`KRB5CCNAME`); nothing
+Users run `kuipa seal` with their own ticket (`KRB5CCNAME`); nothing
 needs root. The realm comes from the world-readable `/etc/ipa/ku-anchors`,
 `/etc/ipa/ca.crt` and the generated `krb5.conf`; per-user state (vault
 descriptors, device key files or URIs) lives in `~/.local/share/kuipa/`
 (0700).
 
 ```
-kuipa vault create NAME [--expires D] [--max-unlocks N]
+kuipa seal create VAULT [--expires D] [--max-unlocks N]
                         [--require device=LEVEL,ticket,passkey]
                         [--sessions reauth=T,offline=T/EPOCH] [--sealing registered]
-kuipa vault device add NAME (--passphrase | --passkey | --pkcs11 URI | --pkcs11-wrap URI)
-kuipa vault device remove NAME ID
-kuipa vault seal NAME FILE [--out F.sealed] [--session]       offline
-kuipa vault open F.sealed [--out F | --out -]
-kuipa vault unlock NAME [--offline] | lock NAME                 sessions
-kuipa vault reseal NAME F.sealed…                              new devices, new epoch
-kuipa vault list | show NAME | revoke NAME
+kuipa seal device add VAULT (--passphrase | --passkey | --pkcs11 URI | --pkcs11-wrap URI)
+kuipa seal device remove VAULT ID
+kuipa seal file VAULT FILE [--out F.sealed] [--session]      offline by default
+kuipa seal open F.sealed [--out F | --out -]
+kuipa seal unlock VAULT [--offline] | lock VAULT              sessions
+kuipa seal reseal VAULT F.sealed…                             new devices, new epoch
+kuipa seal list | show VAULT | revoke VAULT
 ```
 
 `open --out -` follows `kuipa-unseal`'s rules (§10.5): standard output
@@ -1279,31 +1290,35 @@ only when it is not a terminal, unless `--force`.
   escrow check of §7.2.
 * `kuipad`: the vault container and limits, vault and device operations
   (Kerberos-authenticated, as the registration of §7.5), the recovery
-  checks, the counter in the anchor exchange's CRDT, WebAuthn and FIDO MDS
-  verification copied from ahdapa (`src/auth/passkey.rs`,
-  `src/auth/fido_mds.rs`) into a kuipa crate.
-* `kuipa`: `kuipa vault`; device key types: PBES2 PKCS#8 files (OpenSSL),
+  checks, the counter in the anchor exchange's CRDT, and relying-party
+  verification of passkey assertions and FIDO MDS attestation copied from
+  ahdapa (`src/auth/passkey.rs`, `src/auth/fido_mds.rs`) into a kuipa
+  crate, adapted to CTAP-level assertions (a raw `clientDataHash`, not a
+  browser's `clientDataJSON`). ahdapa has no client side: there the browser
+  is the client.
+* `kuipa`: `kuipa seal`; device key types: PBES2 PKCS#8 files (OpenSSL),
   PKCS#11 through pkcs11-provider, and a borrowed libfido2 FFI crate for
   `hmac-secret` and assertions (against the libfido2 from abbra/pqc for
   ML-DSA passkeys).
 * FreeIPA: schema and ACIs for the container, `vault-limits`, and a
   framework front end for administrators (list, revoke, set limits).
 
-#### 7.6.12 Open questions
+#### 7.6.12 Decisions
 
-These came up while writing this section; each has a default, to confirm:
-
-1. **Name.** `kuipa vault` collides with `ipa vault-*` (KRA). Alternatives:
-   `kuipa seal`, `kuipa locker`, `kuipa lease`.
-2. **Descriptor age** before sealing is refused: 30 days by default, or
-   tied to `not_after` only.
-3. **Sealing mode per vault** (`offline` or `registered`): kept as a policy
-   field, so a user can choose "old copies die" over offline sealing.
-4. **Offline-session key storage**: `dk_e` sealed to every server's escrow
-   key in the vault entry (as written), or derived from a realm vault
-   secret carried by the anchor exchange's encrypted gossip.
-5. **Passkey assertions**: any of the owner's `ipaPassKey` credentials, or a
-   subset named in the policy.
+Settled with the design: the threat model of §7.6.1; factors configurable
+per vault, any non-empty combination besides the server share; offline
+sealing with a server-checked commitment, `registered` sealing as a policy
+option; device levels `any` / `hardware-wrapped` / `hardware-bound`, with
+file (PBKDF2 everywhere, for FIPS), passkey-wrapped, PKCS#11-wrapped and
+PKCS#11-native keys; files sealed to every registered device; both session
+kinds as separate policy options; the unlock counter in the anchor
+exchange's CRDT; self-service within realm limits; vault entries in a
+central container; passkeys as both an unlock factor (any of the owner's)
+and a key wrapper; ahdapa's relying-party code copied into kuipa; one
+recovery path for user and machine vaults; the command named `kuipa seal`
+(the server object stays a vault, distinct from `ipa vault-*`);
+offline-session keys sealed per server in the vault entry; descriptors
+older than 30 days (a realm limit) refused for sealing.
 
 ## 8. Offline enrollment
 
