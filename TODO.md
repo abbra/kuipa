@@ -52,7 +52,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] 9a. PKCS#11 devices: an ML-KEM key on a token through
         pkcs11-provider (no attestation yet: registered at `any`).
   - [ ] 9b. Passkeys (libfido2 FFI, relying-party verifier from ahdapa).
-  - [ ] Registered sealing (`sealing = registered`).
+  - [x] Registered sealing (`sealing = registered`).
   - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
 - [ ] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
@@ -75,7 +75,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 - [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
       the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
       `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
-      `ipaKUVaultUnlocks`, `ipaKUVaultSessionKey`, `ipaKUServerEscrowKey` on
+      `ipaKUVaultUnlocks`, `ipaKUVaultSessionKey`, `ipaKUVaultBinding`, `ipaKUServerEscrowKey` on
       `cn=masters` entries,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
       `ipaKUTrustedRealm`) and

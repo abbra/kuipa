@@ -979,6 +979,7 @@ impl EnrollServer {
                 for k in &mut public.session_keys {
                     k.slots.clear();
                 }
+                public.bindings.clear();
                 Descriptor::sign(
                     &self.keys.signing,
                     &delegation,
@@ -1151,6 +1152,11 @@ impl EnrollServer {
         let vault = match op {
             VaultOp::List => return Ok(mine),
             VaultOp::Unlock { .. } => unreachable!("sessions are started by vault_op"),
+            VaultOp::Register { name, add, retire } => {
+                let mut vault = named(&name)?;
+                register_bindings(&mut vault, add, &retire)?;
+                vault
+            }
             VaultOp::Show { name } => return Ok(vec![named(&name)?]),
             VaultOp::Create { name, mut policy } => {
                 if mine.iter().any(|v| v.name == name) {
@@ -1171,6 +1177,7 @@ impl EnrollServer {
                     state: State::Enabled,
                     unlocks: 0,
                     session_keys: Vec::new(),
+                    bindings: Vec::new(),
                 };
                 directory.vault_add(&vault).map_err(Refusal)?;
                 return Ok(vec![vault]);
@@ -1436,6 +1443,14 @@ impl EnrollServer {
                 return Err(Refusal::because("the device's level is too low"));
             }
         }
+        if vault.policy.sealing == crate::vault::Sealing::Registered {
+            let hash = crate::vault::binding_hex(&opened.ciphertext_hash().map_err(Error::from)?);
+            if !vault.bindings.contains(&hash) {
+                return Err(Refusal::because(
+                    "the file's binding is not registered (retired or never registered)",
+                ));
+            }
+        }
         if !directory
             .vault_unlock(request.vault(), &self.info.server, vault.policy.max_unlocks)
             .map_err(Refusal)?
@@ -1448,6 +1463,31 @@ impl EnrollServer {
             None => Recovered::Plain(response),
         })
     }
+}
+
+/// With registered sealing: retire `retire` and register `add` on `vault`.
+fn register_bindings(
+    vault: &mut Vault,
+    add: Vec<String>,
+    retire: &[String],
+) -> Result<(), Refusal> {
+    if vault.policy.sealing != crate::vault::Sealing::Registered {
+        return Err(Refusal::because("the vault does not register its files"));
+    }
+    let valid = |h: &String| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+    if !add.iter().chain(retire).all(valid) {
+        return Err(Refusal::because("malformed binding hash"));
+    }
+    vault.bindings.retain(|b| !retire.contains(b));
+    for h in add {
+        if !vault.bindings.contains(&h) {
+            vault.bindings.push(h);
+        }
+    }
+    if vault.bindings.len() > crate::vault::MAX_BINDINGS {
+        return Err(Refusal::because("too many registered files"));
+    }
+    Ok(())
 }
 
 /// Decode a stage response payload into the bundle and, in mode B, the

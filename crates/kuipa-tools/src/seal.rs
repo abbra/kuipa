@@ -726,7 +726,36 @@ impl<'a> Seal<'a> {
             servers = self.refresh_servers()?;
         }
         let refs: Vec<_> = servers.iter().collect();
-        Ok(SealedVaultFile::seal(&descriptor, &refs, contents)?.to_bytes())
+        let sealed = SealedVaultFile::seal(&descriptor, &refs, contents)?;
+        if descriptor.vault().policy.sealing == kuipa_enroll::vault::Sealing::Registered {
+            // Until registered, no server opens it.
+            self.register(name, &sealed.bindings()?, &[])?;
+        }
+        Ok(sealed.to_bytes())
+    }
+
+    /// Register `add` and retire `retire` on vault `name` (registered
+    /// sealing).
+    fn register(&self, name: &str, add: &[[u8; 32]], retire: &[[u8; 32]]) -> Result<(), Error> {
+        let hex = |v: &[[u8; 32]]| v.iter().map(kuipa_enroll::vault::binding_hex).collect();
+        self.op(&VaultOp::Register {
+            name: name.into(),
+            add: hex(add),
+            retire: hex(retire),
+        })?;
+        Ok(())
+    }
+
+    /// `kuipa seal retire`: with registered sealing, make `sealed` (and
+    /// every copy of it) unopenable.
+    ///
+    /// # Errors
+    ///
+    /// A file of another kind, a vault without registered sealing, or a
+    /// refusal.
+    pub fn retire(&self, name: &str, sealed: &[u8]) -> Result<(), Error> {
+        let file = SealedVaultFile::from_bytes(sealed)?;
+        self.register(name, &[], &file.bindings()?)
     }
 
     /// `kuipa seal open`: open a sealed file with this host's device key
@@ -832,7 +861,15 @@ impl<'a> Seal<'a> {
         passphrase: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
         let plain = self.open(sealed, passphrase)?;
-        self.seal(name, plain.as_ref())
+        let again = self.seal(name, plain.as_ref())?;
+        if self
+            .stored(name)?
+            .is_some_and(|d| d.vault().policy.sealing == kuipa_enroll::vault::Sealing::Registered)
+        {
+            // The old copy, wherever it is, stops opening.
+            self.retire(name, sealed)?;
+        }
+        Ok(again)
     }
 }
 

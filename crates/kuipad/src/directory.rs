@@ -70,6 +70,8 @@ const VAULT_STATE_ATTR: &str = "ipaKUVaultState";
 const VAULT_UNLOCKS_ATTR: &str = "ipaKUVaultUnlocks";
 /// Offline-session keys, one JSON value per epoch (§7.6.6).
 const VAULT_SESSION_KEY_ATTR: &str = "ipaKUVaultSessionKey";
+/// Registered bindings of a vault's files, hex `H(ct)` (§7.6.2).
+const VAULT_BINDING_ATTR: &str = "ipaKUVaultBinding";
 /// A server's current escrow key on its `cn=masters` entry, `<KEM id>
 /// <base64url key>` (§7.6.6).
 const SERVER_ESCROW_KEY_ATTR: &str = "ipaKUServerEscrowKey";
@@ -292,6 +294,11 @@ impl LdapDirectory {
                 .flatten()
                 .map(|k| serde_json::from_str(k))
                 .collect::<Result<_, _>>()?,
+            bindings: entry
+                .attrs
+                .get(&VAULT_BINDING_ATTR.to_lowercase())
+                .cloned()
+                .unwrap_or_default(),
         })
     }
 
@@ -760,6 +767,7 @@ impl Directory for LdapDirectory {
                 VAULT_STATE_ATTR,
                 VAULT_UNLOCKS_ATTR,
                 VAULT_SESSION_KEY_ATTR,
+                VAULT_BINDING_ATTR,
             ],
         ) {
             Ok(entries) => entries.first().map(Self::vault_from).transpose(),
@@ -787,6 +795,11 @@ impl Directory for LdapDirectory {
                     ModOp::Replace,
                     VAULT_SESSION_KEY_ATTR,
                     keys.iter().map(String::as_bytes).collect(),
+                ),
+                (
+                    ModOp::Replace,
+                    VAULT_BINDING_ATTR,
+                    vault.bindings.iter().map(String::as_bytes).collect(),
                 ),
             ],
         )?;
@@ -817,6 +830,7 @@ impl Directory for LdapDirectory {
                 VAULT_STATE_ATTR,
                 VAULT_UNLOCKS_ATTR,
                 VAULT_SESSION_KEY_ATTR,
+                VAULT_BINDING_ATTR,
             ],
         ) {
             Ok(e) => e,

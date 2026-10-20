@@ -1071,7 +1071,7 @@ The **policy**:
 | `max_unlocks` | releases over the vault's life | by the server, approximately across replicas (§7.6.7) |
 | `sessions.reauth` | the longest re-authentication session, or off | by the server (§7.6.6) |
 | `sessions.offline` | the longest offline session and the key epoch, or off (the default) | release by the server; the session's end only by the client (§7.6.6) |
-| `sealing` | `offline` (the default: commitment only, no network) or `registered` (each seal's binding is registered online, so a reseal retires the old copy) | by the server |
+| `sealing` | `offline` (the default: commitment only, no network) or `registered` (implemented: after sealing, the client registers the file's binding hashes with the vault operation `register`, kept in `ipaKUVaultBinding` and left out of descriptors, at most 4096; a server releases a file's share only while its hash is registered; `kuipa seal reseal` retires the old file's hashes and `kuipa seal retire` retires a file's, so every copy of it stops opening) | by the server |
 
 A policy needs **at least one factor besides the server share** (any
 non-empty combination of `device`, `ticket`, `passkey`): a copy plus network
