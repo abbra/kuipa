@@ -4,7 +4,9 @@
 
 Before a host trusts anything from a server, it must know the server
 belongs to its realm. kuipa does not rely on DNS or on TLS for that: both
-are classical, and a host joining for the first time has no CA yet.
+may use classical cryptography and might be attacked by a cryptographically
+relevant quantum computer (CRQC), and a host joining for the first time
+has no CA yet.
 
 Instead, each IPA server holds an **anchor**: an ML-DSA key that stays on
 the server. Anchors vouch for servers: every minute (by default) the servers run
@@ -37,7 +39,7 @@ them at every key rotation.
 * **A host also keeps a watermark** of the realm's anchor history, and
   refuses a server that is behind it.
 
-## Enrollment: joining without classical secrets on the wire
+## Enrollment: nothing on the wire a CRQC could open
 
 ```mermaid
 sequenceDiagram
