@@ -1760,7 +1760,8 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/rekey/{kid}` | `IPJQ` → `IPJS` |
 | POST | `/ipa/ku/stage/{kid}` | `IPSQ` → `IPJS` (payload `IPSP`) |
 | POST | `/ipa/ku/register/{kid}` | `IPJQ` (operation data `IPRP`) → `IPJS` (payload `IPRA`) (§7.5) |
-| POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS` |
+| POST | `/ipa/ku/vault/{kid}` | `IPJQ` (operation data: a JSON vault operation) → `IPJS` (payload `IPVR`) (§7.6) |
+| POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
 | POST | `/ipa/ku/peer/sync` | `IPPS` → agirru envelope (CBOR); servers only (§4.2) |
 | POST | `/ipa/ku/trust/{kid}` | `IPTQ` → `IPTS` (§17.4) |
 | GET | `/ipa/ku/tang/adv`, `/ipa/ku/tang/adv/{thp}` | → Tang advertisement (`application/jose+json`) (§11.5) |
@@ -1783,6 +1784,7 @@ runs on tokio's blocking pool.
 | rekey | as Kerberos join, caller must be `host/<fqdn>`; then, as the daemon, delete `ipaKUStaged` and `krbPrincipalExpiration` if staged, and `userPassword` if present (first contact with the OTP as Kerberos key) |
 | stage | as the caller: join, `KEYTAB_GET`, replace `ipaKUStaged` and `krbPrincipalExpiration` |
 | escrow | as the daemon, on the principal's entry (a host's by FQDN, others by `krbPrincipalName`/`krbCanonicalName` under `cn=accounts`): replace `ipaKUEscrowBinding`; read it and `ipaKUEscrowFileBinding` with `nsAccountLock` |
+| vaults (§7.6) | accept the owner's token with `cb`; as the daemon: one entry `cn=<vault id>` under `cn=vaults,cn=kuipa,cn=etc` (`objectClass: ipaKUVault`, owner, name, policy JSON, one JSON value per device, state), searched one level by `ipaKUVaultOwner`; limits from `ipaKUVaultLimits` (JSON) on `cn=vault-limits,cn=kuipa,cn=etc`, defaults when absent; the owner's lock from `nsAccountLock` on their entry. Names are unique per owner as checked before the add; two servers creating the same name at once can both succeed |
 | registration (§7.5) | accept the token with `cb`, caller must be the principal; as the daemon: replace `ipaKUEscrowBinding`, or delete each retired value of `ipaKUEscrowFileBinding` (an absent one is no error) and add the new ones |
 | voucher join | as the daemon, after the voucher verified: search `ipaKUVoucherSpent` for the salt; add the host entry (as `host-add` lays it out) with it; add it as `member` of `cn=<group>,cn=hostgroups,cn=accounts`; `KEYTAB_GET` |
 | trust invitation | as the daemon: add `ipaKUTrustInvitation: <hex SHA-256 of the secret> <not after>` to `cn=trusts,cn=kuipa,cn=etc,<suffix>`; using it deletes that exact value, which only one server can do |

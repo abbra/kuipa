@@ -7,11 +7,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use kuipa_enroll::escrow::{Kind, RegisterParams};
+use kuipa_enroll::escrow::{Kind, RegisterParams, VaultId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::realm::TrustedRealm;
-use kuipa_enroll::server::{Directory, DirectoryError, Staged};
+use kuipa_enroll::server::{Accepted, Directory, DirectoryError, Staged};
+use kuipa_enroll::vault::Vault;
 use kuipa_gssapi::{AcceptStep, GssServerCred};
 
 use super::kdc::Realm;
@@ -35,6 +36,10 @@ pub struct KdcDirectory {
     pub invitations: Mutex<HashMap<[u8; 32], u64>>,
     /// Recorded trusted realms.
     pub trusts: Mutex<Vec<TrustedRealm>>,
+    /// User vaults.
+    pub vaults: Mutex<HashMap<VaultId, Vault>>,
+    /// Locked principals (`nsAccountLock`).
+    pub locked: Mutex<HashSet<String>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -64,6 +69,8 @@ impl KdcDirectory {
             hostgroups: Mutex::new(HashMap::new()),
             invitations: Mutex::new(HashMap::new()),
             trusts: Mutex::new(Vec::new()),
+            vaults: Mutex::new(HashMap::new()),
+            locked: Mutex::new(HashSet::new()),
             creds,
         }
     }
@@ -275,6 +282,45 @@ impl Directory for KdcDirectory {
 
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         self.accept(token, cb)
+    }
+
+    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+        let (principal, binding) = self.accept_bound(token, cb)?;
+        Ok(Accepted {
+            principal,
+            binding,
+            transited: Vec::new(),
+        })
+    }
+
+    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        self.vaults.lock().unwrap().insert(vault.id, vault.clone());
+        Ok(())
+    }
+
+    fn vault_get(&self, id: &VaultId) -> Result<Option<Vault>, DirectoryError> {
+        Ok(self.vaults.lock().unwrap().get(id).cloned())
+    }
+
+    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        self.vaults.lock().unwrap().insert(vault.id, vault.clone());
+        Ok(())
+    }
+
+    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+        let owner = owner.to_string();
+        Ok(self
+            .vaults
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| v.owner == owner)
+            .cloned()
+            .collect())
+    }
+
+    fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        Ok(self.locked.lock().unwrap().contains(&principal.to_string()))
     }
 
     fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
