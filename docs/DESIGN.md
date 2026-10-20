@@ -1081,12 +1081,18 @@ ipaKUVaultDevice = { "id": thumbprint(dpk), "label", "dpk": <ML-KEM public key>,
                      "attestation": <summary>, "added": <time> }
 ```
 
-| type | where the decapsulation key is | level |
+| type | where the decapsulation key is | highest level |
 |---|---|---|
 | `file` | encrypted PKCS#8 (PBES2, PBKDF2-HMAC-SHA-512), under `~/.local/share/kuipa/keys/` | `any` |
 | `passkey` | a key file encrypted under the FIDO2 `hmac-secret` (WebAuthn PRF) output of a passkey; every use needs a touch or PIN | `hardware-wrapped` |
 | `pkcs11-wrapped` | a key file wrapped by an AES key on a PKCS#11 token (`CKM_AES_KEY_WRAP_KWP`); RSA or EC wrapping is refused (harvest-now-decrypt-later) | `hardware-wrapped` |
 | `pkcs11` | an ML-KEM key generated on a PKCS#11 3.2 token (`CKM_ML_KEM`), non-extractable, used by `pkcs11:` URI through OpenSSL's pkcs11-provider | `hardware-bound` |
+
+A type sets the highest level a device can have; the server grants it only
+when the registration's attestation verifies, and records `any` otherwise.
+A software token behind PKCS#11 (SoftHSM), or a passkey without
+attestation, is an `any` device. That is also the unattended case: a token
+whose PIN a job holds works without a human, at level `any`.
 
 The levels say what an attestation can prove, and no more:
 
