@@ -64,3 +64,71 @@ fn realm_option_cross_checks_the_enrollment_string() {
     let (code, stderr) = enroll("realm-case", &["--realm", "example.test"]);
     assert_eq!(code, 1, "{stderr}");
 }
+
+/// A host with a state file and unreadable pins: enough for `status` to
+/// render every label, with no server contacted.
+fn host_state(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("kuipa-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("var/lib/ipa-client/ku")).unwrap();
+    std::fs::create_dir_all(dir.join("etc/ipa")).unwrap();
+    std::fs::write(
+        dir.join("var/lib/ipa-client/ku/state.json"),
+        r#"{"realm":"EXAMPLE.TEST","fqdn":"web1.example.test","servers":["ipa1.example.test","ipa2.example.test"]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("etc/ipa/ku-anchors"), "not-a-thumbprint\n").unwrap();
+    dir
+}
+
+/// `kuipa status` for a person: who the values are about, and which file on
+/// this host holds each of them; `--json` still prints the flow's object.
+#[test]
+fn status_names_its_subject_and_where_each_value_lives() {
+    let dir = host_state("status");
+
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
+            .args(args)
+            .env("KUIPA_ROOT", &dir)
+            .env_remove("KUIPA_ENROLLMENT_FILE")
+            .env_remove("KUIPA_TRACE")
+            .env_remove("CLICOLOR_FORCE")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let human = run(&["status"]);
+    for expected in [
+        "host/web1.example.test@EXAMPLE.TEST (state file:",
+        "principal: host/web1.example.test@EXAMPLE.TEST",
+        "realm: EXAMPLE.TEST",
+        "IPA servers: ipa1.example.test, ipa2.example.test",
+        "keytab: ",
+        "pinned anchors: ",
+    ] {
+        assert!(human.contains(expected), "{human}");
+    }
+    // A key, not a JSON key: the labels say what a value is.
+    assert!(!human.contains("\"fqdn\""), "{human}");
+    // Values line up in one column: every label of the block ends at the
+    // same place, and each row still greps as `label: value`.
+    let columns: Vec<usize> = human
+        .lines()
+        .filter(|line| line.starts_with(' '))
+        .filter_map(|line| line.find(": "))
+        .collect();
+    assert!(columns.len() > 3, "{human}");
+    assert!(columns.windows(2).all(|pair| pair[0] == pair[1]), "{human}");
+
+    let json: serde_json::Value = serde_json::from_str(&run(&["status", "--json"])).unwrap();
+    assert_eq!(json["realm"], "EXAMPLE.TEST", "{json}");
+    assert_eq!(json["servers"][0], "ipa1.example.test", "{json}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
