@@ -16,8 +16,10 @@ use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::Delegation;
 use crate::epoch::{MAX_EPOCH_FETCH, SignedEpoch};
 use crate::error::Error;
-use crate::escrow::{self, EscrowRequest};
-use crate::join::{AuthType, KerberosBinding, Operation, Request, Response, channel_binding};
+use crate::escrow::{self, EscrowRequest, RegisterParams};
+use crate::join::{
+    AuthType, KerberosBinding, Operation, Request, RequestBody, Response, channel_binding,
+};
 use crate::keytab::{Enctype, Keytab, Principal};
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
@@ -101,7 +103,7 @@ pub trait Directory {
         staged: &Staged,
     ) -> Result<(Keytab, KerberosBinding), DirectoryError>;
 
-    /// Replace the registered escrow bindings of `principal`.
+    /// Replace the registered keytab escrow bindings of `principal`.
     ///
     /// # Errors
     ///
@@ -112,7 +114,8 @@ pub trait Directory {
         bindings: &[[u8; 32]],
     ) -> Result<(), DirectoryError>;
 
-    /// Is `binding` registered for `principal`, and is the host enabled?
+    /// Is `binding` registered for `principal`, in its keytab or its file
+    /// set, and is the principal's entry enabled?
     ///
     /// # Errors
     ///
@@ -122,6 +125,27 @@ pub trait Directory {
         principal: &Principal,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError>;
+
+    /// Accept `token` from `params.principal` itself (any principal of the
+    /// realm with an entry: host, service or user) and change its escrow
+    /// bindings (§7.5): for [`escrow::Kind::Keytab`], `bindings` replace the
+    /// keytab set; for [`escrow::Kind::File`], they join the file set and
+    /// `params.retire` leaves it.
+    ///
+    /// # Errors
+    ///
+    /// Any refusal; by default registration outside a rekey is not
+    /// supported.
+    fn register_with_gss(
+        &self,
+        params: &RegisterParams,
+        bindings: &[[u8; 32]],
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<KerberosBinding, DirectoryError> {
+        let _ = (params, bindings, token, cb);
+        Err("escrow registration outside a rekey is not supported by this directory".into())
+    }
 
     /// The IPA CA chain (DER).
     ///
@@ -271,6 +295,15 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError> {
         (**self).escrow_allowed(principal, binding)
+    }
+    fn register_with_gss(
+        &self,
+        params: &RegisterParams,
+        bindings: &[[u8; 32]],
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<KerberosBinding, DirectoryError> {
+        (**self).register_with_gss(params, bindings, token, cb)
     }
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
         (**self).ca_certificates()
@@ -562,8 +595,8 @@ impl EnrollServer {
         Ok(adv)
     }
 
-    /// Answer a join, rekey or stage request received at the endpoint of
-    /// `request.operation()`.
+    /// Answer a join, rekey, stage or registration request received at the
+    /// endpoint of `request.operation()`.
     ///
     /// # Errors
     ///
@@ -659,6 +692,9 @@ impl EnrollServer {
                     .bytes(secret.as_ref().map_or(&[][..], |s| s.as_bytes()));
                 native_ossl::util::SecretBuf::new(w.finish())
             }
+            (Operation::Register, AuthType::Kerberos) => {
+                return self.register(request, ss.as_ref(), &t, &body, directory);
+            }
             (op, auth) => {
                 return Err(Refusal::because(format!(
                     "{op:?} with {auth:?} is not supported"
@@ -671,6 +707,28 @@ impl EnrollServer {
                 .map_err(Refusal)?;
         }
         Ok(request.respond(ss.as_ref(), &t, kerberos.as_ref(), payload.as_ref())?)
+    }
+
+    /// Answer a registration (§7.5): change the bindings of its principal
+    /// as the directory authorises, and acknowledge.
+    fn register(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let params = RegisterParams::from_bytes(&body.extra)?;
+        if params.principal.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let token = body.authenticator.as_ref();
+        let binding = directory
+            .register_with_gss(&params, &body.registrations, token, &cb)
+            .map_err(Refusal)?;
+        Ok(request.respond(ss, t, Some(&binding), &params.acknowledgement())?)
     }
 
     fn enrollment(&self, keytab: Keytab, directory: &dyn Directory) -> Result<Enrollment, Refusal> {
@@ -782,7 +840,9 @@ impl EnrollServer {
             .escrow_allowed(request.principal(), &binding)
             .map_err(Refusal)?
         {
-            return Err(Refusal::because("binding not registered or host disabled"));
+            return Err(Refusal::because(
+                "binding not registered or its principal disabled",
+            ));
         }
         Ok(opened.respond().map_err(Error::from)?)
     }

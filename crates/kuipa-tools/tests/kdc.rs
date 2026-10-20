@@ -10,6 +10,7 @@
 
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -27,9 +28,9 @@ use kuipa_enroll::keytab::{Enctype, Keytab};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::parse_stage_result;
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred, InitStep};
-use kuipa_tools::flows::{self, Auth, Outcome};
+use kuipa_tools::flows::{self, Auth, Outcome, Target};
 use kuipa_tools::net::{Endpoint, Trust};
-use kuipa_tools::paths::Paths;
+use kuipa_tools::paths::{self, Paths};
 use kuipad::http::{App, router};
 use kuipad::keystore::KeyStore;
 use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
@@ -330,7 +331,7 @@ fn against_a_real_kdc() {
     assert_eq!(check["ok"], true, "{check}");
 
     // ── Keytab protection: rekey with escrow registration, unseal, undo ──
-    flows::protect(&a).unwrap();
+    flows::protect(&a, &Target::Host).unwrap();
     assert!(
         std::fs::symlink_metadata(a.keytab())
             .unwrap()
@@ -339,7 +340,101 @@ fn against_a_real_kdc() {
     );
     assert_eq!(flows::unseal(&a).unwrap().kvno(), Some(first[0] + 2));
     assert_eq!(flows::check(&a, None).unwrap()["ok"], true);
-    flows::unprotect(&a).unwrap();
+
+    // ── Another keytab and any file, sealed for their own principals and
+    //    registered outside a rekey, with those principals' keys (§7.5) ──
+    let service = format!("HTTP/web1.example.test@{REALM}");
+    let http = realm.dir.join("http.keytab");
+    let http_keys = realm.new_keys(&service);
+    std::fs::write(&http, &http_keys).unwrap();
+    let as_keytab = Target::Keytab(http.clone());
+    let protected = flows::protect(&a, &as_keytab).unwrap();
+    assert_eq!(protected["principal"], service.as_str(), "{protected}");
+    assert!(
+        std::fs::symlink_metadata(&http)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&http).unwrap(), http_keys);
+    assert_eq!(directory.escrow.lock().unwrap()[&service].len(), 2);
+    let secret = realm.dir.join("app-secret.conf");
+    std::fs::write(&secret, b"token=first\n").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let as_file = Target::File {
+        path: secret.clone(),
+        keytab: None,
+    };
+    flows::protect(&a, &as_file).unwrap();
+    let host = format!("host/web1.example.test@{REALM}");
+    let file_bindings = || directory.escrow_files.lock().unwrap()[&host].clone();
+    assert_eq!(file_bindings().len(), 2);
+    let copy = a.run_copy(&std::path::absolute(&secret).unwrap());
+    assert_eq!(
+        std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    // A change written through the symlink is resealed by protecting
+    // again, which retires the previous seal's bindings.
+    let first_seal = std::fs::read(paths::sealed_for(&secret)).unwrap();
+    std::fs::write(&secret, b"token=second\n").unwrap();
+    let resealed = flows::protect(&a, &as_file).unwrap();
+    assert_eq!(resealed["resealed"], true);
+    assert_eq!(file_bindings().len(), 2, "the old seal's bindings retired");
+    let stale = realm.dir.join("stale.sealed");
+    std::fs::write(&stale, &first_seal).unwrap();
+    assert!(
+        flows::unseal_file(&a, &stale).is_err(),
+        "retired seal opens"
+    );
+
+    // At boot every copy comes back through a server, as the host keytab
+    // does; a host rekey replaces only the host's keytab bindings.
+    flows::rotate_keys(&a, None).unwrap();
+    for p in [a.run_keytab(), a.run_copy(&http), copy.clone()] {
+        std::fs::remove_file(p).unwrap();
+    }
+    let all = flows::unseal_all(&a).unwrap();
+    assert_eq!(all["written"].as_array().unwrap().len(), 3, "{all}");
+    assert_eq!(std::fs::read(&http).unwrap(), http_keys);
+    assert_eq!(std::fs::read(&secret).unwrap(), b"token=second\n");
+    let check = flows::check(&a, None).unwrap();
+    assert_eq!(check["ok"], true, "{check}");
+    assert_eq!(
+        flows::status(&a).unwrap()["protected"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Undo: plain again, and the bindings retired.
+    let sealed_secret = std::fs::read(paths::sealed_for(&secret)).unwrap();
+    let undone = flows::unprotect(&a, &as_file).unwrap();
+    assert_eq!(undone["retired"], true, "{undone}");
+    assert!(
+        !std::fs::symlink_metadata(&secret)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&secret).unwrap(), b"token=second\n");
+    assert_eq!(file_bindings(), Vec::<[u8; 32]>::new());
+    std::fs::write(&stale, &sealed_secret).unwrap();
+    assert!(
+        flows::unseal_file(&a, &stale).is_err(),
+        "retired seal opens"
+    );
+    let undone = flows::unprotect(&a, &as_keytab).unwrap();
+    assert_eq!(undone["retired"], true, "{undone}");
+    assert_eq!(std::fs::read(&http).unwrap(), http_keys);
+    assert_eq!(
+        directory.escrow.lock().unwrap()[&service],
+        Vec::<[u8; 32]>::new()
+    );
+    assert!(!paths::sealed_for(&http).exists());
+
+    flows::unprotect(&a, &Target::Host).unwrap();
     assert!(!a.sealed().exists());
     flows::rotate_keys(&a, None).unwrap();
 

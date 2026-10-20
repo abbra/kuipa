@@ -3,6 +3,7 @@
 //! All paths hang off a root (`KUIPA_ROOT`, default `/`) so the tools can
 //! be exercised without touching the system.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -50,6 +51,27 @@ impl Paths {
     #[must_use]
     pub fn sealed(&self) -> PathBuf {
         self.at("etc/ipa/krb5.keytab.sealed")
+    }
+
+    /// `/run/ipa/kuipa/<escaped path>`: the unsealed copy of a protected
+    /// keytab or file other than the host keytab (§7.5).  The name is the
+    /// absolute path with `/` as `-` and anything but ASCII letters,
+    /// digits, `_` and `.` (and `-` itself) as `\xNN`, as `systemd-escape
+    /// --path` writes it.
+    #[must_use]
+    pub fn run_copy(&self, path: &Path) -> PathBuf {
+        let mut name = String::new();
+        for b in path.to_string_lossy().trim_start_matches('/').bytes() {
+            match b {
+                b'/' => name.push('-'),
+                b'.' if name.is_empty() => name.push_str("\\x2e"),
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' => name.push(char::from(b)),
+                _ => {
+                    let _ = write!(name, "\\x{b:02x}");
+                }
+            }
+        }
+        self.at("run/ipa/kuipa").join(name)
     }
 
     /// `/etc/ipa/ca.crt`.
@@ -214,6 +236,48 @@ pub enum Holder {
     File,
 }
 
+/// `<path>.sealed`: where a protected keytab or file other than the host
+/// keytab is kept sealed (§7.5).
+#[must_use]
+pub fn sealed_for(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".sealed");
+    PathBuf::from(name)
+}
+
+/// What a [`Protected`] entry holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Contents {
+    /// A keytab, sealed for its own principal.
+    Keytab,
+    /// Any other file, sealed for the principal of [`Protected::keytab`].
+    File,
+}
+
+/// A keytab or file protected besides the host keytab (§7.5): sealed in
+/// [`sealed_for`]`(path)`, unsealed into [`Paths::run_copy`]`(path)`, and
+/// `path` a symlink to that copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Protected {
+    /// A keytab or a file.
+    pub contents: Contents,
+    /// Where it is used (absolute).
+    pub path: PathBuf,
+    /// The principal on whose entry its bindings are registered.
+    pub principal: String,
+    /// The keytab whose keys authenticate its registrations: the keytab
+    /// itself, or the one a file was sealed with.
+    pub keytab: PathBuf,
+    /// Permission bits, owner and group of the unsealed copy: the
+    /// original file's.
+    pub mode: u32,
+    /// Owner.
+    pub uid: u32,
+    /// Group.
+    pub gid: u32,
+}
+
 /// Persistent client state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -226,6 +290,9 @@ pub struct State {
     /// Keytab protection.
     #[serde(default)]
     pub holder: Holder,
+    /// Other keytabs and files that are protected (§7.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected: Vec<Protected>,
 }
 
 impl State {

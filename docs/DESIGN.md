@@ -91,6 +91,7 @@ inherits the old key's protection without forward secrecy (§6).
                                                                            ▼
  kuipa rotate-keys ── POST /ipa/ku/rekey/{kid} ──────────▶        389-ds: bind, join,
  kuipa-unseal ─────── POST /ipa/ku/rec/{kid} ────────────▶        KEYTAB_GET, attributes
+ kuipa protect ────── POST /ipa/ku/register/{kid} ───────▶
  (administrator) ───── POST /ipa/ku/stage/{kid} ──────────▶
  clevis (tang-pqc) ─── GET/POST /ipa/ku/tang/… ───────────▶        Tang keys only (§11.5)
 
@@ -141,7 +142,7 @@ with the `rustls-native-ossl` provider.
 |---|---|---|---|
 | `kuipad` | `kuipad` | IPA servers | socket-activated service behind httpd (§11) |
 | `kuipa` | `kuipa-tools` | hosts | root, from `ipa-client-install`, an administrator or a unit (§10.1) |
-| `/usr/libexec/kuipa-unseal` | `kuipa-tools` | hosts with a sealed keytab | `init_t` at boot, `gssproxy_t` as keytab loader (§10.5) |
+| `/usr/libexec/kuipa-unseal` | `kuipa-tools` | hosts with a sealed keytab or file | `init_t` at boot, `gssproxy_t` as keytab loader (§10.5) |
 | `kuipa-voucher` | `kuipa-tools` | the voucher issuer's and the provisioner's machines | their users (§10.6) |
 | `tang-pqc`, linked as `clevis-{en,de}crypt-tang-pqc` | `tang-pqc-clevis` | any Clevis client, initramfs included | the Clevis pin or a command (§10.7) |
 
@@ -154,8 +155,9 @@ already uses one executable per confined domain, e.g. the Custodia helpers):
   Kerberos; interactive use stays unconfined, like `ipa-join`.
 * **`/usr/libexec/kuipa-unseal`** is started only by `init_t` (boot) and by
   `gssproxy_t` (keytab loader). Its domain, `kuipa_unseal_t`, may read the
-  sealed keytab, anchors and CA, connect to the IPA servers' HTTP port, run
-  `systemd-creds`, and write `/run/ipa/krb5.keytab` or an inherited memfd.
+  sealed keytabs and files, the client state, anchors and CA, connect to the
+  IPA servers' HTTP port, run `systemd-creds`, and write
+  `/run/ipa/krb5.keytab`, `/run/ipa/kuipa/` (§7.5) or an inherited memfd.
   It has no Kerberos client rights and cannot write `/etc`; `gssproxy_t`
   gains only the right to transition into it.
 
@@ -744,6 +746,7 @@ realm's Kerberos keys as a second, independent root (§5.1):
 | `--principal` password join | armoured AS exchange as the user with the password, straight for `ipa-ku/<server>`; then a Kerberos join | yes for plain password users (the reply is encrypted in the user's key); no for password+OTP, RADIUS, IdP and passkey users, whose reply key comes from the armour |
 | `--use-ccache` | the caller's ticket (§5.4) | as above, by how it was obtained |
 | rekey, stage, `check`, `protect` | the host keytab | yes |
+| `protect --keytab` / `--file` (registration, §7.5) | the keytab being protected, or the one a file is sealed with | yes |
 | `--ldap-otp` (auth type 1), voucher, bundle | none | no: the anchor alone |
 
 * **Armoured AS exchanges** (`kuipa-gssapi::password_ticket`) run in
@@ -865,12 +868,14 @@ state, so escrow uses it:
 
 * **Registration:** each binding's `H(ct)` (SHA-256) is sent in a join or
   rekey body and stored in `ipaKUEscrowBinding` on the host entry, replacing
-  the previous set.
+  the previous set. Other keytabs and files register in a request of their
+  own (§7.5).
 * **Recovery:** `POST /ipa/ku/rec/{kid}` carries the principal and a
   `tang-pqc` recovery request, whose binding ciphertext is sealed to the
   escrow key (`tang-pqc` DESIGN §3.3). The server opens it in the escrow
-  domain, then answers only for an enabled host entry (`nsAccountLock` not
-  true) whose registered bindings include the opened `H(ct)`. The principal
+  domain, then answers only for an enabled entry of the principal
+  (`nsAccountLock` not true) whose registered bindings, in either set
+  (§7.5), include the opened `H(ct)`. The principal
   is also bound into `K_i`, so naming another principal yields a wrong key.
 * **Revocation:** disabling or deleting the host, or clearing the attribute,
   stops unsealing at once. A fresh seal (every `rotate-keys`) retires the old
@@ -924,6 +929,72 @@ first; `host/<fqdn>` follows SSSD.
 
 IPA servers' own keytabs stay plain: binding them to peer replicas would make
 a full-realm cold start depend on a non-network unlocker.
+
+### 7.5 Other keytabs and any file (implemented)
+
+The same sealing protects a service's or a user's keytab, and any file:
+
+```
+kuipa protect --keytab /etc/httpd/http.keytab     sealed for HTTP/web1.example.test@REALM
+kuipa protect --file /etc/app/secret.conf          sealed for host/<fqdn>@REALM
+kuipa protect --file F --keytab K                  sealed for K's principal
+```
+
+* **Format.** A keytab is sealed as `IPSK`, byte for byte as it is on disk
+  (`Sealer::seal_mit`); any other file as `IPSF`, the same layout with the
+  file's contents in place of the keytab. The binding context is the
+  principal in both, so `K_i` is bound to it as for the host keytab.
+* **Two binding sets per entry.** A principal's keytab bindings
+  (`ipaKUEscrowBinding`) are *replaced* by each seal, as for the host. File
+  bindings (`ipaKUEscrowFileBinding`) are *added*, and a seal retires only
+  the bindings of the seal it replaces: several files can be sealed for one
+  principal, and a host rekey (which replaces the host's keytab set) leaves
+  the files sealed for the host openable. Recovery accepts a binding from
+  either set.
+* **Registration.** `POST /ipa/ku/register/{kid}` is the join protocol with
+  operation `register` and a Kerberos authenticator: the request body carries
+  the new bindings and, as operation data, `IPRP(principal, kind, retire[])`;
+  the response payload `IPRA(principal)` acknowledges. The caller must be
+  `principal` itself, so its ticket comes from the keytab being protected,
+  or, for a file, from the keytab it is sealed with (the host keytab by
+  default). As with a rekey, `kb` authenticates the server's answer with the
+  realm's Kerberos keys as well as the anchor. The daemon finds the entry
+  as `fqdn=<fqdn>` for `host/<fqdn>`, otherwise by `krbPrincipalName` or
+  `krbCanonicalName` under `cn=accounts`: hosts, services and users alike.
+* **No rekey.** kuipad does not rotate other principals' keys, and copies of
+  a service keytab on other machines (a cluster) must keep working. Keys the
+  plain file held before protection stay valid until rotated: rotate them
+  with `ipa-getkeytab -k <path>` (which writes through the symlink to the
+  unsealed copy), then `kuipa protect --keytab <path>` again to reseal.
+  Protecting an already-protected path always reseals what is there now and
+  retires the previous seal.
+* **On disk.** `kuipa protect` registers, seals into `<path>.sealed`
+  (0600), test-unseals through a server and compares, writes the unsealed
+  copy to `/run/ipa/kuipa/<escaped path>` (tmpfs; the name as `systemd-escape
+  --path` writes it) with the original mode, owner and group, and only then
+  replaces `<path>` with a symlink to it. The entry is recorded in
+  `state.json` (contents, path, principal, the authenticating keytab, mode,
+  owner, group).
+* **At boot** `kuipa-unseal --all` (the unit's command) unseals the host
+  keytab if protected and every recorded keytab and file; one failure does
+  not stop the others, and any for want of a server makes it exit 75. A
+  service that reads a protected path orders itself after
+  `kuipa-unseal.service`. For gssproxy, `kuipa-unseal --sealed <path>.sealed
+  --memfd` is the per-service loader of §7.4.
+* **Undo.** `kuipa unprotect --keytab P` / `--file P` puts the plaintext
+  back with its mode and owner, then retires its bindings with the same
+  keytab (the keytab set cleared, or the file's bindings removed). Without a
+  reachable server the plaintext is still restored and the result says the
+  bindings remain registered. `kuipa leave` restores every protected path
+  without contacting a server.
+
+| attacker has | plain service keytab or file | sealed |
+|---|---|---|
+| disk image or backup, no access to the realm's servers | its contents | nothing |
+| disk image + server access, principal enabled | its contents | its contents |
+| the same after the principal is disabled (`nsAccountLock`) | its contents (keys valid until rotated) | nothing |
+| an image from before the last reseal or `unprotect` | that version | nothing (binding retired) |
+| root on the running host | its contents | its contents |
 
 ## 8. Offline enrollment
 
@@ -1098,11 +1169,13 @@ rebinding, resealing, anchor refresh) happen inside them.
 | `complete` | finish an offline enrollment (§8.5) |
 | `rotate-keys` | new host keys (§6), resealing when protected |
 | `protect` / `unprotect` | seal / unseal the host keytab, file mode (§7.3) |
+| `protect` / `unprotect --keytab F` | the same for another keytab (a service's or a user's), sealed for its own principal; `protect` again reseals (§7.5) |
+| `protect` / `unprotect --file F [--keytab K]` | the same for any file, sealed for `K`'s principal (default: the host) (§7.5) |
 | `trusted-realms` | install, refresh and remove the trusted realms the host's realm advertises: their anchors, PKINIT anchors, CA and `krb5.conf.d` snippets (§17.3) |
-| `status` | local state: realm, principal, kvno, servers, anchors, trusted realms, protection, pending steps, which ML-KEM sets the system policy allows |
-| `check [--server S]` | for each server: advertisement and delegation (warns under 14 days, and when only a succession of rotated anchors verifies it, §4.7), a `kinit` with the host keys, and a test unseal when protected; each problem with the fix |
+| `status` | local state: realm, principal, kvno, servers, anchors, trusted realms, protection and the other protected keytabs and files, pending steps, which ML-KEM sets the system policy allows |
+| `check [--server S]` | for each server: advertisement and delegation (warns under 14 days, and when only a succession of rotated anchors verifies it, §4.7), a `kinit` with the host keys, and a test unseal when protected and of every other protected keytab and file; each problem with the fix |
 | `advertisement [--server S… \| --domain D] [--enrollment-file F \| --realm R]` | for each server: its verified advertisement — realm, domain, KDCs, signing key and which anchor proves it, delegation and vouch lifetimes, join/escrow keys, CA and PKINIT anchors, the anchors vouched for each trusted realm — and the anchor log behind its head: every entry with its landmark head and successions (§4.8).  Then a per-key index of those same facts, derived without a second fetch: for every anchor or signing key these servers name, whether this host pins it, which servers' claims it proves, which servers call it a current anchor and at which log sequences, which trusted realm's anchors it is, and what it replaces or is replaced by (§4.2, §4.6, §4.7); reads and verifies, writes nothing |
-| `leave` | remove what kuipa installed besides the keytab (sealed file, anchors, generated Kerberos files, machine key, state); a sealed keytab is first written back in plain form for `ipa-join --unenroll` |
+| `leave` | remove what kuipa installed besides the keytab (sealed file, anchors, generated Kerberos files, machine key, state); a sealed keytab is first written back in plain form for `ipa-join --unenroll`, and so is every other protected keytab and file |
 
 Common rules:
 
@@ -1132,7 +1205,8 @@ Common rules:
 | `etc/ipa/ku-anchors.d/<REALM>`, `var/lib/ipa-client/ku/trusts/<REALM>/`, `etc/krb5.conf.d/kuipa_trust_<REALM>` | a trusted realm's anchors, PKINIT anchors and CA, and Kerberos configuration (§17.3) |
 | `etc/ipa/krb5.keytab.sealed` | the sealed keytab |
 | `run/ipa/krb5.keytab` | the unsealed keytab in file mode |
-| `var/lib/ipa-client/ku/state.json` | realm, FQDN, servers (issuer first), protection |
+| `<path>.sealed`, `run/ipa/kuipa/<escaped path>` | another protected keytab or file, sealed and unsealed; `<path>` is a symlink to the latter (§7.5) |
+| `var/lib/ipa-client/ku/state.json` | realm, FQDN, servers (issuer first), protection, other protected keytabs and files |
 | `var/lib/ipa-client/ku/krb5.conf`, `pkinit-anchors.pem` | Kerberos configuration generated from the enrollment |
 | `var/lib/ipa-client/ku/recipient.jwk`, `recipient.pub.jwk` | the mode A machine key |
 | `var/lib/ipa-client/ku/pending.json` | deferred steps after offline enrollment |
@@ -1187,8 +1261,11 @@ password enrollment and check that neither secret appears.
 
 Unseals through the first server that answers for a registered binding, and
 writes the MIT keytab to `/run/ipa/krb5.keytab` (default) or to fd 3
-(`--memfd`, the gssproxy loader protocol). Exit 0, 75 (no server could
-unseal) or 1.
+(`--memfd`, the gssproxy loader protocol). `--all` (boot) unseals the host
+keytab if protected and every other protected keytab and file into its
+unsealed copy; `--sealed S` unseals one sealed keytab or file to `--out F`,
+to fd 3 with `--memfd`, or to its unsealed copy if `kuipa protect` recorded
+it (§7.5). Exit 0, 75 (no server could unseal) or 1.
 
 ### 10.6 `kuipa-voucher`
 
@@ -1313,6 +1390,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/join/{kid}` | `IPJQ` → `IPJS` |
 | POST | `/ipa/ku/rekey/{kid}` | `IPJQ` → `IPJS` |
 | POST | `/ipa/ku/stage/{kid}` | `IPSQ` → `IPJS` (payload `IPSP`) |
+| POST | `/ipa/ku/register/{kid}` | `IPJQ` (operation data `IPRP`) → `IPJS` (payload `IPRA`) (§7.5) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS` |
 | POST | `/ipa/ku/peer/sync` | `IPPS` → agirru envelope (CBOR); servers only (§4.2) |
 | POST | `/ipa/ku/trust/{kid}` | `IPTQ` → `IPTS` (§17.4) |
@@ -1335,7 +1413,8 @@ runs on tokio's blocking pool.
 | Kerberos join | accept the token with `cb`; S4U2Self as the caller, SASL GSSAPI bind with that credential (S4U2Proxy to `ldap/`); join and `KEYTAB_GET` |
 | rekey | as Kerberos join, caller must be `host/<fqdn>`; then, as the daemon, delete `ipaKUStaged` and `krbPrincipalExpiration` if staged, and `userPassword` if present (first contact with the OTP as Kerberos key) |
 | stage | as the caller: join, `KEYTAB_GET`, replace `ipaKUStaged` and `krbPrincipalExpiration` |
-| escrow | as the daemon: replace `ipaKUEscrowBinding`; read it with `nsAccountLock` |
+| escrow | as the daemon, on the principal's entry (a host's by FQDN, others by `krbPrincipalName`/`krbCanonicalName` under `cn=accounts`): replace `ipaKUEscrowBinding`; read it and `ipaKUEscrowFileBinding` with `nsAccountLock` |
+| registration (§7.5) | accept the token with `cb`, caller must be the principal; as the daemon: replace `ipaKUEscrowBinding`, or delete each retired value of `ipaKUEscrowFileBinding` (an absent one is no error) and add the new ones |
 | voucher join | as the daemon, after the voucher verified: search `ipaKUVoucherSpent` for the salt; add the host entry (as `host-add` lays it out) with it; add it as `member` of `cn=<group>,cn=hostgroups,cn=accounts`; `KEYTAB_GET` |
 | trust invitation | as the daemon: add `ipaKUTrustInvitation: <hex SHA-256 of the secret> <not after>` to `cn=trusts,cn=kuipa,cn=etc,<suffix>`; using it deletes that exact value, which only one server can do |
 | record a trust | as the daemon: add `krbtgt/<B>@<A>` and `krbtgt/<A>@<B>` under `cn=<A>,cn=kerberos,<suffix>` and give them keys from the trust secret with `KEYTAB_GET` and a password (as `ipa-getkeytab -P`); store the partner as JSON in `ipaKUTrustedRealm` |
@@ -1688,7 +1767,7 @@ like an enrollment string.
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
 | gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; needs the gssproxy change |
-| FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
+| FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 
 ### 18.2 Tests
 
@@ -1696,7 +1775,7 @@ like an enrollment string.
 |---|---|
 | `crates/tang-pqc` unit and `tests/{escrow,extensions,system_policy}.rs` | Tang escrow, sealed recovery requests (no binding ciphertext on the wire, fresh requests for a static binding, wrong key, tampering), the extension points (domains, contexts, opening requests, roles, signed members), crypto-policy enforcement |
 | `kuipa-enroll` unit tests | trust establishment between two in-memory realms (same secret on both sides, single-use invitations, foreign signer, tampering, wrong realm), vouchers (encoding, realm, host, validity, binding, tampering, key), Merkle trees (synta-mtc's roots and inclusion proofs against an independent RFC 9162 reference, for every leaf of trees of 1–33 leaves, and tampered paths), delegations (one vouch covering several claims, proofs per anchor and selection, vouch expiry, tampering, policy), successions (one and two hops, expiry, wrong realm, forged statements and keys, cycles, the hop limit, chains kept by selection, the JSON shape without them), the anchor exchange (trust from Kerberos attestation spreading through vouches, untrusted and removed servers, renewal, an anchor rotated and succeeded, merge/delta/admission/encoding, linear growth, the sync message and attestation), the anchor epoch log (canonical entries, the numbering rule, an entry that does not commit to the entry before it, gaps and forks against a watermark, proven and self-asserted signers, trust carried forward through the chain, a forged continuation, the wire), realm verification, trusted-realm validation (own realm, duplicates, shared anchors, unsafe names) and the realm-section generator, enrollment strings (expiry mandatory, decimal, before the secret; expired strings refused), MIT keytabs, payloads, bundles (all modes, wrong recipient, tampering, `iat` checks) |
-| `crates/kuipa-enroll/tests/end_to_end.rs` | every flow against an in-memory directory, with two servers that have exchanged anchors and a client pinning one: OTP join on either server, wrong OTP / wrong server, endpoint and response binding, field tampering, Kerberos join and rekey with channel bindings and the Kerberos binding (an impostor's response does not open), auth type 4 refused, staging modes A/B and first contact, staging authorisation, sealed keytab with registration, failover, revocation and rebinding, the `krb5.conf` generator |
+| `crates/kuipa-enroll/tests/end_to_end.rs` | every flow against an in-memory directory, with two servers that have exchanged anchors and a client pinning one: OTP join on either server, wrong OTP / wrong server, endpoint and response binding, field tampering, Kerberos join and rekey with channel bindings and the Kerberos binding (an impostor's response does not open), auth type 4 refused, staging modes A/B and first contact, staging authorisation, sealed keytab with registration, failover, revocation and rebinding, a sealed file registered by a service principal (reseal retires the old bindings, another principal's ticket and the rekey endpoint refused), the `krb5.conf` generator |
 | `kuipad` unit tests | `KEYTAB_GET` DER against a hand encoding (with and without a password), `GeneralizedTime`, the key store (generation, rotation, retired keys still loaded, pruning by age, anchor rotation leaving a succession and no trace of the old key), the Tang key directory (generation, rotation, `adv/{thp}` with a retired key, recovery with a retired key), the rate limiter (bursts, refill, per-source limits, idle buckets dropped, `X-Forwarded-For`), `?anchor=` parsing, the anchor epoch merge (a continuing window adopted and both signature sets kept, a shorter window only adds signatures, a different statement at a shared sequence is a fork, a window naming another head is a fork, a gap is fetched not assumed, the sync window is a bounded recent tail) |
 | `crates/ml-dsa-blind` | blind signing (results verify as stock ML-DSA, μ against OpenSSL's `ML-DSA-MU`, requests hide the message, bad responses, resumed state), crypto-policy enforcement |
 | `crates/kuipa-tools/tests/cli.rs` | the `kuipa` binary: `--realm` with an enrollment string for another realm (or another case) is an error before any server is contacted; with the same realm the join goes ahead; no help text, rendered result, or error message cites a DESIGN section; labels are plain when output is captured or `$NO_COLOR` is set, emphasised when `$CLICOLOR_FORCE` asks for colour, and stripping the emphasis gives byte-for-byte the plain rows |
@@ -1705,7 +1784,7 @@ like an enrollment string.
 | `crates/kuipa-tools/tests/dns.rs` | SRV discovery against a stub DNS server over UDP and TCP (truncated answers): priority and weight order, unsafe and duplicate names dropped, no records, no answer |
 | `crates/kuipa-tools/tests/voucher.rs` | against a real MIT KDC: issuer key and quota, blinded request (64 bytes), unblinding, the voucher key in the advertisement; a bearer voucher creates its host in its host group once and not another host; a bound voucher needs its ephemeral key; an unknown voucher key is refused; the quota runs out |
 | `crates/kuipa-tools/tests/trust.rs` | against two real MIT KDCs, realms A and B: B invites A and A's server establishes the trust over HTTP (both directories record it, the invitation is single use, A publishes B refreshed from B's advertisement); a host of A installs B from A's `trusts` (B's anchors apart from A's, B's chain, a `krb5.conf.d` snippet without `[libdefaults]`), gets anonymous-PKINIT armour from B's KDC, and gets none without B's chain or with A's chain instead; with the cross-realm keys the establishment created in both KDCs, a user of B logs in with that armour and gets a ticket for the A host; refresh, an unreachable B keeping its files, a trust entry with A's own anchor refused, removal, `leave` |
-| `crates/kuipa-tools/tests/kdc.rs` | against a real MIT KDC with PKINIT, two servers running the router and the anchor exchange: both converge to both anchors and claims proven by both anchors; the two anchor logs converge to the same head and `check` moves the host's watermark to it (§4.8); GSS-API channel bindings, OTP join → `rotate-keys` → `check`, `protect` → unseal → `unprotect`, one-message krb5 contexts deriving the same PRF output on both sides, the OTP as a temporary Kerberos key → armoured AS exchange → rekey (and the OTP spent after it), admin-ticket join, armoured password joins (wrong and right password), `realm-info` anchors → anonymous PKINIT (and its failure without them) → armoured `kinit` → `--use-ccache` join, staging → bundle → `complete`; an OTP join through ipa2 alone with ipa1's anchor pinned, storing both anchors; syncs with another server's token or no valid token refused |
+| `crates/kuipa-tools/tests/kdc.rs` | against a real MIT KDC with PKINIT, two servers running the router and the anchor exchange: both converge to both anchors and claims proven by both anchors; the two anchor logs converge to the same head and `check` moves the host's watermark to it (§4.8); GSS-API channel bindings, OTP join → `rotate-keys` → `check`, `protect` → unseal → `unprotect`, a service keytab and a file protected with registration (mode kept, reseal retiring the old seal, a host rekey leaving them openable, `kuipa-unseal --all`, `check`, `unprotect` retiring the bindings), one-message krb5 contexts deriving the same PRF output on both sides, the OTP as a temporary Kerberos key → armoured AS exchange → rekey (and the OTP spent after it), admin-ticket join, armoured password joins (wrong and right password), `realm-info` anchors → anonymous PKINIT (and its failure without them) → armoured `kinit` → `--use-ccache` join, staging → bundle → `complete`; an OTP join through ipa2 alone with ipa1's anchor pinned, storing both anchors; syncs with another server's token or no valid token refused |
 
 `contrib/ci/local-ci.sh` runs these as CI jobs (the real-KDC tests as
 `kdc-test`, failing rather than skipping when the KDC tools are missing),

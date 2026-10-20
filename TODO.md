@@ -44,15 +44,17 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 
 ## Outside this workspace
 
-- [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUStaged`,
-      `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm`) and
+- [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
+      `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
+      `ipaKUTrustedRealm`) and
       the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs for the daemon's identity
       (including adding hosts and host-group members for vouchers, and
-      cross-realm `krbtgt` principals and their keys for trusts);
+      cross-realm `krbtgt` principals and their keys for trusts, and the
+      escrow attributes on service and user entries as well as hosts, §7.5);
       framework commands (`pq-anchor-show`,
       `host-add/host-mod --pq-stage`, enrollment strings from `--random`,
-      `--clear-pq-escrow`), installers and upgrade (`kuipad
-      generate-keys` on every server and replica, the `ipa-ku/<server>`
+      `--clear-pq-escrow`, also for services and users), installers and
+      upgrade (`kuipad generate-keys` on every server and replica, the `ipa-ku/<server>`
       principal, keytab and delegation rule), httpd snippet, SELinux module
       (`kuipa_unseal_t`). Enrollment strings use the issuing server's
       anchor and expire (`kuipad enrollment-string --days N`, §4.4);

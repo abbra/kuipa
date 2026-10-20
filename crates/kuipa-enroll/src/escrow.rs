@@ -1,4 +1,5 @@
-//! Sealed keytabs (§7.1) and escrow recovery requests (§7.2).
+//! Sealed keytabs and files (§7.1, §7.5), their registration (§7.5) and
+//! escrow recovery requests (§7.2).
 //!
 //! ```text
 //! DEK ←$ 32 bytes                         (fresh on every seal)
@@ -6,11 +7,12 @@
 //!                     domain "ipa-ku-enroll/v1 escrow", info = principal
 //!                     W_i = GCM_{K_i}(DEK)
 //! IPSK = principal ‖ [(server_i, B_i, ek_i, W_i)] ‖ GCM_DEK(MIT keytab)
+//! IPSF = principal ‖ [(server_i, B_i, ek_i, W_i)] ‖ GCM_DEK(file)
 //! ```
 //!
 //! Any one server can unseal.  Each server answers only for bindings
-//! registered on an enabled host entry (`H(ct_i)`, see
-//! [`Binding::ciphertext_hash`]), which it learns by opening the sealed
+//! registered on the enabled directory entry of the principal (`H(ct_i)`,
+//! see [`Binding::ciphertext_hash`]), which it learns by opening the sealed
 //! recovery request.  Each slot keeps the server's public escrow key, so
 //! unsealing needs no extra round trip to seal the request.  The key is
 //! authenticated by the binding's `kid`.
@@ -29,13 +31,51 @@ use crate::realm::VerifiedRealm;
 pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 escrow");
 
 const SEALED_MAGIC: [u8; 4] = *b"IPSK";
+const SEALED_FILE_MAGIC: [u8; 4] = *b"IPSF";
 const REQUEST_MAGIC: [u8; 4] = *b"IPEQ";
+const REGISTER_MAGIC: [u8; 4] = *b"IPRP";
+const REGISTERED_MAGIC: [u8; 4] = *b"IPRA";
 
 fn context(principal: &Principal) -> BindingContext {
     BindingContext::new(DOMAIN, principal.to_string().as_bytes())
 }
 
-/// One server's way into the sealed keytab.
+/// What a sealed object holds, and so which of its principal's binding
+/// sets opens it (§7.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// The principal's keytab.  Its bindings are replaced at every seal.
+    Keytab,
+    /// Any other file.  Its bindings are added beside the others', and
+    /// retired one seal at a time.
+    File,
+}
+
+impl Kind {
+    const fn magic(self) -> [u8; 4] {
+        match self {
+            Self::Keytab => SEALED_MAGIC,
+            Self::File => SEALED_FILE_MAGIC,
+        }
+    }
+
+    const fn id(self) -> u8 {
+        match self {
+            Self::Keytab => 1,
+            Self::File => 2,
+        }
+    }
+
+    fn from_id(id: u8) -> Result<Self> {
+        match id {
+            1 => Ok(Self::Keytab),
+            2 => Ok(Self::File),
+            _ => Err(Error::Malformed("binding set")),
+        }
+    }
+}
+
+/// One server's way into the sealed object.
 #[derive(Clone, PartialEq, Eq)]
 struct Slot {
     server: String,
@@ -44,17 +84,19 @@ struct Slot {
     wrapped: Box<[u8]>,
 }
 
-/// A keytab sealed to the realm's escrow keys.
+/// A keytab or file sealed to the realm's escrow keys.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SealedKeytab {
+pub struct Sealed {
+    kind: Kind,
     principal: Principal,
     slots: Vec<Slot>,
-    sealed: Box<[u8]>,
+    ciphertext: Box<[u8]>,
 }
 
-impl std::fmt::Debug for SealedKeytab {
+impl std::fmt::Debug for Sealed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SealedKeytab")
+        f.debug_struct("Sealed")
+            .field("kind", &self.kind)
             .field("principal", &self.principal)
             .field("servers", &self.servers())
             .finish_non_exhaustive()
@@ -70,9 +112,10 @@ pub struct Registration {
     pub binding: [u8; 32],
 }
 
-/// Bindings and a data key, made before the keytab they will protect is
-/// known: the registrations travel in the same rekey request that delivers
-/// the new keys (§7.2).
+/// Bindings and a data key, made before what they will protect is known:
+/// for a host keytab, the registrations travel in the same rekey request
+/// that delivers the new keys (§7.2); otherwise in a registration of their
+/// own (§7.5).
 pub struct Sealer {
     principal: Principal,
     dek: SecretBuf,
@@ -145,20 +188,48 @@ impl Sealer {
     ///
     /// [`Error::Mismatch`] for a keytab of another principal, or a crypto
     /// error.
-    pub fn seal(self, keytab: &Keytab) -> Result<SealedKeytab> {
+    pub fn seal(self, keytab: &Keytab) -> Result<Sealed> {
         if keytab.principal() != &self.principal {
             return Err(Error::Mismatch("keytab principal"));
         }
-        let sealed = primitives::seal(self.dek.as_ref(), keytab.to_mit()?.as_ref())?.into();
-        Ok(SealedKeytab {
+        self.seal_as(Kind::Keytab, keytab.to_mit()?.as_ref())
+    }
+
+    /// Seal an MIT keytab as it is, byte for byte (the name types its
+    /// writer chose stay).  Consumes the sealer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for no keytab, [`Error::Mismatch`] for a keytab
+    /// of another principal, or a crypto error.
+    pub fn seal_mit(self, mit: &[u8]) -> Result<Sealed> {
+        if Keytab::from_mit(mit)?.principal() != &self.principal {
+            return Err(Error::Mismatch("keytab principal"));
+        }
+        self.seal_as(Kind::Keytab, mit)
+    }
+
+    /// Seal the contents of a file.  Consumes the sealer.
+    ///
+    /// # Errors
+    ///
+    /// A crypto error.
+    pub fn seal_file(self, contents: &[u8]) -> Result<Sealed> {
+        self.seal_as(Kind::File, contents)
+    }
+
+    fn seal_as(self, kind: Kind, plain: &[u8]) -> Result<Sealed> {
+        let ciphertext = primitives::seal(self.dek.as_ref(), plain)?.into();
+        Ok(Sealed {
+            kind,
             principal: self.principal,
             slots: self.slots,
-            sealed,
+            ciphertext,
         })
     }
 }
 
-impl SealedKeytab {
+impl Sealed {
     /// Seal `keytab` to the escrow key of every server in `servers`:
     /// [`Sealer::prepare`] followed by [`Sealer::seal`].
     ///
@@ -170,10 +241,29 @@ impl SealedKeytab {
         Ok((sealer.seal(keytab)?, registrations))
     }
 
-    /// The principal whose keytab this is.
+    /// A keytab or a file.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// The principal whose keytab this is, or on whose entry the bindings
+    /// of a file are registered.
     #[must_use]
     pub fn principal(&self) -> &Principal {
         &self.principal
+    }
+
+    /// `H(ct)` of each slot's binding: what is registered for it.
+    ///
+    /// # Errors
+    ///
+    /// A crypto error.
+    pub fn bindings(&self) -> Result<Vec<[u8; 32]>> {
+        self.slots
+            .iter()
+            .map(|s| Ok(s.binding.ciphertext_hash()?))
+            .collect()
     }
 
     /// The servers that can unseal it, in order.
@@ -182,7 +272,42 @@ impl SealedKeytab {
         self.slots.iter().map(|s| s.server.as_str()).collect()
     }
 
-    /// Unseal, trying each server in turn.
+    /// Unseal a keytab, trying each server in turn: as
+    /// [`unseal_contents`](Self::unseal_contents), for a sealed keytab of
+    /// its principal.
+    ///
+    /// # Errors
+    ///
+    /// As for that, and [`Error::Mismatch`] for a sealed file or a keytab
+    /// of another principal.
+    pub fn unseal(
+        &self,
+        recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
+    ) -> Result<Keytab> {
+        Keytab::from_mit(self.unseal_mit(recover)?.as_ref())
+    }
+
+    /// Unseal a keytab, trying each server in turn, and return it in MIT
+    /// form as it was sealed.
+    ///
+    /// # Errors
+    ///
+    /// As for [`unseal`](Self::unseal).
+    pub fn unseal_mit(
+        &self,
+        recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
+    ) -> Result<SecretBuf> {
+        if self.kind != Kind::Keytab {
+            return Err(Error::Mismatch("a sealed file, not a keytab"));
+        }
+        let plain = self.unseal_contents(recover)?;
+        if Keytab::from_mit(plain.as_ref())?.principal() != &self.principal {
+            return Err(Error::Mismatch("sealed keytab principal"));
+        }
+        Ok(plain)
+    }
+
+    /// Unseal, trying each server in turn, and return what was sealed.
     ///
     /// `recover(server, request)` sends the request to `server` and returns
     /// its response, or `None` if the server could not be reached or
@@ -191,10 +316,10 @@ impl SealedKeytab {
     /// # Errors
     ///
     /// [`Error::Refused`] if no server could unseal it, or a crypto error.
-    pub fn unseal(
+    pub fn unseal_contents(
         &self,
         mut recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
-    ) -> Result<Keytab> {
+    ) -> Result<SecretBuf> {
         for slot in &self.slots {
             let (request, pending) = slot.binding.recovery_request(&slot.escrow_key)?;
             let request = EscrowRequest {
@@ -209,13 +334,8 @@ impl SealedKeytab {
             };
             let dek =
                 primitives::open(key.as_ref(), &slot.wrapped).map_err(|_| Error::BadResponse)?;
-            let plain =
-                primitives::open(dek.as_ref(), &self.sealed).map_err(|_| Error::BadResponse)?;
-            let keytab = Keytab::from_mit(plain.as_ref())?;
-            if keytab.principal() != &self.principal {
-                return Err(Error::Mismatch("sealed keytab principal"));
-            }
-            return Ok(keytab);
+            return primitives::open(dek.as_ref(), &self.ciphertext)
+                .map_err(|_| Error::BadResponse);
         }
         Err(Error::Refused)
     }
@@ -227,7 +347,7 @@ impl SealedKeytab {
     /// Never for keytabs sealed by this crate (at most 255 servers).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::new(SEALED_MAGIC);
+        let mut w = Writer::new(self.kind.magic());
         w.str(&self.principal.to_string())
             .u8(u8::try_from(self.slots.len()).expect("at most 255 servers"));
         for s in &self.slots {
@@ -236,16 +356,21 @@ impl SealedKeytab {
                 .bytes(s.escrow_key.as_bytes())
                 .bytes(&s.wrapped);
         }
-        w.bytes(&self.sealed).finish()
+        w.bytes(&self.ciphertext).finish()
     }
 
-    /// Decode from storage.
+    /// Decode from storage: a sealed keytab or file.
     ///
     /// # Errors
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, SEALED_MAGIC, "sealed keytab")?;
+        let kind = if bytes.starts_with(&SEALED_FILE_MAGIC) {
+            Kind::File
+        } else {
+            Kind::Keytab
+        };
+        let mut r = Reader::new(bytes, kind.magic(), "sealed keytab or file")?;
         let principal: Principal = r.str()?.parse()?;
         let ctx = context(&principal);
         let slots = (0..r.u8()?)
@@ -264,13 +389,89 @@ impl SealedKeytab {
                 })
             })
             .collect::<Result<_>>()?;
-        let sealed = r.bytes()?.into();
+        let ciphertext = r.bytes()?.into();
+        r.finish()?;
+        Ok(Self {
+            kind,
+            principal,
+            slots,
+            ciphertext,
+        })
+    }
+}
+
+/// What a registration (`POST /ipa/ku/register/{kid}`, §7.5) changes,
+/// sent as the request's operation data beside the new bindings.  The
+/// caller must be `principal` itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisterParams {
+    /// Whose entry holds the bindings.
+    pub principal: Principal,
+    /// [`Kind::Keytab`]: the new bindings replace the keytab set.
+    /// [`Kind::File`]: they join the file set, and `retire` leaves it.
+    pub kind: Kind,
+    /// File bindings to remove: those of the seal being replaced or undone.
+    pub retire: Vec<[u8; 32]>,
+}
+
+impl RegisterParams {
+    /// Encode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for more than 255 bindings to retire.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut w = Writer::new(REGISTER_MAGIC);
+        w.str(&self.principal.to_string())
+            .u8(self.kind.id())
+            .u8(u8::try_from(self.retire.len())
+                .map_err(|_| Error::Malformed("too many bindings to retire"))?);
+        for b in &self.retire {
+            w.fixed(b);
+        }
+        Ok(w.finish())
+    }
+
+    /// Decode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, REGISTER_MAGIC, "registration")?;
+        let principal = r.str()?.parse()?;
+        let kind = Kind::from_id(r.u8()?)?;
+        let retire = (0..r.u8()?).map(|_| r.fixed()).collect::<Result<_, _>>()?;
         r.finish()?;
         Ok(Self {
             principal,
-            slots,
-            sealed,
+            kind,
+            retire,
         })
+    }
+
+    /// The server's answer to an accepted registration: the principal it
+    /// changed.
+    #[must_use]
+    pub fn acknowledgement(&self) -> Vec<u8> {
+        Writer::new(REGISTERED_MAGIC)
+            .str(&self.principal.to_string())
+            .finish()
+    }
+
+    /// Check the server's answer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`], or [`Error::Mismatch`] for another principal.
+    pub fn check_acknowledgement(&self, payload: &[u8]) -> Result<()> {
+        let mut r = Reader::new(payload, REGISTERED_MAGIC, "registration answer")?;
+        let principal: Principal = r.str()?.parse()?;
+        r.finish()?;
+        if principal != self.principal {
+            return Err(Error::Mismatch("registered principal"));
+        }
+        Ok(())
     }
 }
 

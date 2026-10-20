@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use kuipa_enroll::escrow::{Kind, RegisterParams};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::realm::TrustedRealm;
@@ -22,6 +23,8 @@ pub struct KdcDirectory {
     pub admins: HashSet<String>,
     pub otps: Mutex<HashMap<String, Vec<u8>>>,
     pub escrow: Mutex<HashMap<String, Vec<[u8; 32]>>>,
+    /// Escrow bindings of sealed files, by principal (§7.5).
+    pub escrow_files: Mutex<HashMap<String, Vec<[u8; 32]>>>,
     pub staged: Mutex<HashSet<String>>,
     pub servers: Vec<String>,
     /// Spent voucher salts.
@@ -54,6 +57,7 @@ impl KdcDirectory {
             admins: admins.iter().map(|a| (*a).to_owned()).collect(),
             otps: Mutex::new(HashMap::new()),
             escrow: Mutex::new(HashMap::new()),
+            escrow_files: Mutex::new(HashMap::new()),
             staged: Mutex::new(HashSet::new()),
             servers: servers.iter().map(|s| (*s).to_owned()).collect(),
             spent: Mutex::new(HashSet::new()),
@@ -220,12 +224,42 @@ impl Directory for KdcDirectory {
         principal: &Principal,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError> {
-        Ok(self
-            .escrow
-            .lock()
-            .unwrap()
-            .get(&principal.to_string())
-            .is_some_and(|b| b.contains(binding)))
+        let p = principal.to_string();
+        Ok([&self.escrow, &self.escrow_files].iter().any(|set| {
+            set.lock()
+                .unwrap()
+                .get(&p)
+                .is_some_and(|b| b.contains(binding))
+        }))
+    }
+
+    fn register_with_gss(
+        &self,
+        params: &RegisterParams,
+        bindings: &[[u8; 32]],
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<KerberosBinding, DirectoryError> {
+        let (caller, binding) = self.accept_bound(token, cb)?;
+        let principal = params.principal.to_string();
+        if caller != principal {
+            return Err(format!("{caller} may not register for {principal}").into());
+        }
+        match params.kind {
+            Kind::Keytab => {
+                self.escrow
+                    .lock()
+                    .unwrap()
+                    .insert(principal, bindings.to_vec());
+            }
+            Kind::File => {
+                let mut files = self.escrow_files.lock().unwrap();
+                let set = files.entry(principal).or_default();
+                set.retain(|b| !params.retire.contains(b));
+                set.extend_from_slice(bindings);
+            }
+        }
+        Ok(binding)
     }
 
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {

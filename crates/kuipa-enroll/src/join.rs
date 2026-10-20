@@ -1,4 +1,5 @@
-//! Join, rekey and stage messages and their key schedule (§5.1, §5.2, §6, §8.3).
+//! Join, rekey, stage and registration messages and their key schedule
+//! (§5.1, §5.2, §6, §7.5, §8.3).
 //!
 //! ```text
 //! (ct, ss)     = Encaps(ek_kid)            (dk_e, ek_e) = KeyGen()
@@ -43,6 +44,9 @@ pub enum Operation {
     Rekey,
     /// `POST /ipa/ku/stage/{kid}`.
     Stage,
+    /// `POST /ipa/ku/register/{kid}`: escrow bindings outside a rekey
+    /// (§7.5).
+    Register,
 }
 
 impl Operation {
@@ -51,12 +55,19 @@ impl Operation {
             Self::Join => "join",
             Self::Rekey => "rekey",
             Self::Stage => "stage",
+            Self::Register => "register",
         }
+    }
+
+    /// The endpoint path segment, `/ipa/ku/<label>/{kid}`.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        self.label()
     }
 
     const fn magic(self) -> [u8; 4] {
         match self {
-            Self::Join | Self::Rekey => *b"IPJQ",
+            Self::Join | Self::Rekey | Self::Register => *b"IPJQ",
             Self::Stage => *b"IPSQ",
         }
     }
@@ -605,6 +616,25 @@ impl PendingJoin {
             &response.ciphertext,
         )?;
         primitives::open(k.as_ref(), &response.sealed).map_err(|_| Error::BadResponse)
+    }
+
+    /// Finish a registration (§7.5): decrypt the server's answer and check
+    /// it registered for `params.principal`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], or [`Error::Mismatch`]
+    /// for another server or principal.
+    pub fn finish_register(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+        params: &crate::escrow::RegisterParams,
+    ) -> Result<()> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        params.check_acknowledgement(self.open(response)?.as_ref())
     }
 
     /// Finish a join or rekey: decrypt the enrollment, and check it is for

@@ -165,6 +165,21 @@ step 0 "Unseal it, as kuipa-unseal does at boot" 'kuipa-unseal'
 step 0 "Check web1 with the sealed keytab" 'kuipa check'
 step 0 "Write the plain keytab back" 'kuipa unprotect'
 
+section "Protecting any file" \
+    "Any file can be sealed the same way, for the principal of a keytab (the host's by default): its bindings are registered with that principal's own ticket, and a host rekey leaves them in place."
+step 0 "Write an application secret" \
+    'mkdir -p "$KUIPA_ROOT/etc/app" && echo "token=playground" > "$KUIPA_ROOT/etc/app/secret.conf"'
+step 0 "Seal it for web1's host principal" \
+    'kuipa protect --file "$KUIPA_ROOT/etc/app/secret.conf"' \
+    "bindings registered for: host/web1.example.test@EXAMPLE.TEST"
+step 0 "Rotate web1's keys: only the keytab bindings change" 'kuipa rotate-keys'
+step 0 "Unseal everything, as kuipa-unseal does at boot" 'kuipa-unseal --all'
+step 0 "Read the secret through its symlink" 'cat "$KUIPA_ROOT/etc/app/secret.conf"' \
+    "token=playground"
+step 0 "Write the plain file back and retire its bindings" \
+    'kuipa unprotect --file "$KUIPA_ROOT/etc/app/secret.conf"' \
+    "are retired"
+
 section "Failover" \
     "With ipa1 unreachable, web2 enrolls through ipa2: every server presents an advertisement that ipa1's anchor vouches for."
 step 0 "Make ipa1 unreachable" 'pq_down ipa1'
