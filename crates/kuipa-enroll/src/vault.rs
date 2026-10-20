@@ -100,13 +100,15 @@ pub enum TicketDelegation {
 }
 
 impl TicketDelegation {
-    /// Does a ticket that passed through `transited` qualify?
+    /// Does a ticket that passed through `transited` qualify?  `None`
+    /// (the delegation is unknown) qualifies only for [`Self::Allow`].
     #[must_use]
-    pub fn accepts(&self, transited: &[String]) -> bool {
-        match self {
-            Self::Allow => true,
-            Self::Refuse => transited.is_empty(),
-            Self::Via(allowed) => transited.iter().all(|t| allowed.contains(t)),
+    pub fn accepts(&self, transited: Option<&[String]>) -> bool {
+        match (self, transited) {
+            (Self::Allow, _) => true,
+            (_, None) => false,
+            (Self::Refuse, Some(t)) => t.is_empty(),
+            (Self::Via(allowed), Some(t)) => t.iter().all(|s| allowed.contains(s)),
         }
     }
 }

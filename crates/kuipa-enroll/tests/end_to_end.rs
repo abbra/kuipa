@@ -226,7 +226,7 @@ impl Directory for MemoryDirectory {
         Ok(Accepted {
             principal,
             binding: self.binding(&who, cb),
-            transited,
+            transited: Some(transited),
         })
     }
 
