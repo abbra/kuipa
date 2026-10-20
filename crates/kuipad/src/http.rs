@@ -68,6 +68,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/rekey/{kid}", post(rekey::<D>))
         .route("/ipa/ku/stage/{kid}", post(stage::<D>))
         .route("/ipa/ku/register/{kid}", post(register::<D>))
+        .route("/ipa/ku/vault/{kid}", post(vault::<D>))
         .route("/ipa/ku/rec/{kid}", post(recover::<D>))
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
@@ -305,6 +306,15 @@ async fn register<D: Directory + Send + Sync + 'static>(
     body: Bytes,
 ) -> Response {
     exchange(app, Operation::Register, kid, &headers, body).await
+}
+
+async fn vault<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(kid): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    exchange(app, Operation::Vault, kid, &headers, body).await
 }
 
 async fn recover<D: Directory + Send + Sync + 'static>(

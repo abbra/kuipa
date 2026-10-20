@@ -10,7 +10,7 @@ use std::sync::{PoisonError, RwLock};
 use std::time::SystemTime;
 
 use tang_pqc::wire::Writer;
-use tang_pqc::{RecoveryResponse, SignedAdvertisement, Thumbprint, unix_seconds};
+use tang_pqc::{SignedAdvertisement, Thumbprint, unix_seconds};
 
 use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::Delegation;
@@ -24,6 +24,7 @@ use crate::keytab::{Enctype, Keytab, Principal};
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::trust::{self, TrustRequest, TrustResponse};
+use crate::vault::{self, Descriptor, Limits, Recovered, State, Vault, VaultAnswer, VaultOp};
 use crate::voucher::Voucher;
 
 /// Errors from a [`Directory`], kept for the log.
@@ -36,6 +37,18 @@ pub struct Staged {
     pub not_after: u64,
     /// Mode A: thumbprint of the recipient key.
     pub recipient: Option<tang_pqc::Thumbprint>,
+}
+
+/// A GSS-API token accepted for a principal (§7.6).
+#[derive(Debug)]
+pub struct Accepted {
+    /// The client principal.
+    pub principal: String,
+    /// The binding both ends derive from the context.
+    pub binding: KerberosBinding,
+    /// The services a delegated ticket passed through (the PAC's S4U
+    /// delegation info), empty for a ticket the principal obtained itself.
+    pub transited: Vec<String>,
 }
 
 /// The directory operations behind the protocol, implemented by the daemon
@@ -161,6 +174,76 @@ pub trait Directory {
     ///
     /// Any failure.
     fn servers(&self) -> Result<Vec<String>, DirectoryError>;
+
+    /// Accept a user's (or any principal's) GSS-API token bound to `cb`,
+    /// for vault operations and the ticket factor (§7.6).
+    ///
+    /// # Errors
+    ///
+    /// Any refusal; by default vaults are not supported.
+    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+        let _ = (token, cb);
+        Err("vaults are not supported by this directory".into())
+    }
+
+    /// The realm's vault limits.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn vault_limits(&self) -> Result<Limits, DirectoryError> {
+        Ok(Limits::default())
+    }
+
+    /// Store a new vault; refuse a name its owner already uses.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default vaults are not supported.
+    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        let _ = vault;
+        Err("vaults are not supported by this directory".into())
+    }
+
+    /// The vault `id`, if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn vault_get(&self, id: &escrow::VaultId) -> Result<Option<Vault>, DirectoryError> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Replace a stored vault (policy, devices, state).
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default vaults are not supported.
+    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        let _ = vault;
+        Err("vaults are not supported by this directory".into())
+    }
+
+    /// The vaults `owner` owns.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+        let _ = owner;
+        Ok(Vec::new())
+    }
+
+    /// Is `principal`'s entry locked (`nsAccountLock`), or gone?
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        let _ = principal;
+        Ok(true)
+    }
 
     /// Accept a GSS-API token with channel binding `cb` from another
     /// server's anchor exchange (§4.2), returning the initiator principal.
@@ -315,6 +398,27 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         (**self).accept_peer(token, cb)
+    }
+    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+        (**self).accept_user(token, cb)
+    }
+    fn vault_limits(&self) -> Result<Limits, DirectoryError> {
+        (**self).vault_limits()
+    }
+    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        (**self).vault_add(vault)
+    }
+    fn vault_get(&self, id: &escrow::VaultId) -> Result<Option<Vault>, DirectoryError> {
+        (**self).vault_get(id)
+    }
+    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        (**self).vault_update(vault)
+    }
+    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+        (**self).vaults_of(owner)
+    }
+    fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        (**self).principal_locked(principal)
     }
     fn join_with_voucher(
         &self,
@@ -664,38 +768,15 @@ impl EnrollServer {
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
             (Operation::Stage, AuthType::Kerberos) => {
-                let params = StageParams::from_bytes(&body.extra)?;
-                let staged = Staged {
-                    not_after: params.not_after,
-                    recipient: params.recipient.as_ref().map(|k| *k.kid()),
-                };
-                let (keytab, binding) = directory
-                    .stage_with_gss(fqdn, token, &cb, enctypes, &staged)
-                    .map_err(Refusal)?;
+                let (payload, binding) = self.stage(request, &body, &cb, directory)?;
                 kerberos = Some(binding);
-                let enrollment = self.enrollment(keytab, directory)?;
-                let recipient = match (params.mode, &params.recipient) {
-                    (crate::bundle::Mode::MachineKey, Some(k)) => Recipient::MachineKey(k),
-                    (crate::bundle::Mode::Secret, _) => Recipient::Secret,
-                    _ => Recipient::SignedOnly,
-                };
-                let now = unix_seconds(SystemTime::now());
-                let (bundle, secret) = Bundle::create(
-                    &self.keys,
-                    &self.delegation().select(&[]),
-                    request.alg(),
-                    recipient,
-                    &enrollment,
-                    now,
-                    params.not_after,
-                )?;
-                let mut w = Writer::new(STAGE_MAGIC);
-                w.bytes(&bundle.to_bytes())
-                    .bytes(secret.as_ref().map_or(&[][..], |s| s.as_bytes()));
-                native_ossl::util::SecretBuf::new(w.finish())
+                payload
             }
             (Operation::Register, AuthType::Kerberos) => {
                 return self.register(request, ss.as_ref(), &t, &body, directory);
+            }
+            (Operation::Vault, AuthType::Kerberos) => {
+                return self.vault_op(request, ss.as_ref(), &t, &body, directory);
             }
             (op, auth) => {
                 return Err(Refusal::because(format!(
@@ -709,6 +790,51 @@ impl EnrollServer {
                 .map_err(Refusal)?;
         }
         Ok(request.respond(ss.as_ref(), &t, kerberos.as_ref(), payload.as_ref())?)
+    }
+
+    /// Stage a host (§8.3): keys from the directory, packed into a bundle
+    /// for the recipient the parameters name.
+    fn stage(
+        &self,
+        request: &Request,
+        body: &RequestBody,
+        cb: &[u8; 32],
+        directory: &dyn Directory,
+    ) -> Result<(native_ossl::util::SecretBuf, KerberosBinding), Refusal> {
+        let params = StageParams::from_bytes(&body.extra)?;
+        let staged = Staged {
+            not_after: params.not_after,
+            recipient: params.recipient.as_ref().map(|k| *k.kid()),
+        };
+        let (keytab, binding) = directory
+            .stage_with_gss(
+                request.fqdn(),
+                body.authenticator.as_ref(),
+                cb,
+                request.enctypes(),
+                &staged,
+            )
+            .map_err(Refusal)?;
+        let enrollment = self.enrollment(keytab, directory)?;
+        let recipient = match (params.mode, &params.recipient) {
+            (crate::bundle::Mode::MachineKey, Some(k)) => Recipient::MachineKey(k),
+            (crate::bundle::Mode::Secret, _) => Recipient::Secret,
+            _ => Recipient::SignedOnly,
+        };
+        let now = unix_seconds(SystemTime::now());
+        let (bundle, secret) = Bundle::create(
+            &self.keys,
+            &self.delegation().select(&[]),
+            request.alg(),
+            recipient,
+            &enrollment,
+            now,
+            params.not_after,
+        )?;
+        let mut w = Writer::new(STAGE_MAGIC);
+        w.bytes(&bundle.to_bytes())
+            .bytes(secret.as_ref().map_or(&[][..], |s| s.as_bytes()));
+        Ok((native_ossl::util::SecretBuf::new(w.finish()), binding))
     }
 
     /// Answer a registration (§7.5): change the bindings of its principal
@@ -731,6 +857,128 @@ impl EnrollServer {
             .register_with_gss(&params, &body.registrations, token, &cb)
             .map_err(Refusal)?;
         Ok(request.respond(ss, t, Some(&binding), &params.acknowledgement())?)
+    }
+
+    /// Answer an owner's vault operation (§7.6): authenticate the owner
+    /// by their ticket, apply the realm limits, store, and answer with
+    /// signed descriptors.
+    fn vault_op(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let accepted = directory
+            .accept_user(body.authenticator.as_ref(), &cb)
+            .map_err(Refusal)?;
+        let owner: Principal = accepted.principal.parse()?;
+        if owner.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        let op = VaultOp::from_bytes(&body.extra)?;
+        let now = unix_seconds(SystemTime::now());
+        let vaults = Self::apply_vault_op(&owner, op, now, directory)?;
+        let delegation = self.delegation();
+        let descriptors = vaults
+            .iter()
+            .map(|v| Descriptor::sign(&self.keys.signing, &delegation, &self.info.realm, v, now))
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(request.respond(
+            ss,
+            t,
+            Some(&accepted.binding),
+            &vault::reply_to_bytes(&descriptors),
+        )?)
+    }
+
+    fn apply_vault_op(
+        owner: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Vec<Vault>, Refusal> {
+        let limits = directory.vault_limits().map_err(Refusal)?;
+        let mine = directory.vaults_of(owner).map_err(Refusal)?;
+        let named = |name: &str| {
+            mine.iter()
+                .find(|v| v.name == name)
+                .cloned()
+                .ok_or_else(|| Refusal::because(format!("{owner} has no vault {name:?}")))
+        };
+        let vault = match op {
+            VaultOp::List => return Ok(mine),
+            VaultOp::Show { name } => return Ok(vec![named(&name)?]),
+            VaultOp::Create { name, mut policy } => {
+                if mine.iter().any(|v| v.name == name) {
+                    return Err(Refusal::because(format!("vault {name:?} exists")));
+                }
+                if mine.len() >= limits.max_vaults {
+                    return Err(Refusal::because("too many vaults"));
+                }
+                limits.apply(&mut policy, now)?;
+                let mut id = [0u8; 16];
+                native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
+                let vault = Vault {
+                    id: escrow::VaultId::from_bytes(id),
+                    owner: owner.to_string(),
+                    name,
+                    policy,
+                    devices: Vec::new(),
+                    state: State::Enabled,
+                };
+                directory.vault_add(&vault).map_err(Refusal)?;
+                return Ok(vec![vault]);
+            }
+            VaultOp::SetPolicy { name, mut policy } => {
+                let mut vault = named(&name)?;
+                limits.apply(&mut policy, now)?;
+                vault.policy = policy;
+                vault
+            }
+            VaultOp::AddDevice {
+                name,
+                label,
+                kind,
+                alg,
+                key,
+            } => {
+                let mut vault = named(&name)?;
+                if vault.devices.len() >= limits.max_devices {
+                    return Err(Refusal::because("too many devices"));
+                }
+                let public = tang_pqc::ExchangeKey::from_bytes(
+                    tang_pqc::KemAlg::from_id(alg).map_err(Error::from)?,
+                    &tang_pqc::b64::decode(&key).map_err(Error::from)?,
+                )
+                .map_err(Error::from)?;
+                // No attestation is verified yet: every device is `any`.
+                let device = vault::Device::new(&public, &label, kind, now);
+                if vault.devices.iter().any(|d| d.id == device.id) {
+                    return Err(Refusal::because("device already registered"));
+                }
+                vault.devices.push(device);
+                vault
+            }
+            VaultOp::RemoveDevice { name, id } => {
+                let mut vault = named(&name)?;
+                let before = vault.devices.len();
+                vault.devices.retain(|d| d.id != id);
+                if vault.devices.len() == before {
+                    return Err(Refusal::because("no such device"));
+                }
+                vault
+            }
+            VaultOp::Revoke { name } => {
+                let mut vault = named(&name)?;
+                vault.state = State::Revoked;
+                vault
+            }
+        };
+        directory.vault_update(&vault).map_err(Refusal)?;
+        Ok(vec![vault])
     }
 
     fn enrollment(&self, keytab: Keytab, directory: &dyn Directory) -> Result<Enrollment, Refusal> {
@@ -825,7 +1073,7 @@ impl EnrollServer {
         &self,
         request: &EscrowRequest,
         directory: &dyn Directory,
-    ) -> Result<RecoveryResponse, Refusal> {
+    ) -> Result<Recovered, Refusal> {
         let recovery = request.recovery();
         let key = self
             .keys
@@ -844,10 +1092,7 @@ impl EnrollServer {
             )
             .map_err(|_| Refusal::because("the binding is not committed to this vault"))?;
         let Some(kind) = request.vault().machine_kind(request.principal())? else {
-            return Err(Refusal::because(format!(
-                "unknown vault {}",
-                request.vault()
-            )));
+            return Self::recover_vault(request, opened, directory);
         };
         let binding = opened.ciphertext_hash().map_err(Error::from)?;
         if !directory
@@ -858,7 +1103,75 @@ impl EnrollServer {
                 "binding not registered or its principal disabled",
             ));
         }
-        Ok(opened.respond().map_err(Error::from)?)
+        Ok(Recovered::Plain(opened.respond().map_err(Error::from)?))
+    }
+
+    /// The vault half of [`recover`](Self::recover): check the vault and
+    /// its owner, then the policy's factors, and answer to the device.
+    fn recover_vault(
+        request: &EscrowRequest,
+        opened: tang_pqc::OpenedRequest<'_>,
+        directory: &dyn Directory,
+    ) -> Result<Recovered, Refusal> {
+        let vault = directory
+            .vault_get(request.vault())
+            .map_err(Refusal)?
+            .ok_or_else(|| Refusal::because(format!("unknown vault {}", request.vault())))?;
+        let owner = request.principal();
+        if vault.owner != owner.to_string() {
+            return Err(Refusal::because("the vault has another owner"));
+        }
+        if vault.state != State::Enabled {
+            return Err(Refusal::because("the vault is revoked"));
+        }
+        if directory.principal_locked(owner).map_err(Refusal)? {
+            return Err(Refusal::because("the owner is locked or gone"));
+        }
+        let now = unix_seconds(SystemTime::now());
+        if vault.policy.not_after.is_some_and(|t| now > t) {
+            return Err(Refusal::because("the vault has expired"));
+        }
+        let factors = &vault.policy.factors;
+        if factors.passkey {
+            return Err(Refusal::because("the passkey factor is not supported yet"));
+        }
+        if factors.ticket {
+            if request.ticket().is_empty() {
+                return Err(Refusal::because("the vault needs the owner's ticket"));
+            }
+            let cb = request.ticket_binding()?;
+            let accepted = directory
+                .accept_user(request.ticket(), &cb)
+                .map_err(Refusal)?;
+            if accepted.principal != vault.owner {
+                return Err(Refusal::because("the ticket is not the owner's"));
+            }
+            if !vault.policy.ticket_delegation.accepts(&accepted.transited) {
+                return Err(Refusal::because(format!(
+                    "a ticket delegated through {:?} is not accepted",
+                    accepted.transited
+                )));
+            }
+        }
+        let device = match request.device() {
+            Some(id) => Some(
+                vault
+                    .device(id)
+                    .ok_or_else(|| Refusal::because("the device is not registered"))?,
+            ),
+            None => None,
+        };
+        if let Some(level) = factors.device {
+            let device = device.ok_or_else(|| Refusal::because("the vault needs a device"))?;
+            if device.level < level {
+                return Err(Refusal::because("the device's level is too low"));
+            }
+        }
+        let response = opened.respond().map_err(Error::from)?;
+        Ok(match device {
+            Some(d) => Recovered::Device(VaultAnswer::seal(&d.public()?, request, &response)?),
+            None => Recovered::Plain(response),
+        })
     }
 }
 

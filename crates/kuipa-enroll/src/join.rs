@@ -47,6 +47,9 @@ pub enum Operation {
     /// `POST /ipa/ku/register/{kid}`: escrow bindings outside a rekey
     /// (§7.5).
     Register,
+    /// `POST /ipa/ku/vault/{kid}`: an owner's operation on their vaults
+    /// (§7.6).
+    Vault,
 }
 
 impl Operation {
@@ -56,6 +59,7 @@ impl Operation {
             Self::Rekey => "rekey",
             Self::Stage => "stage",
             Self::Register => "register",
+            Self::Vault => "vault",
         }
     }
 
@@ -67,7 +71,7 @@ impl Operation {
 
     const fn magic(self) -> [u8; 4] {
         match self {
-            Self::Join | Self::Rekey | Self::Register => *b"IPJQ",
+            Self::Join | Self::Rekey | Self::Register | Self::Vault => *b"IPJQ",
             Self::Stage => *b"IPSQ",
         }
     }

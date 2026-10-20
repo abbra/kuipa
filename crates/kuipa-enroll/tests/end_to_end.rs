@@ -14,7 +14,11 @@ use kuipa_enroll::join::{
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
-use kuipa_enroll::server::{Directory, DirectoryError, Staged, parse_stage_result};
+use kuipa_enroll::server::{Accepted, Directory, DirectoryError, Staged, parse_stage_result};
+use kuipa_enroll::vault::{
+    self, Descriptor, DeviceType, Factors, Level, Recovered, SealedVaultFile, TicketDelegation,
+    Unlock, Vault, VaultOp,
+};
 use kuipa_enroll::{EnrollServer, Error};
 use native_ossl::util::SecretBuf;
 use tang_pqc::{
@@ -45,6 +49,7 @@ struct MemoryDirectory {
     escrow_files: RefCell<HashMap<String, Vec<[u8; 32]>>>,
     disabled: RefCell<HashSet<String>>,
     staged: RefCell<HashMap<String, Staged>>,
+    vaults: RefCell<HashMap<VaultId, Vault>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -208,6 +213,50 @@ impl Directory for MemoryDirectory {
             }
         }
         Ok(self.binding(&who, cb))
+    }
+
+    /// A token's name may end in ` via svc1,svc2`: the services a
+    /// delegated ticket passed through.
+    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+        let who = Self::accept(token, cb)?;
+        let (principal, transited) = match who.split_once(" via ") {
+            Some((p, via)) => (p.to_owned(), via.split(',').map(str::to_owned).collect()),
+            None => (who.clone(), Vec::new()),
+        };
+        Ok(Accepted {
+            principal,
+            binding: self.binding(&who, cb),
+            transited,
+        })
+    }
+
+    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        self.vaults.borrow_mut().insert(vault.id, vault.clone());
+        Ok(())
+    }
+
+    fn vault_get(&self, id: &VaultId) -> Result<Option<Vault>, DirectoryError> {
+        Ok(self.vaults.borrow().get(id).cloned())
+    }
+
+    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
+        self.vaults.borrow_mut().insert(vault.id, vault.clone());
+        Ok(())
+    }
+
+    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+        let owner = owner.to_string();
+        Ok(self
+            .vaults
+            .borrow()
+            .values()
+            .filter(|v| v.owner == owner)
+            .cloned()
+            .collect())
+    }
+
+    fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        Ok(self.disabled.borrow().contains(&principal.to_string()))
     }
 
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
@@ -766,7 +815,10 @@ fn sealed_keytab_with_registration_and_revocation() {
 
     let recover = |i: usize, req: &EscrowRequest| {
         let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
-        r.servers[i].recover(&req, &r.dir).ok()
+        r.servers[i]
+            .recover(&req, &r.dir)
+            .ok()
+            .and_then(Recovered::into_plain)
     };
     let by_name = |name: &str| usize::from(name == "ipa2.example.test");
 
@@ -840,6 +892,7 @@ fn sealed_file_registered_by_its_principal() {
         r.servers[usize::from(s == "ipa2.example.test")]
             .recover(&req, &r.dir)
             .ok()
+            .and_then(Recovered::into_plain)
     };
     let seal = |contents: &[u8], retire: Vec<[u8; 32]>| {
         let (sealer, registrations) =
@@ -894,6 +947,8 @@ fn renamed(req: &EscrowRequest, principal: &Principal, vault: &VaultId) -> Escro
         .fixed(vault.as_bytes())
         .fixed(req.commitment())
         .bytes(&req.recovery().to_bytes())
+        .bytes(req.device().map_or(&[][..], |d| d.as_bytes()))
+        .bytes(req.ticket())
         .finish();
     EscrowRequest::from_bytes(&bytes).unwrap()
 }
@@ -927,7 +982,9 @@ fn bindings_open_only_under_what_they_commit_to() {
     }
     let answer = |req: &EscrowRequest| {
         let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
-        r.servers[0].recover(&req, &r.dir)
+        r.servers[0]
+            .recover(&req, &r.dir)
+            .map(|a| a.into_plain().unwrap())
     };
 
     let mut seen = Vec::new();
@@ -949,6 +1006,268 @@ fn bindings_open_only_under_what_they_commit_to() {
     // A vault that does not exist.
     let none = renamed(req, &host, &VaultId::from_bytes([9; 16]));
     assert!(answer(&none).is_err());
+}
+
+const ALICE: &str = "alice@EXAMPLE.TEST";
+const BOB: &str = "bob@EXAMPLE.TEST";
+
+/// Run a vault operation as `caller` against server 0.
+fn vault_op(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    caller: &str,
+    op: &VaultOp,
+) -> Result<Vec<Descriptor>, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Vault,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
+        .unwrap();
+    let response = r.send(0, Operation::Vault, &request)?;
+    let payload = pending.open(&response).map_err(|_| ())?;
+    vault::reply_from_bytes(payload.as_ref()).map_err(|_| ())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn user_vault_seals_and_opens_under_its_policy() {
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let adv = &advs[0];
+    let anchors = r.all_anchors();
+    let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let other_device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let add = |name: &str, key: &ExchangeKeyPair| VaultOp::AddDevice {
+        name: name.into(),
+        label: "laptop".into(),
+        kind: DeviceType::File,
+        alg: key.public().alg().id(),
+        key: tang_pqc::b64::encode(key.public().as_bytes()),
+    };
+    let policy = vault::Policy {
+        factors: Factors {
+            device: Some(Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+
+    // Policies the server refuses: no factor, unsupported features.
+    for bad in [
+        vault::Policy::default(),
+        vault::Policy {
+            max_unlocks: Some(3),
+            ..policy.clone()
+        },
+    ] {
+        let op = VaultOp::Create {
+            name: "bad".into(),
+            policy: bad,
+        };
+        assert!(vault_op(&r, adv, ALICE, &op).is_err());
+    }
+
+    let created = vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Create {
+            name: "personal".into(),
+            policy: policy.clone(),
+        },
+    )
+    .unwrap();
+    let v = created[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert!(
+        v.vault().policy.not_after.is_some(),
+        "filled in from the limits"
+    );
+    // Sealing needs a registered device when the policy asks for one.
+    assert!(SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"x").is_err());
+
+    let described = vault_op(&r, adv, ALICE, &add("personal", &device)).unwrap();
+    let desc = Descriptor::from_bytes(&described[0].to_bytes()).unwrap();
+    let v = desc.verify(REALM, &anchors, &Policy::default()).unwrap();
+    assert_eq!(v.vault().devices.len(), 1);
+    // A descriptor checked against unrelated anchors does not verify.
+    let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    assert!(
+        desc.verify(
+            REALM,
+            &[*stranger.public().thumbprint()],
+            &Policy::default()
+        )
+        .is_err()
+    );
+
+    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"token=secret\n").unwrap();
+    let sealed = SealedVaultFile::from_bytes(&sealed.to_bytes()).unwrap();
+    let id = *sealed.vault();
+
+    let ask = |s: &str, req: &EscrowRequest| {
+        let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+        r.servers[usize::from(s == "ipa2.example.test")]
+            .recover(&req, &r.dir)
+            .ok()
+            .map(|a| a.to_bytes())
+    };
+    let open_as = |who: &'static str, key: Option<&ExchangeKeyPair>| {
+        let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(who, cb));
+        sealed.open(
+            Unlock {
+                device: key.map(|k| k as &dyn vault::DeviceKey),
+                ticket: Some(&mut ticket),
+            },
+            ask,
+        )
+    };
+
+    assert_eq!(
+        open_as(ALICE, Some(&device)).unwrap().as_ref(),
+        b"token=secret\n"
+    );
+    // Without the device, or with one the file was not sealed to.
+    assert!(open_as(ALICE, None).is_err());
+    assert!(open_as(ALICE, Some(&other_device)).is_err());
+    // Bob's ticket is not the owner's.
+    assert!(matches!(open_as(BOB, Some(&device)), Err(Error::Refused)));
+    // Without any ticket.
+    let no_ticket = sealed.open(
+        Unlock {
+            device: Some(&device),
+            ticket: None,
+        },
+        ask,
+    );
+    assert!(matches!(no_ticket, Err(Error::Refused)));
+
+    // Delegated tickets: allowed by default, refused or limited by policy.
+    let via = "alice@EXAMPLE.TEST via host/vm1.example.test@EXAMPLE.TEST";
+    assert!(open_as(via, Some(&device)).is_ok());
+    let set = |p: vault::Policy| {
+        vault_op(
+            &r,
+            adv,
+            ALICE,
+            &VaultOp::SetPolicy {
+                name: "personal".into(),
+                policy: p,
+            },
+        )
+        .unwrap()
+    };
+    set(vault::Policy {
+        ticket_delegation: TicketDelegation::Refuse,
+        ..policy.clone()
+    });
+    assert!(open_as(via, Some(&device)).is_err());
+    assert!(open_as(ALICE, Some(&device)).is_ok());
+    set(vault::Policy {
+        ticket_delegation: TicketDelegation::Via(vec!["host/vm1.example.test@EXAMPLE.TEST".into()]),
+        ..policy.clone()
+    });
+    assert!(open_as(via, Some(&device)).is_ok());
+    let elsewhere = "alice@EXAMPLE.TEST via host/vm2.example.test@EXAMPLE.TEST";
+    assert!(open_as(elsewhere, Some(&device)).is_err());
+    // A level the device does not have.
+    set(vault::Policy {
+        factors: Factors {
+            device: Some(Level::HardwareBound),
+            ..policy.factors.clone()
+        },
+        ..policy.clone()
+    });
+    assert!(open_as(ALICE, Some(&device)).is_err());
+    set(policy.clone());
+
+    // Bob's vault cannot release Alice's binding, even under his policy.
+    let bobs = vault_op(
+        &r,
+        adv,
+        BOB,
+        &VaultOp::Create {
+            name: "personal".into(),
+            policy: policy.clone(),
+        },
+    )
+    .unwrap();
+    let bob_vault = bobs[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap()
+        .vault()
+        .id;
+    let mut seen = Vec::new();
+    sealed
+        .open(
+            Unlock {
+                device: Some(&device),
+                ticket: Some(&mut |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb))),
+            },
+            |s, req| {
+                seen.push(req.clone());
+                ask(s, req)
+            },
+        )
+        .unwrap();
+    let theirs = renamed(&seen[0], &BOB.parse().unwrap(), &bob_vault);
+    assert!(r.servers[0].recover(&theirs, &r.dir).is_err());
+    // "personal" names Bob's own vault when Bob asks: Alice's is not his.
+    let shown = vault_op(
+        &r,
+        adv,
+        BOB,
+        &VaultOp::Show {
+            name: "personal".into(),
+        },
+    )
+    .unwrap();
+    let shown = shown[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_ne!(shown.vault().id, id);
+
+    // Removing the device, locking the owner and revoking the vault each
+    // stop unlocks.
+    let device_id = device.public().kid().to_string();
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::RemoveDevice {
+            name: "personal".into(),
+            id: device_id,
+        },
+    )
+    .unwrap();
+    assert!(open_as(ALICE, Some(&device)).is_err());
+    vault_op(&r, adv, ALICE, &add("personal", &device)).unwrap();
+    assert!(open_as(ALICE, Some(&device)).is_ok());
+    r.dir.disabled.borrow_mut().insert(ALICE.into());
+    assert!(open_as(ALICE, Some(&device)).is_err());
+    r.dir.disabled.borrow_mut().clear();
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Revoke {
+            name: "personal".into(),
+        },
+    )
+    .unwrap();
+    assert!(open_as(ALICE, Some(&device)).is_err());
+    let listed = vault_op(&r, adv, ALICE, &VaultOp::List).unwrap();
+    assert_eq!(listed.len(), 1);
 }
 
 #[test]

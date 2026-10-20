@@ -36,6 +36,8 @@ pub enum Error {
     /// The advertisement verifies but describes another deployment than
     /// the client was told to join (§4.6): the message names both.
     Deployment(String),
+    /// A vault policy or operation is refused (§7.6).
+    Policy(String),
 }
 
 impl fmt::Display for Error {
@@ -53,7 +55,7 @@ impl fmt::Display for Error {
             Self::Missing(what) => write!(f, "missing {what}"),
             Self::Insecure(what) => write!(f, "{what} requires an explicit opt-in"),
             Self::PeerSync(what) => write!(f, "peer sync refused: {what}"),
-            Self::Deployment(why) => f.write_str(why),
+            Self::Deployment(why) | Self::Policy(why) => f.write_str(why),
         }
     }
 }

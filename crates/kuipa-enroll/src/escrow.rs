@@ -138,6 +138,35 @@ impl std::fmt::Display for VaultId {
     }
 }
 
+impl std::str::FromStr for VaultId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::Malformed("vault id"));
+        }
+        let mut id = [0u8; 16];
+        for (i, byte) in id.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
+                .map_err(|_| Error::Malformed("vault id"))?;
+        }
+        Ok(Self(id))
+    }
+}
+
+impl serde::Serialize for VaultId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VaultId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl std::fmt::Debug for VaultId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "VaultId({self})")
@@ -413,12 +442,13 @@ impl Sealed {
         let vault = VaultId::machine(&self.principal, self.kind)?;
         for slot in &self.slots {
             let (request, pending) = slot.binding.recovery_request(&slot.escrow_key)?;
-            let request = EscrowRequest {
-                principal: self.principal.clone(),
+            let request = EscrowRequest::for_vault(
+                self.principal.clone(),
                 vault,
-                commitment: slot.commitment,
+                slot.commitment,
                 request,
-            };
+                None,
+            );
             let Some(response) = recover(&slot.server, &request) else {
                 continue;
             };
@@ -572,16 +602,75 @@ impl RegisterParams {
 
 /// `POST /ipa/ku/rec/{kid}`: the unified recovery request (§7.6.5): a
 /// `tang-pqc` recovery request naming the principal and the vault, with the
-/// binding's commitment to both.
+/// binding's commitment to both; for a user vault also the device to answer
+/// to and the owner's GSS-API token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscrowRequest {
     principal: Principal,
     vault: VaultId,
     commitment: [u8; 32],
     request: RecoveryRequest,
+    device: Option<tang_pqc::Thumbprint>,
+    ticket: Vec<u8>,
 }
 
 impl EscrowRequest {
+    /// A request for a user vault, answered to `device` if given.
+    #[must_use]
+    pub fn for_vault(
+        principal: Principal,
+        vault: VaultId,
+        commitment: [u8; 32],
+        request: RecoveryRequest,
+        device: Option<tang_pqc::Thumbprint>,
+    ) -> Self {
+        Self {
+            principal,
+            vault,
+            commitment,
+            request,
+            device,
+            ticket: Vec::new(),
+        }
+    }
+
+    /// The same request carrying the owner's GSS-API `token`, made with
+    /// [`ticket_binding`](Self::ticket_binding) as its channel binding.
+    #[must_use]
+    pub fn with_ticket(mut self, token: Vec<u8>) -> Self {
+        self.ticket = token;
+        self
+    }
+
+    /// The device the answer is encrypted to.
+    #[must_use]
+    pub fn device(&self) -> Option<&tang_pqc::Thumbprint> {
+        self.device.as_ref()
+    }
+
+    /// The owner's GSS-API token, empty without one.
+    #[must_use]
+    pub fn ticket(&self) -> &[u8] {
+        &self.ticket
+    }
+
+    /// The channel binding of the token: `SHA-256("ipa-ku-enroll/v1 vault
+    /// unlock" ‖ the request without its token)`.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn ticket_binding(&self) -> Result<[u8; 32]> {
+        let bare = Self {
+            ticket: Vec::new(),
+            ..self.clone()
+        };
+        Ok(primitives::sha256(&[
+            b"ipa-ku-enroll/v1 vault unlock",
+            &bare.to_bytes(),
+        ])?)
+    }
+
     /// The principal.
     #[must_use]
     pub fn principal(&self) -> &Principal {
@@ -615,6 +704,8 @@ impl EscrowRequest {
             .fixed(self.vault.as_bytes())
             .fixed(&self.commitment)
             .bytes(&self.request.to_bytes())
+            .bytes(self.device.as_ref().map_or(&[][..], |d| d.as_bytes()))
+            .bytes(&self.ticket)
             .finish()
     }
 
@@ -629,12 +720,21 @@ impl EscrowRequest {
         let vault = VaultId::from_bytes(r.fixed()?);
         let commitment = r.fixed()?;
         let request = RecoveryRequest::from_bytes(r.bytes()?)?;
+        let device = match r.bytes()? {
+            [] => None,
+            id => Some(tang_pqc::Thumbprint::from_bytes(
+                id.try_into().map_err(|_| Error::Malformed("device id"))?,
+            )),
+        };
+        let ticket = r.bytes()?.to_vec();
         r.finish()?;
         Ok(Self {
             principal,
             vault,
             commitment,
             request,
+            device,
+            ticket,
         })
     }
 }
