@@ -877,6 +877,9 @@ state, so escrow uses it:
   (`nsAccountLock` not true) whose registered bindings, in either set
   (§7.5), include the opened `H(ct)`. The principal
   is also bound into `K_i`, so naming another principal yields a wrong key.
+* **Planned:** recovery moves to the unified request of §7.6.5, with a
+  commitment the server verifies; host and service escrow become machine
+  vaults (§7.6.8) with the behaviour described here.
 * **Revocation:** disabling or deleting the host, or clearing the attribute,
   stops unsealing at once. A fresh seal (every `rotate-keys`) retires the old
   bindings, so an old disk image stops working too.
@@ -1002,6 +1005,305 @@ kuipa protect --file F --keytab K                  sealed for K's principal
 | the same after the principal is disabled (`nsAccountLock`) | its contents (keys valid until rotated) | nothing |
 | an image from before the last reseal or `unprotect` | that version | nothing (binding retired) |
 | root on the running host | its contents | its contents |
+
+### 7.6 User vaults (designed)
+
+A user seals their own files, without root, so that a copy opens only under
+a policy the user chose within limits the realm sets. The realm's servers
+hold the rule for releasing a key share, never the data: this is
+client-side encryption with server-mediated key release, not a store of
+secrets like FreeIPA's KRA-backed `ipa vault-*`.
+
+#### 7.6.1 Goals and non-goals
+
+A sealed file must not open:
+
+* from a **copy at rest** (backup, disk image, copied home directory,
+  stolen laptop) without the factors its vault's policy names;
+* for **another user of the host** who can read the sealed file;
+* once the owner is **disabled or deleted**, or the vault or the device is
+  **revoked**, on any host, from then on.
+
+Out of scope: **root on the running host** while a file is open or a
+session is unlocked (root can read process memory and the kernel keyring),
+and anything already released: limits govern the *release* of a key share,
+never what a client does with it afterwards.
+
+#### 7.6.2 Vaults, policies and devices
+
+A **vault** is an entry in a central container,
+`cn=<vault id>,cn=vaults,cn=kuipa,cn=etc,<suffix>`, owned by one user
+(`ipaKUVaultOwner`). The vault id is 16 random bytes in hex, chosen by the
+server at creation. The entry holds:
+
+| attribute | content |
+|---|---|
+| `ipaKUVaultOwner` | the owner's principal |
+| `ipaKUVaultName` | the owner's label (unique per owner) |
+| `ipaKUVaultPolicy` | JSON, below |
+| `ipaKUVaultDevice` | one value per registered device key, below |
+| `ipaKUVaultSessionKey` | offline sessions only: the current epoch's session key, sealed to each server's escrow key (§7.6.6) |
+| `ipaKUVaultState` | `enabled` or `revoked` |
+
+The **policy**:
+
+| field | meaning | enforced |
+|---|---|---|
+| `factors.device` | `none`, or the least device-key level: `any`, `hardware-wrapped`, `hardware-bound` | by the server: the answer is encrypted to a registered device key of that level, and the file's device share needs it (§7.6.4) |
+| `factors.ticket` | an unlock needs the owner's Kerberos ticket | by the server |
+| `factors.passkey` | an unlock needs a WebAuthn assertion from one of the owner's IPA passkeys (`ipaPassKey`) | by the server |
+| `not_after` | no unlock after this time | by the server |
+| `max_unlocks` | releases over the vault's life | by the server, approximately across replicas (§7.6.7) |
+| `sessions.reauth` | the longest re-authentication session, or off | by the server (§7.6.6) |
+| `sessions.offline` | the longest offline session and the key epoch, or off | release by the server; the session's end only by the client (§7.6.6) |
+| `sealing` | `offline` (commitment only) or `registered` (each seal's binding is registered, so a reseal or `close` retires a copy) | by the server |
+
+A policy needs **at least one factor besides the server share** (any
+non-empty combination of `device`, `ticket`, `passkey`): a copy plus network
+access alone never opens a file. That is what makes a user vault stronger
+than host escrow (§7.5), whose files open without a human.
+
+**Realm limits** (`cn=vault-limits,cn=kuipa,cn=etc`, set by administrators,
+later per group): the furthest `not_after`, the largest `max_unlocks`,
+vaults per user, devices per vault, the longest sessions, whether offline
+sessions are allowed, and the factor shapes allowed (for example: `ticket`
+alone not allowed). Users create and change their own vaults (self-service)
+within these limits; the server refuses a policy outside them.
+
+A **device** is an ML-KEM key pair of the owner; its public half is
+registered in the vault:
+
+```
+ipaKUVaultDevice = { "id": thumbprint(dpk), "label", "dpk": <ML-KEM public key>,
+                     "level": "any" | "hardware-wrapped" | "hardware-bound",
+                     "type": "file" | "passkey" | "pkcs11" | "pkcs11-wrapped",
+                     "attestation": <summary>, "added": <time> }
+```
+
+| type | where the decapsulation key is | level |
+|---|---|---|
+| `file` | encrypted PKCS#8 (PBES2, PBKDF2-HMAC-SHA-512), under `~/.local/share/kuipa/keys/` | `any` |
+| `passkey` | a key file encrypted under the FIDO2 `hmac-secret` (WebAuthn PRF) output of a passkey; every use needs a touch or PIN | `hardware-wrapped` |
+| `pkcs11-wrapped` | a key file wrapped by an AES key on a PKCS#11 token (`CKM_AES_KEY_WRAP_KWP`); RSA or EC wrapping is refused (harvest-now-decrypt-later) | `hardware-wrapped` |
+| `pkcs11` | an ML-KEM key generated on a PKCS#11 3.2 token (`CKM_ML_KEM`), non-extractable, used by `pkcs11:` URI through OpenSSL's pkcs11-provider | `hardware-bound` |
+
+The levels say what an attestation can prove, and no more:
+
+* **`hardware-bound`**: the attestation (the token vendor's key attestation,
+  checked against roots an administrator configures) covers the ML-KEM key
+  itself and its non-extractability, so no other copy exists.
+* **`hardware-wrapped`**: the attestation covers the *wrapping* key only:
+  for a passkey, its WebAuthn attestation checked against the FIDO Metadata
+  Service, made over a challenge `H(dpk)`; for an AES-wrapped key, the
+  token's attestation of the AES key. Nothing proves the ML-KEM key was
+  never copied before it was wrapped.
+* **`any`**: nothing is attested. A passphrase cannot be proven, so the
+  server never learns whether a file key has one.
+
+A device registration needs the owner's ticket. It carries no proof of
+possession of `dpk`: registering a key one does not hold only gives away
+one's own files' device shares.
+
+#### 7.6.3 The vault descriptor
+
+Sealing is offline, so the client keeps a **descriptor** of each vault:
+id, owner, policy, devices, the realm's escrow keys, and the current
+session-key epoch. The server signs it with its advertisement signing key
+(ML-DSA, context `ipa-ku-enroll/v1 vault descriptor`); the client verifies
+it against the pinned anchors through the delegation, as an advertisement
+(§4.2). Without a signature, whoever could write the cache could add a
+device key, and every file sealed afterwards would carry a device share for
+it. A descriptor is refreshed at every online vault operation. Sealing is
+refused after the vault's `not_after`, and with a descriptor older than a
+realm limit (default 30 days), so a revoked device or vault stops receiving
+new files within that time even on a host that stays offline.
+
+#### 7.6.4 Sealed file format
+
+```
+A, B ←$ 32 bytes each                      server share, device share
+DEK = HKDF(A ‖ B, "ipa-ku-enroll/v1 vault dek" ‖ V ‖ P)    (with factors.device = none: B is empty)
+ctx = BindingContext("ipa-ku-enroll/v1 vault", P ‖ V)
+for each server i:   (B_i, ss_i) = tang-pqc provision to ek_i under ctx
+                     K_i = binding key (ss_i, r_i, ctx);  W_i = GCM_{K_i}(A)
+                     t_i = HMAC(HKDF(ss_i, "commit"), "vault" ‖ P ‖ V)
+for each device j:   (c_j, s_j) = ML-KEM.Encaps(dpk_j)
+                     L_j = HKDF(s_j, "ipa-ku-enroll/v1 vault device" ‖ V ‖ id_j);  U_j = GCM_{L_j}(B)
+IPSV = P ‖ V ‖ mode ‖ [(server_i, B_i, ek_i, t_i, W_i)] ‖ [(id_j, c_j, U_j)] ‖ GCM_DEK(file)
+```
+
+* **Two shares.** The server share `A` comes back only through a server,
+  under policy. The device share `B` needs a registered device's
+  decapsulation key. With `factors.device`, neither alone opens the file,
+  and in particular the realm's administrators, who can reach the escrow
+  keys, cannot read a user's files without the user's device.
+* **Any registered device.** The file has one slot per device registered
+  when it was sealed; a device added later opens only files sealed or
+  resealed after it (`kuipa vault reseal`).
+* **The commitment `t_i`** ties the binding to `(P, V)` in a way the server
+  can check (§7.6.5). Without it the server sees only the binding's
+  ciphertext, and a client could present someone else's binding under a
+  vault whose policy it satisfies, receive `ss_i`, and derive `K_i` from
+  the context stored in the file.
+* **`mode`** is `per-file` or `session-epoch e`. A session-mode file
+  replaces the per-server slots by one slot sealed to the vault's epoch-`e`
+  session key (§7.6.6).
+
+#### 7.6.5 Unlock and the unified recovery request
+
+One recovery request serves user vaults and the host and service escrow of
+§7.2 and §7.5, which become **machine vaults** with a fixed policy (§7.6.8):
+
+```
+IPEQ = P ‖ V ‖ t_i ‖ tang-pqc RecoveryRequest ‖ device id (or none)
+       ‖ [GSS-API token, cb = H(the fields above)]
+       ‖ [WebAuthn assertion, challenge = H(the fields above)]
+       ‖ [session token]
+```
+
+The server:
+
+1. opens the tang-pqc request with its escrow key, in the escrow domain;
+2. checks the **commitment**: recomputes
+   `HMAC(HKDF(ss, "commit"), "vault" ‖ P ‖ V)` and compares it with `t_i`
+   in constant time (`tang_pqc::OpenedRequest::verify_commitment`, a new
+   extension point that does not change the Tang wire format);
+3. looks up vault `V` and checks owner `P`, `ipaKUVaultState`, the owner's
+   `nsAccountLock`, `not_after`, the unlock count, `sealing = registered`
+   bindings, and the factors: the ticket (accepted with `cb`, caller must
+   be `P`), the assertion (verified against `ipaPassKey`, ML-DSA or the
+   classical algorithms the realm allows), or a valid session token;
+4. answers with `ss`, encrypted to the named device's `dpk` when
+   `factors.device` is set (a fresh ML-KEM encapsulation to `dpk`, then
+   GCM under a key derived from it and the request hash), else under the
+   tang-pqc transport key alone.
+
+Encrypting the answer to `dpk` makes the device factor the server's to
+enforce: only a registered device of the required level can read the
+answer, revoking a device takes effect at the next unlock, and the
+device's level, checked at registration, decides whether it qualifies.
+The device share `B` is the part that keeps the server's operators out.
+
+#### 7.6.6 Sessions
+
+The policy enables either kind, both or neither.
+
+* **Re-authentication session.** After an unlock that satisfied the
+  ticket or passkey factor, the server returns a **session token**:
+  `(V, device id, not_after ≤ now + sessions.reauth)`, signed with its
+  advertisement signing key, so any server verifies it. Later requests carry
+  the token instead of a ticket or assertion. Every open still reaches a
+  server, so the session's end, the counts, revocation and the audit stay
+  the server's. The token is bound to the device and is useless without it
+  when `factors.device` is set.
+* **Offline session.** The vault has a **session key** per epoch: an
+  ML-KEM pair `(vk_e, dk_e)` made by the server; `dk_e` is stored in
+  `ipaKUVaultSessionKey`, sealed to each server's escrow key, and resealed
+  when servers are added (the anchor exchange's server list, §4.2).
+  Session-mode files seal `A` to `vk_e` in place of the per-server slots.
+  An unlock with `offline` releases `dk_e`, encrypted to the device; the
+  client keeps it in the kernel keyring with a timeout of at most
+  `sessions.offline` and opens epoch-`e` files offline until then.
+  **Once released, `dk_e` can be kept**: the timeout is the client's
+  courtesy, not a guarantee, and the server no longer sees individual
+  opens. A new epoch starts every policy period; files sealed in an earlier
+  epoch need a release of that epoch's key, so an old leak does not open
+  new files. Realms can forbid offline sessions.
+
+#### 7.6.7 Counting unlocks
+
+`max_unlocks` is a grow-only counter per vault and server, replicated by
+the anchor exchange's agirru gossip (§4.2) that already runs between all
+servers. A server refuses once the merged sum reaches the limit. The
+overshoot is bounded by the releases made during one gossip interval on
+the other servers. Expiry, revocation, the factors and the device checks
+are exact; the count is the only approximate limit.
+
+#### 7.6.8 Machine vaults: host and service escrow on the same path
+
+Host and service keytabs and files sealed for machines (§7.1, §7.5) keep
+their behaviour, but their bindings carry the commitment and their recovery
+uses the request of §7.6.5:
+
+* `V` is derived, `H("machine" ‖ P ‖ kind)`, and has no entry; its policy
+  is fixed: server share only, `sealing = registered` (each seal's binding
+  registered, as `ipaKUEscrowBinding` and `ipaKUEscrowFileBinding` are
+  today, so an old image stops opening), no sessions, no count.
+* Every binding carries the commitment, so the server's check no longer
+  rests on the registration alone.
+* A TPM-protected machine key, when the TPM factor (§7.1) is built, is a
+  machine vault with `factors.device = hardware-bound`.
+
+#### 7.6.9 Client
+
+Users run `kuipa vault` with their own ticket (`KRB5CCNAME`); nothing
+needs root. The realm comes from the world-readable `/etc/ipa/ku-anchors`,
+`/etc/ipa/ca.crt` and the generated `krb5.conf`; per-user state (vault
+descriptors, device key files or URIs) lives in `~/.local/share/kuipa/`
+(0700).
+
+```
+kuipa vault create NAME [--expires D] [--max-unlocks N]
+                        [--require device=LEVEL,ticket,passkey]
+                        [--sessions reauth=T,offline=T/EPOCH] [--sealing registered]
+kuipa vault device add NAME (--passphrase | --passkey | --pkcs11 URI | --pkcs11-wrap URI)
+kuipa vault device remove NAME ID
+kuipa vault seal NAME FILE [--out F.sealed] [--session]       offline
+kuipa vault open F.sealed [--out F | --out -]
+kuipa vault unlock NAME [--offline] | lock NAME                 sessions
+kuipa vault reseal NAME F.sealed…                              new devices, new epoch
+kuipa vault list | show NAME | revoke NAME
+```
+
+`open --out -` follows `kuipa-unseal`'s rules (§10.5): standard output
+only when it is not a terminal, unless `--force`.
+
+#### 7.6.10 What each attacker gets
+
+| attacker has | file sealed with `device` | `ticket` or `passkey` only |
+|---|---|---|
+| a copy of the sealed file, network access | nothing | nothing |
+| the copy and the owner's device key file, network access | nothing without the device's passphrase, touch or token | — |
+| the copy and the owner's password | nothing (no device) | the file, from anywhere, unless `passkey` is required too |
+| the realm's escrow keys (an IPA administrator) | nothing (no device share) | the file |
+| a released offline-session key | that epoch's session-mode files, for as long as it keeps the key | — |
+| any of the above after the vault, device or owner is revoked or disabled | nothing new (released keys stay released) | nothing new |
+| root on the running host during a session | the open files and the session key | the same |
+
+#### 7.6.11 Work this needs
+
+* `tang-pqc`: `OpenedRequest::verify_commitment` and a client-side
+  `Binding::commitment` (extension points, §8 of its DESIGN).
+* `kuipa-enroll`: the `IPSV` format, the unified `IPEQ`, encrypted
+  answers, session tokens, signed descriptors; machine vaults replacing the
+  escrow check of §7.2.
+* `kuipad`: the vault container and limits, vault and device operations
+  (Kerberos-authenticated, as the registration of §7.5), the recovery
+  checks, the counter in the anchor exchange's CRDT, WebAuthn and FIDO MDS
+  verification copied from ahdapa (`src/auth/passkey.rs`,
+  `src/auth/fido_mds.rs`) into a kuipa crate.
+* `kuipa`: `kuipa vault`; device key types: PBES2 PKCS#8 files (OpenSSL),
+  PKCS#11 through pkcs11-provider, and a borrowed libfido2 FFI crate for
+  `hmac-secret` and assertions (against the libfido2 from abbra/pqc for
+  ML-DSA passkeys).
+* FreeIPA: schema and ACIs for the container, `vault-limits`, and a
+  framework front end for administrators (list, revoke, set limits).
+
+#### 7.6.12 Open questions
+
+These came up while writing this section; each has a default, to confirm:
+
+1. **Name.** `kuipa vault` collides with `ipa vault-*` (KRA). Alternatives:
+   `kuipa seal`, `kuipa locker`, `kuipa lease`.
+2. **Descriptor age** before sealing is refused: 30 days by default, or
+   tied to `not_after` only.
+3. **Sealing mode per vault** (`offline` or `registered`): kept as a policy
+   field, so a user can choose "old copies die" over offline sealing.
+4. **Offline-session key storage**: `dk_e` sealed to every server's escrow
+   key in the vault entry (as written), or derived from a realm vault
+   secret carried by the anchor exchange's encrypted gossip.
+5. **Passkey assertions**: any of the owner's `ipaPassKey` credentials, or a
+   subset named in the policy.
 
 ## 8. Offline enrollment
 
@@ -1778,6 +2080,7 @@ like an enrollment string.
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
+| user vaults, unified recovery (§7.6) | designed |
 | gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change is submitted as gssapi/gssproxy#135 |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 
