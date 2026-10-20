@@ -65,19 +65,31 @@ to retire them.
 
 ## What still uses classical cryptography
 
-kuipa does not replace these. They may use classical cryptography and
-might be attacked by a cryptographically relevant quantum computer (CRQC):
+kuipa protects what travels and rests between hosts and the realm's
+servers. It does not replace the cryptography of FreeIPA's own components.
+These may still use classical cryptography and might be attacked by a
+cryptographically relevant quantum computer (CRQC):
 
-* TLS server authentication (the IPA CA is RSA; kuipa reaches it
-  authentically, but TLS itself is not post-quantum);
-* PKINIT and the anonymous PKINIT armour used for password and OTP
-  `kinit`;
-* DNSSEC;
-* Custodia.
+* **The IPA CA and TLS.** The IPA CA issues classical (RSA) certificates,
+  so TLS server authentication to IPA servers is classical. kuipa does not
+  depend on it to authenticate the realm: a host verifies the servers
+  through its anchors and reaches the CA's certificate authentically.
+  But other clients of IPA's TLS services do depend on it.
+* **Kerberos PKINIT.** PKINIT, and the anonymous PKINIT armour that
+  protects password and OTP `kinit`, use classical key exchange and
+  certificates. Password and OTP logins through such an armoured `kinit`
+  can be guessed offline once a CRQC breaks the armour's key exchange, as
+  for any FreeIPA `kinit`. Random one-time passwords are not guessable
+  that way.
+* **Custodia**, which FreeIPA uses to move CA and other secrets between
+  replicas.
+* **DNSSEC**, which belongs to the DNS infrastructure rather than to
+  FreeIPA or kuipa.
 
-Password and OTP logins through an armoured `kinit` can be guessed offline
-once a CRQC breaks the classical key exchange of that armour, as for any
-FreeIPA `kinit`. Random one-time passwords are not guessable that way.
+Moving FreeIPA's components (the CA, Kerberos PKINIT, Custodia) to
+post-quantum cryptography is a separate effort, in progress alongside
+kuipa. As each component moves, this list shrinks; kuipa's protections do
+not depend on it.
 
 ## Clocks
 
