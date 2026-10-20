@@ -905,7 +905,7 @@ it holds the host's keys and knows who asks.
 | an image from before the last rotation, host enabled | that kvno's keys | nothing (binding no longer registered) |
 | root on the running host | host identity | host identity |
 
-### 7.4 gssproxy as the holder (designed; needs a gssproxy change)
+### 7.4 gssproxy as the holder (designed; gssproxy change submitted)
 
 GSS-API services that run through gssproxy never see keytabs. If gssproxy
 itself unseals, the keytab never touches a filesystem. This needs no change
@@ -919,6 +919,13 @@ learn:
 2. re-run the loader on `SIGHUP` and swap the keytab atomically;
 3. retry a failing loader with backoff;
 4. keep keytab memory out of core dumps.
+
+All four are in [gssapi/gssproxy#135](https://github.com/gssapi/gssproxy/pull/135)
+(submitted, not yet merged): a loader that fails or runs over five minutes
+is retried from 5 s up to 10 min while the keys loaded before stay in use,
+services sharing a `MEMORY:` keytab must name the same loader, and gssproxy
+makes itself non-dumpable (`PR_SET_DUMPABLE`) while any loader is
+configured.
 
 `kuipa-unseal --memfd` already implements the loader side. GSS-API
 consumers (NFS, `mod_auth_gssapi`, sshd, `GSS_USE_PROXY=yes` applications)
@@ -1766,7 +1773,7 @@ like an enrollment string.
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
-| gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; needs the gssproxy change |
+| gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change is submitted as gssapi/gssproxy#135 |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 
 ### 18.2 Tests

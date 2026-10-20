@@ -30,8 +30,11 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 ## Protocol and implementation
 
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
-- [ ] gssproxy as the keytab holder in `kuipa protect`, once gssproxy has
-      `keytab_loader` (§7.4).
+- [ ] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
+      `keytab_loader` is merged (§7.4): write the service's gssproxy
+      configuration (`cred_store = keytab:MEMORY:<name>`, `keytab_loader =
+      /usr/libexec/kuipa-unseal --sealed <path>.sealed --memfd`) instead of
+      the tmpfs copy, and send it `SIGHUP` after a reseal.
 - [ ] MTC: anchors issued as Merkle Tree Certificates and pre-distributed
       tree heads (§16).
 - [x] Notice a stolen anchor where the host knows only one: done as the
@@ -72,7 +75,10 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       `kuipa enroll --use-ccache`; for password users `--principal` (an
       armoured `kinit` in `kuipa`, §5.3); the units in `contrib/`.
 - [ ] gssproxy: per-service `keytab_loader` (memfd on fd 3 into a `MEMORY:`
-      keytab), reload on `SIGHUP`, loader retry, `MADV_DONTDUMP` (§7.4).
+      keytab), reload on `SIGHUP`, loader retry with backoff, keys kept out
+      of core dumps (§7.4): submitted as
+      [gssapi/gssproxy#135](https://github.com/gssapi/gssproxy/pull/135),
+      awaiting review and merge.
 - [ ] FreeIPA trusts: a `trust-add --type=ipa` front end for
       `trust-invitation` / `establish-trust`, and the trust objects next to
       the recorded partners; run
