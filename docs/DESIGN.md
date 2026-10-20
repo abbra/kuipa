@@ -1211,14 +1211,25 @@ The policy enables either kind, both or neither. Offline sessions are off
 unless both the vault's policy and the realm limits turn them on: they are
 the one place where a limit stops being the server's to enforce.
 
-* **Re-authentication session.** After an unlock that satisfied the
-  ticket or passkey factor, the server returns a **session token**:
-  `(V, device id, not_after ≤ now + sessions.reauth)`, signed with its
-  advertisement signing key, so any server verifies it. Later requests carry
-  the token instead of a ticket or assertion. Every open still reaches a
-  server, so the session's end, the counts, revocation and the audit stay
-  the server's. The token is bound to the device and is useless without it
-  when `factors.device` is set.
+* **Re-authentication session** (implemented). The owner starts one with
+  the vault operation `unlock` (`kuipa seal unlock`), authenticated by
+  their ticket, naming a registered device. The server answers with a
+  **session token** `IPST(V, owner, device, not_after)`, `not_after` at most
+  `sessions.reauth` ahead and never past the vault's own end, signed with
+  its advertisement signing key under its delegation (context
+  `ipa-ku-enroll/v1 vault session`), so any server checks it against its
+  anchors. An unlock request carrying the token is accepted in place of the
+  ticket and passkey factors, for the named device only, while the policy
+  still allows sessions. Every open still reaches a server, so the
+  session's end, the counts, revocation and the audit stay the server's.
+  Sessions need `factors.device`: the answer is encrypted to the device, so
+  a token is useless without the device key, and a policy without the
+  device factor cannot have sessions (a token alone would open the vault).
+  The client keeps the token **and the unwrapped device key** in the
+  user's runtime directory (`$XDG_RUNTIME_DIR/kuipa/sessions/<vault>`:
+  tmpfs, the user's own, 0600, gone at logout) until the session ends or
+  `kuipa seal lock`, so a session spares the passphrase as well as the
+  ticket; the key never touches a disk unwrapped.
 * **Offline session.** The vault has a **session key** per epoch: an
   ML-KEM pair `(vk_e, dk_e)` made by the server; `dk_e` is stored in
   `ipaKUVaultSessionKey`, sealed to each server's escrow key, and resealed
@@ -1258,14 +1269,20 @@ ticket; with `via`, every transited service must be on the list. A ticket whose 
 directory that does not read it yet: kuipad until the PAC work lands) is
 accepted only under `allow`.
 
-#### 7.6.7 Counting unlocks
+#### 7.6.7 Counting unlocks (implemented)
 
-`max_unlocks` is a grow-only counter per vault and server, replicated by
-the anchor exchange's agirru gossip (§4.2) that already runs between all
-servers. A server refuses once the merged sum reaches the limit. The
-overshoot is bounded by the releases made during one gossip interval on
-the other servers. Expiry, revocation, the factors and the device checks
-are exact; the count is the only approximate limit.
+`max_unlocks` is a grow-only counter per vault and server, kept on the
+vault entry: `ipaKUVaultUnlocks` holds one value `<server> <count>` per
+server, and each server replaces only its own value (delete the old, add
+the new, in one modify), so 389-ds's multi-master replication merges the
+values of different servers without conflict and the total is their sum.
+Every release is counted, with or without a limit, so `kuipa seal show`
+reports it. A server refuses once the sum reaches the limit. The overshoot
+is bounded by the releases other servers make within one replication
+delay. Expiry, revocation, the factors and the device checks are exact;
+the count is the only approximate limit. (An earlier draft carried the
+counter in the anchor exchange's gossip; per-server LDAP values give the
+same convergence without extending that state.)
 
 #### 7.6.8 Machine vaults: host and service escrow on the same path (implemented)
 
@@ -1359,8 +1376,10 @@ PKCS#11-native keys; files sealed to every registered device; both session
 kinds as separate policy options, offline sessions off by default in each
 vault and in the realm limits; delegated tickets allowed by default,
 refusable or limited to the services they passed through
-(`ticket.delegation`); the unlock counter in the anchor
-exchange's CRDT; self-service within realm limits; vault entries in a
+(`ticket.delegation`); the unlock counter as per-server values on the vault entry
+(replicated by 389-ds; the earlier choice was the anchor exchange's CRDT);
+re-authentication sessions that also keep the unwrapped device key in the
+user's runtime directory; self-service within realm limits; vault entries in a
 central container; passkeys as both an unlock factor (any of the owner's)
 and a key wrapper; ahdapa's relying-party code copied into kuipa; one
 recovery path for user and machine vaults; the command named `kuipa seal`
@@ -1921,11 +1940,14 @@ IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)
 IPSK  principal n(1) [server binding(TQBD) ek commitment(32) wrapped] sealed     sealed keytab
 IPSF  same fields                                                                sealed file
 IPCV  principal vault(16)                                                        what a binding commits to (commitment input, never sent)
-IPEQ  principal vault(16) commitment(32) recovery(TQRQ) device ticket             escrow request (device: empty or a 32-byte thumbprint; ticket: empty or a GSS-API token)
+IPEQ  principal vault(16) commitment(32) recovery(TQRQ) device session ticket     escrow request (device: empty or a 32-byte thumbprint; session: empty or IPST; ticket: empty or a GSS-API token)
 IPUF  principal vault(16) n(1) [server binding(TQBD) ek commitment(32) wrapped]
       m(1) [device(32) ct wrapped] sealed                                        file sealed to a user vault
 IPVD  body(JSON) delegation(JSON) signer_key(JWK) signature                      vault descriptor (signed: IPVD without the signature)
-IPVR  n(u64) [descriptor(IPVD)]                                                  vault operation answer
+IPVR  n(u64) [descriptor(IPVD)] session                                          vault operation answer (session: empty or IPST)
+IPST  signed(IPST: vault(16) owner device(32) not_after(u64) delegation signer_key) signature   re-authentication session token
+IPSS  token(IPST) device_key(private JWK)                                       a client's session file in its runtime directory (never sent)
+IPDK  kdf(1) iterations(u64) salt(16) sealed                                    a user's device key file (never sent)
 IPVA  ct sealed                                                                  recovery answer encrypted to a device
 IPRP  principal kind(1) n(1) [retire(32)]                                        registration parameters
 IPRA  principal                                                                  registration answer

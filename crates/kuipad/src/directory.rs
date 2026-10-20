@@ -65,6 +65,9 @@ const VAULT_NAME_ATTR: &str = "ipaKUVaultName";
 const VAULT_POLICY_ATTR: &str = "ipaKUVaultPolicy";
 const VAULT_DEVICE_ATTR: &str = "ipaKUVaultDevice";
 const VAULT_STATE_ATTR: &str = "ipaKUVaultState";
+/// Per-server release counts, `<server> <count>`, one value per server
+/// (§7.6.7).
+const VAULT_UNLOCKS_ATTR: &str = "ipaKUVaultUnlocks";
 /// The realm's vault limits, JSON (new schema).
 const VAULT_LIMITS_ATTR: &str = "ipaKUVaultLimits";
 /// Trust invitations, `<hex secret hash> <not after>` (new schema).
@@ -276,7 +279,22 @@ impl LdapDirectory {
             policy: serde_json::from_str(&one(VAULT_POLICY_ATTR)?)?,
             devices,
             state,
+            unlocks: Self::unlock_counts(entry).iter().map(|(_, n)| n).sum(),
         })
+    }
+
+    /// The per-server release counts on a vault entry.
+    fn unlock_counts(entry: &kuipa_ldap::SearchEntry) -> Vec<(String, u64)> {
+        entry
+            .attrs
+            .get(&VAULT_UNLOCKS_ATTR.to_lowercase())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| {
+                let (server, n) = v.rsplit_once(' ')?;
+                Some((server.to_owned(), n.parse().ok()?))
+            })
+            .collect()
     }
 
     fn vault_attrs(vault: &Vault) -> Result<(String, Vec<String>, &'static str), DirectoryError> {
@@ -716,6 +734,7 @@ impl Directory for LdapDirectory {
                 VAULT_POLICY_ATTR,
                 VAULT_DEVICE_ATTR,
                 VAULT_STATE_ATTR,
+                VAULT_UNLOCKS_ATTR,
             ],
         ) {
             Ok(entries) => entries.first().map(Self::vault_from).transpose(),
@@ -766,6 +785,7 @@ impl Directory for LdapDirectory {
                 VAULT_POLICY_ATTR,
                 VAULT_DEVICE_ATTR,
                 VAULT_STATE_ATTR,
+                VAULT_UNLOCKS_ATTR,
             ],
         ) {
             Ok(e) => e,
@@ -776,6 +796,39 @@ impl Directory for LdapDirectory {
             Err(e) => return Err(e.into()),
         };
         entries.iter().map(Self::vault_from).collect()
+    }
+
+    fn vault_unlock(
+        &self,
+        id: &VaultId,
+        server: &str,
+        limit: Option<u64>,
+    ) -> Result<bool, DirectoryError> {
+        let mut svc = self.service_conn()?;
+        let dn = self.vault_dn(id);
+        let entries = svc.search(
+            &dn,
+            Scope::Base,
+            &format!("(objectClass={VAULT_CLASS})"),
+            &[VAULT_UNLOCKS_ATTR],
+        )?;
+        let entry = entries.first().ok_or("no such vault")?;
+        let counts = Self::unlock_counts(entry);
+        if limit.is_some_and(|l| counts.iter().map(|(_, n)| n).sum::<u64>() >= l) {
+            return Ok(false);
+        }
+        // Only this server's value changes, so replicas never conflict:
+        // the total is the sum of every server's own count.
+        let own = counts.iter().find(|(s, _)| s == server).map(|(_, n)| *n);
+        let old = own.map(|n| format!("{server} {n}"));
+        let new = format!("{server} {}", own.unwrap_or(0) + 1);
+        let mut mods = Vec::new();
+        if let Some(old) = &old {
+            mods.push((ModOp::Delete, VAULT_UNLOCKS_ATTR, vec![old.as_bytes()]));
+        }
+        mods.push((ModOp::Add, VAULT_UNLOCKS_ATTR, vec![new.as_bytes()]));
+        svc.modify_s(&dn, &mods)?;
+        Ok(true)
     }
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {

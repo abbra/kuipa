@@ -199,6 +199,17 @@ step 0 "Open it to standard output: only the plaintext arrives" \
     "token=playground-user"
 step 1 "A wrong passphrase does not open the device key" \
     'echo wrong > "$KUIPA_PLAYGROUND/wrong" && kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong"'
+step 0 "A vault that allows hour-long sessions and 10 unlocks" \
+    'kuipa seal create daily --require device,ticket --session-hours 1 --max-unlocks 10 && kuipa seal device add daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' \
+    "unlocks allowed: 10"
+step 0 "Seal a note to it" \
+    'echo "daily note" > "$KUIPA_PLAYGROUND/daily.txt" && kuipa seal file daily "$KUIPA_PLAYGROUND/daily.txt"'
+step 0 "Start a session: one passphrase and ticket" \
+    'kuipa seal unlock daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' "Session started"
+step 0 "Open without the passphrase while the session lasts" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/daily.txt.sealed" --out - </dev/null | cat' "daily note"
+step 0 "End the session" 'kuipa seal lock daily' "has ended"
+step 0 "The servers counted the releases" 'kuipa seal show daily' "unlocks so far: 1"
 step 0 "Revoke the vault" 'kuipa seal revoke personal' "revoked"
 step 75 "No server opens a file of a revoked vault" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'

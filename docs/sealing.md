@@ -3,9 +3,11 @@
 > **Status: partly implemented.** This guide describes `kuipa seal` as
 > designed in [DESIGN.md §7.6](DESIGN.md). Working today: `create`,
 > `policy`, `device add|remove` with passphrase-protected device keys,
-> `file`, `open`, `reseal`, `show`, `list` and `revoke`, with the `device`
-> and `ticket` factors. Not yet: passkeys, smart cards and tokens,
-> sessions, unlock limits, `--sealing registered`, and refusing or
+> `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
+> with the `device` and `ticket` factors, re-authentication sessions
+> (`--session-hours`) and unlock limits (`--max-unlocks`). Not yet:
+> passkeys, smart cards and tokens, offline sessions,
+> `--sealing registered`, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
 > only the default `allow` is accepted). A vault policy asking for any of
 > those is refused.
@@ -167,10 +169,15 @@ Typing a passphrase or touching a key for every open gets tiring. If the
 vault's policy allows it, one unlock starts a **session**:
 
 ```sh
-kuipa seal unlock work            # ticket and touch once
-kuipa seal open report.sealed ... # no prompts until the session ends
+kuipa seal create work --require device,ticket --session-hours 8
+kuipa seal unlock work            # passphrase and ticket once
+kuipa seal open report.sealed --out report.pdf   # no prompts until the session ends
 kuipa seal lock work              # end it early
 ```
+
+While the session lasts, your device key is kept unwrapped in your
+runtime directory (`$XDG_RUNTIME_DIR`: memory only, yours alone, gone when
+you log out), so neither the passphrase nor a ticket is asked for.
 
 During a session each open still goes to a server, so the session's end,
 revocation and the vault's limits still apply, and every open is logged.
