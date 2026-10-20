@@ -35,7 +35,7 @@ Each vault chooses its factors from:
 | factor | what it asks of you | good for |
 |---|---|---|
 | `device` | a registered device key; its level can be `any`, `hardware-wrapped` (passkey or token-wrapped) or `hardware-bound` (a key that never leaves a token) | almost everything: copies at rest stay closed |
-| `ticket` | your Kerberos ticket (`kinit`) | tying opens to your login session |
+| `ticket` | your Kerberos ticket: the one your login gave you on an IPA-enrolled system (PAM, or SSH with protocol transition), or `kinit` | tying opens to your login session |
 | `passkey` | a touch (and PIN) on one of the passkeys registered to your IPA account | proof that you are present |
 
 A vault needs at least one of them; the server's agreement alone is never
