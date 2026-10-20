@@ -230,9 +230,8 @@ kuipa protect --file /etc/pki/tls/private/app.key --keytab /etc/httpd/http.keyta
 
 * The first is sealed for the host principal; the second for the web
   service's principal, so deleting either principal stops it opening.
-  Disabling (`ipa host-disable`, `ipa service-disable`) removes keys but
-  does not stop sealed files opening yet: use `host-del`, or see the note
-  under termination below.
+  Disabling (`ipa host-disable`, `ipa service-disable`) does not stop it
+  yet; see the note under termination below.
 * Changed the secret? Write the new contents through the link and run
   `kuipa protect --file …` again: the old sealed copy is retired.
 * A one-off read, for a script: `kuipa-unseal --sealed /etc/app/db.conf.sealed
@@ -284,10 +283,12 @@ ipa host-del web-17.example.test --updatedns
   host stops opening, including in snapshots and images.
 * The hostname is free for a replacement to join with a new voucher.
 * If you'd rather keep the entry for audit, `ipa host-disable` removes its
-  keys, so sealed keytabs open to dead keys, and it blocks a voucher join
-  under the same name. Sealed *files* of a disabled host still open today:
-  kuipad checks the entry's `nsAccountLock`, which `host-disable` does not
-  set. Until that is fixed, delete the host to retire its files.
+  keys and certificates and blocks a voucher join under the same name, but
+  today it does **not** lock the entry: a host certificate it did not
+  revoke (from an external CA, say) may still get tickets with PKINIT, and
+  the host's sealed files still open. kuipad, like the KDC, treats only a
+  locked entry (`nsAccountLock`) as disabled. Until FreeIPA's
+  `host-disable` sets the lock, delete the host to retire its files.
 
 ### Bind identities to the instance's virtual TPM
 

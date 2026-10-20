@@ -880,8 +880,14 @@ state, so escrow uses it:
 * **Planned:** recovery moves to the unified request of §7.6.5, with a
   commitment the server verifies; host and service escrow become machine
   vaults (§7.6.8) with the behaviour described here.
-* **Revocation:** disabling or deleting the host, or clearing the attribute,
-  stops unsealing at once. A fresh seal (every `rotate-keys`) retires the old
+* **Revocation:** deleting the host, locking it (`nsAccountLock`), or
+  clearing the attribute stops unsealing at once. `ipa host-disable` and
+  `ipa service-disable` today only remove keys and certificates: the entry
+  stays unlocked, a principal without keys may still authenticate with
+  PKINIT, and its sealed files keep opening. The lock is the right signal
+  (`ipa-kdb` refuses every ticket for a locked entry, PKINIT included), so
+  FreeIPA's disable commands must set `nsAccountLock` (TODO); kuipad does
+  not infer "disabled" from missing keys. A fresh seal (every `rotate-keys`) retires the old
   bindings, so an old disk image stops working too.
 
 The server learns `ss` and can link recoveries; that is irrelevant here, as
@@ -904,7 +910,7 @@ it holds the host's keys and knows who asks.
 |---|---|---|
 | disk image or backup, no access to the realm's servers | host identity | nothing |
 | disk image + server access, host enabled | host identity | host identity (as with Tang) |
-| the same after `ipa host-disable` | nothing (keys gone) | nothing |
+| the same after `ipa host-disable` (keys removed, entry locked once FreeIPA sets `nsAccountLock`) | nothing (keys gone) | nothing |
 | an image from before the last rotation, host enabled | that kvno's keys | nothing (binding no longer registered) |
 | root on the running host | host identity | host identity |
 
@@ -1002,7 +1008,7 @@ kuipa protect --file F --keytab K                  sealed for K's principal
 |---|---|---|
 | disk image or backup, no access to the realm's servers | its contents | nothing |
 | disk image + server access, principal enabled | its contents | its contents |
-| the same after the principal is disabled (`nsAccountLock`) | its contents (keys valid until rotated) | nothing |
+| the same after the principal is locked (`nsAccountLock`; see §7.2 for `service-disable`) | its contents (keys valid until rotated) | nothing |
 | an image from before the last reseal or `unprotect` | that version | nothing (binding retired) |
 | root on the running host | its contents | its contents |
 

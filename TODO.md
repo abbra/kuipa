@@ -61,7 +61,10 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       escrow attributes on service and user entries as well as hosts, §7.5);
       framework commands (`pq-anchor-show`,
       `host-add/host-mod --pq-stage`, enrollment strings from `--random`,
-      `--clear-pq-escrow`, also for services and users), installers and
+      `--clear-pq-escrow`, also for services and users); `host-disable` and
+      `service-disable` must also set `nsAccountLock`, so a disabled
+      principal is locked out of PKINIT and its sealed keytabs and files
+      stop opening (§7.2); installers and
       upgrade (`kuipad generate-keys` on every server and replica, the `ipa-ku/<server>`
       principal, keytab and delegation rule), httpd snippet, SELinux module
       (`kuipa_unseal_t`). Enrollment strings use the issuing server's
