@@ -760,18 +760,31 @@ fn a_long_anchor_log_is_read_page_by_page() {
 }
 
 #[test]
-fn advertisement_lists_details_and_landmarks() {
+#[allow(clippy::too_many_lines)]
+fn advertisement_lists_details_landmarks_and_an_anchor_index() {
     // A realm with no anchor log yet: the advertisement carries no head,
     // so there are no landmarks, but its details still show. Then the
     // same realm through a proper rotation: the whole landmark chain is
-    // listed and verified from the one pinned anchor (§4.8).
+    // listed and verified from the one pinned anchor (§4.8), and the
+    // per-key index says where each key belongs.
     let (old, new) = (
         SigningKey::generate(SignatureAlg::MlDsa65).unwrap(),
         SigningKey::generate(SignatureAlg::MlDsa65).unwrap(),
     );
     let (old_pin, new_pin) = (*old.public().thumbprint(), *new.public().thumbprint());
     let deployment = Deployment::servers(&["ipa1.example.test".to_string()]);
-    let (keys, info, delegation) = server_keys(&old, "ipa1.example.test");
+    let (keys, mut info, delegation) = server_keys(&old, "ipa1.example.test");
+    // A realm this one trusts, with an anchor of its own (§17): the index
+    // is where a reader finds out what such an anchor is.
+    let other = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let other_pin = *other.public().thumbprint();
+    info.trusts = vec![kuipa_enroll::realm::TrustedRealm {
+        realm: "B.TEST".into(),
+        domain: "b.test".into(),
+        servers: vec!["ipa1.b.test".into()],
+        anchors: vec![other_pin],
+    }];
+    info.validate().unwrap();
     let dir = Dir::default();
     dir.otps
         .lock()
@@ -802,6 +815,41 @@ fn advertisement_lists_details_and_landmarks() {
             .as_array()
             .is_some_and(Vec::is_empty),
         "{out}"
+    );
+    // The index names every key this server named, with no log entries to
+    // claim: one per thumbprint, whatever the order the details came in.
+    let find = |out: &serde_json::Value, key: &str| {
+        out["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["key"] == key)
+            .unwrap_or_else(|| panic!("no index entry for {key}: {out}"))
+            .clone()
+    };
+    let old_pin_text = old_pin.to_string();
+    let other_pin_text = other_pin.to_string();
+    assert_eq!(out["pinned"], serde_json::json!([old_pin_text]));
+    let roles = find(&out, &old_pin_text);
+    assert_eq!(roles["pinned"], true);
+    assert_eq!(roles["proves"], serde_json::json!(["ipa1.example.test"]));
+    assert_eq!(
+        roles["current_of"],
+        serde_json::json!(["ipa1.example.test"])
+    );
+    assert_eq!(roles["log_sequences"], serde_json::json!([]), "no log yet");
+    let signer = out["servers"][0]["signer"].as_str().unwrap();
+    assert_eq!(
+        find(&out, signer)["signer_of"],
+        serde_json::json!(["ipa1.example.test"]),
+        "the signing key signs, but is no anchor here",
+    );
+    let roles = find(&out, &other_pin_text);
+    assert_eq!(roles["trust_of"], serde_json::json!(["B.TEST"]));
+    assert_eq!(
+        roles["current_of"],
+        serde_json::json!([]),
+        "a trusted realm's anchor is not this realm's"
     );
 
     // The anchor rotates properly; the log is published through entry 2.
@@ -858,6 +906,51 @@ fn advertisement_lists_details_and_landmarks() {
         landmarks[1]["successions"][0],
         format!("{old_pin} -> {new_pin}"),
         "the rotation the entry records"
+    );
+    // Read the other way round.  Verification accepted the succession, so
+    // the accepted proof is the anchor it reached (§4.2): the new anchor
+    // proves the claim, the pinned one is only its predecessor.
+    let old_roles = find(&out, &old_pin_text);
+    assert_eq!(old_roles["pinned"], true);
+    assert_eq!(
+        old_roles["proves"],
+        serde_json::json!([]),
+        "its own proof no longer covers this advertisement"
+    );
+    assert_eq!(
+        old_roles["current_of"],
+        serde_json::json!([]),
+        "no advertisement names it as an anchor any more"
+    );
+    assert_eq!(
+        old_roles["log_sequences"],
+        serde_json::json!([1]),
+        "current in the log up to the entry that rotated it"
+    );
+    assert_eq!(
+        old_roles["replaced_by"],
+        serde_json::json!([new_pin.to_string()]),
+        "the old side of the succession"
+    );
+    let new_roles = find(&out, &new_pin.to_string());
+    assert_eq!(
+        new_roles["pinned"], false,
+        "this host pins only the old one"
+    );
+    assert_eq!(
+        new_roles["proves"],
+        serde_json::json!(["ipa1.example.test"]),
+        "the reached anchor is the accepted proof"
+    );
+    assert_eq!(
+        new_roles["current_of"],
+        serde_json::json!(["ipa1.example.test"])
+    );
+    assert_eq!(new_roles["log_sequences"], serde_json::json!([2]));
+    assert_eq!(
+        new_roles["replaces"],
+        serde_json::json!([old_pin_text]),
+        "the new side of the succession"
     );
 }
 
