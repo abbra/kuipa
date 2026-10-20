@@ -331,7 +331,10 @@ What you get, and what it rests on:
   file; neither opens without you;
 * a ticket obtained by protocol transition says *the VM* vouched that you
   logged in. Whoever controls the VM's host identity can obtain the same
-  tickets for the users its rules allow. So protect the VM's host keytab
+  tickets for the users its rules allow. A vault can narrow this: accept
+  delegated tickets only through this VM (`--ticket-via
+  host/devvm1.example.test`), or refuse them and accept only a ticket from
+  your own password or passkey login. So protect the VM's host keytab
   (`kuipa protect`) as well: a snapshot then cannot mint tickets either.
   Root on the running VM is out of scope, as it always is;
 * a re-authentication session saves you from typing the passphrase for
