@@ -976,6 +976,7 @@ dependencies = [
 name = "kuipa-tools"
 version = "0.1.0"
 dependencies = [
+ "anstream",
  "axum",
  "clap",
  "hickory-resolver",
