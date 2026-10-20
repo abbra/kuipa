@@ -23,6 +23,12 @@
 //! kuipa complete                            finish an offline enrollment
 //! kuipa rotate-keys                         new host keys
 //! kuipa protect | unprotect                 seal / unseal the keytab on disk
+//! kuipa protect | unprotect --keytab F      the same for another keytab: a
+//!                                            service's or a user's
+//! kuipa protect | unprotect --file F [--keytab K]
+//!                                            the same for any file, sealed
+//!                                            for K's principal (default: the
+//!                                            host)
 //! kuipa trusted-realms                      accept users of the realms this
 //!                                            realm trusts (their KDCs and
 //!                                            PKINIT anchors, verified)
@@ -209,10 +215,18 @@ enum Command {
     Complete,
     /// New host keys; re-seals the keytab where needed.
     RotateKeys,
-    /// Seal the keytab on disk.
-    Protect,
-    /// Unseal the keytab on disk.
-    Unprotect,
+    /// Seal the host keytab on disk, or another keytab or any file; run
+    /// again to reseal what is there now.
+    Protect {
+        #[command(flatten)]
+        target: ProtectTarget,
+    },
+    /// Put the host keytab, or another keytab or file, back on disk in
+    /// plain form.
+    Unprotect {
+        #[command(flatten)]
+        target: ProtectTarget,
+    },
     /// Print the realms this realm trusts (their KDCs and PKINIT anchors,
     /// verified), so their users can log in here.
     TrustedRealms,
@@ -237,6 +251,19 @@ enum Command {
     Leave,
 }
 
+/// What `protect` and `unprotect` act on: the host keytab by default.
+#[derive(clap::Args)]
+struct ProtectTarget {
+    /// Another keytab (a service's or a user's), sealed for its own
+    /// principal; with --file, the keytab of the principal to seal the
+    /// file for (default: the host keytab).
+    #[arg(long, value_name = "FILE")]
+    keytab: Option<String>,
+    /// Any file, sealed for the principal of --keytab.
+    #[arg(long, value_name = "FILE")]
+    file: Option<String>,
+}
+
 impl Cli {
     /// Rebuild the loose option bag `run` reads, so the command handlers
     /// do not change with the parser.
@@ -259,8 +286,8 @@ impl Command {
             Command::RealmInfo { .. } => "realm-info",
             Command::Complete => "complete",
             Command::RotateKeys => "rotate-keys",
-            Command::Protect => "protect",
-            Command::Unprotect => "unprotect",
+            Command::Protect { .. } => "protect",
+            Command::Unprotect { .. } => "unprotect",
             Command::TrustedRealms => "trusted-realms",
             Command::Advertisement { .. } => "advertisement",
             Command::Status => "status",
@@ -323,6 +350,10 @@ impl Command {
                 a.set("hostname", deployment.hostname.as_deref());
             }
             Command::Check { server } => a.set_all("server", server),
+            Command::Protect { target } | Command::Unprotect { target } => {
+                a.set("keytab", target.keytab.as_deref());
+                a.set("file", target.file.as_deref());
+            }
             _ => {}
         }
     }
@@ -370,6 +401,16 @@ impl Args {
 
     fn flag(&self, name: &str) -> bool {
         self.flags.iter().any(|f| f == name)
+    }
+
+    /// `--keytab` and `--file`, for `protect` and `unprotect`.
+    fn protect_target(&self) -> flows::Target {
+        let path = |name| self.option(name).map(std::path::PathBuf::from);
+        match (path("file"), path("keytab")) {
+            (Some(path), keytab) => flows::Target::File { path, keytab },
+            (None, Some(keytab)) => flows::Target::Keytab(keytab),
+            (None, None) => flows::Target::Host,
+        }
     }
 
     /// `--enrollment-file`, or `KUIPA_ENROLLMENT_FILE` from the
@@ -660,8 +701,8 @@ fn run(args: &Args) -> Result<Value, Error> {
         }
         "complete" => flows::complete(&paths),
         "rotate-keys" => flows::rotate_keys(&paths, None),
-        "protect" => flows::protect(&paths),
-        "unprotect" => flows::unprotect(&paths),
+        "protect" => flows::protect(&paths, &args.protect_target()),
+        "unprotect" => flows::unprotect(&paths, &args.protect_target()),
         "trusted-realms" => flows::trusted_realms(&paths),
         "advertisement" => {
             let deployment = args.deployment()?;
@@ -860,7 +901,9 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
         "check" => render_check(value, paths),
         "complete" => render_complete(value),
         "rotate-keys" => render_rotated(value, "New host keys"),
+        "protect" if get(value, "contents").is_string() => render_protect_other(value),
         "protect" => render_protect(value),
+        "unprotect" if get(value, "contents").is_string() => render_unprotect_other(value),
         "unprotect" => println!(
             "The keytab is plain on disk again; its holder is now {}.",
             get(value, "holder").as_str().unwrap_or("none")
@@ -1183,6 +1226,22 @@ fn render_status(value: &Value, paths: &Paths) {
     rows.field("anchors pinned here", get(value, "anchors"));
     rows.field("trusted realms installed", get(value, "trusted_realms"));
     rows.field("keytab held by", get(value, "protection"));
+    rows.field(
+        "also protected",
+        &Value::Array(
+            list(get(value, "protected"))
+                .into_iter()
+                .map(|p| {
+                    Value::String(format!(
+                        "{} ({} for {})",
+                        get(p, "path").as_str().unwrap_or("?"),
+                        get(p, "contents").as_str().unwrap_or("?"),
+                        get(p, "principal").as_str().unwrap_or("?")
+                    ))
+                })
+                .collect(),
+        ),
+    );
     rows.path("keytab", &paths.keytab());
     rows.path("krb5.conf fallback", &paths.krb5_conf());
     rows.path("IPA CA", &paths.ca());
@@ -1297,6 +1356,47 @@ fn render_protect(value: &Value) {
     identity_rows(&mut rows, rotated);
     rows.field("sealed as", get(value, "sealed"));
     rows.print();
+}
+
+fn render_protect_other(value: &Value) {
+    let path = get(value, "path").as_str().unwrap_or("the file");
+    println!(
+        "{path} is {} on disk: opening it needs one of the realm's servers, as at boot.",
+        if get(value, "resealed").as_bool().unwrap_or(false) {
+            "sealed again, as it is now"
+        } else {
+            "sealed"
+        }
+    );
+    let mut rows = Rows::default();
+    rows.field("holds", get(value, "contents"));
+    rows.field("bindings registered for", get(value, "principal"));
+    rows.field("registered by", get(value, "registered_by"));
+    rows.field("servers that can unseal it", get(value, "servers"));
+    rows.field("sealed as", get(value, "sealed"));
+    rows.field("unsealed copy (tmpfs)", get(value, "unsealed_copy"));
+    rows.print();
+}
+
+fn render_unprotect_other(value: &Value) {
+    println!(
+        "{} is plain on disk again.",
+        get(value, "path").as_str().unwrap_or("The file")
+    );
+    if get(value, "retired").as_bool().unwrap_or(false) {
+        println!(
+            "  Its bindings for {} are retired: no copy of the sealed file opens any more.",
+            get(value, "principal").as_str().unwrap_or("its principal")
+        );
+    } else {
+        println!(
+            "  Its bindings for {} are still registered ({}): a copy of the sealed file (in a backup or an old image) still opens until an administrator clears them, or until it is protected and unprotected again with a server reachable.",
+            get(value, "principal").as_str().unwrap_or("its principal"),
+            get(value, "retire_error")
+                .as_str()
+                .unwrap_or("no server answered")
+        );
+    }
 }
 
 fn list(value: &Value) -> Vec<&Value> {

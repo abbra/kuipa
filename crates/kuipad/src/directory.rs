@@ -9,7 +9,10 @@
 //! * Kerberos joins, rekeys and staging accept the client's GSS-API token
 //!   with the exchange's channel binding, then act as the authenticated
 //!   principal (S4U2Self + S4U2Proxy to LDAP), so the existing ACIs decide.
-//! * Escrow bookkeeping uses the daemon's own identity.
+//! * Escrow bookkeeping uses the daemon's own identity.  Bindings live on
+//!   the principal's entry: a host's by its FQDN, a service's or user's
+//!   found by principal name under `cn=accounts` (§7.5).  Registration
+//!   outside a rekey accepts the principal's own GSS-API token first.
 //! * Anchor exchange syncs from other servers are accepted with the same
 //!   credential; the sender must be `ipa-ku/<sender>` (§4.2).
 //! * Voucher joins (§9), as the daemon once the voucher verified: add the
@@ -25,17 +28,21 @@
 
 use std::time::SystemTime;
 
+use kuipa_enroll::escrow::{Kind, RegisterParams};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
-use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, dn_escape, filter_escape};
+use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
 use native_ossl::util::SecretBuf;
 
 use crate::getkeytab::{self, JOIN_OID, KEYTAB_GET_OID};
 
 /// Attribute holding registered escrow binding hashes (new schema).
 const ESCROW_ATTR: &str = "ipaKUEscrowBinding";
+/// Attribute holding the escrow binding hashes of sealed files (new
+/// schema, §7.5).
+const ESCROW_FILE_ATTR: &str = "ipaKUEscrowFileBinding";
 /// Attribute recording staging (new schema), JSON.
 const STAGED_ATTR: &str = "ipaKUStaged";
 
@@ -276,6 +283,35 @@ impl LdapDirectory {
     fn host_principal(&self, fqdn: &str) -> String {
         Principal::host(fqdn, &self.cfg.realm).to_string()
     }
+
+    /// The entry of `principal`, with `attrs`: a host's by its FQDN, any
+    /// other principal's (services, users) by name under `cn=accounts`.
+    fn principal_entry(
+        &self,
+        conn: &mut LdapConnection,
+        principal: &Principal,
+        attrs: &[&str],
+    ) -> Result<Option<SearchEntry>, DirectoryError> {
+        if let [service, fqdn] = principal.components()
+            && service == "host"
+        {
+            let entries = conn.search(
+                &self.host_dn(fqdn),
+                Scope::Base,
+                "(objectClass=ipaHost)",
+                attrs,
+            )?;
+            return Ok(entries.into_iter().next());
+        }
+        let name = filter_escape(&principal.to_string());
+        let entries = conn.search(
+            &format!("cn=accounts,{}", self.cfg.basedn),
+            Scope::Subtree,
+            &format!("(|(krbPrincipalName={name})(krbCanonicalName={name}))"),
+            attrs,
+        )?;
+        Ok(entries.into_iter().next())
+    }
 }
 
 /// LDAP `GeneralizedTime` for Unix seconds.
@@ -415,15 +451,12 @@ impl Directory for LdapDirectory {
         principal: &Principal,
         bindings: &[[u8; 32]],
     ) -> Result<(), DirectoryError> {
-        let fqdn = principal
-            .components()
-            .get(1)
-            .ok_or("not a host principal")?;
+        let mut svc = self.service_conn()?;
+        let entry = self
+            .principal_entry(&mut svc, principal, &["objectClass"])?
+            .ok_or_else(|| format!("no entry for {principal}"))?;
         let values: Vec<&[u8]> = bindings.iter().map(<[u8; 32]>::as_slice).collect();
-        self.service_conn()?.modify_s(
-            &self.host_dn(fqdn),
-            &[(ModOp::Replace, ESCROW_ATTR, values)],
-        )?;
+        svc.modify_s(&entry.dn, &[(ModOp::Replace, ESCROW_ATTR, values)])?;
         Ok(())
     }
 
@@ -432,28 +465,77 @@ impl Directory for LdapDirectory {
         principal: &Principal,
         binding: &[u8; 32],
     ) -> Result<bool, DirectoryError> {
-        let fqdn = principal
-            .components()
-            .get(1)
-            .ok_or("not a host principal")?;
-        let entries = self.service_conn()?.search(
-            &self.host_dn(fqdn),
-            Scope::Base,
-            "(objectClass=ipaHost)",
-            &[ESCROW_ATTR, "nsAccountLock"],
-        )?;
-        let Some(entry) = entries.first() else {
+        let Some(entry) = self.principal_entry(
+            &mut self.service_conn()?,
+            principal,
+            &[ESCROW_ATTR, ESCROW_FILE_ATTR, "nsAccountLock"],
+        )?
+        else {
             return Ok(false);
         };
         let locked = entry
             .attrs
             .get("nsaccountlock")
             .is_some_and(|v| v.iter().any(|s| s.eq_ignore_ascii_case("true")));
-        let registered = entry
-            .bin_attrs
-            .get(&ESCROW_ATTR.to_lowercase())
-            .is_some_and(|v| v.iter().any(|b| b.as_slice() == binding));
+        let registered = [ESCROW_ATTR, ESCROW_FILE_ATTR].iter().any(|attr| {
+            entry
+                .bin_attrs
+                .get(&attr.to_lowercase())
+                .is_some_and(|v| v.iter().any(|b| b.as_slice() == binding))
+        });
         Ok(!locked && registered)
+    }
+
+    fn register_with_gss(
+        &self,
+        params: &RegisterParams,
+        bindings: &[[u8; 32]],
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<KerberosBinding, DirectoryError> {
+        let (caller, binding) = self.accept_bound(token, cb)?;
+        let principal = &params.principal;
+        if caller != principal.to_string() {
+            return Err(
+                format!("{caller} may not register escrow bindings for {principal}").into(),
+            );
+        }
+        let mut svc = self.service_conn()?;
+        let entry = self
+            .principal_entry(&mut svc, principal, &["objectClass"])?
+            .ok_or_else(|| format!("no entry for {principal}"))?;
+        let values: Vec<&[u8]> = bindings.iter().map(<[u8; 32]>::as_slice).collect();
+        match params.kind {
+            Kind::Keytab => {
+                svc.modify_s(&entry.dn, &[(ModOp::Replace, ESCROW_ATTR, values)])?;
+            }
+            Kind::File => {
+                // One value at a time: a binding already gone is no error.
+                for old in &params.retire {
+                    match svc.modify_s(
+                        &entry.dn,
+                        &[(ModOp::Delete, ESCROW_FILE_ATTR, vec![old.as_slice()])],
+                    ) {
+                        Ok(())
+                        | Err(kuipa_ldap::LdapError::Protocol {
+                            code: NO_SUCH_ATTRIBUTE,
+                            ..
+                        }) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                if !values.is_empty() {
+                    svc.modify_s(&entry.dn, &[(ModOp::Add, ESCROW_FILE_ATTR, values)])?;
+                }
+            }
+        }
+        eprintln!(
+            "kuipad: {principal} registered {} {:?} escrow binding(s), retired {}",
+            bindings.len(),
+            params.kind,
+            params.retire.len()
+        );
+        Ok(binding)
     }
 
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {

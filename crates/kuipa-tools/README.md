@@ -5,7 +5,7 @@ The kuipa client programs for FreeIPA hosts.
 | program | does |
 |---|---|
 | `kuipa` | manages the host's post-quantum identity: enrollment, key rotation, keytab protection, trusted realms and health checks |
-| `kuipa-unseal` | unseals a protected keytab at boot, or acts as gssproxy's keytab loader |
+| `kuipa-unseal` | unseals protected keytabs and files at boot, or acts as gssproxy's keytab loader |
 | `kuipa-voucher` | issues enrollment vouchers with blind signatures, as an issuer or a provisioner |
 
 ## Usage
@@ -22,6 +22,9 @@ kuipa realm-info --krb5-dir D         Kerberos configuration for enrolling with 
 kuipa complete                        finish an offline enrollment
 kuipa rotate-keys                     new host keys
 kuipa protect | unprotect             seal or unseal the keytab on disk
+kuipa protect | unprotect --keytab F  the same for a service's or user's keytab
+kuipa protect | unprotect --file F [--keytab K]
+                                      the same for any file, sealed for K's principal
 kuipa trusted-realms                  accept users of the realms this realm trusts
 kuipa status | check [--server S]     is this host healthy?
 kuipa leave                           remove kuipa's state

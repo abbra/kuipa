@@ -8,7 +8,7 @@ use agirru_crdt::GenerationClock;
 use kuipa_enroll::anchors::{AnchorState, Entry, Trust};
 use kuipa_enroll::bundle::{Bundle, Mode, Opener, StageParams};
 use kuipa_enroll::delegation::{Claim, Delegation, SignedVouch, VOUCH_VALIDITY};
-use kuipa_enroll::escrow::{EscrowRequest, SealedKeytab};
+use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer};
 use kuipa_enroll::join::{
     AuthType, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
 };
@@ -42,6 +42,7 @@ struct MemoryDirectory {
     kvno: RefCell<HashMap<String, u32>>,
     admins: HashSet<String>,
     escrow: RefCell<HashMap<String, Vec<[u8; 32]>>>,
+    escrow_files: RefCell<HashMap<String, Vec<[u8; 32]>>>,
     disabled: RefCell<HashSet<String>>,
     staged: RefCell<HashMap<String, Staged>>,
 }
@@ -174,11 +175,36 @@ impl Directory for MemoryDirectory {
     ) -> Result<bool, DirectoryError> {
         let p = principal.to_string();
         Ok(!self.disabled.borrow().contains(&p)
-            && self
-                .escrow
-                .borrow()
-                .get(&p)
-                .is_some_and(|b| b.contains(binding)))
+            && [&self.escrow, &self.escrow_files]
+                .iter()
+                .any(|set| set.borrow().get(&p).is_some_and(|b| b.contains(binding))))
+    }
+
+    fn register_with_gss(
+        &self,
+        params: &RegisterParams,
+        bindings: &[[u8; 32]],
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<KerberosBinding, DirectoryError> {
+        let who = Self::accept(token, cb)?;
+        if who != params.principal.to_string() {
+            return Err("only a principal may register for itself".into());
+        }
+        match params.kind {
+            Kind::Keytab => {
+                self.escrow
+                    .borrow_mut()
+                    .insert(who.clone(), bindings.to_vec());
+            }
+            Kind::File => {
+                let mut files = self.escrow_files.borrow_mut();
+                let set = files.entry(who.clone()).or_default();
+                set.retain(|b| !params.retire.contains(b));
+                set.extend_from_slice(bindings);
+            }
+        }
+        Ok(self.binding(&who, cb))
     }
 
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
@@ -728,7 +754,7 @@ fn sealed_keytab_with_registration_and_revocation() {
             .unwrap()
             .keytab
     };
-    let (sealed, registrations) = SealedKeytab::seal(&host_keys, &[&advs[0], &advs[1]]).unwrap();
+    let (sealed, registrations) = Sealed::seal(&host_keys, &[&advs[0], &advs[1]]).unwrap();
     let hashes: Vec<_> = registrations.iter().map(|g| g.binding).collect();
     r.dir
         .register_escrow(&Principal::host(HOST, REALM), &hashes)
@@ -742,7 +768,7 @@ fn sealed_keytab_with_registration_and_revocation() {
     let by_name = |name: &str| usize::from(name == "ipa2.example.test");
 
     // Any server can unseal.
-    let sealed = SealedKeytab::from_bytes(&stored).unwrap();
+    let sealed = Sealed::from_bytes(&stored).unwrap();
     let kt = sealed.unseal(|s, req| recover(by_name(s), req)).unwrap();
     assert_eq!(kt.kvno(), host_keys.kvno());
     // ipa1 down: ipa2 alone suffices.
@@ -767,13 +793,93 @@ fn sealed_keytab_with_registration_and_revocation() {
     r.dir.disabled.borrow_mut().clear();
 
     // A fresh seal (rebind) retires the old bindings once registered.
-    let (resealed, registrations) = SealedKeytab::seal(&kt, &[&advs[0], &advs[1]]).unwrap();
+    let (resealed, registrations) = Sealed::seal(&kt, &[&advs[0], &advs[1]]).unwrap();
     let hashes: Vec<_> = registrations.iter().map(|g| g.binding).collect();
     r.dir
         .register_escrow(&Principal::host(HOST, REALM), &hashes)
         .unwrap();
     assert!(sealed.unseal(|s, req| recover(by_name(s), req)).is_err());
     resealed.unseal(|s, req| recover(by_name(s), req)).unwrap();
+}
+
+/// A registration (§7.5) made with `caller`'s ticket.
+fn register_request(
+    adv: &VerifiedRealm,
+    caller: &str,
+    params: &RegisterParams,
+    bindings: &[[u8; 32]],
+) -> (Request, PendingJoin) {
+    let p = Prepared::new(
+        adv,
+        Operation::Register,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    p.with_kerberos(fake_binding(caller, &cb))
+        .seal(
+            &gss_token(caller, &cb),
+            bindings,
+            &params.to_bytes().unwrap(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn sealed_file_registered_by_its_principal() {
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let service: Principal = format!("HTTP/{HOST}@{REALM}").parse().unwrap();
+    let recover = |s: &str, req: &EscrowRequest| {
+        let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+        r.servers[usize::from(s == "ipa2.example.test")]
+            .recover(&req, &r.dir)
+            .ok()
+    };
+    let seal = |contents: &[u8], retire: Vec<[u8; 32]>| {
+        let (sealer, registrations) = Sealer::prepare(&service, &[&advs[0], &advs[1]]).unwrap();
+        let bindings: Vec<_> = registrations.iter().map(|g| g.binding).collect();
+        let params = RegisterParams {
+            principal: service.clone(),
+            kind: Kind::File,
+            retire,
+        };
+        let (request, pending) =
+            register_request(&advs[0], &service.to_string(), &params, &bindings);
+        let response = r.send(0, Operation::Register, &request).unwrap();
+        pending
+            .finish_register(&response, &advs[0], &params)
+            .unwrap();
+        sealer.seal_file(contents).unwrap()
+    };
+
+    let first = Sealed::from_bytes(&seal(b"first", Vec::new()).to_bytes()).unwrap();
+    assert_eq!(first.kind(), Kind::File);
+    assert_eq!(first.unseal_contents(recover).unwrap().as_ref(), b"first");
+    assert!(matches!(first.unseal(recover), Err(Error::Mismatch(_))));
+
+    // A reseal retires the bindings it replaces; the keytab set is untouched.
+    let second = seal(b"second", first.bindings().unwrap());
+    assert!(first.unseal_contents(recover).is_err());
+    assert_eq!(second.unseal_contents(recover).unwrap().as_ref(), b"second");
+    assert!(!r.dir.escrow.borrow().contains_key(&service.to_string()));
+
+    // Another principal's ticket cannot register for the service.
+    let params = RegisterParams {
+        principal: service.clone(),
+        kind: Kind::File,
+        retire: second.bindings().unwrap(),
+    };
+    let host = Principal::host(HOST, REALM).to_string();
+    let (request, _) = register_request(&advs[0], &host, &params, &[]);
+    assert!(r.send(0, Operation::Register, &request).is_err());
+    second.unseal_contents(recover).unwrap();
+
+    // Nor can a registration be sent to the rekey endpoint.
+    let (request, _) = register_request(&advs[0], &service.to_string(), &params, &[]);
+    assert!(r.send(0, Operation::Rekey, &request).is_err());
 }
 
 #[test]

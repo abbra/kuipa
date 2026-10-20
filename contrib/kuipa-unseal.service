@@ -1,13 +1,15 @@
 [Unit]
-Description=Unseal the FreeIPA host keytab (file mode)
+Description=Unseal the FreeIPA host keytab and other kuipa-protected keytabs and files
 After=network-online.target
 Wants=network-online.target
 Before=sssd.service gssproxy.service certmonger.service
-ConditionPathExists=/etc/ipa/krb5.keytab.sealed
+ConditionPathExists=/var/lib/ipa-client/ku/state.json
+# A service that uses a protected keytab or file orders itself after this
+# unit (a drop-in with After= and Wants=kuipa-unseal.service).
 
 [Service]
 Type=oneshot
-ExecStart=/usr/libexec/kuipa-unseal
+ExecStart=/usr/libexec/kuipa-unseal --all
 # 75: no server reachable yet; the timer retries.
 RestartForceExitStatus=75
 Restart=on-failure

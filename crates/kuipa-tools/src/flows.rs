@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use kuipa_enroll::bundle::{Bundle, Opener};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::epoch::verify_chain;
-use kuipa_enroll::escrow::{EscrowRequest, SealedKeytab, Sealer};
+use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer};
 use kuipa_enroll::join::{
     AuthType, KERBEROS_BINDING_LEN, KerberosBinding, Operation, PendingJoin, Prepared, Request,
     Response, kerberos_prf_input,
@@ -17,11 +17,12 @@ use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::payload::Enrollment;
 use kuipa_enroll::realm::{Deployment, TrustedRealm, VerifiedRealm, krb5_realm_section};
 use kuipa_gssapi::GssClientCred;
+use native_ossl::util::SecretBuf;
 use serde_json::{Value, json};
 use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, unix_seconds};
 
 use crate::net::{Endpoint, NetError, Trust};
-use crate::paths::{self, Error, Holder, Paths, State};
+use crate::paths::{self, Contents, Error, Holder, Paths, Protected, State};
 
 /// The anchor epoch watermark (§4.8): sequence number and head hash.
 type Epoch = (u64, [u8; 32]);
@@ -339,12 +340,7 @@ fn gss_token(
 }
 
 fn path_for(op: Operation, request: &Request) -> String {
-    let name = match op {
-        Operation::Join => "join",
-        Operation::Rekey => "rekey",
-        Operation::Stage => "stage",
-    };
-    format!("{name}/{}", request.kid())
+    format!("{}/{}", op.path(), request.kid())
 }
 
 /// Run one exchange against the first usable server of `deployment`,
@@ -360,8 +356,36 @@ fn exchange(
     anchors: &[Thumbprint],
     known: Option<(u64, [u8; 32])>,
     op: Operation,
-    mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
+    build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
 ) -> Result<(Enrollment, VerifiedRealm), Error> {
+    exchange_with(
+        deployment,
+        trust,
+        realm,
+        anchors,
+        known,
+        op,
+        build,
+        |pending, response, adv| {
+            let enrollment = pending.finish(response, adv)?;
+            trace_enrollment(adv.server(), &enrollment);
+            Ok(enrollment)
+        },
+    )
+}
+
+/// As [`exchange`], for any operation: `finish` opens the response.
+#[allow(clippy::too_many_arguments)]
+fn exchange_with<T>(
+    deployment: &Deployment,
+    trust: &Trust,
+    realm: &str,
+    anchors: &[Thumbprint],
+    known: Option<(u64, [u8; 32])>,
+    op: Operation,
+    mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
+    finish: impl Fn(PendingJoin, &Response, &VerifiedRealm) -> Result<T, Error>,
+) -> Result<(T, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
         let (endpoint, adv, _) = match verified(server, trust, realm, anchors, known) {
@@ -400,9 +424,8 @@ fn exchange(
             );
             match endpoint.post(&path_for(op, &request), request.to_bytes()) {
                 Ok(body) => {
-                    let enrollment = pending.finish(&Response::from_bytes(&body)?, &adv)?;
-                    trace_enrollment(server, &enrollment);
-                    return Ok((enrollment, adv));
+                    let out = finish(pending, &Response::from_bytes(&body)?, &adv)?;
+                    return Ok((out, adv));
                 }
                 Err(NetError::Unreachable(e)) if attempt == 0 => {
                     tracing::debug!(server = %server, "not processed, trying the next server: {e}");
@@ -474,6 +497,8 @@ fn install(paths: &Paths, enrollment: &Enrollment, fqdn: &str) -> Result<(), Err
         fqdn: fqdn.into(),
         servers,
         holder: Holder::None,
+        // Other protected keytabs and files outlive a re-enrollment.
+        protected: State::load(paths).map(|s| s.protected).unwrap_or_default(),
     }
     .store(paths)
 }
@@ -935,40 +960,146 @@ pub fn complete(paths: &Paths) -> Result<Value, Error> {
     Ok(json!({ "rotated": rotated, "remaining_for_ipa_client_install": deferred }))
 }
 
-/// Unseal the sealed keytab through any server.
+/// Send escrow recovery requests to the servers a sealed object names.
+fn recover(trust: &Trust) -> impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse> + '_ {
+    move |server, request| {
+        tracing::debug!(
+            server = %server,
+            "escrow recovery for {} with escrow key {}",
+            request.principal(),
+            request.recovery().kid()
+        );
+        let endpoint = Endpoint::new(server, trust).ok()?;
+        let body = endpoint
+            .post(
+                &format!("rec/{}", request.recovery().kid()),
+                request.to_bytes(),
+            )
+            .ok()?;
+        RecoveryResponse::from_bytes(&body).ok()
+    }
+}
+
+/// Unseal the sealed host keytab through any server.
 ///
 /// # Errors
 ///
 /// [`Outcome::RetryLater`] if no server could unseal it.
 pub fn unseal(paths: &Paths) -> Result<Keytab, Error> {
-    let sealed = SealedKeytab::from_bytes(&fs::read(paths.sealed())?)?;
+    let sealed = Sealed::from_bytes(&fs::read(paths.sealed())?)?;
     let trust = ca_trust(paths)?;
     sealed
-        .unseal(|server, request: &EscrowRequest| {
-            tracing::debug!(
-                server = %server,
-                "escrow recovery for {} with escrow key {}",
-                request.principal(),
-                request.recovery().kid()
-            );
-            let endpoint = Endpoint::new(server, &trust).ok()?;
-            let body = endpoint
-                .post(
-                    &format!("rec/{}", request.recovery().kid()),
-                    request.to_bytes(),
-                )
-                .ok()?;
-            RecoveryResponse::from_bytes(&body).ok()
-        })
+        .unseal(recover(&trust))
         .map_err(|_| Outcome::RetryLater("no server could unseal the keytab".into()).into())
 }
 
-/// `kuipa protect`: seal the host keytab (file mode, §7.3).
+/// Unseal any sealed keytab or file through any server: a keytab comes
+/// back as it was sealed, checked to be its principal's.
 ///
 /// # Errors
 ///
-/// Any error; the plaintext keytab stays until a test unseal succeeded.
-pub fn protect(paths: &Paths) -> Result<Value, Error> {
+/// [`Outcome::RetryLater`] if no server could unseal it, or a malformed
+/// file.
+pub fn unseal_file(paths: &Paths, sealed: &std::path::Path) -> Result<SecretBuf, Error> {
+    let what = sealed.display().to_string();
+    let sealed = Sealed::from_bytes(&fs::read(sealed)?)?;
+    let trust = ca_trust(paths)?;
+    let retry =
+        |_| -> Error { Outcome::RetryLater(format!("no server could unseal {what}")).into() };
+    match sealed.kind() {
+        Kind::Keytab => sealed.unseal_mit(recover(&trust)).map_err(retry),
+        Kind::File => sealed.unseal_contents(recover(&trust)).map_err(retry),
+    }
+}
+
+/// Write the unsealed copy of `item` with the original file's mode and
+/// ownership.
+fn write_copy(paths: &Paths, item: &Protected, contents: &[u8]) -> Result<(), Error> {
+    let copy = paths.run_copy(&item.path);
+    paths::write_file(&copy, contents, item.mode)?;
+    std::os::unix::fs::chown(&copy, Some(item.uid), Some(item.gid))?;
+    Ok(())
+}
+
+/// `kuipa-unseal --all` (boot): the host keytab if it is protected, and
+/// the unsealed copy of every other protected keytab and file.  Each one
+/// is tried even when another fails.
+///
+/// # Errors
+///
+/// [`Outcome::RetryLater`] if any could not be unsealed for want of a
+/// server, or the first other error.
+pub fn unseal_all(paths: &Paths) -> Result<Value, Error> {
+    let state = State::load(paths)?;
+    let mut written = Vec::new();
+    let mut failed = Vec::new();
+    let mut retry = false;
+    let mut note = |what: String, e: Error| {
+        retry |= e
+            .downcast_ref::<Outcome>()
+            .is_some_and(|o| matches!(o, Outcome::RetryLater(_)));
+        failed.push(format!("{what}: {e}"));
+    };
+    if state.holder == Holder::File {
+        match unseal(paths)
+            .and_then(|k| paths::write_file(&paths.run_keytab(), k.to_mit()?.as_ref(), 0o600))
+        {
+            Ok(()) => written.push(paths.run_keytab().display().to_string()),
+            Err(e) => note(paths.keytab().display().to_string(), e),
+        }
+    }
+    for item in &state.protected {
+        match unseal_file(paths, &paths::sealed_for(&item.path))
+            .and_then(|c| write_copy(paths, item, c.as_ref()))
+        {
+            Ok(()) => written.push(paths.run_copy(&item.path).display().to_string()),
+            Err(e) => note(item.path.display().to_string(), e),
+        }
+    }
+    if failed.is_empty() {
+        Ok(json!({ "written": written }))
+    } else if retry {
+        Err(Outcome::RetryLater(failed.join("; ")).into())
+    } else {
+        Err(failed.join("; ").into())
+    }
+}
+
+/// What `kuipa protect` and `unprotect` act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// The host keytab (file mode, §7.3).
+    Host,
+    /// Another keytab, a service's or a user's, sealed for its own
+    /// principal (§7.5).
+    Keytab(std::path::PathBuf),
+    /// Any file, sealed for the principal of `keytab` (default: the host
+    /// keytab), whose keys authenticate its registrations (§7.5).
+    File {
+        /// The file.
+        path: std::path::PathBuf,
+        /// The keytab of the principal to seal it for.
+        keytab: Option<std::path::PathBuf>,
+    },
+}
+
+/// `kuipa protect`: seal the host keytab (file mode, §7.3), or any other
+/// keytab or file (§7.5).
+///
+/// # Errors
+///
+/// Any error; the plaintext stays until a test unseal succeeded.
+pub fn protect(paths: &Paths, target: &Target) -> Result<Value, Error> {
+    match target {
+        Target::Host => protect_host(paths),
+        Target::Keytab(path) => protect_other(paths, Contents::Keytab, path, None),
+        Target::File { path, keytab } => {
+            protect_other(paths, Contents::File, path, keytab.as_deref())
+        }
+    }
+}
+
+fn protect_host(paths: &Paths) -> Result<Value, Error> {
     let state = State::load(paths)?;
     if state.holder != Holder::None {
         return Err("keytab protection is already on".into());
@@ -985,12 +1116,214 @@ pub fn protect(paths: &Paths) -> Result<Value, Error> {
     Ok(json!({ "holder": "file", "rotated": rotated, "sealed": paths.sealed() }))
 }
 
-/// `kuipa unprotect`: back to a plain keytab.
+/// Which binding set holds what `contents` names.
+fn kind_of(contents: Contents) -> Kind {
+    match contents {
+        Contents::Keytab => Kind::Keytab,
+        Contents::File => Kind::File,
+    }
+}
+
+/// The bindings of the seal in `sealed`, to retire; none if it is gone or
+/// unreadable.
+fn sealed_bindings(sealed: &std::path::Path) -> Result<Vec<[u8; 32]>, Error> {
+    Ok(fs::read(sealed)
+        .ok()
+        .and_then(|b| Sealed::from_bytes(&b).ok())
+        .map(|s| s.bindings())
+        .transpose()?
+        .unwrap_or_default())
+}
+
+/// `path` made absolute without resolving symlinks: a protected path is
+/// one.
+fn absolute(path: &std::path::Path) -> Result<std::path::PathBuf, Error> {
+    Ok(std::path::absolute(path)?)
+}
+
+/// Is `path` the host keytab (or, once protected, its unsealed copy)?
+fn is_host_keytab(paths: &Paths, path: &std::path::Path) -> bool {
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a == b || fs::canonicalize(a).is_ok_and(|a| fs::canonicalize(b).is_ok_and(|b| a == b))
+    };
+    same(path, &paths.keytab()) || same(path, &paths.run_keytab())
+}
+
+/// Register `bindings` for `params.principal`, authenticated by the keys
+/// in `keytab` (§7.5).  Returns the server that registered them.
+fn register(
+    paths: &Paths,
+    state: &State,
+    keytab: &std::path::Path,
+    params: &RegisterParams,
+    bindings: &[[u8; 32]],
+) -> Result<String, Error> {
+    let anchors = paths::read_anchors(paths)?;
+    let known = paths::read_epoch_from(&paths.anchors())?;
+    let trust = ca_trust(paths)?;
+    let cred = GssClientCred::from_keytab_initiate(
+        keytab.to_str().ok_or("non-UTF-8 keytab path")?,
+        &params.principal.to_string(),
+    )?;
+    let extra = params.to_bytes()?;
+    tracing::debug!(
+        "registering {} {:?} binding(s) for {}, retiring {}",
+        bindings.len(),
+        params.kind,
+        params.principal,
+        params.retire.len()
+    );
+    let ((), adv) = exchange_with(
+        &Deployment::servers(&state.servers),
+        &trust,
+        &state.realm,
+        &anchors,
+        known,
+        Operation::Register,
+        |adv| {
+            let p = Prepared::new(
+                adv,
+                Operation::Register,
+                &state.fqdn,
+                AuthType::Kerberos,
+                &Enctype::DEFAULT,
+            )?;
+            let target = format!("ipa-ku@{}", adv.server());
+            let (token, binding) = gss_token(&cred, &target, &p.channel_binding()?)?;
+            Ok(p.with_kerberos(binding).seal(&token, bindings, &extra)?)
+        },
+        |pending, response, adv| Ok(pending.finish_register(response, adv, params)?),
+    )?;
+    Ok(adv.server().to_owned())
+}
+
+/// Seal `path` (a keytab, or a file for the principal of `keytab`),
+/// register its bindings, test-unseal it, and only then replace it with a
+/// symlink to its unsealed copy.  Protecting it again reseals what is
+/// there now (after `ipa-getkeytab` wrote new keys, or the file changed)
+/// and retires the previous seal.
+fn protect_other(
+    paths: &Paths,
+    contents: Contents,
+    path: &std::path::Path,
+    keytab: Option<&std::path::Path>,
+) -> Result<Value, Error> {
+    let mut state = State::load(paths)?;
+    let path = absolute(path)?;
+    if is_host_keytab(paths, &path) {
+        return Err(
+            "that is the host keytab: run `kuipa protect` without --keytab or --file".into(),
+        );
+    }
+    let existing = state.protected.iter().position(|p| p.path == path);
+    if let Some(i) = existing
+        && state.protected[i].contents != contents
+    {
+        return Err(format!(
+            "{} is already protected as a {:?}",
+            path.display(),
+            state.protected[i].contents
+        )
+        .into());
+    }
+    // Through the symlink when already protected: the unsealed copy.
+    let plain = SecretBuf::new(fs::read(&path)?);
+    let owner_keytab = match (contents, existing, keytab) {
+        (Contents::Keytab, _, _) => path.clone(),
+        (Contents::File, Some(i), None) => state.protected[i].keytab.clone(),
+        (Contents::File, _, Some(k)) => absolute(k)?,
+        (Contents::File, None, None) => paths.keytab(),
+    };
+    let principal = Keytab::from_mit(&fs::read(&owner_keytab)?)?
+        .principal()
+        .clone();
+    if principal.realm() != state.realm {
+        return Err(format!("{principal} is not of this host's realm {}", state.realm).into());
+    }
+    let sealed_path = paths::sealed_for(&path);
+    let retire = match (contents, existing) {
+        (Contents::File, Some(_)) => sealed_bindings(&sealed_path)?,
+        _ => Vec::new(),
+    };
+
+    let anchors = paths::read_anchors(paths)?;
+    let trust = ca_trust(paths)?;
+    let servers = all_servers(&state, &trust, &anchors);
+    let refs: Vec<_> = servers.iter().collect();
+    let (sealer, registrations) = Sealer::prepare(&principal, &refs)?;
+    let bindings: Vec<_> = registrations.iter().map(|r| r.binding).collect();
+    let params = RegisterParams {
+        principal: principal.clone(),
+        kind: kind_of(contents),
+        retire,
+    };
+    let registrar = register(paths, &state, &owner_keytab, &params, &bindings)?;
+    let seal = match contents {
+        Contents::Keytab => sealer.seal_mit(plain.as_ref())?,
+        Contents::File => sealer.seal_file(plain.as_ref())?,
+    };
+    paths::write_file(&sealed_path, &seal.to_bytes(), 0o600)?;
+
+    // Test-unseal before the plaintext goes away.
+    let unsealed = unseal_file(paths, &sealed_path)?;
+    if unsealed.as_ref() != plain.as_ref() {
+        return Err(format!(
+            "test unseal returned something else; keeping {} as it is",
+            path.display()
+        )
+        .into());
+    }
+    let item = if let Some(i) = existing {
+        state.protected[i].clone()
+    } else {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(&path)?;
+        let (mode, uid, gid) = (meta.mode() & 0o7777, meta.uid(), meta.gid());
+        let (principal, keytab) = (principal.to_string(), owner_keytab);
+        let path = path.clone();
+        Protected {
+            contents,
+            path,
+            principal,
+            keytab,
+            mode,
+            uid,
+            gid,
+        }
+    };
+    write_copy(paths, &item, plain.as_ref())?;
+    if existing.is_none() {
+        paths::remove(&path)?;
+        std::os::unix::fs::symlink(paths.run_copy(&path), &path)?;
+        state.protected.push(item);
+        state.store(paths)?;
+    }
+    Ok(json!({
+        "contents": contents,
+        "path": path,
+        "principal": principal.to_string(),
+        "sealed": sealed_path,
+        "unsealed_copy": paths.run_copy(&path),
+        "servers": seal.servers(),
+        "registered_by": registrar,
+        "resealed": existing.is_some(),
+    }))
+}
+
+/// `kuipa unprotect`: back to a plain host keytab, or another keytab or
+/// file back in place, its bindings retired.
 ///
 /// # Errors
 ///
 /// Any error.
-pub fn unprotect(paths: &Paths) -> Result<Value, Error> {
+pub fn unprotect(paths: &Paths, target: &Target) -> Result<Value, Error> {
+    match target {
+        Target::Host => unprotect_host(paths),
+        Target::Keytab(path) | Target::File { path, .. } => unprotect_other(paths, path),
+    }
+}
+
+fn unprotect_host(paths: &Paths) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
     if state.holder == Holder::None {
         return Err("keytab protection is not on".into());
@@ -1005,6 +1338,52 @@ pub fn unprotect(paths: &Paths) -> Result<Value, Error> {
     state.holder = Holder::None;
     state.store(paths)?;
     Ok(json!({ "holder": "none" }))
+}
+
+fn unprotect_other(paths: &Paths, path: &std::path::Path) -> Result<Value, Error> {
+    let mut state = State::load(paths)?;
+    let path = absolute(path)?;
+    let i = state
+        .protected
+        .iter()
+        .position(|p| p.path == path)
+        .ok_or_else(|| format!("{} is not protected by kuipa", path.display()))?;
+    let item = state.protected[i].clone();
+    let sealed_path = paths::sealed_for(&path);
+    let copy = paths.run_copy(&path);
+    let plain = match fs::read(&copy) {
+        Ok(b) => SecretBuf::new(b),
+        Err(_) => unseal_file(paths, &sealed_path)?,
+    };
+    // Back in place first: the keytab authenticates the retirement.
+    paths::write_file(&path, plain.as_ref(), item.mode)?;
+    std::os::unix::fs::chown(&path, Some(item.uid), Some(item.gid))?;
+    let keytab = if item.contents == Contents::Keytab {
+        path.clone()
+    } else {
+        item.keytab.clone()
+    };
+    let params = RegisterParams {
+        principal: item.principal.parse()?,
+        kind: kind_of(item.contents),
+        retire: match item.contents {
+            Contents::Keytab => Vec::new(),
+            Contents::File => sealed_bindings(&sealed_path)?,
+        },
+    };
+    // Retiring needs a server; the plain file is back either way.
+    let retired = register(paths, &state, &keytab, &params, &[]).map_err(|e| e.to_string());
+    paths::remove(&sealed_path)?;
+    paths::remove(&copy)?;
+    state.protected.remove(i);
+    state.store(paths)?;
+    Ok(json!({
+        "contents": item.contents,
+        "path": path,
+        "principal": item.principal,
+        "retired": retired.is_ok(),
+        "retire_error": retired.err(),
+    }))
 }
 
 /// `kuipa status`: local state only.
@@ -1031,6 +1410,12 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
         "anchors": paths::read_anchors(paths).unwrap_or_default().iter().map(ToString::to_string).collect::<Vec<_>>(),
         "trusted_realms": paths.trusted_realms(),
         "protection": state.holder,
+        "protected": state.protected.iter().map(|p| json!({
+            "contents": p.contents,
+            "path": p.path,
+            "principal": p.principal,
+            "sealed": paths::sealed_for(&p.path),
+        })).collect::<Vec<_>>(),
         "pending": pending,
         "policy": {
             "ml_kem_768": tang_pqc::KemAlg::MlKem768.allowed_by_system().unwrap_or(false),
@@ -1126,6 +1511,19 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         problems.push(format!(
             "{e}: run `kuipa protect` again once servers are reachable"
         ));
+    }
+    for item in &state.protected {
+        if let Err(e) = unseal_file(paths, &paths::sealed_for(&item.path)) {
+            let flag = match item.contents {
+                Contents::Keytab => "--keytab",
+                Contents::File => "--file",
+            };
+            problems.push(format!(
+                "{}: {e}: run `kuipa protect {flag} {}` again once servers are reachable",
+                item.path.display(),
+                item.path.display()
+            ));
+        }
     }
     Ok(
         json!({ "ok": problems.is_empty(), "servers": servers, "kinit": kinit.is_ok(), "problems": problems }),
@@ -1616,6 +2014,19 @@ pub fn leave(paths: &Paths) -> Result<Value, Error> {
         // Leave a plain keytab behind for `ipa-join --unenroll`.
         if let Ok(b) = fs::read(paths.run_keytab()) {
             paths::write_file(&paths.keytab(), &b, 0o600)?;
+        }
+    }
+    // Other protected keytabs and files go back in place too; their
+    // bindings stay registered until the entries go or are cleared.
+    if let Ok(state) = State::load(paths) {
+        for item in &state.protected {
+            let copy = paths.run_copy(&item.path);
+            if let Ok(b) = fs::read(&copy) {
+                paths::write_file(&item.path, &b, item.mode)?;
+                std::os::unix::fs::chown(&item.path, Some(item.uid), Some(item.gid))?;
+            }
+            paths::remove(&paths::sealed_for(&item.path))?;
+            paths::remove(&copy)?;
         }
     }
     for realm in paths.trusted_realms() {

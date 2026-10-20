@@ -24,7 +24,8 @@ creates keys.
 * **Rekey:** host keys rotate with forward secrecy.
 * **Keytab at rest:** optionally, the keytab is sealed on disk, so a copy
   of the disk is useless without the IPA servers. It is unsealed at boot
-  by `kuipa-unseal`.
+  by `kuipa-unseal`. Service keytabs and any other file can be sealed the
+  same way, for the principal whose keys they hold or belong to.
 * **Offline enrollment:** an administrator stages a host and its keys in
   advance. The host enrolls from a sealed, signed bundle with no network
   access.
@@ -122,6 +123,7 @@ Then, on the host:
 ```sh
 kuipa enroll --server ipa1.example.test < enrollment-string
 kuipa protect    # optional: seal the keytab on disk
+kuipa protect --keytab /etc/httpd/http.keytab   # optional: a service keytab
 kuipa check
 ```
 
