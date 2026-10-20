@@ -176,6 +176,10 @@ step 0 "Rotate web1's keys: only the keytab bindings change" 'kuipa rotate-keys'
 step 0 "Unseal everything, as kuipa-unseal does at boot" 'kuipa-unseal --all'
 step 0 "Read the secret through its symlink" 'cat "$KUIPA_ROOT/etc/app/secret.conf"' \
     "token=playground"
+step 0 "Unseal it to standard output: only the plaintext, traces on stderr" \
+    'diff <(kuipa-unseal --sealed "$KUIPA_ROOT/etc/app/secret.conf.sealed" --out -) "$KUIPA_ROOT/etc/app/secret.conf"'
+step 1 "Refuse --out /dev/stdout, which would replace the link" \
+    'kuipa-unseal --sealed "$KUIPA_ROOT/etc/app/secret.conf.sealed" --out /dev/stdout'
 step 0 "Write the plain file back and retire its bindings" \
     'kuipa unprotect --file "$KUIPA_ROOT/etc/app/secret.conf"' \
     "are retired"

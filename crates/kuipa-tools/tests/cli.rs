@@ -231,3 +231,53 @@ fn output_never_cites_design_sections() {
         assert!(!text.contains('§'), "{text}");
     }
 }
+
+/// Run `kuipa-unseal --sealed <missing> args`, with standard output a pipe.
+fn unseal(args: &[&str]) -> (i32, String, Vec<u8>) {
+    let out = Command::new(env!("CARGO_BIN_EXE_kuipa-unseal"))
+        .args(["--sealed", "/nonexistent/app.conf.sealed"])
+        .args(args)
+        .env(
+            "KUIPA_ROOT",
+            std::env::temp_dir().join("kuipa-cli-unseal-none"),
+        )
+        .env_remove("KUIPA_TRACE")
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.stdout,
+    )
+}
+
+#[test]
+fn unseal_output_targets_are_checked_before_anything_is_read() {
+    // Replacing /dev/stdout (a symlink) atomically would replace the link.
+    let (code, stderr, _) = unseal(&["--out", "/dev/stdout"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("use `--out -`"), "{stderr}");
+
+    // Any other target that is not a regular file is refused too.
+    let dir = std::env::temp_dir().join(format!("kuipa-cli-unseal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(dir.join("target"), &link).unwrap();
+    let (code, stderr, _) = unseal(&["--out", link.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("not a regular file"), "{stderr}");
+    assert!(!dir.join("target").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Standard output as a pipe is accepted: the failure is the missing
+    // sealed file, and nothing is written to standard output.
+    let (code, stderr, stdout) = unseal(&["--out", "-"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(!stderr.contains("terminal"), "{stderr}");
+    assert_eq!(stdout, b"");
+
+    // --force only means something with --out.
+    let (code, _, _) = unseal(&["--force"]);
+    assert_eq!(code, 2);
+}

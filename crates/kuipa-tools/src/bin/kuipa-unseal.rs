@@ -7,10 +7,17 @@
 //! kuipa-unseal --all      boot: the host keytab if protected, and the
 //!                          unsealed copy of every other protected keytab
 //!                          and file
-//! kuipa-unseal --sealed S [--out F | --memfd]
-//!                          one sealed keytab or file: to F, to fd 3, or to
-//!                          its unsealed copy when kuipa protected it
+//! kuipa-unseal --sealed S [--out F | --out - [--force] | --memfd]
+//!                          one sealed keytab or file: to F, to standard
+//!                          output, to fd 3, or to its unsealed copy when
+//!                          kuipa protected it
 //! ```
+//!
+//! `--out -` writes to standard output as it is (a pipe or a file the shell
+//! opened), and refuses a terminal unless `--force`: keys and secrets do not
+//! belong in a scrollback.  Any other `--out` must name a regular file or
+//! nothing yet, outside `/dev`: it is replaced atomically, which for a
+//! symlink such as `/dev/stdout` would replace the link itself.
 //!
 //! `--verbose` / `--trace` (or `KUIPA_TRACE`) trace the requests on
 //! standard error, as for `kuipa`.
@@ -22,7 +29,7 @@
 //!
 //! Exit status: 0 success, 75 no server could unseal (retry later), 1 error.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -53,10 +60,13 @@ struct Args {
     /// A sealed keytab or file to unseal instead of the host keytab.
     #[arg(long, value_name = "FILE")]
     sealed: Option<PathBuf>,
-    /// Where to write what `--sealed` holds (default: its unsealed copy,
-    /// for one `kuipa protect` sealed).
+    /// Where to write what `--sealed` holds, `-` for standard output
+    /// (default: its unsealed copy, for one `kuipa protect` sealed).
     #[arg(long, value_name = "FILE", requires = "sealed")]
     out: Option<PathBuf>,
+    /// With `--out -`, write to standard output even when it is a terminal.
+    #[arg(long, requires = "out")]
+    force: bool,
     #[command(flatten)]
     tracing: Tracing,
 }
@@ -81,13 +91,54 @@ fn write_memfd(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn unseal_one(paths: &Paths, sealed: &Path, out: Option<&Path>, memfd: bool) -> Result<(), Error> {
+/// Where `--out` sends what was unsealed.
+#[derive(Clone, Copy)]
+enum Output<'a> {
+    Stdout,
+    File(&'a Path),
+}
+
+/// Check `--out` before anything is sent to a server.
+fn output(out: &Path, force: bool) -> Result<Output<'_>, Error> {
+    if out == Path::new("-") {
+        if std::io::stdout().is_terminal() && !force {
+            return Err("standard output is a terminal: redirect it, or give --force".into());
+        }
+        return Ok(Output::Stdout);
+    }
+    let absolute = std::path::absolute(out)?;
+    if absolute.starts_with("/dev") {
+        return Err(format!("--out {}: use `--out -` for standard output", out.display()).into());
+    }
+    match std::fs::symlink_metadata(out) {
+        Ok(m) if !m.file_type().is_file() => Err(format!(
+            "--out {}: not a regular file (it would be replaced, not written to)",
+            out.display()
+        )
+        .into()),
+        _ => Ok(Output::File(out)),
+    }
+}
+
+fn unseal_one(
+    paths: &Paths,
+    sealed: &Path,
+    out: Option<Output<'_>>,
+    memfd: bool,
+) -> Result<(), Error> {
     let bytes = flows::unseal_file(paths, sealed)?;
     if memfd {
         return write_memfd(bytes.as_ref());
     }
-    if let Some(out) = out {
-        return paths::write_file(out, bytes.as_ref(), 0o600);
+    match out {
+        Some(Output::Stdout) => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(bytes.as_ref())?;
+            stdout.flush()?;
+            return Ok(());
+        }
+        Some(Output::File(out)) => return paths::write_file(out, bytes.as_ref(), 0o600),
+        None => {}
     }
     let state = State::load(paths)?;
     let item = state
@@ -109,7 +160,12 @@ fn run(args: &Args) -> Result<(), Error> {
     }
     if let Some(sealed) = &args.sealed {
         let sealed = std::path::absolute(sealed)?;
-        return unseal_one(&paths, &sealed, args.out.as_deref(), args.memfd);
+        let out = args
+            .out
+            .as_deref()
+            .map(|o| output(o, args.force))
+            .transpose()?;
+        return unseal_one(&paths, &sealed, out, args.memfd);
     }
     let keytab = flows::unseal(&paths)?;
     let bytes = keytab.to_mit()?;
