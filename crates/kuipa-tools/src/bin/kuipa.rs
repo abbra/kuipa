@@ -360,13 +360,25 @@ enum SealAction {
 #[derive(Subcommand)]
 enum DeviceAction {
     /// Register this host's device key in a vault, making it (under a
-    /// passphrase) if this host has none.
+    /// passphrase) if this host has none, or using an ML-KEM key on a
+    /// PKCS#11 token.
     Add {
         /// The vault.
         vault: String,
-        /// Read the passphrase from this file.
+        /// Read the passphrase (or the token's PIN) from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
+        /// The ML-KEM key on a token, as a `pkcs11:` URI.
+        #[arg(long, value_name = "URI")]
+        pkcs11: Option<String>,
+        /// The token's PKCS#11 module.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "pkcs11",
+            default_value = "/usr/lib64/p11-kit-proxy.so"
+        )]
+        module: String,
     },
     /// Remove a device from a vault.
     Remove {
@@ -1613,7 +1625,7 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
     let value = match file {
         Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
         None if std::io::stdin().is_terminal() => {
-            let first = prompt("device key passphrase", true)?;
+            let first = prompt("device key passphrase or token PIN", true)?;
             if confirm && prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
                 return Err("the passphrases differ".into());
             }
@@ -1638,9 +1650,17 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             DeviceAction::Add {
                 vault,
                 passphrase_file,
+                pkcs11,
+                module,
             } => {
-                let pass = passphrase(passphrase_file.as_deref(), !user.device_key().exists())?;
-                seal.add_device(vault, pass.as_ref())
+                if let Some(uri) = pkcs11 {
+                    let pin = passphrase(passphrase_file.as_deref(), false)?;
+                    seal.add_token_device(vault, std::path::Path::new(module), uri, pin.as_ref())
+                } else {
+                    let first = !user.device_key().exists() && !user.token_device().exists();
+                    let pass = passphrase(passphrase_file.as_deref(), first)?;
+                    seal.add_device(vault, pass.as_ref())
+                }
             }
             DeviceAction::Remove { vault, id } => seal.remove_device(vault, id),
         },
@@ -1668,11 +1688,7 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
         } => {
             let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
             let bytes = std::fs::read(sealed)?;
-            let needs_device = bytes.starts_with(b"IPUS")
-                || !kuipa_enroll::vault::SealedVaultFile::from_bytes(&bytes)?
-                    .devices()
-                    .is_empty();
-            let pass = (needs_device && !kuipa_tools::seal::Seal::in_session(&bytes))
+            let pass = kuipa_tools::seal::Seal::needs_secret(&bytes)
                 .then(|| passphrase(passphrase_file.as_deref(), false))
                 .transpose()?;
             let plain = seal.open(&bytes, pass.as_ref().map(AsRef::as_ref))?;

@@ -108,6 +108,30 @@ impl UserPaths {
         self.dir.join("servers.json")
     }
 
+    /// The token device's location, when this host's device is a token.
+    #[must_use]
+    pub fn token_device(&self) -> PathBuf {
+        self.dir.join("device.pkcs11")
+    }
+
+    fn token(&self) -> Option<TokenConfig> {
+        serde_json::from_slice(&fs::read(self.token_device()).ok()?).ok()
+    }
+
+    /// This host's device under `secret` (the file's passphrase or the
+    /// token's PIN).
+    fn device(&self, secret: &[u8]) -> Result<HostDevice, Error> {
+        match self.token() {
+            Some(t) => Ok(HostDevice::Token(crate::pkcs11::TokenKey::open(
+                &t.module,
+                &t.uri,
+                secret,
+                &Self::runtime().unwrap_or_else(|_| self.dir.clone()),
+            )?)),
+            None => Ok(HostDevice::File(read_device_key(self, secret)?)),
+        }
+    }
+
     /// The runtime directory for sessions: `$KUIPA_RUNTIME_DIR`, else
     /// `$XDG_RUNTIME_DIR/kuipa`.
     fn runtime() -> Result<PathBuf, Error> {
@@ -185,11 +209,41 @@ pub fn read_device_key(user: &UserPaths, passphrase: &[u8]) -> Result<ExchangeKe
 }
 
 /// A live session on this host: the server's token, the unwrapped device
-/// key, and for an offline session the vault's released epoch keys.
+/// key (a file device's; a token's never leaves the token), and for an
+/// offline session the vault's released epoch keys.
 struct LiveSession {
     token: SessionToken,
-    key: ExchangeKeyPair,
+    key: Option<ExchangeKeyPair>,
     epochs: Vec<(u64, ExchangeKeyPair)>,
+}
+
+/// Where this host's token device is: its PKCS#11 module and key URI.
+#[derive(Serialize, Deserialize)]
+struct TokenConfig {
+    module: PathBuf,
+    uri: String,
+}
+
+/// This host's device key: a passphrase-protected file, or a token.
+enum HostDevice {
+    File(ExchangeKeyPair),
+    Token(crate::pkcs11::TokenKey),
+}
+
+impl HostDevice {
+    fn public(&self) -> &tang_pqc::ExchangeKey {
+        match self {
+            Self::File(k) => k.public(),
+            Self::Token(t) => t.public(),
+        }
+    }
+
+    fn as_device(&self) -> &dyn DeviceKey {
+        match self {
+            Self::File(k) => k,
+            Self::Token(t) => t,
+        }
+    }
 }
 
 /// The vault a sealed file (either format) belongs to.
@@ -301,7 +355,7 @@ impl<'a> Seal<'a> {
     /// A wrong passphrase, a policy without sessions, no runtime
     /// directory, or any other error.
     pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
-        let key = read_device_key(self.user, passphrase)?;
+        let key = self.user.device(passphrase)?;
         let (vaults, session, released) = self.op_with_session(&VaultOp::Unlock {
             name: name.into(),
             device: key.public().kid().to_string(),
@@ -310,7 +364,7 @@ impl<'a> Seal<'a> {
         let session = session.ok_or("the server started no session")?;
         let epochs = match (offline, released) {
             (false, _) => Vec::new(),
-            (true, Some(r)) => r.open(&key, session.vault())?,
+            (true, Some(r)) => r.open(key.as_device(), session.vault())?,
             (true, None) => return Err("the server released no session keys".into()),
         };
         let path = UserPaths::session(session.vault())?;
@@ -321,8 +375,12 @@ impl<'a> Seal<'a> {
             }
         }
         let mut w = Writer::new(SESSION_FILE_MAGIC);
+        let cached = match &key {
+            HostDevice::File(k) => k.to_jwk()?,
+            HostDevice::Token(_) => SecretBuf::with_len(0),
+        };
         w.bytes(&session.to_bytes())
-            .bytes(key.to_jwk()?.as_ref())
+            .bytes(cached.as_ref())
             .u64(u64::try_from(epochs.len())?);
         for (epoch, k) in &epochs {
             w.u64(*epoch).bytes(k.to_jwk()?.as_ref());
@@ -358,7 +416,10 @@ impl<'a> Seal<'a> {
         let parsed = (|| -> Result<_, Error> {
             let mut r = Reader::new(bytes.as_ref(), SESSION_FILE_MAGIC, "session")?;
             let token = SessionToken::from_bytes(r.bytes()?)?;
-            let key = ExchangeKeyPair::from_jwk(r.bytes()?)?;
+            let key = match r.bytes()? {
+                [] => None,
+                jwk => Some(ExchangeKeyPair::from_jwk(jwk)?),
+            };
             let mut epochs = Vec::new();
             for _ in 0..r.u64()? {
                 let epoch = r.u64()?;
@@ -374,6 +435,22 @@ impl<'a> Seal<'a> {
                 None
             }
         }
+    }
+
+    /// Whether opening `sealed` needs the device key's passphrase or the
+    /// token's PIN: the file has device shares, and no session holds the
+    /// key unwrapped.
+    #[must_use]
+    pub fn needs_secret(sealed: &[u8]) -> bool {
+        let has_devices = if sealed.starts_with(b"IPUS") {
+            true
+        } else {
+            SealedVaultFile::from_bytes(sealed).is_ok_and(|f| !f.devices().is_empty())
+        };
+        has_devices
+            && vault_of(sealed)
+                .and_then(|v| Self::session_for(&v))
+                .is_none_or(|l| l.key.is_none())
     }
 
     /// Whether `sealed` can open in a live session, without a passphrase.
@@ -531,22 +608,64 @@ impl<'a> Seal<'a> {
     /// A wrong passphrase for an existing key, a refusal, or any other
     /// error.
     pub fn add_device(&self, name: &str, passphrase: &[u8]) -> Result<Value, Error> {
-        let key = if self.user.device_key().exists() {
-            read_device_key(self.user, passphrase)?
+        let (key, kind) = if self.user.token().is_some() {
+            (self.user.device(passphrase)?, DeviceType::Pkcs11)
+        } else if self.user.device_key().exists() {
+            (
+                HostDevice::File(read_device_key(self.user, passphrase)?),
+                DeviceType::File,
+            )
         } else {
             let key = ExchangeKeyPair::generate(KemAlg::MlKem768)?;
             write_device_key(self.user, &key, passphrase)?;
-            key
+            (HostDevice::File(key), DeviceType::File)
         };
         let public = self.public()?;
         let v = self.op(&VaultOp::AddDevice {
             name: name.into(),
             label: public.fqdn,
-            kind: DeviceType::File,
+            kind,
             alg: key.public().alg().id(),
             key: tang_pqc::b64::encode(key.public().as_bytes()),
         })?;
         Ok(describe_all(&v))
+    }
+
+    /// `kuipa seal device add --pkcs11 URI`: make the ML-KEM key at `uri`
+    /// on a token (through PKCS#11 `module`) this host's device, and
+    /// register it in vault `name`.  `pin` logs in to the token.
+    ///
+    /// # Errors
+    ///
+    /// The token or key cannot be reached, a refusal, or any other error.
+    pub fn add_token_device(
+        &self,
+        name: &str,
+        module: &Path,
+        uri: &str,
+        pin: &[u8],
+    ) -> Result<Value, Error> {
+        if self.user.device_key().exists() {
+            return Err(
+                "this host already has a passphrase device key: one device per host".into(),
+            );
+        }
+        let config = TokenConfig {
+            module: module.to_path_buf(),
+            uri: uri.to_owned(),
+        };
+        // Reach the key before remembering where it is.
+        crate::pkcs11::TokenKey::open(
+            module,
+            uri,
+            pin,
+            &UserPaths::runtime().unwrap_or_else(|_| self.user.dir.clone()),
+        )?;
+        self.user.write(
+            &self.user.token_device(),
+            &serde_json::to_vec_pretty(&config)?,
+        )?;
+        self.add_device(name, pin)
     }
 
     /// `kuipa seal device remove`.
@@ -630,21 +749,30 @@ impl<'a> Seal<'a> {
                 .iter()
                 .find(|(e, _)| *e == file.epoch())
                 .ok_or("the session was started before this file's epoch: unlock again")?;
-            return Ok(file.open(epoch_key, &live.key)?);
+            let fetched;
+            let device = if let Some(k) = &live.key {
+                k as &dyn DeviceKey
+            } else {
+                let secret = passphrase.ok_or("the file needs this host's token: give its PIN")?;
+                fetched = self.user.device(secret)?;
+                fetched.as_device()
+            };
+            return Ok(file.open(epoch_key, device)?);
         }
         let file = SealedVaultFile::from_bytes(sealed)?;
         let session = Self::session_for(file.vault());
         let unwrapped;
-        let device = if let Some(live) = &session {
-            Some(&live.key)
-        } else if file.devices().is_empty() {
-            None
-        } else {
-            let passphrase =
-                passphrase.ok_or("the file needs this host's device key: give its passphrase")?;
-            unwrapped = read_device_key(self.user, passphrase)?;
-            Some(&unwrapped)
-        };
+        let device: Option<&dyn DeviceKey> =
+            if let Some(k) = session.as_ref().and_then(|l| l.key.as_ref()) {
+                Some(k)
+            } else if file.devices().is_empty() && session.is_none() {
+                None
+            } else {
+                let passphrase = passphrase
+                    .ok_or("the file needs this host's device key: give its passphrase or PIN")?;
+                unwrapped = self.user.device(passphrase)?;
+                Some(unwrapped.as_device())
+            };
         let trust = flows::ca_trust(self.host)?;
         // A ticket is sent whenever one is available: vaults that do not
         // ask for it ignore it.
@@ -662,7 +790,7 @@ impl<'a> Seal<'a> {
         };
         file.open(
             Unlock {
-                device: device.map(|k| k as &dyn DeviceKey),
+                device,
                 session: session.as_ref().map(|l| &l.token),
                 ticket,
             },

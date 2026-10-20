@@ -1101,9 +1101,12 @@ ipaKUVaultDevice = { "id": thumbprint(dpk), "label", "dpk": <ML-KEM public key>,
 | `file` | `device.key` in the user's kuipa directory: `IPDK(kdf, iterations, salt, GCM_k(private JWK))` with `k = PBKDF2-HMAC-SHA-512(passphrase, salt)`, 600 000 iterations (native-ossl exports no encrypted PKCS#8 for ML-KEM keys, so the format is kuipa's own) | `any` |
 | `passkey` | a key file encrypted under the FIDO2 `hmac-secret` (WebAuthn PRF) output of a passkey; every use needs a touch or PIN | `hardware-wrapped` |
 | `pkcs11-wrapped` | a key file wrapped by an AES key on a PKCS#11 token (`CKM_AES_KEY_WRAP_KWP`); RSA or EC wrapping is refused (harvest-now-decrypt-later) | `hardware-wrapped` |
-| `pkcs11` | an ML-KEM key generated on a PKCS#11 3.2 token (`CKM_ML_KEM`), non-extractable, used by `pkcs11:` URI through OpenSSL's pkcs11-provider | `hardware-bound` |
+| `pkcs11` | an ML-KEM key generated on a PKCS#11 3.2 token (`CKM_ML_KEM`), non-extractable, used by `pkcs11:` URI through OpenSSL's pkcs11-provider (implemented: kuipa loads the provider into its own library context with a configuration written to the user's runtime directory, passes the PIN as the URI's `pin-value`, and decapsulates on the token; the host remembers the module and URI in `device.pkcs11`; tested with kryoptic) | `hardware-bound` |
 
-A type sets the highest level a device can have; the server grants it only
+No attestation is verified yet, so every device is registered at `any`.
+A session cannot cache a token's key (it never leaves the token), so
+opening during a session still asks for the PIN. A type sets the highest
+level a device can have; the server grants it only
 when the registration's attestation verifies, and records `any` otherwise.
 A software token behind PKCS#11 (SoftHSM), or a passkey without
 attestation, is an `any` device. That is also the unattended case: a token
