@@ -550,7 +550,12 @@ mod tests {
         fn register_escrow(&self, _: &Principal, _: &[[u8; 32]]) -> Result<(), DirectoryError> {
             unreachable!()
         }
-        fn escrow_allowed(&self, _: &Principal, _: &[u8; 32]) -> Result<bool, DirectoryError> {
+        fn escrow_allowed(
+            &self,
+            _: &Principal,
+            _: crate::escrow::Kind,
+            _: &[u8; 32],
+        ) -> Result<bool, DirectoryError> {
             unreachable!()
         }
         fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {

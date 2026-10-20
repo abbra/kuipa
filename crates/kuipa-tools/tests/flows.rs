@@ -97,7 +97,12 @@ impl Directory for Dir {
     fn register_escrow(&self, _: &Principal, _: &[[u8; 32]]) -> Result<(), DirectoryError> {
         Ok(())
     }
-    fn escrow_allowed(&self, _: &Principal, _: &[u8; 32]) -> Result<bool, DirectoryError> {
+    fn escrow_allowed(
+        &self,
+        _: &Principal,
+        _: kuipa_enroll::escrow::Kind,
+        _: &[u8; 32],
+    ) -> Result<bool, DirectoryError> {
         Ok(false)
     }
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
