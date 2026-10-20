@@ -171,6 +171,8 @@ by step.
 * [docs/local-ci.md](docs/local-ci.md): the CI jobs and the playground
 * [docs/sealing.md](docs/sealing.md): sealing your own files with
   `kuipa seal`, by use case (planned)
+* [docs/machines.md](docs/machines.md): kuipa on cloud virtual machines,
+  by use case
 * [TODO.md](TODO.md): planned work
 
 ## Contributing

@@ -1,5 +1,5 @@
-# /etc/gssproxy/50-nfs-server.conf — needs the keytab_loader extension (§7.5),
-# which is not in gssproxy yet.
+# /etc/gssproxy/50-nfs-server.conf — needs gssproxy's keytab_loader (DESIGN
+# §7.4), submitted as https://github.com/gssapi/gssproxy/pull/135.
 [service/nfs-server]
   mechs = krb5
   cred_store = keytab:MEMORY:nfs-server
