@@ -47,17 +47,34 @@ pub struct App<D> {
 
 /// Admit a request for `host`, or the status (`429`) to answer.
 fn admit<D>(app: &App<D>, what: &str, host: &str, headers: &HeaderMap) -> Result<(), StatusCode> {
+    admit_for(app, what, Some(host), headers)
+}
+
+/// As [`admit`]; with no `host`, only the source's bucket is used: for
+/// operations that are only ever Kerberos-authenticated (registration,
+/// vault operations), where there is nothing to guess, and whose many
+/// users on one host must not share that host's allowance.
+fn admit_for<D>(
+    app: &App<D>,
+    what: &str,
+    host: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), StatusCode> {
     let source =
         limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
-    app.limiter
-        .check(host, source.as_deref())
-        .map_err(|limited| {
-            eprintln!(
-                "kuipad: {what}: rate limited ({limited:?}, source {})",
-                source.as_deref().unwrap_or("unknown")
-            );
-            StatusCode::TOO_MANY_REQUESTS
-        })
+    match host {
+        Some(host) => app.limiter.check(host, source.as_deref()),
+        None => source
+            .as_deref()
+            .map_or(Ok(()), |s| app.limiter.check_source(s)),
+    }
+    .map_err(|limited| {
+        eprintln!(
+            "kuipad: {what}: rate limited ({limited:?}, source {})",
+            source.as_deref().unwrap_or("unknown")
+        );
+        StatusCode::TOO_MANY_REQUESTS
+    })
 }
 
 /// The router.
@@ -252,7 +269,11 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
         Err(e) => return refused("request", &e),
     };
     let what = format!("{op:?} {}", request.fqdn());
-    if let Err(status) = admit(&app, &what, request.fqdn(), headers) {
+    let host = match op {
+        Operation::Register | Operation::Vault => None,
+        _ => Some(request.fqdn()),
+    };
+    if let Err(status) = admit_for(&app, &what, host, headers) {
         return status.into_response();
     }
     let result = tokio::task::spawn_blocking(move || {

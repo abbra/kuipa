@@ -68,6 +68,11 @@ const VAULT_STATE_ATTR: &str = "ipaKUVaultState";
 /// Per-server release counts, `<server> <count>`, one value per server
 /// (§7.6.7).
 const VAULT_UNLOCKS_ATTR: &str = "ipaKUVaultUnlocks";
+/// Offline-session keys, one JSON value per epoch (§7.6.6).
+const VAULT_SESSION_KEY_ATTR: &str = "ipaKUVaultSessionKey";
+/// A server's current escrow key on its `cn=masters` entry, `<KEM id>
+/// <base64url key>` (§7.6.6).
+const SERVER_ESCROW_KEY_ATTR: &str = "ipaKUServerEscrowKey";
 /// The realm's vault limits, JSON (new schema).
 const VAULT_LIMITS_ATTR: &str = "ipaKUVaultLimits";
 /// Trust invitations, `<hex secret hash> <not after>` (new schema).
@@ -280,6 +285,13 @@ impl LdapDirectory {
             devices,
             state,
             unlocks: Self::unlock_counts(entry).iter().map(|(_, n)| n).sum(),
+            session_keys: entry
+                .attrs
+                .get(&VAULT_SESSION_KEY_ATTR.to_lowercase())
+                .into_iter()
+                .flatten()
+                .map(|k| serde_json::from_str(k))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -297,8 +309,16 @@ impl LdapDirectory {
             .collect()
     }
 
-    fn vault_attrs(vault: &Vault) -> Result<(String, Vec<String>, &'static str), DirectoryError> {
+    #[allow(clippy::type_complexity)]
+    fn vault_attrs(
+        vault: &Vault,
+    ) -> Result<(String, Vec<String>, &'static str, Vec<String>), DirectoryError> {
         let policy = serde_json::to_string(&vault.policy)?;
+        let keys = vault
+            .session_keys
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
         let devices = vault
             .devices
             .iter()
@@ -308,7 +328,7 @@ impl LdapDirectory {
             State::Enabled => "enabled",
             State::Revoked => "revoked",
         };
-        Ok((policy, devices, state))
+        Ok((policy, devices, state, keys))
     }
 
     fn trusts_dn(&self) -> String {
@@ -693,7 +713,7 @@ impl Directory for LdapDirectory {
     }
 
     fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        let (policy, devices, state) = Self::vault_attrs(vault)?;
+        let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
         let id = vault.id.to_string();
         self.service_conn()?.add_s(
             &self.vault_dn(&vault.id),
@@ -711,6 +731,10 @@ impl Directory for LdapDirectory {
                     devices.iter().map(String::as_bytes).collect(),
                 ),
                 (VAULT_STATE_ATTR, vec![state.as_bytes()]),
+                (
+                    VAULT_SESSION_KEY_ATTR,
+                    keys.iter().map(String::as_bytes).collect(),
+                ),
             ]
             .into_iter()
             .filter(|(_, v)| !v.is_empty())
@@ -735,6 +759,7 @@ impl Directory for LdapDirectory {
                 VAULT_DEVICE_ATTR,
                 VAULT_STATE_ATTR,
                 VAULT_UNLOCKS_ATTR,
+                VAULT_SESSION_KEY_ATTR,
             ],
         ) {
             Ok(entries) => entries.first().map(Self::vault_from).transpose(),
@@ -747,7 +772,7 @@ impl Directory for LdapDirectory {
     }
 
     fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        let (policy, devices, state) = Self::vault_attrs(vault)?;
+        let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
         self.service_conn()?.modify_s(
             &self.vault_dn(&vault.id),
             &[
@@ -758,6 +783,11 @@ impl Directory for LdapDirectory {
                     devices.iter().map(String::as_bytes).collect(),
                 ),
                 (ModOp::Replace, VAULT_STATE_ATTR, vec![state.as_bytes()]),
+                (
+                    ModOp::Replace,
+                    VAULT_SESSION_KEY_ATTR,
+                    keys.iter().map(String::as_bytes).collect(),
+                ),
             ],
         )?;
         eprintln!(
@@ -786,6 +816,7 @@ impl Directory for LdapDirectory {
                 VAULT_DEVICE_ATTR,
                 VAULT_STATE_ATTR,
                 VAULT_UNLOCKS_ATTR,
+                VAULT_SESSION_KEY_ATTR,
             ],
         ) {
             Ok(e) => e,
@@ -829,6 +860,60 @@ impl Directory for LdapDirectory {
         mods.push((ModOp::Add, VAULT_UNLOCKS_ATTR, vec![new.as_bytes()]));
         svc.modify_s(&dn, &mods)?;
         Ok(true)
+    }
+
+    fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
+        let base = format!("cn=masters,cn=ipa,cn=etc,{}", self.cfg.basedn);
+        let entries = self.service_conn()?.search(
+            &base,
+            Scope::OneLevel,
+            &format!("({SERVER_ESCROW_KEY_ATTR}=*)"),
+            &["cn", SERVER_ESCROW_KEY_ATTR],
+        )?;
+        Ok(entries
+            .iter()
+            .filter_map(|e| {
+                let server = e.attrs.get("cn")?.first()?.clone();
+                let value = e
+                    .attrs
+                    .get(&SERVER_ESCROW_KEY_ATTR.to_lowercase())?
+                    .first()?;
+                let (alg, key) = value.split_once(' ')?;
+                let key = tang_pqc::ExchangeKey::from_bytes(
+                    tang_pqc::KemAlg::from_id(alg.parse().ok()?).ok()?,
+                    &tang_pqc::b64::decode(key).ok()?,
+                )
+                .ok()?;
+                Some((server, key))
+            })
+            .collect())
+    }
+
+    fn publish_escrow_key(
+        &self,
+        server: &str,
+        key: &tang_pqc::ExchangeKey,
+    ) -> Result<(), DirectoryError> {
+        let dn = format!(
+            "cn={},cn=masters,cn=ipa,cn=etc,{}",
+            dn_escape(server),
+            self.cfg.basedn
+        );
+        let value = format!(
+            "{} {}",
+            key.alg().id(),
+            tang_pqc::b64::encode(key.as_bytes())
+        );
+        self.service_conn()?.modify_s(
+            &dn,
+            &[(
+                ModOp::Replace,
+                SERVER_ESCROW_KEY_ATTR,
+                vec![value.as_bytes()],
+            )],
+        )?;
+        eprintln!("kuipad: published {server}'s escrow key {}", key.kid());
+        Ok(())
     }
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {

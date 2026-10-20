@@ -27,8 +27,8 @@ use kuipa_enroll::join::{AuthType, Operation, Prepared};
 use kuipa_enroll::keytab::Enctype;
 use kuipa_enroll::realm::{Deployment, VerifiedRealm};
 use kuipa_enroll::vault::{
-    Descriptor, DeviceKey, DeviceType, Policy, SealedVaultFile, SessionToken, TicketSource, Unlock,
-    VaultOp, VerifiedDescriptor,
+    Descriptor, DeviceKey, DeviceType, Policy, ReleasedKeys, SealedVaultFile, SessionSealedFile,
+    SessionToken, TicketSource, Unlock, VaultOp, VerifiedDescriptor,
 };
 use kuipa_gssapi::GssClientCred;
 use native_ossl::digest::DigestAlg;
@@ -184,6 +184,25 @@ pub fn read_device_key(user: &UserPaths, passphrase: &[u8]) -> Result<ExchangeKe
     Ok(ExchangeKeyPair::from_jwk(jwk.as_ref())?)
 }
 
+/// A live session on this host: the server's token, the unwrapped device
+/// key, and for an offline session the vault's released epoch keys.
+struct LiveSession {
+    token: SessionToken,
+    key: ExchangeKeyPair,
+    epochs: Vec<(u64, ExchangeKeyPair)>,
+}
+
+/// The vault a sealed file (either format) belongs to.
+fn vault_of(sealed: &[u8]) -> Option<kuipa_enroll::escrow::VaultId> {
+    if sealed.starts_with(b"IPUS") {
+        SessionSealedFile::from_bytes(sealed)
+            .ok()
+            .map(|f| *f.vault())
+    } else {
+        SealedVaultFile::from_bytes(sealed).ok().map(|f| *f.vault())
+    }
+}
+
 /// One cached advertisement.
 #[derive(Serialize, Deserialize)]
 struct CachedAdvertisement {
@@ -224,10 +243,18 @@ impl<'a> Seal<'a> {
         Ok(self.op_with_session(op)?.0)
     }
 
+    #[allow(clippy::type_complexity)]
     fn op_with_session(
         &self,
         op: &VaultOp,
-    ) -> Result<(Vec<VerifiedDescriptor>, Option<SessionToken>), Error> {
+    ) -> Result<
+        (
+            Vec<VerifiedDescriptor>,
+            Option<SessionToken>,
+            Option<ReleasedKeys>,
+        ),
+        Error,
+    > {
         let public = self.public()?;
         let anchors = paths::read_anchors(self.host)?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
@@ -262,7 +289,7 @@ impl<'a> Seal<'a> {
                 .write(&self.user.vault(&v.vault().name)?, &d.to_bytes())?;
             verified.push(v);
         }
-        Ok((verified, reply.session))
+        Ok((verified, reply.session, reply.released))
     }
 
     /// `kuipa seal unlock`: start a re-authentication session for this
@@ -273,13 +300,19 @@ impl<'a> Seal<'a> {
     ///
     /// A wrong passphrase, a policy without sessions, no runtime
     /// directory, or any other error.
-    pub fn unlock(&self, name: &str, passphrase: &[u8]) -> Result<Value, Error> {
+    pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
         let key = read_device_key(self.user, passphrase)?;
-        let (vaults, session) = self.op_with_session(&VaultOp::Unlock {
+        let (vaults, session, released) = self.op_with_session(&VaultOp::Unlock {
             name: name.into(),
             device: key.public().kid().to_string(),
+            offline,
         })?;
         let session = session.ok_or("the server started no session")?;
+        let epochs = match (offline, released) {
+            (false, _) => Vec::new(),
+            (true, Some(r)) => r.open(&key, session.vault())?,
+            (true, None) => return Err("the server released no session keys".into()),
+        };
         let path = UserPaths::session(session.vault())?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
@@ -287,14 +320,19 @@ impl<'a> Seal<'a> {
                 fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
             }
         }
-        let bytes = Writer::new(SESSION_FILE_MAGIC)
-            .bytes(&session.to_bytes())
+        let mut w = Writer::new(SESSION_FILE_MAGIC);
+        w.bytes(&session.to_bytes())
             .bytes(key.to_jwk()?.as_ref())
-            .finish();
-        paths::write_file(&path, &bytes, 0o600)?;
+            .u64(u64::try_from(epochs.len())?);
+        for (epoch, k) in &epochs {
+            w.u64(*epoch).bytes(k.to_jwk()?.as_ref());
+        }
+        let bytes = SecretBuf::new(w.finish());
+        paths::write_file(&path, bytes.as_ref(), 0o600)?;
         Ok(json!({
             "vaults": vaults.iter().map(describe).collect::<Vec<_>>(),
             "session_until": session.not_after(),
+            "offline": offline,
         }))
     }
 
@@ -314,20 +352,23 @@ impl<'a> Seal<'a> {
     }
 
     /// The live session of vault `id`, if any; an ended one is removed.
-    fn session_for(id: &kuipa_enroll::escrow::VaultId) -> Option<(SessionToken, ExchangeKeyPair)> {
+    fn session_for(id: &kuipa_enroll::escrow::VaultId) -> Option<LiveSession> {
         let path = UserPaths::session(id).ok()?;
-        let bytes = fs::read(&path).ok()?;
+        let bytes = SecretBuf::new(fs::read(&path).ok()?);
         let parsed = (|| -> Result<_, Error> {
-            let mut r = Reader::new(&bytes, SESSION_FILE_MAGIC, "session")?;
+            let mut r = Reader::new(bytes.as_ref(), SESSION_FILE_MAGIC, "session")?;
             let token = SessionToken::from_bytes(r.bytes()?)?;
             let key = ExchangeKeyPair::from_jwk(r.bytes()?)?;
+            let mut epochs = Vec::new();
+            for _ in 0..r.u64()? {
+                let epoch = r.u64()?;
+                epochs.push((epoch, ExchangeKeyPair::from_jwk(r.bytes()?)?));
+            }
             r.finish()?;
-            Ok((token, key))
+            Ok(LiveSession { token, key, epochs })
         })();
         match parsed {
-            Ok((token, key)) if token.not_after() >= unix_seconds(flows::now()) => {
-                Some((token, key))
-            }
+            Ok(live) if live.token.not_after() >= unix_seconds(flows::now()) => Some(live),
             _ => {
                 let _ = paths::remove(&path);
                 None
@@ -338,10 +379,26 @@ impl<'a> Seal<'a> {
     /// Whether `sealed` can open in a live session, without a passphrase.
     #[must_use]
     pub fn in_session(sealed: &[u8]) -> bool {
-        SealedVaultFile::from_bytes(sealed)
-            .ok()
-            .and_then(|f| Self::session_for(f.vault()))
-            .is_some()
+        let Some(live) = vault_of(sealed).and_then(|v| Self::session_for(&v)) else {
+            return false;
+        };
+        if sealed.starts_with(b"IPUS") {
+            SessionSealedFile::from_bytes(sealed)
+                .is_ok_and(|f| live.epochs.iter().any(|(e, _)| *e == f.epoch()))
+        } else {
+            true
+        }
+    }
+
+    /// `kuipa seal file --session`: seal `contents` to vault `name`'s
+    /// current epoch key, for opening in offline sessions.
+    ///
+    /// # Errors
+    ///
+    /// A vault without offline sessions, or as for [`seal`](Self::seal).
+    pub fn seal_session(&self, name: &str, contents: &[u8]) -> Result<Vec<u8>, Error> {
+        let descriptor = self.descriptor(name)?;
+        Ok(SessionSealedFile::seal(&descriptor, contents)?.to_bytes())
     }
 
     /// The stored descriptor of vault `name`, verified.
@@ -562,11 +619,24 @@ impl<'a> Seal<'a> {
     /// No device key or a wrong passphrase, [`Outcome::RetryLater`] when no
     /// server would open it, or a malformed file.
     pub fn open(&self, sealed: &[u8], passphrase: Option<&[u8]>) -> Result<SecretBuf, Error> {
+        if sealed.starts_with(b"IPUS") {
+            // Sealed for offline sessions: opened here, without a server.
+            let file = SessionSealedFile::from_bytes(sealed)?;
+            let live = Self::session_for(file.vault()).ok_or(
+                "this file opens in an offline session: run `kuipa seal unlock VAULT --offline`",
+            )?;
+            let (_, epoch_key) = live
+                .epochs
+                .iter()
+                .find(|(e, _)| *e == file.epoch())
+                .ok_or("the session was started before this file's epoch: unlock again")?;
+            return Ok(file.open(epoch_key, &live.key)?);
+        }
         let file = SealedVaultFile::from_bytes(sealed)?;
         let session = Self::session_for(file.vault());
         let unwrapped;
-        let device = if let Some((_, key)) = &session {
-            Some(key)
+        let device = if let Some(live) = &session {
+            Some(&live.key)
         } else if file.devices().is_empty() {
             None
         } else {
@@ -593,7 +663,7 @@ impl<'a> Seal<'a> {
         file.open(
             Unlock {
                 device: device.map(|k| k as &dyn DeviceKey),
-                session: session.as_ref().map(|(t, _)| t),
+                session: session.as_ref().map(|l| &l.token),
                 ticket,
             },
             |server, request| {

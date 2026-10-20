@@ -104,6 +104,8 @@ fn run(args: &[String]) -> Result<(), Error> {
     let (trusted_anchor, trusted_directory, trusted_url) = start_trusted(&trusted, &rt)?;
 
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &SERVERS, &[ADMIN]));
+    // The playground realm's administrators allow offline vault sessions.
+    directory.limits.lock().unwrap().offline_sessions = true;
     let Started {
         anchor,
         mut endpoints,

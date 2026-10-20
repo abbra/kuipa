@@ -48,7 +48,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] 6. `kuipa seal` with passphrase file devices and per-user state.
   - [x] 7. Re-authentication sessions; the unlock counter (per-server
         values on the vault entry).
-  - [ ] 8. Offline sessions.
+  - [x] 8. Offline sessions.
   - [ ] 9. Passkeys (libfido2 FFI, relying-party verifier from ahdapa) and
         PKCS#11 devices.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
@@ -72,7 +72,8 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 - [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
       the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
       `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
-      `ipaKUVaultUnlocks`,
+      `ipaKUVaultUnlocks`, `ipaKUVaultSessionKey`, `ipaKUServerEscrowKey` on
+      `cn=masters` entries,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
       `ipaKUTrustedRealm`) and
       the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs for the daemon's identity

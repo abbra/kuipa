@@ -42,6 +42,10 @@ pub struct KdcDirectory {
     pub locked: Mutex<HashSet<String>>,
     /// Releases per vault and server.
     pub unlocks: Mutex<HashMap<(VaultId, String), u64>>,
+    /// Servers' published escrow keys.
+    pub escrow_keys: Mutex<Vec<(String, tang_pqc::ExchangeKey)>>,
+    /// The realm's vault limits.
+    pub limits: Mutex<kuipa_enroll::vault::Limits>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -74,6 +78,8 @@ impl KdcDirectory {
             vaults: Mutex::new(HashMap::new()),
             locked: Mutex::new(HashSet::new()),
             unlocks: Mutex::new(HashMap::new()),
+            escrow_keys: Mutex::new(Vec::new()),
+            limits: Mutex::new(kuipa_enroll::vault::Limits::default()),
             creds,
         }
     }
@@ -317,6 +323,25 @@ impl Directory for KdcDirectory {
             v.unlocks = self.total(id);
             v
         }))
+    }
+
+    fn vault_limits(&self) -> Result<kuipa_enroll::vault::Limits, DirectoryError> {
+        Ok(self.limits.lock().unwrap().clone())
+    }
+
+    fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
+        Ok(self.escrow_keys.lock().unwrap().clone())
+    }
+
+    fn publish_escrow_key(
+        &self,
+        server: &str,
+        key: &tang_pqc::ExchangeKey,
+    ) -> Result<(), DirectoryError> {
+        let mut keys = self.escrow_keys.lock().unwrap();
+        keys.retain(|(s, _)| s != server);
+        keys.push((server.to_owned(), key.clone()));
+        Ok(())
     }
 
     fn vault_unlock(
