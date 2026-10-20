@@ -60,9 +60,10 @@ to retire them.
 | a released offline-session key | that epoch's session files, for as long as it keeps the key | — |
 | root on the user's machine while a file is open or a session is unlocked | the open files and the session's keys | the same |
 
-## Still classical
+## What still uses classical cryptography
 
-kuipa does not replace these, and their strength is still classical:
+kuipa does not replace these. They may use classical cryptography and
+might be attacked by a cryptographically relevant quantum computer (CRQC):
 
 * TLS server authentication (the IPA CA is RSA; kuipa reaches it
   authentically, but TLS itself is not post-quantum);
@@ -72,8 +73,8 @@ kuipa does not replace these, and their strength is still classical:
 * Custodia.
 
 Password and OTP logins through an armoured `kinit` can be guessed offline
-once the classical key exchange of that armour falls, as for any FreeIPA
-`kinit`. Random one-time passwords are not guessable that way.
+once a CRQC breaks the classical key exchange of that armour, as for any
+FreeIPA `kinit`. Random one-time passwords are not guessable that way.
 
 ## Clocks
 
