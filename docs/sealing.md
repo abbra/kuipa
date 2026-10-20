@@ -1,9 +1,14 @@
 # Sealing your own files with `kuipa seal`
 
-> **Status: planned.** This guide describes `kuipa seal` as designed in
-> [DESIGN.md §7.6](DESIGN.md#76-user-vaults-designed). Nothing here is
-> implemented yet; it is written first so the design can be checked
-> against what people will actually do with it.
+> **Status: partly implemented.** This guide describes `kuipa seal` as
+> designed in [DESIGN.md §7.6](DESIGN.md). Working today: `create`,
+> `policy`, `device add|remove` with passphrase-protected device keys,
+> `file`, `open`, `reseal`, `show`, `list` and `revoke`, with the `device`
+> and `ticket` factors. Not yet: passkeys, smart cards and tokens,
+> sessions, unlock limits, `--sealing registered`, and refusing or
+> limiting delegated tickets (the server cannot tell them apart yet, so
+> only the default `allow` is accepted). A vault policy asking for any of
+> those is refused.
 
 `kuipa seal` lets any user of an IPA realm encrypt their own files so that a
 copy is useless on its own. Opening a sealed file needs one of the realm's

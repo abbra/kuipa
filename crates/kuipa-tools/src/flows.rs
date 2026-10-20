@@ -80,7 +80,7 @@ impl std::fmt::Display for Outcome {
 
 impl std::error::Error for Outcome {}
 
-fn now() -> SystemTime {
+pub(crate) fn now() -> SystemTime {
     SystemTime::now()
 }
 
@@ -95,7 +95,7 @@ pub fn hostname() -> Result<String, Error> {
         .to_owned())
 }
 
-fn ca_trust(paths: &Paths) -> Result<Trust, Error> {
+pub(crate) fn ca_trust(paths: &Paths) -> Result<Trust, Error> {
     let certs = synta_certificate::pem_to_der(&fs::read(paths.ca())?);
     if certs.is_empty() {
         return Err(format!("no certificates in {}", paths.ca().display()).into());
@@ -123,7 +123,7 @@ fn check_deployment(
 const MIN_PROVING_ANCHORS: usize = 2;
 
 /// Fetch and verify one server's advertisement.
-fn verified(
+pub(crate) fn verified(
     server: &str,
     trust: &Trust,
     realm: &str,
@@ -319,7 +319,7 @@ fn trace_enrollment(server: &str, e: &Enrollment) {
 /// its context derives: only the real `ipa-ku/<server>` derives it too, so
 /// the response is authenticated by the realm's Kerberos keys as well as by
 /// the anchor (§5.1).
-fn gss_token(
+pub(crate) fn gss_token(
     cred: &GssClientCred,
     target: &str,
     cb: &[u8; 32],
@@ -376,7 +376,7 @@ fn exchange(
 
 /// As [`exchange`], for any operation: `finish` opens the response.
 #[allow(clippy::too_many_arguments)]
-fn exchange_with<T>(
+pub(crate) fn exchange_with<T>(
     deployment: &Deployment,
     trust: &Trust,
     realm: &str,
@@ -827,7 +827,11 @@ fn payload_epoch(enrollment: &Enrollment) -> Option<Epoch> {
 
 /// Advertisements of every server of the realm that answers and describes
 /// the stored deployment, for sealing.
-fn all_servers(state: &State, trust: &Trust, anchors: &[Thumbprint]) -> Vec<VerifiedRealm> {
+pub(crate) fn all_servers(
+    state: &State,
+    trust: &Trust,
+    anchors: &[Thumbprint],
+) -> Vec<VerifiedRealm> {
     let deployment = Deployment::servers(&state.servers);
     state
         .servers
@@ -2042,6 +2046,7 @@ pub fn leave(paths: &Paths) -> Result<Value, Error> {
         paths.recipient_public(),
         paths.pending(),
         paths.state(),
+        paths.public_state(),
     ] {
         paths::remove(&p)?;
     }

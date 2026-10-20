@@ -27,10 +27,12 @@ use kuipa_enroll::join::{
 use kuipa_enroll::keytab::{Enctype, Keytab};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::parse_stage_result;
+use kuipa_enroll::vault;
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred, InitStep};
 use kuipa_tools::flows::{self, Auth, Outcome, Target};
 use kuipa_tools::net::{Endpoint, Trust};
 use kuipa_tools::paths::{self, Paths};
+use kuipa_tools::seal::{Seal, UserPaths};
 use kuipad::http::{App, router};
 use kuipad::keystore::KeyStore;
 use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
@@ -433,6 +435,62 @@ fn against_a_real_kdc() {
         Vec::<[u8; 32]>::new()
     );
     assert!(!paths::sealed_for(&http).exists());
+
+    // ── A user's own vault, with her ticket and a passphrase device (§7.6) ──
+    // Alice is not root: she reads the host's public realm.json, anchors
+    // and CA, and keeps everything of hers in her own directory.
+    realm.add_user("alice@EXAMPLE.TEST", "Alice123");
+    let alice_cc = realm.dir.join("alice.ccache");
+    realm.kinit("alice@EXAMPLE.TEST", "Alice123", &alice_cc, None, None);
+    let alice_cc = format!("FILE:{}", alice_cc.display());
+    let home = UserPaths::new(realm.dir.join("alice-home"));
+    let seal = Seal::new(&a, &home, Some(&alice_cc));
+    let policy = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    let created = seal.create("personal", policy).unwrap();
+    assert_eq!(
+        created["vaults"][0]["owner"], "alice@EXAMPLE.TEST",
+        "{created}"
+    );
+    seal.add_device("personal", b"correct horse").unwrap();
+    assert_eq!(
+        std::fs::metadata(home.device_key())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let sealed = seal.seal("personal", b"token=alice\n").unwrap();
+    assert_eq!(
+        seal.open(&sealed, Some(b"correct horse")).unwrap().as_ref(),
+        b"token=alice\n"
+    );
+    assert!(seal.open(&sealed, Some(b"wrong")).is_err());
+    assert!(seal.open(&sealed, None).is_err());
+    // Sealing again uses the stored descriptor and advertisements.
+    let again = seal.seal("personal", b"second").unwrap();
+    assert_eq!(
+        seal.open(&again, Some(b"correct horse")).unwrap().as_ref(),
+        b"second"
+    );
+    // Bob's ticket is not Alice's, even with her device and passphrase.
+    realm.add_user("bob@EXAMPLE.TEST", "Bob12345");
+    let bob_cc = realm.dir.join("bob.ccache");
+    realm.kinit("bob@EXAMPLE.TEST", "Bob12345", &bob_cc, None, None);
+    let bob_cc = format!("FILE:{}", bob_cc.display());
+    let as_bob = Seal::new(&a, &home, Some(&bob_cc));
+    assert!(as_bob.open(&sealed, Some(b"correct horse")).is_err());
+    let listed = seal.list().unwrap();
+    assert_eq!(listed["vaults"].as_array().unwrap().len(), 1);
+    seal.revoke("personal").unwrap();
+    assert!(seal.open(&sealed, Some(b"correct horse")).is_err());
 
     flows::unprotect(&a, &Target::Host).unwrap();
     assert!(!a.sealed().exists());

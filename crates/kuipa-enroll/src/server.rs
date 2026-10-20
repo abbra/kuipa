@@ -884,9 +884,19 @@ impl EnrollServer {
         let now = unix_seconds(SystemTime::now());
         let vaults = Self::apply_vault_op(&owner, op, now, directory)?;
         let delegation = self.delegation();
+        let max_age = directory.vault_limits().map_err(Refusal)?.descriptor_age;
         let descriptors = vaults
             .iter()
-            .map(|v| Descriptor::sign(&self.keys.signing, &delegation, &self.info.realm, v, now))
+            .map(|v| {
+                Descriptor::sign(
+                    &self.keys.signing,
+                    &delegation,
+                    &self.info.realm,
+                    v,
+                    now,
+                    max_age,
+                )
+            })
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(request.respond(
             ss,

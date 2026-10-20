@@ -500,6 +500,13 @@ pq_offline() {{
 }}
 # pq_trust: install the realms this host's realm trusts ({trusted_realm}):
 # their anchors, PKINIT chain and KDCs, verified through {realm}.
+# pq_admin_kinit: log in as the administrator, with a kuipa data directory
+# of their own, for `kuipa seal`.
+pq_admin_kinit() {{
+    echo {password} | kinit {admin} >/dev/null || return
+    export KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin"
+    klist
+}}
 pq_trust() {{ kuipa trusted-realms "$@"; }}
 # pq_trusted_kinit [USER]: log in a user of {trusted_realm} on this host
 # (default {trusted_user}; a bare name is taken as USER@{trusted_realm}):

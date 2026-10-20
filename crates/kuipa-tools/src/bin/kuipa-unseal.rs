@@ -29,12 +29,13 @@
 //!
 //! Exit status: 0 success, 75 no server could unseal (retry later), 1 error.
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use kuipa_tools::flows::{self, Outcome};
+use kuipa_tools::output::Output;
 use kuipa_tools::paths::{self, Error, Paths, State};
 use kuipa_tools::trace;
 
@@ -91,35 +92,6 @@ fn write_memfd(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Where `--out` sends what was unsealed.
-#[derive(Clone, Copy)]
-enum Output<'a> {
-    Stdout,
-    File(&'a Path),
-}
-
-/// Check `--out` before anything is sent to a server.
-fn output(out: &Path, force: bool) -> Result<Output<'_>, Error> {
-    if out == Path::new("-") {
-        if std::io::stdout().is_terminal() && !force {
-            return Err("standard output is a terminal: redirect it, or give --force".into());
-        }
-        return Ok(Output::Stdout);
-    }
-    let absolute = std::path::absolute(out)?;
-    if absolute.starts_with("/dev") {
-        return Err(format!("--out {}: use `--out -` for standard output", out.display()).into());
-    }
-    match std::fs::symlink_metadata(out) {
-        Ok(m) if !m.file_type().is_file() => Err(format!(
-            "--out {}: not a regular file (it would be replaced, not written to)",
-            out.display()
-        )
-        .into()),
-        _ => Ok(Output::File(out)),
-    }
-}
-
 fn unseal_one(
     paths: &Paths,
     sealed: &Path,
@@ -130,15 +102,8 @@ fn unseal_one(
     if memfd {
         return write_memfd(bytes.as_ref());
     }
-    match out {
-        Some(Output::Stdout) => {
-            let mut stdout = std::io::stdout().lock();
-            stdout.write_all(bytes.as_ref())?;
-            stdout.flush()?;
-            return Ok(());
-        }
-        Some(Output::File(out)) => return paths::write_file(out, bytes.as_ref(), 0o600),
-        None => {}
+    if let Some(out) = out {
+        return out.write(bytes.as_ref());
     }
     let state = State::load(paths)?;
     let item = state
@@ -163,7 +128,7 @@ fn run(args: &Args) -> Result<(), Error> {
         let out = args
             .out
             .as_deref()
-            .map(|o| output(o, args.force))
+            .map(|o| Output::check(o, args.force))
             .transpose()?;
         return unseal_one(&paths, &sealed, out, args.memfd);
     }
