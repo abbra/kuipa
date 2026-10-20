@@ -218,7 +218,7 @@ enum Command {
     TrustedRealms,
     /// Print what each server of the deployment advertises, verified
     /// against the enrollment string's anchor or the pre-provisioned
-    /// pins, and the realm's anchor log (landmarks) it names (§4.8).
+    /// pins, and the realm's anchor log (landmarks) it names.
     Advertisement {
         #[command(flatten)]
         realm: RealmInput,
