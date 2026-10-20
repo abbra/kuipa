@@ -305,13 +305,35 @@ open it. This closes the gap described under snapshots above.
 **planned** (`kuipa seal`, see [sealing.md](sealing.md))
 
 Users of a shared development or bastion VM can seal their own files with
-`kuipa seal`, without root. On a cloud VM:
+`kuipa seal`, without root. On a cloud VM there is no USB, so a passkey on
+your desk cannot reach the VM. Use a vault that requires your **ticket**
+together with a **device** key file on the VM.
 
-* there is no USB, so a passkey on your desk cannot reach the VM; use a
-  vault that requires your **ticket** (forward it over SSH with GSSAPI
-  delegation, `ssh -K`) together with a **device** key file on the VM;
-* a VM snapshot then holds only sealed files and a passphrase-protected key
+The ticket comes from logging in to the VM, not from your laptop:
+
+* an interactive login through PAM on an IPA-enrolled system gets you a
+  Kerberos ticket, as any IPA login does;
+* an SSH login with a public key gets one too: sshd on Fedora and RHEL
+  obtains it for you by protocol transition (S4U2Self) and, where the
+  realm's delegation rules allow it, constrained delegation (S4U2Proxy) to
+  the services you need. For `kuipa seal`, the rules must let the VM's host
+  obtain tickets to the IPA servers' `ipa-ku/<server>` services on your
+  behalf.
+
+Do not forward your ticket-granting ticket with `ssh -K` for this. It puts
+a full credential on a machine whose root you may not trust, usable from
+anywhere until it expires; the delegated tickets above are limited to the
+services the rules name.
+
+What you get, and what it rests on:
+
+* a VM snapshot holds only sealed files and a passphrase-protected key
   file; neither opens without you;
+* a ticket obtained by protocol transition says *the VM* vouched that you
+  logged in. Whoever controls the VM's host identity can obtain the same
+  tickets for the users its rules allow. So protect the VM's host keytab
+  (`kuipa protect`) as well: a snapshot then cannot mint tickets either.
+  Root on the running VM is out of scope, as it always is;
 * a re-authentication session saves you from typing the passphrase for
   every file during a working day.
 

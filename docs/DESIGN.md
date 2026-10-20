@@ -1056,7 +1056,7 @@ The **policy**:
 | field | meaning | enforced |
 |---|---|---|
 | `factors.device` | `none`, or the least device-key level: `any`, `hardware-wrapped`, `hardware-bound` | by the server: the answer is encrypted to a registered device key of that level, and the file's device share needs it (§7.6.4) |
-| `factors.ticket` | an unlock needs the owner's Kerberos ticket | by the server |
+| `factors.ticket` | an unlock needs a ticket naming the owner as client: one from the owner's login (PAM through SSSD, `kinit`) or obtained for them by the host through protocol transition and S4U2Proxy (sshd on Fedora and RHEL after a public-key login), which then attests the host's vouch, not the owner's credentials | by the server |
 | `factors.passkey` | an unlock needs a passkey assertion from any of the owner's IPA passkeys (`ipaPassKey`): managing a user's passkeys in IPA manages their vault access too | by the server |
 | `not_after` | no unlock after this time | by the server |
 | `max_unlocks` | releases over the vault's life | by the server, approximately across replicas (§7.6.7) |
@@ -1236,6 +1236,15 @@ are registered under (the IPA domain, as `ipa passkeyconfig` and SSSD use
 it), with user verification as that configuration requires. The same
 libfido2 calls give the `hmac-secret` output for passkey-wrapped device
 keys.
+
+**Delegated tickets.** A ticket from S4U2Proxy is as good as the host that
+obtained it: whoever holds that host's keys can obtain one for any user its
+delegation rules cover. The realm's delegation rules decide which hosts may
+act for users towards `ipa-ku/<server>`; a host whose keytab is sealed
+(§7.3) cannot be cloned from a snapshot to mint them. Forwarding a
+ticket-granting ticket (`ssh -K`) is not the intended path: it puts an
+unrestricted credential on the host. Whether a policy can refuse delegated
+tickets (where the KDC records the delegation in the ticket's PAC) is open.
 
 #### 7.6.7 Counting unlocks
 
