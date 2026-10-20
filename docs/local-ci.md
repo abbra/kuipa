@@ -195,13 +195,13 @@ kuipa enroll $PQ_SERVERS --hostname $PQ_HOST --use-ccache
 pq_host web1; pq_trust                   # install the trusted realm B.TEST on web1
 pq_trusted_kinit                         # alice@B.TEST, armoured with B's PKINIT chain
 pq_trusted kvno host/$PQ_HOST            # a ticket for web1 across the trust
-kuipa status                            # trusted_realms: B.TEST
+kuipa status                            # trusted realms installed: B.TEST
 
 pq_voucher web7                          # a blind-signed voucher instead of an OTP
 pq_voucher web8 --bound                  # bound to web8's ephemeral key
 
 pq_offline web5                          # bundle enrollment, no network needed
-kuipa status                            # "pending": the deferred steps
+kuipa status                            # an unfinished offline enrollment, with its deferred steps
 kuipa complete                          # first contact: the staged keys are rotated
 pq_log                                   # "first contact: … unstaged"
 ```

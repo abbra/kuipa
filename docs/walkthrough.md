@@ -176,18 +176,26 @@ host these paths start at `/` (§10.2). Every file is written atomically:
 | `var/lib/ipa-client/ku/state.json` | realm, host name and the servers, issuer first |
 
 ```
-basedn: dc=example,dc=test
-domain: example.test
-issuer: ipa1.example.test
-kvno: 2
+Enrolled host/web1.example.test@EXAMPLE.TEST in EXAMPLE.TEST: its keys, the realm's anchors, CA and Kerberos configuration all taken from ipa1.example.test's verified advertisement.
 principal: host/web1.example.test@EXAMPLE.TEST
+kvno: 2
+issuer: ipa1.example.test
 realm: EXAMPLE.TEST
-servers:
-  - ipa1.example.test
-  - ipa2.example.test
+IPA servers: ipa1.example.test, ipa2.example.test
+domain: example.test
+LDAP base: dc=example,dc=test
+  installed here:
+    host keys: /tmp/kuipa-playground-222664/hosts/web1/etc/krb5.keytab
+    IPA CA: /tmp/kuipa-playground-222664/hosts/web1/etc/ipa/ca.crt
+    pinned anchors: /tmp/kuipa-playground-222664/hosts/web1/etc/ipa/ku-anchors
+    PKINIT anchors: /tmp/kuipa-playground-222664/hosts/web1/var/lib/ipa-client/ku/pkinit-anchors.pem
+    Kerberos configuration: /tmp/kuipa-playground-222664/hosts/web1/var/lib/ipa-client/ku/krb5.conf
+    state: /tmp/kuipa-playground-222664/hosts/web1/var/lib/ipa-client/ku/state.json
 ```
 
-The command's result, on standard output (`--json` for JSON).
+The command's result, on standard output: what was enrolled, which server
+issued it, and which file on this host holds each part. `--json` prints the
+same values as one JSON object.
 
 ## 3. Install the trusted realm: `pq_trust`
 
@@ -254,12 +262,13 @@ files and the command exits 75. If EXAMPLE.TEST stops listing B, the next
 run removes them.
 
 ```
-realm: EXAMPLE.TEST
-trusted_realms:
-    krb5_conf: /tmp/kuipa-playground-222664/hosts/web1/etc/krb5.conf.d/kuipa_trust_B_TEST
-    realm: B.TEST
-    server: ipa1.b.test
-    status: installed
+Realms EXAMPLE.TEST trusts, each verified through the servers it advertises and installed on this host:
+
+realm: B.TEST
+what kuipa did: installed
+verified through: ipa1.b.test
+krb5.conf.d snippet: /tmp/kuipa-playground-222664/hosts/web1/etc/krb5.conf.d/kuipa_trust_B_TEST
+anchors, PKINIT anchors and CA: /tmp/kuipa-playground-222664/hosts/web1/var/lib/ipa-client/ku/trusts/B.TEST
 ```
 
 ## 4. Log in a user of the trusted realm: `pq_trusted_kinit alice`

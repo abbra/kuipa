@@ -81,6 +81,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
+use kuipa_enroll::keytab::Principal;
 use kuipa_enroll::realm::Deployment;
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::{self, Error, Paths};
@@ -678,39 +679,6 @@ fn run(args: &Args) -> Result<Value, Error> {
     }
 }
 
-fn print_human(value: &Value, indent: usize) {
-    match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                if v.is_object() || v.is_array() {
-                    println!("{:indent$}{k}:", "");
-                    print_human(v, indent + 2);
-                } else {
-                    println!(
-                        "{:indent$}{k}: {}",
-                        "",
-                        v.as_str().map_or_else(|| v.to_string(), str::to_owned)
-                    );
-                }
-            }
-        }
-        Value::Array(items) => {
-            for v in items {
-                if v.is_object() {
-                    print_human(v, indent + 2);
-                } else {
-                    println!(
-                        "{:indent$}- {}",
-                        "",
-                        v.as_str().map_or_else(|| v.to_string(), str::to_owned)
-                    );
-                }
-            }
-        }
-        v => println!("{:indent$}{v}", ""),
-    }
-}
-
 /// Fall back to the `krb5.conf` generated at enrollment when the caller
 /// set no `KRB5_CONFIG`: the system file stays first, so a host configured
 /// by `ipa-client-install` behaves as before.
@@ -730,10 +698,595 @@ fn krb5_config_fallback(paths: &Paths) {
         std::env::set_var("KRB5_CONFIG", value);
     }
 }
+// ── The result for a person ──────────────────────────────────────────────
+//
+// `--json` prints the object a flow built.  Without it the same values are
+// labelled and their subject named: which host, which file on this host,
+// which server vouched for what.  The JSON keys alone read the same on
+// every host and never say where a value came from.
+
+/// The rows of one block: labels are ours, values are the flow's.  Labels
+/// are right-aligned to one column, so the values line up under it while
+/// each row still reads `label: value` — `grep` for a label and its value
+/// matches whatever else the block contains.  `Null` and a false flag are
+/// not shown; an empty name or list says `none`, a list of names goes on
+/// one line.
+#[derive(Default)]
+struct Rows {
+    indent: usize,
+    width: usize,
+    lines: Vec<(String, String)>,
+}
+
+impl Rows {
+    fn row(&mut self, label: &str, value: String) {
+        self.width = self.width.max(label.len());
+        self.lines.push((label.to_string(), value));
+    }
+
+    fn field(&mut self, label: &str, value: &Value) {
+        if matches!(value, Value::Null | Value::Bool(false)) {
+            return;
+        }
+        let text = match value {
+            Value::Bool(true) => "yes".to_string(),
+            Value::String(s) if s.is_empty() => "none".to_string(),
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Array(items) if items.iter().all(Value::is_string) => {
+                let names: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                }
+            }
+            other => other.to_string(),
+        };
+        self.row(label, text);
+    }
+
+    /// A duration a flow measured against this host's clock, with its unit.
+    fn left(&mut self, label: &str, value: &Value, unit: &str) {
+        if value.is_null() {
+            return;
+        }
+        self.row(
+            label,
+            format!("{} {unit} left", value.as_u64().unwrap_or_default()),
+        );
+    }
+
+    /// A Unix time a flow recorded, as a date.  `synta`'s `GeneralizedTime`
+    /// does the civil-date arithmetic, in UTC.
+    fn until(&mut self, label: &str, value: &Value) {
+        let Some(secs) = value.as_u64() else { return };
+        match synta::GeneralizedTime::from_unix(i64::try_from(secs).unwrap_or(i64::MAX)) {
+            Some(t) => self.row(
+                label,
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                    t.year, t.month, t.day, t.hour, t.minute, t.second
+                ),
+            ),
+            None => self.row(label, secs.to_string()),
+        }
+    }
+
+    /// A file on this host.
+    fn path(&mut self, label: &str, path: &std::path::Path) {
+        self.row(label, path.display().to_string());
+    }
+
+    /// Rows are only printed once the block is complete: the column width
+    /// is the widest label it holds.
+    fn print(&self) {
+        for (label, value) in &self.lines {
+            println!(
+                "{:>indent$}{:>width$}: {value}",
+                "",
+                label,
+                indent = self.indent,
+                width = self.width,
+            );
+        }
+    }
+}
+
+/// Strings a flow collected, one per line under `heading`'s indent.
+fn items(values: &Value, indent: &str) {
+    for item in values.as_array().into_iter().flatten() {
+        println!("{indent}{}", item.as_str().unwrap_or(&item.to_string()));
+    }
+}
+/// This host, from its state file: the principal it holds keys for.
+fn this_host(paths: &Paths) -> String {
+    match paths::State::load(paths) {
+        Ok(state) => format!(
+            "{} (state file: {})",
+            Principal::host(&state.fqdn, &state.realm),
+            paths.state().display()
+        ),
+        // `State::load` says "this host is not enrolled with kuipa (no
+        // state file)"; the sentence this is inserted into already names
+        // this host, so keep only the reason.
+        Err(e) => {
+            let e = e.to_string();
+            match e.strip_prefix("this host is ") {
+                Some(reason) => format!("this host, {reason}"),
+                None => format!("this host ({e})"),
+            }
+        }
+    }
+}
+
+fn get<'a>(value: &'a Value, key: &str) -> &'a Value {
+    value.get(key).unwrap_or(&Value::Null)
+}
+
+/// Print one command's result: what it is about, where each value came
+/// from, then the values themselves.
+fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
+    match command {
+        "prepare" => render_prepare(value, paths),
+        "enroll" => render_enroll(value, paths),
+        "voucher-key" => render_voucher_key(args, value),
+        "realm-info" => render_realm_info(value),
+        "trusted-realms" => render_trusted_realms(value, paths),
+        "advertisement" => render_advertisement(value, paths),
+        "status" => render_status(value, paths),
+        "check" => render_check(value, paths),
+        "complete" => render_complete(value),
+        "rotate-keys" => render_rotated(value, "New host keys"),
+        "protect" => render_protect(value),
+        "unprotect" => println!(
+            "The keytab is plain on disk again; its holder is now {}.",
+            get(value, "holder").as_str().unwrap_or("none")
+        ),
+        "leave" => println!(
+            "{}: kuipa's own files are removed; the plain keytab is left for ipa-join --unenroll.",
+            this_host(paths)
+        ),
+        // Every command above has a renderer; anything else shows the object.
+        other => println!("{other}: {value}"),
+    }
+}
+fn render_prepare(value: &Value, paths: &Paths) {
+    println!(
+        "A machine key for offline enrollment, made on this host and stored in {}:",
+        paths.recipient().display()
+    );
+    let mut rows = Rows::default();
+    rows.field("machine key thumbprint", get(value, "thumbprint"));
+    rows.field("its public key", get(value, "public_key"));
+    rows.field(
+        "the IPA administrator stages it with",
+        get(value, "admin_command"),
+    );
+    rows.print();
+}
+
+/// Identity and realm values of a join, as one aligned block.
+fn identity_rows(rows: &mut Rows, value: &Value) {
+    rows.field("principal", get(value, "principal"));
+    rows.field("kvno", get(value, "kvno"));
+    rows.field("issuer", get(value, "issuer"));
+}
+
+/// Files a command wrote on this host, as a nested block.
+fn installed_rows(rows: &Rows, paths: &Paths) {
+    println!("{:>indent$}installed here:", "", indent = rows.indent);
+    let mut files = Rows {
+        indent: rows.indent + 2,
+        ..Rows::default()
+    };
+    files.path("host keys", &paths.keytab());
+    files.path("IPA CA", &paths.ca());
+    files.path("pinned anchors", &paths.anchors());
+    files.path("PKINIT anchors", &paths.pkinit_anchors());
+    files.path("Kerberos configuration", &paths.krb5_conf());
+    files.path("state", &paths.state());
+    files.print();
+}
+
+/// The steps an offline enrollment left for `complete`, if any.
+fn pending_rows(value: &Value, done: &str) {
+    let Some(pending) = value.get("pending").filter(|p| !p.is_null()) else {
+        return;
+    };
+    println!("  {done} for {}:", get(pending, "fqdn"));
+    let mut rows = Rows {
+        indent: 2,
+        ..Rows::default()
+    };
+    rows.until(
+        "the staged bundle is usable until",
+        get(pending, "not_after"),
+    );
+    println!("{:>2}deferred steps:", "");
+    items(get(pending, "steps"), "    ");
+}
+
+fn render_enroll(value: &Value, paths: &Paths) {
+    // An offline enrollment reports the same summary under `enrollment`,
+    // plus the steps `complete` still has to do.
+    let summary = value.get("enrollment").unwrap_or(value);
+    println!(
+        "Enrolled {} in {}: its keys, the realm's anchors, CA and Kerberos configuration all taken from {}'s verified advertisement.",
+        get(summary, "principal").as_str().unwrap_or("this host"),
+        get(summary, "realm").as_str().unwrap_or(""),
+        get(summary, "issuer")
+            .as_str()
+            .unwrap_or("the issuing server")
+    );
+    let mut rows = Rows::default();
+    identity_rows(&mut rows, summary);
+    rows.field("realm", get(summary, "realm"));
+    rows.field("IPA servers", get(summary, "servers"));
+    rows.field("domain", get(summary, "domain"));
+    rows.field("LDAP base", get(summary, "basedn"));
+    rows.print();
+    installed_rows(&rows, paths);
+    pending_rows(
+        value,
+        "staged, to finish at first contact (`kuipa complete`)",
+    );
+}
+
+fn render_voucher_key(args: &Args, value: &Value) {
+    println!(
+        "An ephemeral key for this host, written to {}; a voucher carries its binding so that only this host can open it:",
+        args.option("out").unwrap_or("")
+    );
+    let mut rows = Rows::default();
+    rows.field("binding for kuipa-voucher --binding", get(value, "binding"));
+    rows.print();
+}
+
+fn render_realm_info(value: &Value) {
+    println!(
+        "Kerberos configuration for {}, from {}'s verified advertisement:",
+        get(value, "realm").as_str().unwrap_or(""),
+        get(value, "server")
+            .as_str()
+            .unwrap_or("the first usable server")
+    );
+    let mut rows = Rows::default();
+    rows.field("realm", get(value, "realm"));
+    rows.field("domain", get(value, "domain"));
+    rows.field("KDCs", get(value, "servers"));
+    rows.field("krb5.conf", get(value, "krb5_conf"));
+    rows.field("PKINIT anchors", get(value, "pkinit_anchors"));
+    rows.field("IPA CA", get(value, "ca"));
+    rows.print();
+}
+
+fn render_trusted_realms(value: &Value, paths: &Paths) {
+    println!(
+        "Realms {} trusts, each verified through the servers it advertises and installed on this host:",
+        get(value, "realm").as_str().unwrap_or("this realm")
+    );
+    for t in list(get(value, "trusted_realms")) {
+        println!();
+        let mut rows = Rows::default();
+        rows.field("realm", get(t, "realm"));
+        rows.field("what kuipa did", get(t, "status"));
+        rows.field("verified through", get(t, "server"));
+        rows.field("why it is not installed", get(t, "error"));
+        rows.field("krb5.conf.d snippet", get(t, "krb5_conf"));
+        if let Some(realm) = get(t, "realm").as_str() {
+            rows.path("anchors, PKINIT anchors and CA", &paths.trust_dir(realm));
+        }
+        rows.print();
+    }
+}
+
+fn render_advertisement(value: &Value, paths: &Paths) {
+    println!(
+        "What each server of the deployment advertises, verified against the anchors pinned in {}:",
+        paths.anchors().display()
+    );
+    for s in list(get(value, "servers")) {
+        println!();
+        let server = get(s, "server").as_str().unwrap_or("server");
+        if get(s, "ok") == &Value::Bool(false) {
+            println!(
+                "{server}: {}",
+                get(s, "error").as_str().unwrap_or("unusable")
+            );
+            continue;
+        }
+        let mut rows = Rows::default();
+        rows.field("server", get(s, "server"));
+        rows.field("advertises realm", get(s, "realm"));
+        rows.field("domain", get(s, "domain"));
+        rows.field("KDCs", get(s, "kdcs"));
+        rows.field("advertisement signed by", get(s, "signer"));
+        rows.field("delegated by this pinned anchor", get(s, "proven_by"));
+        rows.left("its delegation", get(s, "delegation_days_left"), "days");
+        rows.left("the anchor's vouch", get(s, "vouch_hours_left"), "hours");
+        rows.field("anchor successions it names", get(s, "rotated_anchors"));
+        rows.field("join key", get(s, "join_key"));
+        rows.field("escrow key", get(s, "escrow_key"));
+        rows.field("CA certificates offered", get(s, "ca_certs"));
+        rows.field("PKINIT anchors offered", get(s, "pkinit_anchors"));
+        rows.field("its anchors", get(s, "anchors"));
+        // `REALM (anchors …)`: a trusted realm is only useful to a reader
+        // together with the anchors vouched for it (§17).
+        let trusts = list(get(s, "trusts"))
+            .into_iter()
+            .map(|t| {
+                let anchors = list(get(t, "anchors"))
+                    .into_iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} (anchors: {anchors})",
+                    get(t, "realm").as_str().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        rows.row(
+            "realms it trusts",
+            if trusts.is_empty() {
+                "none".to_string()
+            } else {
+                trusts
+            },
+        );
+        rows.field("anchor log head it names", get(s, "anchor_log_head"));
+        rows.print();
+        let landmarks = list(get(s, "landmarks"));
+        if landmarks.is_empty() {
+            println!("  anchor log: this server records none");
+            continue;
+        }
+        println!("  its anchor log, every entry verified from sequence 0 up:");
+        for l in landmarks {
+            println!(
+                "    sequence {} head {} (follows {})",
+                get(l, "seq"),
+                get(l, "head").as_str().unwrap_or(""),
+                get(l, "prev").as_str().unwrap_or("")
+            );
+            let mut entry = Rows {
+                indent: 4,
+                ..Rows::default()
+            };
+            entry.field("anchors then current", get(l, "anchors"));
+            entry.field("successions then current", get(l, "successions"));
+            entry.print();
+        }
+    }
+    anchor_index_rows(value);
+}
+
+/// The same facts read the other way round: one line per key, naming what
+/// it is and everywhere it appears, so `grep <thumbprint>` answers the
+/// question without reading every server block.  Labels are the
+/// thumbprints, all the same width, so the values line up.
+fn anchor_index_rows(value: &Value) {
+    let names = |a: &Value, key: &str| {
+        list(get(a, key))
+            .into_iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let anchors = list(get(value, "anchors"));
+    let pinned = list(get(value, "pinned"))
+        .into_iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!();
+    println!("  pinned on this host: {pinned}");
+    if anchors.is_empty() {
+        println!("  no server named an anchor, so nothing to index");
+        return;
+    }
+    println!("  every key these servers named, and what it belongs to:");
+    let mut rows = Rows {
+        indent: 2,
+        ..Rows::default()
+    };
+    for a in anchors {
+        let key = get(a, "key").as_str().unwrap_or("key");
+        let mut what: Vec<String> = Vec::new();
+        if get(a, "pinned") == &Value::Bool(true) {
+            what.push("pinned on this host".to_string());
+        }
+        let servers = names(a, "signer_of");
+        if !servers.is_empty() {
+            what.push(format!("signs {servers}' advertisements"));
+        }
+        let servers = names(a, "proves");
+        if !servers.is_empty() {
+            what.push(format!("proves the claim of {servers}"));
+        }
+        let current = names(a, "current_of");
+        if !current.is_empty() {
+            what.push(format!("a current anchor of {current}"));
+        }
+        let sequences = list(get(a, "log_sequences"))
+            .into_iter()
+            .filter_map(Value::as_u64)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !sequences.is_empty() {
+            what.push(format!("current in the anchor log at sequence {sequences}"));
+        }
+        let by = names(a, "replaced_by");
+        if !by.is_empty() {
+            what.push(format!("replaced by {by}"));
+        }
+        let old = names(a, "replaces");
+        if !old.is_empty() {
+            what.push(format!("replaces {old}"));
+        }
+        let realms = names(a, "trust_of");
+        if !realms.is_empty() {
+            what.push(format!("an anchor of the trusted realm {realms}"));
+        }
+        if current.is_empty() && sequences.is_empty() && by.is_empty() && old.is_empty() {
+            // A signer, or a proof that only reaches the current anchor
+            // through a succession: named, but no server here calls it an
+            // anchor now.
+            what.push("not an anchor of any server here".to_string());
+        }
+        rows.row(key, what.join("; "));
+    }
+    rows.print();
+}
+
+fn render_status(value: &Value, paths: &Paths) {
+    println!("What kuipa has installed for {}", this_host(paths));
+    if get(value, "enrolled") == &Value::Bool(false) {
+        println!(
+            "  enrolled: no{}",
+            match get(value, "prepared") {
+                Value::Bool(true) => ", though it is prepared for offline enrollment",
+                _ => "",
+            }
+        );
+        return;
+    }
+    let mut rows = Rows::default();
+    identity_rows(&mut rows, value);
+    rows.field("realm", get(value, "realm"));
+    rows.field("IPA servers", get(value, "servers"));
+    rows.field("anchors pinned here", get(value, "anchors"));
+    rows.field("trusted realms installed", get(value, "trusted_realms"));
+    rows.field("keytab held by", get(value, "protection"));
+    rows.path("keytab", &paths.keytab());
+    rows.path("krb5.conf fallback", &paths.krb5_conf());
+    rows.path("IPA CA", &paths.ca());
+    rows.path("PKINIT anchors", &paths.pkinit_anchors());
+    rows.path("pinned anchors", &paths.anchors());
+    let allowed: Vec<&str> = get(value, "policy")
+        .as_object()
+        .into_iter()
+        .flat_map(|flags| flags.iter())
+        .filter(|(_, allowed)| allowed.as_bool().unwrap_or(false))
+        .map(|(kem, _)| kem.as_str())
+        .collect();
+    rows.field(
+        "post-quantum KEMs this host allows",
+        &Value::String(allowed.join(", ")),
+    );
+    rows.print();
+    pending_rows(value, "an offline enrollment is unfinished");
+}
+
+fn render_check(value: &Value, paths: &Paths) {
+    println!(
+        "Health of {}, checked against the anchors pinned in {}:",
+        this_host(paths),
+        paths.anchors().display()
+    );
+    println!("  servers:");
+    for s in list(get(value, "servers")) {
+        let server = get(s, "server").as_str().unwrap_or("server");
+        if get(s, "ok") == &Value::Bool(false) {
+            println!(
+                "    {server}: {}",
+                get(s, "error").as_str().unwrap_or("unusable")
+            );
+            continue;
+        }
+        println!("    {server}: advertisement verified");
+        let mut health = Rows {
+            indent: 8,
+            ..Rows::default()
+        };
+        health.left("delegation", get(s, "delegation_days_left"), "days");
+        health.left("the anchor's vouch", get(s, "vouch_hours_left"), "hours");
+        health.field(
+            "verified only through rotated anchors",
+            get(s, "rotated_anchors"),
+        );
+        health.print();
+    }
+    let mut host = Rows {
+        indent: 2,
+        ..Rows::default()
+    };
+    host.row(
+        "a ticket with the host keys",
+        if get(value, "kinit").as_bool().unwrap_or(false) {
+            "yes".to_string()
+        } else {
+            "no".to_string()
+        },
+    );
+    host.print();
+    println!("  problems:");
+    let problems = list(get(value, "problems"));
+    if problems.is_empty() {
+        println!("    none");
+    } else {
+        for p in problems {
+            println!("    {}", p.as_str().unwrap_or(&p.to_string()));
+        }
+    }
+}
+
+fn render_complete(value: &Value) {
+    println!(
+        "The offline enrollment is finished: the staged keys were replaced by keys from {}'s KDC.",
+        get(get(value, "rotated"), "issuer")
+            .as_str()
+            .unwrap_or("the issuing server")
+    );
+    let mut rows = Rows::default();
+    identity_rows(&mut rows, get(value, "rotated"));
+    rows.print();
+    println!("  left for ipa-client-install on this host:");
+    items(get(value, "remaining_for_ipa_client_install"), "    ");
+}
+
+fn render_rotated(value: &Value, what: &str) {
+    println!(
+        "{what}, issued by {}:",
+        get(value, "issuer")
+            .as_str()
+            .unwrap_or("the issuing server")
+    );
+    let mut rows = Rows::default();
+    identity_rows(&mut rows, value);
+    rows.print();
+}
+
+fn render_protect(value: &Value) {
+    println!(
+        "The keytab is sealed on disk: opening it needs one of the realm's servers, as at boot."
+    );
+    let rotated = get(value, "rotated");
+    println!(
+        "Keys reissued before sealing, issued by {}:",
+        get(rotated, "issuer")
+            .as_str()
+            .unwrap_or("the issuing server")
+    );
+    let mut rows = Rows::default();
+    identity_rows(&mut rows, rotated);
+    rows.field("sealed as", get(value, "sealed"));
+    rows.print();
+}
+
+fn list(value: &Value) -> Vec<&Value> {
+    value
+        .as_array()
+        .map_or_else(Vec::new, |a| a.iter().collect())
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    krb5_config_fallback(&Paths::from_env());
+    let paths = Paths::from_env();
+    krb5_config_fallback(&paths);
     trace::init(if cli.trace {
         trace::Level::Details
     } else if cli.verbose {
@@ -748,7 +1301,7 @@ fn main() -> ExitCode {
             if cli.json {
                 println!("{value}");
             } else {
-                print_human(&value, 0);
+                render(&args.command, &args, &value, &paths);
             }
             if value.get("ok") == Some(&Value::Bool(false)) {
                 ExitCode::FAILURE
