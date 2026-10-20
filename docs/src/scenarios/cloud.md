@@ -302,7 +302,7 @@ open it. This closes the gap described under snapshots above.
 
 ### Your own secrets on a cloud development VM
 
-**planned** (`kuipa seal`, see [Sealing your own files](../user/sealing.md))
+**available** (`kuipa seal`, see [Sealing your own files](../user/sealing.md))
 
 Users of a shared development or bastion VM can seal their own files with
 `kuipa seal`, without root. On a cloud VM there is no USB, so a passkey on
@@ -354,4 +354,4 @@ What you get, and what it rests on:
 | encrypt data volumes | Clevis `tang-pqc` pin against kuipad | available |
 | invalidate a terminated instance | `ipa host-del` in a termination hook | available |
 | defeat snapshot restores inside the network | vTPM factor | planned |
-| let users seal their own files | `kuipa seal` | planned |
+| let users seal their own files | `kuipa seal` | available |
