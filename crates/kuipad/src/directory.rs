@@ -344,7 +344,7 @@ impl Directory for LdapDirectory {
         }
         let mut conn = self.conn_as(&caller)?;
         let keytab = self.new_keys(&mut conn, &host, enctypes)?;
-        // First contact after offline enrollment: unstage (§9.5).
+        // First contact after offline enrollment: unstage (§8.5).
         let dn = self.host_dn(fqdn);
         let mut svc = self.service_conn()?;
         let entry = svc.search(&dn, Scope::Base, "(objectClass=*)", &[STAGED_ATTR])?;

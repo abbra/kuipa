@@ -1,4 +1,4 @@
-//! `kuipa`: the host's post-quantum identity, by task (§3.1).
+//! `kuipa`: the host's post-quantum identity, by task (§10.1).
 //!
 //! ```text
 //! kuipa prepare [--new]                     get ready to be enrolled offline

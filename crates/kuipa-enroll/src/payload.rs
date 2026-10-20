@@ -1,5 +1,5 @@
-//! What a successful join, rekey or bundle delivers to the host (§5.4,
-//! §9.3): its keys, the CA chain, the anchors and the realm configuration.
+//! What a successful join, rekey or bundle delivers to the host (§5.5,
+//! §8.4): its keys, the CA chain, the anchors and the realm configuration.
 
 use native_ossl::util::SecretBuf;
 use tang_pqc::Thumbprint;

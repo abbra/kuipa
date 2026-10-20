@@ -626,7 +626,7 @@ impl VerifiedRealm {
         kdcs
     }
 
-    /// A `krb5.conf` for bootstrapping Kerberos before enrollment (§5.3),
+    /// A `krb5.conf` for bootstrapping Kerberos before enrollment (§5.4),
     /// with the KDCs of [`Self::kdcs_within`] `deployment`: see
     /// [`krb5_conf`].
     #[must_use]

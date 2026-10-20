@@ -1,7 +1,7 @@
 //! HTTP transport: `reqwest` over rustls with the `rustls-native-ossl`
 //! provider (OpenSSL, FIPS-capable).
 //!
-//! The protocol does not rely on TLS (§11).  On first contact the client
+//! The protocol does not rely on TLS (§10.3).  On first contact the client
 //! has no CA yet, so TLS only hides the host name from passive observers;
 //! after enrollment it verifies against the installed IPA CA.
 //!

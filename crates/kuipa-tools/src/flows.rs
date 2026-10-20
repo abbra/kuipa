@@ -1,4 +1,4 @@
-//! The user-level tasks behind `kuipa` commands (§3.1).  Each one runs
+//! The user-level tasks behind `kuipa` commands (§10.1).  Each one runs
 //! every protocol step it needs; none exposes a step on its own.
 
 use std::fs;
@@ -905,7 +905,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     )
 }
 
-/// `kuipa complete`: finish an offline enrollment (first contact, §9.5).
+/// `kuipa complete`: finish an offline enrollment (first contact, §8.5).
 ///
 /// # Errors
 ///

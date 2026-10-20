@@ -1,4 +1,4 @@
-//! Offline enrollment bundles (§9).
+//! Offline enrollment bundles (§8).
 //!
 //! ```text
 //! B   = mode ‖ alg ‖ realm ‖ fqdn ‖ id ‖ iat ‖ not_after ‖ recipient_thp ‖ signer_thp
@@ -33,7 +33,7 @@ const HEADER_MAGIC: [u8; 4] = *b"IPOH";
 /// signatures (empty context) by the same key.
 pub const SIGNATURE_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 bundle";
 
-/// How a bundle is opened (§9.2).
+/// How a bundle is opened (§8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// A: encrypted to an ML-KEM key the target generated.
@@ -359,7 +359,7 @@ impl Bundle {
         self.not_after
     }
 
-    /// Verify the delegation (at the bundle's `iat`, §9.4) and the bundle
+    /// Verify the delegation (at the bundle's `iat`, §8.4) and the bundle
     /// signature.
     ///
     /// # Errors

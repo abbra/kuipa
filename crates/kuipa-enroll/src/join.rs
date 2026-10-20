@@ -1,4 +1,4 @@
-//! Join, rekey and stage messages and their key schedule (§5.2, §6, §9.3).
+//! Join, rekey and stage messages and their key schedule (§5.1, §5.2, §6, §8.3).
 //!
 //! ```text
 //! (ct, ss)     = Encaps(ek_kid)            (dk_e, ek_e) = KeyGen()
