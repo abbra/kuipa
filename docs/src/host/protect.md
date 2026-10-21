@@ -77,10 +77,11 @@ file or not exist yet, outside `/dev`.
 ## gssproxy
 
 Services that go through gssproxy (NFS, `mod_auth_gssapi`) can load their
-keytab straight into gssproxy's memory, never onto any filesystem, once
-gssproxy has its `keytab_loader`
+keytab straight into gssproxy's memory, never onto any filesystem, with
+gssproxy's `keytab_loader`
 ([gssapi/gssproxy#135](https://github.com/gssapi/gssproxy/pull/135),
-under review):
+merged upstream; not in a release yet, so until it ships gssproxy must be
+built from its main branch):
 
 ```ini
 [service/nfs-server]
