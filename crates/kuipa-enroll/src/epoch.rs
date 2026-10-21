@@ -118,9 +118,13 @@ impl AnchorEpoch {
     /// Encode: `IPAE ‖ 1 ‖ realm ‖ seq ‖ prev(32) ‖ n ‖ anchors(32·n) ‖
     /// m ‖ signed-successions · m`; these are the signed bytes, and the
     /// bytes the head hashes.
-    #[allow(clippy::missing_panics_doc)] // fields are checked when built or parsed
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for a succession whose statement is not valid
+    /// base64url — only possible for a succession that was never
+    /// [`SignedSuccession::check`](crate::delegation::SignedSuccession::check)ed.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut w = Writer::new(EPOCH_MAGIC);
         w.u8(1)
             .str(&self.realm)
@@ -132,9 +136,9 @@ impl AnchorEpoch {
         }
         w.u64(self.successions.len() as u64);
         for s in &self.successions {
-            w.bytes(&s.to_bytes().expect("valid fields"));
+            w.bytes(&s.to_bytes()?);
         }
-        w.finish()
+        Ok(w.finish())
     }
 
     /// Decode, checking the anchor and succession lists are sorted and
@@ -188,7 +192,10 @@ impl AnchorEpoch {
     ///
     /// An OpenSSL error.
     pub fn head(&self) -> Result<[u8; 32]> {
-        Ok(primitives::sha256(&[EPOCH_HEAD_CONTEXT, &self.to_bytes()])?)
+        Ok(primitives::sha256(&[
+            EPOCH_HEAD_CONTEXT,
+            &self.to_bytes()?,
+        ])?)
     }
 }
 
@@ -225,9 +232,9 @@ impl SignedEpoch {
     ///
     /// # Errors
     ///
-    /// A signing or OpenSSL error.
+    /// An OpenSSL error.
     pub fn issue(anchor: &SigningKey, epoch: &AnchorEpoch) -> Result<Self> {
-        let statement = epoch.to_bytes();
+        let statement = epoch.to_bytes()?;
         let signature = anchor.sign_with_context(&statement, EPOCH_CONTEXT)?;
         Ok(Self {
             entry: b64::encode(&statement),
@@ -619,7 +626,10 @@ mod tests {
         let signed = SignedEpoch::issue(&a1, &epoch).unwrap();
         let back = decode(&encode(&signed).unwrap()).unwrap();
         assert_eq!(back, signed);
-        assert_eq!(epoch, AnchorEpoch::from_bytes(&epoch.to_bytes()).unwrap());
+        assert_eq!(
+            epoch,
+            AnchorEpoch::from_bytes(&epoch.to_bytes().unwrap()).unwrap()
+        );
     }
 
     #[test]

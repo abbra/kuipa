@@ -87,14 +87,16 @@ impl Enrollment {
     ///
     /// # Errors
     ///
-    /// [`Error::Malformed`].
+    /// [`Error::Malformed`], also for a realm, domain, issuer or server
+    /// name that is not safe to put in generated configuration and file
+    /// names (see [`crate::realm::is_safe_name`]).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, MAGIC, "enrollment")?;
         let realm = r.str()?.to_owned();
         let domain = r.str()?.to_owned();
         let basedn = r.str()?.to_owned();
         let issuer = r.str()?.to_owned();
-        let servers = (0..r.u8()?)
+        let servers: Vec<String> = (0..r.u8()?)
             .map(|_| r.str().map(str::to_owned))
             .collect::<Result<_, _>>()?;
         let ca_certs = (0..r.u8()?)
@@ -111,6 +113,10 @@ impl Enrollment {
         r.finish()?;
         if keytab.principal().realm() != realm {
             return Err(Error::Mismatch("keytab realm"));
+        }
+        let safe = |n: &str| crate::realm::is_safe_name(n);
+        if !safe(&realm) || !safe(&domain) || !safe(&issuer) || servers.iter().any(|s| !safe(s)) {
+            return Err(Error::Malformed("enrollment: unsafe name"));
         }
         Ok(Self {
             config: RealmConfig {

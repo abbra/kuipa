@@ -723,7 +723,10 @@ pub fn enroll_online(
 /// I/O or key generation errors.
 pub fn prepare(paths: &Paths, replace: bool, fqdn: &str) -> Result<Value, Error> {
     let key = match fs::read(paths.recipient()) {
-        Ok(jwk) if !replace => ExchangeKeyPair::from_jwk(&jwk)?,
+        Ok(jwk) if !replace => {
+            let jwk = native_ossl::util::SecretBuf::new(jwk);
+            ExchangeKeyPair::from_jwk(jwk.as_ref())?
+        }
         _ => {
             let key = ExchangeKeyPair::generate_preferred()?;
             paths::write_file(&paths.recipient(), key.to_jwk()?.as_ref(), 0o600)?;
@@ -783,7 +786,7 @@ pub fn enroll_bundle(
     }
     let machine_key = fs::read(paths.recipient())
         .ok()
-        .map(|j| ExchangeKeyPair::from_jwk(&j))
+        .map(|j| ExchangeKeyPair::from_jwk(native_ossl::util::SecretBuf::new(j).as_ref()))
         .transpose()?;
     let opener = match (
         verified.bundle().mode(),
@@ -909,7 +912,12 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
             Ok(p.with_kerberos(binding).seal(&token, &registrations, &[])?)
         },
     )?;
-    let epoch = payload_epoch(&enrollment).or(known);
+    // §4.8: the watermark advances only through the verified chain, never
+    // by the server's own statement in the enrollment: the exchange above
+    // already checked the advertisement's log continues what this host
+    // knows (`known`), so the enrollment's value may only stand in when
+    // there was nothing to continue.
+    let epoch = known.or(payload_epoch(&enrollment));
     let keytab = merge_previous(enrollment.keytab, old)?;
     match sealer {
         Some(sealer) => {
