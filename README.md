@@ -158,7 +158,9 @@ It starts a throwaway environment (an MIT KDC, two IPA servers, a
 trusted realm and a voucher issuer) and opens a shell where `kuipa` and
 helper commands are ready to use. `./contrib/ci/local-ci.sh
 playground-test` runs a scripted session in the same environment, with
-tracing on, and writes it to `kuipa-playground-report.html`.
+tracing on, and writes a report of it to `kuipa-playground-report/`:
+every step's output and trace, plus an animated terminal capture of each
+section of the session.
 [A traced session](docs/src/scenarios/walkthrough.md) explains one step
 by step.
 

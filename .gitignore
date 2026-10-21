@@ -1,3 +1,5 @@
 /target/
 /kuipa-playground-report.html
+/kuipa-playground-report/
+contrib/ci/playground/node_modules/
 docs/book/

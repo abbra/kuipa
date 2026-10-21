@@ -39,7 +39,7 @@ printing `✓` for what it found and `○` for what is missing:
 | `doc` | `cargo doc --workspace --no-deps --all-features`, with `RUSTDOCFLAGS=-D warnings` | `build` |
 | `test` | `cargo test --workspace --all-features`, without the real-KDC tests | `build` |
 | `kdc-test` | `cargo test -p kuipa-tools --test kdc --test trust --test voucher` with `KUIPA_REQUIRE_KDC=1`, so missing KDC tools fail the job instead of skipping the tests | `build` |
-| `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report.html` (see below) | `build` |
+| `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report/` (see below) | `build` |
 | `msrv` (opt-in) | `cargo build --workspace --all-targets` with the `rust-version` toolchain | |
 
 Dependencies are run on demand: `local-ci.sh clippy` builds first. Inside
@@ -93,11 +93,23 @@ playground itself gets `KUIPA_PLAYGROUND_START_TIMEOUT` seconds (default
 file: a summary, an index of the steps and, per step, the command and its
 output, with the trace and the server log in collapsed panels (open for a
 failed step). It has no external assets and follows the light or dark
-system theme.
+system theme. Each section also carries an animated terminal capture —
+one SVG per section, under `svg/` — built from what the session recorded:
+the commands typed with the prompt of the host the shell acted as, the
+output flowing in (long steps collapse their middle lines), the text a
+step had to show highlighted green and the reason a failed step failed in
+red. `terminal.py` compiles the session into a JSON spec,
+`render-terminal.mjs` renders it with [svg-terminal], and the captures
+play once, when scrolled into view, with a replay button. They are
+renderings of the recording, not a replay: no second run of the
+playground, and the report is the same without them.
 
-The report goes to `kuipa-playground-report.html` in the repository, or
-wherever `KUIPA_PLAYGROUND_REPORT` names. In GitHub Actions the job uploads
-it as the `kuipa-playground-report` artifact and adds the step table, the
+[svg-terminal]: https://github.com/williamzujkowski/svg-terminal
+
+The report goes to `kuipa-playground-report/` in the repository, or
+wherever `KUIPA_PLAYGROUND_REPORT` names: `index.html` plus the `svg/`
+captures. In GitHub Actions the job uploads the directory as the
+`kuipa-playground-report` artifact and adds the step table, the
 failed steps' output and a link to the artifact to the run's Summary tab. The job fails when any step ends with an unexpected exit
 status. To add a step, add a `step EXPECTED "title" 'command' ["text"...]` line to
 `session.sh`, under the `section` it belongs to; `EXPECTED` is an exit
