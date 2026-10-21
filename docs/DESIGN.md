@@ -382,7 +382,8 @@ also the PKINIT anchor): 28.2 KB for ML-KEM-768 + ML-DSA-65, 36.0 KB for
 ML-KEM-1024 + ML-DSA-87, of which the one-proof delegation is 7.5 / 10.1 KB
 (base64 inside base64 JSON; a path hash more per doubling of the realm),
 plus 44 bytes per listed anchor. It is fetched once per join, rekey or
-check.
+check. The vouch-head proofs of §4.9 would make the delegation member a
+few hundred bytes.
 
 ### 4.4 The enrollment string
 
