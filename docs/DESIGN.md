@@ -938,12 +938,12 @@ it holds the host's keys and knows who asks.
 | an image from before the last rotation, host enabled | that kvno's keys | nothing (binding no longer registered) |
 | root on the running host | host identity | host identity |
 
-### 7.4 gssproxy as the holder (designed; gssproxy change submitted)
+### 7.4 gssproxy as the holder (implemented; gssproxy change merged)
 
 GSS-API services that run through gssproxy never see keytabs. If gssproxy
 itself unseals, the keytab never touches a filesystem. This needs no change
 to MIT Kerberos — `MEMORY:` keytabs are stock, and a keytab in a memfd can be
-read through `FILE:/proc/self/fd/N` and copied in — but it needs gssproxy to
+read through `FILE:/proc/self/fd/N` and copied in — but it needed gssproxy to
 learn:
 
 1. a per-service `keytab_loader = /usr/libexec/kuipa-unseal --memfd`: run
@@ -953,14 +953,15 @@ learn:
 3. retry a failing loader with backoff;
 4. keep keytab memory out of core dumps.
 
-All four are in [gssapi/gssproxy#135](https://github.com/gssapi/gssproxy/pull/135)
-(submitted, not yet merged): a loader that fails or runs over five minutes
-is retried from 5 s up to 10 min while the keys loaded before stay in use,
-services sharing a `MEMORY:` keytab must name the same loader, and gssproxy
-makes itself non-dumpable (`PR_SET_DUMPABLE`) while any loader is
+All four landed in
+[gssapi/gssproxy#135](https://github.com/gssapi/gssproxy/pull/135) (merged
+2026-10-21, not in a release yet): a loader that fails or runs over five
+minutes is retried from 5 s up to 10 min while the keys loaded before stay
+in use, services sharing a `MEMORY:` keytab must name the same loader, and
+gssproxy makes itself non-dumpable (`PR_SET_DUMPABLE`) while any loader is
 configured.
 
-`kuipa-unseal --memfd` already implements the loader side. GSS-API
+`kuipa-unseal --memfd` implements the loader side. GSS-API
 consumers (NFS, `mod_auth_gssapi`, sshd, `GSS_USE_PROXY=yes` applications)
 fit directly. SSSD's `ldap_child` and `krb5_child`, certmonger and
 `kinit -k` scripts read the keytab with libkrb5 and stay on file mode until
@@ -2214,7 +2215,7 @@ like an enrollment string.
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
 | user vaults, unified recovery (§7.6) | designed |
-| gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change is submitted as gssapi/gssproxy#135 |
+| gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change merged as gssapi/gssproxy#135, **awaiting an upstream release** |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 
 ### 18.2 Tests
