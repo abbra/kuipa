@@ -28,7 +28,9 @@ use kuipa_enroll::keytab::{Enctype, Keytab};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::parse_stage_result;
 use kuipa_enroll::vault;
-use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred, InitStep};
+use kuipa_gssapi::{
+    AcceptStep, GssClientCred, GssError, GssServerCred, InitStep, NoPreauth, Preauth,
+};
 use kuipa_tools::flows::{self, Auth, Outcome, Target};
 use kuipa_tools::net::{Endpoint, Trust};
 use kuipa_tools::paths::{self, Paths};
@@ -58,6 +60,25 @@ fn set_env(vars: &[(&str, String)]) {
 fn token(cred: &GssClientCred, cb: &[u8]) -> Vec<u8> {
     match kuipa_gssapi::init_token(cred, &format!("ipa-ku@{SERVER}"), Some(cb)).unwrap() {
         InitStep::Complete(t) | InitStep::Continue { token: t, .. } => t,
+    }
+}
+
+/// A front end that answers whatever the KDC asks for from a script, and
+/// records the asking: an exchange with no secret brought is driven by the
+/// KDC, so this is what exercises the responder and the prompter for real.
+struct Scripted {
+    answer: &'static [u8],
+    asked: std::cell::RefCell<Vec<String>>,
+}
+
+impl Preauth for Scripted {
+    fn prompt(&self, label: &str) -> Result<Vec<u8>, GssError> {
+        self.asked.borrow_mut().push(label.to_owned());
+        Ok(self.answer.to_vec())
+    }
+
+    fn secret(&self, label: &str) -> Result<Vec<u8>, GssError> {
+        self.prompt(label)
     }
 }
 
@@ -784,6 +805,61 @@ fn against_a_real_kdc() {
     )
     .unwrap();
     assert_eq!(kvnos(&g.keytab()).len(), 1);
+
+    // ── Collection through kuipa: nobody brought a password ──
+    let collected = Scripted {
+        answer: b"Admin123",
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    kuipa_gssapi::ticket(
+        &conf_path,
+        ADMIN,
+        None,
+        &format!("ipa-ku/{SERVER}@{REALM}"),
+        "MEMORY:collected",
+        &collected,
+    )
+    .expect("the front end answers what libkrb5 asks for");
+    assert!(
+        !collected.asked.borrow().is_empty(),
+        "kuipa was asked, instead of libkrb5 reading a terminal itself"
+    );
+    // A secret brought answers the exchange: nothing is asked of anyone.
+    let quiet = Scripted {
+        answer: b"wrong",
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    kuipa_gssapi::ticket(
+        &conf_path,
+        ADMIN,
+        Some(b"Admin123"),
+        &format!("ipa-ku/{SERVER}@{REALM}"),
+        "MEMORY:quiet",
+        &quiet,
+    )
+    .expect("the secret brought authenticates");
+    assert!(
+        quiet.asked.borrow().is_empty(),
+        "nothing was asked of a join that brought its secret: {:?}",
+        quiet.asked.borrow()
+    );
+    // A factor nobody can be asked for is named as the reason, not libkrb5's
+    // generic preauthentication failure.
+    assert!(
+        matches!(
+            kuipa_gssapi::ticket(
+                &conf_path,
+                ADMIN,
+                None,
+                &format!("ipa-ku/{SERVER}@{REALM}"),
+                "MEMORY:unaskable",
+                &NoPreauth,
+            ),
+            Err(GssError::Preauth { .. }),
+        ),
+        "an uncollectable factor must be named"
+    );
+
     let c = root(&realm, "web3");
     flows::enroll_online(
         &c,
