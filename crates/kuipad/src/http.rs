@@ -3,7 +3,9 @@
 //!
 //! Every refusal is an empty `403`; the reason goes to the log only.
 //! Requests over the rate limits are answered `429` before any work is done
-//! (§5.1).
+//! (§5.1).  A request whose host name or principal is not even shaped like
+//! one is refused before that: nothing of it reaches the limiter's tables,
+//! the LDAP directory or the log.
 
 use std::sync::Arc;
 
@@ -31,6 +33,11 @@ const BODY_LIMIT: usize = 64 * 1024;
 /// Most anchors a client may name in `GET adv`.
 const MAX_WANTED_ANCHORS: usize = 16;
 
+/// Longest host name or principal accepted in a request.  Well-formed
+/// names are far shorter; longer ones serve only to bloat logs and the
+/// limiter's keys.
+const MAX_NAME: usize = 256;
+
 /// Shared state.
 pub struct App<D> {
     /// The protocol server.
@@ -50,6 +57,16 @@ fn admit<D>(app: &App<D>, what: &str, host: &str, headers: &HeaderMap) -> Result
     admit_for(app, what, Some(host), headers)
 }
 
+/// Whether `name` is shaped like a host name or Kerberos principal:
+/// not empty, not absurdly long, no control characters or whitespace.
+/// Only the shape: whether the name is real is the directory's question,
+/// asked after authentication.
+fn plausible_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME
+        && !name.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 /// As [`admit`]; with no `host`, only the source's bucket is used: for
 /// operations that are only ever Kerberos-authenticated (registration,
 /// vault operations), where there is nothing to guess, and whose many
@@ -60,13 +77,14 @@ fn admit_for<D>(
     host: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
+    if host.is_some_and(|h| !plausible_name(h)) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let source =
         limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
     match host {
         Some(host) => app.limiter.check(host, source.as_deref()),
-        None => source
-            .as_deref()
-            .map_or(Ok(()), |s| app.limiter.check_source(s)),
+        None => app.limiter.check_source(source.as_deref()),
     }
     .map_err(|limited| {
         eprintln!(
@@ -230,10 +248,11 @@ async fn tang_recover<D: Directory + Send + Sync + 'static>(
     };
     let source =
         limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
-    if let Some(source) = &source
-        && app.limiter.check_source(source).is_err()
-    {
-        eprintln!("kuipad: tang recovery: rate limited (source {source})");
+    if app.limiter.check_source(source.as_deref()).is_err() {
+        eprintln!(
+            "kuipad: tang recovery: rate limited (source {})",
+            source.as_deref().unwrap_or("unknown")
+        );
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     let request = match tang_pqc::RecoveryRequest::from_bytes(&body) {
@@ -401,8 +420,18 @@ async fn establish_trust<D: Directory + Send + Sync + 'static>(
 
 async fn peer_sync<D: Directory + Send + Sync + 'static>(
     State(app): State<Arc<App<D>>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Syncs arrive from other servers, which the GSS-API token check in
+    // `handle` authenticates; the cost of that check is still bounded by
+    // the per-source rate limit, like every other route.
+    let source =
+        limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
+    if app.limiter.check_source(source.as_deref()).is_err() {
+        eprintln!("kuipad: peer sync: rate limited");
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     let Some(peers) = &app.peers else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -427,5 +456,15 @@ mod tests {
         assert_eq!(wanted_anchors(None).len(), 0);
         let many = format!("anchor={a}&").repeat(40);
         assert_eq!(wanted_anchors(Some(&many)).len(), MAX_WANTED_ANCHORS);
+    }
+
+    #[test]
+    fn implausible_names_are_refused_outright() {
+        assert!(plausible_name("web1.example.test"));
+        assert!(plausible_name("host/web1.example.test@EXAMPLE.TEST"));
+        assert!(!plausible_name(""), "empty");
+        assert!(!plausible_name(&"h".repeat(MAX_NAME + 1)), "too long");
+        assert!(!plausible_name("web1\n.example"), "control character");
+        assert!(!plausible_name("web1 example"), "whitespace");
     }
 }
