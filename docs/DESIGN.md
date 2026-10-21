@@ -657,6 +657,183 @@ them.
   only as fresh as the last verification.
 * Nothing here revokes; §4.7's limits stand.
 
+### 4.9 Vouch heads (designed)
+
+§4.2's proof is an MTC certificate in all but shape, and carries the
+cost of one: measured (`measure_sizes`), the advertisement's delegation
+member is 7.5 KB with ML-DSA-65 and 10.1 KB with ML-DSA-87, of which
+the anchor JWK (2.7 KB) and the ML-DSA signature (3.3 KB raw, 4.4 KB
+base64url) are almost everything; the exchange state is 55 KB (60
+servers, 6 anchors) to 489 KB (60 anchors), and one claim renewal
+gossips 32–321 KB of deltas, most of it the same JWKs and signatures
+repeated per anchor and per round. A certificate whose proof can skip
+the signature and the key would make the advertisement delegation a few
+hundred bytes and the exchange deltas mostly leaf lists. The Merkle
+Tree Certificates drafts call the mechanism that allows this a
+**landmark**: draft-ietf-plants-merkle-tree-certs §6.4 and §7.4 — a
+pre-distributed tree checkpoint a relying party holds, against which an
+inclusion proof verifies with no signature at all. `synta-mtc` (already
+a dependency, for the tree hashing) implements landmark publication,
+distribution and trusted-subtree verification. This section designs
+kuipa's use of it. It is **designed, not implemented** (§18.1); nothing
+above changes until it lands.
+
+#### 4.9.1 What the anchor signs today, and what a head is
+
+An anchor's vouch is a full Merkle tree per signature: the leaves are
+re-sorted and the tree re-rooted on every re-vouch, so every proof for
+every claim changes each round. That is what makes the delegation carry
+its own tree: proof and witness cannot be separated, and a client that
+pins the anchor must repeat the anchor's 2.7 KB public key in every
+proof it checks.
+
+A **claim log** turns the same content into the MTC shape: an
+append-only sequence of leaves, one per claim the anchor vouches for,
+numbered from 1, with the same RFC 9162 hashing as today (the MTC
+draft's leaf and node prefixing is identical to what `merkle.rs` already
+does through `synta-mtc`). The anchor still signs, but what it signs is
+a **head**:
+
+```
+IPVH  version 2: realm anchor(32) iat exp size(u64) root(32)
+```
+
+— the same fields as today's vouch statement, over the claim log
+instead of a re-sorted tree. The **vouch head** is `(anchor thumbprint,
+size, root)`. Re-vouching appends claims and signs the new head; the
+root of an appended tree changes only along the right edge, so the
+inclusion path of an old claim stays valid as long as its suffix hash
+is unchanged — the property MTC issuance logs are built on. A vouch
+that only adds claims no longer rewrites every proof it ever made.
+
+#### 4.9.2 The wire: a proof that skips the signature
+
+A **head proof** replaces today's `Proof` where the client holds the
+head:
+
+```json
+{"head_proof": {"anchor": "<thumbprint>", "index": 3,
+                "path": ["<b64url hash>", …]}}
+```
+
+The old member stays: `{"claim": …, "proofs": […]}` (§4.3) for a client
+that pins the anchor but no head. A `head_proof` is accepted only
+against a pin that carries a head for that anchor (§4.9.4) — the
+thumbprint alone is not enough, since there is no signature to check.
+Selection (`?anchor=`, §4.3) becomes: the first pinned anchor for which
+the client can be served — a head proof when the client's pin carries a
+matching head, else today's signature proof, else the succession chain.
+The two-pin quorum (§4.4) works unchanged on head proofs: two pinned
+heads by distinct anchors must both prove the claim, and a thief
+holding one key alone cannot mint a matching head, so the impostor
+still surfaces as a refusal.
+
+**What it saves.** A head proof is the path (32 bytes per level, six
+levels at 60 anchors) plus a thumbprint: under 300 bytes against 7.5
+KB, and the `anchors` and `claim` members they make redundant shrink
+the delegation member to a few hundred bytes, advertisement to about
+21 KB (ML-DSA-65) — with no signature to make, the proof needs no
+freshness of its own.
+
+#### 4.9.3 Servers: the gossip is leaves
+
+On the servers nothing structural changes — `AnchorState`, agirru
+anti-entropy, the Kerberos-authenticated syncs and the trust
+computation stay as they are. The `SignedVouch` entry becomes a head
+plus its new leaves: `IPSV` version 2, where the leaves are those
+appended since the previous head (a full vouch keeps its leaves, as
+today, until superseded). A
+server that finds a gap between a head it holds and one it receives
+fetches the missing leaves from the peer's public claim log
+(§4.9.5), as it fetches a missing anchor-log window today (§4.8).
+The anchor re-signs on the same schedule (§4.2); with signature-free
+proofs in play it may sign less often — the head a pin carries is
+fresh until its stated `exp` passes — but re-vouching stays cheap and
+the code keeps the batched cadence.
+
+A delegation served to a head-pinned client carries its head proof
+only, not the signature; the signature stays in the exchange and in
+delegations served to clients without heads. This is the size win on
+the wire between servers as well: per anchor per round the delta
+becomes the head (about 100 bytes) and the appended leaves (32 bytes
+per claim), with the 2.7 KB JWK and 3.3 KB signature sent only when
+the anchor itself changes — measured exchange sizes, minus the
+per-anchor signature cost per round: the state keeps one key, one
+current head and its signature per anchor, plus the claims.
+
+#### 4.9.4 How a head reaches a host
+
+Every channel that carries a pin today carries the head next to it,
+because a pin and a head are the same kind of fact — an administrator's
+assertion about an anchor, delivered out of band, and only as fresh as
+its channel:
+
+| channel | today | with a head |
+|---|---|---|
+| enrollment string (§4.4) | `ipa-ku1:REALM:<anchor>:<expiry>` | `ipa-ku2:REALM:<anchor>:<expiry>:<size>:<root>` (versioned prefix; the head is optional, and a string may pin the anchor alone, as today) |
+| `/etc/ipa/ku-anchors` (§4.5) | `<thumbprint> [<expiry>]` | `<thumbprint> [<expiry>] [<size> <root>]`, refreshed inside every sealed join and rekey response, as pins are |
+| sealed response payload (§5.5) | `anchors[]` (thumbprints) | `anchors[]` with each one's current head |
+| image pins (§4.4, `--realm`) | thumbprints + expiry | thumbprints + expiry + head |
+
+A host that has verified a realm keeps the head it used, and replaces
+it only from a verified advertisement or sealed response — never from
+the delegation member itself, which is untrusted input: **the head is
+part of the pin, not of the proof**. An expired head is refused like an
+expired pin (the string's expiry bounds it); a head whose `exp` has
+passed makes the client fall back to a signature proof, which the
+server serves as today. A head may also be pinned *behind* a
+succession (§4.7): the succession chain carries heads as it carries
+keys, and a client whose pinned head is for a rotated anchor follows
+the chain and takes the current anchor's head from the advertisement's
+`anchors` member — verified, as the whole `ipa` member is, by the
+delegated key's signature.
+
+Heads in pins carry the same guarantee MTC gives a pre-distributed
+landmark: the tree a head names cannot change behind it, so any
+inclusion proof that checks against it was fixed when the head was
+pinned. A host that never looks again trusts exactly the claims that
+were in the tree when its pin was written — the stale-pin property
+§4.4's expiry already bounds.
+
+#### 4.9.5 Publishing heads publicly
+
+`GET /ipa/ku/anchor-log` (§4.8) gains the claim logs: the response
+lists, per current anchor, its head `(size, root, exp)` and serves
+`?from=<index>` pages of leaves — the same pagination and public,
+unauthenticated access as the epoch log, for a server that must fill a
+gap or a verifier that wants to audit what a head covered. Leaves are
+content-addressed claims (their hash is the leaf), so pages are
+verifiable against any head that follows them: a page's last leaf at
+index `i`, hashed with the page's path structure, must reproduce the
+root of a head at size ≥ `i` — the MTC subtree proof (`synta-mtc`
+`verify_subtree_inclusion_proof`). The epoch log (§4.8) and the claim
+logs stay separate records: the epoch log records anchor *history*;
+claim logs record what each anchor *vouched for*.
+
+#### 4.9.6 What this does not change
+
+* **No global log, no new quorum.** The claim log is per anchor, and
+  trust still comes from the exchange (§4.2): a claim enters a tree
+  only through the anchor's own server or the gossip. There is no CT
+  monitor, no third-party witness, no new party to run.
+* **Threat model.** A head is a weaker pin than a key: it binds the
+  tree, not the key that signs it. But a client that holds only a
+  thumbprint today trusts *every* signature that key makes, forever,
+  with no freshness; a client that holds a head trusts exactly the
+  leaves under it, and nothing an impostor signs later. Head proofs
+  are strictly stronger than the pins they extend, for the same
+  channel. The two-anchor rule (§4.4) and the Kerberos binding
+  (§5.1) apply unchanged and are what binds a head proof to a live
+  server.
+* **Backwards and forwards.** Old clients ignore the new members; new
+  clients fall back to signature proofs wherever no head is pinned.
+  There is no deployment yet, so both forms ship in one version and
+  the prefix bump (`ipa-ku2`) is free; the v1 form stays only as long
+  as tests and the playground exercise it.
+* **Anchor rotation** (§4.7) is untouched: heads follow successions,
+  and a rotated anchor's claim log simply stops growing; its
+  successor's tree starts fresh.
+
 ## 5. Join protocol
 
 ### 5.1 Key schedule
