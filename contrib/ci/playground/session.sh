@@ -225,10 +225,13 @@ step 75 "No server opens a file of a revoked vault" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
 
 section "Failover" \
-    "With ipa1 unreachable, web2 enrolls through ipa2: every server presents an advertisement that ipa1's anchor vouches for."
+    "With ipa1 unreachable, web2 enrolls through ipa2: every server presents an advertisement that ipa1's anchor vouches for.  Enrolled, web2 must then keep verifying ipa2 with the anchors it pinned — not the one anchor of the enrollment string it was issued, whose server is the one that is down."
 step 0 "Make ipa1 unreachable" 'pq_down ipa1'
 step 0 "Enroll web2 while ipa1 is down" 'pq_enroll web2' \
     "issuer: ipa2.example.test"
+step 0 "web2, enrolled, verifies ipa2's advertisement whole: anchor log included" \
+    'kuipa advertisement --server ipa2.example.test' \
+    "its anchor log, every entry verified from sequence 0 up:"
 step 0 "Make ipa1 reachable again" 'pq_up'
 
 section "Password enrollment" \
