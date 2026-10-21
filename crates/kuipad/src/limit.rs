@@ -2,8 +2,16 @@
 //! checked before any decapsulation or LDAP work.
 //!
 //! A bucket holds up to `burst` tokens and gains `per_minute` tokens a
-//! minute; each request takes one.  Idle buckets (full again) are dropped
-//! when the table grows, so memory stays bounded.
+//! minute; each request takes one.  Memory stays bounded: bucket keys are
+//! truncated (so an attacker cannot store megabytes per entry), and the
+//! tables evict — idle buckets first, then the least recently used —
+//! beyond a fixed number of entries, never growing past that however many
+//! distinct names or addresses a client sends.
+//!
+//! Requests that name no host (registration, vault operations, Tang
+//! recovery) and arrive without a resolvable source share one bucket of
+//! their own, so they are always limited: nothing reaches the handlers
+//! unthrottled.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
@@ -52,8 +60,27 @@ struct Bucket {
     at: Instant,
 }
 
-/// Buckets beyond which idle ones are dropped.
-const PRUNE_ABOVE: usize = 10_000;
+/// Most buckets kept per table (hosts, sources): the tables evict beyond
+/// this, so memory cannot grow with the number of distinct keys a client
+/// sends.  Generous for real realms and client populations.
+const TABLE_CAP: usize = 10_000;
+
+/// At most this many bytes of a bucket key are stored.  Keys arrive from
+/// the network; truncating them bounds what a single entry can cost.
+/// A host or principal name that matters is short; this only tells apart
+/// buckets, and a truncation collision merely shares an allowance.
+const KEY_LEN: usize = 128;
+
+/// The bucket shared by every request that names no host and has no
+/// resolvable source address.
+const UNSOURCED: &str = "\0unsourced";
+
+fn key(k: &str) -> &str {
+    match k.char_indices().nth(KEY_LEN) {
+        Some((i, _)) => &k[..i],
+        None => k,
+    }
+}
 
 #[derive(Debug, Default)]
 struct Table {
@@ -62,8 +89,22 @@ struct Table {
 
 impl Table {
     fn take(&mut self, key: &str, rate: Rate, now: Instant) -> bool {
-        if self.buckets.len() > PRUNE_ABOVE {
+        // Cheap first pass: any table at the cap drops buckets that are
+        // full again (idle), which is almost always enough.
+        if self.buckets.len() >= TABLE_CAP {
             self.buckets.retain(|_, b| level(b, rate, now) < rate.burst);
+        }
+        // Still at the cap — a sustained flood of distinct names: evict
+        // the least recently used until there is room.  The bucket being
+        // taken now has the newest `at`, so it survives its own insertion.
+        while self.buckets.len() >= TABLE_CAP {
+            match self.buckets.iter().min_by_key(|(_, b)| b.at) {
+                Some((oldest, _)) if oldest != key => {
+                    let oldest = oldest.clone();
+                    self.buckets.remove(&oldest);
+                }
+                _ => break,
+            }
         }
         let bucket = self.buckets.entry(key.to_owned()).or_insert(Bucket {
             tokens: rate.burst,
@@ -77,6 +118,11 @@ impl Table {
         } else {
             false
         }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.len()
     }
 }
 
@@ -123,14 +169,16 @@ impl Limiter {
     }
 
     /// Take a token from `source`'s bucket only: for requests that name no
-    /// host (Tang recovery).
+    /// host (Tang recovery, registration, vault operations).  `None`
+    /// limits through the shared unsourced bucket rather than not at all.
     ///
     /// # Errors
     ///
     /// [`Limited::Source`] when it is empty.
-    pub fn check_source(&self, source: &str) -> Result<(), Limited> {
+    pub fn check_source(&self, source: Option<&str>) -> Result<(), Limited> {
         let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
-        if sources.take(source, self.limits.per_source, Instant::now()) {
+        let key = key(source.unwrap_or(UNSOURCED));
+        if sources.take(key, self.limits.per_source, Instant::now()) {
             Ok(())
         } else {
             Err(Limited::Source)
@@ -140,16 +188,25 @@ impl Limiter {
     fn check_at(&self, host: &str, source: Option<&str>, now: Instant) -> Result<(), Limited> {
         if let Some(source) = source {
             let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
-            if !sources.take(source, self.limits.per_source, now) {
+            if !sources.take(key(source), self.limits.per_source, now) {
                 return Err(Limited::Source);
             }
         }
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        if hosts.take(&host.to_ascii_lowercase(), self.limits.per_host, now) {
+        if hosts.take(key(&host.to_ascii_lowercase()), self.limits.per_host, now) {
             Ok(())
         } else {
             Err(Limited::Host)
         }
+    }
+
+    /// The state of both tables, for tests.
+    #[cfg(test)]
+    fn sizes(&self) -> (usize, usize) {
+        (
+            self.hosts.lock().unwrap().len(),
+            self.sources.lock().unwrap().len(),
+        )
     }
 }
 
@@ -168,9 +225,8 @@ pub fn forwarded_source(header: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
+    use std::time::Duration;
 
     fn limiter(host: (f64, f64), source: (f64, f64)) -> Limiter {
         Limiter::new(Limits {
@@ -223,15 +279,88 @@ mod tests {
     }
 
     #[test]
+    fn unsourced_requests_share_one_bucket() {
+        // The per-source limit of the shared bucket bites for requests
+        // without a resolvable source address: no unlimited path remains.
+        let l = limiter((1000.0, 1000.0), (2.0, 1.0));
+        let t = Instant::now();
+        assert_eq!(l.check_source(None), Ok(()));
+        assert_eq!(l.check_source(None), Ok(()));
+        assert_eq!(
+            l.check_source(None),
+            Err(Limited::Source),
+            "no source is the shared bucket, not no limit"
+        );
+        // The same bucket serves hostless requests with and without a
+        // source name... no: a named source has its own.
+        assert_eq!(l.check_at("web", Some("s"), t), Ok(()));
+        assert_eq!(l.check_at("web", None, t), Ok(()));
+    }
+
+    #[test]
+    fn hostless_with_source_is_limited_per_source() {
+        let l = limiter((1000.0, 1000.0), (1.0, 0.0));
+        assert_eq!(l.check_source(Some("198.51.100.7")), Ok(()));
+        assert_eq!(l.check_source(Some("198.51.100.7")), Err(Limited::Source));
+        assert_eq!(l.check_source(Some("198.51.100.8")), Ok(()));
+    }
+
+    #[test]
+    fn table_size_is_capped_under_a_flood_of_distinct_keys() {
+        let l = limiter((10.0, 0.0), (1000.0, 1000.0));
+        let t = Instant::now();
+        // Far more distinct keys than TABLE_CAP: the table must not grow
+        // past the cap, and admission must keep working.
+        for i in 0..(TABLE_CAP * 3) {
+            let _ = l.check_at(&format!("h{i}.example.test"), None, t);
+        }
+        let (hosts, _) = l.sizes();
+        assert!(hosts <= TABLE_CAP, "table grew to {hosts}");
+        // The most recent keys still have buckets: one of the last few
+        // is admitted (burst 10), an early one was evicted.
+        let mut admitted = 0;
+        for i in 0..10 {
+            if l.check_at(&format!("h{}.example.test", TABLE_CAP * 3 - 1 - i), None, t)
+                .is_ok()
+            {
+                admitted += 1;
+            }
+        }
+        assert!(admitted > 0, "recent keys lost their buckets");
+        assert!(
+            l.check_at("h0.example.test", None, t).is_ok(),
+            "an evicted key is simply admitted again — memory is bounded, not correctness"
+        );
+    }
+
+    #[test]
+    fn long_keys_are_truncated_not_stored() {
+        let l = limiter((1.0, 0.0), (1000.0, 1000.0));
+        let t = Instant::now();
+        let long = "h".repeat(60_000);
+        assert_eq!(l.check_at(&long, None, t), Ok(()));
+        // A second 60 kB key, differing only past the truncation point,
+        // shares the first's bucket: bounded memory, shared allowance.
+        assert_eq!(
+            l.check_at(&format!("{long}x"), None, t),
+            Err(Limited::Host),
+            "keys differing past the stored prefix share a bucket"
+        );
+        let (hosts, _) = l.sizes();
+        assert_eq!(hosts, 1);
+    }
+
+    #[test]
     fn idle_buckets_are_dropped() {
         let l = limiter((1.0, 60.0), (1000.0, 1000.0));
         let t = Instant::now();
-        for i in 0..=PRUNE_ABOVE {
+        for i in 0..=TABLE_CAP {
             let _ = l.check_at(&format!("h{i}"), None, t);
         }
         let later = t + Duration::from_secs(120);
         let _ = l.check_at("new", None, later);
-        assert!(l.hosts.lock().unwrap().buckets.len() < 10);
+        let (hosts, _) = l.sizes();
+        assert!(hosts < 10, "{hosts} buckets survived the refill");
     }
 
     #[test]
