@@ -1,7 +1,8 @@
 # Commands
 
-Every program prints its full options with `--help`. This page lists what
-each command is for.
+Every program prints its full options with `--help`, and has a man page
+(`docs/man/*.scd`: `kuipa(1)`, `kuipa-unseal(8)`, `kuipa-voucher(1)`,
+`kuipad(8)`, `tang-pqc(1)`). This page lists what each command is for.
 
 Common to `kuipa` and `kuipa-unseal`: `--json` prints the result as one
 JSON object; `--verbose` and `--trace` trace on standard error;
