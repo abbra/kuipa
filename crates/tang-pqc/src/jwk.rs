@@ -50,11 +50,14 @@ impl Jwk {
             .flatten()
     }
 
-    /// `key_ops` absent, or containing `op`.
-    pub(crate) fn allows(&self, op: &str) -> bool {
+    /// The key states itself usable for `op`: `key_ops` is present and
+    /// allows it.  Absent `key_ops` allows nothing — an AKP key always
+    /// carries one (RFC 9964 §4), and a key without a stated purpose must
+    /// not silently serve every role in an advertisement.
+    pub(crate) fn states(&self, op: &str) -> bool {
         self.key_ops
             .as_ref()
-            .is_none_or(|ops| ops.iter().any(|o| o == op))
+            .is_some_and(|ops| ops.iter().any(|o| o == op))
     }
 
     pub(crate) fn public_bytes(&self) -> Result<Vec<u8>> {

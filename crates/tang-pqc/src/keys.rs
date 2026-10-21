@@ -246,7 +246,7 @@ impl ExchangeKey {
             .akp_alg()
             .and_then(KemAlg::from_jose_name)
             .ok_or(Error::UnsupportedKey)?;
-        if !jwk.allows(OP_DERIVE_KEY) {
+        if !jwk.states(OP_DERIVE_KEY) {
             return Err(Error::Malformed("JWK: key_ops"));
         }
         Self::from_jwk(&jwk, alg)
@@ -533,7 +533,7 @@ impl VerifyingKey {
             .akp_alg()
             .and_then(SignatureAlg::from_jose_name)
             .ok_or(Error::UnsupportedKey)?;
-        if !jwk.allows(OP_VERIFY) {
+        if !jwk.states(OP_VERIFY) {
             return Err(Error::Malformed("JWK: key_ops"));
         }
         Self::from_jwk(&jwk, alg)

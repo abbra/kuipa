@@ -25,6 +25,20 @@ use crate::policy::{Policy, unix_seconds};
 /// JWS `cty` used by Tang for advertisements.
 const CTY_JWK_SET: &str = "jwk-set+json";
 
+/// Most bytes of an accepted advertisement (the JSON document).  Real ones
+/// are a few KiB: a handful of ML-DSA/ML-KEM keys and signatures.  A larger
+/// one is either broken or hostile, and parsing it — let alone verifying a
+/// signature per JWS `signatures` entry — costs CPU and memory before the
+/// pinned key's signature rejects it.
+pub const MAX_ADVERTISEMENT_BYTES: usize = 256 * 1024;
+
+/// Most JWS signatures in one advertisement.  Real servers emit one to a
+/// handful (one per current signing key).
+const MAX_SIGNATURES: usize = 16;
+
+/// Most keys in one advertisement's JWK Set.
+const MAX_KEYS: usize = 256;
+
 #[derive(Serialize, Deserialize)]
 struct JwkSet {
     keys: Vec<Jwk>,
@@ -139,14 +153,14 @@ impl Advertisement {
 fn signing_alg(jwk: &Jwk) -> Option<SignatureAlg> {
     jwk.akp_alg()
         .and_then(SignatureAlg::from_jose_name)
-        .filter(|_| jwk.allows(OP_VERIFY))
+        .filter(|_| jwk.states(OP_VERIFY))
 }
 
 /// The ML-KEM algorithm of an advertised exchange key, if it is one.
 fn exchange_alg(jwk: &Jwk) -> Option<KemAlg> {
     jwk.akp_alg()
         .and_then(KemAlg::from_jose_name)
-        .filter(|_| jwk.allows(OP_DERIVE_KEY))
+        .filter(|_| jwk.states(OP_DERIVE_KEY))
 }
 
 /// An advertisement as served at `GET /adv`.
@@ -207,17 +221,28 @@ impl SignedAdvertisement {
     }
 
     fn key_set(&self) -> Result<JwkSet> {
-        serde_json::from_slice(&b64::decode(&self.jws.payload)?)
-            .map_err(|_| Error::Malformed("advertisement JWK Set"))
+        let payload = b64::decode(&self.jws.payload)?;
+        if payload.len() > MAX_ADVERTISEMENT_BYTES {
+            return Err(Error::Malformed("advertisement JWK Set too large"));
+        }
+        let set: JwkSet = serde_json::from_slice(&payload)
+            .map_err(|_| Error::Malformed("advertisement JWK Set"))?;
+        if set.keys.len() > MAX_KEYS {
+            return Err(Error::Malformed("advertisement JWK Set has too many keys"));
+        }
+        Ok(set)
     }
 
     /// The protected header of `sig` if it verifies under `key`.  Signatures
-    /// with an unexpected `alg` or with critical header parameters we do not
-    /// understand never verify.
+    /// with an unexpected `alg` or `cty`, or with critical header parameters
+    /// we do not understand, never verify.
     fn signed_by(&self, key: &VerifyingKey, sig: &JwsSignature) -> Option<ProtectedHeader> {
         let header: ProtectedHeader =
             serde_json::from_slice(&b64::decode(&sig.protected).ok()?).ok()?;
-        if header.crit.is_some() || header.alg != key.alg().jose_name() {
+        if header.crit.is_some()
+            || header.alg != key.alg().jose_name()
+            || header.cty.as_deref() != Some(CTY_JWK_SET)
+        {
             return None;
         }
         let signature = b64::decode(&sig.signature).ok()?;
@@ -392,9 +417,16 @@ impl SignedAdvertisement {
     ///
     /// # Errors
     ///
-    /// [`Error::Malformed`] for invalid JSON.
+    /// [`Error::Malformed`] for invalid JSON, or an oversized document.
     pub fn from_json(json: &[u8]) -> Result<Self> {
-        let jws = serde_json::from_slice(json).map_err(|_| Error::Malformed("advertisement"))?;
+        if json.len() > MAX_ADVERTISEMENT_BYTES {
+            return Err(Error::Malformed("advertisement too large"));
+        }
+        let jws: GeneralJws =
+            serde_json::from_slice(json).map_err(|_| Error::Malformed("advertisement"))?;
+        if jws.signatures.len() > MAX_SIGNATURES {
+            return Err(Error::Malformed("advertisement has too many signatures"));
+        }
         Ok(Self { jws })
     }
 }
@@ -589,16 +621,57 @@ mod tests {
         let (adv, thp) = server_adv();
         let mut extended = header_json(&adv);
         extended["exp"] = (extended["exp"].as_u64().unwrap() + DAY).into();
-        for header in [
+        let headers = [
             json!({"alg": "ML-DSA-44", "cty": "jwk-set+json"}),
             json!({"alg": "ML-DSA-65", "cty": "jwk-set+json", "crit": ["x"], "x": 1}),
+            json!({"alg": "ML-DSA-65"}),
+            json!({"alg": "ML-DSA-65", "cty": "other+json"}),
             // Extending the signed lifetime invalidates the signature.
             extended,
-        ] {
+        ];
+        for header in headers {
             let mut forged = adv.clone();
             forged.jws.signatures[0].protected = b64::encode(header.to_string().as_bytes());
             assert!(matches!(forged.verify(&thp), Err(Error::InvalidSignature)));
         }
+    }
+
+    #[test]
+    fn oversized_advertisements_are_rejected_before_parsing() {
+        let (adv, _) = server_adv();
+        // Too many signatures: rejected at parse, before any verification.
+        let mut flooded = adv.clone();
+        let one = flooded.jws.signatures[0].clone();
+        flooded.jws.signatures = vec![one; MAX_SIGNATURES + 1];
+        assert!(matches!(
+            SignedAdvertisement::from_json(flooded.to_json().as_bytes()),
+            Err(Error::Malformed(_))
+        ));
+        // Too many bytes: rejected at parse.
+        let huge = format!("{}{}", " ".repeat(MAX_ADVERTISEMENT_BYTES), "]");
+        assert!(matches!(
+            SignedAdvertisement::from_json(huge.as_bytes()),
+            Err(Error::Malformed(_))
+        ));
+        // A normal one still parses.
+        assert!(SignedAdvertisement::from_json(adv.to_json().as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn too_many_keys_or_payload_bytes_are_rejected() {
+        let (adv, thp) = server_adv();
+        // A payload with too many keys fails at the key-set decode, before
+        // signature verification can burn CPU on each one.
+        let mut payload = payload_json(&adv);
+        let filler = json!({"kty": "oct", "k": ""});
+        payload["keys"] = Value::Array(std::iter::repeat_n(filler, MAX_KEYS + 1).collect());
+        let forged = with_payload(&adv, &payload);
+        assert!(matches!(forged.verify(&thp), Err(Error::Malformed(_))));
+        // A payload larger than the cap fails likewise.
+        let mut big = payload_json(&adv);
+        big["keys"][0]["x"] = Value::String("A".repeat(MAX_ADVERTISEMENT_BYTES));
+        let forged = with_payload(&adv, &big);
+        assert!(matches!(forged.verify(&thp), Err(Error::Malformed(_))));
     }
 
     /// Replaying an old, validly signed advertisement fails once it expires.
