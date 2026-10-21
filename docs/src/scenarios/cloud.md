@@ -204,9 +204,10 @@ kuipa protect --keytab /etc/httpd/http.keytab
 
 **gssproxy**: services that go through gssproxy (NFS, `mod_auth_gssapi`)
 can get their keytab straight into gssproxy's memory, never on any
-filesystem, once gssproxy's `keytab_loader` lands
+filesystem, with gssproxy's `keytab_loader`
 ([gssapi/gssproxy#135](https://github.com/gssapi/gssproxy/pull/135),
-**planned** until then):
+merged upstream; not in a release yet, so until it ships gssproxy must be
+built from its main branch):
 
 ```ini
 [service/nfs-server]
@@ -349,7 +350,7 @@ What you get, and what it rests on:
 | join without network access at first boot | staged bundles (mode B for clouds) | needs FreeIPA |
 | keep the host identity out of snapshots | `kuipa protect`, monthly rotation | available |
 | protect service keytabs | `kuipa protect --keytab` | available |
-| keep service keytabs off every filesystem | gssproxy `keytab_loader` | planned (upstream PR) |
+| keep service keytabs off every filesystem | gssproxy `keytab_loader` | available, needs a gssproxy built from main (PR merged, awaiting release) |
 | deliver application secrets | `kuipa protect --file` | available |
 | encrypt data volumes | Clevis `tang-pqc` pin against kuipad | available |
 | invalidate a terminated instance | `ipa host-del` in a termination hook | available |
