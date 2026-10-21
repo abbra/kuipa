@@ -2399,6 +2399,7 @@ like an enrollment string.
 | trusted realms: `trusts` member and its validation, `kuipa trusted-realms`, per-realm anchors, PKINIT anchors and `krb5.conf.d` snippets (§17.1–§17.3) | implemented, tested against two real KDCs |
 | establishing a trust: invitation, trust request, trust secret, cross-realm keys, partner refresh (§17.4) | implemented, tested against two real KDCs; the LDAP side **not yet run against FreeIPA** |
 | units, httpd snippet, config example | provided (`contrib/`) |
+| vouch heads: claim logs, landmark-style pin checks, `ipa-ku2` strings (§4.9) | designed |
 | vouchers (§9): `ml-dsa-blind` issuing, `kuipa-voucher`, bound and bearer vouchers, voucher joins | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
