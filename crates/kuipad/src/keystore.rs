@@ -31,6 +31,12 @@ use tang_pqc::{ExchangeKeyPair, SigningKey, Thumbprint, VerifyingKey};
 /// Errors from the key store.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// Read a private key file into a wiping buffer: the bytes hold the seed,
+/// and must not linger in freed heap memory once the key is parsed.
+fn read_private(path: PathBuf) -> Result<native_ossl::util::SecretBuf, Error> {
+    Ok(native_ossl::util::SecretBuf::new(fs::read(path)?))
+}
+
 /// Which keys [`KeyStore::rotate`] replaces, one flag per
 /// `rotate-keys` option.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -91,11 +97,14 @@ impl KeyStore {
 
     /// Load the server's keys.
     ///
+    /// Private key files are read into wiping buffers, so the seed does
+    /// not linger in freed heap memory after the load.
+    ///
     /// # Errors
     ///
-    /// I/O errors, malformed keys, or a missing signing key.
+    /// I/O or a malformed key.
     pub fn load(&self) -> Result<ServerKeys, Error> {
-        let signing = SigningKey::from_jwk(&fs::read(self.path("signing.jwk"))?)?;
+        let signing = SigningKey::from_jwk(read_private(self.path("signing.jwk"))?.as_ref())?;
         let mut keys = ServerKeys {
             signing,
             join: Vec::new(),
@@ -105,8 +114,10 @@ impl KeyStore {
             retired: Vec::new(),
         };
         for name in self.names()? {
-            let load =
-                || ExchangeKeyPair::from_jwk(&fs::read(self.path(&name))?).map_err(Error::from);
+            let load = || {
+                ExchangeKeyPair::from_jwk(read_private(self.path(&name))?.as_ref())
+                    .map_err(Error::from)
+            };
             if [".join-", ".escrow-", ".trust-"]
                 .iter()
                 .any(|p| name.starts_with(p))
@@ -337,7 +348,9 @@ impl KeyStore {
     ///
     /// I/O errors or a malformed key.
     pub fn anchor(&self) -> Result<SigningKey, Error> {
-        Ok(SigningKey::from_jwk(&fs::read(self.path("anchor.jwk"))?)?)
+        Ok(SigningKey::from_jwk(
+            read_private(self.path("anchor.jwk"))?.as_ref(),
+        )?)
     }
 
     /// The advertised delegation, if one was stored.
