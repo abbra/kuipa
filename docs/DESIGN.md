@@ -745,13 +745,13 @@ realm's Kerberos keys as a second, independent root (§5.1):
 | client | Kerberos credential | `kb` independent of the anchor? |
 |---|---|---|
 | OTP join (default) | armoured AS exchange as `host/<fqdn>` with the OTP, which FreeIPA's `host-add --random` also sets as the host's temporary Kerberos key; then a **rekey** as the host itself, which replaces that key | yes: the AS reply is encrypted in the OTP-derived key |
-| `--principal` password join | armoured AS exchange as the user with the password, straight for `ipa-ku/<server>`; then a Kerberos join | yes for plain password users (the reply is encrypted in the user's key); no for password+OTP, RADIUS, IdP and passkey users, whose reply key comes from the armour |
+| `--principal` password join | armoured AS exchange as the user, straight for `ipa-ku/<server>`; the password answers a plain realm, and whatever else the KDC asks for — a token value, a PIN, a RADIUS or IdP answer, a passkey PIN — is asked for on the terminal, inside the armour; then a Kerberos join | yes for plain password users (the reply is encrypted in the user's key); no for password+OTP, RADIUS, IdP and passkey users, whose reply key comes from the armour |
 | `--use-ccache` | the caller's ticket (§5.4) | as above, by how it was obtained |
 | rekey, stage, `check`, `protect` | the host keytab | yes |
 | `protect --keytab` / `--file` (registration, §7.5) | the keytab being protected, or the one a file is sealed with | yes |
 | `--ldap-otp` (auth type 1), voucher, bundle | none | no: the anchor alone |
 
-* **Armoured AS exchanges** (`kuipa-gssapi::password_ticket`) run in
+* **Armoured AS exchanges** (`kuipa-gssapi::ticket`) run in
   process with their own configuration: the advertisement's KDCs and PKINIT
   anchors in a private temporary `krb5.conf`, anonymous PKINIT armour in a
   memory ccache, FAST required, no fallback to an unarmoured exchange (which
@@ -762,6 +762,22 @@ realm's Kerberos keys as a second, independent root (§5.1):
   `kinit` has: a recorded exchange allows offline guessing once the
   classical PKINIT key exchange of the armour falls. A `--random` OTP is not
   guessable that way.
+* **Pre-authentication** inside those exchanges follows the KDC, as `kinit`
+  does: libkrb5's responder is asked once per round which methods the realm
+  offers, and each is answered — `passkey` by answering nothing, which hands
+  the FIDO2 PIN and device presence to the installed plugin and the
+  prompter; `otp` by showing the token the KDC named and asking for its
+  value, and for a separate PIN when the token asks; `radius`, `idp`,
+  `pkinit` and any method kuipa does not know by showing its challenge and
+  asking for an answer.  A password is not answered there: libkrb5 needs the
+  long-term password to build the FAST encrypted challenge, and takes it
+  from the secret `--password-file` or standard input brought, else asks for
+  it through kuipa's prompter, echo off.  A password never stands in for a
+  passwordless method the realm offered, so a user with a token authenticates
+  with the token.  FAST carries every question and answer, so an impostor's
+  KDC cannot collect them either.  With no terminal to ask on, a realm that
+  needs more than the secret given is refused with that reason;
+  `--use-ccache` (§5.4) is how such a user enrolls from a script.
 * **OTP:** a fake KDC (one named by an impostor's advertisement) could only
   answer the host's AS exchange by knowing the OTP-derived key, and learns
   nothing to guess from. The client never falls back to the LDAP-checked
