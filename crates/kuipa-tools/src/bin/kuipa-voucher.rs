@@ -166,12 +166,16 @@ fn run(command: Command) -> Result<(), Error> {
                 None => [0; 32],
             };
             let now = unix_seconds(std::time::SystemTime::now());
+            let validity = days
+                .checked_mul(86400)
+                .and_then(|s| now.checked_add(s))
+                .ok_or("--days is too large")?;
             let claims = Claims {
                 realm,
                 fqdn: fqdn.to_ascii_lowercase(),
                 hostgroup: hostgroup.unwrap_or_default(),
                 not_before: now.saturating_sub(300),
-                not_after: now + days * 86400,
+                not_after: validity,
                 binding,
             };
             let request = voucher::request(&std::fs::read(&public)?, &claims, Path::new(&state))?;

@@ -143,6 +143,13 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Most bytes read from one response.  Real answers are small: an
+/// advertisement or a page of the anchor log is a few KiB.  A server (or,
+/// on first contact before the CA is known, a network attacker) that
+/// sends more is broken or hostile, and buffering it whole serves only to
+/// exhaust the client's memory.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Reach `server` at `target` (as for [`Endpoint::new`]) from the current
 /// thread, as `KUIPA_ENDPOINTS` does for the whole process.  For tests that
 /// run in parallel: each maps the server names of its deployment to its
@@ -279,10 +286,24 @@ impl Endpoint {
 
     fn finish(response: reqwest::blocking::Response) -> Result<Vec<u8>, NetError> {
         match response.status() {
-            StatusCode::OK => response
-                .bytes()
-                .map(|b| b.to_vec())
-                .map_err(|e| NetError::Unknown(e.to_string())),
+            StatusCode::OK => {
+                let len = response.content_length();
+                if len.is_some_and(|n| usize::try_from(n).is_ok_and(|n| n > MAX_RESPONSE_BYTES)) {
+                    return Err(NetError::Unreachable(format!(
+                        "response larger than {} MiB",
+                        MAX_RESPONSE_BYTES / 1024 / 1024
+                    )));
+                }
+                let body = response
+                    .bytes()
+                    .map_err(|e| NetError::Unknown(e.to_string()))?;
+                if body.len() > MAX_RESPONSE_BYTES {
+                    return Err(NetError::Unreachable(
+                        "response grew past the size limit while reading".into(),
+                    ));
+                }
+                Ok(body.to_vec())
+            }
             StatusCode::FORBIDDEN => Err(NetError::Refused),
             // Rate limited before anything was processed: like an
             // unreachable server, another one may be tried.
