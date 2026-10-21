@@ -12,6 +12,8 @@
 //!
 //! Requests and responses travel as base64url text, so any channel will do.
 
+use std::fs::OpenOptions;
+use std::io::Seek;
 use std::path::Path;
 
 use kuipa_enroll::voucher::{self, Claims, SIGN_CONTEXT, Voucher};
@@ -66,14 +68,68 @@ pub struct Quota {
 ///
 /// I/O or a malformed file.
 pub fn set_quota(path: &Path, limit: u64) -> Result<Quota, Error> {
-    let issued = match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice::<Quota>(&b)?.issued,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e.into()),
+    let mut guard = quota_lock(path)?;
+    let quota = Quota {
+        limit,
+        ..read_quota(&mut guard)?
     };
-    let quota = Quota { limit, issued };
-    write_file(path, serde_json::to_string(&quota)?.as_bytes(), 0o600)?;
+    guard.store(&quota)?;
     Ok(quota)
+}
+
+/// The issuer's exclusive lock on the quota file, held across a
+/// read-modify-write: two `sign` processes running at once must not both
+/// pass the quota check on the same count.  The count is written back
+/// through the locked file itself, in place — replacing the file (an
+/// atomic rename) would put a new, unlocked inode at the path and free
+/// the lock for a second signer.
+#[derive(Debug)]
+struct QuotaGuard {
+    file: std::fs::File,
+}
+
+impl QuotaGuard {
+    /// Write `quota` back through the locked file.
+    ///
+    /// # Errors
+    ///
+    /// Serialisation or I/O.
+    fn store(&mut self, quota: &Quota) -> Result<(), Error> {
+        use std::io::Write as _;
+        self.file.set_len(0)?;
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        self.file
+            .write_all(serde_json::to_string(quota)?.as_bytes())?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+}
+
+impl Drop for QuotaGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Take the issuer's exclusive lock on the quota file at `path`.  The
+/// lock is held until the returned guard drops.
+///
+/// # Errors
+///
+/// I/O, or the quota file cannot be created or locked.
+fn quota_lock(path: &Path) -> Result<QuotaGuard, Error> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.lock()
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    Ok(QuotaGuard { file })
 }
 
 /// Sign one blinded `request` (base64url) with the voucher key in `key`,
@@ -84,18 +140,40 @@ pub fn set_quota(path: &Path, limit: u64) -> Result<Quota, Error> {
 ///
 /// An exhausted quota, a malformed request, or I/O.
 pub fn sign(key: &Path, quota: &Path, request: &str) -> Result<String, Error> {
+    let mut guard = quota_lock(quota)?;
     let request = BlindRequest::from_bytes(&b64::decode(request.trim())?)?;
     let sk = ml_dsa_blind::SigningKey::from_pem(&std::fs::read(key)?)?;
-    let mut q: Quota = serde_json::from_slice(&std::fs::read(quota)?)?;
+    let mut q = read_quota(&mut guard)?;
     if q.issued >= q.limit {
         return Err(format!("quota exhausted ({} of {} issued)", q.issued, q.limit).into());
     }
     // Counted before signing: a crash loses a voucher, never the count.
     q.issued += 1;
-    write_file(quota, serde_json::to_string(&q)?.as_bytes(), 0o600)?;
+    guard.store(&q)?;
     let response = sk.blind_sign(&request)?;
     tracing::info!("signed voucher {} of {}", q.issued, q.limit);
     Ok(b64::encode(response.as_bytes()))
+}
+
+/// Read the quota through the locked file.  An empty file (freshly
+/// created, or a crash between creation and the first store) counts as
+/// nothing issued.
+///
+/// # Errors
+///
+/// I/O or a malformed file.
+fn read_quota(guard: &mut QuotaGuard) -> Result<Quota, Error> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    guard.file.seek(std::io::SeekFrom::Start(0))?;
+    guard.file.read_to_end(&mut buf)?;
+    if buf.is_empty() {
+        return Ok(Quota {
+            limit: 0,
+            issued: 0,
+        });
+    }
+    Ok(serde_json::from_slice(&buf)?)
 }
 
 /// What the provisioner keeps between [`request`] and [`finish`]: the
@@ -186,4 +264,52 @@ pub fn ephemeral(path: &Path) -> Result<[u8; 32], Error> {
     let key = ExchangeKeyPair::generate_preferred()?;
     write_file(path, key.to_jwk()?.as_ref(), 0o600)?;
     Ok(voucher::binding(key.public().as_bytes())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_signs_cannot_exceed_the_quota() {
+        // The issuer's count must be exactly the vouchers that can exist
+        // (one-more unforgeability): two signers racing on the same quota
+        // file must serialise, not both pass the check on one count.
+        let dir = std::env::temp_dir().join(format!("kuipa-quota-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quota = dir.join("quota.json");
+        set_quota(&quota, 4).unwrap();
+
+        let key = dir.join("key.pem");
+        let sk = ml_dsa_blind::SigningKey::generate(ParameterSet::MlDsa44).unwrap();
+        std::fs::write(&key, sk.to_pem().unwrap()).unwrap();
+        let public = VerifyingKey::from_bytes(SignatureAlg::MlDsa44, sk.verifying_key().as_bytes())
+            .unwrap()
+            .to_jwk_json();
+        // One blinded request every signer uses.
+        let claims = Claims {
+            realm: "EXAMPLE.TEST".into(),
+            fqdn: "web.example.test".into(),
+            hostgroup: String::new(),
+            not_before: 0,
+            not_after: 1,
+            binding: [0; 32],
+        };
+        let request = request(public.as_bytes(), &claims, &dir.join("state.json")).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..8 {
+            let (tx, request, quota, key) =
+                (tx.clone(), request.clone(), quota.clone(), key.clone());
+            std::thread::spawn(move || {
+                let signed = sign(&key, &quota, &request).is_ok();
+                tx.send(signed).unwrap();
+            });
+        }
+        drop(tx);
+        let ok: usize = rx.into_iter().filter(|s| *s).count();
+        assert_eq!(ok, 4, "exactly the quota's worth of vouchers");
+        let final_ = read_quota(&mut quota_lock(&quota).unwrap()).unwrap();
+        assert_eq!(final_.issued, 4, "the count agrees with reality");
+    }
 }

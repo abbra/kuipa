@@ -65,7 +65,7 @@ and can be used on their own.
 
 ## Requirements
 
-* Rust 1.88 or later
+* Rust 1.89 or later
 * OpenSSL 3.5 or later (for ML-KEM and ML-DSA)
 * MIT Kerberos and OpenLDAP client libraries and headers
 * A C compiler, libclang and pkg-config, used by the build scripts

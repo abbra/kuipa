@@ -17,7 +17,7 @@ printing `✓` for what it found and `○` for what is missing:
 | OpenSSL ≥ 3.5, krb5 and OpenLDAP development files | building (Fedora: `openssl-devel krb5-devel openldap-devel clang-devel`) |
 | `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` (MIT krb5 1.22 or later), MIT `pkinit.so` | `kdc-test`, `playground-test` and `interactive` (Fedora: `krb5-server krb5-workstation krb5-pkinit`) |
 | `python3` | `playground-test`, to render its report |
-| `rustup` with the MSRV toolchain | `msrv` (`rustup toolchain install 1.88`) |
+| `rustup` with the MSRV toolchain | `msrv` (`rustup toolchain install 1.89`) |
 | `valgrind` | `--valgrind` only |
 | `actionlint` (or `yamllint` as a fallback) | `lint-workflows`; skipped with a warning if neither is installed |
 
