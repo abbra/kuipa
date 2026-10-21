@@ -46,7 +46,7 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 pub use error::GssError;
-pub use kinit::password_ticket;
+pub use kinit::{ticket, NoPreauth, Preauth};
 pub use status::format_gss_status;
 pub use thread_ccache::{set_thread_ccache, thread_ccache_name};
 

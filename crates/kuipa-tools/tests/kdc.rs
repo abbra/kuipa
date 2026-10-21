@@ -744,12 +744,13 @@ fn against_a_real_kdc() {
 
     // The rekey replaced web1's OTP-derived key: the OTP is spent.
     assert!(
-        kuipa_gssapi::password_ticket(
+        kuipa_gssapi::ticket(
             &conf_path,
             &format!("host/web1.example.test@{REALM}"),
-            b"Secret123",
+            Some(b"Secret123"),
             &format!("ipa-ku/{SERVER}@{REALM}"),
             "MEMORY:spent-otp",
+            &kuipa_gssapi::NoPreauth,
         )
         .is_err()
     );

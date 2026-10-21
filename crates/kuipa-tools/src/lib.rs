@@ -6,6 +6,7 @@ pub mod net;
 pub mod output;
 pub mod paths;
 pub mod pkcs11;
+pub mod preauth;
 pub mod seal;
 pub mod trace;
 pub mod voucher;
