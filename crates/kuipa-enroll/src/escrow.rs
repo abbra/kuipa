@@ -500,6 +500,9 @@ impl Sealed {
         let slots = (0..r.u8()?)
             .map(|_| {
                 let server = r.str()?.to_owned();
+                if !crate::realm::is_safe_name(&server) {
+                    return Err(Error::Malformed("sealed slot server"));
+                }
                 let binding = Binding::from_bytes_with(&ctx, r.bytes()?)?;
                 let escrow_key = ExchangeKey::from_bytes(binding.alg(), r.bytes()?)?;
                 if escrow_key.kid() != binding.kid() {

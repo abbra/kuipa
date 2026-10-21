@@ -574,6 +574,47 @@ impl VerifiedRealm {
         Ok(())
     }
 
+    /// Require every anchor an enrollment tells this host to pin to be one
+    /// the verified advertisement vouches for: advertised by the realm, or
+    /// reached from a pinned anchor through proven successions.  An
+    /// enrollment carries the server's own choice of anchors; without this
+    /// check, any server still holding the realm's join key could pin the
+    /// host to anchors of its own (§4.8's frozen-server threat).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mismatch`] for an anchor the advertisement does not vouch
+    /// for.
+    pub fn check_anchors(&self, anchors: &[Thumbprint]) -> Result<()> {
+        // The anchors this advertisement makes believable: the realm's
+        // advertised set, plus every succession end the delegation proved
+        // on the way to it (old pinned ends included, so a rotation in
+        // flight still verifies).
+        let mut believed: Vec<Thumbprint> = self.info.anchors.clone();
+        believed.extend(self.delegation.succeeded.iter().flat_map(|(a, b)| [a, b]));
+        believed.push(*self.anchor());
+        if anchors.is_empty() || anchors.iter().any(|a| !believed.contains(a)) {
+            return Err(Error::Mismatch("anchors"));
+        }
+        Ok(())
+    }
+
+    /// Require an enrollment's epoch watermark to agree with what this
+    /// advertisement showed: either the server named no log at all, or the
+    /// watermark is the one it advertised.  The enrollment's value must
+    /// never replace the client's own verified chain knowledge (§4.8).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mismatch`] when the server named an epoch and the
+    /// enrollment carries a different one.
+    pub fn check_epoch(&self, epoch: (u64, [u8; 32])) -> Result<()> {
+        if self.epoch.is_some_and(|e| e != epoch) {
+            return Err(Error::Mismatch("anchor epoch"));
+        }
+        Ok(())
+    }
+
     /// Check that this advertisement describes `deployment` (§4.6): the
     /// delegated server is one of its servers and lists itself among the
     /// realm's servers, and the domain is the one the client knows, if it
@@ -825,6 +866,66 @@ pub(crate) mod tests {
             SystemTime::now(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn enrollment_anchors_must_be_vouched_for() {
+        let t = test_realm("ipa1.example.test");
+        let v = verified(&t);
+        let own = *t.anchor.public().thumbprint();
+        // The realm's advertised anchors, and the proof's own ends, pass.
+        v.check_anchors(&[own]).unwrap();
+        // A pinned anchor the client does not have does not: the
+        // enrollment cannot introduce trust the advertisement did not
+        // vouch for.
+        let stranger = *SigningKey::generate(SignatureAlg::MlDsa65)
+            .unwrap()
+            .public()
+            .thumbprint();
+        assert!(matches!(
+            v.check_anchors(&[stranger]),
+            Err(Error::Mismatch(_))
+        ));
+        // Nor may a stranger ride along beside a real one.
+        assert!(matches!(
+            v.check_anchors(&[own, stranger]),
+            Err(Error::Mismatch(_))
+        ));
+        // Empty is no choice at all.
+        assert!(matches!(v.check_anchors(&[]), Err(Error::Mismatch(_))));
+    }
+
+    #[test]
+    fn enrollment_epoch_must_match_the_advertisement() {
+        let t = test_realm("ipa1.example.test");
+        let v = verified(&t);
+        // This advertisement named no log: any watermark stands (an older
+        // server names none, §4.8).
+        v.check_epoch((7, [1; 32])).unwrap();
+        // One that names a log demands the same watermark.
+        let e = (3, [2; 32]);
+        // Re-sign with an epoch member, as the server's advertisement does.
+        let set = t
+            .keys
+            .advertisement(&t.info, &t.delegation, now() - 10, now() + 3600, Some(e))
+            .unwrap();
+        let v = VerifiedRealm::verify(
+            &set,
+            "EXAMPLE.TEST",
+            &[*t.anchor.public().thumbprint()],
+            &Policy::default(),
+            SystemTime::now(),
+        )
+        .unwrap();
+        v.check_epoch(e).unwrap();
+        assert!(matches!(
+            v.check_epoch((4, [2; 32])),
+            Err(Error::Mismatch(_))
+        ));
+        assert!(matches!(
+            v.check_epoch((3, [3; 32])),
+            Err(Error::Mismatch(_))
+        ));
     }
 
     #[test]

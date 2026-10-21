@@ -660,12 +660,15 @@ impl PendingJoin {
     }
 
     /// Finish a join or rekey: decrypt the enrollment, and check it is for
-    /// this host and that its CA chain is the one `realm` advertises.
+    /// this host, and that its CA chain, anchors and epoch watermark are
+    /// what `realm` advertises.
     ///
     /// # Errors
     ///
     /// [`Error::BadResponse`], [`Error::Malformed`], or [`Error::Mismatch`]
-    /// for keys of another principal or an unadvertised CA certificate.
+    /// for keys of another principal, an unadvertised CA certificate,
+    /// anchors the advertisement does not vouch for, or an epoch watermark
+    /// that disagrees with the server's advertised log.
     pub fn finish(self, response: &Response, realm: &VerifiedRealm) -> Result<Enrollment> {
         if realm.signer() != &self.signer {
             return Err(Error::Mismatch("server"));
@@ -676,6 +679,8 @@ impl PendingJoin {
             return Err(Error::Mismatch("keytab principal"));
         }
         realm.check_ca_certs(&enrollment.ca_certs)?;
+        realm.check_anchors(&enrollment.anchors)?;
+        realm.check_epoch((enrollment.epoch_seq, enrollment.epoch_head))?;
         if enrollment.anchors.is_empty() {
             return Err(Error::Missing("anchors"));
         }
