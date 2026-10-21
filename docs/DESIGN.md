@@ -216,6 +216,10 @@ most once per round. A **proof** that anchor T vouched for a claim is T's
 public key, the signed vouch and the claim's inclusion path (log₂ of the
 number of claims hashes). A **delegation** is a claim with proofs:
 
+How proofs can skip the signature and the key entirely — a
+pre-distributed **vouch head** checked like an MTC landmark — is
+designed in §4.9.
+
 ```json
 {"claim": "<b64url IPDC>",
  "proofs": [{"anchor": {<anchor public key>}, "vouch": "<b64url IPVH>",
