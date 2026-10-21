@@ -49,8 +49,12 @@ kuipa enroll --server ipa1.example.test --enrollment-file string.txt \
 `kuipa` gets a ticket with the password through an armoured exchange with
 the realm's KDC; the password never leaves the host. Without
 `--password-file` it reads the password from standard input, or asks for
-it on a terminal. With `--realm` instead of an enrollment string, the
-pinned anchors authenticate the realm.
+it on a terminal. A realm that wants more than the password — the value of
+an OTP token, a PIN, a RADIUS or IdP answer, the PIN of a passkey — is
+asked for on the terminal too, inside the same armour, so an impostor's KDC
+cannot collect it; run this on a terminal, or use the ticket path below.
+With `--realm` instead of an enrollment string, the pinned anchors
+authenticate the realm.
 
 **With an existing ticket**, for administrators already logged in, or
 users of an external IdP or passkeys:
