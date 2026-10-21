@@ -266,7 +266,11 @@ jobs:
           key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-target-debug-stable-v1-
       - name: Run a traced playground session
-        run: ./contrib/ci/local-ci.sh --no-deps playground-test
+        run: |
+          pushd ./contrib/ci/playground
+          npm install
+          popd
+          ./contrib/ci/local-ci.sh --no-deps playground-test
       - name: Upload the playground report
         id: report
         if: always()
