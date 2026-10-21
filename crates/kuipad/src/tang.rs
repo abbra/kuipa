@@ -75,15 +75,16 @@ impl TangKeys {
     fn load(&self) -> Result<Loaded, Error> {
         let mut keys = Loaded::default();
         for (name, retired) in self.files()? {
-            let bytes = fs::read(self.dir.join(&name))?;
-            if let Ok(k) = SigningKey::from_jwk(&bytes) {
+            // Wiping buffer: the bytes hold the private seed.
+            let bytes = native_ossl::util::SecretBuf::new(fs::read(self.dir.join(&name))?);
+            if let Ok(k) = SigningKey::from_jwk(bytes.as_ref()) {
                 if retired {
                     keys.retired_signing.push(k);
                 } else {
                     keys.signing.push(k);
                 }
             } else {
-                let k = ExchangeKeyPair::from_jwk(&bytes)
+                let k = ExchangeKeyPair::from_jwk(bytes.as_ref())
                     .map_err(|e| format!("{}: {e}", self.dir.join(&name).display()))?;
                 if retired {
                     keys.retired_exchange.push(k);
