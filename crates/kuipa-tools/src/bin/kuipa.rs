@@ -731,11 +731,19 @@ impl Args {
         }
     }
 
-    /// What to verify the realm against, with the secrets: the enrollment
-    /// string's realm and anchor, or else `--realm` and the pre-provisioned
-    /// `/etc/ipa/ku-anchors`.  With both an enrollment string and
-    /// `--realm` (`ipa-client-install -r`), the string must be for that
-    /// realm: the realm then comes from two channels (§4.6).
+    /// What to verify the realm against, with the secrets: the anchors
+    /// this host pinned for the realm, or else the enrollment string's
+    /// anchor.  With both an enrollment string and `--realm`
+    /// (`ipa-client-install -r`), the string must be for that realm: the
+    /// realm then comes from two channels (§4.6).
+    ///
+    /// An enrolled host trusts what it pinned, not the string's single
+    /// anchor of the day it was issued: the pins are its trust state,
+    /// grown by every verified exchange, while the string still names one
+    /// anchor that later rotations leave behind.  Verifying against the
+    /// pins keeps a server whose claim — or whose part of the anchor log —
+    /// is vouched by an anchor the host learned since, instead of
+    /// refusing it and every other server of the realm.
     fn pins(&self, paths: &Paths, want_password: bool) -> Result<(Pins, Secrets), Error> {
         let realm = self.option("realm");
         if realm.is_some_and(str::is_empty) {
@@ -757,9 +765,21 @@ impl Args {
                 .into());
             }
             flows::check_string(string)?;
+            // An enrolled host trusts what it pinned for this realm, not
+            // the string's single anchor of the day it was issued.
+            let enrolled = paths::State::load(paths).is_ok_and(|s| s.realm == string.realm());
+            let pinned = if enrolled {
+                paths::read_anchors(paths).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let pins = Pins {
                 realm: string.realm().to_owned(),
-                anchors: vec![*string.anchor()],
+                anchors: if pinned.is_empty() {
+                    vec![*string.anchor()]
+                } else {
+                    pinned
+                },
             };
             return Ok((pins, secrets));
         }
