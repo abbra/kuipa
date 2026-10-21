@@ -54,6 +54,17 @@ jobs:
           cargo install --locked "mdbook-mermaid@$MDBOOK_MERMAID_VERSION"
       - name: Build
         run: mdbook build docs
+      # The playground session report, next to the development notes that
+      # describe it (development/local-ci.md), when a run of the CI job
+      # left it at the repository root.  It is a self-contained directory
+      # (index.html + svg/ captures), so it is copied in as-is; the page
+      # links to it only when it is there.
+      - name: Add the playground session report, if this run has one
+        run: |
+          if [[ -d kuipa-playground-report ]]; then
+            mkdir -p docs/book/development/playground-report
+            cp -r kuipa-playground-report/. docs/book/development/playground-report/
+          fi
       - name: Upload the book
         if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v4

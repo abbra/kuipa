@@ -111,7 +111,11 @@ wherever `KUIPA_PLAYGROUND_REPORT` names: `index.html` plus the `svg/`
 captures. In GitHub Actions the job uploads the directory as the
 `kuipa-playground-report` artifact and adds the step table, the
 failed steps' output and a link to the artifact to the run's Summary tab. The job fails when any step ends with an unexpected exit
-status. To add a step, add a `step EXPECTED "title" 'command' ["text"...]` line to
+status. When the docs are published with the report left at the
+repository root by a CI run, it is also served next to this page, as
+[the playground session report](playground-report/) — the report is
+generated per run, so the link is live only while that build had one.
+To add a step, add a `step EXPECTED "title" 'command' ["text"...]` line to
 `session.sh`, under the `section` it belongs to; `EXPECTED` is an exit
 status or `fail` for any non-zero one.
 
