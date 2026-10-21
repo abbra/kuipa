@@ -160,6 +160,31 @@ fn client(ca: Option<&PathBuf>) -> Result<reqwest::blocking::Client, Error> {
         .build()?)
 }
 
+/// Most bytes read from one response: an advertisement, a JWK or a
+/// recovery answer is a few KiB; more is broken or hostile, and Tang URLs
+/// are plain `http://` by design, so an attacker on the network can be
+/// the sender.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read one response's body, capped.
+///
+/// # Errors
+///
+/// I/O, or a body larger than [`MAX_RESPONSE_BYTES`].
+fn body(response: reqwest::blocking::Response) -> Result<Vec<u8>, Error> {
+    if response
+        .content_length()
+        .is_some_and(|n| usize::try_from(n).is_ok_and(|n| n > MAX_RESPONSE_BYTES))
+    {
+        return Err("response too large".into());
+    }
+    let bytes = response.bytes()?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("response too large".into());
+    }
+    Ok(bytes.to_vec())
+}
+
 fn get_adv(
     http: &reqwest::blocking::Client,
     url: &str,
@@ -169,7 +194,7 @@ fn get_adv(
         return Ok(None);
     }
     let response = response.error_for_status()?;
-    Ok(Some(SignedAdvertisement::from_json(&response.bytes()?)?))
+    Ok(Some(SignedAdvertisement::from_json(&body(response)?)?))
 }
 
 /// The advertisement at `url` (or from `adv`), not yet verified.
@@ -327,7 +352,7 @@ pub fn decrypt(jwe: &str) -> Result<SecretBuf, Error> {
         .get(format!("{base}/key/{kid}"))
         .send()?
         .error_for_status()?;
-    let exchange_key = ExchangeKey::from_jwk_json(&key.bytes()?)?;
+    let exchange_key = ExchangeKey::from_jwk_json(&body(key)?)?;
     let (request, pending) = jwe.binding.recovery_request(&exchange_key)?;
     let response = http
         .post(format!("{base}/rec/{kid}"))
@@ -335,7 +360,7 @@ pub fn decrypt(jwe: &str) -> Result<SecretBuf, Error> {
         .body(request.to_bytes())
         .send()?
         .error_for_status()?;
-    let key = pending.finish(&RecoveryResponse::from_bytes(&response.bytes()?)?)?;
+    let key = pending.finish(&RecoveryResponse::from_bytes(&body(response)?)?)?;
     let alg = CipherAlg::fetch(c"AES-256-GCM", None)?;
     let mut ctx = AeadDecryptCtx::new(&alg, key.as_ref(), iv, None)?;
     ctx.set_aad(jwe.protected.as_bytes())?;

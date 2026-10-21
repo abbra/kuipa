@@ -31,6 +31,11 @@ use crate::{Auth, LdapError, Scope};
 /// `ldap_int_sasl_open` has created the SASL context but *before*
 /// `gss_init_sec_context` is called, so the credential is available for
 /// the first GSSAPI token exchange.
+///
+/// When the credential cannot be injected, the callback fails the SASL
+/// exchange: a bind that proceeds with the process's default Kerberos
+/// identity instead of the injected one would silently act as another
+/// principal.
 pub(crate) unsafe extern "C" fn sasl_interact_gssapi(
     ld: *mut LDAP,
     _flags: libc::c_uint,
@@ -41,10 +46,13 @@ pub(crate) unsafe extern "C" fn sasl_interact_gssapi(
         tracing::trace!(cred = ?defaults, "sasl_interact: injecting GSS credential");
         let rc = ffi::ldap_set_option(ld, ffi::LDAP_OPT_X_SASL_GSS_CREDS, defaults.cast_const());
         if rc != ffi::LDAP_SUCCESS {
-            tracing::warn!(rc, "ldap_set_option(LDAP_OPT_X_SASL_GSS_CREDS) failed");
-        } else {
-            tracing::trace!(rc, "ldap_set_option(LDAP_OPT_X_SASL_GSS_CREDS) succeeded");
+            // Fail rather than continue with whatever identity the
+            // process would otherwise use: the bind must not proceed as
+            // the wrong principal.
+            tracing::error!(rc, "ldap_set_option(LDAP_OPT_X_SASL_GSS_CREDS) failed");
+            return rc;
         }
+        tracing::trace!(rc, "ldap_set_option(LDAP_OPT_X_SASL_GSS_CREDS) succeeded");
     } else {
         tracing::trace!("sasl_interact: no credential (defaults is null)");
     }
@@ -1051,7 +1059,14 @@ unsafe fn decode_bervals(vals_ptr: *mut *mut berval) -> (Vec<String>, Vec<Vec<u8
         if bv.is_null() {
             break;
         }
-        let bytes = std::slice::from_raw_parts((*bv).bv_val as *const u8, (*bv).bv_len as usize);
+        // SAFETY: bv_val is null or points to bv_len readable bytes; the
+        // null case yields an empty slice rather than UB, as in
+        // `berval_bytes`.
+        let bytes = if (*bv).bv_val.is_null() {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts((*bv).bv_val as *const u8, (*bv).bv_len as usize) }
+        };
         bin_vals.push(bytes.to_vec());
         str_vals.push(String::from_utf8_lossy(bytes).into_owned());
         i += 1;
