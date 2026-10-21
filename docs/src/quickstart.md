@@ -6,7 +6,7 @@ Nothing touches your system's configuration.
 
 ## Build
 
-You need Rust 1.88 or later, OpenSSL 3.5 or later (for ML-KEM and ML-DSA),
+You need Rust 1.89 or later, OpenSSL 3.5 or later (for ML-KEM and ML-DSA),
 and the MIT Kerberos and OpenLDAP client libraries. On Fedora:
 
 ```sh

@@ -955,6 +955,7 @@ name = "kuipa-gssapi"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "native-ossl",
  "pkg-config",
  "thiserror",
  "tracing",

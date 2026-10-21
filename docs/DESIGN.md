@@ -101,7 +101,7 @@ inherits the old key's protection without forward secrecy (§6).
 
 ### 3.1 Workspace
 
-One Cargo workspace (root `Cargo.toml`: Rust 1.88, edition 2024 except
+One Cargo workspace (root `Cargo.toml`: Rust 1.89, edition 2024 except
 for the two borrowed FFI crates and `ml-dsa-blind`, which stay on 2021,
 shared lints with `unsafe_code` forbidden by default) holds eight crates.
 Each depends only on crates in rows above it:
