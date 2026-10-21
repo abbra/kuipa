@@ -55,7 +55,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] Registered sealing (`sealing = registered`).
   - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
-- [ ] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
+- [x] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
       `keytab_loader` is merged (§7.4): write the service's gssproxy
       configuration (`cred_store = keytab:MEMORY:<name>`, `keytab_loader =
       /usr/libexec/kuipa-unseal --sealed <path>.sealed --memfd`) instead of
@@ -106,11 +106,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       temporary `KRB5_CONFIG` and ccache, `kinit -n`, armoured `kinit -T`,
       `kuipa enroll --use-ccache`; for password users `--principal` (an
       armoured `kinit` in `kuipa`, §5.3); the units in `contrib/`.
-- [ ] gssproxy: per-service `keytab_loader` (memfd on fd 3 into a `MEMORY:`
-      keytab), reload on `SIGHUP`, loader retry with backoff, keys kept out
-      of core dumps (§7.4): submitted as
-      [gssapi/gssproxy#135](https://github.com/gssapi/gssproxy/pull/135),
-      awaiting review and merge.
+- [ ] gssproxy: release upstream version with per-service `keytab_loader`
 - [ ] FreeIPA trusts: a `trust-add --type=ipa` front end for
       `trust-invitation` / `establish-trust`, and the trust objects next to
       the recorded partners; run
