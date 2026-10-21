@@ -65,6 +65,80 @@ fn realm_option_cross_checks_the_enrollment_string() {
     assert_eq!(code, 1, "{stderr}");
 }
 
+/// An enrolled host verifies the realm with the anchors it pinned, even
+/// when an enrollment file is in the environment (the playground keeps
+/// one for every command): its pins are its trust state, grown by every
+/// verified exchange, while the string names the single anchor of the
+/// day it was issued.  With only the string's anchor, a server whose
+/// claim — or whose part of the anchor log — is vouched by an anchor the
+/// host learned since is refused, and so is every other server of the
+/// realm: no failover.
+///
+/// The server here is unreachable, so the refusal the query string
+/// reaches is visible in the error: it must name both pins, not the
+/// string's one.
+#[test]
+fn an_enrolled_host_verifies_with_its_pins_not_the_strings() {
+    let dir = std::env::temp_dir().join(format!("kuipa-cli-pins-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("var/lib/ipa-client/ku")).unwrap();
+    std::fs::create_dir_all(dir.join("etc/ipa")).unwrap();
+    std::fs::write(
+        dir.join("var/lib/ipa-client/ku/state.json"),
+        r#"{"realm":"EXAMPLE.TEST","fqdn":"web1.example.test","servers":["ipa1.example.test","ipa2.example.test"]}"#,
+    )
+    .unwrap();
+
+    // The enrollment string's anchor, and a second anchor the host pinned
+    // later (a rotation, or the second server's own).
+    let string_anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let other_anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let string = EnrollmentString::new(
+        "EXAMPLE.TEST",
+        *string_anchor.public().thumbprint(),
+        unix_seconds(std::time::SystemTime::now()) + 86_400,
+        Some(Secret::new(b"Secret123")),
+    );
+    let file = dir.join("enrollment");
+    std::fs::write(&file, string.encode().as_ref()).unwrap();
+    std::fs::write(
+        dir.join("etc/ipa/ku-anchors"),
+        format!(
+            "{}\n{}\n",
+            string_anchor.public().thumbprint(),
+            other_anchor.public().thumbprint()
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
+        .args([
+            "enroll",
+            "--server",
+            "ipa1.example.test",
+            "--hostname",
+            "web1.example.test",
+        ])
+        .arg("--enrollment-file")
+        .arg(&file)
+        .env("KUIPA_ROOT", &dir)
+        .env("KUIPA_ENDPOINTS", "ipa1.example.test=http://127.0.0.1:9")
+        .env_remove("KUIPA_ENROLLMENT_FILE")
+        .env_remove("KUIPA_TRACE")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("anchor={}", other_anchor.public().thumbprint())),
+        "the query must carry the pinned anchors, not only the string's: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("anchor={}", string_anchor.public().thumbprint())),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A host with a state file and unreadable pins: enough for `status` to
 /// render every label, with no server contacted.
 fn host_state(name: &str) -> std::path::PathBuf {
