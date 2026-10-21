@@ -2177,6 +2177,8 @@ IPPS  sender receiver delegation(JSON) envelope token                           
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
 IPVH  realm anchor(32) iat(u64) exp(u64) size(u64) root(32)                      vouch (signed)
 IPSV  vouch(IPVH) signature n(u64) [leaf(32)]                                    signed vouch with leaves
+IPVH  version 2 (§4.9): the same fields, over the append-only claim log          vouch head (claim log)
+IPSV  version 2 (§4.9): vouch(IPVH) signature n(u64) [leaf(32)]                  signed head, with the leaves appended since the previous head (a full vouch keeps its leaves, as version 1)
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
 IPAE  realm seq(u64) prev(32) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-256` of them under a domain-separation context; `prev` is the previous entry's head, `0…0` for the first)
