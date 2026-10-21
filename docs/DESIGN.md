@@ -131,7 +131,8 @@ Outside `crates/`:
 * `contrib/` holds the systemd units, the httpd snippet, a daemon
   configuration example and a gssproxy example; `contrib/clevis/` the pin's
   installer and dracut module; `contrib/ci/` the local CI and playground
-  script (the local CI guide (`docs/src/development/local-ci.md`)).
+  script (the local CI guide (`docs/src/development/local-ci.md`));
+  `docs/man/` the man pages (scdoc sources, one per program).
 
 All cryptography is OpenSSL (≥ 3.5) through `native-ossl`; TLS uses rustls
 with the `rustls-native-ossl` provider.
