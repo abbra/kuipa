@@ -172,6 +172,12 @@ pub enum GssError {
         msg: &'static str,
         detail: String,
     },
+
+    /// The KDC offered a pre-authentication method whose answer could not be
+    /// collected: there was no terminal to ask on, or the asking failed.
+    /// `detail` says which method was wanted and why it could not be had.
+    #[error("pre-authentication: {detail}")]
+    Preauth { detail: String },
 }
 
 const GSS_S_CALL_INACCESSIBLE_READ: OmUint32 = 0x01000000;
