@@ -1,0 +1,12 @@
+{
+  "name": "kuipa-playground-report",
+  "private": true,
+  "description": "Renders the recorded playground session's terminal captures (contrib/ci/playground/render-terminal.mjs); no code here is shipped.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "svg-terminal": "1.3.1"
+  }
+}

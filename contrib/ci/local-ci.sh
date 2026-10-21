@@ -558,8 +558,14 @@ job_playground_test() {
         fail "playground-test requires python3 to render its report"
         return 1
     fi
+    if ! command -v node >/dev/null 2>&1; then
+        fail "playground-test requires node (>= 22) to render the session's terminal captures"
+        return 1
+    fi
 
-    local report="${KUIPA_PLAYGROUND_REPORT:-$REPO_ROOT/kuipa-playground-report.html}"
+    # The report is a directory: index.html plus the svg/ captures, one
+    # animated terminal per session section.
+    local report="${KUIPA_PLAYGROUND_REPORT:-$REPO_ROOT/kuipa-playground-report}"
     local out
     out="$(mktemp -d /tmp/kuipa-playground-session.XXXXXXXXXX)"
     pg_start 5 || { rm -rf "$out"; return 1; }
@@ -574,13 +580,25 @@ job_playground_test() {
     local commit
     # GitHub's checkout has no .git without git in the container.
     commit="${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)}"
-    python3 "$SCRIPT_DIR/playground/report.py" "$out" --html "$report" --commit "$commit" || rc=1
+    mkdir -p "$report"
+    # One animated terminal capture per session section (svg-terminal);
+    # they are renderings of what the session already recorded, so a
+    # missing node only skips them, it does not fail the job.
+    if python3 "$SCRIPT_DIR/playground/terminal.py" "$out" --json "$out/spec.json" \
+        && node "$SCRIPT_DIR/playground/render-terminal.mjs" "$out/spec.json" "$report/svg"; then
+        svg_args=(--svg "$report/svg")
+    else
+        warn "terminal captures skipped: $SCRIPT_DIR/playground/render-terminal.mjs failed"
+        svg_args=()
+    fi
+    python3 "$SCRIPT_DIR/playground/report.py" "$out" --html "$report/index.html" \
+        --commit "$commit" "${svg_args[@]}" || rc=1
     # Under GitHub Actions, also put the step table on the run's Summary tab.
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         python3 "$SCRIPT_DIR/playground/report.py" "$out" --summary >> "$GITHUB_STEP_SUMMARY" || true
     fi
     rm -rf "$out"
-    echo "Playground report: $report"
+    echo "Playground report: $report/index.html"
     return $rc
 }
 
@@ -682,7 +700,8 @@ Environment:
   CARGO_TARGET_DIR    Redirect Cargo build output to an isolated directory.
   KUIPA_KEEP_REALM   Keep the kdc-test realm's files (/tmp/kuipa-kdc-<pid>).
   KUIPA_PLAYGROUND_REPORT  Where playground-test writes its HTML report
-                      (default: kuipa-playground-report.html in the repository).
+                      (default: kuipa-playground-report/ in the repository;
+                      index.html plus the svg/ terminal captures).
   KUIPA_PLAYGROUND_START_TIMEOUT  Seconds to wait for the playground to start
                       (interactive, playground-test; default 120).
   KUIPA_STEP_TIMEOUT  Seconds each playground-test step may take (default 120).

@@ -12,11 +12,18 @@ prints a Markdown fragment for the GitHub Actions job summary: the step
 table and the failed steps' output.  It names the artifact that holds the
 HTML report; the workflow adds the artifact's link after uploading it,
 since the URL only exists then.
+
+--svg DIR adds the animated terminal captures terminal.py and
+render-terminal.mjs wrote under DIR (one SVG per session section),
+embedded inline in each section's heading: the capture plays once when
+scrolled into view, with a replay button.  Without --svg the page is
+unchanged.
 """
 
 import argparse
 import datetime
 import html
+import json
 import os
 import re
 import sys
@@ -156,6 +163,37 @@ def expect_html(step):
     return f'<ul class="expect" aria-label="Expected in the output">{items}</ul>'
 
 
+def load_captures(svg_dir):
+    """The section captures under SVG_DIR, keyed by section index."""
+    if not svg_dir:
+        return {}
+    try:
+        manifest = json.loads(read(os.path.join(svg_dir, "manifest.json")))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    captures = {}
+    for entry in manifest.get("captures", []):
+        svg = read(os.path.join(svg_dir, entry["file"]))
+        if svg.startswith("<svg"):
+            captures[entry["index"]] = svg
+    return captures
+
+
+def capture_html(index, svg):
+    """One capture, inline, playing when scrolled into view.
+
+    The SVG is SMIL + CSS animation that ends on a static frame, so it is
+    left alone on load and restarted by re-inserting it — the same markup,
+    a fresh element, the animation clock back at zero.  Without
+    JavaScript (or after the page is printed) the last frame shows.
+    """
+    return f"""
+<figure class="capture" data-capture>
+  <div class="frame">{svg}</div>
+  <button type="button" class="replay" title="Play the capture again">↻ replay</button>
+</figure>"""
+
+
 def render_step(step):
     state = "pass" if step["passed"] else "fail"
     trace = trace_html(step["stderr"]) if step["stderr"].strip() else ""
@@ -211,7 +249,9 @@ nav ol { list-style: none; margin: 0 0 1rem; padding: 0; }
 nav li a { display: flex; gap: .5rem; align-items: baseline; color: var(--ink);
   text-decoration: none; padding: .15rem .3rem; border-radius: .3rem; font-size: .88rem; }
 nav li a:hover { background: var(--code); }
-nav .sec { color: var(--muted); font-size: .78rem; margin: .7rem 0 .2rem .3rem; }
+nav .sec { margin: .9rem 0 .25rem .3rem; font-size: .92rem; font-weight: 600; }
+nav .sec a { color: var(--ink); text-decoration: none; }
+nav .sec a:hover { color: var(--accent); }
 .dot { width: .55rem; height: .55rem; border-radius: 50%; flex: none; transform: translateY(-.05rem); }
 .dot.pass { background: var(--pass); } .dot.fail { background: var(--fail); }
 section.group { margin-bottom: 2.2rem; }
@@ -249,10 +289,52 @@ ul.expect .mark { font-weight: 700; width: 1em; }
 ul.expect .found .mark { color: var(--pass); }
 ul.expect .missing .mark { color: var(--fail); }
 ul.expect .missing code { color: var(--fail); }
+figure.capture { margin: 0 0 1rem; }
+figure.capture .frame { border-radius: .6rem; overflow: hidden; }
+figure.capture svg { display: block; width: 100%; height: auto; }
+figure.capture .replay { margin-top: .35rem; font: 600 .78rem system-ui, sans-serif;
+  color: var(--muted); background: none; border: 1px solid var(--line);
+  border-radius: .4rem; padding: .15rem .6rem; cursor: pointer; }
+figure.capture .replay:hover { color: var(--ink); background: var(--code); }
 """
 
 
-def render_html(data, commit):
+CAPTURE_SCRIPT = """<script>
+// Restart a capture: replace the SVG with a copy of itself, which resets
+// every SMIL/CSS clock to zero.  A capture plays once, when it first
+// scrolls into view; the button plays it again.
+(function () {
+  function play(figure) {
+    var frame = figure.querySelector('.frame');
+    var svg = frame.querySelector('svg');
+    if (!svg) return;
+    var fresh = svg.cloneNode(true);
+    frame.replaceChild(fresh, svg);
+    var t = fresh.getCurrentTime ? fresh.getCurrentTime() : 0;
+    try { fresh.beginElement && fresh.beginElement(); } catch (e) {}
+    try { fresh.setCurrentTime && fresh.setCurrentTime(0); } catch (e) {}
+  }
+  var figures = Array.prototype.slice.call(document.querySelectorAll('[data-capture]'));
+  figures.forEach(function (figure) {
+    var button = figure.querySelector('.replay');
+    if (button) button.addEventListener('click', function () { play(figure); });
+    var seen = false;
+    if (!('IntersectionObserver' in window)) return;
+    new IntersectionObserver(function (entries, obs) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting && !seen) {
+          seen = true;
+          play(figure);
+          obs.disconnect();
+        }
+      });
+    }, { threshold: 0.35 }).observe(figure);
+  });
+})();
+</script>"""
+
+
+def render_html(data, commit, captures):
     steps = data["steps"]
     session = data["session"]
     passed = sum(1 for s in steps if s["passed"])
@@ -263,8 +345,8 @@ def render_html(data, commit):
     )
 
     nav = []
-    for sec in data["sections"]:
-        nav.append(f'<div class="sec">{esc(sec["title"])}</div><ol>')
+    for sec_n, sec in enumerate(data["sections"], start=1):
+        nav.append(f'<div class="sec"><a href="#section-{sec_n}">{esc(sec["title"])}</a></div><ol>')
         for s in sec["steps"]:
             state = "pass" if s["passed"] else "fail"
             nav.append(
@@ -274,10 +356,15 @@ def render_html(data, commit):
         nav.append("</ol>")
 
     body = []
-    for sec in data["sections"]:
+    sections_with_captures = set()
+    for i, sec in enumerate(data["sections"], start=1):
+        capture = captures.get(i)
+        if capture:
+            sections_with_captures.add(i)
         body.append(
-            f'<section class="group"><h2>{esc(sec["title"])}</h2>'
+            f'<section class="group" id="section-{i}"><h2>{esc(sec["title"])}</h2>'
             f'<p>{esc(sec["text"])}</p>'
+            + (capture_html(i, capture) if capture else "")
             + "".join(render_step(s) for s in sec["steps"])
             + "</section>"
         )
@@ -332,6 +419,7 @@ def render_html(data, commit):
   <footer>Rendered by contrib/ci/playground/report.py from contrib/ci/playground/session.sh.</footer>
 </main>
 </div>
+{CAPTURE_SCRIPT if sections_with_captures else ""}
 </body>
 </html>
 """
@@ -376,6 +464,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("out")
     ap.add_argument("--html")
+    ap.add_argument("--svg", help="directory of terminal captures (from render-terminal.mjs) to embed")
     ap.add_argument("--summary", action="store_true")
     ap.add_argument("--commit", default="")
     ap.add_argument("--artifact", default="kuipa-playground-report")
@@ -383,7 +472,7 @@ def main():
     data = load(args.out)
     if args.html:
         with open(args.html, "w", encoding="utf-8") as f:
-            f.write(render_html(data, args.commit))
+            f.write(render_html(data, args.commit, load_captures(args.svg)))
         print(f"[playground-report] wrote {args.html}", file=sys.stderr)
     if args.summary:
         sys.stdout.write(render_summary(data, args.artifact))

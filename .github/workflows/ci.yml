@@ -234,9 +234,10 @@ jobs:
   # ── Playground session ─────────────────────────────────────────────────────
   # Starts the interactive playground (two realms, two IPA servers), runs a
   # scripted session through its helpers with KUIPA_TRACE on, and renders
-  # every step's command, output, trace and server log as an HTML report.
+  # every step's command, output, trace and server log as an HTML report,
+  # with one animated terminal capture per session section (svg-terminal).
   # The step table also goes to this run's Summary tab; the uploaded
-  # artifact has the full report.
+  # artifact has the full report directory.
   playground-test:
     name: Playground Session
     needs: [build]
@@ -272,7 +273,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: kuipa-playground-report
-          path: kuipa-playground-report.html
+          path: kuipa-playground-report/
           if-no-files-found: warn
       # The artifact's URL only exists once it is uploaded.
       - name: Link the report from the summary
