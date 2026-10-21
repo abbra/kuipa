@@ -2229,10 +2229,11 @@ recovery request and response.
   321 KB of deltas per renewal round. Large realms should give the anchor
   role to a few servers (6 of 60: 55 KB and 32 KB, §4.2).
 * **Merkle Tree Certificates:** vouches are tree heads over claims, with
-  the same hashing and inclusion proofs as MTC. Anchors issued as MTC
-  certificates, or pre-distributed tree heads ("landmarks") that let a
-  client skip the signature check, can build on this; `synta-mtc`, which
-  already builds the trees, has both.
+  the same hashing and inclusion proofs as MTC. §4.9 designs the use of
+  pre-distributed tree heads ("landmarks"): pins carry a vouch head, and
+  a client that holds one checks a delegation's inclusion proof against
+  it, with no signature and no anchor key on the wire, through
+  `synta-mtc`'s landmark and trusted-subtree machinery.
 * **The daemon's identity:** its own `ipa-ku/<server>` principal with a
   delegation rule to `ldap/<server>` (as implemented) versus `HTTP/<server>`
   through gssproxy. Acting for callers uses protocol transition; S4U2Proxy
