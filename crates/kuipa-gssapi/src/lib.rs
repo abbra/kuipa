@@ -1461,19 +1461,52 @@ impl GssClientCred {
     /// (unlike `MEMORY:` ccaches, which are invisible to the local krb5
     /// library when gssproxy manages the credential).
     ///
-    /// The temporary file is created with `0o600` permissions on tmpfs and
-    /// exists for microseconds.
+    /// The temporary file is created by us, exclusively and mode 0600
+    /// *before* any credential is stored into it, with an unguessable
+    /// name: a predictable path on a shared temp directory would let a
+    /// local attacker pre-plant a symlink at it and have the store write
+    /// the credential through it, or read the file between the store and
+    /// the delete.  krb5 truncates an existing `FILE:` ccache, so the
+    /// store writes into the file we hold open, not a symlink's target.
+    ///
+    /// The file exists for microseconds.
     ///
     /// # Errors
     ///
     /// - [`GssError::ExportCred`] — store or file I/O failed.
     pub fn export(&self) -> Result<Vec<u8>, GssError> {
         debug_assert!(!self.raw.is_null(), "export called on null credential");
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!(".kuipa-ccexport-{}-{id}", std::process::id()));
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // A random, unguessable name: 128 bits from OpenSSL's DRBG, the
+        // same one that protects everything else, so no other process can
+        // find the file (let alone pre-create it) during its short life.
+        let mut id = [0u8; 16];
+        native_ossl::rand::Rand::fill(&mut id).map_err(|e| GssError::ExportCred {
+            major: 0,
+            minor: 0,
+            detail: format!("random temp name: {e}"),
+        })?;
+        let path = std::env::temp_dir().join(format!(
+            ".kuipa-ccexport-{}-{}",
+            std::process::id(),
+            native_ossl::util::hex_encode(id)
+        ));
+        // Create it ourselves: exclusive, never following a symlink at
+        // the path, and private from the first moment it exists.  The
+        // handle also pins the inode, so the store (which opens by name)
+        // writes into this very file even if the name were replaced.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| GssError::ExportCred {
+                major: 0,
+                minor: 0,
+                detail: format!("create {}: {e}", path.display()),
+            })?;
+        drop(file);
         let ccache_name = format!("FILE:{}", path.display());
 
         let result = self.store_into_ccache(&ccache_name);
