@@ -7,7 +7,9 @@ Safe Rust bindings to the MIT Kerberos GSSAPI library, as kuipa uses it.
 * Server credentials from a keytab, and S4U2Self and S4U2Proxy
   credentials
 * Pseudo-random function (PRF) output from an established context
-* An in-process, FAST-armoured password `kinit`
+* An in-process, FAST-armoured `kinit` for every pre-authentication method
+  FreeIPA offers: a password, an OTP token value and PIN, a RADIUS or IdP
+  answer, a passkey PIN — each asked for through a `Preauth` front end
 * Per-thread credential caches
 
 ```rust
