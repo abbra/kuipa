@@ -106,6 +106,14 @@ playground, and the report is the same without them.
 
 [svg-terminal]: https://github.com/williamzujkowski/svg-terminal
 
+The script needs `node.js` and `npm` to install its dependencies:
+
+```
+$ cd contrib/ci/playground && npm i
+```
+
+If dependencies aren't installed, SVG captures will be skipped.
+
 The report goes to `kuipa-playground-report/` in the repository, or
 wherever `KUIPA_PLAYGROUND_REPORT` names: `index.html` plus the `svg/`
 captures. In GitHub Actions the job uploads the directory as the
