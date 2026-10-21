@@ -16,13 +16,14 @@ use kuipa_enroll::join::{
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::payload::Enrollment;
 use kuipa_enroll::realm::{Deployment, TrustedRealm, VerifiedRealm, krb5_realm_section};
-use kuipa_gssapi::GssClientCred;
+use kuipa_gssapi::{GssClientCred, GssError};
 use native_ossl::util::SecretBuf;
 use serde_json::{Value, json};
 use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, unix_seconds};
 
 use crate::net::{Endpoint, NetError, Trust};
 use crate::paths::{self, Contents, Error, Holder, Paths, Protected, State};
+use crate::preauth;
 
 /// The anchor epoch watermark (§4.8): sequence number and head hash.
 type Epoch = (u64, [u8; 32]);
@@ -44,7 +45,8 @@ pub enum Auth {
     Password {
         /// The user principal.
         principal: String,
-        /// The password (with an OTP appended where the user needs one).
+        /// The password.  A token value, PIN or IdP answer the KDC also
+        /// wants is asked for on the terminal, in the same armour (§5.3).
         password: Secret,
     },
     /// An enrollment voucher (§9), with the ephemeral key (JWK) it is bound
@@ -544,21 +546,27 @@ fn service_principal(adv: &VerifiedRealm) -> String {
 }
 
 /// A credential with a ticket for the `kuipa` service of the server that
-/// `adv` describes, got as `principal` with `password` in an AS exchange
-/// armoured by anonymous PKINIT, with the PKINIT anchors from the verified
-/// advertisement and only its KDCs that are in `deployment` (§4.6, §5.4).  Nothing but the ticket outlives
-/// this call: the configuration is written to a private directory that is
-/// removed again.
+/// `adv` describes, got as `principal` in an AS exchange armoured by
+/// anonymous PKINIT, with the PKINIT anchors from the verified
+/// advertisement and only its KDCs that are in `deployment` (§4.6, §5.4).
+/// `secret` answers a plain password; anything else the realm's KDC offers
+/// — a token value, a PIN, a RADIUS or IdP answer, a passkey PIN — is asked
+/// for on the terminal, inside the armour, so an impostor's KDC cannot
+/// collect it either (§5.3).
+///
+/// Nothing but the ticket outlives this call: the configuration is written
+/// to a private directory that is removed again.
 ///
 /// # Errors
 ///
-/// I/O errors, or the KDC refused (no anonymous PKINIT or FAST, a wrong
-/// password): reported as needing an administrator.
+/// I/O errors, a factor nobody could be asked for, or the KDC refused (no
+/// anonymous PKINIT or FAST, a wrong password): reported as needing an
+/// administrator.
 fn armoured_ticket(
     adv: &VerifiedRealm,
     deployment: &Deployment,
     principal: &str,
-    password: &[u8],
+    secret: &[u8],
 ) -> Result<GssClientCred, Error> {
     use std::os::unix::fs::DirBuilderExt;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -579,11 +587,24 @@ fn armoured_ticket(
         let ccache = format!("MEMORY:kuipa-{}-{seq}", std::process::id());
         let service = service_principal(adv);
         tracing::debug!("armoured AS exchange as {principal} for {service}");
-        kuipa_gssapi::password_ticket(&config, principal, password, &service, &ccache).map_err(
-            |e| -> Error {
-                Outcome::NeedsAdmin(format!("Kerberos refused {principal}: {e}")).into()
-            },
-        )?;
+        let front_end = preauth::for_stdin();
+        kuipa_gssapi::ticket(
+            &config,
+            principal,
+            Some(secret),
+            &service,
+            &ccache,
+            front_end.as_ref(),
+        )
+        .map_err(|e| -> Error {
+            match e {
+                GssError::Preauth { detail } => Outcome::NeedsAdmin(format!(
+                    "{principal} needs {detail}; enroll on a terminal, or get a ticket with kinit and enroll with --use-ccache"
+                ))
+                .into(),
+                other => Outcome::NeedsAdmin(format!("Kerberos refused {principal}: {other}")).into(),
+            }
+        })?;
         Ok(GssClientCred::from_named_ccache(&ccache)?)
     })();
     let _ = fs::remove_dir_all(&dir);

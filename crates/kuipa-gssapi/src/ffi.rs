@@ -267,12 +267,68 @@ extern "C" {
         creds: *mut Krb5Creds,
         client: Krb5Principal,
         password: *const c_char,
-        prompter: *const c_void,
+        prompter: Option<Krb5PrompterFn>,
         data: *mut c_void,
         start_time: i32,
         in_tkt_service: *const c_char,
         k5_gic_options: Krb5GetInitCredsOpt,
     ) -> c_int;
+
+    // ── Responder API (MIT Kerberos 1.11 and later) ──────────────────────────
+    //
+    // Client pre-authentication modules — the OTP plugin, the PKINIT plugin,
+    // an installed passkey or IdP plugin — put named questions into a
+    // responder context that a registered responder callback answers.
+
+    /// Register `responder`, with `data` as its callback argument, on `opt`.
+    pub fn krb5_get_init_creds_opt_set_responder(
+        context: Krb5Context,
+        opt: Krb5GetInitCredsOpt,
+        responder: Option<Krb5ResponderFn>,
+        data: *mut c_void,
+    ) -> c_int;
+    /// The NULL-terminated question names in `rctx`, an alias into it.
+    pub fn krb5_responder_list_questions(
+        context: Krb5Context,
+        rctx: Krb5ResponderContext,
+    ) -> *const *const c_char;
+    /// The challenge of `question` in `rctx`, an alias into it, or null.
+    pub fn krb5_responder_get_challenge(
+        context: Krb5Context,
+        rctx: Krb5ResponderContext,
+        question: *const c_char,
+    ) -> *const c_char;
+    /// Answer `question` in `rctx`; both strings are printable UTF-8.  A null
+    /// `answer` hands the question back to the module that asked it, which
+    /// then collects the answer through the prompter callback.
+    pub fn krb5_responder_set_answer(
+        context: Krb5Context,
+        rctx: Krb5ResponderContext,
+        question: *const c_char,
+        answer: *const c_char,
+    ) -> c_int;
+    /// Decode the OTP question; free the result with
+    /// `krb5_responder_otp_challenge_free`.
+    pub fn krb5_responder_otp_get_challenge(
+        context: Krb5Context,
+        rctx: Krb5ResponderContext,
+        chl: *mut *mut Krb5OtpChallenge,
+    ) -> c_int;
+    /// Answer the OTP question with the value and PIN of token `ti`; either
+    /// may be null when it is not collected.
+    pub fn krb5_responder_otp_set_answer(
+        context: Krb5Context,
+        rctx: Krb5ResponderContext,
+        ti: size_t,
+        value: *const c_char,
+        pin: *const c_char,
+    ) -> c_int;
+    /// Free what `krb5_responder_otp_get_challenge` returned.
+    pub fn krb5_responder_otp_challenge_free(
+        context: Krb5Context,
+        rctx: Krb5ResponderContext,
+        chl: *mut Krb5OtpChallenge,
+    );
 }
 
 /// Opaque profile handle (`profile_t`).
@@ -293,6 +349,76 @@ pub struct Krb5Data {
     pub length: c_uint,
     pub data: *mut c_char,
 }
+
+/// Opaque `krb5_responder_context` (MIT Kerberos 1.11 and later).
+pub enum Krb5ResponderContextStruct {}
+pub type Krb5ResponderContext = *mut Krb5ResponderContextStruct;
+
+/// `krb5_responder_otp_tokeninfo` — one token the KDC offered.  `build.rs`
+/// checks this layout against `<krb5.h>` at compile time.
+#[repr(C)]
+pub struct Krb5OtpTokenInfo {
+    /// Which answers the token needs: the flags below, ORed.
+    pub flags: c_int,
+    /// The token's format, or -1 when unspecified.
+    pub format: c_int,
+    /// The token's length, or -1 when unspecified.
+    pub length: c_int,
+    /// Who issued the token; may be a URL to enrol with.
+    pub vendor: *const c_char,
+    /// What the user should do; may be a URL to enrol with.
+    pub challenge: *const c_char,
+    /// The token's serial.
+    pub token_id: *const c_char,
+    /// The algorithm it runs.
+    pub alg_id: *const c_char,
+}
+
+/// `krb5_responder_otp_challenge` — the token(s) offered for an OTP.
+#[repr(C)]
+pub struct Krb5OtpChallenge {
+    /// The service that verifies the OTP, e.g. FreeIPA's `otp` service.
+    pub service: *const c_char,
+    /// The tokens, NULL-terminated.
+    pub tokeninfo: *mut *mut Krb5OtpTokenInfo,
+}
+
+/// `krb5_prompt` — one entry the prompter callback fills in.
+#[repr(C)]
+pub struct Krb5Prompt {
+    /// What to ask the user for.
+    pub prompt: *const c_char,
+    /// Non-zero when the answer is a secret and echo must stay off.
+    pub hidden: c_int,
+    /// The caller-allocated answer buffer: `length` is its capacity on entry
+    /// and the number of bytes written on exit.
+    pub reply: *mut Krb5Data,
+}
+
+/// `krb5_prompter_fct`.
+pub type Krb5PrompterFn = unsafe extern "C" fn(
+    context: Krb5Context,
+    data: *mut c_void,
+    name: *const c_char,
+    banner: *const c_char,
+    num_prompts: c_int,
+    prompts: *mut Krb5Prompt,
+) -> c_int;
+
+/// `krb5_responder_fn`.
+pub type Krb5ResponderFn = unsafe extern "C" fn(
+    context: Krb5Context,
+    data: *mut c_void,
+    rctx: Krb5ResponderContext,
+) -> c_int;
+
+/// `KRB5_RESPONDER_OTP_FLAGS_COLLECT_TOKEN`: ask for the token's value.
+pub const KRB5_RESPONDER_OTP_FLAGS_COLLECT_TOKEN: c_int = 0x0001;
+/// `KRB5_RESPONDER_OTP_FLAGS_COLLECT_PIN`: ask for a PIN as well.
+pub const KRB5_RESPONDER_OTP_FLAGS_COLLECT_PIN: c_int = 0x0002;
+/// `KRB5_RESPONDER_OTP_FLAGS_SEPARATE_PIN`: return the PIN on its own rather
+/// than concatenated with the value.
+pub const KRB5_RESPONDER_OTP_FLAGS_SEPARATE_PIN: c_int = 0x0008;
 
 // ── GSSAPI extern functions ────────────────────────────────────────────────────
 
