@@ -460,7 +460,14 @@ impl PolicyInput {
         };
         let not_after = self
             .expires
-            .map(|days| tang_pqc::unix_seconds(std::time::SystemTime::now()) + days * 86_400);
+            .map(|days| {
+                days.checked_mul(86_400)
+                    .and_then(|s| {
+                        tang_pqc::unix_seconds(std::time::SystemTime::now()).checked_add(s)
+                    })
+                    .ok_or_else(|| "--expires is too large".to_string())
+            })
+            .transpose()?;
         let sealing = match self.sealing.as_deref() {
             None | Some("offline") => kuipa_enroll::vault::Sealing::Offline,
             Some("registered") => kuipa_enroll::vault::Sealing::Registered,
@@ -473,9 +480,18 @@ impl PolicyInput {
             sealing,
             max_unlocks: self.max_unlocks,
             sessions: kuipa_enroll::vault::Sessions {
-                reauth: self.session_hours.map(|h| h * 3600),
-                offline: self.offline_hours.map(|h| h * 3600),
-                epoch: self.epoch_days.map(|d| d * 86_400),
+                reauth: self
+                    .session_hours
+                    .map(|h| h.checked_mul(3600).ok_or("--session-hours is too large"))
+                    .transpose()?,
+                offline: self
+                    .offline_hours
+                    .map(|h| h.checked_mul(3600).ok_or("--offline-hours is too large"))
+                    .transpose()?,
+                epoch: self
+                    .epoch_days
+                    .map(|d| d.checked_mul(86_400).ok_or("--epoch-days is too large"))
+                    .transpose()?,
             },
         })
     }
@@ -813,7 +829,9 @@ fn first_line(bytes: &SecretBuf) -> SecretBuf {
 fn prompt(what: &str, hidden: bool) -> Result<SecretBuf, Error> {
     let stty = |arg: &str| {
         std::fs::File::open("/dev/tty").ok().and_then(|tty| {
-            std::process::Command::new("stty")
+            // Absolute path: the tools run as root during enrollment,
+            // and a PATH-resolved binary there is a planted one.
+            std::process::Command::new("/bin/stty")
                 .arg(arg)
                 .stdin(tty)
                 .status()
