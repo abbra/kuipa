@@ -394,6 +394,9 @@ ipa-ku1:<REALM>:<anchor thumbprint>:<expiry>[:<secret>]
 The anchor thumbprint is 43 base64url characters: the anchor of the server
 that issued the string. The expiry is in Unix seconds; the host refuses the
 string after it (300 s of clock skew), before sending anything.
+The string may also carry the anchor's current **vouch head**, which
+lets the host check the delegation without any signature at all
+(§4.9): `ipa-ku2:<REALM>:<anchor>:<expiry>:<size>:<root>[:<secret>]`.
 `kuipad enrollment-string [--days N]` prints the string without a
 secret (7 days by default, at most 400), to append `:<OTP>` to. The secret
 is an OTP for an online join, or the bundle secret `S` of a mode B bundle
