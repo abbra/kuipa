@@ -64,6 +64,12 @@
 //! From a pipe the enrollment string is the first line and the password the
 //! next; on a terminal each is prompted for (the password without echo).
 //!
+//! An armoured exchange answers whatever the realm's KDC asks for, not only
+//! a password: a token value, a PIN, a RADIUS or IdP answer, the PIN of a
+//! passkey.  On a terminal each is prompted for, inside the armour.  With no
+//! terminal to ask on, `kuipa` names the factor it needs; such a user
+//! enrolls with `--use-ccache` after a `kinit` of their own.
+//!
 //! `--realm R` replaces the enrollment string for `enroll` with a password,
 //! ticket or voucher and for `realm-info`: the advertisement is verified
 //! against the anchors pre-provisioned in `/etc/ipa/ku-anchors` (an image,
@@ -95,6 +101,7 @@ use kuipa_enroll::keytab::Principal;
 use kuipa_enroll::realm::Deployment;
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::{self, Error, Paths};
+use kuipa_tools::preauth::prompt;
 use kuipa_tools::trace;
 use native_ossl::util::SecretBuf;
 use serde_json::Value;
@@ -106,6 +113,8 @@ use tang_pqc::Thumbprint;
     after_help = "Secrets are never taken from the command line: the enrollment \
 string comes from --enrollment-file, $KUIPA_ENROLLMENT_FILE or standard input, the \
 password from --password-file or standard input; on a terminal each is prompted for. \
+A password join answers whatever the realm's KDC asks for — a token value, a PIN, \
+a RADIUS or IdP answer — on a terminal, inside the FAST armour. \
 Without --server, servers are found in DNS (_ldap._tcp.<domain> SRV records). \
 Exit status: 0 success, 75 retry later, 1 needs an administrator or another error, \
 2 usage."
@@ -842,36 +851,6 @@ fn first_line(bytes: &SecretBuf) -> SecretBuf {
         .next()
         .unwrap_or_default();
     SecretBuf::from_slice(first.strip_suffix(b"\r").unwrap_or(first))
-}
-
-/// Prompt on the terminal and read one line; with `hidden`, echo is off
-/// while typing (`stty` on the terminal, so no terminal ioctls here).
-fn prompt(what: &str, hidden: bool) -> Result<SecretBuf, Error> {
-    let stty = |arg: &str| {
-        std::fs::File::open("/dev/tty").ok().and_then(|tty| {
-            // Absolute path: the tools run as root during enrollment,
-            // and a PATH-resolved binary there is a planted one.
-            std::process::Command::new("/bin/stty")
-                .arg(arg)
-                .stdin(tty)
-                .status()
-                .ok()
-        })
-    };
-    eprint!("{}{}: ", what[..1].to_uppercase(), &what[1..]);
-    if hidden {
-        stty("-echo");
-    }
-    let mut line = String::new();
-    let read = std::io::stdin().read_line(&mut line);
-    if hidden {
-        stty("echo");
-        eprintln!();
-    }
-    read?;
-    let value = SecretBuf::from_slice(line.trim_end_matches(['\n', '\r']).as_bytes());
-    drop(SecretBuf::new(line.into_bytes()));
-    Ok(value)
 }
 
 struct Secrets {
