@@ -190,6 +190,18 @@ problem.
 Write protected keytabs back in plain form and remove *kuipa*'s state from this
 host.
 
+## keys fetch _NAME_ [--alg _ALG_] [--out _FILE_]
+
+Fetch a named secret from the realm's servers, authenticated by this
+host's keytab: *NAME* is *<namespace>/<nickname>*, one of *dm/DMHash*,
+*ra/ipaCert*, *ca/<nickname>*, *ca_wrapped/<nickname>* or
+*lwca/<nickname>*.  This is how a promoting replica receives the
+Directory Manager password hash, the RA agent key and the CA subsystem
+keys.  The value is written to standard output, or to *FILE*.  For
+*ca_wrapped* only, *--alg* names the wrap algorithm: *aes-256-cbc-pad*
+or *aes-256-wrap*.  A host outside the realm's server list, or without
+the CA role for the wrapped CA keys, is refused.
+
 # VAULT COMMANDS
 
 *kuipa seal* seals a user's own files to a vault of hers. It runs as
