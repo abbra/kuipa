@@ -71,7 +71,7 @@ fn check_period(iat: u64, exp: u64, max: u64, what: &'static str) -> Result<()> 
     Ok(())
 }
 
-fn valid_at(iat: u64, exp: u64, at: u64) -> bool {
+pub(crate) fn valid_at(iat: u64, exp: u64, at: u64) -> bool {
     at <= exp.saturating_add(CLOCK_SKEW) && iat <= at.saturating_add(CLOCK_SKEW)
 }
 
@@ -359,7 +359,7 @@ impl SignedVouch {
     ) -> Result<Option<HeadProof>> {
         let prefix = usize::try_from(head.0)
             .ok()
-            .filter(|n| *n <= self.leaves.len());
+            .filter(|n| *n > 0 && *n <= self.leaves.len());
         if anchor != &self.vouch.anchor
             || prefix.is_none()
             || merkle::root(&self.leaves[..prefix.unwrap_or(0)])? != head.1
@@ -431,15 +431,20 @@ fn continue_log(
     leaves: impl IntoIterator<Item = Hash>,
     previous: Option<&SignedVouch>,
 ) -> Vec<Hash> {
-    let wanted: Vec<Hash> = leaves.into_iter().collect();
+    let mut wanted: Vec<Hash> = Vec::new();
+    for l in leaves {
+        if !wanted.contains(&l) {
+            wanted.push(l);
+        }
+    }
     let Some(previous) = previous else {
         return wanted;
     };
     let old = previous.leaves();
     let kept: Vec<Hash> = old.iter().copied().filter(|l| wanted.contains(l)).collect();
-    if kept.len() != wanted.len() {
-        // A claim was dropped (or the previous log is not a prefix of the
-        // trusted set): the log restarts, so no old prefix stays valid.
+    if kept.len() != old.len() {
+        // A claim was dropped: the log restarts, so no old prefix stays
+        // valid.  New claims never cause a restart — they append.
         return wanted;
     }
     let mut log = kept;
@@ -686,6 +691,31 @@ impl Proof {
     /// The anchor's thumbprint, unverified.
     fn signer(&self) -> Option<Thumbprint> {
         self.anchor_key().map(|k| *k.thumbprint())
+    }
+
+    /// The anchor's vouch statement, **verified**: its embedded key is
+    /// allowed, the statement names that key's anchor, the proof's
+    /// signature is the key's over the statement (`(size, root)` and the
+    /// period included), and it is valid at `at`.
+    fn verified_vouch(&self, policy: &Policy, at: u64) -> Option<Vouch> {
+        let key = self.anchor_key()?;
+        if !policy.allows_signature(key.alg()) {
+            return None;
+        }
+        let bytes = b64::decode(&self.vouch).ok()?;
+        let vouch = Vouch::from_bytes(&bytes).ok()?;
+        if &vouch.anchor != key.thumbprint() {
+            return None;
+        }
+        let signature = b64::decode(&self.signature).ok()?;
+        if key
+            .verify_with_context(&bytes, VOUCH_CONTEXT, &signature)
+            .is_err()
+            || !valid_at(vouch.iat, vouch.exp, at)
+        {
+            return None;
+        }
+        Some(vouch)
     }
 
     /// Check it for `claim` (only from `anchors`, when given) and return
@@ -939,6 +969,10 @@ pub struct VerifiedDelegation {
     /// was needed).
     pub head_anchor: Option<Thumbprint>,
     /// When that anchor's vouch expires (Unix seconds).
+    /// `u64::MAX` when the claim was proven by a **head** (§4.9): a
+    /// head proof carries no lifetime — the pinned head is a landmark,
+    /// and a head-proven reader's trust does not ride on a vouch's
+    /// expiry — so nothing expires for it.
     pub vouched_until: u64,
     /// The successions followed from a pinned anchor to `anchor`, as
     /// `(old, new)` from the pinned one; empty if `anchor` is pinned.
@@ -1026,6 +1060,27 @@ impl Delegation {
         self.head_proofs
             .iter()
             .filter_map(|v| HeadProof::from_json(v).ok())
+            .collect()
+    }
+
+    /// The vouch heads this delegation proves **by signature**: for each
+    /// signature proof, the `(size, root)` of the vouch its embedded
+    /// anchor key signed, valid at `at`.  This is what a head pin must be
+    /// taken **from**: an advertised head that does not appear here is
+    /// the advertising server's assertion, not the anchor's (§4.9.6,
+    /// DESIGN-claim-logs.md §4).
+    #[must_use]
+    pub fn verified_heads(&self, policy: &Policy, at: u64) -> Vec<HeadPin> {
+        self.proofs
+            .iter()
+            .filter_map(|p| {
+                let v = p.verified_vouch(policy, at)?;
+                Some(HeadPin {
+                    anchor: v.anchor,
+                    size: v.size,
+                    root: v.root,
+                })
+            })
             .collect()
     }
 
@@ -1131,14 +1186,23 @@ impl Delegation {
         let own = self.claim().ok().and_then(|c| c.anchor);
         let by = |a: &Thumbprint| self.proofs.iter().find(|p| p.signer() == Some(*a));
         let proofs = self.head_proofs();
-        let head = heads
+        let matching: Vec<Value> = proofs
             .iter()
-            .find_map(|h| proofs.iter().find(|p| *p.anchor() == h.anchor));
-        if let Some(head) = head {
+            .filter(|p| {
+                heads
+                    .iter()
+                    .any(|h| h.anchor == *p.anchor() && h.size == p.size)
+            })
+            .map(HeadProof::to_json)
+            .collect();
+        if !matching.is_empty() {
+            // The head wins over everything (§4.9): no signature, and
+            // **every** matching head — a frozen host's §2 gate demands
+            // a proof per frozen anchor, not the first one.
             return Self {
                 claim: self.claim.clone(),
                 proofs: Vec::new(),
-                head_proofs: vec![head.to_json()],
+                head_proofs: matching,
                 successions: Vec::new(),
             };
         }
@@ -1261,7 +1325,8 @@ impl Delegation {
                 exp: claim.exp,
                 anchor,
                 head_anchor: Some(anchor),
-                vouched_until: at,
+                // No vouch lifetime: the pinned head is the proof.
+                vouched_until: u64::MAX,
                 succeeded: Vec::new(),
             });
         }
@@ -1561,6 +1626,7 @@ mod tests {
             .verify_at_with_heads(&[], &[head1], &Policy::default(), NOW + 5)
             .unwrap();
         assert_eq!(v.head_anchor, Some(head1.anchor));
+        assert_eq!(v.vouched_until, u64::MAX, "a head proof never expires");
         assert_eq!(&v.key, servers[0].public().thumbprint());
 
         // A new claim is not under the pinned head: no head proof for it.
@@ -1610,6 +1676,118 @@ mod tests {
         // The new log's own head works.
         let head2 = (v2.vouch().size, v2.vouch().root);
         assert!(v2.head_proof(&claims[0], &thp, head2).unwrap().is_some());
+    }
+
+    // PoC port (adversary poc_log_prefix): the production caller passes
+    // `Trust::leaves()` — claim leaves in server-name order — so a new
+    // member can sort *in front of* the existing log.  The old log's
+    // order must survive regardless of caller order: every earlier
+    // prefix is the tree an earlier vouch signed (§4.9.1).
+    #[test]
+    fn log_extends_in_log_order_when_a_new_member_sorts_first() {
+        let anchor = key();
+        let thp = *anchor.public().thumbprint();
+        let b = claim(&anchor, "b.example.test", &key());
+        let a = claim(&anchor, "a.example.test", &key());
+
+        let v1 =
+            SignedVouch::issue(&anchor, "R", [b.leaf().unwrap()], NOW, NOW + 100, None).unwrap();
+        let pinned = v1.head();
+
+        // "a" joins and sorts before "b": the caller hands [a, b].
+        let v2 = SignedVouch::issue(
+            &anchor,
+            "R",
+            [a.leaf().unwrap(), b.leaf().unwrap()],
+            NOW + 1,
+            NOW + 101,
+            Some(&v1),
+        )
+        .unwrap();
+        assert_eq!(
+            v2.leaves(),
+            &[b.leaf().unwrap(), a.leaf().unwrap()],
+            "the old log keeps its order; the new claim appends"
+        );
+        assert!(v2.covers(&b).unwrap());
+        assert_eq!(merkle::root(&v2.leaves()[..1]).unwrap(), pinned.1);
+        assert!(
+            v2.head_proof(&b, &thp, pinned).unwrap().is_some(),
+            "the pinned head still proves the older claim, without a signature"
+        );
+    }
+
+    // PoC port (adversary poc_merkle_edges, duplicate leaves): leaves
+    // are deduplicated on every path, so the server can never sign a
+    // vouch its own verify() rejects.
+    #[test]
+    fn duplicate_leaves_are_deduplicated_on_issue() {
+        let anchor = key();
+        let c1 = claim(&anchor, "a", &key());
+        let c2 = claim(&anchor, "b", &key());
+        let v = SignedVouch::issue(
+            &anchor,
+            "R",
+            [c1.leaf().unwrap(), c2.leaf().unwrap(), c1.leaf().unwrap()],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
+        assert_eq!(v.leaves(), &[c1.leaf().unwrap(), c2.leaf().unwrap()]);
+        v.verify(anchor.public(), &Policy::default())
+            .unwrap_or_else(|e| panic!("an issued vouch must survive verify: {e}"));
+    }
+
+    // PoC port (adversary poc_merkle_edges, zero-size head): size 0 is
+    // not a head — it proves nothing, and never errors into a 503.
+    #[test]
+    fn a_zero_size_head_proves_nothing() {
+        let anchor = key();
+        let thp = *anchor.public().thumbprint();
+        let c = claim(&anchor, "a", &key());
+        let v =
+            SignedVouch::issue(&anchor, "R", [c.leaf().unwrap()], NOW, NOW + 100, None).unwrap();
+        assert!(v.head_proof(&c, &thp, (0, [0; 32])).unwrap().is_none());
+    }
+
+    // The heads a delegation proves by signature (§4.9.6): an advertised
+    // head must appear here to be the anchor's own.  A tampered vouch
+    // proves no head; an expired vouch proves none either.
+    #[test]
+    fn verified_heads_follow_the_signed_vouch_only() {
+        let anchor = key();
+        let server = key();
+        let d = Delegation::issue(
+            &anchor,
+            "R",
+            "ipa1.r",
+            server.public(),
+            NOW,
+            NOW + DEFAULT_VALIDITY,
+        )
+        .unwrap();
+        let p = Policy::default();
+        let leaf = d.claim().unwrap().leaf().unwrap();
+        assert_eq!(
+            d.verified_heads(&p, NOW),
+            vec![HeadPin {
+                anchor: *anchor.public().thumbprint(),
+                size: 1,
+                root: merkle::root(&[leaf]).unwrap(),
+            }]
+        );
+        let mut forged = d.clone();
+        forged.proofs[0].vouch = b64::encode(&[0u8; 8]);
+        assert!(
+            forged.verified_heads(&p, NOW).is_empty(),
+            "a vouch its anchor did not sign proves no head"
+        );
+        assert!(
+            d.verified_heads(&p, NOW + VOUCH_VALIDITY + CLOCK_SKEW + 1)
+                .is_empty(),
+            "an expired vouch proves no head"
+        );
     }
 
     #[test]

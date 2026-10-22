@@ -10,7 +10,7 @@ use std::sync::{PoisonError, RwLock};
 use std::time::SystemTime;
 
 use tang_pqc::wire::Writer;
-use tang_pqc::{SignedAdvertisement, Thumbprint, unix_seconds};
+use tang_pqc::{Policy, SignedAdvertisement, Thumbprint, VerifyingKey, unix_seconds};
 
 use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::{Delegation, HeadPin, SignedVouch};
@@ -21,6 +21,7 @@ use crate::join::{
     AuthType, KerberosBinding, Operation, Request, RequestBody, Response, channel_binding,
 };
 use crate::keytab::{Enctype, Keytab, Principal};
+use crate::merkle;
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::trust::{self, TrustRequest, TrustResponse};
@@ -552,12 +553,15 @@ impl From<Error> for Refusal {
 pub const ADVERTISEMENT_VALIDITY: u64 = 7 * 24 * 3600;
 
 /// Cache key of a signed advertisement: the anchor whose proof it
-/// carries, the anchor its succession chain starts from, and the epoch
-/// head it names (§4.8).
+/// carries, the anchor its succession chain starts from, the epoch
+/// head it names (§4.8), and a digest of the delegation it carries —
+/// head proofs (§4.9) differ per pinned head, so two clients pinning
+/// different heads must not share a cached answer.
 type AdvKey = (
     Option<Thumbprint>,
     Option<Thumbprint>,
     Option<(u64, [u8; 32])>,
+    Option<[u8; 32]>,
 );
 
 /// Most claim-log leaves served in one page (§4.9): a page is for
@@ -586,6 +590,54 @@ pub struct ClaimLogPage {
     /// was signed at all, against the anchor's key from any
     /// advertisement.  Absent for an older server.
     pub vouch: Option<String>,
+}
+
+impl ClaimLogPage {
+    /// The head this page's vouch **proves**: parse the signed vouch,
+    /// verify it against the anchor's `key` (policy, signature, anchor,
+    /// tree), bind it to this page's anchor and `(size, root)`, and
+    /// check the vouch is valid at `at`.  A reader that pinned a thumbprint
+    /// pins a head only when a page verifies here (DESIGN-claim-logs.md
+    /// §4): the page bytes alone, or an advertisement's `heads` member,
+    /// are the server's assertion, not the anchor's.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for a missing or unparsable vouch or anchor,
+    /// [`Error::UntrustedAnchor`] for another key or a bad signature,
+    /// [`Error::Mismatch`] when the vouch names another anchor or head,
+    /// [`Error::Expired`] when the vouch is expired at `at`.
+    pub fn verified_head(
+        &self,
+        key: &VerifyingKey,
+        policy: &Policy,
+        at: u64,
+    ) -> crate::Result<HeadPin> {
+        let bytes = tang_pqc::b64::decode(
+            self.vouch
+                .as_ref()
+                .ok_or(Error::Malformed("claim log: head is not signed"))?,
+        )
+        .map_err(|_| Error::Malformed("claim log vouch"))?;
+        let vouch = SignedVouch::from_bytes(&bytes)?;
+        vouch.verify(key, policy)?;
+        let anchor = self
+            .anchor
+            .parse::<Thumbprint>()
+            .map_err(|_| Error::Malformed("claim log anchor"))?;
+        let v = vouch.vouch();
+        if v.anchor != anchor || v.size != self.size || v.root != self.root {
+            return Err(Error::Mismatch("claim log head"));
+        }
+        if !crate::delegation::valid_at(v.iat, v.exp, at) {
+            return Err(Error::Expired);
+        }
+        Ok(HeadPin {
+            anchor,
+            size: self.size,
+            root: self.root,
+        })
+    }
 }
 
 /// What the anchor exchange decides (§4.2): this server's delegation, with
@@ -835,18 +887,23 @@ impl EnrollServer {
             .last()
             .and_then(|e| e.statement().ok())
             .and_then(|s| Some((s.seq(), s.head().ok()?)));
+        // One head proof per pinned head that this server's vouches can
+        // make (§1.4: the server tries each pinned head in turn): a host
+        // with several pinned anchors — frozen ones especially (§2) —
+        // needs *each* of its heads to prove the claim, so the answer
+        // carries every proof, not just the first.
         let mut delegation = published.delegation.clone();
-        for head in heads {
-            let Some(vouch) = published.vouches.get(&head.anchor) else {
-                continue;
-            };
-            let Some(claim) = delegation.claim().ok() else {
-                break;
-            };
-            if let Some(proof) = vouch.head_proof(&claim, &head.anchor, (head.size, head.root))? {
-                delegation = Delegation::new(&claim);
-                delegation.add_head_proofs([proof]);
-                break;
+        let claim = delegation.claim().ok();
+        if let Some(claim) = claim.as_ref() {
+            for head in heads {
+                let Some(vouch) = published.vouches.get(&head.anchor) else {
+                    continue;
+                };
+                if let Some(proof) =
+                    vouch.head_proof(claim, &head.anchor, (head.size, head.root))?
+                {
+                    delegation.add_head_proofs([proof]);
+                }
             }
         }
         let delegation = delegation.select_with_heads(wanted, heads);
@@ -861,6 +918,7 @@ impl EnrollServer {
                 .and_then(|s| s.statement().ok())
                 .map(|s| s.old),
             epoch,
+            Some(merkle::leaf_hash(delegation.to_json().as_bytes())?),
         );
         if let Some((adv, iat)) = published.advertisements.get(&signer)
             && now.saturating_sub(*iat) < ADVERTISEMENT_VALIDITY / 2
@@ -896,6 +954,7 @@ impl EnrollServer {
             && p.anchors == published.anchors
             && p.trusts == published.trusts
             && p.epoch == published.epoch
+            && p.vouches == published.vouches
         {
             p.advertisements.insert(signer, (adv.clone(), now));
         }
@@ -1657,4 +1716,124 @@ pub fn parse_stage_result(
         bundle,
         (!secret.is_empty()).then(|| crate::enrollment::Secret::new(secret)),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::realm::tests::{now, test_realm};
+    use tang_pqc::{SignatureAlg, SigningKey};
+
+    // PoC port (adversary poc_adv_cache): the cache must key on the
+    // delegation it serves — two clients pinning heads of *different*
+    // anchors must each get their own proof.
+    #[test]
+    fn advertisements_are_cached_per_delegation() {
+        let t = test_realm("ipa1.example.test");
+        let a2 = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let thp1 = *t.anchor.public().thumbprint();
+        let thp2 = *a2.public().thumbprint();
+        let leaf = t.delegation.claim().unwrap().leaf().unwrap();
+        let root = merkle::root(&[leaf]).unwrap();
+        let mut vouches = HashMap::new();
+        for a in [&t.anchor, &a2] {
+            vouches.insert(
+                *a.public().thumbprint(),
+                SignedVouch::issue(a, "EXAMPLE.TEST", [leaf], now() - 60, now() + 3600, None)
+                    .unwrap(),
+            );
+        }
+        let server = EnrollServer::new(t.keys, t.info.clone(), t.delegation.clone());
+        server.publish(t.delegation.clone(), vec![thp1, thp2], vouches);
+
+        let proof_anchor = |adv: SignedAdvertisement| {
+            adv.unverified_member("delegation").unwrap().unwrap()["head_proofs"][0]["anchor"]
+                .as_str()
+                .unwrap_or("?")
+                .to_owned()
+        };
+        let adv1 = server
+            .advertisement_with_heads(
+                &[],
+                &[HeadPin {
+                    anchor: thp1,
+                    size: 1,
+                    root,
+                }],
+            )
+            .unwrap();
+        let adv2 = server
+            .advertisement_with_heads(
+                &[],
+                &[HeadPin {
+                    anchor: thp2,
+                    size: 1,
+                    root,
+                }],
+            )
+            .unwrap();
+        assert_eq!(proof_anchor(adv1), thp1.to_string());
+        assert_eq!(
+            proof_anchor(adv2),
+            thp2.to_string(),
+            "the second client is served *its* anchor's proof, not the cached first one"
+        );
+    }
+
+    #[test]
+    fn a_claim_log_page_verifies_its_head_against_the_anchor_key() {
+        let t = test_realm("ipa1.example.test");
+        let thp = *t.anchor.public().thumbprint();
+        let leaf = t.delegation.claim().unwrap().leaf().unwrap();
+        let mut vouches = HashMap::new();
+        vouches.insert(
+            thp,
+            SignedVouch::issue(
+                &t.anchor,
+                "EXAMPLE.TEST",
+                [leaf],
+                now() - 60,
+                now() + 3600,
+                None,
+            )
+            .unwrap(),
+        );
+        let s = EnrollServer::new(t.keys, t.info.clone(), t.delegation.clone());
+        s.publish(t.delegation.clone(), vec![thp], vouches);
+        let page = s.claim_log(&thp, 0).expect("the served anchor has a vouch");
+        let p = Policy::default();
+        let head = page
+            .verified_head(t.anchor.public(), &p, now())
+            .expect("the served head is signed by the anchor");
+        assert_eq!((head.size, head.root), (page.size, page.root));
+
+        // A stranger's key proves nothing.
+        let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        assert!(page.verified_head(stranger.public(), &p, now()).is_err());
+        // A tampered head mismatches the signed vouch.
+        let mut tampered = page.clone();
+        tampered.root = [9; 32];
+        assert!(
+            tampered
+                .verified_head(t.anchor.public(), &p, now())
+                .is_err()
+        );
+        // An older server's page carries no vouch: the head is unsigned.
+        let mut unsigned = page.clone();
+        unsigned.vouch = None;
+        assert!(
+            unsigned
+                .verified_head(t.anchor.public(), &p, now())
+                .is_err()
+        );
+        // An expired vouch proves no head.
+        assert!(
+            page.verified_head(
+                t.anchor.public(),
+                &p,
+                now() + 3600 + crate::delegation::CLOCK_SKEW + 1
+            )
+            .is_err()
+        );
+    }
 }

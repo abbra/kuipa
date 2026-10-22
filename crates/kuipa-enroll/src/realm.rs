@@ -13,7 +13,8 @@ use tang_pqc::{
     SigningKey, Thumbprint, VerifyingKey, b64, unix_seconds,
 };
 
-use crate::delegation::{Delegation, HeadPin, VerifiedDelegation};
+use crate::delegation::Claim;
+use crate::delegation::{Delegation, HeadPin, HeadProof, VerifiedDelegation};
 use crate::error::{Error, Result};
 
 /// JWK member naming a key's role.
@@ -439,6 +440,16 @@ fn same_name(a: &str, b: &str) -> bool {
 pub struct VerifiedRealm {
     info: RealmInfo,
     delegation: VerifiedDelegation,
+    /// The head proofs the advertisement's delegation carried, parsed
+    /// (each still needs a pinned window to check against — §2).
+    head_proofs: Vec<HeadProof>,
+    /// The heads the delegation proved **by signature** at verification
+    /// time (`Delegation::verified_heads`): the only heads a reader may
+    /// pin from this advertisement (DESIGN-claim-logs.md §4).
+    proved_heads: Vec<HeadPin>,
+    /// The server's claim the delegation carries: what head proofs are
+    /// checked against (§2 gate).
+    claim: Claim,
     adv: Advertisement,
     epoch: Option<(u64, [u8; 32])>,
 }
@@ -486,11 +497,14 @@ impl VerifiedRealm {
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
-        let delegation = Delegation::from_value(
+        let parsed = Delegation::from_value(
             adv.unverified_member(MEMBER_DELEGATION)?
                 .ok_or(Error::Missing("delegation"))?,
-        )?
-        .verify_at_with_heads(anchors, heads, policy, unix_seconds(now))?;
+        )?;
+        let proved_heads = parsed.verified_heads(policy, unix_seconds(now));
+        let head_proofs = parsed.head_proofs();
+        let claim = parsed.claim()?;
+        let delegation = parsed.verify_at_with_heads(anchors, heads, policy, unix_seconds(now))?;
         if delegation.realm != realm {
             return Err(Error::WrongRealm);
         }
@@ -514,6 +528,9 @@ impl VerifiedRealm {
         Ok(Self {
             info,
             delegation,
+            head_proofs,
+            proved_heads,
+            claim,
             adv,
             epoch,
         })
@@ -544,15 +561,39 @@ impl VerifiedRealm {
         &self.delegation.anchor
     }
 
-    /// The pinned anchor whose **head** proved the delegation, if one
-    /// did (§4.9): `None` when a signature was checked.  A frozen pin
+    /// The pinned anchor whose **head** proved the delegation, if one did
+    /// (§4.9): `None` when a signature was checked.  A frozen pin
     /// demands one of these (DESIGN-claim-logs.md §2).
     #[must_use]
     pub fn head_anchor(&self) -> Option<Thumbprint> {
         self.delegation.head_anchor
     }
 
+    /// The head proofs this advertisement carried, for a frozen pin's
+    /// §2 gate: each frozen anchor must have one that checks against
+    /// its pinned window ([`HeadPin::check`]).
+    #[must_use]
+    pub fn head_proofs(&self) -> &[HeadProof] {
+        &self.head_proofs
+    }
+
+    /// The heads this advertisement proved by signature: the only heads
+    /// a reader may pin from it (DESIGN-claim-logs.md §4).
+    #[must_use]
+    pub fn proved_heads(&self) -> &[HeadPin] {
+        &self.proved_heads
+    }
+
+    /// The server's claim this advertisement delegates: the claim head
+    /// proofs prove ([`HeadPin::check`] takes it).
+    #[must_use]
+    pub fn claim(&self) -> &Claim {
+        &self.claim
+    }
+
     /// When the accepted anchor's vouch expires (Unix seconds).
+    /// `u64::MAX` when a pinned head proved the claim instead (§4.9):
+    /// a head proof has no lifetime.
     #[must_use]
     pub fn vouched_until(&self) -> u64 {
         self.delegation.vouched_until
