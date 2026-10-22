@@ -244,6 +244,7 @@ fn start_trusted(
         peers: None,
         limiter: kuipad::limit::Limiter::default(),
         tang: None,
+        keys: None,
     });
     let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -347,6 +348,7 @@ fn start_servers(
             peers: Some(peers.clone()),
             limiter: kuipad::limit::Limiter::default(),
             tang,
+            keys: None,
         });
         rt.spawn(peers.run());
         rt.spawn(async move { axum::serve(listener, router(app)).await });

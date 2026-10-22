@@ -53,6 +53,8 @@ pub struct App<D> {
     pub limiter: Limiter,
     /// The post-quantum Tang server, if this server has Tang keys (§11.5).
     pub tang: Option<Arc<Tang>>,
+    /// The `keys` operation's handlers and audit, if enabled (§18.5).
+    pub keys: Option<Arc<crate::keys::Keys>>,
 }
 
 /// Admit a request for `host`, or the status (`429`) to answer.
@@ -107,6 +109,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/stage/{kid}", post(stage::<D>))
         .route("/ipa/ku/register/{kid}", post(register::<D>))
         .route("/ipa/ku/vault/{kid}", post(vault::<D>))
+        .route("/ipa/ku/keys/{kid}", post(keys::<D>))
         .route("/ipa/ku/rec/{kid}", post(recover::<D>))
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
@@ -356,7 +359,7 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     };
     let what = format!("{op:?} {}", request.fqdn());
     let host = match op {
-        Operation::Register | Operation::Vault => None,
+        Operation::Register | Operation::Vault | Operation::Keys => None,
         _ => Some(request.fqdn()),
     };
     if let Err(status) = admit_for(&app, &what, host, headers) {
@@ -422,6 +425,17 @@ async fn vault<D: Directory + Send + Sync + 'static>(
     body: Bytes,
 ) -> Response {
     exchange(app, Operation::Vault, kid, &headers, body).await
+}
+
+async fn keys<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(kid): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Like registration and vault operations: only ever
+    // Kerberos-authenticated, so only the source's bucket applies.
+    exchange(app, Operation::Keys, kid, &headers, body).await
 }
 
 async fn recover<D: Directory + Send + Sync + 'static>(

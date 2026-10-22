@@ -217,6 +217,7 @@ fn app(server: Arc<EnrollServer>, directory: Dir) -> Arc<App<Dir>> {
         peers: None,
         limiter: kuipad::limit::Limiter::default(),
         tang: None,
+        keys: None,
         directory,
     })
 }
@@ -633,6 +634,7 @@ fn guessing_is_rate_limited_per_host() {
                 ..Limits::default()
             }),
             tang: None,
+            keys: None,
         }),
     );
     let guess = |otp: &[u8]| {
@@ -1506,6 +1508,7 @@ fn post_quantum_tang_over_http() {
             peers: None,
             limiter: Limiter::default(),
             tang: keys.server().unwrap().map(Arc::new),
+            keys: None,
         }))
     };
     let _ = rustls_native_ossl::default_provider().install_default();
