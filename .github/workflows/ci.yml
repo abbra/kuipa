@@ -1,3 +1,4 @@
+---
 # Adapted from kurbu5-pkinit's .github/workflows/ci.yml.  Every job runs a
 # job of contrib/ci/local-ci.sh, so CI and local runs stay identical.
 name: CI
