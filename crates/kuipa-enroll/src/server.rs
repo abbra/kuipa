@@ -568,7 +568,7 @@ pub const MAX_CLAIM_LOG_PAGE: usize = 4096;
 /// `GET /ipa/ku/claim-log/{anchor}?from=`: the leaves after `from`, with
 /// the head they lead to.  The leaves are base64url hashes; a claim is
 /// found by its own leaf hash, in the anchor exchange or a delegation.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClaimLogPage {
     /// The anchor whose log this is (base64url thumbprint).
     pub anchor: String,

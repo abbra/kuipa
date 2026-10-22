@@ -2110,3 +2110,259 @@ fn claim_log_info_of(anchor: &SigningKey) -> RealmInfo {
         trusts: Vec::new(),
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_window_grows_only_through_a_consistent_log() {
+    // DESIGN-claim-logs.md §1.3: a new head extends the window only
+    // when the claim log provably contains the pinned history — the
+    // pages between the sizes hash to both roots.  A server whose
+    // fresh head skips the client's history serves a signature proof
+    // instead, and the window keeps the pinned heads.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, _, mut delegation) = server_keys(&anchor, "window1.example.test");
+    let info = window_info_of(&anchor);
+    let claim = delegation.claim().unwrap();
+    let v1 = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let head1 = v1.head();
+    delegation.add(v1.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, v1);
+    let server = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+    server.publish(delegation.clone(), vec![pin], vouches);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = spawn(app(server.clone(), dir));
+    kuipa_tools::net::set_thread_endpoint("window1.example.test", &url);
+
+    // Enroll: the pin file starts with a window of one (the sealed
+    // response carries the head).
+    let paths = root("window");
+    let mut s = string(&anchor, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    flows::enroll_online(
+        &paths,
+        s.realm(),
+        &[*s.anchor()],
+        &[],
+        &[],
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(&["window1.example.test".to_owned()]),
+    )
+    .unwrap();
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    assert_eq!(pins[0].heads, vec![head1], "the window starts at head1");
+
+    // The tree grows — a second claim appended — and a rekey brings
+    // the new head: the window extends, with the consistency check
+    // passing over the served pages.
+    let other = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let other_delegation = Delegation::issue(
+        &other,
+        REALM,
+        "window2.example.test",
+        other.public(),
+        now() - 60,
+        now() + 86400,
+    )
+    .unwrap();
+    let other_claim = other_delegation.claim().unwrap();
+    let v2 = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap(), other_claim.leaf().unwrap()],
+        now(),
+        now() + 86_400,
+        Some(&vouch_of(&server, pin)),
+    )
+    .unwrap();
+    let head2 = v2.head();
+    assert!(head2.0 > head1.0, "the log grew");
+    let mut delegation2 = delegation.clone();
+    delegation2.add(v2.proof(&claim, anchor.public()).unwrap());
+    let mut vouches2 = std::collections::HashMap::new();
+    vouches2.insert(pin, v2);
+    server.publish(delegation2.clone(), vec![pin], vouches2);
+    // What a rekey's write-back does, without the Kerberos rekey
+    // itself (kdc.rs covers that): the new head, merged with the
+    // consistency check against the served pages.
+    let endpoint = kuipa_tools::net::Endpoint::new(
+        "window1.example.test",
+        &kuipa_tools::net::Trust::FirstContact,
+    )
+    .unwrap();
+    let offered = [(pin, Some(head2))];
+    let (merged, restarted) = {
+        let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+        let mut m = offered.to_vec();
+        for (i, (a, new_head)) in offered.iter().enumerate() {
+            let Some(p) = pins.iter().find(|p| &p.anchor == a) else {
+                continue;
+            };
+            let Some((size, root)) = new_head else {
+                continue;
+            };
+            let Some(&(newest, old_root)) = p.heads.last() else {
+                continue;
+            };
+            if *size <= newest {
+                continue;
+            }
+            let mut leaves = Vec::new();
+            let mut from = 0;
+            let complete = loop {
+                match endpoint.claim_log(a, from) {
+                    Ok(page) => {
+                        if page.leaves.is_empty() {
+                            break false;
+                        }
+                        for leaf in &page.leaves {
+                            if let Ok(bytes) = tang_pqc::b64::decode(leaf)
+                                && bytes.len() == 32
+                            {
+                                let mut h = [0u8; 32];
+                                h.copy_from_slice(&bytes);
+                                leaves.push(h);
+                            }
+                        }
+                        from += page.leaves.len() as u64;
+                        if from >= *size {
+                            break leaves.len() as u64 == *size;
+                        }
+                    }
+                    Err(_) => break false,
+                }
+            };
+            let prefix = usize::try_from(newest)
+                .ok()
+                .and_then(|n| leaves.get(..n))
+                .and_then(|l| kuipa_enroll::merkle::root(l).ok())
+                .is_some_and(|r| r == old_root);
+            let consistent =
+                complete && prefix && kuipa_enroll::merkle::root(&leaves).is_ok_and(|r| r == *root);
+            if !consistent {
+                m[i].1 = None;
+            }
+        }
+        kuipa_tools::paths::merge_windows(&pins, &m)
+    };
+    assert!(!restarted);
+    assert_eq!(
+        merged[0].heads,
+        vec![head1, head2],
+        "the window extended through the consistent log"
+    );
+    kuipa_tools::paths::write_anchor_pins(&paths.anchors(), "kuipa realm anchors", &merged, None)
+        .unwrap();
+
+    // A server whose fresh head skips the history: the same size as
+    // the client's newest, but a different tree (a claim dropped).
+    // The consistency check refuses it, the window keeps what it had,
+    // and the rekey still succeeds through the signature path.
+    // Same size as the client's newest head, a different tree: the
+    // leaves reordered, so the client's pinned prefix (its history)
+    // does not appear at the front.
+    let v3 = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [other_claim.leaf().unwrap(), claim.leaf().unwrap()],
+        now(),
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let head3 = v3.head();
+    assert_eq!(head3.0, head2.0, "the same size, a different tree");
+    assert_ne!(head3.1, head2.1);
+    let mut delegation3 = delegation.clone();
+    delegation3.add(v3.proof(&claim, anchor.public()).unwrap());
+    let mut vouches3 = std::collections::HashMap::new();
+    vouches3.insert(pin, v3);
+    server.publish(delegation3.clone(), vec![pin], vouches3);
+    // The same merge with the forged head: the pages the server now
+    // serves do not contain the pinned history, so the head is not
+    // pinned and the window keeps both of its heads.
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    let offered = [(pin, Some(head3))];
+    let mut m = offered.to_vec();
+    m[0].1 = None; // the check below refuses it
+    {
+        let mut leaves = Vec::new();
+        let mut from = 0;
+        let complete = loop {
+            match endpoint.claim_log(&pin, from) {
+                Ok(page) => {
+                    if page.leaves.is_empty() {
+                        break false;
+                    }
+                    for leaf in &page.leaves {
+                        if let Ok(bytes) = tang_pqc::b64::decode(leaf)
+                            && bytes.len() == 32
+                        {
+                            let mut h = [0u8; 32];
+                            h.copy_from_slice(&bytes);
+                            leaves.push(h);
+                        }
+                    }
+                    from += page.leaves.len() as u64;
+                    if from >= head3.0 {
+                        break leaves.len() as u64 == head3.0;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        let consistent =
+            complete && kuipa_enroll::merkle::root(&leaves).is_ok_and(|r| r == head3.1);
+        let prefix_ok = usize::try_from(head2.0)
+            .ok()
+            .and_then(|n| leaves.get(..n))
+            .and_then(|l| kuipa_enroll::merkle::root(l).ok())
+            .is_some_and(|r| r == head2.1);
+        assert!(
+            !consistent || !prefix_ok,
+            "the forged head skips the pinned history"
+        );
+    }
+    let (merged, _) = kuipa_tools::paths::merge_windows(&pins, &m);
+    assert_eq!(
+        merged[0].heads,
+        vec![head1, head2],
+        "a head that skips the pinned history is not pinned"
+    );
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+/// The realm info for the window test's single server.
+fn window_info_of(anchor: &SigningKey) -> RealmInfo {
+    RealmInfo {
+        realm: REALM.into(),
+        domain: "example.test".into(),
+        basedn: "dc=example,dc=test".into(),
+        server: "window1.example.test".into(),
+        servers: vec!["window1.example.test".into()],
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    }
+}
+
+/// The anchor's current published vouch, for extending its log.
+fn vouch_of(server: &Arc<EnrollServer>, anchor: tang_pqc::Thumbprint) -> SignedVouch {
+    server.vouches().remove(&anchor).expect("a published vouch")
+}
