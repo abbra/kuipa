@@ -2551,6 +2551,7 @@ fn audit_reports_coverage_and_split_views() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let pin = *anchor.public().thumbprint();
     let (keys, _, mut delegation) = server_keys(&anchor, "audit1.example.test");
+    let signing = SigningKey::from_jwk(keys.signing.to_jwk().unwrap().as_ref()).unwrap();
     let info = audit_info_of(&anchor);
     let claim = delegation.claim().unwrap();
     let v1 = SignedVouch::issue(
@@ -2624,10 +2625,18 @@ fn audit_reports_coverage_and_split_views() {
     forked.add(v2.proof(&claim, anchor.public()).unwrap());
     let mut forked_vouches = std::collections::HashMap::new();
     forked_vouches.insert(pin, v2);
-    let mut keys2 = server_keys(&anchor, "audit2.example.test").0;
-    let _ = &mut keys2;
+    // A second server of the same realm shares the delegated claim
+    // key (§4.6): its advertisement verifies against that key, as
+    // kuipad's does — with its own exchange keys.
     let server2 = Arc::new(EnrollServer::new(
-        server_keys(&anchor, "audit2.example.test").0,
+        ServerKeys {
+            signing,
+            join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+            escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+            trust: Vec::new(),
+            vouchers: Vec::new(),
+            retired: Vec::new(),
+        },
         audit_info_of(&anchor),
         forked,
     ));

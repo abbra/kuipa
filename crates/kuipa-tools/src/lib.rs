@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod dns;
 pub mod flows;
+pub mod mirror;
 pub mod net;
 pub mod output;
 pub mod paths;
