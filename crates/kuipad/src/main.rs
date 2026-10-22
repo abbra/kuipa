@@ -4,8 +4,10 @@
 //! kuipad [serve] [--config FILE]
 //! kuipad generate-keys [--config FILE]   create the keys, print the anchor
 //! kuipad anchor [--config FILE]          print this server's anchor thumbprint
-//! kuipad enrollment-string [--days N] [--config FILE]
-//!                                                print ipa-ku1:REALM:<anchor>:<expiry>,
+//! kuipad enrollment-string [--days N] [--head] [--config FILE]
+//!                                                print ipa-ku1:REALM:<anchor>:<expiry>
+//!                                                (with --head, ipa-ku2 with the anchor's
+//!                                                vouch head: signature-free checks §4.9),
 //!                                                to append :<OTP> to (default: 7 days)
 //! kuipad rotate-anchor [--days N] [--config FILE]
 //!                                                new anchor; the old one signs a succession
@@ -209,21 +211,36 @@ async fn serve(cfg: Config) -> Result<(), Error> {
 const MAX_STRING_DAYS: u64 = 400;
 
 /// `enrollment-string`: the string for this realm and this server's
-/// anchor, without a secret, valid for `--days` (§4.4).
+/// anchor, without a secret, valid for `--days` (§4.4).  With `--head`,
+/// a version 2 string that also pins the anchor's current vouch head
+/// (§4.9), from the stored delegation's proof by this anchor: the host
+/// then checks delegations with no signature at all.
 fn enrollment_string(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Error> {
     let days = args.days("days", 7)?;
     if days.is_zero() || days.as_secs() > MAX_STRING_DAYS * 86400 {
         return Err(format!("--days must be between 1 and {MAX_STRING_DAYS}").into());
     }
     let exp = tang_pqc::unix_seconds(std::time::SystemTime::now()) + days.as_secs();
-    let string = kuipa_enroll::enrollment::EnrollmentString::new(
+    let head = args.flag("head").then(|| head_of(store)).transpose()?;
+    let string = kuipa_enroll::enrollment::EnrollmentString::with_head(
         &cfg.realm,
         *store.anchor()?.public().thumbprint(),
+        head,
         exp,
         None,
     );
     println!("{}", String::from_utf8_lossy(string.encode().as_ref()));
     Ok(())
+}
+
+/// The anchor's current vouch head (§4.9), from the stored delegation:
+/// the `(size, root)` its own proof's vouch signed.
+fn head_of(store: &KeyStore) -> Result<(u64, [u8; 32]), Error> {
+    let anchor = *store.anchor()?.public().thumbprint();
+    let delegation = store.delegation()?.ok_or("no stored delegation")?;
+    delegation.vouch_head(&anchor).ok_or_else(|| {
+        "no vouch by this anchor in the stored delegation: wait for the next exchange round".into()
+    })
 }
 
 /// `trust-invitation`: issue an invitation for another realm (§17.4).
