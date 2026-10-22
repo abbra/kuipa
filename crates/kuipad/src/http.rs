@@ -28,8 +28,10 @@ use crate::limit::{self, Limiter};
 use crate::peers::Peers;
 use crate::tang::Tang;
 
-/// Largest accepted request body.
-const BODY_LIMIT: usize = 64 * 1024;
+/// Largest accepted request body.  Large enough for a sealed CA or KRA
+/// subsystem PKCS#12 or a wrapped ML-DSA key (§18): an ML-DSA-87 key and
+/// certificate, base64-encoded, stay well under a megabyte.
+const BODY_LIMIT: usize = 1024 * 1024;
 
 /// Most anchors a client may name in `GET adv`.
 const MAX_WANTED_ANCHORS: usize = 16;
