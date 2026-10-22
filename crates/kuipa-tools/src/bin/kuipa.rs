@@ -1523,6 +1523,32 @@ fn render_status(value: &Value, paths: &Paths) {
     rows.field("realm", get(value, "realm"));
     rows.field("IPA servers", get(value, "servers"));
     rows.field("anchors pinned here", get(value, "anchors"));
+    // The pinned windows (DESIGN-claim-logs.md §1): what each head
+    // covers, and whether the pin is frozen (§2).
+    for w in list(get(value, "windows")) {
+        let frozen = get(w, "frozen") == &Value::Bool(true);
+        let heads: Vec<String> = list(get(w, "heads"))
+            .into_iter()
+            .map(|h| format!("{} leaves", get(h, "size").as_u64().unwrap_or(0)))
+            .collect();
+        rows.field(
+            "head window",
+            &Value::String(format!(
+                "{}: {}{}",
+                get(w, "anchor").as_str().unwrap_or("?"),
+                if heads.is_empty() {
+                    "no head".to_owned()
+                } else {
+                    heads.join(", ")
+                },
+                if frozen {
+                    " (frozen)".to_owned()
+                } else {
+                    String::new()
+                }
+            )),
+        );
+    }
     rows.field("trusted realms installed", get(value, "trusted_realms"));
     rows.field("keytab held by", get(value, "protection"));
     rows.field(
