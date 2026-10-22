@@ -955,7 +955,10 @@ fn advertisement_lists_details_landmarks_and_an_anchor_index() {
         .insert(HOST.into(), b"Secret123".to_vec());
     serve_as(
         "ipa1.example.test",
-        app(Arc::new(EnrollServer::new(keys, info, delegation)), dir),
+        app(
+            Arc::new(EnrollServer::new(keys, info, delegation.clone())),
+            dir,
+        ),
     );
     let paths = root("advert");
     let mut s = string(&old, b"Secret123");
@@ -1611,4 +1614,179 @@ fn post_quantum_tang_over_http() {
     let url = serve(&none);
     let r = http.get(format!("{url}/ipa/ku/tang/adv")).send().unwrap();
     assert_eq!(r.status(), 404);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn trusted_realms_pins_and_uses_the_partners_heads() {
+    // A realm A that trusts realm B: B's server publishes vouches, so
+    // A's trusts entry — taken from B's verified advertisement, as
+    // kuipad's refresh fills it — carries B's anchors with their heads
+    // (DESIGN-claim-logs.md §3).  A host of A installs them, and B's
+    // next refresh verifies with no signature served.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, info, mut delegation) = server_keys(&anchor, "ipa1.example.test");
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(*anchor.public().thumbprint(), vouch);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let paths = root("trust-heads");
+    let deployment = Deployment::servers(&["ipa1.example.test".to_owned()]);
+
+    // B: its own anchor, vouching for its own claim, so its
+    // advertisement carries a head.
+    let b = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let b_pin = *b.public().thumbprint();
+    let b_signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let mut b_delegation = Delegation::issue(
+        &b,
+        "B.TEST",
+        "ipa1.b.test",
+        b_signing.public(),
+        now() - 60,
+        now() + 86400,
+    )
+    .unwrap();
+    let b_keys = ServerKeys {
+        signing: b_signing,
+        join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+        escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+        trust: Vec::new(),
+        vouchers: Vec::new(),
+        retired: Vec::new(),
+    };
+    let b_info = RealmInfo {
+        realm: "B.TEST".into(),
+        domain: "b.test".into(),
+        basedn: "dc=b,dc=test".into(),
+        server: "ipa1.b.test".into(),
+        servers: vec!["ipa1.b.test".into()],
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: vec![b_pin],
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    };
+    let b_claim = b_delegation.claim().unwrap();
+    let b_vouch = SignedVouch::issue(
+        &b,
+        "B.TEST",
+        [b_claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let b_head = b_vouch.head();
+    b_delegation.add(b_vouch.proof(&b_claim, b.public()).unwrap());
+    let mut b_vouches = std::collections::HashMap::new();
+    b_vouches.insert(b_pin, b_vouch);
+    let b_server = Arc::new(EnrollServer::new(b_keys, b_info, b_delegation.clone()));
+    b_server.publish(b_delegation, vec![b_pin], b_vouches);
+    serve_as("ipa1.b.test", app(b_server.clone(), Dir::default()));
+
+    // What A's kuipad refresh would publish: B as a partner, with the
+    // heads B's advertisement carries for its anchors.
+    let partner = kuipa_enroll::realm::TrustedRealm {
+        realm: "B.TEST".into(),
+        domain: "b.test".into(),
+        servers: vec!["ipa1.b.test".into()],
+        anchors: vec![b_pin],
+        heads: b_server.heads(),
+    };
+    // A, advertising the trust: B's entry with its heads, as kuipad's
+    // refresh would publish it.
+    let mut info = info;
+    info.trusts = vec![partner];
+    info.validate().unwrap();
+    let mut published_vouches = std::collections::HashMap::new();
+    published_vouches.extend(vouches);
+    let a = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+    a.publish(
+        delegation,
+        vec![*anchor.public().thumbprint()],
+        published_vouches,
+    );
+    serve_as("ipa1.example.test", app(a.clone(), dir));
+
+    // Enroll a host of A: trusted_realms works on an enrolled host's
+    // state, and the enrollment pins A's head too.
+    let mut s = string(&anchor, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    flows::enroll_online(
+        &paths,
+        s.realm(),
+        &[*s.anchor()],
+        &[],
+        &Auth::LdapOtp(otp),
+        HOST,
+        &deployment,
+    )
+    .unwrap();
+
+    // Install B: the anchors file carries B's heads beside its
+    // thumbprints.
+    let result = flows::trusted_realms(&paths).unwrap();
+    assert_eq!(
+        result["trusted_realms"][0]["status"], "installed",
+        "{result}"
+    );
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.trust_anchors("B.TEST")).unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].anchor, b_pin);
+    assert_eq!(pins[0].head, Some(b_head), "B's head is pinned");
+
+    // B's next refresh verifies through the pinned head with no
+    // signature served: ask B's advertisement with the head and check
+    // the delegation carries a head proof only.
+    let (result, trace) = traced(|| flows::trusted_realms(&paths));
+    let result = result.unwrap();
+    assert_eq!(
+        result["trusted_realms"][0]["status"], "refreshed",
+        "{result}"
+    );
+    assert_eq!(result["trusted_realms"][0]["heads"], 1, "{result}");
+    assert!(
+        trace.contains("claim also proven") || trace.contains("advertisement verified"),
+        "{trace}"
+    );
+    let endpoint = kuipa_tools::net::Endpoint::new(
+        &serve_as("ipa1.b.test", app(b_server.clone(), Dir::default())),
+        &kuipa_tools::net::Trust::FirstContact,
+    )
+    .expect("endpoint");
+    let adv = endpoint
+        .advertisement_with_heads(
+            &[b_pin],
+            &[kuipa_enroll::delegation::HeadPin {
+                anchor: b_pin,
+                size: b_head.0,
+                root: b_head.1,
+            }],
+        )
+        .unwrap();
+    let body = adv
+        .unverified_member("delegation")
+        .expect("delegation member")
+        .expect("present")
+        .to_string();
+    assert!(body.contains("head_proofs"), "no head proof in:\n{body}");
+    assert!(
+        !body.contains("signatures"),
+        "a signature proof was served to a head-pinned client:\n{body}"
+    );
 }
