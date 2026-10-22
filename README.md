@@ -172,7 +172,7 @@ and reference. Build it with `mdbook build docs` (and `mdbook-mermaid`
 for the diagrams); the HTML lands in `docs/book/`.
 
 * [docs/DESIGN.md](docs/DESIGN.md): the protocol, the implementation and
-  its status (§18); the book includes it as its reference
+  its status (§19); the book includes it as its reference
 * [TODO.md](TODO.md): planned work
 * [docs/man/](docs/man): man pages for the programs (scdoc sources,
   `*.scd`; compile one with `scdoc < kuipa.1.scd > kuipa.1`)
