@@ -16,12 +16,13 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kuipa_enroll::EnrollServer;
+use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::escrow::EscrowRequest;
 use kuipa_enroll::join::{Operation, Request};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::TrustRequest;
 use serde_json::json;
-use tang_pqc::Thumbprint;
+use tang_pqc::{Thumbprint, b64};
 
 use crate::limit::{self, Limiter};
 use crate::peers::Peers;
@@ -107,6 +108,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/rec/{kid}", post(recover::<D>))
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
+        .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
         .route("/ipa/ku/trust/{kid}", post(establish_trust::<D>))
         .route("/ipa/ku/tang/adv", get(tang_advertisement::<D>))
         .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for::<D>))
@@ -136,11 +138,35 @@ fn wanted_anchors(query: Option<&str>) -> Vec<Thumbprint> {
         .collect()
 }
 
+/// The vouch heads a client pins (§4.9): `?head=<thumbprint>.<size>.
+/// <root>`, repeated; unparsable ones are ignored.  The root is a
+/// base64url tree hash, the size a decimal leaf count.
+fn wanted_heads(query: Option<&str>) -> Vec<HeadPin> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|p| p.strip_prefix("head="))
+        .filter_map(|h| {
+            let (anchor, rest) = h.split_once('.')?;
+            let (size, root) = rest.split_once('.')?;
+            Some(HeadPin {
+                anchor: anchor.parse().ok()?,
+                size: size.parse().ok()?,
+                root: b64::decode(root).ok().and_then(|r| r.try_into().ok())?,
+            })
+        })
+        .take(MAX_WANTED_ANCHORS)
+        .collect()
+}
+
 async fn advertisement<D: Directory + Send + Sync + 'static>(
     State(app): State<Arc<App<D>>>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    match app.server.advertisement(&wanted_anchors(query.as_deref())) {
+    match app.server.advertisement_with_heads(
+        &wanted_anchors(query.as_deref()),
+        &wanted_heads(query.as_deref()),
+    ) {
         Ok(adv) => (
             [(header::CONTENT_TYPE, "application/jose+json")],
             adv.to_json(),
@@ -166,10 +192,46 @@ async fn anchor_log<D: Directory + Send + Sync + 'static>(
         .find_map(|p| p.strip_prefix("from="))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    match serde_json::to_vec(&json!({ "entries": app.server.epoch_log(from) })) {
+    let heads: Vec<_> = app
+        .server
+        .heads()
+        .into_iter()
+        .map(|h| h.to_json())
+        .collect();
+    match serde_json::to_vec(&json!({ "entries": app.server.epoch_log(from), "heads": heads })) {
         Ok(body) => binary(body, "application/json"),
         Err(e) => {
             eprintln!("kuipad: anchor log: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// One anchor's claim log (§4.9): `?from=<index>`, the leaves after that
+/// index, oldest first, with the head they lead to.  Public, like the
+/// anchor log: leaves are content-addressed claims, verifiable against
+/// any head that follows them.
+async fn claim_log<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(anchor): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let from = query
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|p| p.strip_prefix("from="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let Ok(anchor) = anchor.parse() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(page) = app.server.claim_log(&anchor, from) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match serde_json::to_vec(&page) {
+        Ok(body) => binary(body, "application/json"),
+        Err(e) => {
+            eprintln!("kuipad: claim log: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -456,6 +518,24 @@ mod tests {
         assert_eq!(wanted_anchors(None).len(), 0);
         let many = format!("anchor={a}&").repeat(40);
         assert_eq!(wanted_anchors(Some(&many)).len(), MAX_WANTED_ANCHORS);
+    }
+
+    #[test]
+    fn heads_from_the_query() {
+        let a = Thumbprint::from_bytes([1; 32]);
+        let root = [7; 32];
+        let head = format!("head={a}.12.{}", b64::encode(&root));
+        assert_eq!(
+            wanted_heads(Some(&format!("{head}&head=junk&head={a}."))),
+            [HeadPin {
+                anchor: a,
+                size: 12,
+                root,
+            }]
+        );
+        assert_eq!(wanted_heads(None).len(), 0);
+        // Unparsable heads are ignored, not fatal.
+        assert_eq!(wanted_heads(Some("head=not-a-head&head=x.y.z")).len(), 0);
     }
 
     #[test]
