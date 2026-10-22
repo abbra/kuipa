@@ -234,6 +234,7 @@ fn start_trusted(
         ca_certs: vec![realm.chain.ca_der.clone()],
         pkinit_anchors: vec![realm.chain.ca_der.clone()],
         anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
         trusts: Vec::new(),
     };
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &[TRUSTED_SERVER], &[]));
@@ -304,6 +305,7 @@ fn start_servers(
             ca_certs: vec![realm.chain.ca_der.clone()],
             pkinit_anchors: vec![realm.chain.ca_der.clone()],
             anchors: vec![*anchor.public().thumbprint()],
+            heads: Vec::new(),
             trusts: Vec::new(),
         };
         anchors.push(*anchor.public().thumbprint());

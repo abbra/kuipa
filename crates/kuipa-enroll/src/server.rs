@@ -13,7 +13,7 @@ use tang_pqc::wire::Writer;
 use tang_pqc::{SignedAdvertisement, Thumbprint, unix_seconds};
 
 use crate::bundle::{Bundle, Recipient, StageParams};
-use crate::delegation::Delegation;
+use crate::delegation::{Delegation, HeadPin, SignedVouch};
 use crate::epoch::{MAX_EPOCH_FETCH, SignedEpoch};
 use crate::error::Error;
 use crate::escrow::{self, EscrowRequest, RegisterParams};
@@ -560,12 +560,37 @@ type AdvKey = (
     Option<(u64, [u8; 32])>,
 );
 
+/// Most claim-log leaves served in one page (§4.9): a page is for
+/// filling a gap or auditing, both of which walk forward.
+pub const MAX_CLAIM_LOG_PAGE: usize = 4096;
+
+/// One page of an anchor's claim log (§4.9), the answer to
+/// `GET /ipa/ku/claim-log/{anchor}?from=`: the leaves after `from`, with
+/// the head they lead to.  The leaves are base64url hashes; a claim is
+/// found by its own leaf hash, in the anchor exchange or a delegation.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ClaimLogPage {
+    /// The anchor whose log this is (base64url thumbprint).
+    pub anchor: String,
+    /// The size of the log at the head.
+    pub size: u64,
+    /// The tree hash at the head.
+    pub root: [u8; 32],
+    /// When the vouch that signed the head expires (Unix seconds).
+    pub exp: u64,
+    /// The base64url leaf hashes after the page's `from`, oldest first.
+    pub leaves: Vec<String>,
+}
+
 /// What the anchor exchange decides (§4.2): this server's delegation, with
 /// every trusted anchor's signature, and the trusted anchors.
 #[derive(Clone, Debug)]
 struct Published {
     delegation: Delegation,
     anchors: Vec<Thumbprint>,
+    /// The trusted anchors' signed vouches, by thumbprint: what head
+    /// proofs (§4.9) are served from.
+    vouches: HashMap<Thumbprint, SignedVouch>,
     /// Trusted realms (§17).
     trusts: Vec<TrustedRealm>,
     /// The anchor epoch log (§4.8), oldest first.
@@ -598,6 +623,7 @@ impl EnrollServer {
             published: RwLock::new(Published {
                 delegation,
                 anchors,
+                vouches: HashMap::new(),
                 trusts,
                 advertisements: HashMap::new(),
                 epoch: Vec::new(),
@@ -606,15 +632,22 @@ impl EnrollServer {
     }
 
     /// Replace the delegation and the trusted anchors, as decided by the
-    /// anchor exchange.
-    pub fn publish(&self, delegation: Delegation, anchors: Vec<Thumbprint>) {
+    /// anchor exchange, with the trusted anchors' signed vouches (the
+    /// claim logs head proofs are served from, §4.9).
+    pub fn publish(
+        &self,
+        delegation: Delegation,
+        anchors: Vec<Thumbprint>,
+        vouches: HashMap<Thumbprint, SignedVouch>,
+    ) {
         let mut p = self
             .published
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        if p.delegation != delegation || p.anchors != anchors {
+        if p.delegation != delegation || p.anchors != anchors || p.vouches != vouches {
             p.delegation = delegation;
             p.anchors = anchors;
+            p.vouches = vouches;
             p.advertisements.clear();
         }
     }
@@ -689,6 +722,59 @@ impl EnrollServer {
         self.published().anchors
     }
 
+    /// A trusted anchor's signed vouch, if it published one (§4.9).
+    #[must_use]
+    pub fn vouch(&self, anchor: &Thumbprint) -> Option<SignedVouch> {
+        self.published().vouches.get(anchor).cloned()
+    }
+
+    /// The trusted anchors' signed vouches (§4.9), by thumbprint.
+    #[must_use]
+    pub fn vouches(&self) -> HashMap<Thumbprint, SignedVouch> {
+        self.published().vouches
+    }
+
+    /// The trusted anchors' current vouch heads (§4.9).
+    #[must_use]
+    pub fn heads(&self) -> Vec<HeadPin> {
+        let p = self.published();
+        p.anchors
+            .iter()
+            .filter_map(|a| {
+                p.vouches.get(a).map(|v| HeadPin {
+                    anchor: *a,
+                    size: v.vouch().size,
+                    root: v.vouch().root,
+                })
+            })
+            .collect()
+    }
+
+    /// One anchor's claim log page (§4.9): the leaves after index
+    /// `from`, oldest first, at most [`MAX_CLAIM_LOG_PAGE`], with the
+    /// head they lead to and its expiry.  `None` if this server does not
+    /// know the anchor or holds no vouch of it.
+    #[must_use]
+    pub fn claim_log(&self, anchor: &Thumbprint, from: u64) -> Option<ClaimLogPage> {
+        let vouch = self.vouch(anchor)?;
+        let v = vouch.vouch();
+        let from = usize::try_from(from).unwrap_or(usize::MAX);
+        let leaves = vouch
+            .leaves()
+            .iter()
+            .skip(from)
+            .take(MAX_CLAIM_LOG_PAGE)
+            .map(|l| tang_pqc::b64::encode(l))
+            .collect();
+        Some(ClaimLogPage {
+            anchor: anchor.to_string(),
+            size: v.size,
+            root: v.root,
+            exp: v.exp,
+            leaves,
+        })
+    }
+
     fn published(&self) -> Published {
         self.published
             .read()
@@ -712,12 +798,29 @@ impl EnrollServer {
     /// delegation carries one signature: by the first of `wanted` (the
     /// anchors the client pins) that signed it, else by this server's own
     /// anchor (§4.3); for a client that pins only rotated anchors, with the
-    /// successions that lead to the signer (§4.7).
+    /// successions that lead to the signer (§4.7).  For a client that
+    /// pins a vouch head (§4.9), the delegation carries a head proof
+    /// instead: no signature, no anchor key.
     ///
     /// # Errors
     ///
     /// A signing error.
     pub fn advertisement(&self, wanted: &[Thumbprint]) -> crate::Result<SignedAdvertisement> {
+        self.advertisement_with_heads(wanted, &[])
+    }
+
+    /// [`advertisement`](Self::advertisement) with the client's pinned
+    /// vouch heads (§4.9): a head that matches one of this server's
+    /// published vouches turns into a head proof, served alone.
+    ///
+    /// # Errors
+    ///
+    /// A signing error, or a hash error building the proof.
+    pub fn advertisement_with_heads(
+        &self,
+        wanted: &[Thumbprint],
+        heads: &[HeadPin],
+    ) -> crate::Result<SignedAdvertisement> {
         let now = unix_seconds(SystemTime::now());
         let published = self.published();
         let epoch = published
@@ -725,7 +828,21 @@ impl EnrollServer {
             .last()
             .and_then(|e| e.statement().ok())
             .and_then(|s| Some((s.seq(), s.head().ok()?)));
-        let delegation = published.delegation.select(wanted);
+        let mut delegation = published.delegation.clone();
+        for head in heads {
+            let Some(vouch) = published.vouches.get(&head.anchor) else {
+                continue;
+            };
+            let Some(claim) = delegation.claim().ok() else {
+                break;
+            };
+            if let Some(proof) = vouch.head_proof(&claim, &head.anchor, (head.size, head.root))? {
+                delegation = Delegation::new(&claim);
+                delegation.add_head_proofs([proof]);
+                break;
+            }
+        }
+        let delegation = delegation.select_with_heads(wanted, heads);
         let signer = (
             delegation
                 .signers(&tang_pqc::Policy::default())
@@ -745,6 +862,15 @@ impl EnrollServer {
         }
         let info = RealmInfo {
             anchors: published.anchors.clone(),
+            heads: published
+                .vouches
+                .iter()
+                .map(|(a, v)| HeadPin {
+                    anchor: *a,
+                    size: v.vouch().size,
+                    root: v.vouch().root,
+                })
+                .collect(),
             trusts: published.trusts.clone(),
             ..self.info.clone()
         };
@@ -1233,6 +1359,18 @@ impl EnrollServer {
 
     fn enrollment(&self, keytab: Keytab, directory: &dyn Directory) -> Result<Enrollment, Refusal> {
         let anchors = self.anchors();
+        let heads = {
+            let p = self.published();
+            anchors
+                .iter()
+                .map(|a| {
+                    p.vouches.get(a).map(|v| {
+                        let v = v.vouch();
+                        (v.size, v.root)
+                    })
+                })
+                .collect()
+        };
         let epoch = self.epoch_head();
         Ok(Enrollment {
             config: RealmConfig {
@@ -1246,6 +1384,7 @@ impl EnrollServer {
             ca_certs: directory.ca_certificates().map_err(Refusal)?,
             pkinit_anchors: self.info.pkinit_anchors.clone(),
             anchors,
+            heads,
             epoch_seq: epoch.map_or(0, |(seq, _)| seq),
             epoch_head: epoch.map_or([0; 32], |(_, head)| head),
         })

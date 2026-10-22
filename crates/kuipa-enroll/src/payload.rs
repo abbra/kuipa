@@ -39,6 +39,11 @@ pub struct Enrollment {
     pub pkinit_anchors: Vec<Vec<u8>>,
     /// The current realm anchors.
     pub anchors: Vec<Thumbprint>,
+    /// The anchors' current vouch heads (§4.9), aligned with `anchors`:
+    /// `None` where the issuing server knew no head for the anchor.
+    /// Clients pin them next to the thumbprints, and check a delegation
+    /// against a head with no signature at all.
+    pub heads: Vec<Option<(u64, [u8; 32])>>,
     /// The sequence number of the issuing server's anchor epoch log
     /// (§4.8); `0` when it kept none.
     pub epoch_seq: u64,
@@ -61,6 +66,9 @@ impl Enrollment {
     pub fn to_bytes(&self) -> Result<SecretBuf> {
         let mut w = Writer::new(MAGIC);
         let c = &self.config;
+        if self.heads.len() != self.anchors.len() {
+            return Err(Error::Malformed("enrollment: heads do not match anchors"));
+        }
         w.str(&c.realm).str(&c.domain).str(&c.basedn).str(&c.issuer);
         w.u8(count(c.servers.len())?);
         for s in &c.servers {
@@ -75,8 +83,17 @@ impl Enrollment {
             w.bytes(cert);
         }
         w.u8(count(self.anchors.len())?);
-        for a in &self.anchors {
+        for (a, head) in self.anchors.iter().zip(&self.heads) {
             w.fixed(a.as_bytes());
+            // A head is `(size, root)`; an absent one is a zero size.
+            match head {
+                Some((size, root)) => {
+                    w.u64(*size).fixed(root);
+                }
+                None => {
+                    w.u64(0).fixed(&[0; 32]);
+                }
+            }
         }
         w.u64(self.epoch_seq).fixed(&self.epoch_head);
         w.bytes(self.keytab.to_mit()?.as_ref());
@@ -105,9 +122,15 @@ impl Enrollment {
         let pkinit_anchors = (0..r.u8()?)
             .map(|_| r.bytes().map(<[u8]>::to_vec))
             .collect::<Result<_, _>>()?;
-        let anchors = (0..r.u8()?)
-            .map(|_| r.fixed().map(Thumbprint::from_bytes))
-            .collect::<Result<_, _>>()?;
+        let n = r.u8()?;
+        let mut anchors = Vec::with_capacity(n as usize);
+        let mut heads = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            anchors.push(Thumbprint::from_bytes(r.fixed()?));
+            let size = r.u64()?;
+            let root = r.fixed()?;
+            heads.push((size != 0).then_some((size, root)));
+        }
         let (epoch_seq, epoch_head) = (r.u64()?, r.fixed()?);
         let keytab = Keytab::from_mit(r.bytes()?)?;
         r.finish()?;
@@ -130,6 +153,7 @@ impl Enrollment {
             ca_certs,
             pkinit_anchors,
             anchors,
+            heads,
             epoch_seq,
             epoch_head,
         })
@@ -166,7 +190,11 @@ pub(crate) mod tests {
             keytab: keytab("a.example.test", 1),
             ca_certs: vec![b"ca".to_vec()],
             pkinit_anchors: vec![b"pkinit".to_vec()],
-            anchors: vec![Thumbprint::from_bytes([1; 32])],
+            anchors: vec![
+                Thumbprint::from_bytes([1; 32]),
+                Thumbprint::from_bytes([2; 32]),
+            ],
+            heads: vec![Some((3, [4; 32])), None],
             epoch_seq: 7,
             epoch_head: [9; 32],
         };

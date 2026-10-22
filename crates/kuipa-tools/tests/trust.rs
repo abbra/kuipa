@@ -67,6 +67,7 @@ fn server(
         ca_certs: vec![realm.chain.ca_der.clone()],
         pkinit_anchors: vec![realm.chain.ca_der.clone()],
         anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
         trusts,
     };
     info.validate().unwrap();

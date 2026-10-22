@@ -8,7 +8,7 @@
 //! a Merkle tree), and publishes its claim, with every trusted anchor's
 //! proof, and the trusted anchors to the [`EnrollServer`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -392,6 +392,11 @@ impl Peers {
         }
         let candidate = trust.own_delegation(&state)?;
         let epoch_successions: Vec<SignedSuccession> = state.successions().cloned().collect();
+        let published_vouches: HashMap<Thumbprint, SignedVouch> = state
+            .vouches()
+            .filter(|v| trust.anchors().contains(&v.vouch().anchor))
+            .map(|v| (v.vouch().anchor, v.clone()))
+            .collect();
         if wrote || state.len() != before {
             x.store.store_peer_state(&state)?;
         }
@@ -403,16 +408,17 @@ impl Peers {
         let current = x.server.delegation();
         let advertised = anchors::prefer(Some(current.clone()), candidate, at);
         let trusted = trust.anchors();
+        let vouches = published_vouches;
         if advertised != current {
             x.store.store_delegation(&advertised)?;
         }
-        if advertised != current || trusted != x.server.anchors() {
+        if advertised != current || trusted != x.server.anchors() || x.server.vouches() != vouches {
             eprintln!(
                 "kuipad: anchor exchange: trusted anchors: {}, proofs for this server's claim: {}",
                 trusted.len(),
                 advertised.proof_count()
             );
-            x.server.publish(advertised, trusted.clone());
+            x.server.publish(advertised, trusted.clone(), vouches);
         }
         // §4.8: with the anchor role, keep the anchor epoch log current.
         if let Some(anchor) = &x.anchor {

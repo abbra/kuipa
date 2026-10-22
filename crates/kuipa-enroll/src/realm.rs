@@ -13,7 +13,7 @@ use tang_pqc::{
     SigningKey, Thumbprint, VerifyingKey, b64, unix_seconds,
 };
 
-use crate::delegation::{Delegation, VerifiedDelegation};
+use crate::delegation::{Delegation, HeadPin, VerifiedDelegation};
 use crate::error::{Error, Result};
 
 /// JWK member naming a key's role.
@@ -60,6 +60,10 @@ pub struct RealmInfo {
     pub pkinit_anchors: Vec<Vec<u8>>,
     /// Current realm anchors.
     pub anchors: Vec<Thumbprint>,
+    /// The anchors' current vouch heads (§4.9), when this server knows
+    /// them: what a client pins instead of — or beside — the
+    /// thumbprint, to check a delegation with no signature.
+    pub heads: Vec<HeadPin>,
     /// Realms this realm trusts, with the anchors it vouches for (§17).
     pub trusts: Vec<TrustedRealm>,
 }
@@ -175,6 +179,8 @@ struct InfoJson {
     pkinit_anchors: Vec<String>,
     anchors: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    heads: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     trusts: Vec<TrustJson>,
 }
 
@@ -197,6 +203,7 @@ impl RealmInfo {
             ca_certs: self.ca_certs.iter().map(|c| b64::encode(c)).collect(),
             pkinit_anchors: self.pkinit_anchors.iter().map(|c| b64::encode(c)).collect(),
             anchors: self.anchors.iter().map(ToString::to_string).collect(),
+            heads: self.heads.iter().map(HeadPin::to_json).collect(),
             trusts: self.trusts.iter().map(TrustJson::from).collect(),
         })
         .expect("serialisable")
@@ -243,6 +250,12 @@ impl RealmInfo {
             ca_certs: decode_all(&j.ca_certs).ok_or_else(malformed)?,
             pkinit_anchors: decode_all(&j.pkinit_anchors).ok_or_else(malformed)?,
             anchors: parse_anchors(&j.anchors).ok_or_else(malformed)?,
+            heads: j
+                .heads
+                .iter()
+                .map(HeadPin::from_json)
+                .collect::<Result<_>>()
+                .map_err(|_| malformed())?,
             trusts,
             realm: j.realm,
             domain: j.domain,
@@ -779,6 +792,7 @@ pub(crate) mod tests {
             ca_certs: vec![ca.clone()],
             pkinit_anchors: vec![b"pkinit anchor".to_vec()],
             anchors: vec![*anchor.public().thumbprint()],
+            heads: Vec::new(),
             trusts: Vec::new(),
         };
         TestRealm {

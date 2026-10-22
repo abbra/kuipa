@@ -486,6 +486,7 @@ mod tests {
             ca_certs: vec![b"ca".to_vec()],
             pkinit_anchors: Vec::new(),
             anchors: Vec::new(),
+            heads: Vec::new(),
             epoch_seq: 0,
             epoch_head: [0; 32],
         }
@@ -532,6 +533,7 @@ mod tests {
                 ca_certs: vec![ca.clone()],
                 pkinit_anchors: vec![ca.clone()],
                 anchors: vec![*anchor.public().thumbprint()],
+                heads: Vec::new(),
                 trusts: Vec::new(),
             };
             let adv = keys
