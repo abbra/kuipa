@@ -282,6 +282,35 @@ step 0 "Encrypt a secret with the tang-pqc pin" 'echo "a secret" | tang-pqc encr
 step 0 "Decrypt it through ipa1" 'tang-pqc decrypt < "$KUIPA_PLAYGROUND/secret.jwe"' \
     "a secret"
 
+section "Replica promotion" \
+    "web7 imitates a promoting replica: it fetches the material promotion delivers — the DM password hash, the RA agent key, the CA subsystem keys — through the keys operation, sealed under ML-KEM.  The server checks cn=masters first: a host that is not a server is refused, and only a CA server's host or dogtag service may ask for the wrapped CA keys."
+step 0 "Enroll web7 with the administrator's password, as ipa-client-install -p does" 'pq_password web7' \
+    "Enrolled host/web7.example.test@EXAMPLE.TEST in EXAMPLE.TEST"
+step fail "A host outside cn=masters is refused, with the reason on the server only" \
+    'kuipa keys fetch dm/DMHash' \
+    "refused the request"
+step 0 "Promotion adds web7 to cn=masters" \
+    'kuipa-playground masters --add web7.example.test' \
+    "web7.example.test joined cn=masters"
+step 0 "Now the DM password hash arrives" \
+    'mkdir -p "$KUIPA_ROOT/promotion" && kuipa keys fetch dm/DMHash --out "$KUIPA_ROOT/promotion/dmhash" && cat "$KUIPA_ROOT/promotion/dmhash"' \
+    "playground-dm-hash"
+step fail "An unknown nickname is refused" \
+    'kuipa keys fetch dm/no-such-secret' \
+    "refused the request"
+step fail "The wrapped CA keys still need the CA role" \
+    'kuipa keys fetch ca_wrapped/lwca-signing' \
+    "refused the request"
+step 0 "ipa-ca-install records the CA role" \
+    'kuipa-playground masters --ca web7.example.test' \
+    "web7.example.test has the CA role"
+step 0 "The whole promotion set, as a CA replica fetches it" \
+    'pq_promote web7' \
+    "promotion material fetched"
+step fail "A removed server is refused again (ipa-server-del)" \
+    'kuipa-playground masters --remove web7.example.test >/dev/null && kuipa keys fetch dm/DMHash' \
+    "refused the request"
+
 section "Failure is reported" \
     "With both servers unreachable, the health check must fail and say why."
 step 0 "Make ipa1 and ipa2 unreachable" 'pq_down ipa1; pq_down ipa2'
