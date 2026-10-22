@@ -2020,3 +2020,93 @@ fn info_of(anchor: &SigningKey) -> RealmInfo {
         trusts: Vec::new(),
     }
 }
+
+#[test]
+fn the_claim_log_carries_the_heads_signed_vouch() {
+    // DESIGN-claim-logs.md §4: the public claim-log page carries the
+    // signed vouch of the head it answers, so a reader can check the
+    // head was signed at all — here against the anchor key the
+    // verified advertisement names — and the leaves against it.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, _, mut delegation) = server_keys(&anchor, "claimlog1.example.test");
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let head = vouch.head();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, vouch);
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        claim_log_info_of(&anchor),
+        delegation.clone(),
+    ));
+    server.publish(delegation, vec![pin], vouches);
+    let url = spawn(app(server, Dir::default()));
+    kuipa_tools::net::set_thread_endpoint("claimlog1.example.test", &url);
+
+    let _ = rustls_native_ossl::default_provider().install_default();
+    let http = reqwest::blocking::Client::new();
+    let page: serde_json::Value = serde_json::from_slice(
+        &http
+            .get(format!("{url}/ipa/ku/claim-log/{pin}"))
+            .send()
+            .unwrap()
+            .bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["size"], head.0, "{page}");
+    assert_eq!(page["leaves"].as_array().map(Vec::len), Some(1), "{page}");
+    let page_vouch = kuipa_enroll::delegation::SignedVouch::from_bytes(
+        &tang_pqc::b64::decode(page["vouch"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    // The signature checks against the anchor's key — the same key the
+    // advertisement's signature proof carries, which the delegation's
+    // own verification (against the pinned anchor) already checked.
+    page_vouch
+        .verify(anchor.public(), &tang_pqc::Policy::default())
+        .unwrap();
+    // And the page's leaves hash to the vouch's head.
+    let leaves: Vec<[u8; 32]> = page["leaves"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            let bytes = tang_pqc::b64::decode(l.as_str().unwrap()).unwrap();
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&bytes);
+            h
+        })
+        .collect();
+    assert_eq!(
+        kuipa_enroll::merkle::root(&leaves).unwrap(),
+        page_vouch.vouch().root
+    );
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+/// The realm info for the claim-log test's single server.
+fn claim_log_info_of(anchor: &SigningKey) -> RealmInfo {
+    RealmInfo {
+        realm: REALM.into(),
+        domain: "example.test".into(),
+        basedn: "dc=example,dc=test".into(),
+        server: "claimlog1.example.test".into(),
+        servers: vec!["claimlog1.example.test".into()],
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    }
+}
