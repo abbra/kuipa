@@ -23,8 +23,12 @@ A host verifies an advertisement against an anchor it already **pins**:
 
   ```text
   ipa-ku1:EXAMPLE.TEST:<anchor thumbprint>:<expiry>[:<OTP or secret>]
+  ipa-ku2:EXAMPLE.TEST:<anchor thumbprint>:<expiry>:<size>:<root>[:<OTP or secret>]
   ```
 
+  A version 2 string also pins the anchor's **vouch head** — a
+  checkpoint of what its servers were vouched for — which lets the host
+  check a server's proof with no signature at all;
 * or the anchors are pinned ahead of time in `/etc/ipa/ku-anchors`, for
   images and configuration management.
 

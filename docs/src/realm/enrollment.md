@@ -20,10 +20,21 @@ An enrollment string tells a host which anchor to trust, until when, and
 ```sh
 ipa host-add web1.example.test --random        # prints the OTP
 kuipad enrollment-string --days 1              # ipa-ku1:EXAMPLE.TEST:<anchor>:<expiry>
+kuipad enrollment-string --days 1 --head       # ipa-ku2:EXAMPLE.TEST:<anchor>:<expiry>:<size>:<root>
 ```
 
 Append `:<OTP>` and hand the string to whoever enrolls `web1`, through a
 channel you trust: it is what the host authenticates the realm with.
+
+The `--head` form also pins the anchor's **vouch head**: a checkpoint of
+the claims every server of the realm was vouched for at issue time. A
+host holding it checks a server's proof against that checkpoint with no
+signature at all — the advertisement it fetches carries no anchor key
+and no signature, only the claim's inclusion path. The head is pinned
+through the same channel as the thumbprint and is only as fresh: the
+realm keeps working past it (servers answer with a normal signed proof
+once the head is stale), so `--head` is a size and speed optimisation,
+not a stronger pin.
 
 * **Keep strings short-lived.** `--days 1` is plenty for interactive
   installs; the most is 400. The expiry is what makes an old string (left
@@ -43,9 +54,10 @@ For hosts built from images or by configuration management, pin the realm
 instead of shipping strings:
 
 ```text
-# /etc/ipa/ku-anchors: thumbprint and expiry (Unix seconds), one per line
+# /etc/ipa/ku-anchors: thumbprint, expiry (Unix seconds) and optional
+# vouch head, one per line
 pjLVUZeo5CYHWwNIxNTa1uAyFIRS9Z6NVW7X2h_qgOQ 1798761600
-Qx3l…                                       1798761600
+Qx3l…                                       1798761600 12 4hZ2…9kQ
 ```
 
 Hosts then enroll with `--realm EXAMPLE.TEST` and a password, a ticket or
