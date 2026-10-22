@@ -53,6 +53,12 @@ struct MemoryDirectory {
     unlocks: RefCell<HashMap<(VaultId, String), u64>>,
     escrow_keys: RefCell<Vec<(String, tang_pqc::ExchangeKey)>>,
     limits: RefCell<vault::Limits>,
+    /// The server list for the keys operation's policy (§18.2).
+    masters: RefCell<Vec<String>>,
+    /// The masters with the CA role.
+    ca_masters: RefCell<Vec<String>>,
+    /// The keys operation's secrets, by `namespace id/nickname`.
+    key_secrets: RefCell<HashMap<(u8, String), Vec<u8>>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -231,6 +237,25 @@ impl Directory for MemoryDirectory {
             binding: self.binding(&who, cb),
             transited: Some(transited),
         })
+    }
+
+    fn fetch_key(
+        &self,
+        principal: &Principal,
+        fetch: &kuipa_enroll::keys::KeysFetch,
+    ) -> Result<Vec<u8>, DirectoryError> {
+        let policy = kuipa_enroll::keys::KeysPolicy {
+            servers: self.masters.borrow().clone(),
+            ca_servers: self.ca_masters.borrow().clone(),
+        };
+        if let Some(reason) = policy.check(principal, fetch.namespace) {
+            return Err(reason.into());
+        }
+        self.key_secrets
+            .borrow()
+            .get(&(fetch.namespace.id(), fetch.nickname.clone()))
+            .cloned()
+            .ok_or_else(|| "no such key".into())
     }
 
     fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
@@ -1828,4 +1853,99 @@ fn advertisement_bootstraps_kerberos() {
     let conf = adv.krb5_conf("/var/lib/ipa-client/ku/pkinit-anchors.pem", &only);
     assert!(conf.contains("kdc = ipa2.example.test"));
     assert!(!conf.contains("ipa1.example.test"));
+}
+
+/// A `keys` fetch (§18.2): the promotion-shaped policy checks and the
+/// value's round trip, with the caller's ticket inside the sealed body.
+#[test]
+fn keys_fetch_follows_the_masters_policy() {
+    let r = realm();
+    let adv = r.verify(0);
+    let dm = kuipa_enroll::keys::KeysFetch {
+        namespace: kuipa_enroll::keys::Namespace::Dm,
+        nickname: "DMHash".into(),
+        alg: None,
+    };
+    let wrapped = kuipa_enroll::keys::KeysFetch {
+        namespace: kuipa_enroll::keys::Namespace::CaWrapped,
+        nickname: "lwca-signing".into(),
+        alg: Some(kuipa_enroll::keys::WrapAlg::Aes256CbcPad),
+    };
+    *r.dir.masters.borrow_mut() = vec![SERVERS[0].to_owned()];
+    *r.dir.ca_masters.borrow_mut() = vec![SERVERS[0].to_owned()];
+    r.dir.key_secrets.borrow_mut().insert(
+        (dm.namespace.id(), dm.nickname.clone()),
+        b"{\"dmhash\":\"x\"}".to_vec(),
+    );
+    r.dir.key_secrets.borrow_mut().insert(
+        (wrapped.namespace.id(), wrapped.nickname.clone()),
+        b"{\"wrapped_key\":\"x\"}".to_vec(),
+    );
+
+    let request = |caller: &str, fetch: &kuipa_enroll::keys::KeysFetch| {
+        let p = Prepared::new(
+            &adv,
+            Operation::Keys,
+            HOST,
+            AuthType::Kerberos,
+            &Enctype::DEFAULT,
+        )
+        .unwrap();
+        let cb = p.channel_binding().unwrap();
+        p.with_kerberos(fake_binding(caller, &cb))
+            .seal(&gss_token(caller, &cb), &[], &fetch.to_bytes().unwrap())
+            .unwrap()
+    };
+
+    // A server in cn=masters fetches dm/ra/ca; the answer round trips.
+    let server = format!("host/{}@{REALM}", SERVERS[0]);
+    let (req, pending) = request(&server, &dm);
+    let response = r.send(0, Operation::Keys, &req).unwrap();
+    let answer = pending.finish_keys(&response, &adv).unwrap();
+    assert_eq!(answer.value, b"{\"dmhash\":\"x\"}");
+
+    // A host outside cn=masters — a client, or a removed server — is
+    // refused, before any secret is touched.
+    let client = Principal::host(HOST, REALM).to_string();
+    let (req, _) = request(&client, &dm);
+    assert!(r.send(0, Operation::Keys, &req).is_err());
+
+    // dogtag/ of a CA server fetches the wrapped keys; of a non-CA
+    // server it may not, and it may never fetch dm.
+    let dogtag = format!("dogtag/{}@{REALM}", SERVERS[0]);
+    let (req, pending) = request(&dogtag, &wrapped);
+    let response = r.send(0, Operation::Keys, &req).unwrap();
+    assert_eq!(
+        pending.finish_keys(&response, &adv).unwrap().value,
+        b"{\"wrapped_key\":\"x\"}"
+    );
+    let (req, _) = request(&dogtag, &dm);
+    assert!(r.send(0, Operation::Keys, &req).is_err());
+    let other_dogtag = format!("dogtag/{}@{REALM}", SERVERS[1]);
+    let (req, _) = request(&other_dogtag, &wrapped);
+    assert!(r.send(0, Operation::Keys, &req).is_err());
+
+    // A user's ticket may not fetch anything.
+    let (req, _) = request("admin@EXAMPLE.TEST", &dm);
+    assert!(r.send(0, Operation::Keys, &req).is_err());
+
+    // An unknown nickname is refused.
+    let missing = kuipa_enroll::keys::KeysFetch {
+        namespace: kuipa_enroll::keys::Namespace::Dm,
+        nickname: "no-such".into(),
+        alg: None,
+    };
+    let (req, _) = request(&server, &missing);
+    assert!(r.send(0, Operation::Keys, &req).is_err());
+
+    // A wrap algorithm outside ca_wrapped does not even parse.
+    assert!(
+        kuipa_enroll::keys::KeysFetch {
+            namespace: kuipa_enroll::keys::Namespace::Ca,
+            nickname: "x".into(),
+            alg: Some(kuipa_enroll::keys::WrapAlg::Aes256CbcPad),
+        }
+        .to_bytes()
+        .is_err()
+    );
 }
