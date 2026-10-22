@@ -32,9 +32,14 @@ names every anchor two servers answer differently, with each side's
 head and the signed vouch that commits to it — the claim-log
 counterpart of a forked anchor log.
 
-The exit status is `0` for a clean report, `2` for a split view, so a
-cron job or a monitoring check can watch it. `--json` prints the
-report as one JSON object instead of rows.
+The served head is checked before it is reported: its vouch must
+verify against the anchor's key and the pages must hash to its root,
+so an unsigned or inconsistent head — and a server that names an
+anchor it does not answer — reports as a **split**, and a tree larger
+than the audit's fetch bound as **unchecked**.  The exit status is
+`0` for a clean report (every anchor current or stale) and `2` for
+anything else, so a cron job or a monitoring check can watch it.
+`--json` prints the report as one JSON object instead of rows.
 
 ## kuipa-mirror
 
@@ -50,8 +55,11 @@ kuipa-mirror --origin https://ipa1.example.test \
 ```
 
 It syncs the origin's advertisement, anchor log and claim-log pages
-into `--data`, and serves them as received: a head-pinned client
-verifies a proof from the mirror with no signature and no key on it.
+into `--data`, and serves them as received: a page is cached only
+under a head the synced advertisement *proves by signature*, so the
+mirror never serves the origin's bare assertion as a proof.  A
+head-pinned client verifies a proof from the mirror with no signature
+and no key on it.
 A head query the mirror has cached is answered with the origin's
 head-proof advertisement; an unseen one falls back to the cached plain
 advertisement, which the client verifies through signatures — the
