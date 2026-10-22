@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! ipa-ku1:<REALM>:<anchor thumbprint>:<expiry>[:<secret>]
+//! ipa-ku2:<REALM>:<anchor thumbprint>:<expiry>:<size>:<root>[:<secret>]
 //! ```
 //!
 //! The expiry is in Unix seconds; a host refuses the string after it (with
@@ -11,16 +12,22 @@
 //! in an old image, can pin an anchor that may have been rotated or stolen
 //! since.
 //!
+//! A version 2 string also pins the anchor's **vouch head** (§4.9): the
+//! claim log's `(size, root)` at issue time, which lets the host check a
+//! delegation's inclusion proof with no signature at all.
+//!
 //! The secret is an OTP for an online join, or the bundle secret `S` for an
 //! offline mode B bundle.  It is the last field and may itself contain `:`.
 
 use native_ossl::util::SecretBuf;
 use tang_pqc::Thumbprint;
 
-use crate::delegation::CLOCK_SKEW;
+use crate::delegation::{CLOCK_SKEW, HeadPin};
 use crate::error::{Error, Result};
+use tang_pqc::b64;
 
 const PREFIX: &str = "ipa-ku1";
+const PREFIX_HEAD: &str = "ipa-ku2";
 
 /// A parsed enrollment string.
 #[derive(Debug)]
@@ -28,6 +35,7 @@ pub struct EnrollmentString {
     realm: String,
     anchor: Thumbprint,
     exp: u64,
+    head: Option<(u64, [u8; 32])>,
     secret: Option<Secret>,
 }
 
@@ -59,9 +67,23 @@ impl EnrollmentString {
     /// seconds), with an optional secret.
     #[must_use]
     pub fn new(realm: &str, anchor: Thumbprint, exp: u64, secret: Option<Secret>) -> Self {
+        Self::with_head(realm, anchor, None, exp, secret)
+    }
+
+    /// A version 2 string, additionally pinning the anchor's vouch head
+    /// (§4.9): `(size, root)` of its claim log.
+    #[must_use]
+    pub fn with_head(
+        realm: &str,
+        anchor: Thumbprint,
+        head: Option<(u64, [u8; 32])>,
+        exp: u64,
+        secret: Option<Secret>,
+    ) -> Self {
         Self {
             realm: realm.into(),
             anchor,
+            head,
             exp,
             secret,
         }
@@ -73,14 +95,21 @@ impl EnrollmentString {
     /// # Errors
     ///
     /// [`Error::Malformed`] for anything but
-    /// `ipa-ku1:REALM:thp:exp[:secret]`.
+    /// `ipa-ku1:REALM:thp:exp[:secret]` or
+    /// `ipa-ku2:REALM:thp:exp:size:root[:secret]`.
     pub fn parse(text: &[u8]) -> Result<Self> {
         let malformed = || Error::Malformed("enrollment string");
         let text = std::str::from_utf8(text).map_err(|_| malformed())?.trim();
-        let mut fields = text.splitn(5, ':');
-        if fields.next() != Some(PREFIX) {
-            return Err(malformed());
-        }
+        let (prefix, rest) = text.split_once(':').ok_or_else(malformed)?;
+        let v2 = match prefix {
+            PREFIX => false,
+            PREFIX_HEAD => true,
+            _ => return Err(malformed()),
+        };
+        // The prefix is split off already: realm, anchor, expiry, then —
+        // v2 only — size and root, then the secret, which may contain `:`
+        // and is the last field, however many `:` it holds.
+        let mut fields = rest.splitn(if v2 { 6 } else { 4 }, ':');
         let realm = fields
             .next()
             .filter(|r| !r.is_empty())
@@ -95,6 +124,22 @@ impl EnrollmentString {
             .filter(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|e| e.parse().ok())
             .ok_or_else(malformed)?;
+        let head = if v2 {
+            let size = fields
+                .next()
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse().ok())
+                .filter(|s| *s > 0)
+                .ok_or_else(malformed)?;
+            let root = fields
+                .next()
+                .and_then(|r| b64::decode(r).ok())
+                .and_then(|r| <[u8; 32]>::try_from(r).ok())
+                .ok_or_else(malformed)?;
+            Some((size, root))
+        } else {
+            None
+        };
         let secret = match fields.next() {
             None => None,
             Some("") => return Err(malformed()),
@@ -103,6 +148,7 @@ impl EnrollmentString {
         Ok(Self {
             realm: realm.into(),
             anchor,
+            head,
             exp,
             secret,
         })
@@ -111,7 +157,20 @@ impl EnrollmentString {
     /// Encode; the result holds the secret, so it is wiped on drop.
     #[must_use]
     pub fn encode(&self) -> SecretBuf {
-        let head = format!("{PREFIX}:{}:{}:{}", self.realm, self.anchor, self.exp);
+        let head = format!(
+            "{}:{}:{}:{}",
+            if self.head.is_some() {
+                PREFIX_HEAD
+            } else {
+                PREFIX
+            },
+            self.realm,
+            self.anchor,
+            self.exp
+        );
+        let head = self.head.as_ref().map_or(head.clone(), |(size, root)| {
+            format!("{head}:{size}:{}", b64::encode(root))
+        });
         let secret = self.secret.as_ref().map_or(&[][..], Secret::as_bytes);
         let extra = if secret.is_empty() {
             0
@@ -138,6 +197,16 @@ impl EnrollmentString {
     #[must_use]
     pub fn anchor(&self) -> &Thumbprint {
         &self.anchor
+    }
+
+    /// The pinned vouch head (§4.9), for a version 2 string.
+    #[must_use]
+    pub fn head(&self) -> Option<HeadPin> {
+        self.head.map(|(size, root)| HeadPin {
+            anchor: self.anchor,
+            size,
+            root,
+        })
     }
 
     /// When it expires (Unix seconds).
@@ -199,6 +268,51 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_with_a_head() {
+        let root = [7; 32];
+        let s = EnrollmentString::with_head(
+            "EXAMPLE.TEST",
+            thp(),
+            Some((12, root)),
+            1800,
+            Some(Secret::new(b"a:b c")),
+        );
+        let enc = s.encode();
+        assert!(
+            enc.as_ref().starts_with(
+                format!(
+                    "ipa-ku2:EXAMPLE.TEST:{}:1800:12:{}:",
+                    thp(),
+                    b64::encode(&root)
+                )
+                .as_bytes()
+            )
+        );
+        let back = EnrollmentString::parse(enc.as_ref()).unwrap();
+        let head = back.head().unwrap();
+        assert_eq!(head.anchor, thp());
+        assert_eq!(head.size, 12);
+        assert_eq!(head.root, root);
+        assert_eq!(back.secret().unwrap().as_bytes(), b"a:b c");
+
+        // Without a secret, and v1 still parses with no head.
+        let s = EnrollmentString::with_head("R", thp(), Some((1, root)), 10, None);
+        assert!(
+            EnrollmentString::parse(s.encode().as_ref())
+                .unwrap()
+                .head()
+                .is_some()
+        );
+        let v1 = EnrollmentString::new("R", thp(), 10, None);
+        assert!(
+            EnrollmentString::parse(v1.encode().as_ref())
+                .unwrap()
+                .head()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn expires() {
         let s = EnrollmentString::new("R", thp(), 1000, None);
         assert!(s.check_valid(1000).is_ok());
@@ -224,6 +338,11 @@ mod tests {
             format!("ipa-ku1:R:{t}:Secret123"),
             format!("ipa-ku1:R:{t}:+5"),
             format!("ipa-ku1:R:{t}:99999999999999999999999"),
+            // A v2 string needs a decimal size and a 32-byte root.
+            format!("ipa-ku2:R:{t}:1:0:{}", b64::encode(&[0; 32])),
+            format!("ipa-ku2:R:{t}:1:x:{}", b64::encode(&[0; 32])),
+            format!("ipa-ku2:R:{t}:1:2:short"),
+            format!("ipa-ku2:R:{t}:1:2:"),
         ] {
             assert!(EnrollmentString::parse(bad.as_bytes()).is_err(), "{bad}");
         }
