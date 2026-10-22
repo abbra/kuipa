@@ -82,6 +82,7 @@ fn vouchers_against_a_real_kdc() {
         ca_certs: vec![realm.chain.ca_der.clone()],
         pkinit_anchors: vec![realm.chain.ca_der.clone()],
         anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
         trusts: Vec::new(),
     };
     let keys = ServerKeys {

@@ -155,6 +155,7 @@ impl Config {
             ca_certs: read(&self.ca_file)?,
             pkinit_anchors: read(&self.pkinit_anchors_file)?,
             anchors: anchor.into_iter().collect(),
+            heads: Vec::new(),
             trusts: self
                 .trusts
                 .iter()

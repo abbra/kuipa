@@ -619,6 +619,7 @@ mod tests {
             ca_certs: vec![b"ca".to_vec()],
             pkinit_anchors: vec![b"pkinit".to_vec()],
             anchors: vec![*anchor.public().thumbprint()],
+            heads: Vec::new(),
             trusts: Vec::new(),
         };
         let copy = SigningKey::from_jwk(signing.to_jwk().unwrap().as_ref()).unwrap();

@@ -361,6 +361,7 @@ fn server(anchor: &SigningKey, fqdn: &str) -> (EnrollServer, Delegation) {
             ca_certs: vec![CA.to_vec()],
             pkinit_anchors: vec![CA.to_vec()],
             anchors: vec![*anchor.public().thumbprint()],
+            heads: Vec::new(),
             trusts: Vec::new(),
         },
         own.clone(),
@@ -408,7 +409,11 @@ fn exchange(anchors: &[SigningKey], servers: &[EnrollServer], own: &[Delegation]
     }
     for (i, server) in servers.iter().enumerate() {
         let t = trust(&state, i);
-        server.publish(t.own_delegation(&state).unwrap(), t.anchors());
+        let vouches: HashMap<_, _> = state
+            .vouches()
+            .map(|v| (v.vouch().anchor, v.clone()))
+            .collect();
+        server.publish(t.own_delegation(&state).unwrap(), t.anchors(), vouches);
     }
 }
 
@@ -524,7 +529,7 @@ fn rotated(server: &EnrollServer) -> EnrollServer {
         server.info().clone(),
         server.delegation(),
     );
-    rotated.publish(server.delegation(), server.anchors());
+    rotated.publish(server.delegation(), server.anchors(), server.vouches());
     rotated
 }
 
