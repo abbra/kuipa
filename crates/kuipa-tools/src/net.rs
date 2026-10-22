@@ -163,6 +163,15 @@ pub fn set_thread_endpoint(server: &str, target: &str) {
     });
 }
 
+/// Forget every endpoint this thread mapped (see
+/// [`set_thread_endpoint`]): a test that replaces the bindings of
+/// shared server names ends with this, so a later test on the same
+/// thread starts from its own.
+#[doc(hidden)]
+pub fn clear_thread_endpoints() {
+    THREAD_ENDPOINTS.with_borrow_mut(Vec::clear);
+}
+
 /// Where to reach `server` instead of `https://<server>/`: from
 /// [`set_thread_endpoint`], else `KUIPA_ENDPOINTS` (`fqdn=target,…`, target
 /// as for [`Endpoint::new`]), for talking to a daemon's socket directly, or

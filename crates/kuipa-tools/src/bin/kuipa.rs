@@ -777,23 +777,10 @@ impl Args {
             // An enrolled host trusts what it pinned for this realm, not
             // the string's single anchor of the day it was issued.
             let enrolled = paths::State::load(paths).is_ok_and(|s| s.realm == string.realm());
-            let (pinned, pinned_heads) = if enrolled {
-                let pins = paths::read_anchor_pins(&paths.anchors()).unwrap_or_default();
-                (
-                    pins.iter().map(|p| p.anchor).collect::<Vec<_>>(),
-                    pins.into_iter()
-                        .filter_map(|p| {
-                            p.head
-                                .map(|(size, root)| kuipa_enroll::delegation::HeadPin {
-                                    anchor: p.anchor,
-                                    size,
-                                    root,
-                                })
-                        })
-                        .collect::<Vec<_>>(),
-                )
+            let (pinned, pinned_heads, frozen) = if enrolled {
+                head_pins(&paths.anchors())
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
             let string_head = string.head();
             let pins = Pins {
@@ -804,6 +791,7 @@ impl Args {
                     pinned
                 },
                 heads: pinned_heads.into_iter().chain(string_head).collect(),
+                frozen,
             };
             return Ok((pins, secrets));
         }
@@ -820,20 +808,15 @@ impl Args {
             };
             return Err(format!("--realm: {why} pinned anchors in {}", file.display()).into());
         }
+        let (anchors, heads, frozen) = {
+            let (a, h, f) = head_pins(&file);
+            (a, h, f)
+        };
         let pins = Pins {
             realm: realm.to_owned(),
             anchors,
-            heads: pinned
-                .into_iter()
-                .filter_map(|p| {
-                    p.head
-                        .map(|(size, root)| kuipa_enroll::delegation::HeadPin {
-                            anchor: p.anchor,
-                            size,
-                            root,
-                        })
-                })
-                .collect(),
+            heads,
+            frozen,
         };
         Ok((pins, self.secrets(false, want_password)?))
     }
@@ -885,13 +868,46 @@ struct Secrets {
 }
 
 /// The realm to enroll in and the anchors that must vouch for its servers.
+/// The anchors, head pins and frozen anchors of a pin file: every head
+/// of every window becomes a [`HeadPin`](kuipa_enroll::delegation::HeadPin),
+/// oldest first, so the server can try each; a frozen pin's anchor is
+/// named for the flows' no-fallback policy (DESIGN-claim-logs.md §2).
+fn head_pins(
+    file: &std::path::Path,
+) -> (
+    Vec<Thumbprint>,
+    Vec<kuipa_enroll::delegation::HeadPin>,
+    Vec<Thumbprint>,
+) {
+    let pins = paths::read_anchor_pins(file).unwrap_or_default();
+    let frozen = pins.iter().filter(|p| p.frozen).map(|p| p.anchor).collect();
+    let heads = pins
+        .iter()
+        .flat_map(|p| {
+            p.heads
+                .iter()
+                .map(move |(size, root)| kuipa_enroll::delegation::HeadPin {
+                    anchor: p.anchor,
+                    size: *size,
+                    root: *root,
+                })
+        })
+        .collect();
+    (pins.iter().map(|p| p.anchor).collect(), heads, frozen)
+}
+
 struct Pins {
     realm: String,
     anchors: Vec<Thumbprint>,
     /// The vouch heads pinned with them (§4.9), if any: an enrolled
-    /// host's pin file carries them next to the thumbprints, and a v2
-    /// enrollment string carries one for its anchor.
+    /// host's pin file carries them next to the thumbprints — a window
+    /// per anchor (DESIGN-claim-logs.md §1) — and a v2 enrollment
+    /// string carries one for its anchor.
     heads: Vec<kuipa_enroll::delegation::HeadPin>,
+    /// The anchors whose pins are frozen (DESIGN-claim-logs.md §2):
+    /// their heads are the only acceptable proofs, with no signature
+    /// fallback, for this command.
+    frozen: Vec<Thumbprint>,
 }
 
 #[allow(clippy::too_many_lines)] // one command dispatch, one function
@@ -957,6 +973,7 @@ fn run(args: &Args) -> Result<Value, Error> {
                     &pins.realm,
                     &pins.anchors,
                     &pins.heads,
+                    &pins.frozen,
                     &auth,
                     &fqdn,
                     &deployment,
