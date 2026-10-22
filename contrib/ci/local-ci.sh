@@ -606,7 +606,11 @@ job_playground_test() {
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         python3 "$SCRIPT_DIR/playground/report.py" "$out" --summary >> "$GITHUB_STEP_SUMMARY" || true
     fi
-    rm -rf "$out"
+    if [[ $rc -eq 0 ]]; then
+        rm -rf "$out"
+    else
+        echo "Session output kept for debugging: $out"
+    fi
     echo "Playground report: $report/index.html"
     return $rc
 }
