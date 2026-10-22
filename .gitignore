@@ -2,4 +2,5 @@
 /kuipa-playground-report.html
 /kuipa-playground-report/
 contrib/ci/playground/node_modules/
+contrib/ci/playground/__pycache__/
 docs/book/
