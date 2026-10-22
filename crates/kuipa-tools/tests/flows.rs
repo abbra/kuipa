@@ -267,6 +267,151 @@ fn string(anchor: &SigningKey, secret: &[u8]) -> EnrollmentString {
     )
 }
 
+/// A v2 enrollment string pinning the anchor's vouch head (§4.9).
+fn string_with_head(anchor: &SigningKey, head: (u64, [u8; 32]), secret: &[u8]) -> EnrollmentString {
+    EnrollmentString::with_head(
+        REALM,
+        *anchor.public().thumbprint(),
+        Some(head),
+        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        Some(Secret::new(secret)),
+    )
+}
+
+#[test]
+fn head_pinned_client_enrolls_without_any_signature() {
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, info, mut delegation) = server_keys(&anchor, "ipa1.example.test");
+    // The anchor vouches for the claim; the delegation carries its proof.
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let head = vouch.head();
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(*anchor.public().thumbprint(), vouch);
+    let server = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+    server.publish(delegation, vec![*anchor.public().thumbprint()], vouches);
+
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = serve_as("ipa1.example.test", app(server, dir));
+    let paths = root("head-pinned");
+
+    // The client pins the head: the advertisement it fetches carries no
+    // anchor key and no signature, and still verifies.
+    let mut s = string_with_head(&anchor, head, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    let (result, trace) = traced(|| {
+        flows::enroll_online(
+            &paths,
+            s.realm(),
+            &[*s.anchor()],
+            [s.head().unwrap()].as_slice(),
+            &Auth::LdapOtp(otp),
+            HOST,
+            &Deployment::servers(&[url.clone()]),
+        )
+    });
+    let result = result.unwrap();
+    assert_eq!(result["issuer"], "ipa1.example.test");
+    assert!(trace.contains("advertisement verified"), "{trace}");
+
+    // The rekey wrote the pin file with the head: the next exchange can
+    // also be signature-free.
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].head, Some(head), "the head is pinned");
+
+    // The advertisement itself, asked with the head, carries a head proof
+    // only: no JWK, no signature value.
+    let endpoint = kuipa_tools::net::Endpoint::new(&url, &kuipa_tools::net::Trust::FirstContact)
+        .expect("endpoint");
+    let adv = endpoint
+        .advertisement_with_heads(&[*anchor.public().thumbprint()], &[s.head().unwrap()])
+        .unwrap();
+    let delegation = adv
+        .unverified_member("delegation")
+        .expect("delegation member")
+        .expect("present");
+    let body = delegation.to_string();
+    assert!(body.contains("head_proofs"), "no head proof in:\n{body}");
+    assert!(
+        !body.contains("signatures"),
+        "a signature proof was served to a head-pinned client:\n{body}"
+    );
+    // And it verifies against the pinned head with no signature at all.
+    kuipa_enroll::realm::VerifiedRealm::verify_with_heads(
+        &adv,
+        REALM,
+        &[*anchor.public().thumbprint()],
+        &[s.head().unwrap()],
+        &tang_pqc::Policy::default(),
+        std::time::SystemTime::now(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_stale_head_falls_back_to_the_signature_proof() {
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, info, mut delegation) = server_keys(&anchor, "ipa1.example.test");
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(*anchor.public().thumbprint(), vouch);
+    let server = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+    server.publish(delegation, vec![*anchor.public().thumbprint()], vouches);
+
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = serve_as("ipa1.example.test", app(server, dir));
+    let paths = root("stale-head");
+
+    // A head the vouch does not make (a stale pin, or another realm's):
+    // the server cannot serve a head proof, and serves the signature
+    // proof instead.  The client pins the anchor by thumbprint too, so
+    // verification succeeds through the signature.
+    let mut s = string_with_head(&anchor, (7, [9; 32]), b"Secret123");
+    let otp = s.take_secret().unwrap();
+    let (result, trace) = traced(|| {
+        flows::enroll_online(
+            &paths,
+            s.realm(),
+            &[*s.anchor()],
+            &[s.head().unwrap()],
+            &Auth::LdapOtp(otp),
+            HOST,
+            &Deployment::servers(&[url]),
+        )
+    });
+    let result = result.unwrap();
+    assert_eq!(result["issuer"], "ipa1.example.test");
+    assert!(trace.contains("advertisement verified"), "{trace}");
+}
+
 #[test]
 fn online_enrollment_with_failover() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
@@ -291,6 +436,7 @@ fn online_enrollment_with_failover() {
             &paths,
             s.realm(),
             &[*s.anchor()],
+            &[],
             &Auth::LdapOtp(otp),
             HOST,
             &Deployment::servers(&[dead.clone(), url.clone()]),
@@ -331,6 +477,7 @@ fn online_enrollment_with_failover() {
         &paths,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         HOST,
         &Deployment::servers(&[url]),
@@ -348,6 +495,7 @@ fn online_enrollment_with_failover() {
         &paths,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         HOST,
         &Deployment::servers(&[dead]),
@@ -398,6 +546,7 @@ fn advertisement_must_describe_the_deployment() {
             &root("deployment"),
             s.realm(),
             &[*s.anchor()],
+            &[],
             &Auth::LdapOtp(otp),
             HOST,
             deployment,
@@ -426,6 +575,7 @@ fn advertisement_must_describe_the_deployment() {
             &root("deployment-password"),
             REALM,
             &[*anchor.public().thumbprint()],
+            &[],
             &Auth::Password {
                 principal: "admin".into(),
                 password: Secret::new(b"Secret123"),
@@ -440,7 +590,8 @@ fn advertisement_must_describe_the_deployment() {
     // realm-info refuses too, and writes nothing.
     let out = root("deployment-realm-info");
     let krb5 = out.dir.join("krb5");
-    let err = flows::realm_info(REALM, &[*anchor.public().thumbprint()], &both, &krb5).unwrap_err();
+    let err =
+        flows::realm_info(REALM, &[*anchor.public().thumbprint()], &[], &both, &krb5).unwrap_err();
     needs_admin(&*err, "rogue.example.test");
     assert!(!krb5.join("krb5.conf").exists());
 
@@ -484,6 +635,7 @@ fn guessing_is_rate_limited_per_host() {
             &root("limited"),
             s.realm(),
             &[*s.anchor()],
+            &[],
             &Auth::LdapOtp(otp),
             HOST,
             &Deployment::servers(std::slice::from_ref(&url)),
@@ -522,6 +674,7 @@ fn wrong_anchor_is_not_a_usable_server() {
         &root("anchor"),
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         HOST,
         &Deployment::servers(&[url]),
@@ -567,6 +720,7 @@ fn rotated_anchors_are_followed_and_old_strings_expire() {
             &paths,
             s.realm(),
             &[*s.anchor()],
+            &[],
             &Auth::LdapOtp(otp),
             HOST,
             &Deployment::servers(std::slice::from_ref(&url)),
@@ -631,6 +785,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
         &paths,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         HOST,
         &Deployment::servers(std::slice::from_ref(&"ipa1.example.test".to_string())),
@@ -738,6 +893,7 @@ fn a_long_anchor_log_is_read_page_by_page() {
         &paths,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         HOST,
         &Deployment::servers(std::slice::from_ref(&"ipa1.example.test".to_string())),
@@ -807,12 +963,13 @@ fn advertisement_lists_details_landmarks_and_an_anchor_index() {
         &paths,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         HOST,
         &deployment,
     )
     .unwrap();
-    let out = flows::advertisements(REALM, &[old_pin], &deployment);
+    let out = flows::advertisements(REALM, &[old_pin], &[], &deployment);
     assert_eq!(out["ok"], true, "{out}");
     assert_eq!(out["servers"][0]["realm"], REALM);
     assert_eq!(out["servers"][0]["anchor_log_head"], "", "no log, no head");
@@ -880,7 +1037,7 @@ fn advertisement_lists_details_landmarks_and_an_anchor_index() {
         SignedEpoch::issue(&new, &second).unwrap(),
     ]);
     serve_as("ipa1.example.test", app(server2, Dir::default()));
-    let out = flows::advertisements(REALM, &[old_pin], &deployment);
+    let out = flows::advertisements(REALM, &[old_pin], &[], &deployment);
     assert_eq!(out["ok"], true, "{out}");
     let adv = &out["servers"][0];
     assert_eq!(
@@ -1077,6 +1234,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     let info = flows::realm_info(
         REALM,
         &[*anchor.public().thumbprint()],
+        &[],
         &Deployment::servers(std::slice::from_ref(&url)),
         &dir,
     )
@@ -1099,6 +1257,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
         &paths,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(Secret::new(b"guess")),
         HOST,
         &Deployment::servers(std::slice::from_ref(&url)),
@@ -1113,6 +1272,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
             &paths,
             s.realm(),
             &[*s.anchor()],
+            &[],
             &otp(),
             HOST,
             &Deployment::servers(std::slice::from_ref(&url)),
@@ -1140,6 +1300,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     flows::realm_info(
         REALM,
         &pinned,
+        &[],
         &Deployment::servers(std::slice::from_ref(&url)),
         &dir,
     )
@@ -1148,6 +1309,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
         &paths,
         REALM,
         &pinned,
+        &[],
         &otp(),
         HOST,
         &Deployment::servers(std::slice::from_ref(&url)),
@@ -1163,6 +1325,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
             *stranger.public().thumbprint(),
             *anchor.public().thumbprint(),
         ],
+        &[],
         &otp(),
         HOST,
         &Deployment::servers(std::slice::from_ref(&url)),
@@ -1174,6 +1337,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
         &root("ldap-otp-stranger"),
         REALM,
         &[*stranger.public().thumbprint()],
+        &[],
         &otp(),
         HOST,
         &Deployment::servers(&[url]),
@@ -1241,6 +1405,7 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
             &paths,
             REALM,
             &pins,
+            &[],
             &Auth::LdapOtp(Secret::new(b"Secret123")),
             HOST,
             &Deployment::servers(&[thief.clone(), ipa1.clone()]),
@@ -1261,6 +1426,7 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
         &root("stolen-anchor-alone"),
         REALM,
         &pins,
+        &[],
         &Auth::LdapOtp(Secret::new(b"Secret123")),
         HOST,
         &Deployment::servers(std::slice::from_ref(&thief)),
@@ -1284,6 +1450,7 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
         &root("stolen-anchor-one-pin"),
         REALM,
         &pins[..1],
+        &[],
         &Auth::LdapOtp(Secret::new(b"Secret123")),
         HOST,
         &Deployment::servers(&[thief]),

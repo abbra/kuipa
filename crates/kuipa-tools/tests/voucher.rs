@@ -161,6 +161,7 @@ fn vouchers_against_a_real_kdc() {
             &Paths::new(&root),
             string.realm(),
             &[*string.anchor()],
+            &[],
             &auth,
             host,
             &Deployment::servers(&[SERVER.into()]),

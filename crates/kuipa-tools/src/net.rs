@@ -15,6 +15,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
+use tang_pqc::b64;
 
 /// How to authenticate the server's TLS certificate.
 #[derive(Clone, Debug)]
@@ -327,10 +328,34 @@ impl Endpoint {
         &self,
         anchors: &[tang_pqc::Thumbprint],
     ) -> Result<tang_pqc::SignedAdvertisement, NetError> {
+        self.advertisement_with_heads(anchors, &[])
+    }
+
+    /// `GET adv`, also naming the pinned vouch heads (§4.9): the server
+    /// answers a delegation the client can check without any signature,
+    /// when it can.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`].
+    pub fn advertisement_with_heads(
+        &self,
+        anchors: &[tang_pqc::Thumbprint],
+        heads: &[kuipa_enroll::delegation::HeadPin],
+    ) -> Result<tang_pqc::SignedAdvertisement, NetError> {
         let query: Vec<String> = anchors
             .iter()
             .take(16)
             .map(|a| format!("anchor={a}"))
+            .collect();
+        let query: Vec<String> = query
+            .into_iter()
+            .chain(
+                heads
+                    .iter()
+                    .take(16)
+                    .map(|h| format!("head={}.{}.{}", h.anchor, h.size, b64::encode(&h.root))),
+            )
             .collect();
         let url = if query.is_empty() {
             format!("{}adv", self.base)

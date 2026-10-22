@@ -6,6 +6,7 @@ use std::fs;
 use std::time::SystemTime;
 
 use kuipa_enroll::bundle::{Bundle, Opener};
+use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::epoch::verify_chain;
 use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer};
@@ -130,18 +131,31 @@ pub(crate) fn verified(
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
+    heads: &[HeadPin],
     known: Option<Epoch>,
 ) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), String> {
     let endpoint = Endpoint::new(server, trust).map_err(|e| e.to_string())?;
     let mut pins: Vec<Thumbprint> = anchors.to_vec();
     pins.sort_unstable();
     pins.dedup();
-    let adv = endpoint.advertisement(&pins).map_err(|e| e.to_string())?;
-    let advertisement = VerifiedRealm::verify(&adv, realm, &pins, &Policy::default(), now())
-        .map_err(|e| {
-            tracing::debug!(server = %server, "advertisement rejected: {e}");
-            format!("advertisement: {e}")
-        })?;
+    let mut wanted_heads: Vec<HeadPin> = heads.to_vec();
+    wanted_heads.sort_by_key(|h| h.anchor);
+    wanted_heads.dedup_by_key(|h| h.anchor);
+    let adv = endpoint
+        .advertisement_with_heads(&pins, &wanted_heads)
+        .map_err(|e| e.to_string())?;
+    let advertisement = VerifiedRealm::verify_with_heads(
+        &adv,
+        realm,
+        &pins,
+        &wanted_heads,
+        &Policy::default(),
+        now(),
+    )
+    .map_err(|e| {
+        tracing::debug!(server = %server, "advertisement rejected: {e}");
+        format!("advertisement: {e}")
+    })?;
     trace_advertisement(server, &advertisement);
     for (old, new) in advertisement.succeeded() {
         tracing::debug!(server = %server, "pinned anchor {old} was rotated: succeeded by {new}");
@@ -351,11 +365,13 @@ fn path_for(op: Operation, request: &Request) -> String {
 /// server whose verified advertisement describes another deployment stops
 /// the exchange before anything is sent: that is an attack or a
 /// misconfiguration, and failing over would hide it.
+#[allow(clippy::too_many_arguments)] // heads joined the anchors, as they travel together
 fn exchange(
     deployment: &Deployment,
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
+    heads: &[HeadPin],
     known: Option<(u64, [u8; 32])>,
     op: Operation,
     build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -365,6 +381,7 @@ fn exchange(
         trust,
         realm,
         anchors,
+        heads,
         known,
         op,
         build,
@@ -383,6 +400,7 @@ pub(crate) fn exchange_with<T>(
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
+    heads: &[HeadPin],
     known: Option<(u64, [u8; 32])>,
     op: Operation,
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -390,7 +408,7 @@ pub(crate) fn exchange_with<T>(
 ) -> Result<(T, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        let (endpoint, adv, _) = match verified(server, trust, realm, anchors, known) {
+        let (endpoint, adv, _) = match verified(server, trust, realm, anchors, heads, known) {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(server = %server, "skipped, trying the next server: {e}");
@@ -474,7 +492,16 @@ fn merge_previous(mut new: Keytab, old: Option<Keytab>) -> Result<Keytab, Error>
 fn install(paths: &Paths, enrollment: &Enrollment, fqdn: &str) -> Result<(), Error> {
     paths::write_file(&paths.keytab(), enrollment.keytab.to_mit()?.as_ref(), 0o600)?;
     paths::write_pem(&paths.ca(), &enrollment.ca_certs)?;
-    paths::write_anchors_epoch(paths, &enrollment.anchors, payload_epoch(enrollment))?;
+    paths::write_anchors_epoch_with_heads(
+        paths,
+        &enrollment
+            .anchors
+            .iter()
+            .copied()
+            .zip(enrollment.heads.iter().copied())
+            .collect::<Vec<_>>(),
+        payload_epoch(enrollment),
+    )?;
     let config = &enrollment.config;
     let mut servers = vec![config.issuer.clone()];
     servers.extend(
@@ -641,6 +668,7 @@ pub fn enroll_online(
     paths: &Paths,
     realm: &str,
     anchors: &[Thumbprint],
+    heads: &[HeadPin],
     auth: &Auth,
     fqdn: &str,
     deployment: &Deployment,
@@ -666,6 +694,7 @@ pub fn enroll_online(
         &Trust::FirstContact,
         realm,
         anchors,
+        heads,
         None,
         op,
         |adv| {
@@ -861,7 +890,7 @@ pub(crate) fn all_servers(
         .servers
         .iter()
         .filter_map(|s| {
-            verified(s, trust, &state.realm, anchors, None)
+            verified(s, trust, &state.realm, anchors, &[], None)
                 .ok()
                 .map(|(_, v, _)| v)
                 .filter(|v| check_deployment(s, v, &deployment).is_ok())
@@ -918,6 +947,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         &trust,
         &state.realm,
         &anchors,
+        &[],
         known,
         Operation::Rekey,
         |adv| {
@@ -947,7 +977,16 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         }
         None => paths::write_file(&paths.keytab(), keytab.to_mit()?.as_ref(), 0o600)?,
     }
-    paths::write_anchors_epoch(paths, &enrollment.anchors, epoch)?;
+    paths::write_anchors_epoch_with_heads(
+        paths,
+        &enrollment
+            .anchors
+            .iter()
+            .copied()
+            .zip(enrollment.heads.iter().copied())
+            .collect::<Vec<_>>(),
+        epoch,
+    )?;
     let mut servers = vec![enrollment.config.issuer.clone()];
     servers.extend(
         state
@@ -1211,6 +1250,7 @@ fn register(
         &trust,
         &state.realm,
         &anchors,
+        &[],
         known,
         Operation::Register,
         |adv| {
@@ -1479,7 +1519,7 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         .iter()
         .filter(|s| only.is_none_or(|o| o == s.as_str()))
     {
-        match verified(server, &trust, &state.realm, &anchors, known).and_then(
+        match verified(server, &trust, &state.realm, &anchors, &[], known).and_then(
             |(e, adv, advance)| {
                 adv.check_deployment(&Deployment::servers(&state.servers))
                     .map(|()| (e, adv, advance))
@@ -1571,21 +1611,25 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
 /// enrollment, the transport is trust-on-first-use: what is believed comes
 /// from the anchors, not the server certificate.
 #[must_use]
-pub fn advertisements(realm: &str, anchors: &[Thumbprint], deployment: &Deployment) -> Value {
+pub fn advertisements(
+    realm: &str,
+    anchors: &[Thumbprint],
+    heads: &[HeadPin],
+    deployment: &Deployment,
+) -> Value {
     let trust = Trust::FirstContact;
     let mut servers = Vec::new();
     for server in &deployment.servers {
-        let detail =
-            match verified(server, &trust, realm, anchors, None).and_then(|(endpoint, adv, _)| {
+        let detail = match verified(server, &trust, realm, anchors, heads, None).and_then(
+            |(endpoint, adv, _)| {
                 adv.check_deployment(deployment)
                     .map(|()| (endpoint, adv))
                     .map_err(|e| e.to_string())
-            }) {
-                Ok((endpoint, adv)) => {
-                    advertisement_detail(server, &endpoint, &adv, realm, anchors)
-                }
-                Err(e) => Err(e),
-            };
+            },
+        ) {
+            Ok((endpoint, adv)) => advertisement_detail(server, &endpoint, &adv, realm, anchors),
+            Err(e) => Err(e),
+        };
         match detail {
             Ok(value) => servers.push(value),
             Err(e) => servers.push(json!({ "server": server, "ok": false, "error": e })),
@@ -1851,12 +1895,13 @@ fn landmark_chain(
 pub fn realm_info(
     realm: &str,
     anchors: &[Thumbprint],
+    heads: &[HeadPin],
     deployment: &Deployment,
     dir: &std::path::Path,
 ) -> Result<Value, Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        match verified(server, &Trust::FirstContact, realm, anchors, None) {
+        match verified(server, &Trust::FirstContact, realm, anchors, heads, None) {
             Ok((_, adv, _)) => {
                 check_deployment(server, &adv, deployment)?;
                 let anchors_file = dir.join("pkinit-anchors.pem");
@@ -1950,7 +1995,7 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
         .servers
         .iter()
         .find_map(
-            |s| match verified(s, &trust, &state.realm, &anchors, None) {
+            |s| match verified(s, &trust, &state.realm, &anchors, &[], None) {
                 Ok((_, v, _)) => Some(v),
                 Err(e) => {
                     skipped.push(format!("{s}: {e}"));
@@ -1982,7 +2027,7 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
         }
         let adv = if errors.is_empty() {
             t.servers.iter().find_map(|s| {
-                match verified(s, &Trust::FirstContact, &t.realm, &t.anchors, None) {
+                match verified(s, &Trust::FirstContact, &t.realm, &t.anchors, &[], None) {
                     Ok((_, v, _)) => Some(v),
                     Err(e) => {
                         errors.push(format!("{s}: {e}"));

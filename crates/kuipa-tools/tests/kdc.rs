@@ -400,6 +400,7 @@ fn against_a_real_kdc() {
         &a,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::Otp(otp),
         "web1.example.test",
         &servers,
@@ -723,6 +724,7 @@ fn against_a_real_kdc() {
         &b,
         REALM,
         &anchors,
+        &[],
         &Auth::Ccache,
         "web2.example.test",
         &servers,
@@ -732,7 +734,7 @@ fn against_a_real_kdc() {
 
     // ── 2FA bootstrap: the advertisement's PKINIT anchors give FAST armour ──
     let boot = realm.dir.join("bootstrap");
-    flows::realm_info(REALM, &anchors, &servers, &boot).unwrap();
+    flows::realm_info(REALM, &anchors, &[], &servers, &boot).unwrap();
     // The generated krb5.conf names KDCs by FQDN; this KDC is on a socket.
     let conf = std::fs::read_to_string(boot.join("krb5.conf"))
         .unwrap()
@@ -787,6 +789,7 @@ fn against_a_real_kdc() {
         &g,
         REALM,
         &anchors,
+        &[],
         &password(b"guess"),
         "web6.example.test",
         &servers,
@@ -800,6 +803,7 @@ fn against_a_real_kdc() {
         &g,
         REALM,
         &anchors,
+        &[],
         &password(b"Admin123"),
         "web6.example.test",
         &servers,
@@ -866,6 +870,7 @@ fn against_a_real_kdc() {
         &c,
         REALM,
         &anchors,
+        &[],
         &Auth::Ccache,
         "web3.example.test",
         &servers,
@@ -940,6 +945,7 @@ fn against_a_real_kdc() {
         &e,
         s5.realm(),
         &[*s5.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         "web5.example.test",
         &Deployment::servers(&[SERVER2.to_owned()]),
