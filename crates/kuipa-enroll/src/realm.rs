@@ -447,7 +447,7 @@ impl VerifiedRealm {
     ///
     /// # Errors
     ///
-    /// As [`verify`].
+    /// As [`verify`](Self::verify).
     pub fn verify_with_heads(
         adv: &SignedAdvertisement,
         realm: &str,
