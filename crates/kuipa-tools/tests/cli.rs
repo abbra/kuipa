@@ -151,7 +151,15 @@ fn host_state(name: &str) -> std::path::PathBuf {
         r#"{"realm":"EXAMPLE.TEST","fqdn":"web1.example.test","servers":["ipa1.example.test","ipa2.example.test"]}"#,
     )
     .unwrap();
-    std::fs::write(dir.join("etc/ipa/ku-anchors"), "not-a-thumbprint\n").unwrap();
+    // A real pin line: anchor, a window of two heads, frozen
+    // (DESIGN-claim-logs.md §1.2); status reports the window.
+    std::fs::write(
+        dir.join("etc/ipa/ku-anchors"),
+        "ERERERERERERERERERERERERERERERERERERERERERE 12 \
+IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI 20 \
+ERERERERERERERERERERERERERERERERERERERERERE frozen\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -186,6 +194,7 @@ fn status_names_its_subject_and_where_each_value_lives() {
         "IPA servers: ipa1.example.test, ipa2.example.test",
         "keytab: ",
         "pinned anchors: ",
+        "head window: ERERERERERERERERERERERERERERERERERERERERERE: 12 leaves, 20 leaves (frozen)",
     ] {
         assert!(human.contains(expected), "{human}");
     }
@@ -204,6 +213,26 @@ fn status_names_its_subject_and_where_each_value_lives() {
     let json: serde_json::Value = serde_json::from_str(&run(&["status", "--json"])).unwrap();
     assert_eq!(json["realm"], "EXAMPLE.TEST", "{json}");
     assert_eq!(json["servers"][0], "ipa1.example.test", "{json}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pin file that cannot be parsed is not "no trust": `status` refuses
+/// and names the file, so a corrupted trust store is visible instead of
+/// silently empty.
+#[test]
+fn a_corrupt_pin_file_refuses_not_forgets() {
+    let dir = host_state("corrupt-pin");
+    std::fs::write(dir.join("etc/ipa/ku-anchors"), "not-a-thumbprint\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
+        .args(["status"])
+        .env("KUIPA_ROOT", &dir)
+        .env_remove("KUIPA_ENROLLMENT_FILE")
+        .env_remove("KUIPA_TRACE")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a corrupt pin file must not pass");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("ku-anchors"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

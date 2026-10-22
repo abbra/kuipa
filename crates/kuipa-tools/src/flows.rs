@@ -125,6 +125,118 @@ fn check_deployment(
 /// a client that knows two of a realm's anchors refuses it.
 const MIN_PROVING_ANCHORS: usize = 2;
 
+/// The heads pinned for `anchor`, oldest first: what a head proof for
+/// that anchor must check against — no other anchor's head says anything
+/// about this one (§1.4, DESIGN-claim-logs.md §2).
+#[must_use]
+fn window_of(heads: &[HeadPin], anchor: &Thumbprint) -> Vec<HeadPin> {
+    heads
+        .iter()
+        .filter(|h| &h.anchor == anchor)
+        .copied()
+        .collect()
+}
+
+/// Whether `adv` carries, for anchor `a`, a head proof that checks
+/// against one of `window`'s heads (§2): what a frozen pin accepts,
+/// and nothing else.
+fn head_proves(adv: &VerifiedRealm, a: &Thumbprint, window: &[HeadPin]) -> bool {
+    adv.head_proofs().iter().any(|p| {
+        p.anchor() == a
+            && window
+                .iter()
+                .any(|h| h.check(adv.claim(), p).unwrap_or(false))
+    })
+}
+
+/// The frozen pins' §2 gate: **every** frozen anchor must be served a
+/// proof that checks against one of its own pinned heads — a
+/// signature, or another anchor's proof of the same claim, is exactly
+/// what the freeze removes.  A frozen anchor with no head pinned has
+/// nothing that could prove the claim and refuses likewise; the
+/// refusal names the freeze.
+fn frozen_gate(
+    advertisement: &VerifiedRealm,
+    wanted: &[HeadPin],
+    frozen: &[Thumbprint],
+) -> Result<(), String> {
+    for f in frozen {
+        if !head_proves(advertisement, f, &window_of(wanted, f)) {
+            return Err(format!(
+                "frozen: the pinned head of {f} does not prove this claim"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One quorum anchor's own proof of the claim (§4.4): a frozen anchor
+/// is asked with its window and can only answer head-wise (§2); the
+/// others take the signature path as before.
+fn quorum_proof(
+    endpoint: &Endpoint,
+    realm: &str,
+    a: &Thumbprint,
+    window: &[HeadPin],
+    frozen: bool,
+) -> Result<VerifiedRealm, String> {
+    if frozen {
+        endpoint
+            .advertisement_with_heads(std::slice::from_ref(a), window)
+            .map_err(|e| e.to_string())
+            .and_then(|adv| {
+                VerifiedRealm::verify_with_heads(
+                    &adv,
+                    realm,
+                    std::slice::from_ref(a),
+                    window,
+                    &Policy::default(),
+                    now(),
+                )
+                .map_err(|e| e.to_string())
+            })
+    } else {
+        endpoint
+            .advertisement(std::slice::from_ref(a))
+            .map_err(|e| e.to_string())
+            .and_then(|adv| {
+                VerifiedRealm::verify(
+                    &adv,
+                    realm,
+                    std::slice::from_ref(a),
+                    &Policy::default(),
+                    now(),
+                )
+                .map_err(|e| e.to_string())
+            })
+    }
+}
+
+/// Whether a quorum proof counts (§4.4): only for the claim it is a
+/// proof of — the same server, the same key, the same delegation;
+/// anything else proves a different claim.  Proofs that reach an
+/// already-counted final anchor (a rotated one and its successor)
+/// count once.
+fn count_proof(
+    proven: &mut Vec<Thumbprint>,
+    proof: &VerifiedRealm,
+    advertisement: &VerifiedRealm,
+    a: &Thumbprint,
+) {
+    let by = *proof.anchor();
+    if proof.server() != advertisement.server()
+        || proof.signer() != advertisement.signer()
+        || proof.delegation_expires() != advertisement.delegation_expires()
+    {
+        tracing::debug!("pinned anchor {a} proved a different claim");
+    } else if proven.contains(&by) {
+        tracing::debug!("pinned anchor {a} proves the claim through {by}, already counted");
+    } else {
+        proven.push(by);
+        tracing::debug!("claim also proven by pinned anchor {a}");
+    }
+}
+
 /// Fetch and verify one server's advertisement.
 pub(crate) fn verified(
     server: &str,
@@ -141,7 +253,9 @@ pub(crate) fn verified(
     pins.dedup();
     let mut wanted_heads: Vec<HeadPin> = heads.to_vec();
     wanted_heads.sort_by_key(|h| h.anchor);
-    wanted_heads.dedup_by_key(|h| h.anchor);
+    // The whole window travels, one head per line and all of them: the
+    // server tries each pinned head in turn (§1.4), and a claim only
+    // under the newest head has no proof under the oldest.
     let adv = endpoint
         .advertisement_with_heads(&pins, &wanted_heads)
         .map_err(|e| e.to_string())?;
@@ -157,15 +271,7 @@ pub(crate) fn verified(
         tracing::debug!(server = %server, "advertisement rejected: {e}");
         format!("advertisement: {e}")
     })?;
-    // A frozen pin accepts a head proof only (DESIGN-claim-logs.md §2):
-    // no signature fallback, and the refusal names the freeze.
-    if let Some(a) = frozen.first()
-        && advertisement.head_anchor().is_none()
-    {
-        return Err(format!(
-            "frozen: the pinned head of {a} does not prove this claim"
-        ));
-    }
+    frozen_gate(&advertisement, &wanted_heads, frozen)?;
     trace_advertisement(server, &advertisement);
     for (old, new) in advertisement.succeeded() {
         tracing::debug!(server = %server, "pinned anchor {old} was rotated: succeeded by {new}");
@@ -185,36 +291,23 @@ pub(crate) fn verified(
             if proven.contains(a) {
                 continue;
             }
-            match endpoint
-                .advertisement(std::slice::from_ref(a))
-                .map_err(|e| e.to_string())
-                .and_then(|adv| {
-                    VerifiedRealm::verify(
-                        &adv,
-                        realm,
-                        std::slice::from_ref(a),
-                        &Policy::default(),
-                        now(),
-                    )
-                    .map_err(|e| e.to_string())
-                }) {
+            // A frozen anchor counts head-wise only (§2); a signature
+            // proof, even a valid one for this very claim, is what the
+            // freeze removes.
+            let window = window_of(&wanted_heads, a);
+            let proof = quorum_proof(&endpoint, realm, a, &window, frozen.contains(a));
+            match proof {
                 Ok(proof) => {
-                    let by = *proof.anchor();
-                    if proof.server() != advertisement.server()
-                        || proof.signer() != advertisement.signer()
-                        || proof.delegation_expires() != advertisement.delegation_expires()
+                    if frozen.contains(a)
+                        && (proof.head_anchor() != Some(*a) || !head_proves(&proof, a, &window))
                     {
-                        // §4.4: a proof counts only for the claim it is
-                        // a proof of: the same server, the same key, the
-                        // same delegation — anything else proves a
-                        // different claim.
-                        tracing::debug!(server = %server, "pinned anchor {a} proved a different claim");
-                    } else if proven.contains(&by) {
-                        tracing::debug!(server = %server, "pinned anchor {a} proves the claim through {by}, already counted");
-                    } else {
-                        proven.push(by);
-                        tracing::debug!(server = %server, "claim also proven by pinned anchor {a}");
+                        tracing::debug!(
+                            server = %server,
+                            "pinned anchor {a} proves the claim only by signature; its pin is frozen"
+                        );
+                        continue;
                     }
+                    count_proof(&mut proven, &proof, &advertisement, a);
                 }
                 Err(e) => {
                     tracing::debug!(server = %server, "pinned anchor {a} does not prove the claim: {e}");
@@ -503,7 +596,17 @@ fn merge_previous(mut new: Keytab, old: Option<Keytab>) -> Result<Keytab, Error>
 }
 
 /// Install an enrollment's identity: keytab, CA chain, anchors and state.
-fn install(paths: &Paths, enrollment: &Enrollment, fqdn: &str) -> Result<(), Error> {
+///
+/// `proved` is what the verified response behind this enrollment proved
+/// by signature — the only heads its payload may pin (§4); a bundle,
+/// which carries no anchor signature, passes none and gets its backing
+/// from the issuer's advertisement instead.
+fn install(
+    paths: &Paths,
+    enrollment: &Enrollment,
+    fqdn: &str,
+    proved: &[HeadPin],
+) -> Result<(), Error> {
     paths::write_file(&paths.keytab(), enrollment.keytab.to_mit()?.as_ref(), 0o600)?;
     paths::write_pem(&paths.ca(), &enrollment.ca_certs)?;
     let heads = enrollment
@@ -514,10 +617,12 @@ fn install(paths: &Paths, enrollment: &Enrollment, fqdn: &str) -> Result<(), Err
         .collect::<Vec<_>>();
     write_windows(
         paths,
-        &paths::read_anchor_pins(&paths.anchors()).unwrap_or_default(),
+        &pins_to_merge(&paths.anchors())?,
         payload_epoch(enrollment),
+        &enrollment.config.realm,
         &enrollment.config.issuer,
         &heads,
+        proved,
     )?;
     let config = &enrollment.config;
     let mut servers = vec![config.issuer.clone()];
@@ -708,7 +813,9 @@ pub fn enroll_online(
         Auth::Otp(_) => Operation::Rekey,
         _ => Operation::Join,
     };
-    let (enrollment, _) = exchange(
+    // The verified advertisement behind the enrollment is what its
+    // payload's heads may be pinned from (§4).
+    let (enrollment, adv) = exchange(
         deployment,
         &Trust::FirstContact,
         realm,
@@ -782,7 +889,7 @@ pub fn enroll_online(
             Ok(p.seal(authenticator.as_ref(), &[], &[])?)
         },
     )?;
-    install(paths, &enrollment, fqdn)?;
+    install(paths, &enrollment, fqdn, adv.proved_heads())?;
     Ok(summary(&enrollment))
 }
 
@@ -873,7 +980,10 @@ pub fn enroll_bundle(
         }
     };
     let enrollment = verified.open(opener)?;
-    install(paths, &enrollment, &fqdn)?;
+    // A bundle carries no anchor signature over a head (§4): nothing here
+    // proves one, so a payload head is pinned only if the issuer's
+    // advertisement for that anchor proves it.
+    install(paths, &enrollment, &fqdn, &[])?;
     paths::remove(&paths.recipient())?;
     paths::remove(&paths.recipient_public())?;
     let pending = json!({
@@ -898,6 +1008,93 @@ fn payload_epoch(enrollment: &Enrollment) -> Option<Epoch> {
     (enrollment.epoch_seq != 0).then_some((enrollment.epoch_seq, enrollment.epoch_head))
 }
 
+/// The host's pins for a merge: none where there is no pin file, but a
+/// malformed pin file is an error — pins are trust, and an exchange must
+/// not rewrite a file it cannot read (§4.4).
+fn pins_to_merge(path: &std::path::Path) -> Result<Vec<paths::Pin>, Error> {
+    match paths::read_anchor_pins(path) {
+        Ok(pins) => Ok(pins),
+        Err(e) if paths::is_missing(&e) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Most claim-log pages one window extension reads (§4.9): past this many
+/// the gap between the pinned head and the new one is too wide to check
+/// from the leaves, and the head is not pinned
+/// (DESIGN-claim-logs.md §1.3).  [`MAX_HEAD_FETCH_PAGES`] pages of the
+/// server's page size (`kuipa_enroll::server::MAX_CLAIM_LOG_PAGE` leaves)
+/// cover far more growth than daily re-vouching produces.
+const MAX_HEAD_FETCH_PAGES: usize = 64;
+
+/// Drop heads that no anchor signature backs (DESIGN-claim-logs.md §4):
+/// a head of an anchor with no window yet must appear in `proved` — the
+/// heads the verified response proved by signature — or in what the
+/// issuer's advertisement for that anchor alone proves, asked here.  An
+/// anchor that already has a window grows through [`extend_windows`]
+/// instead, whose consistency check decides for it.  What is dropped is
+/// named, and only the head: the anchor stays pinned, because it came
+/// from a verified response.  An advertised head nothing signed is the
+/// advertising server's assertion, and pinning it would make a stolen or
+/// lying server the host's trust root (§4.9.6).
+fn backed(
+    endpoint: Option<&Endpoint>,
+    realm: &str,
+    pins: &[paths::Pin],
+    heads: &[paths::AnchorHead],
+    proved: &[HeadPin],
+) -> Vec<paths::AnchorHead> {
+    let mut out = Vec::with_capacity(heads.len());
+    for (anchor, head) in heads {
+        let Some((size, root)) = head else {
+            out.push((*anchor, None));
+            continue;
+        };
+        if pins
+            .iter()
+            .any(|p| &p.anchor == anchor && !p.heads.is_empty())
+        {
+            // A window exists: the growth check decides (§1.3).
+            out.push((*anchor, Some((*size, *root))));
+            continue;
+        }
+        let want = HeadPin {
+            anchor: *anchor,
+            size: *size,
+            root: *root,
+        };
+        let signed = proved.contains(&want)
+            || endpoint.is_some_and(|endpoint| {
+                endpoint
+                    .advertisement(std::slice::from_ref(anchor))
+                    .ok()
+                    .and_then(|adv| {
+                        VerifiedRealm::verify(
+                            &adv,
+                            realm,
+                            std::slice::from_ref(anchor),
+                            &Policy::default(),
+                            now(),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|v| v.proved_heads().contains(&want))
+            });
+        if signed {
+            out.push((*anchor, Some((*size, *root))));
+        } else {
+            // The anchor itself is still pinned — it came from a verified
+            // response — only its head is refused.
+            out.push((*anchor, None));
+            tracing::warn!(
+                anchor = %anchor,
+                "head {size} not pinned: no anchor signature proves it (DESIGN-claim-logs.md §4)"
+            );
+        }
+    }
+    out
+}
+
 /// Extend the host's pin windows with a verified advertisement's heads
 /// (DESIGN-claim-logs.md §1.3): for every anchor whose new head does
 /// not extend the window, fetch the claim-log pages of the whole log
@@ -907,6 +1104,10 @@ fn payload_epoch(enrollment: &Enrollment) -> Option<Epoch> {
 /// alone.  A head that fails the check is not pinned and the window
 /// keeps what it had; a head whose size is lower (the log restarted)
 /// truncates the window in [`paths::merge_windows`], reported here.
+///
+/// The walk is bounded: at most [`MAX_HEAD_FETCH_PAGES`] pages, each of
+/// the anchor asked for.  A gap past that budget is not checked, and a
+/// page naming another anchor says nothing about this window.
 fn extend_windows(
     endpoint: &Endpoint,
     pins: &[paths::Pin],
@@ -924,11 +1125,43 @@ fn extend_windows(
         if *size <= newest {
             continue; // A repeat or a restart: merge_windows decides.
         }
+        if *size > MAX_HEAD_FETCH_PAGES as u64 * kuipa_enroll::server::MAX_CLAIM_LOG_PAGE as u64 {
+            tracing::warn!(
+                anchor = %anchor,
+                "window not extended: its head names {size} leaves, more than the {} this host will read",
+                MAX_HEAD_FETCH_PAGES * kuipa_enroll::server::MAX_CLAIM_LOG_PAGE
+            );
+            merged[i].1 = None;
+            continue;
+        }
         let mut leaves = Vec::new();
         let mut from = 0;
+        let mut pages = 0;
         let complete = loop {
+            if pages == MAX_HEAD_FETCH_PAGES {
+                tracing::warn!(
+                    anchor = %anchor,
+                    "window not extended: the gap needs more than {MAX_HEAD_FETCH_PAGES} pages to check"
+                );
+                break false;
+            }
+            pages += 1;
             match endpoint.claim_log(anchor, from) {
                 Ok(page) => {
+                    // A page of another anchor's log says nothing about
+                    // this window: the check cannot go on with it.
+                    if !page
+                        .anchor
+                        .parse::<Thumbprint>()
+                        .is_ok_and(|p| p == *anchor)
+                    {
+                        tracing::warn!(
+                            anchor = %anchor,
+                            "window not extended: the served page names {}",
+                            page.anchor
+                        );
+                        break false;
+                    }
                     if page.leaves.is_empty() {
                         break false;
                     }
@@ -976,43 +1209,58 @@ fn extend_windows(
 /// Merge a verified response's heads into the host's pin file with the
 /// consistency check of [`extend_windows`]: the windows grow only
 /// through pages that provably contain the pinned history
-/// (DESIGN-claim-logs.md §1.3), and a restart is reported.  `issuer`
-/// is the server the verified response came from, for the pages.
+/// (DESIGN-claim-logs.md §1.3), and a restart is reported.  `issuer` is
+/// the server the verified response came from, for the pages and for the
+/// signature backing of a head `proved` does not cover (§4).
 fn write_windows(
     paths: &Paths,
     pins: &[paths::Pin],
     epoch: Option<(u64, [u8; 32])>,
+    realm: &str,
     issuer: &str,
     heads: &[paths::AnchorHead],
+    proved: &[HeadPin],
 ) -> Result<bool, Error> {
-    let (pins, restarted) = if pins.is_empty() {
-        (paths::merge_windows(pins, heads).0, false)
-    } else {
+    // The issuer is dialed whenever a head is named at all: for the pages
+    // of a growing window, and for the signature backing of a head the
+    // verified response did not prove itself (§4).
+    let endpoint = if heads.iter().any(|(_, head)| head.is_some()) {
         match Endpoint::new(issuer, &Trust::FirstContact) {
-            Ok(endpoint) => extend_windows(&endpoint, pins, heads),
+            Ok(endpoint) => Some(endpoint),
             Err(e) => {
                 tracing::warn!("window not extended: {e}");
-                (paths::merge_windows(pins, heads).0, false)
+                None
             }
         }
+    } else {
+        None
+    };
+    let heads = backed(endpoint.as_ref(), realm, pins, heads, proved);
+    // With no pins there is nothing to keep consistent: no pages to read.
+    let (pins, restarted) = match (&endpoint, pins.is_empty()) {
+        (Some(endpoint), false) => extend_windows(endpoint, pins, &heads),
+        _ => (paths::merge_windows(pins, &heads).0, false),
     };
     paths::write_anchor_pins(&paths.anchors(), "kuipa realm anchors", &pins, epoch)?;
     Ok(restarted)
 }
 
 /// Advertisements of every server of the realm that answers and describes
-/// the stored deployment, for sealing.
+/// the stored deployment, for sealing.  The pinned windows and the frozen
+/// anchors travel with the anchors, as for any verified fetch (§1.4, §2).
 pub(crate) fn all_servers(
     state: &State,
     trust: &Trust,
     anchors: &[Thumbprint],
+    heads: &[HeadPin],
+    frozen: &[Thumbprint],
 ) -> Vec<VerifiedRealm> {
     let deployment = Deployment::servers(&state.servers);
     state
         .servers
         .iter()
         .filter_map(|s| {
-            verified(s, trust, &state.realm, anchors, &[], &[], None)
+            verified(s, trust, &state.realm, anchors, heads, frozen, None)
                 .ok()
                 .map(|(_, v, _)| v)
                 .filter(|v| check_deployment(s, v, &deployment).is_ok())
@@ -1030,7 +1278,7 @@ pub(crate) fn all_servers(
 pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
     let holder = protect.unwrap_or(state.holder);
-    let anchors = paths::read_anchors(paths)?;
+    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm);
@@ -1047,7 +1295,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     let (sealer, registrations) = if holder == Holder::None {
         (None, Vec::new())
     } else {
-        let servers = all_servers(&state, &trust, &anchors);
+        let servers = all_servers(&state, &trust, &anchors, &heads, &frozen);
         let refs: Vec<_> = servers.iter().collect();
         let (sealer, registered) = Sealer::prepare(&principal, Kind::Keytab, &refs)?;
         tracing::debug!(
@@ -1064,13 +1312,13 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         )
     };
 
-    let (enrollment, _) = exchange(
+    let (enrollment, adv) = exchange(
         &Deployment::servers(&state.servers),
         &trust,
         &state.realm,
         &anchors,
-        &[],
-        &[],
+        &heads,
+        &frozen,
         known,
         Operation::Rekey,
         |adv| {
@@ -1108,10 +1356,12 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         .collect::<Vec<_>>();
     let restarted = write_windows(
         paths,
-        &paths::read_anchor_pins(&paths.anchors()).unwrap_or_default(),
+        &pins_to_merge(&paths.anchors())?,
         epoch,
+        &state.realm,
         &enrollment.config.issuer,
         &heads,
+        adv.proved_heads(),
     )?;
     if restarted {
         tracing::warn!(
@@ -1361,7 +1611,7 @@ fn register(
     params: &RegisterParams,
     bindings: &[[u8; 32]],
 ) -> Result<String, Error> {
-    let anchors = paths::read_anchors(paths)?;
+    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let cred = GssClientCred::from_keytab_initiate(
@@ -1381,8 +1631,8 @@ fn register(
         &trust,
         &state.realm,
         &anchors,
-        &[],
-        &[],
+        &heads,
+        &frozen,
         known,
         Operation::Register,
         |adv| {
@@ -1451,9 +1701,9 @@ fn protect_other(
         _ => Vec::new(),
     };
 
-    let anchors = paths::read_anchors(paths)?;
+    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
     let trust = ca_trust(paths)?;
-    let servers = all_servers(&state, &trust, &anchors);
+    let servers = all_servers(&state, &trust, &anchors, &heads, &frozen);
     let refs: Vec<_> = servers.iter().collect();
     let (sealer, registrations) = Sealer::prepare(&principal, kind_of(contents), &refs)?;
     let bindings: Vec<_> = registrations.iter().map(|r| r.binding).collect();
@@ -1608,7 +1858,8 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
         .and_then(|b| serde_json::from_slice(&b).ok());
     // The pinned windows and frozen pins (DESIGN-claim-logs.md §1–§2):
     // what a reader can see about this host's trust state.
-    let pins = paths::read_anchor_pins(&paths.anchors()).unwrap_or_default();
+    // A corrupt pin file is reported, not shown as no windows.
+    let pins = pins_to_merge(&paths.anchors())?;
     let windows: Vec<Value> = pins
         .iter()
         .map(|p| {
@@ -1645,6 +1896,43 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
     }))
 }
 
+/// One reachable server's health row: the age of its claim and vouch,
+/// and the successions it verified through (§4.7).  A server proven
+/// under a pinned head has no vouch to age — the head is the proof
+/// (§4.9) — so the half-life warning does not apply to it.
+fn server_health(server: &str, adv: &VerifiedRealm) -> (Vec<String>, Value) {
+    let mut problems = Vec::new();
+    let days = adv.delegation_expires().saturating_sub(unix_seconds(now())) / 86400;
+    let vouch_hours = adv
+        .head_anchor()
+        .is_none()
+        .then(|| adv.vouched_until().saturating_sub(unix_seconds(now())) / 3600);
+    if days < 14 {
+        problems.push(format!("{server}: its claim expires in {days} days: the server renews it itself, so check its anchor exchange"));
+    }
+    if let Some(hours) = vouch_hours
+        && hours < 48
+    {
+        problems.push(format!("{server}: the anchor's vouch expires in {hours} hours: anchors vouch again at half life, so check that server's anchor exchange"));
+    }
+    // Pins are only rewritten from Kerberos-bound responses (§4.7).
+    let rotated: Vec<String> = adv
+        .succeeded()
+        .iter()
+        .map(|(old, new)| format!("{old} -> {new}"))
+        .collect();
+    if !rotated.is_empty() {
+        problems.push(format!(
+            "{server}: verified only through the succession of rotated anchors ({}): run `kuipa rotate-keys` to refresh the pinned anchors",
+            rotated.join(", ")
+        ));
+    }
+    (
+        problems,
+        json!({ "server": server, "ok": true, "delegation_days_left": days, "vouch_hours_left": vouch_hours, "rotated_anchors": rotated }),
+    )
+}
+
 /// `kuipa check`: would this host work right now?  Reports problems with
 /// the action that fixes them.
 ///
@@ -1654,7 +1942,9 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
 /// result.
 pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
     let state = State::load(paths)?;
-    let anchors = paths::read_anchors(paths)?;
+    // The whole window travels and the frozen anchors are named: §1.4 and
+    // §2 are enforced here, not left to what the server happens to serve.
+    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm).to_string();
@@ -1667,36 +1957,25 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         .iter()
         .filter(|s| only.is_none_or(|o| o == s.as_str()))
     {
-        match verified(server, &trust, &state.realm, &anchors, &[], &[], known).and_then(
-            |(e, adv, advance)| {
-                adv.check_deployment(&Deployment::servers(&state.servers))
-                    .map(|()| (e, adv, advance))
-                    .map_err(|e| e.to_string())
-            },
-        ) {
+        match verified(
+            server,
+            &trust,
+            &state.realm,
+            &anchors,
+            &heads,
+            &frozen,
+            known,
+        )
+        .and_then(|(e, adv, advance)| {
+            adv.check_deployment(&Deployment::servers(&state.servers))
+                .map(|()| (e, adv, advance))
+                .map_err(|e| e.to_string())
+        }) {
             Ok((_, adv, advance)) => {
                 advanced = advance;
-                let days = adv.delegation_expires().saturating_sub(unix_seconds(now())) / 86400;
-                let vouch_hours = adv.vouched_until().saturating_sub(unix_seconds(now())) / 3600;
-                if days < 14 {
-                    problems.push(format!("{server}: its claim expires in {days} days: the server renews it itself, so check its anchor exchange"));
-                }
-                if vouch_hours < 48 {
-                    problems.push(format!("{server}: the anchor's vouch expires in {vouch_hours} hours: anchors vouch again at half life, so check that server's anchor exchange"));
-                }
-                // Pins are only rewritten from Kerberos-bound responses (§4.7).
-                let rotated: Vec<String> = adv
-                    .succeeded()
-                    .iter()
-                    .map(|(old, new)| format!("{old} -> {new}"))
-                    .collect();
-                if !rotated.is_empty() {
-                    problems.push(format!(
-                        "{server}: verified only through the succession of rotated anchors ({}): run `kuipa rotate-keys` to refresh the pinned anchors",
-                        rotated.join(", ")
-                    ));
-                }
-                servers.push(json!({ "server": server, "ok": true, "delegation_days_left": days, "vouch_hours_left": vouch_hours, "rotated_anchors": rotated }));
+                let (why, row) = server_health(server, &adv);
+                problems.extend(why);
+                servers.push(row);
             }
             Err(e) => {
                 problems.push(format!("{server}: {e}"));
@@ -1932,7 +2211,9 @@ fn advertisement_detail(
         "signer": adv.signer().to_string(),
         "proven_by": adv.anchor().to_string(),
         "delegation_days_left": adv.delegation_expires().saturating_sub(now) / 86400,
-        "vouch_hours_left": adv.vouched_until().saturating_sub(now) / 3600,
+        // Null for a server proven under a pinned head: no vouch ages
+        // it (§4.9).
+        "vouch_hours_left": adv.head_anchor().is_none().then(|| adv.vouched_until().saturating_sub(now) / 3600),
         "rotated_anchors": adv
             .succeeded()
             .iter()
@@ -2089,6 +2370,7 @@ fn install_trust(
     own_realm: &str,
     t: &TrustedRealm,
     adv: &VerifiedRealm,
+    endpoint: &Endpoint,
 ) -> Result<(), Error> {
     let dir = paths.trust_dir(&t.realm);
     let pkinit = dir.join("pkinit-anchors.pem");
@@ -2110,26 +2392,63 @@ fn install_trust(
     // B's heads, pinned beside its anchors: the anchors file of a
     // trusted realm carries the same pin grammar as the host's own
     // (DESIGN-claim-logs.md §3), refreshed here on every trust
-    // refresh, with no expiry — the refresh renews them.
+    // refresh, with no expiry — the refresh renews them.  What is new
+    // here is only what is *backed* (§4): a head the verified
+    // advertisement proved by signature, or — when the refresh verified
+    // head-wise and carried no signature — one B's own advertisement
+    // proves for that anchor.  A head A or B merely names is an
+    // assertion; pinning it unbacked would hand this host's trust for B
+    // to whoever wrote the advertisement.  What this host already
+    // pinned stays (a head-wise refresh signs nothing), and
+    // [`paths::merge_windows`] grows and trims the windows as the
+    // host's own exchange does (§1.2).
+    let previous = match paths::read_anchor_pins(&paths.trust_anchors(&t.realm)) {
+        Ok(pins) => pins
+            .into_iter()
+            .filter(|p| t.anchors.contains(&p.anchor))
+            .collect::<Vec<_>>(),
+        Err(e) if paths::is_missing(&e) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let wanted: Vec<paths::AnchorHead> = t
+        .heads
+        .iter()
+        .filter(|h| t.anchors.contains(&h.anchor))
+        .map(|h| (h.anchor, Some((h.size, h.root))))
+        .collect();
+    let backed_heads = backed(
+        Some(endpoint),
+        &t.realm,
+        &previous,
+        &wanted,
+        adv.proved_heads(),
+    );
+    let mut pins = previous;
+    for a in &t.anchors {
+        // Every anchor B lists gets a line, head or no head.
+        if !pins.iter().any(|p| p.anchor == *a) {
+            pins.push(Pin {
+                anchor: *a,
+                exp: None,
+                heads: Vec::new(),
+                frozen: false,
+            });
+        }
+    }
+    let (pins, restarted) = paths::merge_windows(&pins, &backed_heads);
+    if restarted {
+        tracing::warn!(
+            realm = %t.realm,
+            "a trusted anchor restarted its claim log: the realm removed something; the window starts fresh"
+        );
+    }
     paths::write_anchor_pins(
         &paths.trust_anchors(&t.realm),
         &format!(
             "kuipa anchors of {}, vouched for by {own_realm}; used for {} only",
             t.realm, t.realm
         ),
-        &t.anchors
-            .iter()
-            .map(|a| Pin {
-                anchor: *a,
-                exp: None,
-                heads: t
-                    .heads
-                    .iter()
-                    .find(|h| &h.anchor == a)
-                    .map_or_else(Vec::new, |h| vec![(h.size, h.root)]),
-                frozen: false,
-            })
-            .collect::<Vec<_>>(),
+        &pins,
         None,
     )
 }
@@ -2148,6 +2467,78 @@ fn remove_trust(paths: &Paths, realm: &str) -> Result<(), Error> {
     paths::remove(&paths.trust_anchors(realm))
 }
 
+/// Refresh one trusted realm: install or keep its files, and the row
+/// that reports it.  The second value is the failure reason when the
+/// refresh did not happen — the realm's last verified files are kept,
+/// not half-written from an unverified advertisement.
+fn refresh_trust(
+    paths: &Paths,
+    own_realm: &str,
+    own_anchors: &[Thumbprint],
+    t: &TrustedRealm,
+) -> Result<(Value, Option<String>), Error> {
+    let installed = paths.trust_anchors(&t.realm).exists();
+    let mut errors = Vec::new();
+    if t.anchors.iter().any(|a| own_anchors.contains(a)) {
+        errors.push("shares an anchor with this host's realm".to_owned());
+    }
+    // The heads A vouches for B's anchors, pinned beside them, so
+    // this refresh — and B's next — can verify with no signature
+    // (DESIGN-claim-logs.md §3).  Only heads for anchors B lists,
+    // whatever the wire carried.
+    let heads = t.pins();
+    let found = if errors.is_empty() {
+        t.servers.iter().find_map(|s| {
+            match verified(
+                s,
+                &Trust::FirstContact,
+                &t.realm,
+                &t.anchors,
+                &heads,
+                &[],
+                None,
+            ) {
+                Ok((endpoint, v, _)) => Some((endpoint, v)),
+                Err(e) => {
+                    errors.push(format!("{s}: {e}"));
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+    if let Some((endpoint, adv)) = found {
+        tracing::debug!(
+            "installing {}: {} PKINIT anchor(s), {} CA certificate(s), KDCs {:?}",
+            t.realm,
+            adv.info().pkinit_anchors.len(),
+            adv.info().ca_certs.len(),
+            adv.info().servers
+        );
+        install_trust(paths, own_realm, t, &adv, &endpoint)?;
+        Ok((
+            json!({
+                "realm": t.realm,
+                "status": if installed { "refreshed" } else { "installed" },
+                "server": adv.server(),
+                "krb5_conf": paths.trust_krb5_conf(&t.realm),
+                "heads": heads.len(),
+            }),
+            None,
+        ))
+    } else {
+        Ok((
+            json!({
+                "realm": t.realm,
+                "status": if installed { "kept" } else { "not installed" },
+                "error": errors.join("; "),
+            }),
+            Some(format!("{}: {}", t.realm, errors.join("; "))),
+        ))
+    }
+}
+
 /// `kuipa trusted-realms`: make this host's trusted realms match what its
 /// own realm advertises (§17).  For each listed realm, fetch that realm's
 /// advertisement, verify it with the anchors the own realm vouches for, and
@@ -2161,21 +2552,31 @@ fn remove_trust(paths: &Paths, realm: &str) -> Result<(), Error> {
 /// could not be refreshed (after applying everything else); I/O errors.
 pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
     let state = State::load(paths)?;
-    let anchors = paths::read_anchors(paths)?;
+    // This host's own pins, windows and freezes included: the fetch of
+    // its own realm is verified under them like any other (§1.4, §2).
+    let (anchors, own_heads, own_frozen) = paths::pinned_windows(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let mut skipped = Vec::new();
     let own = state
         .servers
         .iter()
-        .find_map(
-            |s| match verified(s, &trust, &state.realm, &anchors, &[], &[], None) {
+        .find_map(|s| {
+            match verified(
+                s,
+                &trust,
+                &state.realm,
+                &anchors,
+                &own_heads,
+                &own_frozen,
+                None,
+            ) {
                 Ok((_, v, _)) => Some(v),
                 Err(e) => {
                     skipped.push(format!("{s}: {e}"));
                     None
                 }
-            },
-        )
+            }
+        })
         .ok_or_else(|| {
             Outcome::RetryLater(format!(
                 "no usable server of {}: {}",
@@ -2193,61 +2594,11 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
     let mut realms = Vec::new();
     let mut failed = Vec::new();
     for t in &listed {
-        let installed = paths.trust_anchors(&t.realm).exists();
-        let mut errors = Vec::new();
-        if t.anchors.iter().any(|a| anchors.contains(a)) {
-            errors.push("shares an anchor with this host's realm".to_owned());
+        let (row, failure) = refresh_trust(paths, &state.realm, &anchors, t)?;
+        if let Some(why) = failure {
+            failed.push(why);
         }
-        // The heads A vouches for B's anchors, pinned beside them, so
-        // this refresh — and B's next — can verify with no signature
-        // (DESIGN-claim-logs.md §3).  Only heads for anchors B lists,
-        // whatever the wire carried.
-        let heads = t.pins();
-        let adv = if errors.is_empty() {
-            t.servers.iter().find_map(|s| {
-                match verified(
-                    s,
-                    &Trust::FirstContact,
-                    &t.realm,
-                    &t.anchors,
-                    &heads,
-                    &[],
-                    None,
-                ) {
-                    Ok((_, v, _)) => Some(v),
-                    Err(e) => {
-                        errors.push(format!("{s}: {e}"));
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        if let Some(adv) = adv {
-            tracing::debug!(
-                "installing {}: {} PKINIT anchor(s), {} CA certificate(s), KDCs {:?}",
-                t.realm,
-                adv.info().pkinit_anchors.len(),
-                adv.info().ca_certs.len(),
-                adv.info().servers
-            );
-            install_trust(paths, &state.realm, t, &adv)?;
-            realms.push(json!({
-                "realm": t.realm,
-                "status": if installed { "refreshed" } else { "installed" },
-                "server": adv.server(),
-                "krb5_conf": paths.trust_krb5_conf(&t.realm),
-                "heads": heads.len(),
-            }));
-        } else {
-            failed.push(format!("{}: {}", t.realm, errors.join("; ")));
-            realms.push(json!({
-                "realm": t.realm,
-                "status": if installed { "kept" } else { "not installed" },
-                "error": errors.join("; "),
-            }));
-        }
+        realms.push(row);
     }
     for realm in paths.trusted_realms() {
         if !listed.iter().any(|t| t.realm == realm) {
