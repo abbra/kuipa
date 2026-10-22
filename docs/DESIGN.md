@@ -2,7 +2,7 @@
 
 This document describes the protocol and its implementation in this
 workspace. the local CI guide (`docs/src/development/local-ci.md`) covers CI and the interactive
-playground. §18 lists what is implemented, what is tested
+playground. §19 lists what is implemented, what is tested
 where, and what is not built yet.
 
 ## 1. Goal and scope
@@ -33,8 +33,8 @@ Constraints:
   and the servers vouch for each other through an exchange authenticated
   with their Kerberos keys (§4.2).
 
-Out of scope: PKINIT itself, FAST armour, ML-DSA certificates from the IPA
-CA, and Custodia (§16).
+Out of scope: PKINIT itself, FAST armour, and ML-DSA certificates from the
+IPA CA. Custodia's job moves onto kuipa's envelope (§18).
 
 ## 2. Enrollment in FreeIPA today
 
@@ -2003,6 +2003,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/rekey/{kid}` | `IPJQ` → `IPJS` |
 | POST | `/ipa/ku/stage/{kid}` | `IPSQ` → `IPJS` (payload `IPSP`) |
 | POST | `/ipa/ku/register/{kid}` | `IPJQ` (operation data `IPRP`) → `IPJS` (payload `IPRA`) (§7.5) |
+| POST | `/ipa/ku/keys/{kid}` | `IPJQ` (operation data `IPKG`) → `IPJS` (payload `IPKR`) (§18) |
 | POST | `/ipa/ku/vault/{kid}` | `IPJQ` (operation data: a JSON vault operation) → `IPJS` (payload `IPVR`) (§7.6) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
 | POST | `/ipa/ku/peer/sync` | `IPPS` → agirru envelope (CBOR); servers only (§4.2) |
@@ -2013,7 +2014,9 @@ delegation, which the next exchange round issues and vouches for.
 | GET | `/ipa/ku/tang/key/{kid}` | → Tang exchange key (`application/jwk+json`) (§11.5) |
 | POST | `/ipa/ku/tang/rec/{kid}` | `TQRQ` → `TQRS` (§11.5) |
 
-Bodies are limited to 64 KiB; the path `kid` must match the request's.
+Bodies are limited to 1 MiB (64 KiB before §18; a CA or KRA subsystem
+PKCS#12 and a wrapped ML-DSA key fit, §18); the path `kid` must match the
+request's.
 Refusals are empty `403`s with the reason logged, rate-limited requests
 empty `429`s (§5.1); blocking LDAP and GSS work
 runs on tokio's blocking pool.
@@ -2130,8 +2133,8 @@ existing proofs stop verifying when the vouches they come from expire
 (7 days).
 
 Still classical: TLS server authentication (an RSA IPA CA, now reached
-authentically), PKINIT and its anonymous armour, Custodia (which escrows
-CA storage keys in non-HSM deployments), DNSSEC.
+authentically), PKINIT and its anonymous armour, DNSSEC. Custodia is
+replaced by §18.
 
 FIPS: every primitive is approved; HKDF over `ss ‖ ss_e` is an SP 800-56C
 rev. 2 derivation over two approved KEM secrets.
@@ -2169,6 +2172,10 @@ IPEK  ct sealed(IPEK n(u64) [epoch(u64) private JWK])                          s
 IPVA  ct sealed                                                                  recovery answer encrypted to a device
 IPRP  principal kind(1) n(1) [retire(32)]                                        registration parameters
 IPRA  principal                                                                  registration answer
+IPKG  namespace(1) nickname alg_arg(1)                                           keys operation data (§18.2)
+      (namespace: 1 dm, 2 ra, 3 ca, 4 ca_wrapped, 5 lwca-store; alg_arg: a wrap
+       algorithm selector for ca_wrapped, 0 none; nickname: a string)
+IPKR  value                                                                      keys answer (the handler's JSON)
 IPPS  sender receiver delegation(JSON) envelope token                           peer sync request
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
 IPVH  realm anchor(32) iat(u64) exp(u64) size(u64) root(32)                      vouch (signed)
@@ -2218,8 +2225,9 @@ recovery request and response.
   keys kuipa protects are symmetric.
 * **ML-DSA certificates** from the IPA CA would make TLS server
   authentication post-quantum; kuipa's CA pinning works for any algorithm.
-* **Custodia** should gain an ML-KEM key exchange; kuipa does not depend on
-  it.
+* **Custodia's JOSE message layer** has no post-quantum standard to move
+  to (`draft-ietf-jose-pqc-kem` is still moving); §18 replaces the whole
+  daemon on kuipa's envelope instead of waiting for one.
 * **Anchor exchange scale:** the state grows linearly with the number of
   anchors; with every server an anchor, 60 servers make 489 KB of state and
   321 KB of deltas per renewal round. Large realms should give the anchor
@@ -2386,9 +2394,178 @@ authenticates the PKINIT chains and protects the trust secret in transit,
 not PKINIT itself. The invitation needs an authentic out-of-band channel,
 like an enrollment string.
 
-## 18. Implementation status and tests
+## 18. Secrets transport: replacing FreeIPA's Custodia
 
-### 18.1 Status
+FreeIPA moves its most sensitive material — CA and KRA subsystem PKCS#12
+bundles, the RA agent key, the Directory Manager password hash and
+Dogtag's wrapped lightweight-CA keys — through its embedded Custodia
+daemon: a JWS (`RS256`) inside a JWE (`RSA-OAEP`, `A256CBC-HS512`),
+client public keys in a self-writable LDAP tree (`cn=custodia`), fetched
+as `GET /ipa/keys/<name>` over TLS through httpd and SPNEGO. All of it is
+classical, and the JWE layer has no post-quantum standard to move to
+(§16). This section designs the same job on kuipa's envelope: FreeIPA's
+own design for adopting it is `doc/designs/kuipa-secrets-transport.md` in
+the FreeIPA tree, which this section stays in sync with.
+
+### 18.1 What is being replaced
+
+Custodia's `IPASecStore` stores nothing: it dispatches four key names to
+handler executables that export or import against a live subsystem. The
+namespaces, each with a fixed producer and consumer:
+
+| namespace | export | import | when |
+|---|---|---|---|
+| `dm/DMHash` | `nsslapd-rootpw` from `cn=config` over LDAPI | the promoting replica writes its own `cn=config` | end of `ipa-replica-install` |
+| `ra/ipaCert` | the RA agent key and certificate as PKCS#12 | a clone or non-CA replica | replica promotion, CA topology repair |
+| `ca/<nickname>` | a subsystem certificate and key from Dogtag's NSS database as PKCS#12 | a CA or KRA clone, one nickname at a time | `ipa-ca-install`, `ipa-kra-install` |
+| `ca_wrapped/<nickname>` | a lightweight-CA key wrapped by the CA signing key (PKIArchiveOptions) | nobody: Dogtag itself consumes it | runtime, on CA clones missing a LWCA key |
+
+The `KEYS` service entry (`cn=masters`), the audit log and
+`ipa-custodia-check` complete the surface. The trust root it needs — the
+LDAP public-key directory that a promoting replica must poll until its
+keys replicate (`_wait_keys`) — disappears entirely: kuipa's callers
+authenticate with Kerberos tickets the KDC already knows.
+
+### 18.2 The `keys` operation
+
+`Operation::Keys` (a sibling of `register`, §7.5) carries a fetch from a
+host that is already enrolled:
+
+* **Endpoint.** `POST /ipa/ku/keys/{kid}`, request `IPJQ` with operation
+  data `IPKG`, response `IPJS` (payload `IPKR`, §14).
+* **Authenticator.** Kerberos, as `register`: the caller's ticket inside
+  the sealed body, channel-bound (`cb`), the response authenticated by
+  the realm's Kerberos keys as well as the anchor (`kb`). The caller is
+  `host/<fqdn>` (install-time fetches) or `dogtag/<fqdn>` (lightweight-CA
+  retrieval, as today).
+* **Operation data** (`IPKG`): namespace (one of `dm`, `ra`, `ca`,
+  `ca_wrapped`), nickname, and for `ca_wrapped` a wrap-algorithm
+  argument validated against an allowlist. No string parsing of the key
+  name: the namespace is an enum, the nickname opaque bytes with a
+  length bound.
+* **Policy** (static, in `kuipad.json`, §18.5): the daemon checks the
+  caller's principal against the namespace's allowed shape and against
+  the server list in `cn=masters,cn=ipa,cn=etc`, the way Ahdapa admits
+  gossip peers by IPA topology: a host not in `cn=masters` — a locked or
+  removed server, or an unenrolled impostor — is refused before any
+  handler runs. `dogtag/<fqdn>` additionally requires the peer's
+  `cn=CA,cn=<fqdn>,cn=masters` entry, so a non-CA server cannot ask for
+  wrapped CA keys.
+* **Handler execution.** Direct runas spawn on tokio's blocking pool, as
+  Custodia does today: the daemon execs the same four handler executables
+  (`ipa-custodia-dmldap`, `ipa-custodia-pki-tomcat`,
+  `ipa-custodia-pki-tomcat-wrapped`, `ipa-custodia-ra-agent`) with
+  `--export -`, capturing stdout, each under the SELinux domain its file
+  type already selects (root for `dmldap` and `ra-agent`, `pkiuser` for
+  the NSS handlers). Import is the same spawn with `--import -` and the
+  value on stdin. `ca_wrapped` stays export-only.
+* **Response.** The handler's JSON value, sealed in the envelope. The
+  body limit (§11.3) is 1 MiB, enough for a CA or KRA subsystem PKCS#12
+  and ML-DSA-sized wrapped keys; Custodia's 10 MiB limit was never
+  needed.
+* **Audit.** One structured line per request: caller principal,
+  namespace, nickname, allowed or refused, reason — the parity
+  `/var/log/ipa-custodia.audit.log` needs.
+
+### 18.3 Sealed lightweight-CA keys (replacing `ca_wrapped` storage)
+
+The wrapped-CA-key flow moves from per-request live export to a sealed
+artifact replicated in LDAP, unsealed by a key-recovery request. This
+removes the live-master dependency (any replica serves the fetch) and,
+with an ML-DSA CA, fixes what Custodia cannot do at all: Dogtag's
+`KeyWrapAlgorithm.RSA` cannot wrap an ML-DSA-87 private key (the RSA
+wrap of the session key needs an RSA public key; the CA signing key is
+ML-DSA), so `ca_wrapped` is impossible against a post-quantum CA without
+new Dogtag work.
+
+* **Artifact.** When Dogtag creates or rotates a lightweight CA's key,
+  the wrapped PKIArchiveOptions and the certificate are sealed as a
+  machine-vault file (§7.6.8): server share under the escrow keys, sealed
+  to `dogtag/<server>` as the recovery principal, `sealing = registered`
+  bindings, policy fixed as for host keytabs. The artifact name is the
+  LWCA nickname under a `cn=lwca,cn=kuipa,cn=etc` container.
+* **Producer.** The `keys` operation with namespace `lwca-store`: the
+  CA's Dogtag instance asks through the same `keys` operation (the
+  dogtag principal it already runs the retriever as), the daemon
+  seals what the handler exported. Dogtag's ML-KEM archival
+  (`CryptoUtil.encapsulateMLKEM`) already produces a wrapped form the
+  artifact can carry; its import side still needs the matching ML-KEM
+  unwrap, which is Dogtag-side work either way.
+* **Consumer.** `ipa-pki-retrieve-key` becomes `kuipa keys fetch
+  lwca/<nickname> --json` under the hood: unseal the artifact (a
+  recovery request naming the machine vault, §7.6.5) and print the JSON
+  Dogtag's `ExternalProcessKeyRetriever` expects (`certificate` and
+  `wrapped_key`, base64 PKIArchiveOptions). Dogtag itself does not
+  change: the retriever's contract — executable, arguments, JSON on
+  stdout, nonzero exit retried on the next host — is untouched.
+* **Wrap algorithm.** Inside the artifact, the session key Dogtag wraps
+  with is no longer bound to AES-128-CBC or DES-EDE3-CBC
+  (`2.16.840.1.101.3.4.1.2`, `1.2.840.113549.3.7`): the allowlist names
+  AES-256 variants (AES-256-CBC-PAD, and AES key wrap where Dogtag
+  supports it), and any RSA-key-wrap of the session key is refused for
+  ML-DSA CAs because it is structurally impossible. The artifact's own
+  protection is kuipa's ML-KEM escrow seal, so the wrap is defense in
+  depth, not the carrier of the post-quantum property.
+
+### 18.4 Client and CLI
+
+`kuipa keys fetch <namespace>/<nickname> [--alg A] [--out F]` writes
+the handler's value to standard output, or to `F`.  Importing what was
+fetched (as `fetch_key(store=True)` does today) stays with the caller:
+the FreeIPA integration runs its handler itself. Callers that cannot
+link Rust (`ipa-pki-retrieve-key`, FreeIPA's Python installers) shell
+out to `kuipa keys fetch`, as they shell out to `ipa-getkeytab` today.
+The ticket comes from the caller's
+keytab (`/etc/krb5.keytab` for hosts, `/etc/pki/pki-tomcat/dogtag.keytab`
+for the retriever), the anchor list and CA from `/etc/ipa`.
+
+### 18.5 Configuration
+
+`kuipad.json` gains a `keys` object:
+
+```json
+{
+  "keys": {
+    "enabled": true,
+    "handlers": {
+      "dm":      {"command": "/usr/libexec/ipa/custodia/ipa-custodia-dmldap", "runas": "root"},
+      "ra":      {"command": "/usr/libexec/ipa/custodia/ipa-custodia-ra-agent", "runas": "root"},
+      "ca":      {"command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat", "runas": "pkiuser"},
+      "ca_wrapped": {"command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat-wrapped", "runas": "pkiuser"},
+      "lwca-store": {"command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat-wrapped", "runas": "pkiuser"}
+    },
+    "lwca": {"container": "cn=lwca,cn=kuipa,cn=etc"}
+  }
+}
+```
+
+The four handlers keep their names and SELinux labels (they are FreeIPA
+files); the daemon only replaces Custodia's forking HTTP server, its
+KEM/JOSE message layer and its LDAP public-key directory. The policy —
+which principal may ask for which namespace — is static in the daemon
+(`host/*` in `cn=masters` for `dm`, `ra`, `ca`; `dogtag/*` or `host/*`
+for `ca_wrapped` and `lwca-store`), checked against the server list and
+CA role in `cn=masters` before any handler runs. Nothing is
+LDAP-configurable: the four flows have no runtime policy to change, and
+a static table is the smallest surface to audit.
+
+### 18.6 What stays out
+
+* **Dogtag's internal wrap** stays what Dogtag ships. The artifact seal
+  (ML-KEM escrow) governs the secret at rest and in transit; Dogtag's
+  PKIArchiveOptions wrap is access control by the CA signing key, only
+  breakable by someone who already holds the CA, which is circular.
+* **TLS** stays classical until FreeIPA's PQ TLS lands — irrelevant to
+  payload confidentiality, which the envelope provides.
+* **The `simple` store, PUT/DELETE and container operations** are not
+  ported: FreeIPA never used them (`allowed_keytypes = kem`, and
+  `IPASecStore.list` raises `NotImplementedError`).
+* **HSM deployments** do not fetch CA or wrapped keys through this path
+  (as with Custodia today); `dm` and `ra` still flow.
+
+## 19. Implementation status and tests
+
+### 19.1 Status
 
 | area | state |
 |---|---|
@@ -2403,6 +2580,7 @@ like an enrollment string.
 | vouch heads: claim logs, head proofs in advertisements and delegations, `?head=` selection with signature fallback, heads in pins and sealed responses, `ipa-ku2` strings, public claim logs (§4.9) | implemented, tested (claim logs and head proofs, tampering and stale heads, HTTP flows with a head-pinned client, pin-file round trips, KDC exchange) |
 | claim-log services: head windows with consistency-checked refresh, frozen-trust pins, cross-realm heads, the signed vouch in claim-log pages, `kuipa-audit`, `kuipa-mirror` (DESIGN-claim-logs.md) | implemented, tested (window merge and consistency rules, frozen refusals — every frozen anchor by its own head, trust install of a partner's heads *only where a signature proves them*, claim-log pages with their vouch, the audit's coverage states and split views over HTTP with the served head's signature checked, the mirror's sync/serve/no-route and cached head proofs with pages cached only under proved heads, expired pins trusted no more than absent ones, corrupt pin files refusing, the whole window travelling on `?head=`, fetch caps on oversized trees, playground session steps) |
 | vouchers (§9): `ml-dsa-blind` issuing, `kuipa-voucher`, bound and bearer vouchers, voucher joins | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
+| secrets transport (§18): the `keys` operation, handler execution with runas, `kuipa keys fetch`, the `cn=masters` and CA-role policy, a promotion scenario in the playground | implemented, tested; the LDAP policy check **not yet run against a FreeIPA server**; sealed lightweight-CA artifacts (§18.3) designed |
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
@@ -2410,7 +2588,7 @@ like an enrollment string.
 | gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change merged as gssapi/gssproxy#135, **awaiting an upstream release** |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 
-### 18.2 Tests
+### 19.2 Tests
 
 | suite | covers |
 |---|---|
