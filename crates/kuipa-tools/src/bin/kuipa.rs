@@ -1096,16 +1096,8 @@ impl Rows {
     /// does the civil-date arithmetic, in UTC.
     fn until(&mut self, label: &str, value: &Value) {
         let Some(secs) = value.as_u64() else { return };
-        match synta::GeneralizedTime::from_unix(i64::try_from(secs).unwrap_or(i64::MAX)) {
-            Some(t) => self.row(
-                label,
-                format!(
-                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-                    t.year, t.month, t.day, t.hour, t.minute, t.second
-                ),
-            ),
-            None => self.row(label, secs.to_string()),
-        }
+        let text = kuipa_tools::text::date(secs).unwrap_or_else(|| secs.to_string());
+        self.row(label, text);
     }
 
     /// A file on this host.
@@ -1861,13 +1853,14 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
 
 fn render_seal(value: &Value) {
     if let Some(until) = get(value, "session_until").as_u64() {
+        let until = kuipa_tools::text::date(until).unwrap_or_else(|| until.to_string());
         if get(value, "offline").as_bool().unwrap_or(false) {
             println!(
-                "Offline session started: files sealed with --session open on this host without any server until {until} (Unix time), or `kuipa seal lock`."
+                "Offline session started: files sealed with --session open on this host without any server until {until}, or `kuipa seal lock`."
             );
         } else {
             println!(
-                "Session started: files open on this host without the passphrase or a ticket until {until} (Unix time), or `kuipa seal lock`."
+                "Session started: files open on this host without the passphrase or a ticket until {until}, or `kuipa seal lock`."
             );
         }
     }
@@ -1894,7 +1887,7 @@ fn render_seal(value: &Value) {
                 needs.push("your Kerberos ticket".to_owned());
             }
             rows.row("opening needs", needs.join(" and "));
-            rows.field("expires (Unix time)", get(policy, "not_after"));
+            rows.until("expires", get(policy, "not_after"));
             rows.field("unlocks so far", get(v, "unlocks"));
             rows.field("unlocks allowed", get(policy, "max_unlocks"));
             rows.field(
