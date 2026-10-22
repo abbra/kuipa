@@ -202,7 +202,7 @@ fn render(command: &Command, value: &serde_json::Value) {
                 .unwrap_or_default()
                 .enumerate()
             {
-                println!("  {:>4}  {}", i + 1, leaf.as_str().unwrap_or(""));
+                println!("  {:>4}  {}", i + 1, sanitize(leaf.as_str().unwrap_or("")));
             }
         }
         Command::Coverage { .. } => {
@@ -260,8 +260,18 @@ fn format_head(head: &serde_json::Value) -> String {
     format!(
         "{} leaves, root {}",
         head["size"].as_u64().unwrap_or(0),
-        head["root"].as_str().unwrap_or("?")
+        sanitize(head["root"].as_str().unwrap_or("?"))
     )
+}
+
+/// Server-supplied strings print as given except for control
+/// characters: a malicious server must not drive the auditor's
+/// terminal with escape sequences smuggled into an anchor, root or
+/// leaf string.
+fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '…' } else { c })
+        .collect()
 }
 
 /// The plain labelled rows the other tools print: label, two spaces,
@@ -287,12 +297,23 @@ impl Rows {
             serde_json::Value::Number(n) => n.to_string(),
             other => other.to_string(),
         };
-        self.row(label, text);
+        self.row(label, sanitize(&text));
     }
 
     fn print(&self) {
         for (label, value) in &self.lines {
             println!("{label:width$}  {value}", width = self.width);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize;
+
+    #[test]
+    fn control_characters_never_reach_the_terminal() {
+        assert_eq!(sanitize("thp\u{1b}[2J\u{7}root\nleaf"), "thp…[2J…root…leaf");
+        assert_eq!(sanitize("plain 43-char anchor"), "plain 43-char anchor");
     }
 }

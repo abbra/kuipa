@@ -8,7 +8,8 @@
 //! Every `--interval` seconds (and once at start) it fetches the
 //! origin's **public** endpoints — the plain advertisement, the anchor
 //! log and every anchor's claim-log pages — and stores them under
-//! `--data`.  It then answers, read-only:
+//! `--data` (the cache and sync live in `kuipa_tools::mirror`).  It
+//! then answers, read-only:
 //!
 //! * `/ipa/ku/adv` — the cached advertisement bytes as received: a
 //!   cached advertisement is valid until its own expiry.  A query
@@ -27,31 +28,15 @@
 //! verifications — the clients' own clocks decide, and the mirror
 //! cannot lie about it: it serves the signed bytes as received.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::response::IntoResponse;
 use clap::Parser;
+use kuipa_tools::mirror::{self, Cache};
 use kuipa_tools::net::{Endpoint, Trust};
-
-/// What the mirror holds: the public bytes it serves, and the queries
-/// it has seen (to fetch head answers for at the next sync).
-#[derive(Default)]
-struct Cache {
-    /// The plain advertisement, as received.
-    advertisement: RwLock<Option<Vec<u8>>>,
-    /// Advertisements by their full query string, as received: the
-    /// head-proof answers clients ask for by name.
-    heads: RwLock<std::collections::BTreeMap<String, Vec<u8>>>,
-    /// Head queries clients asked and no sync has fetched yet.
-    wanted: RwLock<std::collections::BTreeSet<String>>,
-    /// The anchor log, as received.
-    anchor_log: RwLock<Option<Vec<u8>>>,
-    /// Claim-log pages by `(anchor, from)`, as received.
-    claim_log: RwLock<std::collections::BTreeMap<(String, u64), Vec<u8>>>,
-}
 
 #[derive(Parser)]
 #[command(
@@ -69,8 +54,8 @@ struct Cli {
     /// The address to listen on.
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: String,
-    /// Where to keep the cache (default: a kuipa-mirror/ under the
-    /// system temporary directory).
+    /// Where to keep the cache (default: a private `kuipa-mirror-<pid>`
+    /// under the system temporary directory, mode `0700`).
     #[arg(long)]
     data: Option<PathBuf>,
     /// Seconds between syncs (default 60).
@@ -80,9 +65,13 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let dir = cli.data.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("kuipa-mirror-{}", std::process::id()))
-    });
+    let dir = match mirror::cache_dir(cli.data.as_deref(), std::process::id()) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("kuipa-mirror: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let cache = Arc::new(Cache::default());
     if let Err(e) = run(&cli, &dir, Arc::clone(&cache)) {
         eprintln!("kuipa-mirror: {e}");
@@ -91,7 +80,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(cli: &Cli, dir: &Path, cache: Arc<Cache>) -> Result<(), String> {
+fn run(cli: &Cli, dir: &std::path::Path, cache: Arc<Cache>) -> Result<(), String> {
     // Fail fast when the origin is unusable, before binding.
     drop(Endpoint::new(&cli.origin, &Trust::FirstContact).map_err(|e| e.to_string())?);
     {
@@ -101,9 +90,9 @@ fn run(cli: &Cli, dir: &Path, cache: Arc<Cache>) -> Result<(), String> {
         let interval = cli.interval;
         std::thread::spawn(move || {
             loop {
-                if let Err(e) = sync(&origin, &cache) {
+                if let Err(e) = mirror::sync(&origin, &cache) {
                     eprintln!("kuipa-mirror: sync: {e}");
-                } else if let Err(e) = store(&cache, &dir) {
+                } else if let Err(e) = mirror::store(&cache, &dir) {
                     eprintln!("kuipa-mirror: store: {e}");
                 }
                 std::thread::sleep(Duration::from_secs(interval.max(1)));
@@ -130,120 +119,6 @@ fn run(cli: &Cli, dir: &Path, cache: Arc<Cache>) -> Result<(), String> {
     })
 }
 
-/// Fetch the origin's public endpoints into the cache.
-fn sync(origin: &Endpoint, cache: &Cache) -> Result<(), String> {
-    // The plain advertisement, and the anchors it names.
-    let adv = origin.advertisement(&[]).map_err(|e| e.to_string())?;
-    let bytes = adv.to_json().into_bytes();
-    let anchors: Vec<String> = adv
-        .unverified_member("ipa")
-        .map_err(|e| e.to_string())?
-        .as_ref()
-        .and_then(|ipa| ipa.get("anchors"))
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|a| a.as_str().map(str::to_string))
-        .collect();
-    *cache
-        .advertisement
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bytes);
-    let mut heads = Vec::new();
-
-    // Every anchor's claim log, page by page; the head is the page's,
-    // recorded once per anchor.
-    for anchor in &anchors {
-        let a: tang_pqc::Thumbprint = anchor.parse().map_err(|_| format!("bad anchor {anchor}"))?;
-        let mut from = 0;
-        // Assigned on every round; the last one is kept.
-        let mut head;
-        loop {
-            let page = origin.claim_log(&a, from).map_err(|e| e.to_string())?;
-            let n = page.leaves.len();
-            let page_bytes = serde_json::to_vec(&page).map_err(|e| e.to_string())?;
-            cache
-                .claim_log
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert((anchor.clone(), from), page_bytes);
-            head = Some(serde_json::json!({
-                "anchor": page.anchor,
-                "size": page.size,
-                "root": tang_pqc::b64::encode(&page.root),
-            }));
-            if n == 0 {
-                break;
-            }
-            from += n as u64;
-        }
-        heads.extend(head);
-    }
-
-    // The anchor log, with the heads the pages just walked.
-    let entries = origin.anchor_log(0).map_err(|e| e.to_string())?;
-    let log = serde_json::to_vec(&serde_json::json!({ "entries": entries, "heads": heads }))
-        .map_err(|e| e.to_string())?;
-    *cache
-        .anchor_log
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(log);
-
-    // The head queries clients asked for: fetch and cache the origin's
-    // answers, so the next client with the same query gets the
-    // head-proof advertisement.
-    let wanted: Vec<String> = std::mem::take(
-        &mut *cache
-            .wanted
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-    .into_iter()
-    .collect();
-    for query in wanted {
-        if let Ok(answer) = origin.advertisement_query(query.as_str()) {
-            cache
-                .heads
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(query, answer);
-        }
-    }
-    Ok(())
-}
-
-/// Keep the cache under `dir`, so a restart starts warm.
-fn store(cache: &Cache, dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    if let Some(bytes) = cache
-        .advertisement
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-    {
-        std::fs::write(dir.join("adv"), bytes).map_err(|e| e.to_string())?;
-    }
-    if let Some(bytes) = cache
-        .anchor_log
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-    {
-        std::fs::write(dir.join("anchor-log"), bytes).map_err(|e| e.to_string())?;
-    }
-    for ((anchor, from), bytes) in cache
-        .claim_log
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-    {
-        std::fs::write(dir.join(format!("claim-log-{anchor}-{from}")), bytes)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 type Shared = Arc<Cache>;
 
 async fn adv(
@@ -252,29 +127,16 @@ async fn adv(
 ) -> axum::response::Response {
     let query = query.unwrap_or_default();
     if query.contains("head=") {
-        if let Some(bytes) = cache
-            .heads
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&query)
-            .cloned()
-        {
+        if let Some(bytes) = cache.head_answer(&query) {
             return binary(bytes);
         }
         // Not cached: remember the query for the next sync and serve
         // the plain advertisement — the client's stale-head fallback
         // (§4.9.2), which verifies through signatures.
-        cache
-            .wanted
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(query);
+        cache.remember_wanted(&query);
     }
     cache
-        .advertisement
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+        .advertisement()
         .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
 }
 
@@ -282,10 +144,7 @@ async fn anchor_log(
     axum::extract::State(cache): axum::extract::State<Shared>,
 ) -> axum::response::Response {
     cache
-        .anchor_log
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+        .anchor_log()
         .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
 }
 
@@ -301,11 +160,7 @@ async fn claim_log(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     cache
-        .claim_log
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&(anchor, from))
-        .cloned()
+        .claim_log(&anchor, from)
         .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
 }
 
