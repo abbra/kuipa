@@ -104,8 +104,95 @@ fn run(args: &[String]) -> Result<(), Error> {
     let (trusted_anchor, trusted_directory, trusted_url) = start_trusted(&trusted, &rt)?;
 
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &SERVERS, &[ADMIN]));
+    // Write the initial `cn=masters` state and watch for changes from
+    // `kuipa-playground masters` (the promotion story of §18): a thread
+    // applies them to the directory and acknowledges them.
+    {
+        let initial = serde_json::to_string_pretty(&serde_json::json!({
+            "masters": SERVERS,
+            "ca": [SERVERS[0]],
+        }))?;
+        std::fs::write(dir.join("masters.json"), &initial)?;
+        let watch = directory.clone();
+        let path = dir.join("masters.json");
+        let ack = dir.join("masters.ack");
+        std::thread::spawn(move || {
+            let mut last = String::new();
+            loop {
+                let applied = std::fs::read_to_string(&path)
+                    .ok()
+                    .filter(|text| *text != last)
+                    .and_then(|text| {
+                        serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .map(|state| (text, state))
+                    })
+                    .and_then(|(text, state)| {
+                        let names = |key: &str| -> Vec<String> {
+                            state[key]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
+                        };
+                        *watch.masters.lock().unwrap() = names("masters");
+                        *watch.ca_masters.lock().unwrap() = names("ca");
+                        std::fs::write(&ack, &text).is_ok().then_some(text)
+                    });
+                if let Some(text) = applied {
+                    last = text;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+    }
     // The playground realm's administrators allow offline vault sessions.
     directory.limits.lock().unwrap().offline_sessions = true;
+    // The secrets transport (§18): ipa1 is the CA and renewal master, as
+    // in a fresh IPA deployment, and holds the material a promoting
+    // replica would fetch (the DM password hash, the RA agent key, a
+    // CA subsystem key and a wrapped LWCA key).  The playground's
+    // directory stands in for the handler executables.
+    directory
+        .ca_masters
+        .lock()
+        .unwrap()
+        .push(SERVERS[0].to_owned());
+    {
+        let mut secrets = directory.key_secrets.lock().unwrap();
+        secrets.insert(
+            (kuipa_enroll::keys::Namespace::Dm.id(), "DMHash".into()),
+            b"{\"dmhash\":\"{SSHA512}playground-dm-hash\"}".to_vec(),
+        );
+        secrets.insert(
+            (kuipa_enroll::keys::Namespace::Ra.id(), "ipaCert".into()),
+            br#"{"export password":"playground","pkcs12 data":"cmVwbGF5Z3JvdW5kLXJhLWFnZW50"}"#
+                .to_vec(),
+        );
+        // The four CA subsystem keys a CA clone fetches, one at a time
+        // (`CustodiaInstance.get_ca_keys`).
+        for nickname in [
+            "caSigningCert cert-pki-ca",
+            "ocspSigningCert cert-pki-ca",
+            "auditSigningCert cert-pki-ca",
+            "subsystemCert cert-pki-ca",
+        ] {
+            secrets.insert(
+                (kuipa_enroll::keys::Namespace::Ca.id(), nickname.into()),
+                br#"{"export password":"playground","pkcs12 data":"cGxheWdyb3VuZC1jYS1zaWduaW5n"}"#
+                    .to_vec(),
+            );
+        }
+        secrets.insert(
+            (
+                kuipa_enroll::keys::Namespace::CaWrapped.id(),
+                "lwca-signing".into(),
+            ),
+            br#"{"wrapped_key":"cGxheWdyb3VuZC1sd2Nh","certificate":"-----BEGIN CERTIFICATE-----"}"#
+                .to_vec(),
+        );
+    }
     let Started {
         anchor,
         mut endpoints,
@@ -560,6 +647,25 @@ pq_tang() {{
     printf '{{"url":"%s","thp":"%s"}}\n' "$(cat "$KUIPA_PLAYGROUND/tang/$s.url")" \
         "$(cat "$KUIPA_PLAYGROUND/tang/$s.thp")"
 }}
+# pq_promote NAME: imitate a replica promotion's secret fetches (§18):
+# the DM password hash, the RA agent key and the CA subsystem keys a
+# promoting CA replica receives from a peer, with kuipa keys fetch.
+# With --ca-less, only the fetches every replica makes (dm, ra).
+pq_promote() {{
+    local name="$1"; shift
+    pq_host "$name"
+    local d="$KUIPA_ROOT/promotion"; mkdir -p "$d"
+    # The steps before this one already fetched some of it: a promotion
+    # idempotently re-fetches what it does not have.
+    [ -f "$d/dmhash" ] || kuipa keys fetch dm/DMHash --out "$d/dmhash" || return
+    [ -f "$d/ra-agent.p12" ] || kuipa keys fetch ra/ipaCert --out "$d/ra-agent.p12" || return
+    case " $* " in *" --ca-less "*) return 0;; esac
+    for nickname in "caSigningCert cert-pki-ca" "ocspSigningCert cert-pki-ca" \
+                    "auditSigningCert cert-pki-ca" "subsystemCert cert-pki-ca"; do
+        [ -f "$d/$nickname.p12" ] || kuipa keys fetch "ca/$nickname" --out "$d/$nickname.p12" || return
+    done
+    echo "promotion material fetched into $d"
+}}
 # pq_voucher NAME [--bound] [kuipa enroll options]: enroll a new host NAME
 # with a voucher in host group webservers: blind it, have the issuer
 # ($KUIPA_PLAYGROUND/voucher, quota 100) sign it, unblind it, enroll.
@@ -671,6 +777,7 @@ fn main() -> std::process::ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
         Some("stage") => stage(&args[1..]),
+        Some("masters") => masters(&args[1..]),
         _ => Err("usage: kuipa-playground {run --env-file F [--hosts N] | stage --host FQDN (--recipient JWK | --secret) --out FILE}".into()),
     };
     match result {
@@ -680,4 +787,61 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// `kuipa-playground masters [--add FQDN] [--remove FQDN] [--ca FQDN]`:
+/// edit the modelled `cn=masters` list and CA roles, the way a replica
+/// promotion adds the promoting host and `ipa-ca-install` records the CA
+/// role.  The running playground applies the change and acknowledges it
+/// in `masters.ack`; this waits for that, so the next command sees it.
+fn masters(args: &[String]) -> Result<(), Error> {
+    let pg =
+        PathBuf::from(std::env::var("KUIPA_PLAYGROUND").map_err(|_| "run inside the playground")?);
+    let path = pg.join("masters.json");
+    let mut state: std::collections::BTreeMap<String, Vec<String>> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut add: Option<String> = None;
+    let mut remove: Option<String> = None;
+    let mut ca: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--add" => add = it.next().cloned(),
+            "--remove" => remove = it.next().cloned(),
+            "--ca" => ca = it.next().cloned(),
+            _ => return Err(format!("unknown option: {arg}").into()),
+        }
+    }
+    if let Some(fqdn) = add {
+        state
+            .entry("masters".into())
+            .or_default()
+            .push(fqdn.clone());
+        println!("{fqdn} joined cn=masters (promotion)");
+    }
+    if let Some(fqdn) = remove {
+        if let Some(list) = state.get_mut("masters") {
+            list.retain(|s| *s != fqdn);
+        }
+        println!("{fqdn} left cn=masters (ipa-server-del)");
+    }
+    if let Some(fqdn) = ca {
+        state.entry("ca".into()).or_default().push(fqdn.clone());
+        println!("{fqdn} has the CA role (ipa-ca-install)");
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&state)?)?;
+    let written = std::fs::read_to_string(&path)?;
+    let ack = pg.join("masters.ack");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(&ack).is_ok_and(|a| a == written) {
+            println!("the playground applied the change");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("kuipa-playground: the playground did not acknowledge; is it running?");
+    Ok(())
 }
