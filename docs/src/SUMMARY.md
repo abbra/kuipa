@@ -13,6 +13,7 @@
 - [Keys and rotation](realm/keys.md)
 - [Trusted realms](realm/trusts.md)
 - [Limits and revocation](realm/limits.md)
+- [Auditing and mirroring](realm/audit.md)
 
 # Host administrators
 

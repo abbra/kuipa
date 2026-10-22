@@ -66,6 +66,26 @@ two demands that both vouch for a server, so one stolen anchor cannot
 impersonate the realm to it. In a realm with a single anchor server, pin
 exactly one.
 
+### Frozen pins
+
+A pin line may end in `frozen`: the host then verifies the realm
+**only** against that pin's vouch heads, never falling back to a
+signature, for the host's lifetime. What the head covers — the claims
+in the tree when the pin was written — is all it ever accepts; a
+renewed claim outside the tree is refused, naming the freeze:
+
+```text
+# /etc/ipa/ku-anchors: a frozen pin, its head pinned
+pjLVUZeo5CYHWwNIxNTa1uAyFIRS9Z6NVW7X2h_qgOQ 1798761600 12 4hZ2…9kQ frozen
+```
+
+This is for appliances and images whose trust must not move without an
+operator: the enrollment writes the host's keys as usual, but its pin
+file's frozen lines are preserved untouched beside them. Unfreeze by
+editing the pin file (removing the marker) or re-provisioning. `kuipa
+status` marks frozen pins; `kuipa check` refuses a server whose claims
+the frozen head cannot prove.
+
 ## Vouchers
 
 Vouchers let something else (an autoscaler, an image pipeline) decide
