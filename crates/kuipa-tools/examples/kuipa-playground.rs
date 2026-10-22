@@ -574,7 +574,7 @@ pq_voucher() {{
         rm -f "$eph"
         local b
         b=$(kuipa voucher-key --out "$eph" --json | sed 's/.*"binding":"\([^"]*\)".*/\1/')
-        bind=(--binding "$b") key=(--ephemeral-key "$eph")
+        bind=("--binding=$b") key=("--ephemeral-key=$eph")
     fi
     kuipa-voucher request --public "$v/issuer.jwk" --realm {REALM} --fqdn "$PQ_HOST" \
         --hostgroup webservers "${{bind[@]}}" --state "$v/$name.state" \
