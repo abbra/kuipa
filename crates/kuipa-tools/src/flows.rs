@@ -132,6 +132,7 @@ pub(crate) fn verified(
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    frozen: &[Thumbprint],
     known: Option<Epoch>,
 ) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), String> {
     let endpoint = Endpoint::new(server, trust).map_err(|e| e.to_string())?;
@@ -156,6 +157,15 @@ pub(crate) fn verified(
         tracing::debug!(server = %server, "advertisement rejected: {e}");
         format!("advertisement: {e}")
     })?;
+    // A frozen pin accepts a head proof only (DESIGN-claim-logs.md §2):
+    // no signature fallback, and the refusal names the freeze.
+    if let Some(a) = frozen.first()
+        && advertisement.head_anchor().is_none()
+    {
+        return Err(format!(
+            "frozen: the pinned head of {a} does not prove this claim"
+        ));
+    }
     trace_advertisement(server, &advertisement);
     for (old, new) in advertisement.succeeded() {
         tracing::debug!(server = %server, "pinned anchor {old} was rotated: succeeded by {new}");
@@ -365,13 +375,14 @@ fn path_for(op: Operation, request: &Request) -> String {
 /// server whose verified advertisement describes another deployment stops
 /// the exchange before anything is sent: that is an attack or a
 /// misconfiguration, and failing over would hide it.
-#[allow(clippy::too_many_arguments)] // heads joined the anchors, as they travel together
+#[allow(clippy::too_many_arguments)] // heads and frozen travel with the anchors
 fn exchange(
     deployment: &Deployment,
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    frozen: &[Thumbprint],
     known: Option<(u64, [u8; 32])>,
     op: Operation,
     build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -382,6 +393,7 @@ fn exchange(
         realm,
         anchors,
         heads,
+        frozen,
         known,
         op,
         build,
@@ -401,6 +413,7 @@ pub(crate) fn exchange_with<T>(
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    frozen: &[Thumbprint],
     known: Option<(u64, [u8; 32])>,
     op: Operation,
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -408,7 +421,8 @@ pub(crate) fn exchange_with<T>(
 ) -> Result<(T, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        let (endpoint, adv, _) = match verified(server, trust, realm, anchors, heads, known) {
+        let (endpoint, adv, _) = match verified(server, trust, realm, anchors, heads, frozen, known)
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(server = %server, "skipped, trying the next server: {e}");
@@ -664,11 +678,13 @@ pub fn check_string(string: &EnrollmentString) -> Result<(), Error> {
 /// # Errors
 ///
 /// [`Outcome`] for retry/administrator cases, or any other error.
+#[allow(clippy::too_many_arguments)] // heads and frozen travel with the anchors
 pub fn enroll_online(
     paths: &Paths,
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    frozen: &[Thumbprint],
     auth: &Auth,
     fqdn: &str,
     deployment: &Deployment,
@@ -695,6 +711,7 @@ pub fn enroll_online(
         realm,
         anchors,
         heads,
+        frozen,
         None,
         op,
         |adv| {
@@ -890,7 +907,7 @@ pub(crate) fn all_servers(
         .servers
         .iter()
         .filter_map(|s| {
-            verified(s, trust, &state.realm, anchors, &[], None)
+            verified(s, trust, &state.realm, anchors, &[], &[], None)
                 .ok()
                 .map(|(_, v, _)| v)
                 .filter(|v| check_deployment(s, v, &deployment).is_ok())
@@ -947,6 +964,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         &trust,
         &state.realm,
         &anchors,
+        &[],
         &[],
         known,
         Operation::Rekey,
@@ -1251,6 +1269,7 @@ fn register(
         &state.realm,
         &anchors,
         &[],
+        &[],
         known,
         Operation::Register,
         |adv| {
@@ -1519,7 +1538,7 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         .iter()
         .filter(|s| only.is_none_or(|o| o == s.as_str()))
     {
-        match verified(server, &trust, &state.realm, &anchors, &[], known).and_then(
+        match verified(server, &trust, &state.realm, &anchors, &[], &[], known).and_then(
             |(e, adv, advance)| {
                 adv.check_deployment(&Deployment::servers(&state.servers))
                     .map(|()| (e, adv, advance))
@@ -1620,7 +1639,7 @@ pub fn advertisements(
     let trust = Trust::FirstContact;
     let mut servers = Vec::new();
     for server in &deployment.servers {
-        let detail = match verified(server, &trust, realm, anchors, heads, None).and_then(
+        let detail = match verified(server, &trust, realm, anchors, heads, &[], None).and_then(
             |(endpoint, adv, _)| {
                 adv.check_deployment(deployment)
                     .map(|()| (endpoint, adv))
@@ -1901,7 +1920,15 @@ pub fn realm_info(
 ) -> Result<Value, Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        match verified(server, &Trust::FirstContact, realm, anchors, heads, None) {
+        match verified(
+            server,
+            &Trust::FirstContact,
+            realm,
+            anchors,
+            heads,
+            &[],
+            None,
+        ) {
             Ok((_, adv, _)) => {
                 check_deployment(server, &adv, deployment)?;
                 let anchors_file = dir.join("pkinit-anchors.pem");
@@ -1966,11 +1993,12 @@ fn install_trust(
             .map(|a| Pin {
                 anchor: *a,
                 exp: None,
-                head: t
+                heads: t
                     .heads
                     .iter()
                     .find(|h| &h.anchor == a)
-                    .map(|h| (h.size, h.root)),
+                    .map_or_else(Vec::new, |h| vec![(h.size, h.root)]),
+                frozen: false,
             })
             .collect::<Vec<_>>(),
         None,
@@ -2011,7 +2039,7 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
         .servers
         .iter()
         .find_map(
-            |s| match verified(s, &trust, &state.realm, &anchors, &[], None) {
+            |s| match verified(s, &trust, &state.realm, &anchors, &[], &[], None) {
                 Ok((_, v, _)) => Some(v),
                 Err(e) => {
                     skipped.push(format!("{s}: {e}"));
@@ -2048,7 +2076,15 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
         let heads = t.pins();
         let adv = if errors.is_empty() {
             t.servers.iter().find_map(|s| {
-                match verified(s, &Trust::FirstContact, &t.realm, &t.anchors, &heads, None) {
+                match verified(
+                    s,
+                    &Trust::FirstContact,
+                    &t.realm,
+                    &t.anchors,
+                    &heads,
+                    &[],
+                    None,
+                ) {
                     Ok((_, v, _)) => Some(v),
                     Err(e) => {
                         errors.push(format!("{s}: {e}"));

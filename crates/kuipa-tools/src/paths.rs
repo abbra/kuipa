@@ -415,18 +415,36 @@ pub fn read_anchor_pins(path: &Path) -> Result<Vec<Pin>, Error> {
     Ok(read_anchors_file(path)?.0)
 }
 
-/// One pin of an anchors file: the thumbprint, an optional expiry, and
-/// the optional vouch head (§4.9) pinned next to it.
+/// One pin of an anchors file: the thumbprint, an optional expiry, the
+/// vouch heads (§4.9) pinned next to it, and whether the pin is frozen.
+///
+/// The heads are a **window** (DESIGN-claim-logs.md §1): every head
+/// the host verified for the anchor, oldest first, at most
+/// [`MAX_HEAD_WINDOW`] of them.  A claim under any of them verifies
+/// head-wise, since every prefix of the claim log is the tree an
+/// earlier vouch signed; a claim older than the oldest falls back to a
+/// signature proof — unless the pin is frozen, which removes the
+/// fallback (DESIGN-claim-logs.md §2): what the head covers is all the
+/// pin ever accepts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pin {
     /// The pinned anchor.
     pub anchor: tang_pqc::Thumbprint,
     /// When the pin expires (Unix seconds).
     pub exp: Option<u64>,
-    /// The pinned vouch head (§4.9): `(size, root)` of the anchor's
-    /// claim log.
-    pub head: Option<(u64, [u8; 32])>,
+    /// The pinned vouch heads (§4.9), oldest first: a window over the
+    /// anchor's claim log.
+    pub heads: Vec<(u64, [u8; 32])>,
+    /// The pin never falls back to a signature proof
+    /// (DESIGN-claim-logs.md §2): what the heads cover is all it
+    /// accepts, for the host's lifetime, moved only by an operator.
+    pub frozen: bool,
 }
+
+/// Most heads kept in one pin's window (DESIGN-claim-logs.md §1.2):
+/// enough to cover a month of daily re-vouching with room for
+/// refreshes in between, small enough that a pin line stays a line.
+pub const MAX_HEAD_WINDOW: usize = 4;
 
 /// The anchor epoch watermark stored in an anchors file (§4.8): the
 /// `(seq, head)` of the last entry of the anchor log this host has
@@ -475,32 +493,57 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
             continue;
         }
         let anchor = first.parse()?;
-        // The rest is `[<expiry>] [<size> <root>]`, in either combination:
-        // an expiry is a decimal number, a head is a number followed by a
-        // thumbprint, and a lone number is an expiry.  Look at the field
-        // after the first number to tell them apart.
-        let rest: Vec<&str> = fields.collect();
-        let (exp, head) = match rest.as_slice() {
-            [] => (None, None),
-            [e] => (Some(parse_expiry(e, l, path)?), None),
-            [e, root] => {
-                // Either `<expiry> <root>` (nonsense: a root without a
-                // size) or `<size> <root>` with no expiry: the second
-                // field is a thumbprint either way, so the first is the
-                // head's size.
-                let root = parse_root(root, l, path)?;
-                (None, Some((parse_size(e, l, path)?, root)))
+        // The rest is `[<expiry>] [<size> <root>]… [frozen]`: an expiry
+        // is a decimal number, a head is a number followed by a
+        // thumbprint, and a lone number is an expiry.  The field after
+        // the first number tells an expiry from a size.  The head pairs
+        // are a window, oldest first (DESIGN-claim-logs.md §1.2), and
+        // `frozen` (DESIGN-claim-logs.md §2) removes the signature
+        // fallback.
+        let mut rest: Vec<&str> = fields.collect();
+        let frozen = rest.last().is_some_and(|f| *f == "frozen");
+        if frozen {
+            rest.pop();
+            if rest.is_empty() {
+                // Frozen pins a head (DESIGN-claim-logs.md §2): what
+                // the head covers is what the pin accepts.
+                return Err(format!("{}: frozen without a head in {l:?}", path.display()).into());
             }
-            [e, size, root] => {
-                let exp = parse_expiry(e, l, path)?;
+        }
+        let (exp, heads) = match rest.as_slice() {
+            [] => (None, Vec::new()),
+            [e] => (Some(parse_expiry(e, l, path)?), Vec::new()),
+            [e, size, root, tail @ ..] => {
                 let root = parse_root(root, l, path)?;
-                (Some(exp), Some((parse_size(size, l, path)?, root)))
+                let first = (parse_size(size, l, path)?, root);
+                let mut heads = vec![first];
+                heads.extend(parse_pairs(tail, l, path)?);
+                (Some(parse_expiry(e, l, path)?), heads)
+            }
+            [e, size, ..] if looks_like_head(e, size) => {
+                // `<size> <root>` with no expiry, then more pairs.
+                let mut heads = parse_pairs(&rest, l, path)?;
+                check_window(&heads, l, path)?;
+                (None, std::mem::take(&mut heads))
             }
             _ => {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
             }
         };
-        pins.push(Pin { anchor, exp, head });
+        check_window(&heads, l, path)?;
+        if heads.len() > MAX_HEAD_WINDOW {
+            return Err(format!(
+                "{}: more than {MAX_HEAD_WINDOW} heads in {l:?}",
+                path.display()
+            )
+            .into());
+        }
+        pins.push(Pin {
+            anchor,
+            exp,
+            heads,
+            frozen,
+        });
     }
     Ok((pins, epoch))
 }
@@ -519,6 +562,51 @@ fn parse_size(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
         return Err(format!("{}: zero head size in {line:?}", path.display()).into());
     }
     Ok(size)
+}
+
+/// Whether `size`-then-`root` reads as a head pair whose first field
+/// is a size, not an expiry followed by one: the second field parses
+/// as a thumbprint either way, so the first is the size when what
+/// follows the pair is another pair or the line's end — in practice,
+/// an expiry is never followed by a number that is itself followed by
+/// a thumbprint.
+fn looks_like_head(first: &str, second: &str) -> bool {
+    first.parse::<u64>().is_ok() && second.parse::<tang_pqc::Thumbprint>().is_ok()
+}
+
+/// Parse `<size> <root>` pairs, oldest first.
+///
+/// # Errors
+///
+/// A malformed size or root.
+fn parse_pairs(fields: &[&str], line: &str, path: &Path) -> Result<Vec<(u64, [u8; 32])>, Error> {
+    if !fields.len().is_multiple_of(2) {
+        return Err(format!("{}: odd head fields in {line:?}", path.display()).into());
+    }
+    fields
+        .chunks(2)
+        .map(|pair| {
+            Ok((
+                parse_size(pair[0], line, path)?,
+                parse_root(pair[1], line, path)?,
+            ))
+        })
+        .collect()
+}
+
+/// A window's heads must strictly grow (DESIGN-claim-logs.md §1.2):
+/// the file is an administrator's assertion and must round-trip.
+///
+/// # Errors
+///
+/// A duplicate or shrinking head.
+fn check_window(heads: &[(u64, [u8; 32])], line: &str, path: &Path) -> Result<(), Error> {
+    for pair in heads.windows(2) {
+        if pair[1].0 <= pair[0].0 {
+            return Err(format!("{}: head sizes must grow in {line:?}", path.display()).into());
+        }
+    }
+    Ok(())
 }
 
 fn parse_root(field: &str, line: &str, path: &Path) -> Result<[u8; 32], Error> {
@@ -574,7 +662,8 @@ pub fn write_anchors_epoch_with_heads(
             .map(|(a, head)| Pin {
                 anchor: *a,
                 exp: None,
-                head: *head,
+                heads: head.map_or_else(Vec::new, |h| vec![h]),
+                frozen: false,
             })
             .collect::<Vec<_>>(),
         epoch,
@@ -625,9 +714,12 @@ pub fn write_anchor_pins(
         if let Some(e) = pin.exp {
             write!(text, " {e}").expect("a String sink never fails");
         }
-        if let Some((size, root)) = pin.head {
-            write!(text, " {size} {}", tang_pqc::Thumbprint::from_bytes(root))
+        for (size, root) in &pin.heads {
+            write!(text, " {size} {}", tang_pqc::Thumbprint::from_bytes(*root))
                 .expect("a String sink never fails");
+        }
+        if pin.frozen {
+            text.push_str(" frozen");
         }
         text.push('\n');
     }
@@ -692,17 +784,20 @@ mod tests {
                 Pin {
                     anchor: a,
                     exp: None,
-                    head: None
+                    heads: Vec::new(),
+                    frozen: false
                 },
                 Pin {
                     anchor: b,
                     exp: Some(now + 3600),
-                    head: None
+                    heads: Vec::new(),
+                    frozen: false
                 },
                 Pin {
                     anchor: c,
                     exp: Some(now - CLOCK_SKEW - 1),
-                    head: None
+                    heads: Vec::new(),
+                    frozen: false
                 },
             ]
         );
@@ -717,14 +812,30 @@ mod tests {
             "expired pin left out"
         );
 
+        let root = |n: u8| tang_pqc::Thumbprint::from_bytes([n; 32]);
         for bad in [
             format!("{a} soon\n"),
             format!("{a} 1 2 3\n"),
             // A lone number is an expiry; two numbers are not a head.
-            format!("{a} 0 {}\n", tang_pqc::Thumbprint::from_bytes([9; 32])),
+            format!("{a} 0 {}\n", root(9)),
             format!("{a} 1 2\n"),
             format!("{a} 1 2 3 4\n"),
-            format!("{a} x {}\n", tang_pqc::Thumbprint::from_bytes([9; 32])),
+            format!("{a} x {}\n", root(9)),
+            // Windows (DESIGN-claim-logs.md §1.2): sizes must grow, at
+            // most MAX_HEAD_WINDOW, in pairs.
+            format!("{a} 5 {} 5 {}\n", root(1), root(2)),
+            format!("{a} 5 {} 4 {}\n", root(1), root(2)),
+            format!(
+                "{a} 1 {} 2 {} 3 {} 4 {} 5 {}\n",
+                root(1),
+                root(2),
+                root(3),
+                root(4),
+                root(5)
+            ),
+            format!("{a} 1 {} 2\n", root(1)),
+            // Frozen needs heads.
+            format!("{a} frozen\n"),
             "short\n".into(),
             "epoch nope xx\n".into(),
             "epoch 7 notahash\n".into(),
@@ -748,7 +859,8 @@ mod tests {
             &[Pin {
                 anchor: a,
                 exp: None,
-                head: Some((5, [8; 32])),
+                heads: vec![(5, [8; 32])],
+                frozen: false,
             }],
             None,
         )
@@ -758,7 +870,8 @@ mod tests {
             vec![Pin {
                 anchor: a,
                 exp: None,
-                head: Some((5, [8; 32])),
+                heads: vec![(5, [8; 32])],
+                frozen: false,
             }]
         );
         write_anchor_pins(
@@ -767,7 +880,8 @@ mod tests {
             &[Pin {
                 anchor: a,
                 exp: Some(now + 3600),
-                head: Some((3, [4; 32])),
+                heads: vec![(3, [4; 32])],
+                frozen: false,
             }],
             Some((3, [4; 32])),
         )
@@ -777,10 +891,22 @@ mod tests {
             vec![Pin {
                 anchor: a,
                 exp: Some(now + 3600),
-                head: Some((3, [4; 32])),
+                heads: vec![(3, [4; 32])],
+                frozen: false,
             }]
         );
         assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 32])));
+
+        // A window round-trips: several heads, oldest first, and the
+        // frozen marker (DESIGN-claim-logs.md §1.2, §2).
+        let window = Pin {
+            anchor: a,
+            exp: Some(now + 3600),
+            heads: vec![(3, [4; 32]), (7, [5; 32]), (9, [6; 32])],
+            frozen: true,
+        };
+        write_anchor_pins(&path, "test", std::slice::from_ref(&window), None).unwrap();
+        assert_eq!(read_anchor_pins(&path).unwrap(), vec![window]);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

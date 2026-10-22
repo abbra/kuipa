@@ -544,6 +544,14 @@ impl VerifiedRealm {
         &self.delegation.anchor
     }
 
+    /// The pinned anchor whose **head** proved the delegation, if one
+    /// did (§4.9): `None` when a signature was checked.  A frozen pin
+    /// demands one of these (DESIGN-claim-logs.md §2).
+    #[must_use]
+    pub fn head_anchor(&self) -> Option<Thumbprint> {
+        self.delegation.head_anchor
+    }
+
     /// When the accepted anchor's vouch expires (Unix seconds).
     #[must_use]
     pub fn vouched_until(&self) -> u64 {
