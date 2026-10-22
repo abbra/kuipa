@@ -1,3 +1,4 @@
+---
 # Build the user documentation (docs/, an mdBook with Mermaid diagrams)
 # and publish it on GitHub Pages.  Pull requests build it without
 # publishing, so a broken book is caught before it merges.
