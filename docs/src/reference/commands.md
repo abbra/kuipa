@@ -65,6 +65,23 @@ usage.
 | `finish --state F` | provisioner | unblind the issuer's answer; print the voucher |
 | `show` | anyone | print a voucher's claims |
 
+## kuipa-audit
+
+Read-only reports on a realm's claim logs (no keys, no writes; exit
+status 2 for a split view):
+
+| invocation | does |
+|---|---|
+| `claim-log --server S --anchor THP [--from N]` | one anchor's claim-log page, decoded: leaves, the head, the signed vouch |
+| `coverage --server S [--anchor THP…] [--pinned-head "THP SIZE ROOT"…]` | what the pinned heads cover, and whether the server's log extends them |
+| `split-view --server S1 --server S2…` | the heads each server answers, and where they disagree |
+
+## kuipa-mirror
+
+| invocation | does |
+|---|---|
+| `--origin URL --listen ADDR [--data DIR] [--interval N]` | sync one server's public endpoints and serve them read-only: advertisements (head-proof answers cached), the anchor log, claim-log pages. No keys, no authenticated route; port 0 in `--listen` picks a free port and prints it |
+
 ## kuipad (IPA servers)
 
 | command | does |
