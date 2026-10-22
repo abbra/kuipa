@@ -562,6 +562,15 @@ job_playground_test() {
         fail "playground-test requires node (>= 22) to render the session's terminal captures"
         return 1
     fi
+    # The terminal captures need svg-terminal (contrib/ci/playground/
+    # package.json); with npm present, install it when it is missing.
+    # Without npm the captures are skipped below, as before.
+    if [[ ! -d "$SCRIPT_DIR/playground/node_modules/svg-terminal" ]] \
+        && command -v npm >/dev/null 2>&1; then
+        echo "Installing svg-terminal (npm ci in contrib/ci/playground/)…"
+        (cd "$SCRIPT_DIR/playground" && npm ci --no-fund --no-audit) \
+            || warn "npm ci failed — terminal captures may be skipped"
+    fi
 
     # The report is a directory: index.html plus the svg/ captures, one
     # animated terminal per session section.
