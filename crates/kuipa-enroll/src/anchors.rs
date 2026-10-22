@@ -69,13 +69,16 @@ pub fn needs_vouch(own: Option<&SignedVouch>, leaves: &[Hash], now: u64, interva
     if now >= vouch.iat + (vouch.exp - vouch.iat) / 2 {
         return true;
     }
-    let mut sorted = leaves.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    if v.leaves() == sorted.as_slice() {
+    let mut wanted = leaves.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut have = v.leaves().to_vec();
+    have.sort_unstable();
+    have.dedup();
+    if have == wanted {
         return false;
     }
-    let drops = v.leaves().iter().any(|l| sorted.binary_search(l).is_err());
+    let drops = have.iter().any(|l| wanted.binary_search(l).is_err());
     drops || now.saturating_sub(vouch.iat) >= interval
 }
 
@@ -965,8 +968,16 @@ mod tests {
             let leaves = t.leaves().unwrap();
             if self.anchored && needs_vouch(state.vouch(&self.thp()), &leaves, NOW, self.interval) {
                 let iat = next_vouch_iat(state.vouch(&self.thp()), NOW);
-                let v = SignedVouch::issue(&self.anchor, REALM, leaves, iat, iat + VOUCH_VALIDITY)
-                    .unwrap();
+                let previous = state.vouch(&self.thp()).cloned();
+                let v = SignedVouch::issue(
+                    &self.anchor,
+                    REALM,
+                    leaves,
+                    iat,
+                    iat + VOUCH_VALIDITY,
+                    previous.as_ref(),
+                )
+                .unwrap();
                 state.put(Entry::Vouch(v), REALM, &p, NOW, clock).unwrap();
             }
             t
@@ -1342,7 +1353,7 @@ mod tests {
             )
             .is_err()
         );
-        let forged = SignedVouch::issue(&b.anchor, REALM, [[1; 32]], NOW, NOW + 100).unwrap();
+        let forged = SignedVouch::issue(&b.anchor, REALM, [[1; 32]], NOW, NOW + 100, None).unwrap();
         let mut wrong_key = AnchorState::default();
         wrong_key
             .put(

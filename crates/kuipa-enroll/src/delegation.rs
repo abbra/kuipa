@@ -223,8 +223,14 @@ pub struct SignedVouch {
 
 impl SignedVouch {
     /// Vouch, as `anchor`, for the claims with these `leaves` in `realm`,
-    /// valid from `iat` to `exp`.  Leaves are sorted and deduplicated, so
-    /// every server derives the same tree from the same claims.
+    /// valid from `iat` to `exp`.  The leaves are the anchor's **claim
+    /// log** (§4.9): deduplicated, in log order.  They extend the previous
+    /// vouch's log where they can — the old log kept, in its order, with
+    /// new claims appended — and start a fresh log where they cannot
+    /// (a claim dropped, an unknown previous log).  The tree is over that
+    /// order, so every prefix of the log is the tree an earlier vouch
+    /// signed: a head pinned at that prefix verifies without the
+    /// signature.
     ///
     /// # Errors
     ///
@@ -236,11 +242,10 @@ impl SignedVouch {
         leaves: impl IntoIterator<Item = Hash>,
         iat: u64,
         exp: u64,
+        previous: Option<&SignedVouch>,
     ) -> Result<Self> {
         check_period(iat, exp, MAX_VOUCH_VALIDITY, "vouch validity")?;
-        let mut leaves: Vec<Hash> = leaves.into_iter().collect();
-        leaves.sort_unstable();
-        leaves.dedup();
+        let leaves = continue_log(leaves, previous);
         let vouch = Vouch {
             realm: realm.into(),
             anchor: *anchor.public().thumbprint(),
@@ -270,8 +275,8 @@ impl SignedVouch {
     }
 
     /// Check it against the anchor's `key`: the key's thumbprint, the
-    /// policy, the signature, and that the leaves are sorted, unique and
-    /// make the signed tree.
+    /// policy, the signature, and that the leaves are unique and make the
+    /// signed tree, in their log order.
     ///
     /// # Errors
     ///
@@ -283,7 +288,12 @@ impl SignedVouch {
         }
         key.verify_with_context(&self.vouch.to_bytes(), VOUCH_CONTEXT, &self.signature)
             .map_err(|_| Error::UntrustedAnchor)?;
-        if !self.leaves.windows(2).all(|w| w[0] < w[1])
+        if self
+            .leaves
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != self.leaves.len()
             || self.leaves.len() as u64 != self.vouch.size
             || merkle::root(&self.leaves)? != self.vouch.root
         {
@@ -298,7 +308,7 @@ impl SignedVouch {
     ///
     /// An OpenSSL error.
     pub fn covers(&self, claim: &Claim) -> Result<bool> {
-        Ok(self.leaves.binary_search(&claim.leaf()?).is_ok())
+        Ok(self.leaves.contains(&claim.leaf()?))
     }
 
     /// The proof that it covers `claim`, by the anchor with `key`; `None`
@@ -308,7 +318,8 @@ impl SignedVouch {
     ///
     /// An OpenSSL error.
     pub fn proof(&self, claim: &Claim, key: &VerifyingKey) -> Result<Option<Proof>> {
-        let Ok(index) = self.leaves.binary_search(&claim.leaf()?) else {
+        let leaf = claim.leaf()?;
+        let Some(index) = self.leaves.iter().position(|l| *l == leaf) else {
             return Ok(None);
         };
         Ok(Some(Proof {
@@ -321,6 +332,54 @@ impl SignedVouch {
                 .map(|h| b64::encode(h))
                 .collect(),
         }))
+    }
+
+    /// The head of this vouch's claim log: the `(size, root)` a client
+    /// can pin, so an inclusion proof at that prefix verifies with no
+    /// signature (§4.9).
+    #[must_use]
+    pub fn head(&self) -> (u64, Hash) {
+        (self.vouch.size, self.vouch.root)
+    }
+
+    /// The prefix head proof for `claim` against the pinned `head`: the
+    /// claim's position in the log and its inclusion path within the
+    /// first `head.0` leaves.  `None` if the claim is not in that
+    /// prefix, or the prefix does not make the pinned root (a stale
+    /// head, or another anchor's log).
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn head_proof(
+        &self,
+        claim: &Claim,
+        anchor: &Thumbprint,
+        head: (u64, Hash),
+    ) -> Result<Option<HeadProof>> {
+        let prefix = usize::try_from(head.0)
+            .ok()
+            .filter(|n| *n <= self.leaves.len());
+        if anchor != &self.vouch.anchor
+            || prefix.is_none()
+            || merkle::root(&self.leaves[..prefix.unwrap_or(0)])? != head.1
+        {
+            return Ok(None);
+        }
+        let leaf = claim.leaf()?;
+        let prefix = &self.leaves[..prefix.unwrap_or(0)];
+        let Some(index) = prefix.iter().position(|l| *l == leaf) else {
+            return Ok(None);
+        };
+        Ok(Some(HeadProof::new(
+            *anchor,
+            index as u64,
+            head.0,
+            merkle::path(prefix, index)?
+                .iter()
+                .map(|h| b64::encode(h))
+                .collect(),
+        )))
     }
 
     /// Encode: `IPSV ‖ 1 ‖ vouch ‖ signature ‖ n(u64) ‖ leaves(32·n)`.
@@ -361,6 +420,35 @@ impl SignedVouch {
             leaves,
         })
     }
+}
+
+/// The next claim log for an anchor that vouches for `leaves`, given its
+/// `previous` vouch: the previous log kept, in its order, with the new
+/// leaves appended; or a fresh log, in the caller's order, when the
+/// previous one cannot be extended (a claim dropped, or no usable
+/// previous log).  Deduplicated, so no claim is in a log twice.
+fn continue_log(
+    leaves: impl IntoIterator<Item = Hash>,
+    previous: Option<&SignedVouch>,
+) -> Vec<Hash> {
+    let wanted: Vec<Hash> = leaves.into_iter().collect();
+    let Some(previous) = previous else {
+        return wanted;
+    };
+    let old = previous.leaves();
+    let kept: Vec<Hash> = old.iter().copied().filter(|l| wanted.contains(l)).collect();
+    if kept.len() != wanted.len() {
+        // A claim was dropped (or the previous log is not a prefix of the
+        // trusted set): the log restarts, so no old prefix stays valid.
+        return wanted;
+    }
+    let mut log = kept;
+    for l in wanted {
+        if !log.contains(&l) {
+            log.push(l);
+        }
+    }
+    log
 }
 
 /// What an anchor signs when another anchor replaces it (§4.7).
@@ -639,6 +727,176 @@ impl Proof {
     }
 }
 
+/// A pinned vouch head (§4.9): the anchor it names and the `(size,
+/// root)` of its claim log when the pin was written.  Nothing in it is
+/// secret, and nothing in it is trusted until the whole pin is: it comes
+/// from the same out-of-band channel as the thumbprint it extends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadPin {
+    /// The anchor whose claim log this head names.
+    pub anchor: Thumbprint,
+    /// The number of leaves in the log at the pinned head.
+    pub size: u64,
+    /// The tree hash over those leaves.
+    pub root: Hash,
+}
+
+impl HeadPin {
+    /// The JSON form, as thumbprints are on the wire: `{"anchor": …,
+    /// "size": …, "root": …}` with base64url strings.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "anchor": self.anchor.to_string(),
+            "size": self.size,
+            "root": b64::encode(&self.root),
+        })
+    }
+
+    /// Parse the JSON form.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for anything else.
+    pub fn from_json(value: &Value) -> Result<Self> {
+        let malformed = || Error::Malformed("head pin");
+        let anchor = value
+            .get("anchor")
+            .and_then(Value::as_str)
+            .and_then(|a| a.parse().ok())
+            .ok_or_else(malformed)?;
+        let size = value
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(malformed)?;
+        let root = value
+            .get("root")
+            .and_then(Value::as_str)
+            .and_then(|r| b64::decode(r).ok())
+            .and_then(|r| <[u8; 32]>::try_from(r).ok())
+            .ok_or_else(malformed)?;
+        Ok(Self { anchor, size, root })
+    }
+
+    /// Check `proof` for `claim` against this head: the proof must be by
+    /// this anchor, and its inclusion path must lead from the claim's
+    /// leaf to the pinned root within `size` leaves.  There is no
+    /// signature: the pin is the whole authority (§4.9.4).
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn check(&self, claim: &Claim, proof: &HeadProof) -> Result<bool> {
+        Ok(proof.anchor() == &self.anchor
+            && proof.size == self.size
+            && merkle::verify(
+                &claim.leaf()?,
+                proof.index,
+                self.size,
+                &proof.decode_path()?,
+                &self.root,
+            )?)
+    }
+}
+
+/// One anchor's head proof for a claim (§4.9): the anchor, the claim's
+/// position in the claim log, the size of the prefix the pinned head
+/// names, and the inclusion path within that prefix.  No key, no
+/// signature — it verifies only against a pinned [`HeadPin`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadProof {
+    /// The anchor's thumbprint.
+    anchor: String,
+    /// The claim's leaf index in the claim log.
+    index: u64,
+    /// The size of the prefix the pinned head names.
+    size: u64,
+    /// The inclusion path (base64url hashes), leaf level first.
+    path: Vec<String>,
+    /// The parsed `anchor`, private.
+    parsed_anchor: Thumbprint,
+}
+
+impl HeadProof {
+    /// The anchor's thumbprint, unverified.
+    #[must_use]
+    pub fn anchor(&self) -> &Thumbprint {
+        &self.parsed_anchor
+    }
+
+    /// Parse `anchor` once, on construction.
+    fn new(anchor: Thumbprint, index: u64, size: u64, path: Vec<String>) -> Self {
+        Self {
+            anchor: anchor.to_string(),
+            index,
+            size,
+            path,
+            parsed_anchor: anchor,
+        }
+    }
+
+    /// The JSON form, as it appears in a delegation: the anchor, the
+    /// index, the prefix size and the path.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "anchor": self.anchor,
+            "index": self.index,
+            "size": self.size,
+            "path": self.path,
+        })
+    }
+
+    /// Parse the JSON form.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for anything else.
+    pub fn from_json(value: &Value) -> Result<Self> {
+        let malformed = || Error::Malformed("head proof");
+        let anchor = value
+            .get("anchor")
+            .and_then(Value::as_str)
+            .and_then(|a| a.parse().ok())
+            .ok_or_else(malformed)?;
+        let index = value
+            .get("index")
+            .and_then(Value::as_u64)
+            .ok_or_else(malformed)?;
+        let size = value
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(malformed)?;
+        let path = value
+            .get("path")
+            .and_then(Value::as_array)
+            .map(|p| {
+                p.iter()
+                    .filter_map(|h| h.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(malformed)?;
+        Ok(Self::new(anchor, index, size, path))
+    }
+
+    fn decode_path(&self) -> Result<Vec<Hash>> {
+        self.path
+            .iter()
+            .map(|h| b64::decode(h).ok().and_then(|b| b.try_into().ok()))
+            .collect::<Option<_>>()
+            .ok_or(Error::Malformed("head proof path"))
+    }
+
+    /// Check it for `claim` against the pinned `heads`, returning the
+    /// anchor whose head proved it.  Only the anchor's pin is consulted:
+    /// there is no signature to verify.
+    fn check(&self, claim: &Claim, heads: &[HeadPin]) -> Option<Thumbprint> {
+        heads
+            .iter()
+            .find_map(|h| h.check(claim, self).ok().filter(|b| *b).map(|_| h.anchor))
+    }
+}
+
 fn to_value(json: &str) -> Value {
     serde_json::from_str(json).expect("JWK serialisation is valid JSON")
 }
@@ -650,6 +908,12 @@ pub struct Delegation {
     /// The claim (base64url).
     claim: String,
     proofs: Vec<Proof>,
+    /// Head proofs (§4.9), for clients that pin a vouch head: at most
+    /// one per anchor, and none in a delegation that also carries that
+    /// anchor's signature proof (a head proof subsumes it, for a client
+    /// that can check it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    head_proofs: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     successions: Vec<SignedSuccession>,
 }
@@ -669,6 +933,11 @@ pub struct VerifiedDelegation {
     pub exp: u64,
     /// The pinned anchor whose proof was accepted.
     pub anchor: Thumbprint,
+    /// The pinned anchor whose **head** proved the claim, if one did
+    /// (§4.9): a different fact from `anchor`, which names the signature
+    /// proof's signer (an anchor whose head proved it when no signature
+    /// was needed).
+    pub head_anchor: Option<Thumbprint>,
     /// When that anchor's vouch expires (Unix seconds).
     pub vouched_until: u64,
     /// The successions followed from a pinned anchor to `anchor`, as
@@ -683,6 +952,7 @@ impl Delegation {
         Self {
             claim: b64::encode(&claim.to_bytes()),
             proofs: Vec::new(),
+            head_proofs: Vec::new(),
             successions: Vec::new(),
         }
     }
@@ -717,6 +987,7 @@ impl Delegation {
             [claim.leaf()?],
             iat,
             (iat + VOUCH_VALIDITY).min(exp),
+            None,
         )?;
         let mut d = Self::new(&claim);
         d.add(vouch.proof(&claim, anchor.public())?);
@@ -731,6 +1002,47 @@ impl Delegation {
                 self.proofs.push(p);
             }
         }
+    }
+
+    /// Add `proof`s (for this claim), at most one per anchor; the head
+    /// proofs replace a signature proof by the same anchor, which they
+    /// subsume for a client that can check them (§4.9).
+    pub fn add_head_proofs(&mut self, proofs: impl IntoIterator<Item = HeadProof>) {
+        for p in proofs {
+            if self
+                .head_proofs
+                .iter()
+                .any(|q| HeadProof::from_json(q).is_ok_and(|q| *q.anchor() == *p.anchor()))
+            {
+                continue;
+            }
+            self.head_proofs.push(p.to_json());
+        }
+    }
+
+    /// The anchors whose head proofs it carries, **unverified**.
+    #[must_use]
+    pub fn head_proofs(&self) -> Vec<HeadProof> {
+        self.head_proofs
+            .iter()
+            .filter_map(|v| HeadProof::from_json(v).ok())
+            .collect()
+    }
+
+    /// The vouch head (§4.9) of the proof by `anchor`, if it carries one:
+    /// the `(size, root)` its vouch signed, **unverified**.
+    #[must_use]
+    pub fn vouch_head(&self, anchor: &Thumbprint) -> Option<(u64, Hash)> {
+        let bytes = b64::decode(
+            &self
+                .proofs
+                .iter()
+                .find(|p| p.signer() == Some(*anchor))?
+                .vouch,
+        )
+        .ok()?;
+        let vouch = Vouch::from_bytes(&bytes).ok()?;
+        Some((vouch.size, vouch.root))
     }
 
     /// Add `successions`, each once.
@@ -803,10 +1115,33 @@ impl Delegation {
     /// shortest chain of successions from the first wanted anchor that has
     /// one, and the delegation keeps that chain.  With nothing wanted (a
     /// bundle, whose reader is unknown) it keeps every succession.
+    ///
+    /// With `wanted_heads` (§4.9), a head proof for the first pinned head
+    /// wins over everything: no signature is needed, and none is served.
+    /// A client that pins a head for an anchor that also has a signature
+    /// proof served gets the head proof only.
     #[must_use]
     pub fn select(&self, wanted: &[Thumbprint]) -> Self {
+        self.select_with_heads(wanted, &[])
+    }
+
+    /// [`select`](Self::select) with the client's pinned vouch heads.
+    #[must_use]
+    pub fn select_with_heads(&self, wanted: &[Thumbprint], heads: &[HeadPin]) -> Self {
         let own = self.claim().ok().and_then(|c| c.anchor);
         let by = |a: &Thumbprint| self.proofs.iter().find(|p| p.signer() == Some(*a));
+        let proofs = self.head_proofs();
+        let head = heads
+            .iter()
+            .find_map(|h| proofs.iter().find(|p| *p.anchor() == h.anchor));
+        if let Some(head) = head {
+            return Self {
+                claim: self.claim.clone(),
+                proofs: Vec::new(),
+                head_proofs: vec![head.to_json()],
+                successions: Vec::new(),
+            };
+        }
         let direct = wanted.iter().find_map(by);
         let chained = if direct.is_some() {
             None
@@ -835,6 +1170,7 @@ impl Delegation {
         Self {
             claim: self.claim.clone(),
             proofs: chosen.cloned().into_iter().collect(),
+            head_proofs: Vec::new(),
             successions,
         }
     }
@@ -892,7 +1228,43 @@ impl Delegation {
         policy: &Policy,
         at: u64,
     ) -> Result<VerifiedDelegation> {
+        self.verify_at_with_heads(anchors, &[], policy, at)
+    }
+
+    /// [`verify_at`](Self::verify_at) with the client's pinned vouch
+    /// heads (§4.9): a head proof that checks against one of them is
+    /// accepted with no signature, and wins over a signature proof.  The
+    /// claim's validity is still checked, and the successions still lead
+    /// to signature proofs — a head proof needs none.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify_at`].
+    pub fn verify_at_with_heads(
+        &self,
+        anchors: &[Thumbprint],
+        heads: &[HeadPin],
+        policy: &Policy,
+        at: u64,
+    ) -> Result<VerifiedDelegation> {
         let claim = self.claim()?;
+        let head_proofs = self.head_proofs();
+        if let Some(anchor) = head_proofs.iter().find_map(|p| p.check(&claim, heads)) {
+            if !claim.valid_at(at) {
+                return Err(Error::Expired);
+            }
+            return Ok(VerifiedDelegation {
+                realm: claim.realm,
+                server: claim.server,
+                key: claim.key,
+                iat: claim.iat,
+                exp: claim.exp,
+                anchor,
+                head_anchor: Some(anchor),
+                vouched_until: at,
+                succeeded: Vec::new(),
+            });
+        }
         let proven = |pinned: &[Thumbprint]| {
             self.proofs
                 .iter()
@@ -924,6 +1296,7 @@ impl Delegation {
             iat: claim.iat,
             exp: claim.exp,
             anchor,
+            head_anchor: None,
             vouched_until: vouch.exp,
             succeeded,
         })
@@ -1150,6 +1523,144 @@ mod tests {
     }
 
     #[test]
+    fn claim_logs_append_and_keep_old_heads() {
+        let anchor = key();
+        let servers: Vec<_> = (0..4).map(|_| key()).collect();
+        let claims: Vec<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| claim(&anchor, &format!("s{i}"), s))
+            .collect();
+        let leaves = |n: usize| claims[..n].iter().map(|c| c.leaf().unwrap());
+
+        // The first vouch covers two claims; a head pinned at it.
+        let v1 = SignedVouch::issue(&anchor, "R", leaves(2), NOW, NOW + 100, None).unwrap();
+        let head1 = HeadPin {
+            anchor: *anchor.public().thumbprint(),
+            size: v1.vouch().size,
+            root: v1.vouch().root,
+        };
+
+        // Two more claims join: the log keeps its order and appends, so
+        // the old head still names a prefix of the new log.
+        let v2 =
+            SignedVouch::issue(&anchor, "R", leaves(4), NOW + 1, NOW + 101, Some(&v1)).unwrap();
+        assert_eq!(v1.leaves(), &v2.leaves()[..2], "the log extends, in order");
+        assert_eq!(merkle::root(&v2.leaves()[..2]).unwrap(), head1.root);
+
+        // The old claim's head proof against the pinned head verifies,
+        // from the new vouch, with no signature.
+        let thp = *anchor.public().thumbprint();
+        let hp = v2
+            .head_proof(&claims[0], &thp, (head1.size, head1.root))
+            .unwrap()
+            .expect("the old claim is under the pinned head");
+        let mut d = Delegation::new(&claims[0]);
+        d.add_head_proofs([hp]);
+        let v = d
+            .verify_at_with_heads(&[], &[head1], &Policy::default(), NOW + 5)
+            .unwrap();
+        assert_eq!(v.head_anchor, Some(head1.anchor));
+        assert_eq!(&v.key, servers[0].public().thumbprint());
+
+        // A new claim is not under the pinned head: no head proof for it.
+        assert!(
+            v2.head_proof(&claims[3], &thp, (head1.size, head1.root))
+                .unwrap()
+                .is_none()
+        );
+        // A head the log does not make (wrong root, or too long) is
+        // refused: no head proof at all.
+        let wrong = (head1.size, [9; 32]);
+        assert!(v2.head_proof(&claims[0], &thp, wrong).unwrap().is_none());
+        let beyond = (v2.leaves().len() as u64 + 1, v2.vouch().root);
+        assert!(v2.head_proof(&claims[0], &thp, beyond).unwrap().is_none());
+    }
+
+    #[test]
+    fn dropping_a_claim_restarts_the_log() {
+        let anchor = key();
+        let thp = *anchor.public().thumbprint();
+        let servers: Vec<_> = (0..3).map(|_| key()).collect();
+        let claims: Vec<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| claim(&anchor, &format!("s{i}"), s))
+            .collect();
+        let leaves = |keep: &[usize]| {
+            keep.iter()
+                .map(|i| claims[*i].leaf().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let v1 =
+            SignedVouch::issue(&anchor, "R", leaves(&[0, 1, 2]), NOW, NOW + 100, None).unwrap();
+        let v2 = SignedVouch::issue(&anchor, "R", leaves(&[0, 2]), NOW + 1, NOW + 101, Some(&v1))
+            .unwrap();
+        // Claim 1 dropped: the log restarts, so no prefix of the old one
+        // stays valid (a pinned head must not prove a dropped claim).
+        assert_eq!(v2.leaves().len(), 2);
+        let head1 = (v1.vouch().size, v1.vouch().root);
+        for c in &claims {
+            assert!(
+                v2.head_proof(c, &thp, head1).unwrap().is_none(),
+                "no head proof from a restarted log against the old head"
+            );
+        }
+        // The new log's own head works.
+        let head2 = (v2.vouch().size, v2.vouch().root);
+        assert!(v2.head_proof(&claims[0], &thp, head2).unwrap().is_some());
+    }
+
+    #[test]
+    fn head_proofs_do_not_verify_against_other_heads_or_tampering() {
+        let anchor = key();
+        let server = key();
+        let c = claim(&anchor, "s", &server);
+        let c2 = claim(&anchor, "t", &server);
+        let v = SignedVouch::issue(
+            &anchor,
+            "R",
+            [c.leaf().unwrap(), c2.leaf().unwrap()],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
+        let head = HeadPin {
+            anchor: *anchor.public().thumbprint(),
+            size: 2,
+            root: v.vouch().root,
+        };
+        let thp = *anchor.public().thumbprint();
+        let hp = v
+            .head_proof(&c, &thp, (head.size, head.root))
+            .unwrap()
+            .unwrap();
+
+        // Another anchor's head does not prove it.
+        let other = key();
+        let foreign = HeadPin {
+            anchor: *other.public().thumbprint(),
+            size: head.size,
+            root: head.root,
+        };
+        assert!(!foreign.check(&c, &hp).unwrap());
+        // A tampered path does not verify.
+        let mut tampered = hp.clone();
+        tampered.path[0] = b64::encode(&[0; 32]);
+        assert!(!head.check(&c, &tampered).unwrap());
+        // A head proof for another claim does not verify for this one.
+        let c2 = claim(&anchor, "t", &server);
+        assert!(!head.check(&c2, &hp).unwrap());
+
+        // JSON round trip keeps the proof.
+        let back = HeadProof::from_json(&hp.to_json()).unwrap();
+        assert_eq!(back, hp);
+        assert_eq!(HeadPin::from_json(&head.to_json()).unwrap(), head);
+    }
+
+    #[test]
     fn issue_and_verify() {
         let (anchor, server) = (key(), key());
         let d = Delegation::issue(
@@ -1204,6 +1715,7 @@ mod tests {
             claims.iter().map(|c| c.leaf().unwrap()),
             NOW,
             NOW + VOUCH_VALIDITY,
+            None,
         )
         .unwrap();
         v.verify(anchors[0].public(), &Policy::default()).unwrap();
@@ -1231,7 +1743,8 @@ mod tests {
         let (own, other, signing) = (key(), key(), key());
         let c = claim(&own, "s", &signing);
         let vouch = |a: &SigningKey| {
-            SignedVouch::issue(a, "R", [c.leaf().unwrap()], NOW, NOW + VOUCH_VALIDITY).unwrap()
+            SignedVouch::issue(a, "R", [c.leaf().unwrap()], NOW, NOW + VOUCH_VALIDITY, None)
+                .unwrap()
         };
         let mut d = Delegation::new(&c);
         d.add(vouch(&own).proof(&c, own.public()).unwrap());
@@ -1271,13 +1784,14 @@ mod tests {
         ));
         // A vouch for another realm.
         let claim = d.claim().unwrap();
-        let other =
-            SignedVouch::issue(&anchor, "X", [claim.leaf().unwrap()], NOW, NOW + 100).unwrap();
+        let other = SignedVouch::issue(&anchor, "X", [claim.leaf().unwrap()], NOW, NOW + 100, None)
+            .unwrap();
         let mut d2 = Delegation::new(&claim);
         d2.add(other.proof(&claim, anchor.public()).unwrap());
         assert!(d2.verify_at(&pinned, &Policy::default(), NOW).is_err());
         // Leaves that do not make the signed tree.
-        let mut sv = SignedVouch::issue(&anchor, "R", [[1; 32], [2; 32]], NOW, NOW + 100).unwrap();
+        let mut sv =
+            SignedVouch::issue(&anchor, "R", [[1; 32], [2; 32]], NOW, NOW + 100, None).unwrap();
         sv.leaves[1] = [3; 32];
         assert!(sv.verify(anchor.public(), &Policy::default()).is_err());
     }

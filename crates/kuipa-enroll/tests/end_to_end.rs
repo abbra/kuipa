@@ -393,8 +393,15 @@ fn exchange(anchors: &[SigningKey], servers: &[EnrollServer], own: &[Delegation]
     };
     for (i, anchor) in anchors.iter().enumerate() {
         let leaves = trust(&state, i).leaves().unwrap();
-        let vouch =
-            SignedVouch::issue(anchor, REALM, leaves, now() - 60, now() + VOUCH_VALIDITY).unwrap();
+        let vouch = SignedVouch::issue(
+            anchor,
+            REALM,
+            leaves,
+            now() - 60,
+            now() + VOUCH_VALIDITY,
+            None,
+        )
+        .unwrap();
         state
             .put(Entry::Vouch(vouch), REALM, &policy, now(), &clock)
             .unwrap();

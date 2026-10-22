@@ -373,12 +373,20 @@ impl Peers {
             let interval = x.settings.vouch_interval.as_secs();
             if anchors::needs_vouch(current_vouch, &leaves, at, interval) {
                 let iat = anchors::next_vouch_iat(current_vouch, at);
+                let previous = current_vouch.cloned();
                 eprintln!(
                     "kuipad: anchor exchange: vouching for {} claim(s) of {:?}",
                     leaves.len(),
                     trust.servers().collect::<Vec<_>>()
                 );
-                let vouch = SignedVouch::issue(anchor, realm, leaves, iat, iat + VOUCH_VALIDITY)?;
+                let vouch = SignedVouch::issue(
+                    anchor,
+                    realm,
+                    leaves,
+                    iat,
+                    iat + VOUCH_VALIDITY,
+                    previous.as_ref(),
+                )?;
                 wrote |= put(&mut state, Entry::Vouch(vouch))?;
             }
         }
@@ -984,8 +992,15 @@ mod tests {
             iat: now(),
             exp: now() + 100,
         };
-        let vouch =
-            SignedVouch::issue(&anchor, "R", [claim.leaf().unwrap()], now(), now() + 100).unwrap();
+        let vouch = SignedVouch::issue(
+            &anchor,
+            "R",
+            [claim.leaf().unwrap()],
+            now(),
+            now() + 100,
+            None,
+        )
+        .unwrap();
         for e in [Entry::Claim(claim), Entry::Vouch(vouch)] {
             state
                 .put(e, "R", &Policy::default(), now(), &GenerationClock::new())

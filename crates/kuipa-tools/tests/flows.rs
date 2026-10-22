@@ -1205,6 +1205,7 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
         [claim.leaf().unwrap()],
         now() - 60,
         now() + 86_400,
+        None,
     )
     .unwrap();
     delegation.add(vouch.proof(&claim, other.public()).unwrap());
