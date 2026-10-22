@@ -1606,6 +1606,21 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
     let pending: Option<Value> = fs::read(paths.pending())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
+    // The pinned windows and frozen pins (DESIGN-claim-logs.md §1–§2):
+    // what a reader can see about this host's trust state.
+    let pins = paths::read_anchor_pins(&paths.anchors()).unwrap_or_default();
+    let windows: Vec<Value> = pins
+        .iter()
+        .map(|p| {
+            json!({
+                "anchor": p.anchor.to_string(),
+                "heads": p.heads.iter().map(|(s, r)| json!({
+                    "size": s, "root": tang_pqc::b64::encode(r),
+                })).collect::<Vec<_>>(),
+                "frozen": p.frozen,
+            })
+        })
+        .collect();
     Ok(json!({
         "enrolled": true,
         "realm": state.realm,
@@ -1613,6 +1628,7 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
         "kvno": keytab.as_ref().and_then(Keytab::kvno),
         "servers": state.servers,
         "anchors": paths::read_anchors(paths).unwrap_or_default().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "windows": windows,
         "trusted_realms": paths.trusted_realms(),
         "protection": state.holder,
         "protected": state.protected.iter().map(|p| json!({
