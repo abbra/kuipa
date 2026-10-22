@@ -86,9 +86,15 @@ history", which is the landmark-window property the MTC draft gives a
 relying party that keeps its landmarks (draft-ietf-plants-merkle-tree-certs
 §6.4): the past cannot change behind the window.
 
-The fetch is bounded: `H2.size − H1.size` leaves at 32 bytes each,
-paged like the anchor log (`MAX_CLAIM_LOG_PAGE`). Between routine
-refreshes of a realm that renews claims daily, that is one page.
+The fetch is bounded, and it is a *whole-log* walk: the client keeps
+only the roots of its window, so the consistency of a new head can
+only be checked by rehashing from the first leaf — pages from 0 like
+the anchor log (`MAX_CLAIM_LOG_PAGE` each), at most
+`MAX_HEAD_FETCH_PAGES` (64) of them. An advertised head naming a
+larger tree is refused with a warning and the window stays as it is:
+extending it would take trust the fetch cannot supply. Between routine
+refreshes of a realm that renews claims daily, the whole log is one
+page.
 
 **Restart is a truncation, not an extension.** A head whose size is
 *lower* than the window's newest (the anchor restarted its log — a
@@ -108,9 +114,10 @@ pinned head and takes the first that matches. With windows it checks
 against **every** head in the window: a proof for a claim under any of
 them verifies, since every prefix of the log is the tree an earlier
 vouch signed. The `?head=` parameters carry the whole window, in
-order; the server's `advertisement_with_heads` already tries each
-pinned head in turn and serves the first that makes a proof, so its
-behaviour is unchanged. A claim below the oldest head in the window
+order; the server's `advertisement_with_heads` tries each pinned head
+in turn and serves a proof for **each** of them that its vouches can
+make — a frozen host (§2) with several pinned anchors needs *each*
+anchor's proof, not just the first. A claim below the oldest head in the window
 still falls back to a signature proof — the window only widens what
 is head-provable, it never narrows today's guarantees.
 
@@ -171,12 +178,17 @@ The `TrustedRealm` wire member gains each anchor's current head:
 ```
 
 — exactly `RealmInfo.heads`'s shape (§4.3), so `as_partner` reuses it,
-and `kuipad`'s trust refresh fills it from B's advertisement the same
-way it fills `anchors` today. A missing `heads` member means "A knows
-B's anchors but not their heads" (an older partner, or B's first
-advertisement carried none): the client pins the anchors alone, as
-today, and B's refresh verifies with signatures until a later refresh
-of the trust carries heads.
+and `kuipad`'s trust refresh fills it from B's advertisement — the
+*backed* heads only: a head is pinned for B when a signature proves
+it, the delegation's proof-derived heads (§4.9) of B's verified
+advertisement, or, failing that, the head as proved by that anchor's
+own advertisement fetched and verified against exactly that anchor.
+An advertised head with no proof behind it is B's assertion, not a
+pin, and is dropped with a line in the daemon's log.  A missing
+`heads` member means "A knows B's anchors but not their heads" (an
+older partner, or B's first advertisement carried none): the client
+pins the anchors alone, as today, and B's refresh verifies with
+signatures until a later refresh of the trust carries heads.
 
 `kuipa trusted-realms` writes B's heads into
 `/etc/ipa/ku-anchors.d/B.TEST` (§1.2's grammar, no expiry: the trust
@@ -184,10 +196,11 @@ refresh renews them) and verifies B's advertisement against them on
 every refresh, with B's advertisement's own `heads` member as the
 window extension source — subject to §1.3's consistency rule, so a
 host of A watches B's tree grow only through provable prefixes. The
-`heads` a host of A accepts for B come from A's *trusts* (signed by
-A's delegated key) or B's *advertisement* (verified with B's pinned
-anchors and heads) — never from B's delegation member, which is
-untrusted input, the same rule as §4.9.4.
+`heads` a host of A accepts for B come from A's *trusts* (signed by A's
+delegated key) or B's *advertisement* (verified with B's pinned anchors
+and heads) — never from B's delegation member, which is untrusted
+input, the same rule as §4.9.4.  Either way the head is pinned only
+once a signature proves it: an assertion travels, a proof pins.
 
 Trust refresh cadence is unchanged; the trust's pin file grows a
 window per B anchor exactly as the host's own pin file does for A.
@@ -241,9 +254,20 @@ kuipa-audit split-view --server S1 --server S2 [--anchor THP]…
   current (the server's newest head extends it), stale (the server's
   tree has grown: the consistency check of §1.3, applied read-only),
   or restarted (the server's tree is shorter).
+  The served head is first checked as §4 says — its vouch must verify
+  against the anchor's key, and the pages must hash to its root — so
+  an unsigned or inconsistent head reports as *split*, a server that
+  names the anchor but serves no claim log reports as *split* too,
+  and a tree larger than the audit's fetch bound reports as
+  *unchecked*; none of those leave the report clean.
 * `split-view` fetches each server's current heads and reports
   anchors on which they disagree, with each side's `(size, root)` and
   vouch — the claim-log counterpart of the anchor-log fork report.
+  Each advertisement is first self-checked (its signature must match
+  the key its own delegation delegates — relay tampering, since the
+  auditor trusts no key); a server that fails, names an anchor it
+  does not answer, or sends an unparseable anchor string is recorded
+  as a disagreement, never dropped.
 
 Output is the same labelled-rows text style as `kuipa advertisement`
 (`--json` for machine-readable), and the refusal vocabulary of
@@ -267,7 +291,9 @@ kuipa-mirror --origin https://ipa1.example.test \
   and `/ipa/ku/claim-log/{anchor}` pages, storing them under `--data`.
   It follows head growth page by page (the same fetch as §1.3's
   consistency check), so its claim-log copy is always a verified
-  prefix chain. It never authenticates to the origin, never receives
+  prefix chain: a page is cached only under a head the synced
+  advertisement *proves by signature* (§4), never under the origin's
+  bare assertion. It never authenticates to the origin, never receives
   a secret, and stores nothing but public bytes.
 * **Serve.** It answers, read-only: `/ipa/ku/adv` (the cached
   advertisement, re-signed at half life *by the origin's delegated
@@ -299,7 +325,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 
 | threat | today (§4.9) | with this design |
 |---|---|---|
-| compromised server serves its own tree as a head | client pins it (the advertisement verifies; same as the signature path) | §1.3's consistency check refuses it and keeps the old window |
+| compromised server serves its own tree as a head | client pins it (the advertisement verifies; same as the signature path) | a head no signature proves is never pinned (§3, §4); growth of a pinned window still passes §1.3's consistency check |
 | anchor key theft | head proofs bounded by pinned heads; signature path unbounded | unchanged (§4.9.6); audit (§5) reconstructs exactly what was covered |
 | mirror operator edits stored data | — | proofs stop verifying against client pins; no trust in the mirror |
 | realm removes a server | head restart; client silently re-pins | §1.3: restart reported by `check`/`status` |
