@@ -436,11 +436,31 @@ impl VerifiedRealm {
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
+        Self::verify_with_heads(adv, realm, anchors, &[], policy, now)
+    }
+
+    /// [`verify`](Self::verify) with the client's pinned vouch heads
+    /// (§4.9): a delegation that carries a head proof for one of them is
+    /// accepted with no signature.  The heads do not replace the pins:
+    /// an expired or absent head falls back to the signature proofs the
+    /// advertisement also carries or the client asks for again.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify`].
+    pub fn verify_with_heads(
+        adv: &SignedAdvertisement,
+        realm: &str,
+        anchors: &[Thumbprint],
+        heads: &[HeadPin],
+        policy: &Policy,
+        now: SystemTime,
+    ) -> Result<Self> {
         let delegation = Delegation::from_value(
             adv.unverified_member(MEMBER_DELEGATION)?
                 .ok_or(Error::Missing("delegation"))?,
         )?
-        .verify_at(anchors, policy, unix_seconds(now))?;
+        .verify_at_with_heads(anchors, heads, policy, unix_seconds(now))?;
         if delegation.realm != realm {
             return Err(Error::WrongRealm);
         }
