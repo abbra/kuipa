@@ -167,6 +167,24 @@ pub trait Directory {
         Err("escrow registration outside a rekey is not supported by this directory".into())
     }
 
+    /// Fetch a named secret for a `keys` operation's caller (§18.2):
+    /// `principal` is the caller the token authenticated, and the value
+    /// is the handler's output.  The policy check against the server
+    /// list and CA roles is the directory's to make, against `cn=masters`
+    /// in FreeIPA.
+    ///
+    /// # Errors
+    ///
+    /// Any refusal; by default the keys operation is not supported.
+    fn fetch_key(
+        &self,
+        principal: &Principal,
+        fetch: &crate::keys::KeysFetch,
+    ) -> Result<Vec<u8>, DirectoryError> {
+        let _ = (principal, fetch);
+        Err("the keys operation is not supported by this directory".into())
+    }
+
     /// The IPA CA chain (DER).
     ///
     /// # Errors
@@ -440,6 +458,13 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
         (**self).register_with_gss(params, bindings, token, cb)
+    }
+    fn fetch_key(
+        &self,
+        principal: &Principal,
+        fetch: &crate::keys::KeysFetch,
+    ) -> Result<Vec<u8>, DirectoryError> {
+        (**self).fetch_key(principal, fetch)
     }
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
         (**self).ca_certificates()
@@ -1038,6 +1063,9 @@ impl EnrollServer {
             (Operation::Vault, AuthType::Kerberos) => {
                 return self.vault_op(request, ss.as_ref(), &t, &body, directory);
             }
+            (Operation::Keys, AuthType::Kerberos) => {
+                return self.keys_op(request, ss.as_ref(), &t, &body, directory);
+            }
             (op, auth) => {
                 return Err(Refusal::because(format!(
                     "{op:?} with {auth:?} is not supported"
@@ -1188,6 +1216,34 @@ impl EnrollServer {
             released,
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
+    }
+
+    /// Answer a `keys` fetch (§18.2): authenticate the caller by their
+    /// ticket, let the directory check the namespace policy (the server
+    /// list and CA roles) and produce the value, and answer with it.
+    fn keys_op(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let accepted = directory
+            .accept_user(body.authenticator.as_ref(), &cb)
+            .map_err(Refusal)?;
+        let caller: Principal = accepted.principal.parse()?;
+        if caller.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        let fetch = crate::keys::KeysFetch::from_bytes(&body.extra)?;
+        let value = directory.fetch_key(&caller, &fetch).map_err(Refusal)?;
+        let answer = crate::keys::KeysAnswer { value };
+        let payload = answer
+            .to_bytes()
+            .map_err(|e| Refusal::because(e.to_string()))?;
+        Ok(request.respond(ss, t, Some(&accepted.binding), &payload)?)
     }
 
     /// Every server's escrow key, this one's own current key included
