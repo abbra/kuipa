@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use kuipa_enroll::keytab::Enctype;
 use kuipa_enroll::realm::{RealmInfo, TrustedRealm};
@@ -73,6 +74,9 @@ pub struct Config {
     /// Listen address when not socket-activated (`unix:/path` or `host:port`).
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// The `keys` operation's handlers (§18.5); absent disables it.
+    #[serde(default)]
+    pub keys: Option<KeysConfig>,
 }
 
 fn default_key_dir() -> PathBuf {
@@ -101,6 +105,31 @@ pub struct TrustConfig {
     pub anchors: Vec<String>,
 }
 
+/// The `keys` operation's configuration (§18.5).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeysConfig {
+    /// Whether the operation is served; default true when the section is
+    /// present.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// A handler per namespace, keyed by its label (`dm`, `ra`, `ca`,
+    /// `ca_wrapped`, `lwca-store`).
+    pub handlers: BTreeMap<String, HandlerConfig>,
+}
+
+/// One namespace's handler.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandlerConfig {
+    /// The executable.
+    pub command: String,
+    /// The user to run it as (`root`, `pkiuser`); absent keeps the
+    /// daemon's own user.
+    #[serde(default)]
+    pub runas: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -124,6 +153,40 @@ impl Config {
     /// I/O or parse errors.
     pub fn load(path: &str) -> Result<Self, Error> {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    /// The `keys` operation's handler table (§18.5), or `None` when the
+    /// section is absent or disabled.
+    ///
+    /// # Errors
+    ///
+    /// A namespace label that is not one of §18.1's.
+    pub fn keys_service(&self) -> Result<Option<Arc<crate::keys::Keys>>, Error> {
+        let Some(cfg) = &self.keys else {
+            return Ok(None);
+        };
+        if !cfg.enabled {
+            return Ok(None);
+        }
+        let mut handlers = Vec::new();
+        for (label, handler) in &cfg.handlers {
+            let namespace = match label.as_str() {
+                "dm" => kuipa_enroll::keys::Namespace::Dm,
+                "ra" => kuipa_enroll::keys::Namespace::Ra,
+                "ca" => kuipa_enroll::keys::Namespace::Ca,
+                "ca_wrapped" => kuipa_enroll::keys::Namespace::CaWrapped,
+                "lwca-store" => kuipa_enroll::keys::Namespace::LwcaStore,
+                _ => return Err(format!("unknown keys namespace: {label}").into()),
+            };
+            handlers.push((
+                namespace,
+                crate::keys::Handler {
+                    command: handler.command.clone().into(),
+                    runas: handler.runas.clone(),
+                },
+            ));
+        }
+        Ok(Some(Arc::new(crate::keys::Keys::new(handlers))))
     }
 
     /// The realm metadata this server publishes, listing `servers` and,
