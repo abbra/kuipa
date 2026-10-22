@@ -580,6 +580,12 @@ pub struct ClaimLogPage {
     pub exp: u64,
     /// The base64url leaf hashes after the page's `from`, oldest first.
     pub leaves: Vec<String>,
+    /// The signed vouch of this head (DESIGN-claim-logs.md §4):
+    /// base64url `IPSV` v2, public data — it travels in the exchange
+    /// and every signature proof — so a reader can check that the head
+    /// was signed at all, against the anchor's key from any
+    /// advertisement.  Absent for an older server.
+    pub vouch: Option<String>,
 }
 
 /// What the anchor exchange decides (§4.2): this server's delegation, with
@@ -772,6 +778,7 @@ impl EnrollServer {
             root: v.root,
             exp: v.exp,
             leaves,
+            vouch: Some(tang_pqc::b64::encode(&vouch.to_bytes())),
         })
     }
 
