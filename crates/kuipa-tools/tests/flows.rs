@@ -2366,3 +2366,129 @@ fn window_info_of(anchor: &SigningKey) -> RealmInfo {
 fn vouch_of(server: &Arc<EnrollServer>, anchor: tang_pqc::Thumbprint) -> SignedVouch {
     server.vouches().remove(&anchor).expect("a published vouch")
 }
+
+#[test]
+fn audit_reports_coverage_and_split_views() {
+    // DESIGN-claim-logs.md §5: the audit tool reads the public
+    // endpoints and reports.  Coverage names current, stale and
+    // restarted heads; a split view is two servers answering
+    // different roots for the same anchor.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, _, mut delegation) = server_keys(&anchor, "audit1.example.test");
+    let info = audit_info_of(&anchor);
+    let claim = delegation.claim().unwrap();
+    let v1 = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let head1 = v1.head();
+    delegation.add(v1.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, v1);
+    let server = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+    server.publish(delegation.clone(), vec![pin], vouches);
+    let url = spawn(app(server.clone(), Dir::default()));
+    kuipa_tools::net::set_thread_endpoint("audit1.example.test", &url);
+
+    // Coverage: the served head is current for itself, stale for a
+    // smaller pinned one, and a split for a root the log does not
+    // contain.
+    let report =
+        kuipa_tools::audit::coverage("audit1.example.test", &[(pin, head1.0, head1.1)]).unwrap();
+    assert_eq!(report["anchors"][0]["state"], "current", "{report}");
+    let report =
+        kuipa_tools::audit::coverage("audit1.example.test", &[(pin, head1.0, [7; 32])]).unwrap();
+    assert!(
+        report["anchors"][0]["state"]
+            .as_str()
+            .unwrap()
+            .starts_with("split"),
+        "{report}"
+    );
+    let report =
+        kuipa_tools::audit::coverage("audit1.example.test", &[(pin, head1.0 + 5, head1.1)])
+            .unwrap();
+    assert!(
+        report["anchors"][0]["state"]
+            .as_str()
+            .unwrap()
+            .starts_with("restarted"),
+        "{report}"
+    );
+
+    // A second server of the same realm, its anchor's log forked: the
+    // same claim in a different order makes a different root at the
+    // same size, and the split view names both sides.
+    let other = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let other_delegation = Delegation::issue(
+        &other,
+        REALM,
+        "audit2.example.test",
+        other.public(),
+        now() - 60,
+        now() + 86400,
+    )
+    .unwrap();
+    let other_claim = other_delegation.claim().unwrap();
+    let v2 = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [other_claim.leaf().unwrap(), claim.leaf().unwrap()],
+        now(),
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let mut forked = delegation.clone();
+    forked.add(v2.proof(&claim, anchor.public()).unwrap());
+    let mut forked_vouches = std::collections::HashMap::new();
+    forked_vouches.insert(pin, v2);
+    let mut keys2 = server_keys(&anchor, "audit2.example.test").0;
+    let _ = &mut keys2;
+    let server2 = Arc::new(EnrollServer::new(
+        server_keys(&anchor, "audit2.example.test").0,
+        audit_info_of(&anchor),
+        forked,
+    ));
+    server2.publish(delegation.clone(), vec![pin], forked_vouches);
+    let url2 = spawn(app(server2, Dir::default()));
+    kuipa_tools::net::set_thread_endpoint("audit2.example.test", &url2);
+
+    let report = kuipa_tools::audit::split_view(&[
+        "audit1.example.test".to_owned(),
+        "audit2.example.test".to_owned(),
+    ])
+    .unwrap();
+    assert_eq!(
+        report["disagreements"].as_array().map(Vec::len),
+        Some(1),
+        "{report}"
+    );
+    assert!(
+        !kuipa_tools::audit::clean(&report),
+        "a split view is not clean"
+    );
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+/// The realm info for the audit tests' servers.
+fn audit_info_of(anchor: &SigningKey) -> RealmInfo {
+    RealmInfo {
+        realm: REALM.into(),
+        domain: "example.test".into(),
+        basedn: "dc=example,dc=test".into(),
+        server: "audit1.example.test".into(),
+        servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    }
+}
