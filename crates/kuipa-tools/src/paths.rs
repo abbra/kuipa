@@ -399,6 +399,72 @@ pub fn read_anchors_from(path: &Path) -> Result<Vec<tang_pqc::Thumbprint>, Error
         .collect())
 }
 
+/// Every pin of an anchors file that has not expired (§4.4), the whole
+/// pin rather than only its thumbprint: its head window
+/// (DESIGN-claim-logs.md §1) and its frozen marker (§2) travel with it.
+///
+/// # Errors
+///
+/// I/O errors or a malformed line.
+pub fn live_pins(path: &Path) -> Result<Vec<Pin>, Error> {
+    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    Ok(read_anchor_pins(path)?
+        .into_iter()
+        .filter(|p| p.exp.is_none_or(|e| now <= e.saturating_add(CLOCK_SKEW)))
+        .collect())
+}
+
+/// Whether a pin-read error is only "no pin file here yet".
+#[must_use]
+pub(crate) fn is_missing(e: &Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// What a pin file hands to verification: the live anchors, every head
+/// of their windows oldest first, and the anchors that are frozen
+/// (DESIGN-claim-logs.md §1.2).
+pub type Windows = (
+    Vec<tang_pqc::Thumbprint>,
+    Vec<kuipa_enroll::delegation::HeadPin>,
+    Vec<tang_pqc::Thumbprint>,
+);
+
+/// What a pin file says this host trusts: the live anchors, every head of
+/// their windows oldest first (§1.4: the whole window travels so the
+/// server can try each pinned head in turn), and which of those anchors
+/// are frozen (§2).  Expired pins are out, as in [`read_anchors_from`].
+///
+/// A missing file is nothing pinned.  A malformed one is an error: pins
+/// are trust, and a corrupt pin file must fail closed rather than read as
+/// "nothing pinned".
+///
+/// # Errors
+///
+/// I/O errors or a malformed line.
+pub fn pinned_windows(path: &Path) -> Result<Windows, Error> {
+    let pins = match live_pins(path) {
+        Ok(pins) => pins,
+        Err(e) if is_missing(&e) => return Ok((Vec::new(), Vec::new(), Vec::new())),
+        Err(e) => return Err(e),
+    };
+    let anchors = pins.iter().map(|p| p.anchor).collect();
+    let heads = pins
+        .iter()
+        .flat_map(|p| {
+            p.heads
+                .iter()
+                .map(move |(size, root)| kuipa_enroll::delegation::HeadPin {
+                    anchor: p.anchor,
+                    size: *size,
+                    root: *root,
+                })
+        })
+        .collect();
+    let frozen = pins.iter().filter(|p| p.frozen).map(|p| p.anchor).collect();
+    Ok((anchors, heads, frozen))
+}
+
 /// Every pin in an anchors file, `<thumbprint> [<expiry> [<size>
 /// <root>]]` per line, with its expiry (Unix seconds) and its vouch
 /// head (§4.9) if they have one.  Lists written from server responses
@@ -548,7 +614,15 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
             }
             continue;
         }
-        let anchor = first.parse()?;
+        let anchor: tang_pqc::Thumbprint = first
+            .parse()
+            .map_err(|_| format!("{}: malformed anchor thumbprint in {l:?}", path.display()))?;
+        // One line per anchor: two lines for one anchor would say two
+        // different things about it, and the file is an administrator's
+        // assertion that must round-trip.
+        if pins.iter().any(|p: &Pin| p.anchor == anchor) {
+            return Err(format!("{}: duplicate anchor in {l:?}", path.display()).into());
+        }
         // The rest is `[<expiry>] [<size> <root>]… [frozen]`: an expiry
         // is a decimal number, a head is a number followed by a
         // thumbprint, and a lone number is an expiry.  The field after
@@ -608,12 +682,18 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
 }
 
 fn parse_expiry(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
+    if !is_number(field) {
+        return Err(format!("{}: bad expiry in {line:?}", path.display()).into());
+    }
     field
         .parse()
         .map_err(|_| format!("{}: bad expiry in {line:?}", path.display()).into())
 }
 
 fn parse_size(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
+    if !is_number(field) {
+        return Err(format!("{}: bad head size in {line:?}", path.display()).into());
+    }
     let size = field
         .parse()
         .map_err(|_| format!("{}: bad head size in {line:?}", path.display()))?;
@@ -623,6 +703,14 @@ fn parse_size(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
     Ok(size)
 }
 
+/// A number field of a pin line: ASCII digits only, as an enrollment
+/// string's fields are (§4.4).  `u64::from_str` also accepts a leading
+/// `+` (and whitespace is already gone), which a pin file must not carry:
+/// `+5` is not an expiry anyone provisioned on purpose.
+fn is_number(field: &str) -> bool {
+    !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Whether `size`-then-`root` reads as a head pair whose first field
 /// is a size, not an expiry followed by one: the second field parses
 /// as a thumbprint either way, so the first is the size when what
@@ -630,7 +718,7 @@ fn parse_size(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
 /// an expiry is never followed by a number that is itself followed by
 /// a thumbprint.
 fn looks_like_head(first: &str, second: &str) -> bool {
-    first.parse::<u64>().is_ok() && second.parse::<tang_pqc::Thumbprint>().is_ok()
+    is_number(first) && second.parse::<tang_pqc::Thumbprint>().is_ok()
 }
 
 /// Parse `<size> <root>` pairs, oldest first.
@@ -895,6 +983,11 @@ mod tests {
             format!("{a} 1 {} 2\n", root(1)),
             // Frozen needs heads.
             format!("{a} frozen\n"),
+            // A number is digits only: `u64::from_str` accepts a leading
+            // `+`, a pin file does not (§4.4).
+            format!("{a} +5\n"),
+            format!("{a} {} +3 {}\n", now + 3600, root(9)),
+            format!("{a} +1 {}\n", root(9)),
             "short\n".into(),
             "epoch nope xx\n".into(),
             "epoch 7 notahash\n".into(),
@@ -902,6 +995,12 @@ mod tests {
             fs::write(&path, bad).unwrap();
             assert!(read_anchor_pins(&path).is_err());
         }
+        // One line per anchor: a duplicate is a contradiction, not a
+        // pin to average.
+        fs::write(&path, format!("{a}\n{a} {}\n", now + 3600)).unwrap();
+        assert!(read_anchor_pins(&path).is_err());
+        fs::write(&path, format!("{a} 5 {}\n{a} 6 {}\n", root(9), root(9))).unwrap();
+        assert!(read_anchor_pins(&path).is_err());
         // Written lists carry no expiry and read back unchanged.
         write_anchors_to(&path, "test", &[a, b]).unwrap();
         assert_eq!(read_anchors_from(&path).unwrap(), vec![a, b]);
@@ -966,6 +1065,63 @@ mod tests {
         };
         write_anchor_pins(&path, "test", std::slice::from_ref(&window), None).unwrap();
         assert_eq!(read_anchor_pins(&path).unwrap(), vec![window]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn live_pins_drops_expired_pins_with_their_heads() {
+        let dir = std::env::temp_dir().join(format!("kuipa-paths-live-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pq-anchors");
+        let live = tang_pqc::Thumbprint::from_bytes([1; 32]);
+        let expired = tang_pqc::Thumbprint::from_bytes([2; 32]);
+        let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+        let pins = [
+            Pin {
+                anchor: live,
+                exp: Some(now + 3600),
+                heads: vec![(3, [4; 32]), (7, [5; 32])],
+                frozen: true,
+            },
+            Pin {
+                anchor: expired,
+                exp: Some(now - CLOCK_SKEW - 1),
+                heads: vec![(9, [6; 32])],
+                frozen: true,
+            },
+        ];
+        write_anchor_pins(&path, "test", &pins, None).unwrap();
+        assert_eq!(live_pins(&path).unwrap(), vec![pins[0].clone()]);
+        let (anchors, heads, frozen) = pinned_windows(&path).unwrap();
+        assert_eq!(anchors, vec![live]);
+        assert_eq!(
+            heads,
+            vec![
+                kuipa_enroll::delegation::HeadPin {
+                    anchor: live,
+                    size: 3,
+                    root: [4; 32]
+                },
+                kuipa_enroll::delegation::HeadPin {
+                    anchor: live,
+                    size: 7,
+                    root: [5; 32]
+                },
+            ],
+            "the whole window of a live pin, oldest first (§1.4)"
+        );
+        assert_eq!(frozen, vec![live], "an expired frozen pin is no freeze");
+        // No file at all is nothing pinned; a malformed one is an error.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            pinned_windows(&path).unwrap(),
+            (Vec::new(), Vec::new(), Vec::new())
+        );
+        fs::write(&path, format!("{live} +5\n")).unwrap();
+        assert!(
+            pinned_windows(&path).is_err(),
+            "a corrupt pin file fails closed"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }
