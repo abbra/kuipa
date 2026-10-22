@@ -320,7 +320,7 @@ fn head_pinned_client_enrolls_without_any_signature() {
             [s.head().unwrap()].as_slice(),
             &Auth::LdapOtp(otp),
             HOST,
-            &Deployment::servers(&[url.clone()]),
+            &Deployment::servers(std::slice::from_ref(&url)),
         )
     });
     let result = result.unwrap();

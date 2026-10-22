@@ -13,9 +13,12 @@ against an anchor it trusts. It gets that anchor from one of:
 
   ```text
   ipa-ku1:EXAMPLE.TEST:<anchor>:<expiry>[:<OTP>]
+  ipa-ku2:EXAMPLE.TEST:<anchor>:<expiry>:<size>:<root>[:<OTP>]
   ```
 
-  An expired string is refused before anything is sent;
+  An expired string is refused before anything is sent. A version 2
+  string also pins the anchor's vouch head, so the realm's proof is
+  checked against it with no signature;
 * or **pinned anchors** in `/etc/ipa/ku-anchors`, with `--realm R`, for
   images and configuration management.
 

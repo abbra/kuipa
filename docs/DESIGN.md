@@ -343,7 +343,8 @@ half life. The JWK Set carries two extension members:
          "servers":["ipa1.example.test","ipa2.example.test"],
          "ca_certs":["<b64url DER>"],
          "pkinit_anchors":["<b64url DER>"],
-         "anchors":["<b64url thumbprint>", …]},
+         "anchors":["<b64url thumbprint>", …],
+         "heads":[{"anchor":"<b64url thumbprint>","size":12,"root":"<b64url hash>"}, …]},
  "delegation": {"claim":"…","proofs":[<one proof>]}}
 ```
 
@@ -665,7 +666,7 @@ them.
   only as fresh as the last verification.
 * Nothing here revokes; §4.7's limits stand.
 
-### 4.9 Vouch heads (designed)
+### 4.9 Vouch heads
 
 §4.2's proof is an MTC certificate in all but shape, and carries the
 cost of one: measured (`measure_sizes`), the advertisement's delegation
@@ -682,20 +683,14 @@ Tree Certificates drafts call the mechanism that allows this a
 pre-distributed tree checkpoint a relying party holds, against which an
 inclusion proof verifies with no signature at all. `synta-mtc` (already
 a dependency, for the tree hashing) implements landmark publication,
-distribution and trusted-subtree verification. This section designs
-kuipa's use of it. It is **designed, not implemented** (§18.1); nothing
-above changes until it lands.
+distribution and trusted-subtree verification. This section is kuipa's
+use of it, and it is implemented: vouches are claim logs, pins carry
+heads, and a head-pinned client is served a proof with no signature,
+no anchor key and no vouch on the wire (§18.1).
 
 #### 4.9.1 What the anchor signs today, and what a head is
 
-An anchor's vouch is a full Merkle tree per signature: the leaves are
-re-sorted and the tree re-rooted on every re-vouch, so every proof for
-every claim changes each round. That is what makes the delegation carry
-its own tree: proof and witness cannot be separated, and a client that
-pins the anchor must repeat the anchor's 2.7 KB public key in every
-proof it checks.
-
-A **claim log** turns the same content into the MTC shape: an
+An anchor's vouch is a **claim log**: an
 append-only sequence of leaves, one per claim the anchor vouches for,
 numbered from 1, with the same RFC 9162 hashing as today (the MTC
 draft's leaf and node prefixing is identical to what `merkle.rs` already
@@ -706,35 +701,36 @@ a **head**:
 IPVH  version 2: realm anchor(32) iat exp size(u64) root(32)
 ```
 
-— the same fields as today's vouch statement, over the claim log
+— the same fields as the v1 vouch statement, over the claim log
 instead of a re-sorted tree. The **vouch head** is `(anchor thumbprint,
-size, root)`. Re-vouching appends claims and signs the new head; the
-root of an appended tree changes only along the right edge, so the
-inclusion path of an old claim stays valid as long as its suffix hash
-is unchanged — the property MTC issuance logs are built on. A vouch
-that only adds claims no longer rewrites every proof it ever made.
+size, root)`. Re-vouching keeps the previous log's order and appends
+the new claims, so every prefix of the log is the tree an earlier
+vouch signed: a head pinned at any prefix keeps verifying, with the
+inclusion path recomputed inside that prefix. A vouch that must *drop*
+a claim (a removed server) restarts the log, so no old prefix stays
+valid — a pinned head must not prove a claim the realm dropped.
 
 #### 4.9.2 The wire: a proof that skips the signature
 
 A **head proof** replaces today's `Proof` where the client holds the
-head:
+head, in the delegation's `head_proofs` member:
 
 ```json
-{"head_proof": {"anchor": "<thumbprint>", "index": 3,
-                "path": ["<b64url hash>", …]}}
+{"head_proofs": [{"anchor": "<thumbprint>", "index": 3, "size": 12,
+                  "path": ["<b64url hash>", …]}]}
 ```
 
-The old member stays: `{"claim": …, "proofs": […]}` (§4.3) for a client
-that pins the anchor but no head. A `head_proof` is accepted only
-against a pin that carries a head for that anchor (§4.9.4) — the
-thumbprint alone is not enough, since there is no signature to check.
-Selection (`?anchor=`, §4.3) becomes: the first pinned anchor for which
-the client can be served — a head proof when the client's pin carries a
-matching head, else today's signature proof, else the succession chain.
-The two-pin quorum (§4.4) works unchanged on head proofs: two pinned
-heads by distinct anchors must both prove the claim, and a thief
-holding one key alone cannot mint a matching head, so the impostor
-still surfaces as a refusal.
+The `proofs` member stays (§4.3) for a client that pins the anchor but
+no head. A head proof is accepted only against a pin that carries a
+head for that anchor (§4.9.4) — the thumbprint alone is not enough,
+since there is no signature to check. The client names its pinned
+heads as repeated `?head=<anchor>.<size>.<root>` parameters next to
+`?anchor=`; the server answers a head proof when one of its vouches
+makes the pinned prefix, else today's signature proof — a stale head
+is a silent fallback, not an error. The two-pin quorum (§4.4) works
+unchanged on head proofs: two pinned heads by distinct anchors must
+both prove the claim, and a thief holding one key alone cannot mint a
+matching head, so the impostor still surfaces as a refusal.
 
 **What it saves.** A head proof is the path (32 bytes per level, six
 levels at 60 anchors) plus a thumbprint: under 300 bytes against 7.5
@@ -747,17 +743,15 @@ freshness of its own.
 
 On the servers nothing structural changes — `AnchorState`, agirru
 anti-entropy, the Kerberos-authenticated syncs and the trust
-computation stay as they are. The `SignedVouch` entry becomes a head
-plus its new leaves: `IPSV` version 2, where the leaves are those
-appended since the previous head (a full vouch keeps its leaves, as
-today, until superseded). A
-server that finds a gap between a head it holds and one it receives
-fetches the missing leaves from the peer's public claim log
-(§4.9.5), as it fetches a missing anchor-log window today (§4.8).
-The anchor re-signs on the same schedule (§4.2); with signature-free
-proofs in play it may sign less often — the head a pin carries is
-fresh until its stated `exp` passes — but re-vouching stays cheap and
-the code keeps the batched cadence.
+computation stay as they are. The `IPSV` entry keeps carrying the
+whole leaf list, in log order: a re-vouch that only appends keeps the
+previous log and adds to it, one that must drop a claim starts a new
+log, and the newest vouch of an anchor always carries its current
+log — so a peer that receives one can check and serve any prefix of
+it. A server that wants a leaf older than the vouch it holds fetches
+the pages it needs from the peer's public claim log (§4.9.5), as it
+fetches a missing anchor-log window today (§4.8). The anchor
+re-signs on the same schedule and cadence (§4.2).
 
 A delegation served to a head-pinned client carries its head proof
 only, not the signature; the signature stays in the exchange and in
@@ -778,8 +772,8 @@ its channel:
 
 | channel | today | with a head |
 |---|---|---|
-| enrollment string (§4.4) | `ipa-ku1:REALM:<anchor>:<expiry>` | `ipa-ku2:REALM:<anchor>:<expiry>:<size>:<root>` (versioned prefix; the head is optional, and a string may pin the anchor alone, as today) |
-| `/etc/ipa/ku-anchors` (§4.5) | `<thumbprint> [<expiry>]` | `<thumbprint> [<expiry>] [<size> <root>]`, refreshed inside every sealed join and rekey response, as pins are |
+| enrollment string (§4.4) | `ipa-ku1:REALM:<anchor>:<expiry>` | `ipa-ku2:REALM:<anchor>:<expiry>:<size>:<root>` (`kuipad enrollment-string --head`; a v1 string pins the anchor alone, as today) |
+| `/etc/ipa/ku-anchors` (§4.5) | `<thumbprint> [<expiry>]` | `<thumbprint> [<expiry> [<size> <root>]]`, refreshed inside every sealed join and rekey response, as pins are |
 | sealed response payload (§5.5) | `anchors[]` (thumbprints) | `anchors[]` with each one's current head |
 | image pins (§4.4, `--realm`) | thumbprints + expiry | thumbprints + expiry + head |
 
@@ -805,9 +799,9 @@ were in the tree when its pin was written — the stale-pin property
 
 #### 4.9.5 Publishing heads publicly
 
-`GET /ipa/ku/anchor-log` (§4.8) gains the claim logs: the response
-lists, per current anchor, its head `(size, root, exp)` and serves
-`?from=<index>` pages of leaves — the same pagination and public,
+`GET /ipa/ku/anchor-log` (§4.8) also answers the anchors' current
+heads, and `GET /ipa/ku/claim-log/{anchor}?from=<index>` serves pages
+of one anchor's claim log — the same pagination and public,
 unauthenticated access as the epoch log, for a server that must fill a
 gap or a verifier that wants to audit what a head covered. Leaves are
 content-addressed claims (their hash is the leaf), so pages are
@@ -1011,7 +1005,7 @@ runs `kinit -n` (armour) and `kinit -T <armour> admin`, and calls
 realm, domain, basedn, issuer, servers[]       → configuration; issuer listed first
 ca_certs[] (DER)                               → /etc/ipa/ca.crt; each must be in the advertisement
 pkinit_anchors[] (DER)                         → PKINIT anchors for the generated krb5.conf
-anchors[] (thumbprints)                        → /etc/ipa/ku-anchors
+anchors[] (thumbprints) with heads[]           → /etc/ipa/ku-anchors (§4.9.4)
 keytab (MIT 0x0502)                            → /etc/krb5.keytab; principal must be host/<fqdn>@REALM
 ```
 
@@ -1813,7 +1807,7 @@ Common rules:
 |---|---|
 | `etc/krb5.keytab` | the host keytab (a symlink to `run/ipa/krb5.keytab` when protected) |
 | `etc/ipa/ca.crt` | the IPA CA chain |
-| `etc/ipa/ku-anchors` | pinned anchors of the host's realm, one per line; a pre-provisioned line may add its expiry, `<thumbprint> <unix seconds>`, after which it is ignored (§4.4) |
+| `etc/ipa/ku-anchors` | pinned anchors of the host's realm, one per line; a line may add the pin's expiry, `<thumbprint> <unix seconds>`, after which it is ignored, and the anchor's vouch head, `<size> <root>` (§4.9.4); lines written from server responses carry the head and no expiry |
 | `etc/ipa/ku-anchors.d/<REALM>`, `var/lib/ipa-client/ku/trusts/<REALM>/`, `etc/krb5.conf.d/kuipa_trust_<REALM>` | a trusted realm's anchors, PKINIT anchors and CA, and Kerberos configuration (§17.3) |
 | `etc/ipa/krb5.keytab.sealed` | the sealed keytab |
 | `run/ipa/krb5.keytab` | the unsealed keytab in file mode |
@@ -1985,7 +1979,7 @@ Commands:
 | `serve` | the daemon |
 | `generate-keys` | create the anchor (unless `anchor` is false), signing, join, escrow and trust keys; print the anchor thumbprint |
 | `anchor` | print the anchor thumbprint |
-| `enrollment-string [--days 7]` | print `ipa-ku1:REALM:<anchor>:<expiry>`, valid that many days (at most 400), to append `:<OTP>` to (§4.4) |
+| `enrollment-string [--days 7] [--head]` | print `ipa-ku1:REALM:<anchor>:<expiry>` (with `--head`: `ipa-ku2`, also pinning the anchor's vouch head, §4.9), valid that many days (at most 400), to append `:<OTP>` to (§4.4) |
 | `rotate-anchor [--days 400]` | replace the anchor: the old one signs a succession to the new one, valid that many days, and is deleted (§4.7); print the new thumbprint |
 | `rotate-keys [--join] [--escrow] [--trust] [--signing]` | retire the chosen keys (default: join, escrow and trust) and create new ones; a retired key keeps answering, with its retirement time as the file's mtime |
 | `prune-keys [--join-days 14] [--escrow-days 400]` | delete retired join and trust keys, and escrow keys, retired longer ago than that, and expired successions |
@@ -2012,6 +2006,8 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/vault/{kid}` | `IPJQ` (operation data: a JSON vault operation) → `IPJS` (payload `IPVR`) (§7.6) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
 | POST | `/ipa/ku/peer/sync` | `IPPS` → agirru envelope (CBOR); servers only (§4.2) |
+| GET | `/ipa/ku/anchor-log?from=n` | → epoch-log entries and the anchors' current vouch heads (§4.8, §4.9) |
+| GET | `/ipa/ku/claim-log/{anchor}?from=i` | → one anchor's claim-log page (§4.9.5) |
 | POST | `/ipa/ku/trust/{kid}` | `IPTQ` → `IPTS` (§17.4) |
 | GET | `/ipa/ku/tang/adv`, `/ipa/ku/tang/adv/{thp}` | → Tang advertisement (`application/jose+json`) (§11.5) |
 | GET | `/ipa/ku/tang/key/{kid}` | → Tang exchange key (`application/jwk+json`) (§11.5) |
@@ -2178,7 +2174,7 @@ IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                         
 IPVH  realm anchor(32) iat(u64) exp(u64) size(u64) root(32)                      vouch (signed)
 IPSV  vouch(IPVH) signature n(u64) [leaf(32)]                                    signed vouch with leaves
 IPVH  version 2 (§4.9): the same fields, over the append-only claim log          vouch head (claim log)
-IPSV  version 2 (§4.9): vouch(IPVH) signature n(u64) [leaf(32)]                  signed head, with the leaves appended since the previous head (a full vouch keeps its leaves, as version 1)
+IPSV  version 2 (§4.9): vouch(IPVH) signature n(u64) [leaf(32)]                  signed head, with the whole claim log in order: appending keeps the previous log, a drop restarts it
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
 IPAE  realm seq(u64) prev(32) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-256` of them under a domain-separation context; `prev` is the previous entry's head, `0…0` for the first)
@@ -2399,7 +2395,7 @@ like an enrollment string.
 | trusted realms: `trusts` member and its validation, `kuipa trusted-realms`, per-realm anchors, PKINIT anchors and `krb5.conf.d` snippets (§17.1–§17.3) | implemented, tested against two real KDCs |
 | establishing a trust: invitation, trust request, trust secret, cross-realm keys, partner refresh (§17.4) | implemented, tested against two real KDCs; the LDAP side **not yet run against FreeIPA** |
 | units, httpd snippet, config example | provided (`contrib/`) |
-| vouch heads: claim logs, landmark-style pin checks, `ipa-ku2` strings (§4.9) | designed |
+| vouch heads: claim logs, head proofs in advertisements and delegations, `?head=` selection with signature fallback, heads in pins and sealed responses, `ipa-ku2` strings, public claim logs (§4.9) | implemented, tested (claim logs and head proofs, tampering and stale heads, HTTP flows with a head-pinned client, pin-file round trips, KDC exchange) |
 | vouchers (§9): `ml-dsa-blind` issuing, `kuipa-voucher`, bound and bearer vouchers, voucher joins | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
