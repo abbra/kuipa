@@ -169,6 +169,10 @@ impl Config {
                             .iter()
                             .map(|a| a.parse())
                             .collect::<Result<_, _>>()?,
+                        // Configuration cannot know the partner's
+                        // heads; the trust refresh fills them from
+                        // its advertisement (DESIGN-claim-logs.md §3).
+                        heads: Vec::new(),
                     })
                 })
                 .collect::<Result<_, Error>>()?,
@@ -195,6 +199,7 @@ impl Config {
                         .iter()
                         .map(|a| a.parse())
                         .collect::<Result<_, _>>()?,
+                    heads: Vec::new(),
                 })
             })
             .collect()

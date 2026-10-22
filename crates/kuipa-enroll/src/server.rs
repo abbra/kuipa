@@ -1399,6 +1399,10 @@ impl EnrollServer {
             domain: self.info.domain.clone(),
             servers: self.info.servers.clone(),
             anchors: self.anchors(),
+            // What a partner's hosts pin next to them
+            // (DESIGN-claim-logs.md §3): this realm's heads for the
+            // same anchors, as the advertisement carries them.
+            heads: self.heads(),
         }
     }
 
