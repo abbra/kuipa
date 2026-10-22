@@ -112,6 +112,7 @@ fn trust_b(servers: &[&str], anchor: Thumbprint) -> TrustedRealm {
         domain: "b.test".into(),
         servers: servers.iter().map(|s| (*s).to_owned()).collect(),
         anchors: vec![anchor],
+        heads: Vec::new(),
     }
 }
 

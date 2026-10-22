@@ -81,6 +81,13 @@ pub struct TrustedRealm {
     pub servers: Vec<String>,
     /// Its anchors.
     pub anchors: Vec<Thumbprint>,
+    /// Its anchors' current vouch heads (DESIGN-claim-logs.md §3),
+    /// aligned with `anchors` and in its advertisement's `heads` form:
+    /// what a host of this realm pins for that realm next to its
+    /// anchors, so its next refresh verifies with no signature.
+    /// Empty where unknown (an older partner, or none of its anchors
+    /// vouched yet).
+    pub heads: Vec<HeadPin>,
 }
 
 impl TrustedRealm {
@@ -124,6 +131,18 @@ impl TrustedRealm {
         }
         Ok(())
     }
+
+    /// The heads a client should pin for this realm's anchors
+    /// (DESIGN-claim-logs.md §3): only those for anchors it lists, at
+    /// most one each, whatever order the wire carried.
+    #[must_use]
+    pub fn pins(&self) -> Vec<HeadPin> {
+        self.anchors
+            .iter()
+            .filter_map(|a| self.heads.iter().find(|h| &h.anchor == a))
+            .copied()
+            .collect()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,6 +151,10 @@ struct TrustJson {
     domain: String,
     servers: Vec<String>,
     anchors: Vec<String>,
+    /// Absent in older advertisements: the realm's partners carried no
+    /// heads (DESIGN-claim-logs.md §3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    heads: Vec<serde_json::Value>,
 }
 
 impl From<&TrustedRealm> for TrustJson {
@@ -141,6 +164,7 @@ impl From<&TrustedRealm> for TrustJson {
             domain: t.domain.clone(),
             servers: t.servers.clone(),
             anchors: t.anchors.iter().map(ToString::to_string).collect(),
+            heads: t.heads.iter().map(HeadPin::to_json).collect(),
         }
     }
 }
@@ -149,6 +173,12 @@ impl TrustJson {
     fn parse(self) -> Option<TrustedRealm> {
         Some(TrustedRealm {
             anchors: parse_anchors(&self.anchors)?,
+            heads: self
+                .heads
+                .iter()
+                .map(HeadPin::from_json)
+                .collect::<Result<_>>()
+                .ok()?,
             realm: self.realm,
             domain: self.domain,
             servers: self.servers,
@@ -773,6 +803,8 @@ pub(crate) mod tests {
     use tang_pqc::{KemAlg, SignatureAlg};
 
     use super::*;
+    use crate::delegation::{SignedVouch, VOUCH_VALIDITY};
+    use crate::server::EnrollServer;
 
     pub(crate) struct TestRealm {
         pub anchor: SigningKey,
@@ -845,6 +877,7 @@ pub(crate) mod tests {
             domain: realm.to_ascii_lowercase(),
             servers: vec![format!("ipa1.{}", realm.to_ascii_lowercase())],
             anchors: vec![anchor],
+            heads: Vec::new(),
         }
     }
 
@@ -1132,5 +1165,84 @@ pub(crate) mod tests {
             ),
             Err(Error::Mismatch(_))
         ));
+    }
+
+    #[test]
+    fn trusted_realm_heads_round_trip() {
+        let a = *test_realm("ipa1.example.test").anchor.public().thumbprint();
+        let head = HeadPin {
+            anchor: a,
+            size: 3,
+            root: [7; 32],
+        };
+        let t = TrustedRealm {
+            realm: "B.TEST".into(),
+            domain: "b.test".into(),
+            servers: vec!["ipa1.b.test".into()],
+            anchors: vec![a],
+            heads: vec![head],
+        };
+        assert_eq!(TrustedRealm::from_json(t.to_json().as_bytes()).unwrap(), t);
+        // pins(): the head for an anchor it lists, none for one it
+        // does not (DESIGN-claim-logs.md §3).
+        assert_eq!(t.pins(), vec![head]);
+        let stranger = TrustedRealm {
+            anchors: vec![Thumbprint::from_bytes([9; 32])],
+            heads: vec![head],
+            ..t.clone()
+        };
+        assert_eq!(stranger.pins(), Vec::<HeadPin>::new());
+
+        // A partner without heads (an older one) parses to none, and
+        // the JSON form of one without heads carries no member.
+        let bare = TrustedRealm {
+            heads: Vec::new(),
+            ..t
+        };
+        let json = bare.to_json();
+        assert!(!json.contains("heads"));
+        assert_eq!(TrustedRealm::from_json(json.as_bytes()).unwrap(), bare);
+
+        // validate_for still separates the realms: a head is a fact
+        // about an anchor, not a new way to share one.
+        assert!(bare.validate_for("EXAMPLE.TEST", &[a]).is_err());
+    }
+
+    #[test]
+    fn as_partner_carries_the_heads() {
+        // The partner form fills heads from the server's published
+        // vouches, aligned with its anchors (DESIGN-claim-logs.md §3).
+        let t = test_realm("ipa1.example.test");
+        let a = *t.anchor.public().thumbprint();
+        let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let server = EnrollServer::new(
+            ServerKeys {
+                signing,
+                join: Vec::new(),
+                escrow: Vec::new(),
+                trust: Vec::new(),
+                vouchers: Vec::new(),
+                retired: Vec::new(),
+            },
+            t.info.clone(),
+            t.delegation.clone(),
+        );
+        assert_eq!(server.as_partner().heads, Vec::<HeadPin>::new());
+        let vouch = SignedVouch::issue(
+            &t.anchor,
+            "EXAMPLE.TEST",
+            [t.delegation.claim().unwrap().leaf().unwrap()],
+            now() - 60,
+            now() + VOUCH_VALIDITY,
+            None,
+        )
+        .unwrap();
+        let mut vouches = std::collections::HashMap::new();
+        vouches.insert(a, vouch);
+        server.publish(t.delegation.clone(), vec![a], vouches);
+        let heads = server.as_partner().heads;
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].anchor, a);
+        assert_eq!(heads[0].size, 1);
     }
 }

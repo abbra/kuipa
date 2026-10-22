@@ -945,6 +945,7 @@ fn advertisement_lists_details_landmarks_and_an_anchor_index() {
         domain: "b.test".into(),
         servers: vec!["ipa1.b.test".into()],
         anchors: vec![other_pin],
+        heads: Vec::new(),
     }];
     info.validate().unwrap();
     let dir = Dir::default();

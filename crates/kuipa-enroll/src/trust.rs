@@ -155,6 +155,10 @@ fn get_realm(r: &mut Reader) -> Result<TrustedRealm> {
         domain,
         servers,
         anchors,
+        // The wire form carries no heads: they arrive with the
+        // partner's first refresh, from its advertisement
+        // (DESIGN-claim-logs.md §3).
+        heads: Vec::new(),
     })
 }
 

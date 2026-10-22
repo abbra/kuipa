@@ -254,6 +254,11 @@ pub async fn refresh(
                         domain: info.domain.clone(),
                         servers: info.servers.clone(),
                         anchors: info.anchors.clone(),
+                        // The partner's own heads for those anchors,
+                        // from its verified advertisement — what a
+                        // host of this realm pins for it
+                        // (DESIGN-claim-logs.md §3).
+                        heads: info.heads.clone(),
                     };
                     break;
                 }
