@@ -394,6 +394,23 @@ impl Endpoint {
             .entries)
     }
 
+    /// One anchor's claim log (§4.9.5): the leaves after `from`, with
+    /// the head they lead to and its signed vouch
+    /// (DESIGN-claim-logs.md §4).
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`].
+    pub fn claim_log(
+        &self,
+        anchor: &tang_pqc::Thumbprint,
+        from: u64,
+    ) -> Result<kuipa_enroll::server::ClaimLogPage, NetError> {
+        let url = format!("{}claim-log/{anchor}?from={from}", self.base);
+        let body = self.send("GET", &url, self.client.get(&url), 0)?;
+        serde_json::from_slice(&body).map_err(|e| NetError::Other(format!("claim log: {e}")))
+    }
+
     /// `POST <path>` with a binary body.
     ///
     /// # Errors

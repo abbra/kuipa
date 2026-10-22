@@ -506,15 +506,18 @@ fn merge_previous(mut new: Keytab, old: Option<Keytab>) -> Result<Keytab, Error>
 fn install(paths: &Paths, enrollment: &Enrollment, fqdn: &str) -> Result<(), Error> {
     paths::write_file(&paths.keytab(), enrollment.keytab.to_mit()?.as_ref(), 0o600)?;
     paths::write_pem(&paths.ca(), &enrollment.ca_certs)?;
-    paths::write_anchors_epoch_with_heads(
+    let heads = enrollment
+        .anchors
+        .iter()
+        .copied()
+        .zip(enrollment.heads.iter().copied())
+        .collect::<Vec<_>>();
+    write_windows(
         paths,
-        &enrollment
-            .anchors
-            .iter()
-            .copied()
-            .zip(enrollment.heads.iter().copied())
-            .collect::<Vec<_>>(),
+        &paths::read_anchor_pins(&paths.anchors()).unwrap_or_default(),
         payload_epoch(enrollment),
+        &enrollment.config.issuer,
+        &heads,
     )?;
     let config = &enrollment.config;
     let mut servers = vec![config.issuer.clone()];
@@ -895,6 +898,108 @@ fn payload_epoch(enrollment: &Enrollment) -> Option<Epoch> {
     (enrollment.epoch_seq != 0).then_some((enrollment.epoch_seq, enrollment.epoch_head))
 }
 
+/// Extend the host's pin windows with a verified advertisement's heads
+/// (DESIGN-claim-logs.md §1.3): for every anchor whose new head does
+/// not extend the window, fetch the claim-log pages of the whole log
+/// up to the new head and check that the first `newest` leaves hash
+/// to the pinned root and all of them to the new one — the RFC 9162
+/// consistency check between the two tree sizes, from the leaves
+/// alone.  A head that fails the check is not pinned and the window
+/// keeps what it had; a head whose size is lower (the log restarted)
+/// truncates the window in [`paths::merge_windows`], reported here.
+fn extend_windows(
+    endpoint: &Endpoint,
+    pins: &[paths::Pin],
+    heads: &[paths::AnchorHead],
+) -> (Vec<paths::Pin>, bool) {
+    let mut merged = heads.to_vec();
+    for (i, (anchor, head)) in heads.iter().enumerate() {
+        let Some(pin) = pins.iter().find(|p| &p.anchor == anchor) else {
+            continue;
+        };
+        let Some((size, root)) = head else { continue };
+        let Some(&(newest, old_root)) = pin.heads.last() else {
+            continue; // No window yet: the first head needs no check.
+        };
+        if *size <= newest {
+            continue; // A repeat or a restart: merge_windows decides.
+        }
+        let mut leaves = Vec::new();
+        let mut from = 0;
+        let complete = loop {
+            match endpoint.claim_log(anchor, from) {
+                Ok(page) => {
+                    if page.leaves.is_empty() {
+                        break false;
+                    }
+                    for leaf in &page.leaves {
+                        if let Ok(bytes) = tang_pqc::b64::decode(leaf)
+                            && bytes.len() == 32
+                        {
+                            let mut h = [0u8; 32];
+                            h.copy_from_slice(&bytes);
+                            leaves.push(h);
+                        }
+                    }
+                    from += page.leaves.len() as u64;
+                    if from >= *size {
+                        break leaves.len() as u64 == *size;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        anchor = %anchor,
+                        "window not extended: claim log unreachable: {e}"
+                    );
+                    break false;
+                }
+            }
+        };
+        let prefix = usize::try_from(newest)
+            .ok()
+            .and_then(|n| leaves.get(..n))
+            .and_then(|l| kuipa_enroll::merkle::root(l).ok())
+            .is_some_and(|r| r == old_root);
+        let consistent =
+            complete && prefix && kuipa_enroll::merkle::root(&leaves).is_ok_and(|r| r == *root);
+        if !consistent {
+            tracing::warn!(
+                anchor = %anchor,
+                "window not extended: the served head does not contain the pinned history"
+            );
+            merged[i].1 = None;
+        }
+    }
+    paths::merge_windows(pins, &merged)
+}
+
+/// Merge a verified response's heads into the host's pin file with the
+/// consistency check of [`extend_windows`]: the windows grow only
+/// through pages that provably contain the pinned history
+/// (DESIGN-claim-logs.md §1.3), and a restart is reported.  `issuer`
+/// is the server the verified response came from, for the pages.
+fn write_windows(
+    paths: &Paths,
+    pins: &[paths::Pin],
+    epoch: Option<(u64, [u8; 32])>,
+    issuer: &str,
+    heads: &[paths::AnchorHead],
+) -> Result<bool, Error> {
+    let (pins, restarted) = if pins.is_empty() {
+        (paths::merge_windows(pins, heads).0, false)
+    } else {
+        match Endpoint::new(issuer, &Trust::FirstContact) {
+            Ok(endpoint) => extend_windows(&endpoint, pins, heads),
+            Err(e) => {
+                tracing::warn!("window not extended: {e}");
+                (paths::merge_windows(pins, heads).0, false)
+            }
+        }
+    };
+    paths::write_anchor_pins(&paths.anchors(), "kuipa realm anchors", &pins, epoch)?;
+    Ok(restarted)
+}
+
 /// Advertisements of every server of the realm that answers and describes
 /// the stored deployment, for sealing.
 pub(crate) fn all_servers(
@@ -995,16 +1100,24 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         }
         None => paths::write_file(&paths.keytab(), keytab.to_mit()?.as_ref(), 0o600)?,
     }
-    paths::write_anchors_epoch_with_heads(
+    let heads = enrollment
+        .anchors
+        .iter()
+        .copied()
+        .zip(enrollment.heads.iter().copied())
+        .collect::<Vec<_>>();
+    let restarted = write_windows(
         paths,
-        &enrollment
-            .anchors
-            .iter()
-            .copied()
-            .zip(enrollment.heads.iter().copied())
-            .collect::<Vec<_>>(),
+        &paths::read_anchor_pins(&paths.anchors()).unwrap_or_default(),
         epoch,
+        &enrollment.config.issuer,
+        &heads,
     )?;
+    if restarted {
+        tracing::warn!(
+            "an anchor restarted its claim log: the realm removed something; the window starts fresh"
+        );
+    }
     let mut servers = vec![enrollment.config.issuer.clone()];
     servers.extend(
         state

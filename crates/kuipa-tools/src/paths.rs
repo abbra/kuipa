@@ -446,6 +446,62 @@ pub struct Pin {
 /// refreshes in between, small enough that a pin line stays a line.
 pub const MAX_HEAD_WINDOW: usize = 4;
 
+/// Merge a verified advertisement's heads into the host's pins
+/// (DESIGN-claim-logs.md §1.2–§1.3): a head that extends a pin's
+/// window is appended (the window trimmed to [`MAX_HEAD_WINDOW`], the
+/// oldest dropped first); a head whose size is lower — the anchor
+/// restarted its log, a claim was dropped — ends the window and
+/// starts a fresh one; a head already in the window keeps it.  A pin
+/// with no head yet starts its window at the new one.  Frozen pins
+/// keep exactly what they had.  The consistency check (that the old
+/// window's heads are prefixes of the new tree) is the caller's, on
+/// the claim-log pages between the sizes; this only merges what
+/// verified.
+///
+/// Returns the merged pins and whether any window was truncated (a
+/// restart), for the caller to report.
+#[must_use]
+pub fn merge_windows(pins: &[Pin], heads: &[AnchorHead]) -> (Vec<Pin>, bool) {
+    let mut restarted = false;
+    let mut out = pins.to_vec();
+    for (anchor, head) in heads {
+        let Some(pin) = out.iter_mut().find(|p| &p.anchor == anchor) else {
+            // A new anchor: its pin starts at the new head.
+            out.push(Pin {
+                anchor: *anchor,
+                exp: None,
+                heads: head.map_or_else(Vec::new, |h| vec![h]),
+                frozen: false,
+            });
+            continue;
+        };
+        let Some((size, root)) = head else { continue };
+        if pin.frozen {
+            // What the head covers is all the pin ever accepts
+            // (DESIGN-claim-logs.md §2): the operator moves it, not
+            // the exchange.
+            continue;
+        }
+        if pin.heads.iter().any(|(s, _)| s == size) {
+            continue; // Already pinned: the window keeps it.
+        }
+        match pin.heads.last() {
+            Some((newest, _)) if *newest < *size => {
+                pin.heads.push((*size, *root));
+                let cut = pin.heads.len().saturating_sub(MAX_HEAD_WINDOW);
+                pin.heads.drain(..cut);
+            }
+            Some(_) => {
+                // Lower than the window's newest: the log restarted.
+                restarted = true;
+                pin.heads = vec![(*size, *root)];
+            }
+            None => pin.heads = vec![(*size, *root)],
+        }
+    }
+    (out, restarted)
+}
+
 /// The anchor epoch watermark stored in an anchors file (§4.8): the
 /// `(seq, head)` of the last entry of the anchor log this host has
 /// verified, from the `epoch <seq> <hash>` line, if it has one.
@@ -513,18 +569,21 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
         let (exp, heads) = match rest.as_slice() {
             [] => (None, Vec::new()),
             [e] => (Some(parse_expiry(e, l, path)?), Vec::new()),
+            // `<size> <root>` with no expiry, then more pairs: the
+            // first field is a number and the second a thumbprint.
+            // Checked before the expiry form, which would otherwise
+            // read the first root as the expiry's size.
+            [e, size, ..] if looks_like_head(e, size) => {
+                let mut heads = parse_pairs(&rest, l, path)?;
+                check_window(&heads, l, path)?;
+                (None, std::mem::take(&mut heads))
+            }
             [e, size, root, tail @ ..] => {
                 let root = parse_root(root, l, path)?;
                 let first = (parse_size(size, l, path)?, root);
                 let mut heads = vec![first];
                 heads.extend(parse_pairs(tail, l, path)?);
                 (Some(parse_expiry(e, l, path)?), heads)
-            }
-            [e, size, ..] if looks_like_head(e, size) => {
-                // `<size> <root>` with no expiry, then more pairs.
-                let mut heads = parse_pairs(&rest, l, path)?;
-                check_window(&heads, l, path)?;
-                (None, std::mem::take(&mut heads))
             }
             _ => {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
