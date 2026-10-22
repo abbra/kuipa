@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use kuipa_enroll::EnrollServer;
+use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::realm::{TrustedRealm, VerifiedRealm};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::{self, Established, Invitation, TrustResponse};
@@ -221,6 +222,18 @@ pub fn secret_text(established: &Established) -> SecretBuf {
     trust::secret_text(&established.secret)
 }
 
+/// The advertised heads backed by a signature: those also in `proved`,
+/// the heads an advertisement's delegation signed (§4.9,
+/// DESIGN-claim-logs.md §4).  An advertised head with no proof behind
+/// it is the server's assertion, not a pin a host may trust.
+fn back_heads(advertised: &[HeadPin], proved: &[HeadPin]) -> Vec<HeadPin> {
+    advertised
+        .iter()
+        .filter(|h| proved.contains(h))
+        .copied()
+        .collect()
+}
+
 /// Refresh every recorded partner from its verified advertisement, and
 /// publish `configured` plus the recorded partners.  A partner that cannot
 /// be verified keeps its last description.
@@ -249,16 +262,51 @@ pub async fn refresh(
             match advertisement(s, endpoints, &partner.realm, &partner.anchors).await {
                 Ok(adv) => {
                     let info = adv.info();
+                    // Pin only heads a signature proves: first the
+                    // heads this advertisement itself signed; for a
+                    // head it does not, that anchor's own
+                    // advertisement — verified against exactly that
+                    // anchor — must prove it (§4.9).
+                    let mut heads = back_heads(&info.heads, adv.proved_heads());
+                    let mut missing: Vec<Thumbprint> = Vec::new();
+                    for h in info.heads.iter().filter(|h| !heads.contains(h)) {
+                        if !missing.contains(&h.anchor) {
+                            missing.push(h.anchor);
+                        }
+                    }
+                    for anchor in missing {
+                        match advertisement(s, endpoints, &partner.realm, &[anchor]).await {
+                            Ok(own) => {
+                                for h in back_heads(&info.heads, own.proved_heads()) {
+                                    if !heads.contains(&h) {
+                                        heads.push(h);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "kuipad: trusts: {} via {s}: head of {anchor}: {e}",
+                                    partner.realm
+                                );
+                            }
+                        }
+                    }
+                    let unbacked = info.heads.iter().filter(|h| !heads.contains(h)).count();
+                    if unbacked > 0 {
+                        eprintln!(
+                            "kuipad: trusts: {}: unbacked heads not pinned ({unbacked})",
+                            partner.realm
+                        );
+                    }
                     current = TrustedRealm {
                         realm: partner.realm.clone(),
                         domain: info.domain.clone(),
                         servers: info.servers.clone(),
                         anchors: info.anchors.clone(),
-                        // The partner's own heads for those anchors,
-                        // from its verified advertisement — what a
-                        // host of this realm pins for it
-                        // (DESIGN-claim-logs.md §3).
-                        heads: info.heads.clone(),
+                        // The partner's signature-backed heads for
+                        // those anchors — what a host of this realm
+                        // pins for it (DESIGN-claim-logs.md §3).
+                        heads,
                     };
                     break;
                 }
@@ -285,4 +333,27 @@ pub async fn refresh(
         }
     }
     server.publish_trusts(published);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(anchor: u8, size: u64, root: u8) -> HeadPin {
+        HeadPin {
+            anchor: Thumbprint::from_bytes([anchor; 32]),
+            size,
+            root: [root; 32],
+        }
+    }
+
+    #[test]
+    fn only_proved_heads_are_backed() {
+        let proved = head(1, 12, 7);
+        let asserted = head(1, 13, 8);
+        assert_eq!(back_heads(&[proved, asserted], &[proved]), [proved]);
+        // An advertisement that proves nothing backs no head: every
+        // advertised head is only the server's assertion.
+        assert_eq!(back_heads(&[proved], &[]).len(), 0);
+    }
 }

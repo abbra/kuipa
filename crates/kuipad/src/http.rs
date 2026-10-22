@@ -140,7 +140,8 @@ fn wanted_anchors(query: Option<&str>) -> Vec<Thumbprint> {
 
 /// The vouch heads a client pins (§4.9): `?head=<thumbprint>.<size>.
 /// <root>`, repeated; unparsable ones are ignored.  The root is a
-/// base64url tree hash, the size a decimal leaf count.
+/// base64url tree hash, the size a decimal leaf count; a size of zero
+/// names no head and is ignored.
 fn wanted_heads(query: Option<&str>) -> Vec<HeadPin> {
     query
         .unwrap_or_default()
@@ -155,6 +156,8 @@ fn wanted_heads(query: Option<&str>) -> Vec<HeadPin> {
                 root: b64::decode(root).ok().and_then(|r| r.try_into().ok())?,
             })
         })
+        // A zero-size log has no head: no proof backs it (§4.9).
+        .filter(|h| h.size > 0)
         .take(MAX_WANTED_ANCHORS)
         .collect()
 }
@@ -536,6 +539,12 @@ mod tests {
         assert_eq!(wanted_heads(None).len(), 0);
         // Unparsable heads are ignored, not fatal.
         assert_eq!(wanted_heads(Some("head=not-a-head&head=x.y.z")).len(), 0);
+        // A size of zero names no head — no proof backs it — and is
+        // ignored like junk.
+        assert_eq!(
+            wanted_heads(Some(&format!("head={a}.0.{}", b64::encode(&root)))).len(),
+            0,
+        );
     }
 
     #[test]
