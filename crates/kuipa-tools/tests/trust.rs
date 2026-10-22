@@ -229,6 +229,7 @@ fn trusted_realm_against_real_kdcs() {
         &p,
         s.realm(),
         &[*s.anchor()],
+        &[],
         &Auth::LdapOtp(otp),
         HOST,
         &Deployment::servers(&[SERVER_A.to_owned()]),

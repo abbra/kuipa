@@ -777,11 +777,25 @@ impl Args {
             // An enrolled host trusts what it pinned for this realm, not
             // the string's single anchor of the day it was issued.
             let enrolled = paths::State::load(paths).is_ok_and(|s| s.realm == string.realm());
-            let pinned = if enrolled {
-                paths::read_anchors(paths).unwrap_or_default()
+            let (pinned, pinned_heads) = if enrolled {
+                let pins = paths::read_anchor_pins(&paths.anchors()).unwrap_or_default();
+                (
+                    pins.iter().map(|p| p.anchor).collect::<Vec<_>>(),
+                    pins.into_iter()
+                        .filter_map(|p| {
+                            p.head
+                                .map(|(size, root)| kuipa_enroll::delegation::HeadPin {
+                                    anchor: p.anchor,
+                                    size,
+                                    root,
+                                })
+                        })
+                        .collect::<Vec<_>>(),
+                )
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
+            let string_head = string.head();
             let pins = Pins {
                 realm: string.realm().to_owned(),
                 anchors: if pinned.is_empty() {
@@ -789,6 +803,7 @@ impl Args {
                 } else {
                     pinned
                 },
+                heads: pinned_heads.into_iter().chain(string_head).collect(),
             };
             return Ok((pins, secrets));
         }
@@ -808,6 +823,17 @@ impl Args {
         let pins = Pins {
             realm: realm.to_owned(),
             anchors,
+            heads: pinned
+                .into_iter()
+                .filter_map(|p| {
+                    p.head
+                        .map(|(size, root)| kuipa_enroll::delegation::HeadPin {
+                            anchor: p.anchor,
+                            size,
+                            root,
+                        })
+                })
+                .collect(),
         };
         Ok((pins, self.secrets(false, want_password)?))
     }
@@ -862,8 +888,13 @@ struct Secrets {
 struct Pins {
     realm: String,
     anchors: Vec<Thumbprint>,
+    /// The vouch heads pinned with them (§4.9), if any: an enrolled
+    /// host's pin file carries them next to the thumbprints, and a v2
+    /// enrollment string carries one for its anchor.
+    heads: Vec<kuipa_enroll::delegation::HeadPin>,
 }
 
+#[allow(clippy::too_many_lines)] // one command dispatch, one function
 fn run(args: &Args) -> Result<Value, Error> {
     let paths = Paths::from_env();
     match args.command.as_str() {
@@ -925,6 +956,7 @@ fn run(args: &Args) -> Result<Value, Error> {
                     &paths,
                     &pins.realm,
                     &pins.anchors,
+                    &pins.heads,
                     &auth,
                     &fqdn,
                     &deployment,
@@ -943,6 +975,7 @@ fn run(args: &Args) -> Result<Value, Error> {
             flows::realm_info(
                 &pins.realm,
                 &pins.anchors,
+                &pins.heads,
                 &deployment,
                 std::path::Path::new(dir),
             )
@@ -958,6 +991,7 @@ fn run(args: &Args) -> Result<Value, Error> {
             Ok(flows::advertisements(
                 &pins.realm,
                 &pins.anchors,
+                &pins.heads,
                 &deployment,
             ))
         }

@@ -320,6 +320,7 @@ impl<'a> Seal<'a> {
             &trust,
             &public.realm,
             &anchors,
+            &[],
             known,
             Operation::Vault,
             |adv| {
@@ -524,7 +525,7 @@ impl<'a> Seal<'a> {
         let mut verified = Vec::new();
         for server in &public.servers {
             let Ok((endpoint, v, _)) =
-                flows::verified(server, &trust, &public.realm, &anchors, known)
+                flows::verified(server, &trust, &public.realm, &anchors, &[], known)
             else {
                 continue;
             };
