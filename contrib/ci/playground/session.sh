@@ -252,6 +252,23 @@ section "Voucher enrollment" \
     "web6 has no host entry and no OTP: it enrolls with a voucher the issuer signed blindly, bound to the host's ephemeral key."
 step 0 "Enroll web6 with a bound voucher" 'pq_voucher web6 --bound'
 
+section "Auditing the claim logs" \
+    "kuipa-audit reads the realm's public claim logs: what an anchor's tree covers, and whether the servers agree on their heads."
+step 0 "web1's pinned heads, against the realm" \
+    'pq_host web1; kuipa-audit coverage --server ipa1.example.test' \
+    "current"
+step 0 "The two servers agree on their heads" \
+    'kuipa-audit split-view --server ipa1.example.test --server ipa2.example.test' \
+    "no disagreements"
+
+section "A keyless mirror" \
+    "kuipa-mirror syncs the public endpoints of one server and serves them read-only: a head-pinned client verifies a proof with no signature and no key on the mirror."
+step 0 "Serve a mirror of ipa1" \
+    'kuipa-mirror --origin ipa1.example.test --listen 127.0.0.1:0 --interval 1 >"$KUIPA_PLAYGROUND/mirror.port" 2>/dev/null & MIRROR=$!; sleep 2; kill -0 $MIRROR; MIRROR_PORT=$(cat "$KUIPA_PLAYGROUND/mirror.port")'
+step 0 "The mirror answers the claim log, with the head's vouch" \
+    'kuipa-audit claim-log --server http://127.0.0.1:$MIRROR_PORT --anchor "$(cat "$KUIPA_PLAYGROUND/anchor")"; s=$?; kill $MIRROR; rm -f "$KUIPA_PLAYGROUND/mirror.port"; [[ $s -eq 0 ]]' \
+    "vouch expires"
+
 section "Trusted realm" \
     "web1 installs the realm its realm trusts, B.TEST, verified through EXAMPLE.TEST; a B.TEST user logs in on web1 and gets a ticket for it across the trust."
 step 0 "Install the trusted realms on web1" 'pq_host web1; pq_trust'

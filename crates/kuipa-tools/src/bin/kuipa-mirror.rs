@@ -121,7 +121,11 @@ fn run(cli: &Cli, dir: &Path, cache: Arc<Cache>) -> Result<(), String> {
         let listener = tokio::net::TcpListener::bind(&cli.listen)
             .await
             .map_err(|e| format!("listen {}: {e}", cli.listen))?;
-        eprintln!("kuipa-mirror: serving {} on {}", cli.origin, cli.listen);
+        // Port 0 asks for a free one; say which, so a caller (the
+        // playground session) learns where to reach the mirror.
+        let bound = listener.local_addr().map_err(|e| e.to_string())?;
+        println!("{}", bound.port());
+        eprintln!("kuipa-mirror: serving {} on {}", cli.origin, bound);
         axum::serve(listener, app).await.map_err(|e| e.to_string())
     })
 }
