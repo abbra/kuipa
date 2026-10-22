@@ -1239,7 +1239,7 @@ impl Delegation {
     ///
     /// # Errors
     ///
-    /// As [`verify_at`].
+    /// As [`verify_at`](Self::verify_at).
     pub fn verify_at_with_heads(
         &self,
         anchors: &[Thumbprint],

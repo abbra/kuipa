@@ -554,7 +554,7 @@ pub fn write_anchors_epoch(
     )
 }
 
-/// [`write_anchors_epoch`](Self::write_anchors_epoch) with the anchors'
+/// [`write_anchors_epoch`] with the anchors'
 /// vouch heads (§4.9), aligned with `anchors`: `None` where the server
 /// knew no head.
 ///
