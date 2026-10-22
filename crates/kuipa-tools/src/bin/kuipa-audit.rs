@@ -192,7 +192,7 @@ fn render(command: &Command, value: &serde_json::Value) {
             rows.field("anchor", &get("anchor"));
             rows.field("leaves", &get("size"));
             rows.field("root", &get("root"));
-            rows.field("vouch expires", &get("exp"));
+            rows.until("vouch expires", &get("exp"));
             let leaves = get("leaves").as_array().map_or(0, Vec::len);
             rows.row("leaf count", leaves.to_string());
             rows.print();
@@ -296,6 +296,20 @@ impl Rows {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),
             other => other.to_string(),
+        };
+        self.row(label, sanitize(&text));
+    }
+
+    /// A Unix time a row names, as a date: `vouch expires` is read by a
+    /// person deciding whether to trust a log, not by a clock.  Out of
+    /// range the seconds are kept, and anything else prints as it is.
+    fn until(&mut self, label: &str, value: &serde_json::Value) {
+        if value.is_null() {
+            return;
+        }
+        let text = match value.as_u64() {
+            Some(secs) => kuipa_tools::text::date(secs).unwrap_or_else(|| secs.to_string()),
+            None => value.to_string(),
         };
         self.row(label, sanitize(&text));
     }
