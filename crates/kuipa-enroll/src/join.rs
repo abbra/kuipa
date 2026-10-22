@@ -50,6 +50,9 @@ pub enum Operation {
     /// `POST /ipa/ku/vault/{kid}`: an owner's operation on their vaults
     /// (§7.6).
     Vault,
+    /// `POST /ipa/ku/keys/{kid}`: a Kerberos-authenticated fetch of a
+    /// named secret (§18.2).
+    Keys,
 }
 
 impl Operation {
@@ -60,6 +63,7 @@ impl Operation {
             Self::Stage => "stage",
             Self::Register => "register",
             Self::Vault => "vault",
+            Self::Keys => "keys",
         }
     }
 
@@ -71,7 +75,7 @@ impl Operation {
 
     const fn magic(self) -> [u8; 4] {
         match self {
-            Self::Join | Self::Rekey | Self::Register | Self::Vault => *b"IPJQ",
+            Self::Join | Self::Rekey | Self::Register | Self::Vault | Self::Keys => *b"IPJQ",
             Self::Stage => *b"IPSQ",
         }
     }
@@ -657,6 +661,23 @@ impl PendingJoin {
             return Err(Error::Mismatch("server"));
         }
         crate::vault::Reply::from_bytes(self.open(response)?.as_ref())
+    }
+
+    /// Finish a `keys` fetch (§18.2): decrypt the answer's value.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], or
+    /// [`Error::Mismatch`] for another server.
+    pub fn finish_keys(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+    ) -> Result<crate::keys::KeysAnswer> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        crate::keys::KeysAnswer::from_bytes(self.open(response)?.as_ref())
     }
 
     /// Finish a join or rekey: decrypt the enrollment, and check it is for

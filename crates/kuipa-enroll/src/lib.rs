@@ -20,6 +20,7 @@ pub mod epoch;
 pub mod error;
 pub mod escrow;
 pub mod join;
+pub mod keys;
 pub mod keytab;
 pub mod merkle;
 pub mod payload;
