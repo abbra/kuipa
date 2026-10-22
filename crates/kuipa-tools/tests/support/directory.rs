@@ -44,6 +44,13 @@ pub struct KdcDirectory {
     pub unlocks: Mutex<HashMap<(VaultId, String), u64>>,
     /// Servers' published escrow keys.
     pub escrow_keys: Mutex<Vec<(String, tang_pqc::ExchangeKey)>>,
+    /// The server list (`cn=masters`) for the keys operation's policy.
+    pub masters: Mutex<Vec<String>>,
+    /// The masters with the CA role (`cn=CA` under their entry).
+    pub ca_masters: Mutex<Vec<String>>,
+    /// The `keys` operation's secrets, by `namespace/nickname` (§18.2):
+    /// the playground stands in for the handler executables.
+    pub key_secrets: Mutex<std::collections::BTreeMap<(u8, String), Vec<u8>>>,
     /// The realm's vault limits.
     pub limits: Mutex<kuipa_enroll::vault::Limits>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
@@ -79,6 +86,9 @@ impl KdcDirectory {
             locked: Mutex::new(HashSet::new()),
             unlocks: Mutex::new(HashMap::new()),
             escrow_keys: Mutex::new(Vec::new()),
+            masters: Mutex::new(servers.iter().map(|s| (*s).to_owned()).collect()),
+            ca_masters: Mutex::new(Vec::new()),
+            key_secrets: Mutex::new(std::collections::BTreeMap::new()),
             limits: Mutex::new(kuipa_enroll::vault::Limits::default()),
             creds,
         }
@@ -311,6 +321,35 @@ impl Directory for KdcDirectory {
             // The PAC's delegation info is not read yet.
             transited: None,
         })
+    }
+
+    fn fetch_key(
+        &self,
+        principal: &kuipa_enroll::keytab::Principal,
+        fetch: &kuipa_enroll::keys::KeysFetch,
+    ) -> Result<Vec<u8>, DirectoryError> {
+        // The policy of §18.2, against the modelled cn=masters lists.
+        let policy = kuipa_enroll::keys::KeysPolicy {
+            servers: self.masters.lock().unwrap().clone(),
+            ca_servers: self.ca_masters.lock().unwrap().clone(),
+        };
+        if let Some(reason) = policy.check(principal, fetch.namespace) {
+            eprintln!("playground keys: DENIED {principal}: {reason}");
+            return Err(reason.into());
+        }
+        self.key_secrets
+            .lock()
+            .unwrap()
+            .get(&(fetch.namespace.id(), fetch.nickname.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "no such key: {}/{}",
+                    fetch.namespace.label(),
+                    fetch.nickname
+                )
+                .into()
+            })
     }
 
     fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
