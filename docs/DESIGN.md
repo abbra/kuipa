@@ -2230,6 +2230,11 @@ recovery request and response.
   a client that holds one checks a delegation's inclusion proof against
   it, with no signature and no anchor key on the wire, through
   `synta-mtc`'s landmark and trusted-subtree machinery.
+  The services built on that exchange — head windows (a pin that keeps
+  every head it verified, with a consistency check against the public
+  claim log), frozen-trust pins, cross-realm heads, the signed vouch in
+  the public claim log, and the `kuipa-audit` and `kuipa-mirror` tools
+  — are designed in `DESIGN-claim-logs.md`.
 * **The daemon's identity:** its own `ipa-ku/<server>` principal with a
   delegation rule to `ldap/<server>` (as implemented) versus `HTTP/<server>`
   through gssproxy. Acting for callers uses protocol transition; S4U2Proxy
@@ -2396,6 +2401,7 @@ like an enrollment string.
 | establishing a trust: invitation, trust request, trust secret, cross-realm keys, partner refresh (§17.4) | implemented, tested against two real KDCs; the LDAP side **not yet run against FreeIPA** |
 | units, httpd snippet, config example | provided (`contrib/`) |
 | vouch heads: claim logs, head proofs in advertisements and delegations, `?head=` selection with signature fallback, heads in pins and sealed responses, `ipa-ku2` strings, public claim logs (§4.9) | implemented, tested (claim logs and head proofs, tampering and stale heads, HTTP flows with a head-pinned client, pin-file round trips, KDC exchange) |
+| claim-log services: head windows with consistency-checked refresh, frozen-trust pins, cross-realm heads, the signed vouch in claim-log pages, `kuipa-audit`, `kuipa-mirror` (DESIGN-claim-logs.md) | designed |
 | vouchers (§9): `ml-dsa-blind` issuing, `kuipa-voucher`, bound and bearer vouchers, voucher joins | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
