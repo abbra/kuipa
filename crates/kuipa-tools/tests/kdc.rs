@@ -348,6 +348,7 @@ fn against_a_real_kdc() {
                 peers: Some(peers),
                 limiter: kuipad::limit::Limiter::default(),
                 tang: None,
+                keys: None,
             }),
         );
         ipa.push(server);

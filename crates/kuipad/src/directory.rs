@@ -107,6 +107,8 @@ pub struct Config {
 pub struct LdapDirectory {
     cfg: Config,
     server_cred: GssServerCred,
+    /// The `keys` operation's handlers (§18.5), if the daemon serves it.
+    keys: Option<std::sync::Arc<crate::keys::Keys>>,
     /// Serialises use of the daemon's initiator ccache.
     initiator: std::sync::Mutex<()>,
 }
@@ -122,8 +124,14 @@ impl LdapDirectory {
         Ok(Self {
             cfg,
             server_cred,
+            keys: None,
             initiator: std::sync::Mutex::new(()),
         })
+    }
+
+    /// Serve the `keys` operation through `handlers` (§18.5).
+    pub fn serve_keys(&mut self, keys: std::sync::Arc<crate::keys::Keys>) {
+        self.keys = Some(keys);
     }
 
     fn host_dn(&self, fqdn: &str) -> String {
@@ -694,6 +702,67 @@ impl Directory for LdapDirectory {
         })
     }
 
+    fn fetch_key(
+        &self,
+        principal: &Principal,
+        fetch: &kuipa_enroll::keys::KeysFetch,
+    ) -> Result<Vec<u8>, DirectoryError> {
+        let Some(keys) = &self.keys else {
+            return Err("the keys operation is not configured".into());
+        };
+        // The policy check runs against LDAP before any handler does
+        // (§18.2): the server list (`cn=masters`) and, for the CA-only
+        // namespaces, the enabled CA role on the caller's own entry.
+        let mut conn = self.service_conn()?;
+        let base = format!("cn=masters,cn=ipa,cn=etc,{}", self.cfg.basedn);
+        let masters: Vec<String> = conn
+            .search(&base, Scope::OneLevel, "(objectClass=*)", &["cn"])?
+            .iter()
+            .filter_map(|e| e.attrs.get("cn").and_then(|v| v.first().cloned()))
+            .collect();
+        let needs_ca = matches!(
+            fetch.namespace,
+            kuipa_enroll::keys::Namespace::CaWrapped | kuipa_enroll::keys::Namespace::LwcaStore
+        );
+        let ca_servers: Vec<String> = if needs_ca {
+            // `cn=CA,cn=<master>,cn=masters,…` with
+            // `ipaConfigString=enabledService`: the masters with an
+            // enabled CA.
+            conn.search(
+                &base,
+                Scope::Subtree,
+                "(&(cn=CA)(ipaConfigString=enabledService))",
+                &[],
+            )?
+            .iter()
+            .filter_map(|e| master_of(&e.dn, &base))
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let policy = kuipa_enroll::keys::KeysPolicy {
+            servers: masters,
+            ca_servers,
+        };
+        if let Some(reason) = policy.check(principal, fetch.namespace) {
+            keys.audit(format!(
+                "DENIED: {principal} asked for {}/{}: {reason}",
+                fetch.namespace.label(),
+                fetch.nickname
+            ));
+            return Err(reason.into());
+        }
+        let answer = keys
+            .fetch(fetch)
+            .map_err(|e| DirectoryError::from(e.to_string()))?;
+        keys.audit(format!(
+            "ALLOWED: {principal} fetched {}/{}",
+            fetch.namespace.label(),
+            fetch.nickname
+        ));
+        Ok(answer.value)
+    }
+
     fn vault_limits(&self) -> Result<Limits, DirectoryError> {
         let dn = format!("cn=vault-limits,cn=kuipa,cn=etc,{}", self.cfg.basedn);
         let entries = match self.service_conn()?.search(
@@ -1106,6 +1175,17 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+/// The master a `cn=<role>,cn=<master>,<base>` DN belongs to, for the
+/// role entries under `cn=masters` (§18.2).
+fn master_of(dn: &str, base: &str) -> Option<String> {
+    let rest = dn.strip_suffix(base)?;
+    let rest = rest.strip_suffix(',')?;
+    // `cn=CA,cn=<master>`: the last RDN before the base is the master.
+    let master_rdn = rest.rsplit(',').next()?;
+    let value = master_rdn.strip_prefix("cn=")?;
+    Some(value.to_owned())
 }
 
 #[cfg(test)]

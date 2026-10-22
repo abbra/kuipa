@@ -125,7 +125,15 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     } else {
         None
     };
-    let directory = Arc::new(LdapDirectory::new(cfg.directory())?);
+    let keys_service = cfg.keys_service()?;
+    if keys_service.is_some() {
+        eprintln!("kuipad: serving the keys operation at /ipa/ku/keys");
+    }
+    let mut ldap = LdapDirectory::new(cfg.directory())?;
+    if let Some(keys) = &keys_service {
+        ldap.serve_keys(keys.clone());
+    }
+    let directory = Arc::new(ldap);
     let servers = directory.servers().unwrap_or_else(|e| {
         eprintln!("kuipad: cannot list servers ({e}); advertising only this one");
         vec![cfg.server.clone()]
@@ -186,6 +194,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
         peers: Some(peers),
         limiter: kuipad::limit::Limiter::new(cfg.rate_limit),
         tang,
+        keys: keys_service,
     }));
 
     let mut fds = listenfd::ListenFd::from_env();
