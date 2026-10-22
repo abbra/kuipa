@@ -4,6 +4,7 @@ pub mod config;
 pub mod directory;
 pub mod getkeytab;
 pub mod http;
+pub mod keys;
 pub mod keystore;
 pub mod limit;
 pub mod peers;
