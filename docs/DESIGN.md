@@ -2401,7 +2401,7 @@ like an enrollment string.
 | establishing a trust: invitation, trust request, trust secret, cross-realm keys, partner refresh (§17.4) | implemented, tested against two real KDCs; the LDAP side **not yet run against FreeIPA** |
 | units, httpd snippet, config example | provided (`contrib/`) |
 | vouch heads: claim logs, head proofs in advertisements and delegations, `?head=` selection with signature fallback, heads in pins and sealed responses, `ipa-ku2` strings, public claim logs (§4.9) | implemented, tested (claim logs and head proofs, tampering and stale heads, HTTP flows with a head-pinned client, pin-file round trips, KDC exchange) |
-| claim-log services: head windows with consistency-checked refresh, frozen-trust pins, cross-realm heads, the signed vouch in claim-log pages, `kuipa-audit`, `kuipa-mirror` (DESIGN-claim-logs.md) | designed |
+| claim-log services: head windows with consistency-checked refresh, frozen-trust pins, cross-realm heads, the signed vouch in claim-log pages, `kuipa-audit`, `kuipa-mirror` (DESIGN-claim-logs.md) | implemented, tested (window merge and consistency rules, frozen refusals, trust install of a partner's heads, claim-log pages with their vouch, the audit's coverage states and split views over HTTP, the mirror's sync/serve/no-route and cached head proofs, playground session steps) |
 | vouchers (§9): `ml-dsa-blind` issuing, `kuipa-voucher`, bound and bearer vouchers, voucher joins | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
