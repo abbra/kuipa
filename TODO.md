@@ -1,7 +1,7 @@
 # kuipa — open work
 
 What exists and how it is tested is in [docs/DESIGN.md](docs/DESIGN.md)
-§18. This list holds only what remains; section numbers refer to
+§19. This list holds only what remains; section numbers refer to
 DESIGN.md.
 
 Rules for new code: Rust 2024 edition, MSRV 1.88 (`clippy::incompatible_msrv`
@@ -55,6 +55,18 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] Registered sealing (`sealing = registered`).
   - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
+- [x] Secrets transport (§18): the `keys` operation in `kuipa-enroll`
+      (`IPKG`/`IPKR`) and its route in kuipad; handler execution with
+      runas and the static namespace policy checked against `cn=masters`
+      and the CA role; `kuipa keys fetch`; an audit line per operation;
+      a replica-promotion scenario in the playground (web7 enrolls, is
+      refused outside `cn=masters`, joins, fetches the promotion set).
+- [ ] Secrets transport, remaining: run the LDAP policy check against a
+      real FreeIPA server (`cn=masters`, the CA role); sealed
+      lightweight-CA artifacts (`lwca-store`, the
+      `cn=lwca,cn=kuipa,cn=etc` container) and the Dogtag-side ML-KEM
+      import; the `kuipad.json` `keys` section documented in the example
+      configuration.
 - [x] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
       `keytab_loader` is merged (§7.4): write the service's gssproxy
       configuration (`cred_store = keytab:MEMORY:<name>`, `keytab_loader =
@@ -72,6 +84,14 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 
 ## Outside this workspace
 
+- [ ] FreeIPA: adopt the secrets transport (§18) — the design is
+      `doc/designs/kuipa-secrets-transport.md` in the FreeIPA tree.
+      `CustodiaInstance` grows a kuipa branch gated on peer capability
+      (a service entry for kuipad in `cn=masters`); `ipa-pki-retrieve-key`
+      shells out to `kuipa keys fetch`; the LWCA artifact producer; the
+      `cn=lwca,cn=kuipa,cn=etc` container and ACIs; retirement of
+      `ipa-custodia`, the vendored server, the `cn=custodia` tree and
+      `_wait_keys`.
 - [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
       the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
       `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
