@@ -14,6 +14,7 @@ use kuipa_enroll::join::{
     AuthType, KERBEROS_BINDING_LEN, KerberosBinding, Operation, PendingJoin, Prepared, Request,
     Response, kerberos_prf_input,
 };
+use kuipa_enroll::keys::{KeysFetch, Namespace, WrapAlg};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::payload::Enrollment;
 use kuipa_enroll::realm::{Deployment, TrustedRealm, VerifiedRealm, krb5_realm_section};
@@ -1550,6 +1551,82 @@ pub fn protect(paths: &Paths, target: &Target) -> Result<Value, Error> {
             protect_other(paths, Contents::File, path, keytab.as_deref())
         }
     }
+}
+
+/// `kuipa keys fetch` (§18.4): fetch a named secret with this host's
+/// keytab, authenticated like a registration (§7.5).
+///
+/// # Errors
+///
+/// [`Outcome::RetryLater`] while no server is reachable, or any error.
+pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8>, Error> {
+    let state = State::load(paths)?;
+    let (namespace, nickname) = name
+        .split_once('/')
+        .ok_or("name the secret as <namespace>/<nickname>")?;
+    let namespace = match namespace {
+        "dm" => Namespace::Dm,
+        "ra" => Namespace::Ra,
+        "ca" => Namespace::Ca,
+        "ca_wrapped" => Namespace::CaWrapped,
+        "lwca" | "lwca-store" => Namespace::LwcaStore,
+        _ => return Err("namespace must be dm, ra, ca, ca_wrapped or lwca".into()),
+    };
+    if nickname.is_empty() && namespace != Namespace::Dm && namespace != Namespace::Ra {
+        return Err("the nickname is empty".into());
+    }
+    let alg = match (alg, namespace) {
+        (None, _) => None,
+        (Some(label), Namespace::CaWrapped) => Some(
+            WrapAlg::from_label(label)
+                .ok_or("the wrap algorithm must be aes-256-cbc-pad or aes-256-wrap")?,
+        ),
+        (Some(_), _) => return Err("a wrap algorithm applies to ca_wrapped only".into()),
+    };
+    let fetch = KeysFetch {
+        namespace,
+        nickname: nickname.to_owned(),
+        alg,
+    };
+    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let known = paths::read_epoch_from(&paths.anchors())?;
+    let trust = ca_trust(paths)?;
+    let principal = Principal::host(&state.fqdn, &state.realm);
+    let cred = GssClientCred::from_keytab_initiate(
+        paths.keytab().to_str().ok_or("non-UTF-8 keytab path")?,
+        &principal.to_string(),
+    )?;
+    let extra = fetch.to_bytes()?;
+    let (answer, _) = exchange_with(
+        &Deployment::servers(&state.servers),
+        &trust,
+        &state.realm,
+        &anchors,
+        &heads,
+        &frozen,
+        known,
+        Operation::Keys,
+        |adv| {
+            let p = Prepared::new(
+                adv,
+                Operation::Keys,
+                &state.fqdn,
+                AuthType::Kerberos,
+                &Enctype::DEFAULT,
+            )?;
+            let target = format!("ipa-ku@{}", adv.server());
+            let (token, binding) = gss_token(&cred, &target, &p.channel_binding()?)?;
+            Ok(p.with_kerberos(binding).seal(&token, &[], &extra)?)
+        },
+        |pending, response, adv| Ok(pending.finish_keys(response, adv)?),
+    )?;
+    tracing::debug!(
+        "fetched {}/{} ({} bytes)",
+        namespace.label(),
+        fetch.nickname,
+        answer.value.len()
+    );
+    Ok(answer.value)
 }
 
 fn protect_host(paths: &Paths) -> Result<Value, Error> {
