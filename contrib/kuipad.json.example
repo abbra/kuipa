@@ -20,5 +20,14 @@
     "per_source": { "burst": 60, "per_minute": 30 }
   },
   "trusts": [],
-  "enctypes": [20, 19, 18, 17]
+  "enctypes": [20, 19, 18, 17],
+  "keys": {
+    "enabled": true,
+    "handlers": {
+      "dm":          { "command": "/usr/libexec/ipa/custodia/ipa-custodia-dmldap", "runas": "root" },
+      "ra":          { "command": "/usr/libexec/ipa/custodia/ipa-custodia-ra-agent", "runas": "root" },
+      "ca":          { "command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat", "runas": "pkiuser" },
+      "ca_wrapped":  { "command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat-wrapped", "runas": "pkiuser" }
+    }
+  }
 }
