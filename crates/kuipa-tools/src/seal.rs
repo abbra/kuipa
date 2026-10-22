@@ -310,7 +310,10 @@ impl<'a> Seal<'a> {
         Error,
     > {
         let public = self.public()?;
-        let anchors = paths::read_anchors(self.host)?;
+        // This host's pins, windows and freezes included (§1.4, §2): a
+        // vault descriptor is fetched through a verified advertisement,
+        // and a frozen pin must not fall back to a signature here.
+        let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
@@ -320,8 +323,8 @@ impl<'a> Seal<'a> {
             &trust,
             &public.realm,
             &anchors,
-            &[],
-            &[],
+            &heads,
+            &frozen,
             known,
             Operation::Vault,
             |adv| {
@@ -515,7 +518,9 @@ impl<'a> Seal<'a> {
     /// Fetch and verify every server's advertisement, and cache them.
     fn refresh_servers(&self) -> Result<Vec<VerifiedRealm>, Error> {
         let public = self.public()?;
-        let anchors = paths::read_anchors(self.host)?;
+        // The whole window travels and a frozen pin is enforced (§1.4,
+        // §2): these advertisements are what sealing trusts.
+        let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let mut pins = anchors.clone();
@@ -525,9 +530,15 @@ impl<'a> Seal<'a> {
         let mut cache = Vec::new();
         let mut verified = Vec::new();
         for server in &public.servers {
-            let Ok((endpoint, v, _)) =
-                flows::verified(server, &trust, &public.realm, &anchors, &[], &[], known)
-            else {
+            let Ok((endpoint, v, _)) = flows::verified(
+                server,
+                &trust,
+                &public.realm,
+                &anchors,
+                &heads,
+                &frozen,
+                known,
+            ) else {
                 continue;
             };
             if let Ok(adv) = endpoint.advertisement(&pins) {

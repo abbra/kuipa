@@ -2667,3 +2667,830 @@ fn audit_info_of(anchor: &SigningKey) -> RealmInfo {
         trusts: Vec::new(),
     }
 }
+
+/// An enrolled host's state and CA, for a flow that works from stored
+/// state (`check`) without an enrollment having run in this test.
+fn enrolled(paths: &Paths, servers: &[&str]) {
+    kuipa_tools::paths::write_pem(&paths.ca(), &[CA.to_vec()]).unwrap();
+    kuipa_tools::paths::State {
+        realm: REALM.into(),
+        fqdn: HOST.into(),
+        servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+        ..Default::default()
+    }
+    .store(paths)
+    .unwrap();
+}
+
+/// Realm info naming `server` and these anchors, one server only.
+fn info_named(server: &str, anchors: &[tang_pqc::Thumbprint]) -> RealmInfo {
+    RealmInfo {
+        realm: REALM.into(),
+        domain: "example.test".into(),
+        basedn: "dc=example,dc=test".into(),
+        server: server.into(),
+        servers: vec![server.into()],
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: anchors.to_vec(),
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    }
+}
+
+/// What the `kuipa` CLI puts on the wire from a pin file: the live
+/// anchors, their whole windows, and the frozen ones (§1.4, §2).
+fn pins_for(
+    paths: &Paths,
+) -> (
+    Vec<tang_pqc::Thumbprint>,
+    Vec<kuipa_enroll::delegation::HeadPin>,
+    Vec<tang_pqc::Thumbprint>,
+) {
+    kuipa_tools::paths::pinned_windows(&paths.anchors()).unwrap()
+}
+
+/// Pin lines, oldest-first windows and freezes as written by hand.
+fn write_pins(paths: &Paths, pins: &[kuipa_tools::paths::Pin]) {
+    kuipa_tools::paths::write_anchor_pins(&paths.anchors(), "test", pins, None).unwrap();
+}
+
+#[test]
+fn an_expired_pin_is_no_trust_at_all() {
+    // PoC poc_expired_pin: a pin whose expiry passed is not trust — not
+    // its anchor, not its head, not its freeze.  Before this was fixed
+    // the CLI's pin read ignored the expiry, so an unrefreshed pin kept
+    // working and its head kept proving claims.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, _, mut delegation) = server_keys(&anchor, "expired1.example.test");
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let head = vouch.head();
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, vouch);
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        info_named("expired1.example.test", &[pin]),
+        delegation.clone(),
+    ));
+    server.publish(delegation, vec![pin], vouches);
+    serve_as("expired1.example.test", app(server, Dir::default()));
+
+    let paths = root("expired-pin");
+    enrolled(&paths, &["expired1.example.test"]);
+    write_pins(
+        &paths,
+        &[kuipa_tools::paths::Pin {
+            anchor: pin,
+            exp: Some(now() - kuipa_enroll::delegation::CLOCK_SKEW - 1),
+            heads: vec![head],
+            frozen: true,
+        }],
+    );
+    assert_eq!(
+        pins_for(&paths),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "an expired pin gives nothing to verify with"
+    );
+    let out = flows::check(&paths, None).unwrap();
+    assert_eq!(
+        out["servers"][0]["ok"],
+        serde_json::json!(false),
+        "an expired pin must not verify the server: {out}"
+    );
+
+    // The same pin, unexpired: the anchor is trusted, its head is what
+    // the advertisement is verified against, and the freeze is in force.
+    write_pins(
+        &paths,
+        &[kuipa_tools::paths::Pin {
+            anchor: pin,
+            exp: Some(now() + 3600),
+            heads: vec![head],
+            frozen: true,
+        }],
+    );
+    let (anchors, heads, frozen) = pins_for(&paths);
+    assert_eq!(anchors, vec![pin]);
+    assert_eq!(frozen, vec![pin]);
+    assert_eq!(heads.len(), 1);
+    let out = flows::check(&paths, None).unwrap();
+    assert_eq!(out["servers"][0]["ok"], serde_json::json!(true), "{out}");
+
+    // A corrupt pin file is an error, never "nothing pinned".
+    std::fs::write(paths.anchors(), format!("{pin} +5\n")).unwrap();
+    assert!(
+        flows::check(&paths, None).is_err(),
+        "a corrupt pin file fails closed"
+    );
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_forged_partner_head_is_not_pinned() {
+    // PoC poc_head_trust: A's trust entry names a head for B's anchor
+    // that no signature backs.  An advertised head is the advertising
+    // server's assertion (DESIGN-claim-logs.md §4); a head nothing signed
+    // must not become this host's trust for B.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, _, mut delegation) = server_keys(&anchor, "forgeA1.example.test");
+    let mut info = info_named("forgeA1.example.test", &[*anchor.public().thumbprint()]);
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(*anchor.public().thumbprint(), vouch);
+
+    // B: its anchor signing a real head.
+    let b = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let b_pin = *b.public().thumbprint();
+    let b_signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let mut b_delegation = Delegation::issue(
+        &b,
+        "B.TEST",
+        "forgeB1.example.test",
+        b_signing.public(),
+        now() - 60,
+        now() + 86_400,
+    )
+    .unwrap();
+    let b_claim = b_delegation.claim().unwrap();
+    let b_vouch = SignedVouch::issue(
+        &b,
+        "B.TEST",
+        [b_claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let b_head = b_vouch.head();
+    b_delegation.add(b_vouch.proof(&b_claim, b.public()).unwrap());
+    let b_info = RealmInfo {
+        realm: "B.TEST".into(),
+        domain: "b.test".into(),
+        basedn: "dc=b,dc=test".into(),
+        server: "forgeB1.example.test".into(),
+        servers: vec!["forgeB1.example.test".into()],
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: vec![b_pin],
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    };
+    let b_server = Arc::new(EnrollServer::new(
+        ServerKeys {
+            signing: b_signing,
+            join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+            escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+            trust: Vec::new(),
+            vouchers: Vec::new(),
+            retired: Vec::new(),
+        },
+        b_info,
+        b_delegation.clone(),
+    ));
+    let mut b_vouches = std::collections::HashMap::new();
+    b_vouches.insert(b_pin, b_vouch);
+    b_server.publish(b_delegation, vec![b_pin], b_vouches);
+    let b_url = serve_as(
+        "forgeB1.example.test",
+        app(b_server.clone(), Dir::default()),
+    );
+
+    // A advertises B with a head B never signed.
+    info.trusts = vec![kuipa_enroll::realm::TrustedRealm {
+        realm: "B.TEST".into(),
+        domain: "b.test".into(),
+        servers: vec!["forgeB1.example.test".into()],
+        anchors: vec![b_pin],
+        heads: vec![kuipa_enroll::delegation::HeadPin {
+            anchor: b_pin,
+            size: 99,
+            root: [7; 32],
+        }],
+    }];
+    info.validate().unwrap();
+    let a = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+    a.publish(delegation, vec![*anchor.public().thumbprint()], vouches);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    serve_as("forgeA1.example.test", app(a, dir));
+
+    let paths = root("forge-partner-head");
+    let mut s = string(&anchor, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    flows::enroll_online(
+        &paths,
+        s.realm(),
+        &[*s.anchor()],
+        &[],
+        &[],
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(&["forgeA1.example.test".to_owned()]),
+    )
+    .unwrap();
+    let result = flows::trusted_realms(&paths).unwrap();
+    assert_eq!(
+        result["trusted_realms"][0]["status"], "installed",
+        "{result}"
+    );
+
+    // The forged head is not installed.  B's real head is what its own
+    // advertisement signs — the drop was a decision, not an absence.
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.trust_anchors("B.TEST")).unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].anchor, b_pin);
+    assert!(
+        pins[0]
+            .heads
+            .iter()
+            .all(|(size, root)| *size != 99 && *root != [7; 32]),
+        "a forged head was pinned: {:?}",
+        pins[0].heads
+    );
+    assert!(
+        pins[0].heads.is_empty(),
+        "nothing signed these heads: {:?}",
+        pins[0].heads
+    );
+    let endpoint = kuipa_tools::net::Endpoint::new(&b_url, &kuipa_tools::net::Trust::FirstContact)
+        .expect("endpoint");
+    let adv = endpoint
+        .advertisement(std::slice::from_ref(&b_pin))
+        .unwrap();
+    let decoded = kuipa_enroll::delegation::Delegation::from_value(
+        adv.unverified_member("delegation")
+            .expect("delegation member")
+            .expect("present"),
+    )
+    .unwrap();
+    let proved = decoded.verified_heads(&tang_pqc::Policy::default(), now());
+    assert_eq!(proved.len(), 1, "{proved:?}");
+    assert_eq!((proved[0].size, proved[0].root), b_head);
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_frozen_pin_needs_a_proof_by_its_own_head() {
+    // DESIGN-claim-logs.md §2, the mixed case: F is frozen and its head
+    // does not cover the claim, N is unfrozen and its head does.  The
+    // other anchor's proof is not an answer for F, so the host refuses
+    // and names the freeze.  Before this was fixed one anchor's head
+    // proof satisfied every frozen pin.
+    let f = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let n = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let fp = *f.public().thumbprint();
+    let np = *n.public().thumbprint();
+    let (keys, _, delegation) = server_keys(&f, "mixed1.example.test");
+    let claim = delegation.claim().unwrap();
+    // F vouches for a log that does not contain this claim at all.
+    let other = kuipa_enroll::merkle::leaf_hash(b"another claim entirely").unwrap();
+    let f_vouch = SignedVouch::issue(&f, REALM, [other], now() - 60, now() + 86_400, None).unwrap();
+    let f_head = f_vouch.head();
+    // N vouches for the claim the server advertises.
+    let n_vouch = SignedVouch::issue(
+        &n,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let n_head = n_vouch.head();
+    let mut published = delegation.clone();
+    published.add(n_vouch.proof(&claim, n.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(fp, f_vouch);
+    vouches.insert(np, n_vouch);
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        info_named("mixed1.example.test", &[fp, np]),
+        published.clone(),
+    ));
+    server.publish(published, vec![fp, np], vouches);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = serve_as("mixed1.example.test", app(server, dir));
+
+    let paths = root("frozen-mixed");
+    write_pins(
+        &paths,
+        &[
+            kuipa_tools::paths::Pin {
+                anchor: fp,
+                exp: None,
+                heads: vec![f_head],
+                frozen: true,
+            },
+            kuipa_tools::paths::Pin {
+                anchor: np,
+                exp: None,
+                heads: vec![n_head],
+                frozen: false,
+            },
+        ],
+    );
+    let (anchors, heads, frozen) = pins_for(&paths);
+    let mut s = string(&f, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    let err = flows::enroll_online(
+        &paths,
+        s.realm(),
+        &anchors,
+        &heads,
+        &frozen,
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(std::slice::from_ref(&url)),
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("frozen"), "{msg}");
+    assert!(
+        msg.contains(&fp.to_string()),
+        "the refusal must name F: {msg}"
+    );
+
+    // The very same pins, with F unfrozen: the signature fallback is back
+    // and the realm is usable — the refusal was the freeze, not F's head.
+    write_pins(
+        &paths,
+        &[
+            kuipa_tools::paths::Pin {
+                anchor: fp,
+                exp: None,
+                heads: vec![f_head],
+                frozen: false,
+            },
+            kuipa_tools::paths::Pin {
+                anchor: np,
+                exp: None,
+                heads: vec![n_head],
+                frozen: false,
+            },
+        ],
+    );
+    let (anchors, heads, frozen) = pins_for(&paths);
+    let mut s = string(&f, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    let result = flows::enroll_online(
+        &paths,
+        s.realm(),
+        &anchors,
+        &heads,
+        &frozen,
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(std::slice::from_ref(&url)),
+    )
+    .unwrap();
+    assert_eq!(result["issuer"], "mixed1.example.test", "{result}");
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn two_frozen_pins_must_both_prove_the_claim() {
+    // DESIGN-claim-logs.md §2: with two frozen pins of distinct anchors,
+    // each anchor's own head must prove the claim.  The server that
+    // answers both is usable; one that answers only the other is refused
+    // by name.
+    let f = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let n = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let fp = *f.public().thumbprint();
+    let np = *n.public().thumbprint();
+    let (keys, _, delegation) = server_keys(&f, "twofrozen1.example.test");
+    let claim = delegation.claim().unwrap();
+    let f_vouch = SignedVouch::issue(
+        &f,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let n_vouch = SignedVouch::issue(
+        &n,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let f_head = f_vouch.head();
+    let n_head = n_vouch.head();
+    let mut published = delegation.clone();
+    published.add(f_vouch.proof(&claim, f.public()).unwrap());
+    published.add(n_vouch.proof(&claim, n.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(fp, f_vouch);
+    vouches.insert(np, n_vouch);
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        info_named("twofrozen1.example.test", &[fp, np]),
+        published.clone(),
+    ));
+    server.publish(published, vec![fp, np], vouches);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = serve_as("twofrozen1.example.test", app(server, dir));
+
+    // Both frozen pins cover the claim: the enrollment is head-wise and
+    // each anchor counts toward §4.4's quorum through its own head.
+    let paths = root("frozen-two");
+    write_pins(
+        &paths,
+        &[
+            kuipa_tools::paths::Pin {
+                anchor: fp,
+                exp: None,
+                heads: vec![f_head],
+                frozen: true,
+            },
+            kuipa_tools::paths::Pin {
+                anchor: np,
+                exp: None,
+                heads: vec![n_head],
+                frozen: true,
+            },
+        ],
+    );
+    let (anchors, heads, frozen) = pins_for(&paths);
+    assert_eq!(frozen.len(), 2);
+    let mut s = string(&f, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    let result = flows::enroll_online(
+        &paths,
+        s.realm(),
+        &anchors,
+        &heads,
+        &frozen,
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(std::slice::from_ref(&url)),
+    )
+    .unwrap();
+    assert_eq!(result["issuer"], "twofrozen1.example.test", "{result}");
+
+    // The other half: F's pinned head no longer covers the claim, so only
+    // one proof can be served — and a proof by N is not an answer for F.
+    write_pins(
+        &paths,
+        &[
+            kuipa_tools::paths::Pin {
+                anchor: fp,
+                exp: None,
+                heads: vec![(7, [9; 32])],
+                frozen: true,
+            },
+            kuipa_tools::paths::Pin {
+                anchor: np,
+                exp: None,
+                heads: vec![n_head],
+                frozen: true,
+            },
+        ],
+    );
+    let (anchors, heads, frozen) = pins_for(&paths);
+    let mut s = string(&f, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    let err = flows::enroll_online(
+        &root("frozen-two-outside"),
+        s.realm(),
+        &anchors,
+        &heads,
+        &frozen,
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(std::slice::from_ref(&url)),
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("frozen"), "{msg}");
+    assert!(
+        msg.contains(&fp.to_string()),
+        "the refusal must name F: {msg}"
+    );
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+#[test]
+fn a_whole_window_travels_so_the_newest_head_proves() {
+    // DESIGN-claim-logs.md §1.4: the server tries each pinned head in
+    // turn, so a claim under the newest head of a window is proven even
+    // though nothing under the oldest proves it.  Sending only one head
+    // per anchor used to refuse this honest server.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, _, delegation) = server_keys(&anchor, "window1.example.test");
+    let claim = delegation.claim().unwrap();
+    // The claim is the second leaf: the pinned window's oldest head, over
+    // the first leaf alone, cannot prove it.
+    let older = kuipa_enroll::merkle::leaf_hash(b"an earlier enrollment").unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [older, claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let newest = vouch.head();
+    let oldest = (1, kuipa_enroll::merkle::root(&[older]).unwrap());
+    let mut published = delegation.clone();
+    published.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, vouch);
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        info_named("window1.example.test", &[pin]),
+        published.clone(),
+    ));
+    server.publish(published, vec![pin], vouches);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = serve_as("window1.example.test", app(server, dir));
+
+    let paths = root("full-window");
+    write_pins(
+        &paths,
+        &[kuipa_tools::paths::Pin {
+            anchor: pin,
+            exp: None,
+            heads: vec![oldest, newest],
+            frozen: true,
+        }],
+    );
+    let (anchors, heads, frozen) = pins_for(&paths);
+    assert_eq!(heads.len(), 2, "the whole window travels (§1.4)");
+    let mut s = string(&anchor, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    let (result, trace) = traced(|| {
+        flows::enroll_online(
+            &paths,
+            s.realm(),
+            &anchors,
+            &heads,
+            &frozen,
+            &Auth::LdapOtp(otp),
+            HOST,
+            &Deployment::servers(std::slice::from_ref(&url)),
+        )
+    });
+    let result = result.expect("the newest head of the window proves the claim");
+    assert_eq!(result["issuer"], "window1.example.test", "{result}");
+    assert!(trace.contains("advertisement verified"), "{trace}");
+
+    // The answer was head-wise: asked with the window, the server serves
+    // a proof and no signature.
+    let endpoint = kuipa_tools::net::Endpoint::new(&url, &kuipa_tools::net::Trust::FirstContact)
+        .expect("endpoint");
+    let body = endpoint
+        .advertisement_with_heads(&[pin], &heads)
+        .unwrap()
+        .unverified_member("delegation")
+        .expect("delegation member")
+        .expect("present")
+        .to_string();
+    assert!(body.contains("head_proofs"), "no head proof in:\n{body}");
+    assert!(
+        !body.contains("signatures"),
+        "a signature was served to a head-pinned client:\n{body}"
+    );
+    // What the operator froze stays as written: the exchange rewrites
+    // nothing of a frozen window (§2).
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    assert_eq!(pins[0].heads, vec![oldest, newest]);
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+/// Open a staged bundle offline into `paths`: what `install` merges into
+/// the pin file, with the payload naming `heads` beside its anchor.
+fn bundle_enroll(
+    paths: &Paths,
+    anchor: &SigningKey,
+    keys: &ServerKeys,
+    delegation: &Delegation,
+    heads: Vec<Option<(u64, [u8; 32])>>,
+    issuer: &str,
+) -> Result<serde_json::Value, kuipa_tools::paths::Error> {
+    let _ = flows::prepare(paths, false, HOST);
+    let public =
+        tang_pqc::ExchangeKey::from_jwk_json(&std::fs::read(paths.recipient_public()).unwrap())
+            .unwrap();
+    let enrollment = Enrollment {
+        config: RealmConfig {
+            realm: REALM.into(),
+            domain: "example.test".into(),
+            basedn: "dc=example,dc=test".into(),
+            issuer: issuer.into(),
+            servers: vec![issuer.into()],
+        },
+        keytab: Dir::default().keys(HOST),
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: vec![*anchor.public().thumbprint()],
+        heads,
+        epoch_seq: 0,
+        epoch_head: [0; 32],
+    };
+    let (bundle, _) = Bundle::create(
+        keys,
+        delegation,
+        KemAlg::MlKem768,
+        Recipient::MachineKey(&public),
+        &enrollment,
+        now(),
+        now() + 3600,
+    )
+    .unwrap();
+    let s = EnrollmentString::new(REALM, *anchor.public().thumbprint(), now() + 86_400, None);
+    flows::enroll_bundle(paths, &bundle.to_bytes(), Some(&s), false, Some(HOST))
+}
+
+#[test]
+fn a_payload_head_nothing_signed_is_not_pinned() {
+    // DESIGN-claim-logs.md §4: an enrollment names heads beside its
+    // anchors, but a head becomes trust only when an anchor signed it.
+    // Here the issuer signs one head; a payload naming another must not
+    // pin it, and the head it does sign must be pinned.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    // The bundle is staged by one server key; the daemon that answers the
+    // backing fetch has its own, each consistent with its own delegation.
+    let (bundle_keys, _, bundle_delegation) = server_keys(&anchor, "back1.example.test");
+    let (keys, _, mut delegation) = server_keys(&anchor, "back1.example.test");
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let head = vouch.head();
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, vouch);
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        info_named("back1.example.test", &[pin]),
+        delegation.clone(),
+    ));
+    server.publish(delegation.clone(), vec![pin], vouches);
+    serve_as("back1.example.test", app(server, Dir::default()));
+
+    // A head nothing signed: the anchor is pinned, its window stays empty.
+    let paths = root("payload-unbacked");
+    bundle_enroll(
+        &paths,
+        &anchor,
+        &bundle_keys,
+        &bundle_delegation,
+        vec![Some((9, [9; 32]))],
+        "back1.example.test",
+    )
+    .unwrap();
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].anchor, pin);
+    assert!(
+        pins[0].heads.is_empty(),
+        "an unbacked head was pinned: {:?}",
+        pins[0].heads
+    );
+
+    // The head the issuer does sign: pinned.
+    let paths = root("payload-backed");
+    bundle_enroll(
+        &paths,
+        &anchor,
+        &bundle_keys,
+        &bundle_delegation,
+        vec![Some(head)],
+        "back1.example.test",
+    )
+    .unwrap();
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    assert_eq!(pins[0].heads, vec![head], "the signed head is pinned");
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+#[test]
+fn a_head_beyond_the_fetch_cap_is_not_pinned() {
+    // DESIGN-claim-logs.md §1.3, bounded: growing a window means reading
+    // the claim log between the pinned head and the new one, and a host
+    // reads at most `flows::MAX_HEAD_FETCH_PAGES` (64) pages of
+    // `MAX_CLAIM_LOG_PAGE` leaves.  A head past that budget is not
+    // checked and not pinned — otherwise one answer could make a host
+    // walk an unbounded log to grow its trust.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (bundle_keys, _, bundle_delegation) = server_keys(&anchor, "cap1.example.test");
+    let (keys, _, mut delegation) = server_keys(&anchor, "cap1.example.test");
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, vouch);
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        info_named("cap1.example.test", &[pin]),
+        delegation.clone(),
+    ));
+    server.publish(delegation.clone(), vec![pin], vouches);
+    serve_as("cap1.example.test", app(server, Dir::default()));
+
+    // A window of one leaf, and a payload head past the budget.
+    let leaf = kuipa_enroll::merkle::leaf_hash(b"the pinned leaf").unwrap();
+    let pinned = (1, kuipa_enroll::merkle::root(&[leaf]).unwrap());
+    let paths = root("fetch-cap");
+    write_pins(
+        &paths,
+        &[kuipa_tools::paths::Pin {
+            anchor: pin,
+            exp: None,
+            heads: vec![pinned],
+            frozen: false,
+        }],
+    );
+    let budget = 64 * kuipa_enroll::server::MAX_CLAIM_LOG_PAGE;
+    // The budget is checked against the *claimed* size, before a page is
+    // read or a hash computed, so the refused head needs no tree behind
+    // it: what is being tested is that a claimed size past the budget is
+    // never chased.
+    let far = (
+        budget as u64 + 1,
+        kuipa_enroll::merkle::root(&[leaf]).unwrap(),
+    );
+    let (result, trace) = traced(|| {
+        bundle_enroll(
+            &paths,
+            &anchor,
+            &bundle_keys,
+            &bundle_delegation,
+            vec![Some(far)],
+            "cap1.example.test",
+        )
+    });
+    result.unwrap();
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    assert_eq!(
+        pins[0].heads,
+        vec![pinned],
+        "a head beyond the fetch budget was pinned"
+    );
+    assert!(
+        trace.contains(&format!("its head names {} leaves", budget + 1)),
+        "{trace}"
+    );
+    kuipa_tools::net::clear_thread_endpoints();
+}

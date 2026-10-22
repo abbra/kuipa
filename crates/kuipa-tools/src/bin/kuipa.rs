@@ -778,7 +778,7 @@ impl Args {
             // the string's single anchor of the day it was issued.
             let enrolled = paths::State::load(paths).is_ok_and(|s| s.realm == string.realm());
             let (pinned, pinned_heads, frozen) = if enrolled {
-                head_pins(&paths.anchors())
+                paths::pinned_windows(&paths.anchors())?
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
             };
@@ -808,10 +808,7 @@ impl Args {
             };
             return Err(format!("--realm: {why} pinned anchors in {}", file.display()).into());
         }
-        let (anchors, heads, frozen) = {
-            let (a, h, f) = head_pins(&file);
-            (a, h, f)
-        };
+        let (anchors, heads, frozen) = paths::pinned_windows(&file)?;
         let pins = Pins {
             realm: realm.to_owned(),
             anchors,
@@ -867,35 +864,9 @@ struct Secrets {
     password: Option<Secret>,
 }
 
-/// The realm to enroll in and the anchors that must vouch for its servers.
-/// The anchors, head pins and frozen anchors of a pin file: every head
-/// of every window becomes a [`HeadPin`](kuipa_enroll::delegation::HeadPin),
-/// oldest first, so the server can try each; a frozen pin's anchor is
-/// named for the flows' no-fallback policy (DESIGN-claim-logs.md §2).
-fn head_pins(
-    file: &std::path::Path,
-) -> (
-    Vec<Thumbprint>,
-    Vec<kuipa_enroll::delegation::HeadPin>,
-    Vec<Thumbprint>,
-) {
-    let pins = paths::read_anchor_pins(file).unwrap_or_default();
-    let frozen = pins.iter().filter(|p| p.frozen).map(|p| p.anchor).collect();
-    let heads = pins
-        .iter()
-        .flat_map(|p| {
-            p.heads
-                .iter()
-                .map(move |(size, root)| kuipa_enroll::delegation::HeadPin {
-                    anchor: p.anchor,
-                    size: *size,
-                    root: *root,
-                })
-        })
-        .collect();
-    (pins.iter().map(|p| p.anchor).collect(), heads, frozen)
-}
-
+/// The realm to enroll in and the anchors that must vouch for its
+/// servers, with the windows pinned beside them and which of those pins
+/// are frozen.
 struct Pins {
     realm: String,
     anchors: Vec<Thumbprint>,
