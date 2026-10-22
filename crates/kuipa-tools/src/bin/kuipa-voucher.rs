@@ -98,8 +98,9 @@ enum Command {
         /// Days the voucher is valid from now.
         #[arg(long, value_name = "N", default_value = "7")]
         days: String,
-        /// Binding from `kuipa voucher-key`, base64.
-        #[arg(long, value_name = "BASE64")]
+        /// Binding from `kuipa voucher-key`, base64.  Base64url may
+        /// start with `-`, so hyphen-leading values are allowed.
+        #[arg(long, value_name = "BASE64", allow_hyphen_values = true)]
         binding: Option<String>,
         /// State file `finish` needs: the unblinding is kept there, not
         /// on the issuer.
