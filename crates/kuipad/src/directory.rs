@@ -442,29 +442,6 @@ impl LdapDirectory {
     }
 }
 
-/// LDAP `GeneralizedTime` for Unix seconds.
-#[allow(clippy::many_single_char_names)] // the textbook algorithm
-fn generalized_time(t: u64) -> String {
-    let days = t / 86400;
-    let secs = t % 86400;
-    // Civil-from-days (Howard Hinnant), valid for the Unix era.
-    let z = i64::try_from(days).unwrap_or(0) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}{m:02}{d:02}{:02}{:02}{:02}Z",
-        secs / 3600,
-        secs % 3600 / 60,
-        secs % 60
-    )
-}
-
 impl Directory for LdapDirectory {
     fn join_with_otp(
         &self,
@@ -558,7 +535,10 @@ impl Directory for LdapDirectory {
             "recipient": staged.recipient.map(|t| t.to_string()),
         })
         .to_string();
-        let expiration = generalized_time(staged.not_after);
+        let expiration =
+            synta::GeneralizedTime::from_unix(i64::try_from(staged.not_after).unwrap_or(i64::MAX))
+                .ok_or("staging expiration is out of range")?
+                .to_string();
         conn.modify_s(
             &self.host_dn(fqdn),
             &[
@@ -1188,14 +1168,3 @@ fn master_of(dn: &str, base: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generalized_time_formats() {
-        assert_eq!(generalized_time(0), "19700101000000Z");
-        assert_eq!(generalized_time(1_800_000_000), "20270115080000Z");
-        assert_eq!(generalized_time(951_782_400), "20000229000000Z");
-    }
-}
