@@ -268,6 +268,29 @@ enum Command {
         #[command(subcommand)]
         action: SealAction,
     },
+    /// Fetch a named secret from the realm's servers, authenticated by
+    /// this host's keytab.
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+}
+
+/// `kuipa keys` subcommands.
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Fetch a secret named `<namespace>/<nickname>` (`dm`, `ra`, `ca`,
+    /// `ca_wrapped`, `lwca`) and print its value on standard output.
+    Fetch {
+        /// The secret, as `<namespace>/<nickname>`.
+        name: String,
+        /// The wrap algorithm, for `ca_wrapped` only.
+        #[arg(long, value_name = "ALG")]
+        alg: Option<String>,
+        /// Write the value to a file instead of standard output.
+        #[arg(long, value_name = "FILE")]
+        out: Option<String>,
+    },
 }
 
 /// `kuipa seal` subcommands.
@@ -549,6 +572,7 @@ impl Command {
             Command::Check { .. } => "check",
             Command::Leave => "leave",
             Command::Seal { .. } => "seal",
+            Command::Keys { .. } => "keys",
         }
     }
 
@@ -1721,6 +1745,26 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
     Ok(value)
 }
 
+/// `kuipa keys fetch` (§18.4): the value on standard output, or in a
+/// file with `--out`.  Standard output only when it is not a terminal,
+/// as `kuipa-unseal` does (§10.5).
+fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
+    let KeysAction::Fetch { name, alg, out } = action;
+    let value = flows::keys_fetch(paths, name, alg.as_deref())?;
+    if let Some(path) = out {
+        if std::path::Path::new(path).exists() {
+            return Err(format!("{path} already exists").into());
+        }
+        std::fs::write(path, &value)?;
+    } else {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&value)?;
+        stdout.flush()?;
+    }
+    Ok(serde_json::json!({ "quiet": true }))
+}
+
 /// `kuipa seal …`: as the user, with their ticket.
 fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
     let user = kuipa_tools::seal::UserPaths::from_env()?;
@@ -1916,6 +1960,7 @@ fn main() -> ExitCode {
     tracing::debug!("kuipa {}", args.command);
     let result = match &cli.command {
         Command::Seal { action } => run_seal(&paths, action),
+        Command::Keys { action } => run_keys(&paths, action),
         _ => run(&args),
     };
     match result {
