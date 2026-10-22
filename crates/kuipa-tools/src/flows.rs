@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, unix_seconds};
 
 use crate::net::{Endpoint, NetError, Trust};
-use crate::paths::{self, Contents, Error, Holder, Paths, Protected, State};
+use crate::paths::{self, Contents, Error, Holder, Paths, Pin, Protected, State};
 use crate::preauth;
 
 /// The anchor epoch watermark (§4.8): sequence number and head hash.
@@ -1951,13 +1951,29 @@ fn install_trust(
         )
     );
     paths::write_file(&paths.trust_krb5_conf(&t.realm), conf.as_bytes(), 0o644)?;
-    paths::write_anchors_to(
+    // B's heads, pinned beside its anchors: the anchors file of a
+    // trusted realm carries the same pin grammar as the host's own
+    // (DESIGN-claim-logs.md §3), refreshed here on every trust
+    // refresh, with no expiry — the refresh renews them.
+    paths::write_anchor_pins(
         &paths.trust_anchors(&t.realm),
         &format!(
             "kuipa anchors of {}, vouched for by {own_realm}; used for {} only",
             t.realm, t.realm
         ),
-        &t.anchors,
+        &t.anchors
+            .iter()
+            .map(|a| Pin {
+                anchor: *a,
+                exp: None,
+                head: t
+                    .heads
+                    .iter()
+                    .find(|h| &h.anchor == a)
+                    .map(|h| (h.size, h.root)),
+            })
+            .collect::<Vec<_>>(),
+        None,
     )
 }
 
@@ -2025,9 +2041,14 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
         if t.anchors.iter().any(|a| anchors.contains(a)) {
             errors.push("shares an anchor with this host's realm".to_owned());
         }
+        // The heads A vouches for B's anchors, pinned beside them, so
+        // this refresh — and B's next — can verify with no signature
+        // (DESIGN-claim-logs.md §3).  Only heads for anchors B lists,
+        // whatever the wire carried.
+        let heads = t.pins();
         let adv = if errors.is_empty() {
             t.servers.iter().find_map(|s| {
-                match verified(s, &Trust::FirstContact, &t.realm, &t.anchors, &[], None) {
+                match verified(s, &Trust::FirstContact, &t.realm, &t.anchors, &heads, None) {
                     Ok((_, v, _)) => Some(v),
                     Err(e) => {
                         errors.push(format!("{s}: {e}"));
@@ -2052,6 +2073,7 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
                 "status": if installed { "refreshed" } else { "installed" },
                 "server": adv.server(),
                 "krb5_conf": paths.trust_krb5_conf(&t.realm),
+                "heads": heads.len(),
             }));
         } else {
             failed.push(format!("{}: {}", t.realm, errors.join("; ")));
