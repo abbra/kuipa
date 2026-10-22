@@ -411,6 +411,19 @@ impl Endpoint {
         serde_json::from_slice(&body).map_err(|e| NetError::Other(format!("claim log: {e}")))
     }
 
+    /// `GET adv?<query>` as given, for a replica serving the origin's
+    /// public answers byte for byte (DESIGN-claim-logs.md §6): the
+    /// query string is the caller's, built by the same means as
+    /// [`Self::advertisement_with_heads`] builds its own.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`].
+    pub fn advertisement_query(&self, query: &str) -> Result<Vec<u8>, NetError> {
+        let url = format!("{}adv?{query}", self.base);
+        self.send("GET", &url, self.client.get(&url), 0)
+    }
+
     /// `POST <path>` with a binary body.
     ///
     /// # Errors
