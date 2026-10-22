@@ -1840,6 +1840,181 @@ fn trust_info_of(anchor: &SigningKey) -> RealmInfo {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn a_mirror_serves_what_it_cached_and_no_authenticated_route() {
+    // DESIGN-claim-logs.md §6: the mirror syncs the origin's public
+    // endpoints and re-serves them read-only.  A head query it has
+    // cached is answered with the origin's head-proof advertisement;
+    // an unseen one falls back to the plain advertisement (the
+    // client's stale-head fallback); a join has no route at all.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, _, mut delegation) = server_keys(&anchor, "mirror1.example.test");
+    let info = mirror_info_of(&anchor);
+    let claim = delegation.claim().unwrap();
+    let vouch = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let head = vouch.head();
+    delegation.add(vouch.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, vouch);
+    let server = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+    server.publish(delegation, vec![pin], vouches);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let origin = spawn(app(server, dir));
+
+    // Run the mirror binary against the origin, on a free port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let data = std::env::temp_dir().join(format!("kuipa-mirror-test-{port}"));
+    let _ = std::fs::remove_dir_all(&data);
+    let mut mirror = std::process::Command::new(env!("CARGO_BIN_EXE_kuipa-mirror"))
+        .arg("--origin")
+        .arg(&origin)
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--data")
+        .arg(&data)
+        .arg("--interval")
+        .arg("1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(data.with_extension("log")).unwrap())
+        .spawn()
+        .expect("the mirror binary");
+    let base = format!("http://127.0.0.1:{port}/ipa/ku");
+    let _ = rustls_native_ossl::default_provider().install_default();
+    let http = reqwest::blocking::Client::new();
+    let mut adv = None;
+    for _ in 0..100 {
+        if let Ok(r) = http.get(format!("{base}/adv")).send()
+            && r.status() == 200
+        {
+            adv = Some(r.bytes().unwrap().to_vec());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let adv = adv.expect("the mirror served the advertisement");
+    let adv_json: serde_json::Value = serde_json::from_slice(&adv).unwrap();
+
+    // The claim log, with its vouch, and the anchor log with heads.
+    let page: serde_json::Value = serde_json::from_slice(
+        &http
+            .get(format!("{base}/claim-log/{pin}"))
+            .send()
+            .unwrap()
+            .bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["size"], head.0, "{page}");
+    assert!(page["vouch"].is_string(), "the vouch is served: {page}");
+    let log: serde_json::Value = serde_json::from_slice(
+        &http
+            .get(format!("{base}/anchor-log"))
+            .send()
+            .unwrap()
+            .bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(log["heads"].as_array().map_or(0, Vec::len), 1, "{log}");
+
+    // A head query: uncached, the plain advertisement (the fallback);
+    // after a sync, the origin's head-proof answer, cached.
+    let root = tang_pqc::b64::encode(&head.1);
+    let query = format!("anchor={pin}&head={pin}.{}.{root}", head.0);
+    let first: serde_json::Value = serde_json::from_slice(
+        &http
+            .get(format!("{base}/adv?{query}"))
+            .send()
+            .unwrap()
+            .bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first, adv_json, "the fallback is the plain advertisement");
+    let mut head_answer = None;
+    for _ in 0..100 {
+        let r: serde_json::Value = serde_json::from_slice(
+            &http
+                .get(format!("{base}/adv?{query}"))
+                .send()
+                .unwrap()
+                .bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        if r != adv_json {
+            head_answer = Some(r);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let head_answer = head_answer.unwrap_or_else(|| {
+        panic!(
+            "the mirror cached no head-proof answer; its log:\n{}",
+            std::fs::read_to_string(data.with_extension("log")).unwrap_or_default()
+        )
+    });
+    // The head-proof answer is a JWS: the delegation member, decoded,
+    // carries a head proof and no signature.
+    let signed =
+        tang_pqc::SignedAdvertisement::from_json(head_answer.to_string().as_bytes()).unwrap();
+    let body = signed
+        .unverified_member("delegation")
+        .expect("delegation member")
+        .expect("present")
+        .to_string();
+    assert!(body.contains("head_proofs"), "no head proof in:\n{body}");
+    assert!(
+        !body.contains("signatures"),
+        "no signature served to a head-pinned client:\n{body}"
+    );
+
+    // A join has no route: a mirror is not a server.
+    let r = http
+        .post(format!("{base}/join/whatever"))
+        .body("{}")
+        .send()
+        .unwrap();
+    assert_eq!(r.status(), 404, "no authenticated route on a mirror");
+
+    mirror.kill().unwrap();
+    mirror.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&data);
+    kuipa_tools::net::clear_thread_endpoints();
+}
+
+/// The realm info for the mirror test's single server.
+fn mirror_info_of(anchor: &SigningKey) -> RealmInfo {
+    RealmInfo {
+        realm: REALM.into(),
+        domain: "example.test".into(),
+        basedn: "dc=example,dc=test".into(),
+        server: "mirror1.example.test".into(),
+        servers: vec!["mirror1.example.test".into()],
+        ca_certs: vec![CA.to_vec()],
+        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn a_frozen_pin_refuses_what_its_head_does_not_prove() {
     // DESIGN-claim-logs.md §2: a frozen pin accepts a head proof only.
     // A client whose pin is frozen enrolls while the head proves the
