@@ -1167,4 +1167,3 @@ fn master_of(dn: &str, base: &str) -> Option<String> {
     let value = master_rdn.strip_prefix("cn=")?;
     Some(value.to_owned())
 }
-
