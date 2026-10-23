@@ -192,9 +192,12 @@ when standard input is a terminal.
 
 ### Recipes
 
-[A traced session](../scenarios/walkthrough.md) follows one session — OTP enrollment,
-installing the trusted realm, a `B.TEST` user's login and a ticket across
-the trust — with `KUIPA_TRACE` on, and explains every traced step.
+[A traced session](../scenarios/walkthrough.md) follows the scripted
+session `playground-test` records — every section of it, from OTP
+enrollment through keytab and file protection, vaults, failover, offline
+and voucher enrollment, auditing, mirroring, the trusted realm, Tang,
+replica promotion and reported failure — with `KUIPA_TRACE` on, and
+explains every traced step.
 
 ```sh
 pq_enroll web1                  # OTP join through ipa1
