@@ -1254,6 +1254,7 @@ fn pending_rows(value: &Value, done: &str) {
         "the staged bundle is usable until",
         get(pending, "not_after"),
     );
+    rows.print();
     println!("{:>2}deferred steps:", "");
     items(get(pending, "steps"), "    ");
 }
