@@ -120,6 +120,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
         .route("/ipa/ku/tlog/{id}", post(tlog::<D>))
+        .route("/ipa/ku/sign/{kid}", post(sign::<D>))
         .route("/ipa/ku/tlog/{id}/head", get(log_head::<D>))
         .route("/ipa/ku/tlog/{id}/cosign", post(log_cosign::<D>))
         .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves::<D>))
@@ -526,7 +527,11 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     };
     let what = format!("{op:?} {}", request.fqdn());
     let host = match op {
-        Operation::Register | Operation::Vault | Operation::Keys | Operation::Tlog => None,
+        Operation::Register
+        | Operation::Vault
+        | Operation::Keys
+        | Operation::Tlog
+        | Operation::Sign => None,
         _ => Some(request.fqdn()),
     };
     if let Err(status) = admit_for(&app, &what, host, headers) {
@@ -614,6 +619,16 @@ async fn tlog<D: Directory + Send + Sync + 'static>(
     // A lookup of the caller's own entries: Kerberos-only, like vault
     // operations.
     exchange(app, Operation::Tlog, kid, &headers, body).await
+}
+
+async fn sign<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(kid): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Kerberos-only, like vault operations: the source's bucket applies.
+    exchange(app, Operation::Sign, kid, &headers, body).await
 }
 
 async fn recover<D: Directory + Send + Sync + 'static>(

@@ -220,6 +220,28 @@ pub trait Directory {
         Ok(Limits::default())
     }
 
+    /// The realm's signing policy (`DESIGN-sign.md`): who may sign for
+    /// which purpose.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default signing is not supported.
+    fn sign_policy(&self) -> Result<crate::sign::SignPolicy, DirectoryError> {
+        Err("signing is not supported by this directory".into())
+    }
+
+    /// The groups `principal` is a member of (user groups for a user,
+    /// host groups for a host), directly or not: the directory's
+    /// `memberOf`.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default groups are not supported.
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        let _ = principal;
+        Err("groups are not supported by this directory".into())
+    }
+
     /// Store a new vault; refuse a name its owner already uses.
     ///
     /// # Errors
@@ -481,6 +503,12 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn vault_limits(&self) -> Result<Limits, DirectoryError> {
         (**self).vault_limits()
+    }
+    fn sign_policy(&self) -> Result<crate::sign::SignPolicy, DirectoryError> {
+        (**self).sign_policy()
+    }
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        (**self).principal_groups(principal)
     }
     fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
         (**self).vault_add(vault)
@@ -1229,6 +1257,9 @@ impl EnrollServer {
             (Operation::Tlog, AuthType::Kerberos) => {
                 return self.tlog_op(request, ss.as_ref(), &t, &body, directory);
             }
+            (Operation::Sign, AuthType::Kerberos) => {
+                return self.sign_op(request, ss.as_ref(), &t, &body, directory);
+            }
             (op, auth) => {
                 return Err(Refusal::because(format!(
                     "{op:?} with {auth:?} is not supported"
@@ -1432,6 +1463,72 @@ impl EnrollServer {
             .to_bytes()
             .map_err(|e| Refusal::because(e.to_string()))?;
         Ok(request.respond(ss, t, Some(&accepted.binding), &payload)?)
+    }
+
+    /// Answer a signing request (`DESIGN-sign.md`): authenticate the
+    /// caller by their ticket, check the realm's signing policy against
+    /// the caller and its groups, record the statement in the log — no
+    /// log, no statement — and sign it with the log's position.
+    fn sign_op(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let accepted = directory
+            .accept_user(body.authenticator.as_ref(), &cb)
+            .map_err(Refusal)?;
+        let caller: Principal = accepted.principal.parse()?;
+        if caller.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        if directory.principal_locked(&caller).map_err(Refusal)? {
+            return Err(Refusal::because(format!("{caller} is locked or gone")));
+        }
+        let asked = crate::sign::Request::from_bytes(&body.extra)?;
+        let groups = directory.principal_groups(&caller).map_err(Refusal)?;
+        directory
+            .sign_policy()
+            .map_err(Refusal)?
+            .check(&caller, &groups, &asked.purpose)?;
+        let leaves = asked.leaves()?;
+        let batch_root = merkle::root(&leaves)?;
+        let now = unix_seconds(SystemTime::now());
+        let Some(appended) = self
+            .ledger
+            .append(
+                Kind::STATEMENT,
+                caller.to_string().as_bytes(),
+                &crate::sign::Statement::log_body(
+                    &asked.purpose,
+                    leaves.len() as u64,
+                    &batch_root,
+                    now,
+                ),
+            )
+            .map_err(Refusal)?
+        else {
+            return Err(Refusal::because(
+                "this server keeps no transparency log: it states nothing it cannot show",
+            ));
+        };
+        let statement = crate::sign::Statement {
+            realm: self.info.realm.clone(),
+            principal: caller.to_string(),
+            purpose: asked.purpose.clone(),
+            batch_size: leaves.len() as u64,
+            batch_root,
+            iat: now,
+            log: appended.log,
+            index: appended.index,
+        };
+        let signed =
+            crate::sign::SignedStatement::sign(&self.keys.signing, &self.delegation(), statement)?;
+        let answer = crate::sign::Answer::new(&asked, signed)?;
+        Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
     }
 
     /// Answer a `tlog` lookup (`DESIGN-tlog.md` §6): the caller's own

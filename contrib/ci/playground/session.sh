@@ -289,6 +289,30 @@ step 0 "Revoke the vault" 'kuipa seal revoke personal' "revoked"
 step 75 "No server opens a file of a revoked vault" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
 
+section "Signing under your ticket" \
+    "The realm states that the administrator, by their ticket, signed a release: kuipa sign asks a server, which checks the signing policy (the release group may sign blobs), logs the statement in its transparency log, and signs it.  Anyone with the realm's anchors verifies it offline."
+step 0 "Sign two files in one statement" \
+    'echo "release 1.0" > "$KUIPA_PLAYGROUND/release.tar" && echo "notes" > "$KUIPA_PLAYGROUND/notes.md" && kuipa sign blob "$KUIPA_PLAYGROUND/release.tar" "$KUIPA_PLAYGROUND/notes.md"' \
+    "Signed by admin@EXAMPLE.TEST for blob" "release.tar.kusig"
+step 0 "Verify one offline, as signed by the administrator" \
+    'kuipa sign verify "$KUIPA_PLAYGROUND/release.tar" --signer admin --purpose blob' \
+    "Good signature" "admin@EXAMPLE.TEST"
+step 1 "A changed file does not verify" \
+    'echo tampered >> "$KUIPA_PLAYGROUND/notes.md" && kuipa sign verify "$KUIPA_PLAYGROUND/notes.md"' \
+    "does not match"
+step 1 "Another signer than the one asked for is not accepted" \
+    'kuipa sign verify "$KUIPA_PLAYGROUND/release.tar" --signer bob' \
+    "not as asked"
+step fail "A purpose the policy does not name is refused" \
+    'kuipa sign blob --purpose rpm "$KUIPA_PLAYGROUND/release.tar"' \
+    "refused the request"
+step 0 "Sign a git commit, with kuipa-gitsign as git's x509 program" \
+    'g="$KUIPA_PLAYGROUND/repo" && git init -q "$g" && git -C "$g" config user.name Admin && git -C "$g" config user.email admin@example.test && git -C "$g" config gpg.format x509 && git -C "$g" config gpg.x509.program kuipa-gitsign && git -C "$g" config user.signingkey kuipa && echo hello > "$g/README" && git -C "$g" add README && git -C "$g" commit -q -S -m "Signed under a ticket" && git -C "$g" cat-file commit HEAD' \
+    "BEGIN SIGNED MESSAGE"
+step 0 "git verifies the commit offline" \
+    'git -C "$KUIPA_PLAYGROUND/repo" verify-commit HEAD' \
+    "Good signature by admin@EXAMPLE.TEST for git-commit"
+
 section "Failover" \
     "With ipa1 unreachable, web2 enrolls through ipa2: every server presents an advertisement that ipa1's anchor vouches for.  Enrolled, web2 must then keep verifying ipa2 with the anchors it pinned — not the one anchor of the enrollment string it was issued, whose server is the one that is down."
 step 0 "Make ipa1 unreachable" 'pq_down ipa1'
