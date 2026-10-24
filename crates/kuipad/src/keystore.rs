@@ -14,6 +14,7 @@
 //! succession-<thp>.json  a rotated anchor's signed succession (§4.7); the
 //!                      rotated anchor's private key is gone
 //! peers.state          the anchor exchange state (§4.2)
+//! tlog/                the transparency log and its index key (`ledger`)
 //! ```
 
 use std::fs;

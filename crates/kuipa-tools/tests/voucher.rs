@@ -109,6 +109,7 @@ fn vouchers_against_a_real_kdc() {
         limiter: kuipad::limit::Limiter::default(),
         tang: None,
         keys: None,
+        ledger: None,
     });
     let rt = tokio::runtime::Runtime::new().unwrap();
     listener.set_nonblocking(true).unwrap();

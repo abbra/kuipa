@@ -13,7 +13,7 @@ hold such events, and the order in which it replaces the claim log.
 | 2 | tombstones | retiring a leaf appends, so heads only ever extend | implemented |
 | 3 | signed heads, consistency proofs | RFC 9162 consistency instead of refetching | implemented |
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented (the cosign step) |
-| 5 | storage and serving | tiles under `/var/lib/ipa/ku/log/`, public routes | planned |
+| 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
 | 6 | producers and lookups | vault, Keys, signing and token events; the `log` operation | producers for vault, escrow and Keys events implemented, with receipts; lookups planned |
 | 7 | clients | `kuipa log watch`, `kuipa-audit log`, `kuipa-mirror --witness` | planned |
 | 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
@@ -39,10 +39,12 @@ server logs kinds they do not know yet.
 | 0xFFFF | tombstone (§2) |
 
 `index` is `HMAC-SHA-256(k_index, subject)`. The subject is a vault id
-or a principal, and `k_index` is a realm secret held escrow-sealed like
-`ipaKUVaultSessionKey`. The index lets the public log be mirrored and
-audited without listing who it is about. Only an authenticated lookup
-(§6) maps a subject to its index. Leaves without a subject use zeros.
+or a principal, and `k_index` is the logging server's own key (§5). The
+index lets the public log be mirrored and audited without listing who
+it is about. Only the server that logged a leaf, answering an
+authenticated lookup (§6), maps a subject to it. Servers use different
+keys, so an auditor reading two servers' logs cannot tell that two
+leaves concern the same vault. Leaves without a subject use zeros.
 
 Each server keeps its own log, `LogId = SHA-256("ipa-ku-log/v1 id" ‖
 len(realm) ‖ realm ‖ server)`. Events go to the log of the server that
@@ -133,14 +135,44 @@ same log that is large enough but does not hold the leaf is evidence
 against the server. Escrow releases and Keys fetches have no receipt in
 their answers; owners find them through lookups.
 
-## 5, 7, 8. Next
+## 5. Storage and serving
 
-* **Storage and serving.** The log lives in a `kuipad` tile store under
-  `/var/lib/ipa/ku/log/<log id>/`, laid out as tlog-tiles. Routes:
-  `GET /ipa/ku/log/{id}/checkpoint`, `GET /ipa/ku/log/{id}/tile/…`, and
-  a witness endpoint for `kuipad` acting as one. A C2SP signed-note
-  checkpoint encoding is added for interoperable witnesses once the
-  ML-DSA note format is settled.
+`kuipad` keeps its log under the key directory:
+
+```text
+tlog/index.key          the server's index key: 32 random bytes, 0600
+tlog/<log id>/leaves    the leaves in order, each a u32 length ‖ IPLF
+```
+
+The log id is in lowercase hex. A leaf is checked (`Log::check`),
+written and synced before it joins the in-memory log, so an append the
+server acknowledged survives a crash. A record cut short by a crash
+mid-write was never acknowledged, and is dropped when the store opens.
+A malformed complete record stops the daemon instead of being skipped.
+
+The head is signed with the server's signing key. It is signed again
+when the log has grown, or when the last signature is an hour old,
+since monitors want a recent time.
+
+The routes are public, like the claim log:
+
+| method | path | response |
+|---|---|---|
+| GET | `/ipa/ku/log/{id}/head` | the current `IPLS` (404 while the log is empty) |
+| GET | `/ipa/ku/log/{id}/leaves?from=i` | JSON `{from, leaves}`: up to 4096 base64url `IPLF` |
+| GET | `/ipa/ku/log/{id}/proof?index=i&size=n` | JSON `{path}`: leaf `i` in the tree of `n` leaves |
+| GET | `/ipa/ku/log/{id}/consistency?from=m&size=n` | JSON `{proof}`: the tree of `m` leaves is a prefix of the tree of `n` |
+
+Proofs are served at any size up to the current one, the size of a head
+the client holds, so a client never needs the newest head to check an
+old receipt. An id other than the server's own answers 404.
+
+A tlog-tiles layout, a C2SP signed-note checkpoint encoding, and a
+witness endpoint come with interoperable witnesses, once the ML-DSA note
+format is settled.
+
+## 7, 8. Next
+
 * **Lookups.** The Kerberos-authenticated `log` operation (`IPLQ`/`IPLR`)
   returns a caller's own entries with inclusion proofs. Per-user
   completeness is not proven. Omissions are left to public auditing and

@@ -33,6 +33,9 @@ use crate::tang::Tang;
 /// certificate, base64-encoded, stay well under a megabyte.
 const BODY_LIMIT: usize = 1024 * 1024;
 
+/// Most leaves in one page of `GET log/{id}/leaves`.
+const MAX_LOG_PAGE: usize = 4096;
+
 /// Most anchors a client may name in `GET adv`.
 const MAX_WANTED_ANCHORS: usize = 16;
 
@@ -55,6 +58,8 @@ pub struct App<D> {
     pub tang: Option<Arc<Tang>>,
     /// The `keys` operation's handlers and audit, if enabled (§18.5).
     pub keys: Option<Arc<crate::keys::Keys>>,
+    /// This server's transparency log, if it keeps one (`DESIGN-tlog.md`).
+    pub ledger: Option<Arc<crate::ledger::FileLedger>>,
 }
 
 /// Admit a request for `host`, or the status (`429`) to answer.
@@ -114,6 +119,10 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
+        .route("/ipa/ku/log/{id}/head", get(log_head::<D>))
+        .route("/ipa/ku/log/{id}/leaves", get(log_leaves::<D>))
+        .route("/ipa/ku/log/{id}/proof", get(log_proof::<D>))
+        .route("/ipa/ku/log/{id}/consistency", get(log_consistency::<D>))
         .route("/ipa/ku/trust/{kid}", post(establish_trust::<D>))
         .route("/ipa/ku/tang/adv", get(tang_advertisement::<D>))
         .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for::<D>))
@@ -242,6 +251,121 @@ async fn claim_log<D: Directory + Send + Sync + 'static>(
             eprintln!("kuipad: claim log: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+/// The `u64` query parameters `names`, in order; `None` if one is missing
+/// or not a number.
+fn numbers<const N: usize>(query: Option<&str>, names: [&str; N]) -> Option<[u64; N]> {
+    let query = query.unwrap_or_default();
+    let mut out = [0; N];
+    for (slot, name) in out.iter_mut().zip(names) {
+        *slot = query
+            .split('&')
+            .find_map(|p| p.strip_prefix(name)?.strip_prefix('='))?
+            .parse()
+            .ok()?;
+    }
+    Some(out)
+}
+
+/// This server's log, if `id` names it.
+fn ledger_for<'a, D>(app: &'a App<D>, id: &str) -> Option<&'a crate::ledger::FileLedger> {
+    let ledger = app.ledger.as_deref()?;
+    (id.parse::<kuipa_enroll::tlog::LogId>().ok()? == ledger.id()).then_some(ledger)
+}
+
+fn hashes_json(what: &str, hashes: &[kuipa_enroll::merkle::Hash]) -> Response {
+    let hashes: Vec<String> = hashes.iter().map(|h| b64::encode(h)).collect();
+    match serde_json::to_vec(&json!({ what: hashes })) {
+        Ok(body) => binary(body, "application/json"),
+        Err(e) => {
+            eprintln!("kuipad: log {what}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The log's current signed head (`IPLS`, DESIGN-tlog.md §3).  Public:
+/// heads and leaves are what monitors and witnesses check.
+async fn log_head<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(ledger) = ledger_for(&app, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    match ledger.signed_head(&app.server.keys().signing, now) {
+        Ok(Some(head)) => binary(head.to_bytes(), "application/octet-stream"),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            eprintln!("kuipad: log head: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `?from=<index>`: up to [`MAX_LOG_PAGE`] leaves (`IPLF`, base64url),
+/// oldest first.  Leaves name no subject, only its index.
+async fn log_leaves<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(ledger) = ledger_for(&app, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let [from] = numbers(query.as_deref(), ["from"]).unwrap_or([0]);
+    let leaves: Vec<String> = ledger
+        .leaves(from, MAX_LOG_PAGE)
+        .iter()
+        .map(|l| b64::encode(&l.to_bytes()))
+        .collect();
+    match serde_json::to_vec(&json!({ "from": from, "leaves": leaves })) {
+        Ok(body) => binary(body, "application/json"),
+        Err(e) => {
+            eprintln!("kuipad: log leaves: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `?index=<i>&size=<n>`: the inclusion path of leaf `i` in the tree of
+/// `n` leaves — the size of a head the client holds.
+async fn log_proof<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(ledger) = ledger_for(&app, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some([index, size]) = numbers(query.as_deref(), ["index", "size"]) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match ledger.inclusion(index, size) {
+        Ok(path) => hashes_json("path", &path),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `?from=<m>&size=<n>`: the proof that the tree of `m` leaves is a
+/// prefix of the tree of `n`.
+async fn log_consistency<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let Some(ledger) = ledger_for(&app, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some([from, size]) = numbers(query.as_deref(), ["from", "size"]) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match ledger.consistency(from, size) {
+        Ok(proof) => hashes_json("proof", &proof),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -561,6 +685,19 @@ mod tests {
             wanted_heads(Some(&format!("head={a}.0.{}", b64::encode(&root)))).len(),
             0,
         );
+    }
+
+    #[test]
+    fn numbers_from_the_query() {
+        assert_eq!(
+            numbers(Some("size=5&x=1&index=2"), ["index", "size"]),
+            Some([2, 5])
+        );
+        assert_eq!(numbers(Some("index=2"), ["index", "size"]), None);
+        assert_eq!(numbers(Some("index=-1&size=2"), ["index", "size"]), None);
+        // A name must match whole: `sizes` is not `size`.
+        assert_eq!(numbers(Some("sizes=3"), ["size"]), None);
+        assert_eq!(numbers(None, ["from"]), None);
     }
 
     #[test]

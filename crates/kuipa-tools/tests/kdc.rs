@@ -349,6 +349,7 @@ fn against_a_real_kdc() {
                 limiter: kuipad::limit::Limiter::default(),
                 tang: None,
                 keys: None,
+                ledger: None,
             }),
         );
         ipa.push(server);
