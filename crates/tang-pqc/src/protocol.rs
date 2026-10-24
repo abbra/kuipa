@@ -282,15 +282,16 @@ pub struct OpenedRequest<'k> {
 }
 
 impl OpenedRequest<'_> {
-    /// SHA-256 of the binding ciphertext, matching
+    /// The suite hash of the binding ciphertext (SHA-256 for ML-KEM-768,
+    /// SHA-384 for ML-KEM-1024), matching
     /// [`Binding::ciphertext_hash`](crate::Binding::ciphertext_hash), so a
     /// server can check the request against registered bindings.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn ciphertext_hash(&self) -> Result<[u8; 32]> {
-        primitives::sha256(&[&self.ciphertext])
+    pub fn ciphertext_hash(&self) -> Result<Vec<u8>> {
+        primitives::digest(self.key.public().alg().hash(), &[&self.ciphertext])
     }
 
     /// Check that `tag` commits this binding to `data`: the tag

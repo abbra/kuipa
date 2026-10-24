@@ -330,7 +330,7 @@ impl ServerKeys {
         delegation: &Delegation,
         iat: u64,
         exp: u64,
-        epoch: Option<(u64, [u8; 32])>,
+        epoch: Option<(u64, crate::epoch::EpochHead)>,
     ) -> Result<SignedAdvertisement> {
         let signing = [&self.signing];
         let mut builder = AdvertisementBuilder::new(&signing);
@@ -451,7 +451,7 @@ pub struct VerifiedRealm {
     /// checked against (§2 gate).
     claim: Claim,
     adv: Advertisement,
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, crate::epoch::EpochHead)>,
 }
 
 impl VerifiedRealm {
@@ -524,7 +524,7 @@ impl VerifiedRealm {
         let epoch = adv.member(MEMBER_EPOCH).and_then(|v| {
             let seq = v.get("seq")?.as_u64()?;
             let head = b64::decode(v.get("head")?.as_str()?).ok()?;
-            <[u8; 32]>::try_from(head.as_slice())
+            crate::epoch::EpochHead::try_from(head.as_slice())
                 .ok()
                 .filter(|_| seq > 0)
                 .map(|h| (seq, h))
@@ -623,7 +623,7 @@ impl VerifiedRealm {
     /// The head of the server's anchor epoch log, if it named one
     /// (§4.8).
     #[must_use]
-    pub fn epoch(&self) -> Option<(u64, [u8; 32])> {
+    pub fn epoch(&self) -> Option<(u64, crate::epoch::EpochHead)> {
         self.epoch
     }
 
@@ -734,7 +734,7 @@ impl VerifiedRealm {
     ///
     /// [`Error::Mismatch`] when the server named an epoch and the
     /// enrollment carries a different one.
-    pub fn check_epoch(&self, epoch: (u64, [u8; 32])) -> Result<()> {
+    pub fn check_epoch(&self, epoch: (u64, crate::epoch::EpochHead)) -> Result<()> {
         if self.epoch.is_some_and(|e| e != epoch) {
             return Err(Error::Mismatch("anchor epoch"));
         }
@@ -1031,9 +1031,9 @@ pub(crate) mod tests {
         let v = verified(&t);
         // This advertisement named no log: any watermark stands (an older
         // server names none, §4.8).
-        v.check_epoch((7, [1; 32])).unwrap();
+        v.check_epoch((7, [1; 48])).unwrap();
         // One that names a log demands the same watermark.
-        let e = (3, [2; 32]);
+        let e = (3, [2; 48]);
         // Re-sign with an epoch member, as the server's advertisement does.
         let set = t
             .keys
@@ -1049,11 +1049,11 @@ pub(crate) mod tests {
         .unwrap();
         v.check_epoch(e).unwrap();
         assert!(matches!(
-            v.check_epoch((4, [2; 32])),
+            v.check_epoch((4, [2; 48])),
             Err(Error::Mismatch(_))
         ));
         assert!(matches!(
-            v.check_epoch((3, [3; 32])),
+            v.check_epoch((3, [3; 48])),
             Err(Error::Mismatch(_))
         ));
     }

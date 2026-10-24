@@ -982,8 +982,15 @@ impl<'a> Seal<'a> {
 
     /// Register `add` and retire `retire` on vault `name` (registered
     /// sealing).
-    fn register(&self, name: &str, add: &[[u8; 32]], retire: &[[u8; 32]]) -> Result<(), Error> {
-        let hex = |v: &[[u8; 32]]| v.iter().map(kuipa_enroll::vault::binding_hex).collect();
+    fn register(
+        &self,
+        name: &str,
+        add: &[kuipa_enroll::escrow::BindingHash],
+        retire: &[kuipa_enroll::escrow::BindingHash],
+    ) -> Result<(), Error> {
+        let hex = |v: &[kuipa_enroll::escrow::BindingHash]| {
+            v.iter().map(kuipa_enroll::vault::binding_hex).collect()
+        };
         self.op(&VaultOp::Register {
             name: name.into(),
             add: hex(add),

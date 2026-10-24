@@ -768,7 +768,10 @@ pub struct PeerSync {
 }
 
 impl PeerSync {
-    /// The channel binding for the token: a hash of every other field.
+    /// The channel binding for the token: a hash of every other field,
+    /// SHA-384 under every policy (no single key decides it, and both
+    /// servers must agree), taken to the 32 bytes every channel binding
+    /// has.
     ///
     /// # Errors
     ///
@@ -789,7 +792,8 @@ impl PeerSync {
         for c in chain {
             w.bytes(c);
         }
-        Ok(primitives::sha256(&[SYNC_LABEL, &w.finish()])?)
+        let digest = primitives::sha384(&[SYNC_LABEL, &w.finish()])?;
+        Ok(crate::join::channel_binding_of(&digest))
     }
 
     /// Encode.

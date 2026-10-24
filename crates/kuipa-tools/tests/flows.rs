@@ -95,14 +95,18 @@ impl Directory for Dir {
     ) -> Result<(Keytab, kuipa_enroll::join::KerberosBinding), DirectoryError> {
         Err("no KDC in this test".into())
     }
-    fn register_escrow(&self, _: &Principal, _: &[[u8; 32]]) -> Result<(), DirectoryError> {
+    fn register_escrow(
+        &self,
+        _: &Principal,
+        _: &[kuipa_enroll::escrow::BindingHash],
+    ) -> Result<(), DirectoryError> {
         Ok(())
     }
     fn escrow_allowed(
         &self,
         _: &Principal,
         _: kuipa_enroll::escrow::Kind,
-        _: &[u8; 32],
+        _: &kuipa_enroll::escrow::BindingHash,
     ) -> Result<bool, DirectoryError> {
         Ok(false)
     }
@@ -1082,7 +1086,7 @@ fn advertisement_lists_details_landmarks_and_an_anchor_index() {
     let adv = &out["servers"][0];
     assert_eq!(
         adv["anchor_log_head"],
-        format!("2 {}", tang_pqc::Thumbprint::from_bytes(head2)),
+        format!("2 {}", tang_pqc::b64::encode(&head2)),
         "the head the advertisement names"
     );
     assert_eq!(
@@ -1092,11 +1096,11 @@ fn advertisement_lists_details_landmarks_and_an_anchor_index() {
     );
     let landmarks = adv["landmarks"].as_array().unwrap();
     assert_eq!(landmarks.len(), 2, "{adv}");
-    let thp = |h: [u8; 32]| tang_pqc::Thumbprint::from_bytes(h).to_string();
+    let thp = |h: kuipa_enroll::epoch::EpochHead| tang_pqc::b64::encode(&h);
     assert_eq!(landmarks[0]["seq"], 1);
     assert_eq!(
         landmarks[0]["prev"],
-        thp([0; 32]),
+        thp([0; 48]),
         "the first entry commits to nothing"
     );
     assert_eq!(
@@ -1195,7 +1199,7 @@ fn offline_enrollment_from_a_bundle() {
         anchors: vec![*anchor.public().thumbprint()],
         heads: vec![None],
         epoch_seq: 0,
-        epoch_head: [0; 32],
+        epoch_head: [0; 48],
     };
     let (bundle, _) = Bundle::create(
         &keys,
@@ -3374,7 +3378,7 @@ fn bundle_enroll(
         anchors: vec![*anchor.public().thumbprint()],
         heads,
         epoch_seq: 0,
-        epoch_head: [0; 32],
+        epoch_head: [0; 48],
     };
     let (bundle, _) = Bundle::create(
         keys,

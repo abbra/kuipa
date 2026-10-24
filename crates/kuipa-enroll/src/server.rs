@@ -16,7 +16,7 @@ use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::{Delegation, HeadPin, SignedVouch};
 use crate::epoch::{MAX_EPOCH_FETCH, SignedEpoch};
 use crate::error::Error;
-use crate::escrow::{self, EscrowRequest, RegisterParams};
+use crate::escrow::{self, BindingHash, EscrowRequest, RegisterParams};
 use crate::join::{
     AuthType, KerberosBinding, Operation, Request, RequestBody, Response, channel_binding,
 };
@@ -131,7 +131,7 @@ pub trait Directory {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
     ) -> Result<(), DirectoryError>;
 
     /// Is `binding` registered for `principal` in its `kind` set, and is
@@ -144,7 +144,7 @@ pub trait Directory {
         &self,
         principal: &Principal,
         kind: escrow::Kind,
-        binding: &[u8; 32],
+        binding: &BindingHash,
     ) -> Result<bool, DirectoryError>;
 
     /// Accept `token` from `params.principal` itself (any principal of the
@@ -160,7 +160,7 @@ pub trait Directory {
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -372,7 +372,11 @@ pub trait Directory {
     /// # Errors
     ///
     /// Any failure; by default trusts are not supported.
-    fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
+    fn add_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
         let _ = (hash, not_after);
         Err("trusts are not supported by this directory".into())
     }
@@ -382,7 +386,10 @@ pub trait Directory {
     /// # Errors
     ///
     /// An unknown, used or expired invitation, or any other failure.
-    fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+    fn consume_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+    ) -> Result<(), DirectoryError> {
         let _ = hash;
         Err("trusts are not supported by this directory".into())
     }
@@ -461,7 +468,7 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
     ) -> Result<(), DirectoryError> {
         (**self).register_escrow(principal, bindings)
     }
@@ -469,14 +476,14 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         &self,
         principal: &Principal,
         kind: escrow::Kind,
-        binding: &[u8; 32],
+        binding: &BindingHash,
     ) -> Result<bool, DirectoryError> {
         (**self).escrow_allowed(principal, kind, binding)
     }
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -552,10 +559,17 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     ) -> Result<Keytab, DirectoryError> {
         (**self).join_with_voucher(fqdn, hostgroup, salt, enctypes)
     }
-    fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
+    fn add_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
         (**self).add_trust_invitation(hash, not_after)
     }
-    fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+    fn consume_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+    ) -> Result<(), DirectoryError> {
         (**self).consume_trust_invitation(hash)
     }
     fn record_trust(&self, partner: &TrustedRealm, secret: &[u8]) -> Result<(), DirectoryError> {
@@ -690,7 +704,7 @@ pub const ADVERTISEMENT_VALIDITY: u64 = 7 * 24 * 3600;
 type AdvKey = (
     Option<Thumbprint>,
     Option<Thumbprint>,
-    Option<(u64, [u8; 32])>,
+    Option<(u64, crate::epoch::EpochHead)>,
     Option<merkle::Hash>,
 );
 
@@ -895,9 +909,9 @@ impl EnrollServer {
         device: Option<&crate::vault::Device>,
         opened: &tang_pqc::OpenedRequest<'_>,
     ) -> Result<Option<Receipt>, Refusal> {
-        // The release is logged by the escrow binding, which is SHA-256
-        // in every suite (`tang-pqc`), whatever the log's own hash.
-        let binding = merkle::Hash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
+        // The release is logged by the escrow binding: the KEM suite's
+        // hash, as the log's own is the signer's.
+        let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
         let device = device.map(|d| d.id.as_str());
         self.record_vault(request.vault(), VaultAction::Release, device, binding)
     }
@@ -976,7 +990,7 @@ impl EnrollServer {
 
     /// The head of this server's anchor epoch log, if it has one.
     #[must_use]
-    pub fn epoch_head(&self) -> Option<(u64, [u8; 32])> {
+    pub fn epoch_head(&self) -> Option<(u64, crate::epoch::EpochHead)> {
         self.published()
             .epoch
             .last()
@@ -1875,7 +1889,7 @@ impl EnrollServer {
             anchors,
             heads,
             epoch_seq: epoch.map_or(0, |(seq, _)| seq),
-            epoch_head: epoch.map_or([0; 32], |(_, head)| head),
+            epoch_head: epoch.map_or(crate::epoch::GENESIS, |(_, head)| head),
         })
     }
 
@@ -1973,10 +1987,13 @@ impl EnrollServer {
                 request.commitment(),
             )
             .map_err(|_| Refusal::because("the binding is not committed to this vault"))?;
-        let Some(kind) = request.vault().machine_kind(request.principal())? else {
+        let Some(kind) = request
+            .vault()
+            .machine_kind(request.principal(), key.public().alg())?
+        else {
             return self.recover_vault(request, opened, directory);
         };
-        let binding = opened.ciphertext_hash().map_err(Error::from)?;
+        let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
         if !directory
             .escrow_allowed(request.principal(), kind, &binding)
             .map_err(Refusal)?
@@ -2078,7 +2095,9 @@ impl EnrollServer {
             }
         }
         if vault.policy.sealing == crate::vault::Sealing::Registered {
-            let hash = crate::vault::binding_hex(&opened.ciphertext_hash().map_err(Error::from)?);
+            let hash = crate::vault::binding_hex(&BindingHash::from_slice(
+                &opened.ciphertext_hash().map_err(Error::from)?,
+            )?);
             if !vault.bindings.contains(&hash) {
                 return Err(Refusal::because(
                     "the file's binding is not registered (retired or never registered)",

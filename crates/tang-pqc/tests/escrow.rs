@@ -50,6 +50,13 @@ fn provision_and_recover_all_algorithms() {
             let recovered = recover(&s.server, &binding).unwrap();
             assert_eq!(key.as_ref(), recovered.as_ref(), "{kem:?}/{sig:?}");
             assert_eq!(key.as_ref().len(), tang_pqc::KEY_LEN);
+            // The binding's identity is the suite hash: SHA-384 for
+            // ML-KEM-1024 (CNSA 2.0), SHA-256 for ML-KEM-768.
+            assert_eq!(
+                Some(binding.ciphertext_hash().unwrap().len()),
+                tang_pqc::primitives::digest_len(kem.hash()),
+                "{kem:?}"
+            );
         }
     }
 }

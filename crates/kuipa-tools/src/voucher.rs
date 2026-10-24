@@ -192,9 +192,10 @@ pub struct State {
 
 impl State {
     fn claims(&self) -> Result<Claims, Error> {
-        let binding: [u8; 32] = b64::decode(&self.binding)?
-            .try_into()
-            .map_err(|_| "bad binding in the voucher state")?;
+        let binding = b64::decode(&self.binding)?;
+        if !binding.is_empty() && !voucher::is_binding_len(binding.len()) {
+            return Err("bad binding in the voucher state".into());
+        }
         Ok(Claims {
             realm: self.realm.clone(),
             fqdn: self.fqdn.clone(),
@@ -257,7 +258,7 @@ pub fn finish(state: &Path, response: &str) -> Result<Voucher, Error> {
 /// # Errors
 ///
 /// An existing `path`, or I/O.
-pub fn ephemeral(path: &Path) -> Result<[u8; 32], Error> {
+pub fn ephemeral(path: &Path) -> Result<Vec<u8>, Error> {
     if path.exists() {
         return Err(format!("{} exists", path.display()).into());
     }
@@ -293,7 +294,7 @@ mod tests {
             hostgroup: String::new(),
             not_before: 0,
             not_after: 1,
-            binding: [0; 32],
+            binding: Vec::new(),
         };
         let request = request(public.as_bytes(), &claims, &dir.join("state.json")).unwrap();
 

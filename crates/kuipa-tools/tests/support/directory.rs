@@ -23,9 +23,9 @@ pub struct KdcDirectory {
     /// Who may enroll and stage hosts with a ticket or a password.
     pub admins: HashSet<String>,
     pub otps: Mutex<HashMap<String, Vec<u8>>>,
-    pub escrow: Mutex<HashMap<String, Vec<[u8; 32]>>>,
+    pub escrow: Mutex<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     /// Escrow bindings of sealed files, by principal (§7.5).
-    pub escrow_files: Mutex<HashMap<String, Vec<[u8; 32]>>>,
+    pub escrow_files: Mutex<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     pub staged: Mutex<HashSet<String>>,
     pub servers: Vec<String>,
     /// Spent voucher salts.
@@ -33,7 +33,7 @@ pub struct KdcDirectory {
     /// Host groups and their members, as voucher joins add them.
     pub hostgroups: Mutex<HashMap<String, Vec<String>>>,
     /// Trust invitations (secret hash → not after).
-    pub invitations: Mutex<HashMap<[u8; 32], u64>>,
+    pub invitations: Mutex<HashMap<[u8; 48], u64>>,
     /// Recorded trusted realms.
     pub trusts: Mutex<Vec<TrustedRealm>>,
     /// User vaults.
@@ -253,7 +253,7 @@ impl Directory for KdcDirectory {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), DirectoryError> {
         self.escrow
             .lock()
@@ -266,7 +266,7 @@ impl Directory for KdcDirectory {
         &self,
         principal: &Principal,
         kind: Kind,
-        binding: &[u8; 32],
+        binding: &kuipa_enroll::escrow::BindingHash,
     ) -> Result<bool, DirectoryError> {
         let set = match kind {
             Kind::Keytab => &self.escrow,
@@ -282,7 +282,7 @@ impl Directory for KdcDirectory {
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -464,12 +464,12 @@ impl Directory for KdcDirectory {
         Ok(self.locked.lock().unwrap().contains(&principal.to_string()))
     }
 
-    fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
+    fn add_trust_invitation(&self, hash: &[u8; 48], not_after: u64) -> Result<(), DirectoryError> {
         self.invitations.lock().unwrap().insert(*hash, not_after);
         Ok(())
     }
 
-    fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+    fn consume_trust_invitation(&self, hash: &[u8; 48]) -> Result<(), DirectoryError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

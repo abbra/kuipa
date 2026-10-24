@@ -35,7 +35,7 @@ fn now() -> u64 {
     unix_seconds(SystemTime::now())
 }
 
-fn claims(fqdn: &str, binding: [u8; 32]) -> Claims {
+fn claims(fqdn: &str, binding: Vec<u8>) -> Claims {
     Claims {
         realm: REALM.into(),
         fqdn: fqdn.into(),
@@ -172,7 +172,7 @@ fn vouchers_against_a_real_kdc() {
     };
 
     // ── A bearer voucher creates its host, once ──
-    let web1 = issue(&claims("web1.voucher.test", [0; 32]), "web1");
+    let web1 = issue(&claims("web1.voucher.test", Vec::new()), "web1");
     enroll("web1.voucher.test", &web1, None).unwrap();
     assert!(realm.has(&format!("host/web1.voucher.test@{REALM}")));
     assert_eq!(
@@ -199,7 +199,7 @@ fn vouchers_against_a_real_kdc() {
     let state = dir.join("web3.state");
     let request = voucher::request(
         other.as_bytes(),
-        &claims("web3.voucher.test", [0; 32]),
+        &claims("web3.voucher.test", Vec::new()),
         &state,
     )
     .unwrap();
@@ -211,7 +211,7 @@ fn vouchers_against_a_real_kdc() {
     let state = dir.join("web4.state");
     let request = voucher::request(
         public.as_bytes(),
-        &claims("web4.voucher.test", [0; 32]),
+        &claims("web4.voucher.test", Vec::new()),
         &state,
     )
     .unwrap();
