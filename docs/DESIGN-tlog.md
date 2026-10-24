@@ -14,7 +14,7 @@ hold such events, and the order in which it replaces the claim log.
 | 3 | signed heads, consistency proofs | RFC 9162 consistency instead of refetching | implemented |
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented (the cosign step) |
 | 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
-| 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | producers for vault, escrow and Keys events implemented, with receipts; lookups planned |
+| 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow and Keys events, with receipts and lookups |
 | 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | planned |
 | 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
 
@@ -135,6 +135,28 @@ same log that is large enough but does not hold the leaf is evidence
 against the server. Escrow releases and Keys fetches have no receipt in
 their answers; owners find them through lookups.
 
+**Lookups.** `POST /ipa/ku/tlog/{kid}` is a sealed, Kerberos-only
+operation, labelled `tlog` in the transcript. Its data is `IPLQ ‖ 1 ‖
+vault ‖ from(u64)`:
+- naming a vault the caller owns asks for that vault's entries;
+- an empty name asks for those about the caller's principal (Keys
+  fetches, for a host).
+
+Nobody can look up another principal's entries, so auditors work from
+the public log (§5). The answer is `IPLR ‖ 1 ‖ signer(JWK) ‖ head(IPLS,
+empty for an empty log) ‖ n(u64) ‖ [index ‖ leaf(IPLF) ‖ m(1) ‖
+[hash(32)]]`. Each entry carries its inclusion path in the head. At most
+1024 entries come in one answer, and the client pages on with `from`.
+
+The client accepts an answer only if three checks pass:
+- the signer key's thumbprint is the one its verified advertisement names;
+- the head's signature checks;
+- every entry is included in the head.
+
+Per-user completeness is not proven: a server could leave an entry out
+of an answer. Omissions are left to public auditing and witnesses; a
+prefix-tree map would need a post-quantum VRF.
+
 ## 5. Storage and serving
 
 `kuipad` keeps its log under the key directory:
@@ -173,10 +195,6 @@ format is settled.
 
 ## 7, 8. Next
 
-* **Lookups.** The Kerberos-authenticated `tlog` operation (`IPLQ`/`IPLR`)
-  returns a caller's own entries with inclusion proofs. Per-user
-  completeness is not proven. Omissions are left to public auditing and
-  witnesses; a prefix-tree map would need a post-quantum VRF.
 * **Clients.** `kuipa tlog watch` flags device and escrow events the user
   did not cause. `kuipa-audit tlog` checks consistency and tombstones.
   `kuipa-mirror --witness` cosigns.

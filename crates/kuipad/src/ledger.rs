@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 
 use kuipa_enroll::merkle::{self, Hash};
 use kuipa_enroll::server::{Appended, DirectoryError, Ledger};
-use kuipa_enroll::tlog::{self, Kind, Leaf, Log, LogId, SignedHead};
+use kuipa_enroll::tlog::{self, Entry, Kind, Leaf, Log, LogId, SignedHead};
 use native_ossl::rand::Rand;
 use tang_pqc::{SigningKey, unix_seconds};
 
@@ -221,6 +221,41 @@ impl Ledger for FileLedger {
         inner.leaves.push(leaf);
         Ok(Some(appended))
     }
+
+    fn signed_head(
+        &self,
+        key: &SigningKey,
+        now: u64,
+    ) -> Result<Option<SignedHead>, DirectoryError> {
+        FileLedger::signed_head(self, key, now)
+    }
+
+    fn find(
+        &self,
+        subject: &[u8],
+        from: u64,
+        size: u64,
+        max: usize,
+    ) -> Result<Vec<Entry>, DirectoryError> {
+        let index = tlog::index(&self.key, subject)?;
+        let inner = self.inner();
+        let hashes = prefix(inner.log.hashes(), size)?;
+        let from = usize::try_from(from)?;
+        let mut found = Vec::new();
+        for (i, leaf) in inner.leaves[..hashes.len()].iter().enumerate().skip(from) {
+            if found.len() == max {
+                break;
+            }
+            if leaf.index == index {
+                found.push(Entry {
+                    index: i as u64,
+                    leaf: leaf.clone(),
+                    path: merkle::path(hashes, i)?,
+                });
+            }
+        }
+        Ok(found)
+    }
 }
 
 /// The first `size` of `hashes`.
@@ -356,6 +391,32 @@ mod tests {
         assert!(ledger.inclusion(5, 2).is_err());
         assert!(ledger.inclusion(0, 0).is_err());
         assert!(ledger.consistency(2, 99).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_a_subjects_leaves_up_to_a_head() {
+        let dir = temp("find");
+        let ledger = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test").unwrap();
+        for (i, subject) in [b"a", b"b", b"a", b"a"].iter().enumerate() {
+            let body = [u8::try_from(i).unwrap()];
+            ledger.append(Kind::VAULT_DEVICE, *subject, &body).unwrap();
+        }
+        let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let head = ledger.signed_head(&key, 100).unwrap().unwrap().head;
+        let found = Ledger::find(&ledger, b"a", 0, head.size, 10).unwrap();
+        assert_eq!(found.iter().map(|e| e.index).collect::<Vec<_>>(), [0, 2, 3]);
+        for e in &found {
+            assert!(head.includes(&e.leaf, e.index, &e.path).unwrap());
+        }
+        // From an index, at most `max`, only up to the head's size.
+        assert_eq!(Ledger::find(&ledger, b"a", 1, 4, 1).unwrap()[0].index, 2);
+        assert_eq!(Ledger::find(&ledger, b"a", 0, 2, 10).unwrap().len(), 1);
+        assert_eq!(
+            Ledger::find(&ledger, b"c", 0, 4, 10).unwrap(),
+            [] as [kuipa_enroll::tlog::Entry; 0]
+        );
+        assert!(Ledger::find(&ledger, b"a", 0, 9, 10).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -18,7 +18,7 @@ use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::{
     Accepted, Appended, Directory, DirectoryError, Ledger, Staged, parse_stage_result,
 };
-use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, VaultAction, VaultEvent};
+use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, SignedHead, VaultAction, VaultEvent};
 use kuipa_enroll::vault::{
     self, Descriptor, DeviceType, Factors, Level, Recovered, SealedVaultFile, TicketDelegation,
     Unlock, Vault, VaultOp,
@@ -1425,6 +1425,69 @@ impl Ledger for MemoryLedger {
             time: leaf.time,
         }))
     }
+
+    fn signed_head(
+        &self,
+        key: &SigningKey,
+        now: u64,
+    ) -> Result<Option<SignedHead>, DirectoryError> {
+        let log = self.log.lock().unwrap();
+        if log.0.size() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(SignedHead::issue(key, log.0.head(now)?)?))
+    }
+
+    fn find(
+        &self,
+        subject: &[u8],
+        from: u64,
+        size: u64,
+        max: usize,
+    ) -> Result<Vec<tlog::Entry>, DirectoryError> {
+        let index = tlog::index(&self.key, subject)?;
+        let log = self.log.lock().unwrap();
+        let size = usize::try_from(size)?;
+        let hashes = &log.0.hashes()[..size];
+        Ok(log.1[..size]
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(from)?)
+            .filter(|(_, l)| l.index == index)
+            .take(max)
+            .map(|(i, l)| tlog::Entry {
+                index: i as u64,
+                leaf: l.clone(),
+                path: kuipa_enroll::merkle::path(hashes, i).unwrap(),
+            })
+            .collect())
+    }
+}
+
+/// A `tlog` lookup by `caller` at server 0, checked by the client.
+fn tlog_lookup(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    caller: &str,
+    query: &tlog::Query,
+) -> Result<tlog::Answer, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Tlog,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &query.to_bytes())
+        .unwrap();
+    let response = r.send(0, Operation::Tlog, &request)?;
+    pending
+        .finish_tlog(&response, adv, &Policy::default())
+        .map_err(|_| ())
 }
 
 /// A ledger whose store has failed.
@@ -1561,6 +1624,34 @@ fn vault_events_are_logged_with_receipts() {
             assert!(!bytes.windows(name.len()).any(|w| w == name));
         }
     }
+
+    // The owner looks their vault's entries up, with proofs the client
+    // checks against the head; pages on with `from`.
+    let lookup = |who: &str, vault: &str, from: u64| {
+        tlog_lookup(
+            &r,
+            adv,
+            who,
+            &tlog::Query {
+                vault: vault.into(),
+                from,
+            },
+        )
+    };
+    let answer = lookup(ALICE, "personal", 0).unwrap();
+    assert_eq!(answer.entries.len(), leaves.len());
+    assert_eq!(answer.entries[1].leaf, leaves[1]);
+    assert_eq!(lookup(ALICE, "personal", 2).unwrap().entries.len(), 1);
+    // Nothing is about Alice's principal; Bob cannot look up her vault.
+    assert_eq!(
+        lookup(ALICE, "", 0).unwrap().entries,
+        [] as [kuipa_enroll::tlog::Entry; 0]
+    );
+    assert!(lookup(BOB, "personal", 0).is_err());
+    // A tampered answer does not verify.
+    let mut forged = answer.clone();
+    forged.entries[0].leaf.body.push(0);
+    assert!(forged.verify(adv.signer(), &Policy::default()).is_err());
 
     // A server whose ledger fails refuses the change, and does not make
     // it: the vault is still enabled.

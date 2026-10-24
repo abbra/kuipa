@@ -119,6 +119,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
+        .route("/ipa/ku/tlog/{id}", post(tlog::<D>))
         .route("/ipa/ku/tlog/{id}/head", get(log_head::<D>))
         .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves::<D>))
         .route("/ipa/ku/tlog/{id}/proof", get(log_proof::<D>))
@@ -483,7 +484,7 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     };
     let what = format!("{op:?} {}", request.fqdn());
     let host = match op {
-        Operation::Register | Operation::Vault | Operation::Keys => None,
+        Operation::Register | Operation::Vault | Operation::Keys | Operation::Tlog => None,
         _ => Some(request.fqdn()),
     };
     if let Err(status) = admit_for(&app, &what, host, headers) {
@@ -560,6 +561,17 @@ async fn keys<D: Directory + Send + Sync + 'static>(
     // Like registration and vault operations: only ever
     // Kerberos-authenticated, so only the source's bucket applies.
     exchange(app, Operation::Keys, kid, &headers, body).await
+}
+
+async fn tlog<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(kid): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // A lookup of the caller's own entries: Kerberos-only, like vault
+    // operations.
+    exchange(app, Operation::Tlog, kid, &headers, body).await
 }
 
 async fn recover<D: Directory + Send + Sync + 'static>(
