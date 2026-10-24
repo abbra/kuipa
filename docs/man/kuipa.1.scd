@@ -323,6 +323,20 @@ but not recorded, so run the watch again after the witnesses' next
 pass.  Exits 1 for a flag, a log that does not extend what was seen
 (*FORKED*), an unwitnessed head, or a server that could not be checked.
 
+## sign blob [--purpose _P_] _FILE_...
+
+Have a realm server state that the principal of your ticket signed the
+files, for purpose _P_ (default *blob*), as the realm's signing policy
+allows; the statement is recorded in the server's transparency log.
+Each file gets a _FILE_*.kusig* bundle.  See *kuipa-gitsign* for git
+commits.
+
+## sign verify _FILE_ [--signature _SIG_] [--signer _S_] [--purpose _P_]
+
+Verify _FILE_ against its bundle (default _FILE_*.kusig*) offline, with
+this host's pinned anchors, as of the time it was signed.  Exits 1 for
+another signer or purpose than asked for.
+
 ## tlog witnesses [--add _JWK_] [--remove _THUMBPRINT_] [--required _N_]
 
 Show the transparency-log witnesses this host trusts, and how many

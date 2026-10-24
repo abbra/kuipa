@@ -279,6 +279,43 @@ enum Command {
         #[command(subcommand)]
         action: TlogAction,
     },
+    /// Have the realm state, under your ticket, that you signed files;
+    /// verify such statements.
+    Sign {
+        #[command(subcommand)]
+        action: SignAction,
+    },
+}
+
+/// `kuipa sign` subcommands.
+#[derive(Subcommand)]
+enum SignAction {
+    /// Sign files: one statement for all of them, by your ticket's
+    /// principal, and a `<file>.kusig` beside each.
+    Blob {
+        /// What the signature is for, as the realm's signing policy names it.
+        #[arg(long, default_value = "blob")]
+        purpose: String,
+        /// The files.
+        #[arg(required = true)]
+        files: Vec<std::path::PathBuf>,
+    },
+    /// Check a file against its signature, offline, with this host's
+    /// pinned anchors.  Exits non-zero for another signer or purpose
+    /// than asked for.
+    Verify {
+        /// The file.
+        file: std::path::PathBuf,
+        /// The signature (default `<file>.kusig`).
+        #[arg(long)]
+        signature: Option<std::path::PathBuf>,
+        /// Require this signer (`alice` or `alice@REALM`).
+        #[arg(long)]
+        signer: Option<String>,
+        /// Require this purpose.
+        #[arg(long)]
+        purpose: Option<String>,
+    },
 }
 
 /// `kuipa tlog` subcommands.
@@ -603,6 +640,7 @@ impl Command {
             Command::Seal { .. } => "seal",
             Command::Keys { .. } => "keys",
             Command::Tlog { .. } => "tlog",
+            Command::Sign { .. } => "sign",
         }
     }
 
@@ -1219,6 +1257,7 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
         "complete" => render_complete(value),
         "rotate-keys" => render_rotated(value, "New host keys"),
         "tlog" => render_tlog(value),
+        "sign" => render_sign(value),
         "protect" if get(value, "contents").is_string() => render_protect_other(value),
         "protect" => render_protect(value),
         "unprotect" if get(value, "contents").is_string() => render_unprotect_other(value),
@@ -1234,6 +1273,42 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
         other => println!("{other}: {value}"),
     }
 }
+fn render_sign(value: &Value) {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    let when = get(value, "time")
+        .as_u64()
+        .and_then(kuipa_tools::text::date)
+        .unwrap_or_default();
+    if let Some(files) = get(value, "signed").as_array() {
+        for f in files {
+            println!("{} -> {}", text(&f["file"]), text(&f["signature"]));
+        }
+        println!(
+            "Signed by {} for {} at {when}, stated by {} (log {} #{}).",
+            text(get(value, "principal")),
+            text(get(value, "purpose")),
+            text(get(value, "server")),
+            text(get(value, "log")),
+            get(value, "index")
+        );
+        return;
+    }
+    let verdict = if get(value, "ok") == &Value::Bool(true) {
+        "Good signature"
+    } else {
+        "Signature verifies, but not as asked"
+    };
+    println!(
+        "{verdict}: {} signed by {} for {} at {when}, stated by {} (log {} #{}).",
+        text(get(value, "file")),
+        text(get(value, "principal")),
+        text(get(value, "purpose")),
+        text(get(value, "server")),
+        text(get(value, "log")),
+        get(value, "index")
+    );
+}
+
 fn render_tlog(value: &Value) {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     if value.get("vault").is_none() {
@@ -1840,6 +1915,26 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
 /// `kuipa keys fetch` (§18.4): the value on standard output, or in a
 /// file with `--out`.  Standard output only when it is not a terminal,
 /// as `kuipa-unseal` does (§10.5).
+fn run_sign(paths: &Paths, action: &SignAction) -> Result<Value, Error> {
+    match action {
+        SignAction::Blob { purpose, files } => {
+            kuipa_tools::sign::sign_files(paths, None, purpose, files)
+        }
+        SignAction::Verify {
+            file,
+            signature,
+            signer,
+            purpose,
+        } => kuipa_tools::sign::verify_file(
+            paths,
+            file,
+            signature.as_deref(),
+            signer.as_deref(),
+            purpose.as_deref(),
+        ),
+    }
+}
+
 fn run_tlog(paths: &Paths, action: &TlogAction) -> Result<Value, Error> {
     match action {
         TlogAction::Watch { vault } => {
@@ -2069,6 +2164,7 @@ fn main() -> ExitCode {
         Command::Seal { action } => run_seal(&paths, action),
         Command::Keys { action } => run_keys(&paths, action),
         Command::Tlog { action } => run_tlog(&paths, action),
+        Command::Sign { action } => run_sign(&paths, action),
         _ => run(&args),
     };
     match result {

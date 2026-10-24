@@ -53,6 +53,11 @@ pub struct KdcDirectory {
     pub key_secrets: Mutex<std::collections::BTreeMap<(u8, String), Vec<u8>>>,
     /// The realm's vault limits.
     pub limits: Mutex<kuipa_enroll::vault::Limits>,
+    /// The realm's signing policy (`DESIGN-sign.md`).
+    pub sign_policy: Mutex<kuipa_enroll::sign::SignPolicy>,
+    /// User groups by principal, as `memberOf` lists them (host groups
+    /// come from `hostgroups`).
+    pub groups: Mutex<HashMap<String, Vec<String>>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -90,6 +95,8 @@ impl KdcDirectory {
             ca_masters: Mutex::new(Vec::new()),
             key_secrets: Mutex::new(std::collections::BTreeMap::new()),
             limits: Mutex::new(kuipa_enroll::vault::Limits::default()),
+            sign_policy: Mutex::new(kuipa_enroll::sign::SignPolicy::default()),
+            groups: Mutex::new(HashMap::new()),
             creds,
         }
     }
@@ -366,6 +373,34 @@ impl Directory for KdcDirectory {
 
     fn vault_limits(&self) -> Result<kuipa_enroll::vault::Limits, DirectoryError> {
         Ok(self.limits.lock().unwrap().clone())
+    }
+
+    fn sign_policy(&self) -> Result<kuipa_enroll::sign::SignPolicy, DirectoryError> {
+        Ok(self.sign_policy.lock().unwrap().clone())
+    }
+
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        let name = principal.to_string();
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
+        if let [service, fqdn] = principal.components()
+            && service == "host"
+        {
+            groups.extend(
+                self.hostgroups
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, members)| members.iter().any(|m| m == fqdn))
+                    .map(|(g, _)| g.clone()),
+            );
+        }
+        Ok(groups)
     }
 
     fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {

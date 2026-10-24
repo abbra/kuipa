@@ -56,6 +56,9 @@ pub enum Operation {
     /// `POST /ipa/ku/tlog/{kid}`: a lookup of the caller's own entries in
     /// the server's transparency log (`DESIGN-tlog.md` §6).
     Tlog,
+    /// `POST /ipa/ku/sign/{kid}`: a statement that the caller signed some
+    /// digests (`DESIGN-sign.md`).
+    Sign,
 }
 
 impl Operation {
@@ -68,6 +71,7 @@ impl Operation {
             Self::Vault => "vault",
             Self::Keys => "keys",
             Self::Tlog => "tlog",
+            Self::Sign => "sign",
         }
     }
 
@@ -79,9 +83,13 @@ impl Operation {
 
     const fn magic(self) -> [u8; 4] {
         match self {
-            Self::Join | Self::Rekey | Self::Register | Self::Vault | Self::Keys | Self::Tlog => {
-                *b"IPJQ"
-            }
+            Self::Join
+            | Self::Rekey
+            | Self::Register
+            | Self::Vault
+            | Self::Keys
+            | Self::Tlog
+            | Self::Sign => *b"IPJQ",
             Self::Stage => *b"IPSQ",
         }
     }
@@ -707,6 +715,30 @@ impl PendingJoin {
         let answer = crate::tlog::Answer::from_bytes(self.open(response)?.as_ref())?;
         answer.verify(realm.signer(), policy)?;
         Ok(answer)
+    }
+
+    /// Finish a signing request: decrypt the answer and make the bundle of
+    /// each digest of `request`, checked against the statement's batch.
+    /// The bundles still verify only against the realm's anchors
+    /// ([`crate::sign::Bundle::verify`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], or [`Error::Mismatch`]
+    /// for another server or an answer that does not cover `request`.
+    pub fn finish_sign(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+        request: &crate::sign::Request,
+    ) -> Result<Vec<crate::sign::Bundle>> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        let answer = crate::sign::Answer::from_bytes(self.open(response)?.as_ref())?;
+        (0..request.digests.len())
+            .map(|i| answer.bundle(request, i))
+            .collect()
     }
 
     /// Finish a join or rekey: decrypt the enrollment, and check it is for
