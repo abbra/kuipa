@@ -613,3 +613,10 @@ derivations are the `Domain::TANG` case, byte for byte.
 Tang, signed members, binding context (domain and info), commitments (the
 committed data verifies, other data or a tag of another binding does not),
 and the default context matching Tang.
+
+A symbolic model of the protocol for the Tamarin prover lives in
+`../../contrib/tamarin/tang-pqc.spthy`. It verifies the two-factor,
+authenticated-setup, sealed-transport and response-authentication
+properties of §4, and reproduces the attacks §4 and §5 document: a
+mis-delivered `thp` with a stolen disk, and the disk holder querying
+the server for `ss` (the P2 gap). Its header records the abstractions.
