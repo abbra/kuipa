@@ -221,6 +221,31 @@ impl LogId {
     }
 }
 
+impl std::fmt::Display for LogId {
+    /// Lowercase hex, as in the log's directory and routes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+impl std::str::FromStr for LogId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let bytes = s.as_bytes();
+        // Hex digits only: from_str_radix would also take a sign.
+        if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return Err(Error::Malformed("log id"));
+        }
+        let mut id = [0u8; 32];
+        for (out, pair) in id.iter_mut().zip(bytes.chunks_exact(2)) {
+            let pair = std::str::from_utf8(pair).map_err(|_| Error::Malformed("log id"))?;
+            *out = u8::from_str_radix(pair, 16).map_err(|_| Error::Malformed("log id"))?;
+        }
+        Ok(Self(id))
+    }
+}
+
 /// A log, as the hashes and kinds of its leaves: enough to append, prove
 /// and sign.  The leaves themselves live in the server's store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -288,20 +313,36 @@ impl Log {
     /// [`Error::Malformed`] for a tombstone that breaks those rules, an
     /// OpenSSL error otherwise.
     pub fn append(&mut self, leaf: &Leaf) -> Result<u64> {
-        if leaf.kind == Kind::TOMBSTONE {
-            let target = Tombstone::from_bytes(&leaf.body)?.target;
-            let kind = usize::try_from(target)
-                .ok()
-                .and_then(|t| self.kinds.get(t))
-                .ok_or(Error::Malformed("tombstone target"))?;
-            if *kind == Kind::TOMBSTONE || self.retired.contains(&target) {
-                return Err(Error::Malformed("tombstone target"));
-            }
+        let retires = self.check(leaf)?;
+        let hash = leaf.hash()?;
+        if let Some(target) = retires {
             self.retired.insert(target);
         }
-        self.hashes.push(leaf.hash()?);
+        self.hashes.push(hash);
         self.kinds.push(leaf.kind);
         Ok(self.size() - 1)
+    }
+
+    /// Whether [`append`](Self::append) would accept `leaf`, without
+    /// appending it: a store checks before it writes.  Returns the index a
+    /// tombstone retires.
+    ///
+    /// # Errors
+    ///
+    /// As [`append`](Self::append).
+    pub fn check(&self, leaf: &Leaf) -> Result<Option<u64>> {
+        if leaf.kind != Kind::TOMBSTONE {
+            return Ok(None);
+        }
+        let target = Tombstone::from_bytes(&leaf.body)?.target;
+        let kind = usize::try_from(target)
+            .ok()
+            .and_then(|t| self.kinds.get(t))
+            .ok_or(Error::Malformed("tombstone target"))?;
+        if *kind == Kind::TOMBSTONE || self.retired.contains(&target) {
+            return Err(Error::Malformed("tombstone target"));
+        }
+        Ok(Some(target))
     }
 
     /// The tree hash over all leaves.
@@ -852,6 +893,10 @@ mod tests {
             id(),
             LogId::of("EXAMPLE.TEST", "ipa2.example.test").unwrap()
         );
+        assert_eq!(id().to_string().parse::<LogId>().unwrap(), id());
+        for bad in ["", "zz", &"0".repeat(63), &"g".repeat(64), &"+f".repeat(32)] {
+            assert!(bad.parse::<LogId>().is_err(), "{bad:?}");
+        }
         // The realm is length-prefixed: no shifting bytes between fields.
         assert_ne!(LogId::of("A", "BC").unwrap(), LogId::of("AB", "C").unwrap());
     }
