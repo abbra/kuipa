@@ -12,6 +12,7 @@
 #   ./contrib/ci/local-ci.sh interactive         # throwaway realm + shell
 #   ./contrib/ci/local-ci.sh playground-test     # scripted, traced session + HTML report
 #   CARGO_TARGET_DIR=/tmp/kuipa-target ./contrib/ci/local-ci.sh all
+#   KUIPA_KRB5_VENDOR=heimdal ./contrib/ci/local-ci.sh build   # build against Heimdal
 
 # Require bash 4+
 if [ "${BASH_VERSINFO:-0}" -lt 4 ]; then
@@ -72,6 +73,64 @@ fi
 
 export CARGO_TERM_COLOR=always
 export RUSTDOCFLAGS="-D warnings"
+
+# ── Kerberos vendor ─────────────────────────────────────────────────────────
+# `KUIPA_KRB5_VENDOR` names the Kerberos implementation the build scripts
+# compile against.  It is validated here rather than by the build scripts so a
+# typo is reported before anything compiles, and exported so every job in one
+# run sees the same vendor — cargo would otherwise re-detect, and therefore
+# rebuild, per crate invocation.
+case "${KUIPA_KRB5_VENDOR:-}" in
+    ""|auto) KRB_VENDOR="auto" ;;
+    mit|mit-krb5|krb5|massachusetts) KRB_VENDOR="mit" ;;
+    heimdal) KRB_VENDOR="heimdal" ;;
+    *)
+        echo "error: KUIPA_KRB5_VENDOR='${KUIPA_KRB5_VENDOR}' is not a known vendor (expected mit, heimdal or auto)" >&2
+        exit 1
+        ;;
+esac
+export KUIPA_KRB5_VENDOR="$KRB_VENDOR"
+
+# ── Keg-only Homebrew installs (macOS) ──────────────────────────────────────
+# Homebrew refuses to symlink krb5 and openldap into the normal prefix because
+# macOS ships its own copies (Heimdal Kerberos, its own LDAP), so a `brew
+# install` of either puts binaries, headers, libraries and `.pc` files on
+# neither PATH nor PKG_CONFIG_PATH. Put the keg directories first: `kinit` has
+# to resolve to MIT, not the system Heimdal one, and the build scripts have to
+# see the OpenLDAP and MIT Kerberos pkg-config packages.
+keg_only_formulas() {
+    if [[ "$(uname -s)" != "Darwin" ]] || ! command -v brew >/dev/null 2>&1; then
+        return
+    fi
+    for formula in krb5 openldap; do
+        local prefix=""
+        prefix="$(brew --prefix "$formula" 2>/dev/null)" || continue
+        [[ -n "$prefix" && -d "$prefix" ]] || continue
+        for dir in "$prefix/bin" "$prefix/sbin"; do
+            if [[ -d "$dir" ]]; then
+                PATH="$dir:$PATH"
+            fi
+        done
+        if [[ -d "$prefix/lib/pkgconfig" ]]; then
+            PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+        fi
+        echo -e "${CYAN}Keg-only Homebrew ${formula}:${NC} ${prefix}"
+    done
+    # The Heimdal keg deliberately stays off PATH: it ships its own `kinit`,
+    # `klist` and `kswitch`, which would shadow the MIT tools the KDC jobs
+    # start realms with, and it has no `krb5kdc`/`kdb5_util` at all.  Its
+    # pkg-config directory is enough for a Heimdal build to find the headers.
+    if [[ "$KRB_VENDOR" == "heimdal" ]]; then
+        local heimdal=""
+        heimdal="$(brew --prefix heimdal 2>/dev/null)" || heimdal=""
+        if [[ -n "$heimdal" && -d "$heimdal/lib/pkgconfig" ]]; then
+            PKG_CONFIG_PATH="$heimdal/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo -e "${CYAN}Keg-only Homebrew heimdal:${NC} ${heimdal} (pkg-config only; PATH stays MIT)"
+        fi
+    fi
+    export PATH PKG_CONFIG_PATH
+}
+keg_only_formulas
 
 # The minimum supported Rust version, from the workspace manifest.
 MSRV="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -137,7 +196,18 @@ detect_tools() {
         has_krb5kdc=1
         echo -e "  ${GREEN}✓${NC} krb5kdc, kdb5_util, kadmin.local, kinit (kdc-test)"
     else
-        echo -e "  ${YELLOW}○${NC} MIT KDC tools (optional, needed for kdc-test; install krb5-server krb5-workstation krb5-pkinit)"
+        echo -e "  ${YELLOW}○${NC} MIT KDC tools (optional, needed for kdc-test; install krb5-server krb5-workstation krb5-pkinit, or brew install krb5)"
+    fi
+
+    # Which Kerberos the build scripts compile against, and whether the
+    # MIT-only jobs can run.
+    if [[ "$KRB_VENDOR" == "auto" ]]; then
+        echo -e "  ${CYAN}•${NC} Kerberos vendor: auto — MIT when both implementations are present"
+    else
+        echo -e "  ${CYAN}•${NC} Kerberos vendor: $KRB_VENDOR"
+        if [[ "$KRB_VENDOR" == "heimdal" ]]; then
+            echo -e "  ${YELLOW}○${NC} kdc-test, playground-test, interactive: MIT-only, skipped for a Heimdal build"
+        fi
     fi
 
     if command -v mdbook >/dev/null 2>&1; then
@@ -190,7 +260,18 @@ fi
 # ── Job tracking ────────────────────────────────────────────────────────────
 declare -A JOB_STATUS=()
 declare -A JOB_SECS=()
+declare -A SKIP_NOTE=()
 FAILED_JOBS=()
+# A job whose environment cannot run it at all — here, a Heimdal Kerberos
+# build trying to start a MIT realm — returns this after naming the reason, so
+# the summary reports SKIP with that reason instead of a misleading FAIL.
+SKIP_RC=75
+SKIP_REASON=""
+skip_job() {
+    SKIP_REASON="$1"
+    warn "$1"
+    return $SKIP_RC
+}
 
 ALL_JOBS=(build fmt lint-workflows deps clippy doc test kdc-test playground-test)
 # Opt-in jobs: not part of 'all' (need an extra toolchain).
@@ -244,11 +325,15 @@ run_job() {
     if [[ $_rc -eq 0 ]]; then
         JOB_STATUS[$name]="PASS"
         ok "[$name] passed (${JOB_SECS[$name]}s)"
+    elif [[ $_rc -eq $SKIP_RC ]]; then
+        JOB_STATUS[$name]="SKIP"
+        SKIP_NOTE[$name]="${SKIP_REASON:-not runnable}"
     else
         JOB_STATUS[$name]="FAIL"
         FAILED_JOBS+=("$name")
         fail "[$name] FAILED (${JOB_SECS[$name]}s)"
     fi
+    SKIP_REASON=""
 }
 
 # ── Individual job implementations ──────────────────────────────────────────
@@ -386,8 +471,21 @@ job_test() {
     cargo test --workspace --all-features -- --skip against_a_real_kdc --skip trusted_realm_against_real_kdcs
 }
 
+# The KDC realms are MIT: `kdb5_util`, `kadmin.local` and MIT's `pkinit.so`.
+# A Heimdal build cannot drive them — its libkrb5 speaks to those daemons'
+# database and preauth plugins as a different implementation — so the jobs that
+# need them report a skip instead of failing for the wrong reason.
+require_mit_vendor() {
+    if [[ "$KRB_VENDOR" == "heimdal" ]]; then
+        skip_job "$1 needs a MIT Kerberos build (KUIPA_KRB5_VENDOR=heimdal); the realm is created with MIT's kdb5_util and pkinit.so"
+        return $SKIP_RC
+    fi
+    return 0
+}
+
 job_kdc_test() {
     require_cargo || return 1
+    require_mit_vendor "kdc-test" || return $SKIP_RC
     if [[ $has_krb5kdc -eq 0 ]]; then
         fail "kdc-test requires krb5kdc, kdb5_util, kadmin.local and kinit (install krb5-server krb5-workstation krb5-pkinit)"
         return 1
@@ -480,7 +578,23 @@ pg_stop() {
 }
 
 run_interactive_playground() {
+    local hosts=5
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hosts) hosts="$2"; shift 2 ;;
+            --keep) export KUIPA_KEEP_REALM=1; shift ;;
+            --help|-h) print_interactive_help; return 0 ;;
+            *) echo "interactive: unknown option: $1" >&2; print_interactive_help; return 2 ;;
+        esac
+    done
+
     require_cargo || return 1
+    # The realm is a MIT one, so a Heimdal build cannot host it even when the
+    # MIT server tools are installed.
+    if [[ "$KRB_VENDOR" == "heimdal" ]]; then
+        fail "interactive needs a MIT Kerberos build: the realm is created with MIT's kdb5_util and pkinit.so. Unset KUIPA_KRB5_VENDOR (or set it to mit) and rebuild."
+        return 1
+    fi
     if [[ $has_krb5kdc -eq 0 ]]; then
         fail "interactive requires krb5kdc, kdb5_util, kadmin.local and kinit (install krb5-server krb5-workstation krb5-pkinit)"
         return 1
@@ -550,6 +664,7 @@ run_interactive_playground() {
 # report (contrib/ci/playground/: session.sh runs it, report.py renders it).
 job_playground_test() {
     require_cargo || return 1
+    require_mit_vendor "playground-test" || return $SKIP_RC
     if [[ $has_krb5kdc -eq 0 ]]; then
         fail "playground-test requires krb5kdc, kdb5_util, kadmin.local and kinit (install krb5-server krb5-workstation krb5-pkinit)"
         return 1
@@ -660,6 +775,8 @@ print_summary() {
             printf "  ${GREEN}%-20s PASS${NC}  (%ds)\n" "$job" "$secs"
         elif [[ "$status" == "FAIL" ]]; then
             printf "  ${RED}%-20s FAIL${NC}  (%ds)\n" "$job" "$secs"
+        elif [[ -n "${SKIP_NOTE[$job]:-}" ]]; then
+            printf "  ${YELLOW}%-20s SKIP${NC}  (%s)\n" "$job" "${SKIP_NOTE[$job]}"
         else
             printf "  ${YELLOW}%-20s SKIP${NC}  (dep failed)\n" "$job"
         fi
@@ -711,6 +828,10 @@ Options:
 
 Environment:
   CARGO_TARGET_DIR    Redirect Cargo build output to an isolated directory.
+  KUIPA_KRB5_VENDOR   Kerberos implementation to build against: mit, heimdal
+                      or auto (default: MIT when both are installed).
+                      kdc-test, playground-test and interactive need a MIT
+                      build; with heimdal they report SKIP.
   KUIPA_KEEP_REALM   Keep the kdc-test realm's files (/tmp/kuipa-kdc-<pid>).
   KUIPA_PLAYGROUND_REPORT  Where playground-test writes its HTML report
                       (default: kuipa-playground-report/ in the repository;
@@ -725,6 +846,7 @@ Examples:
   $(basename "$0") --no-color all
   $(basename "$0") --valgrind test
   CARGO_TARGET_DIR=/tmp/kuipa-target $(basename "$0") all
+  KUIPA_KRB5_VENDOR=heimdal $(basename "$0") build clippy test
 EOF
 }
 
