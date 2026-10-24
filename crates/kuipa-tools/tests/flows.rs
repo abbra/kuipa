@@ -3603,9 +3603,14 @@ fn tlog_server(
     anchor: &SigningKey,
     fqdn: &str,
     dir: &std::path::Path,
+    witnesses: &[&SigningKey],
 ) -> Arc<kuipad::ledger::FileLedger> {
     let (keys, info, delegation) = server_keys(anchor, fqdn);
-    let ledger = Arc::new(kuipad::ledger::FileLedger::open(dir, REALM, fqdn).unwrap());
+    let ledger = Arc::new(
+        kuipad::ledger::FileLedger::open(dir, REALM, fqdn)
+            .unwrap()
+            .with_witnesses(witnesses.iter().map(|w| w.public().clone()).collect()),
+    );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
     let url = spawn(Arc::new(App {
         server,
@@ -3635,9 +3640,9 @@ fn audit_replays_a_servers_transparency_log() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let pin = [*anchor.public().thumbprint()];
     let fqdn = "tlogaudit1.example.test";
-    let audit = || kuipa_tools::audit::tlog(fqdn, &pin, Some(&state)).unwrap();
+    let audit = || kuipa_tools::audit::tlog(fqdn, &pin, &[], Some(&state)).unwrap();
 
-    let ledger = tlog_server(&anchor, fqdn, &base.join("one"));
+    let ledger = tlog_server(&anchor, fqdn, &base.join("one"), &[]);
     assert_eq!(audit()["state"], "empty");
     for i in 0..3u8 {
         ledger.append(Kind::VAULT_DEVICE, b"v", &[i]).unwrap();
@@ -3657,11 +3662,11 @@ fn audit_replays_a_servers_transparency_log() {
 
     // Another anchor does not verify the advertisement: no report.
     let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-    assert!(kuipa_tools::audit::tlog(fqdn, &[*stranger.public().thumbprint()], None).is_err());
+    assert!(kuipa_tools::audit::tlog(fqdn, &[*stranger.public().thumbprint()], &[], None).is_err());
 
     // The same server answering from a different log — its history
     // rewritten — is forked against the recorded head.
-    let rewritten = tlog_server(&anchor, fqdn, &base.join("two"));
+    let rewritten = tlog_server(&anchor, fqdn, &base.join("two"), &[]);
     for i in 0..6u8 {
         rewritten.append(Kind::VAULT_POLICY, b"v", &[i]).unwrap();
     }
@@ -3671,8 +3676,69 @@ fn audit_replays_a_servers_transparency_log() {
         "{forked}"
     );
     // Without the state file, the rewritten log is consistent in itself.
-    let alone = kuipa_tools::audit::tlog(fqdn, &pin, None).unwrap();
+    let alone = kuipa_tools::audit::tlog(fqdn, &pin, &[], None).unwrap();
     assert_eq!(alone["state"], "verified", "{alone}");
+    kuipa_tools::net::clear_thread_endpoints();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_witness_cosigns_only_heads_that_extend() {
+    // DESIGN-tlog.md §4: kuipa-witness cosigns a head the log's advertised
+    // key signed and that extends the last it cosigned; the server serves
+    // trusted cosignatures; a rewritten log is reported forked, never
+    // cosigned.
+    use kuipa_enroll::server::Ledger;
+    use kuipa_enroll::tlog::Kind;
+
+    let base = std::env::temp_dir().join(format!("kuipa-flows-witness-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = [*anchor.public().thumbprint()];
+    let fqdn = "witnessed1.example.test";
+    let servers = [fqdn.to_owned()];
+    let witness = SigningKey::generate(SignatureAlg::MlDsa44).unwrap();
+    let stranger = SigningKey::generate(SignatureAlg::MlDsa44).unwrap();
+    let state = base.join("witness.json");
+    let pass = |key: &SigningKey, state: &std::path::Path| {
+        let v = kuipa_tools::witness::pass(key, &servers, &pin, state).unwrap();
+        v["servers"][0]["state"].as_str().unwrap().to_owned()
+    };
+    let cosigners = || {
+        kuipa_tools::audit::tlog(fqdn, &pin, &[witness.public().clone()], None).unwrap()
+            ["witnesses"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    let ledger = tlog_server(&anchor, fqdn, &base.join("one"), &[&witness]);
+    assert_eq!(pass(&witness, &state), "empty");
+    for i in 0..3u8 {
+        ledger.append(Kind::VAULT_DEVICE, b"v", &[i]).unwrap();
+    }
+    assert_eq!(pass(&witness, &state), "cosigned");
+    assert_eq!(cosigners(), 1);
+    assert_eq!(pass(&witness, &state), "unchanged");
+    // The log grew: re-signed, cosigned again through a consistency proof.
+    ledger.append(Kind::ESCROW_RELEASE, b"v", b"x").unwrap();
+    assert_eq!(cosigners(), 0);
+    assert_eq!(pass(&witness, &state), "cosigned");
+    assert_eq!(cosigners(), 1);
+    // A witness the server does not trust is refused.
+    let by_stranger = pass(&stranger, &base.join("stranger.json"));
+    assert!(by_stranger.starts_with("skipped"), "{by_stranger}");
+
+    // The server's history rewritten: the witness refuses, and keeps
+    // refusing.
+    let rewritten = tlog_server(&anchor, fqdn, &base.join("two"), &[&witness]);
+    for i in 0..6u8 {
+        rewritten.append(Kind::VAULT_POLICY, b"v", &[i]).unwrap();
+    }
+    assert_eq!(pass(&witness, &state), "forked");
+    assert_eq!(pass(&witness, &state), "forked");
+    assert_eq!(cosigners(), 0);
     kuipa_tools::net::clear_thread_endpoints();
     let _ = std::fs::remove_dir_all(&base);
 }

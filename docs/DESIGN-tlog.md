@@ -12,10 +12,10 @@ hold such events, and the order in which it replaces the claim log.
 | 1 | typed leaves | a kind inside every hashed leaf; an opaque subject index | implemented (`kuipa-enroll::tlog`) |
 | 2 | tombstones | retiring a leaf appends, so heads only ever extend | implemented |
 | 3 | signed heads, consistency proofs | RFC 9162 consistency instead of refetching | implemented |
-| 4 | witness cosignatures | a fork needs the witnesses to collude | implemented (the cosign step) |
+| 4 | witness cosignatures | a fork needs the witnesses to collude | implemented: `kuipa-witness`, served cosignatures |
 | 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
 | 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow and Keys events, with receipts and lookups |
-| 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | `kuipa tlog watch` and `kuipa-audit tlog` implemented; the witness planned |
+| 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | implemented |
 | 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
 
 ## 1. Typed leaves
@@ -95,6 +95,40 @@ witness cosigned for that log, before it adds a cosignature. A server
 that shows different logs to different clients is then caught unless
 the witnesses collude. `SignedHead::witnesses` counts only cosignatures
 by keys the verifier trusts, made with algorithms its policy allows.
+
+**The witness, `kuipa-witness`.** It is a separate tool from the keyless
+`kuipa-mirror`, because a witness holds a key. `kuipa-witness keygen`
+makes one: ML-DSA-44, the default profile's witness algorithm, unless
+the system policy refuses it (CNSA 2.0 gives ML-DSA-87). The public JWK
+it prints goes to each server with `kuipad add-witness-key`.
+
+`kuipa-witness run --server S… [--anchor THP…] --state FILE` makes one
+pass per server:
+1. It verifies the server's advertisement against the anchors, which
+   names the log's signing key.
+2. It fetches the head, and a consistency proof from the last head it
+   cosigned for that log. The state file records that head's size,
+   root and time.
+3. It cosigns through `tlog::witness`.
+4. It posts the head with its cosignature to
+   `POST /ipa/ku/tlog/{id}/cosign`.
+
+The server takes a submission only when it is for the head being
+served, and only adds trusted cosignatures that head does not already
+carry. A stranger resubmitting a served head with the cosignatures it
+was served adds nothing. The answer is `{cosignatures}`, `409` for a
+head re-signed since it was fetched (the witness tries the next pass,
+recording nothing), or `403`.
+
+A head re-signed after the log grows starts with no cosignatures, so
+witnesses should run more often than heads change: the default is
+every 60 s, and heads are re-signed at least hourly. A rewritten log is
+reported `forked` and is never cosigned again, until someone removes its
+state entry by hand.
+
+`kuipa-audit tlog --witness JWK…` counts the trusted cosignatures on the
+served head. Clients do not yet require any; that waits for a host-side
+list of trusted witnesses.
 
 **Algorithms follow the deployment.** The verifier's `tang_pqc::Policy`
 comes from the system crypto policy (`Policy::from_system`).
@@ -244,8 +278,8 @@ counts the leaves by kind, and names nobody. Leaves carry only indexes.
 
 ## 8. Next
 
-* **Witnesses.** `kuipa-mirror --witness` cosigns heads that extend
-  the last it cosigned, and servers serve the cosignatures.
+* **Required cosignatures.** A host-side list of trusted witnesses, and
+  `kuipa tlog watch` requiring K of them on each head.
 * **Migration.** Claims are appended as kind-1 leaves, and a dropped
   claim becomes a tombstone instead of a restart. IPVH/IPSV are kept for
   pinned hosts until their windows age out.

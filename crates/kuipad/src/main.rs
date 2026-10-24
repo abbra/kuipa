@@ -23,6 +23,9 @@
 //!                                                trust the realm that issued F
 //! kuipad add-voucher-key --file JWK [--config FILE]
 //!                                                accept vouchers under a voucher key (§9)
+//! kuipad add-witness-key --file JWK [--config FILE]
+//!                                                accept the transparency-log cosignatures
+//!                                                of a witness (DESIGN-tlog.md §4)
 //! kuipad tang-keygen [--config FILE]   Tang keys: serve post-quantum Tang
 //!                                                at /ipa/ku/tang; prints the thumbprint
 //! kuipad tang-rotate [--config FILE]   retire the Tang keys, create new ones
@@ -147,11 +150,10 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     )?;
     let info = cfg.realm_info(servers, anchor.as_ref().map(|a| *a.public().thumbprint()))?;
     let ca_certs = info.ca_certs.clone();
-    let ledger = Arc::new(kuipad::ledger::FileLedger::open(
-        &cfg.key_dir,
-        &cfg.realm,
-        &cfg.server,
-    )?);
+    let ledger = Arc::new(
+        kuipad::ledger::FileLedger::open(&cfg.key_dir, &cfg.realm, &cfg.server)?
+            .with_witnesses(store.witness_keys()?),
+    );
     eprintln!(
         "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
         ledger.id(),
@@ -406,6 +408,12 @@ fn run(args: &Args) -> Result<(), Error> {
             for thp in TangKeys::new(&cfg.key_dir).thumbprints()? {
                 println!("{thp}");
             }
+            Ok(())
+        }
+        "add-witness-key" => {
+            let file = args.option("file").ok_or("--file is required")?;
+            println!("{}", store.add_witness_key(&std::fs::read(file)?)?);
+            eprintln!("kuipad: restart the daemon to accept cosignatures by it");
             Ok(())
         }
         "add-voucher-key" => {

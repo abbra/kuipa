@@ -29,7 +29,7 @@ anchors of the deployment's servers converging.
 The daemon is socket-activated (*kuipad.socket*,
 */run/ipa/kuipad.sock*) or listens on the *listen* configuration key.
 It reads its keys at start: restart it after *generate-keys*,
-*rotate-keys*, *rotate-anchor*, *prune-keys*, *add-voucher-key*,
+*rotate-keys*, *rotate-anchor*, *prune-keys*, *add-voucher-key*, *add-witness-key*,
 *tang-keygen* or *tang-rotate* — the socket stays open, so clients see
 no outage.
 
@@ -75,6 +75,13 @@ Remove keys retired longer ago (default 14 and 400 days).
 
 Accept vouchers signed under the voucher key _JWK_ (see
 *kuipa-voucher*(1)).
+
+## add-witness-key --file _JWK_ [--config _FILE_]
+
+Accept transparency-log cosignatures by the witness whose public key
+is _JWK_ (from *kuipa-witness keygen*).  Served log heads then carry
+its cosignatures, posted to */ipa/ku/tlog/ID/cosign*.  Remove the
+*witness-THUMBPRINT.jwk* file from the key directory to stop.
 
 ## trust-invitation [--days _N_] [--config _FILE_]
 

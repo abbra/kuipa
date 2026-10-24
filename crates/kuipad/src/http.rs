@@ -121,6 +121,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
         .route("/ipa/ku/tlog/{id}", post(tlog::<D>))
         .route("/ipa/ku/tlog/{id}/head", get(log_head::<D>))
+        .route("/ipa/ku/tlog/{id}/cosign", post(log_cosign::<D>))
         .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves::<D>))
         .route("/ipa/ku/tlog/{id}/proof", get(log_proof::<D>))
         .route("/ipa/ku/tlog/{id}/consistency", get(log_consistency::<D>))
@@ -303,6 +304,47 @@ async fn log_head<D: Directory + Send + Sync + 'static>(
         Err(e) => {
             eprintln!("kuipad: log head: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// A witness's cosignature on the head being served (`IPLS` with its
+/// cosignature, DESIGN-tlog.md §4): JSON `{cosignatures}` (the trusted
+/// ones the served head now carries) when one was added, `409` for a head no longer served (fetch it again), `403` for
+/// no trusted cosignature.  Rate limited by source like vault operations.
+async fn log_cosign<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(status) = admit_for(&app, "tlog cosign", None, &headers) {
+        return status.into_response();
+    }
+    let Some(ledger) = ledger_for(&app, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(submitted) = kuipa_enroll::tlog::SignedHead::from_bytes(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let policy = match tang_pqc::Policy::from_system() {
+        Ok(p) => p,
+        Err(e) => return refused("tlog cosign", &e),
+    };
+    match ledger.cosign(&submitted, &policy) {
+        crate::ledger::Cosigned::Accepted(n) => {
+            eprintln!(
+                "kuipad: tlog cosign: head of {} leaves now has {n} trusted cosignatures",
+                submitted.head.size
+            );
+            binary(
+                json!({ "cosignatures": n }).to_string().into_bytes(),
+                "application/json",
+            )
+        }
+        crate::ledger::Cosigned::Stale => StatusCode::CONFLICT.into_response(),
+        crate::ledger::Cosigned::Untrusted => {
+            refused("tlog cosign", &"no cosignature by a trusted witness")
         }
     }
 }
