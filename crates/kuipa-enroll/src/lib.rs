@@ -11,6 +11,8 @@
 //! * [`join`]: join, rekey and stage requests (§5, §6).
 //! * [`bundle`]: offline enrollment bundles (§8).
 //! * [`escrow`]: sealed keytabs (§7).
+//! * [`tlog`]: typed transparency logs with tombstones and witness
+//!   cosignatures (`docs/DESIGN-tlog.md`).
 
 pub mod anchors;
 pub mod bundle;
@@ -26,6 +28,7 @@ pub mod merkle;
 pub mod payload;
 pub mod realm;
 pub mod server;
+pub mod tlog;
 pub mod trust;
 pub mod vault;
 pub mod voucher;

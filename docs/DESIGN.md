@@ -2196,6 +2196,11 @@ IPTB  secret realm domain n[server] n[anchor(32)] delegation(JSON)
       signer_key(JWK) signature                                                  sealed trust request body (no version)
 IPTS  ct_e sealed                                                                trust response
 IPTP  realm domain n[server] n[anchor(32)]                                       sealed trust response payload (no version)
+IPLF  kind(2) time(u64) index(32) body                                          typed log leaf (DESIGN-tlog.md §1)
+IPLT  target(u64) reason                                                        tombstone body (DESIGN-tlog.md §2)
+IPLH  log(32) size(u64) root(32) time(u64)                                      log head (signed, DESIGN-tlog.md §3)
+IPLC  time(u64) head(IPLH)                                                      what a witness cosigns (never sent)
+IPLS  head(IPLH) signature n(1) [witness(32) time(u64) signature]                signed log head with cosignatures
 ```
 
 `ct` is empty in bundle modes B and C, `recipient` all zeros outside mode A,
