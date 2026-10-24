@@ -38,6 +38,8 @@ const SIGNED_HEAD_MAGIC: [u8; 4] = *b"IPLS";
 const COSIGNATURE_MAGIC: [u8; 4] = *b"IPLC";
 const RECEIPT_MAGIC: [u8; 4] = *b"IPLP";
 const VAULT_EVENT_MAGIC: [u8; 4] = *b"IPLV";
+const QUERY_MAGIC: [u8; 4] = *b"IPLQ";
+const ANSWER_MAGIC: [u8; 4] = *b"IPLR";
 const HEAD_CONTEXT: &[u8] = b"ipa-ku-log/v1 head";
 const COSIGNATURE_CONTEXT: &[u8] = b"ipa-ku-log/v1 cosignature";
 const RECEIPT_CONTEXT: &[u8] = b"ipa-ku-log/v1 receipt";
@@ -45,6 +47,9 @@ const LOG_ID_CONTEXT: &[u8] = b"ipa-ku-log/v1 id";
 
 /// Largest leaf body accepted.
 pub const MAX_BODY: usize = 64 * 1024;
+
+/// Most entries one lookup answers; a client pages on with `from`.
+pub const MAX_ANSWER: usize = 1024;
 
 /// Most cosignatures a signed head carries.
 pub const MAX_COSIGNATURES: usize = 16;
@@ -832,6 +837,160 @@ impl VaultEvent {
     }
 }
 
+/// A lookup of the caller's own entries in one server's log (the `tlog`
+/// operation): those about one of their vaults, or with no vault named,
+/// those about the caller's principal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Query {
+    /// The vault's name, or empty for the caller's principal.
+    pub vault: String,
+    /// The first leaf index to look at.
+    pub from: u64,
+}
+
+impl Query {
+    /// `IPLQ ‖ 1 ‖ vault ‖ from`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Writer::new(QUERY_MAGIC)
+            .str(&self.vault)
+            .u64(self.from)
+            .finish()
+    }
+
+    /// Parse a query.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, QUERY_MAGIC, "log query")?;
+        let vault = r.str()?.to_owned();
+        let from = r.u64()?;
+        r.finish()?;
+        Ok(Self { vault, from })
+    }
+}
+
+/// One leaf a lookup found, with its inclusion path in the answer's head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// The leaf's index.
+    pub index: u64,
+    /// The leaf.
+    pub leaf: Leaf,
+    /// Its inclusion path in the tree of the answer's head.
+    pub path: Vec<Hash>,
+}
+
+/// What a lookup answers: the log's signed head, the key that signed it,
+/// and the caller's entries up to that head, each with its proof.  An
+/// empty log answers no head and no entries.
+#[derive(Clone, Debug)]
+pub struct Answer {
+    /// The server's signing key.
+    pub signer: VerifyingKey,
+    /// The head the entries are proven against.
+    pub head: Option<SignedHead>,
+    /// The entries, oldest first; at most [`MAX_ANSWER`].
+    pub entries: Vec<Entry>,
+}
+
+impl Answer {
+    /// `IPLR ‖ 1 ‖ signer(JWK) ‖ head (IPLS, empty for none) ‖ n(u64) ‖
+    /// [index ‖ leaf(IPLF) ‖ m(1) ‖ [hash(32)]]`.
+    ///
+    /// # Panics
+    ///
+    /// Never for paths of fewer than 256 hashes, which is every tree of
+    /// fewer than 2²⁵⁶ leaves.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new(ANSWER_MAGIC);
+        w.str(&self.signer.to_jwk_json())
+            .bytes(
+                &self
+                    .head
+                    .as_ref()
+                    .map(SignedHead::to_bytes)
+                    .unwrap_or_default(),
+            )
+            .u64(self.entries.len() as u64);
+        for e in &self.entries {
+            w.u64(e.index).bytes(&e.leaf.to_bytes());
+            w.u8(u8::try_from(e.path.len()).expect("short paths"));
+            for h in &e.path {
+                w.fixed(h);
+            }
+        }
+        w.finish()
+    }
+
+    /// Parse an answer, **unverified**: see [`verify`](Self::verify).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, ANSWER_MAGIC, "log answer")?;
+        let signer = VerifyingKey::from_jwk_json(r.str()?.as_bytes())
+            .map_err(|_| Error::Malformed("log answer signer"))?;
+        let head = match r.bytes()? {
+            [] => None,
+            b => Some(SignedHead::from_bytes(b)?),
+        };
+        let n = usize::try_from(r.u64()?)
+            .ok()
+            .filter(|n| *n <= MAX_ANSWER)
+            .ok_or(Error::Malformed("log answer size"))?;
+        let mut entries = Vec::with_capacity(n);
+        for _ in 0..n {
+            let index = r.u64()?;
+            let leaf = Leaf::from_bytes(r.bytes()?)?;
+            let path = (0..r.u8()?)
+                .map(|_| r.fixed())
+                .collect::<std::result::Result<_, _>>()?;
+            entries.push(Entry { index, leaf, path });
+        }
+        r.finish()?;
+        Ok(Self {
+            signer,
+            head,
+            entries,
+        })
+    }
+
+    /// Check the answer came from the server whose signing key is
+    /// `signer` (the thumbprint its verified advertisement names): the
+    /// head's signature, and every entry's inclusion in it.  Returns the
+    /// verified head, none for an empty log.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mismatch`] for another server's key, entries without a
+    /// head, or an entry the head does not include;
+    /// [`Error::UntrustedAnchor`] for a bad head signature.
+    pub fn verify(&self, signer: &Thumbprint, policy: &Policy) -> Result<Option<&Head>> {
+        if self.signer.thumbprint() != signer {
+            return Err(Error::Mismatch("log signer"));
+        }
+        let Some(head) = &self.head else {
+            return if self.entries.is_empty() {
+                Ok(None)
+            } else {
+                Err(Error::Mismatch("log entries without a head"))
+            };
+        };
+        head.verify(&self.signer, policy)?;
+        for e in &self.entries {
+            if e.index >= head.head.size || !head.head.includes(&e.leaf, e.index, &e.path)? {
+                return Err(Error::Mismatch("log entry"));
+            }
+        }
+        Ok(Some(&head.head))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tang_pqc::SignatureAlg;
@@ -1085,6 +1244,58 @@ mod tests {
             ..receipt
         };
         assert!(!broken.proven_by(&head, &log.inclusion(2).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn queries_and_answers_round_trip_and_verify() {
+        let q = Query {
+            vault: "personal".into(),
+            from: 3,
+        };
+        assert_eq!(Query::from_bytes(&q.to_bytes()).unwrap(), q);
+
+        let server = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let thp = *server.public().thumbprint();
+        let policy = Policy::default();
+        let (log, leaves) = log_of(5);
+        let head = SignedHead::issue(&server, log.head(T).unwrap()).unwrap();
+        let entries = [1u64, 3]
+            .iter()
+            .map(|&i| Entry {
+                index: i,
+                leaf: leaves[usize::try_from(i).unwrap()].clone(),
+                path: log.inclusion(i).unwrap(),
+            })
+            .collect();
+        let answer = Answer {
+            signer: server.public().clone(),
+            head: Some(head),
+            entries,
+        };
+        let parsed = Answer::from_bytes(&answer.to_bytes()).unwrap();
+        assert_eq!(parsed.verify(&thp, &policy).unwrap().unwrap().size, 5);
+
+        // Another server's key, a swapped entry, an index past the head,
+        // entries with no head: refused.
+        let other = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        assert!(parsed.verify(other.public().thumbprint(), &policy).is_err());
+        let mut swapped = parsed.clone();
+        swapped.entries[0].leaf = leaves[2].clone();
+        assert!(swapped.verify(&thp, &policy).is_err());
+        let mut past = parsed.clone();
+        past.entries[1].index = 9;
+        assert!(past.verify(&thp, &policy).is_err());
+        let headless = Answer {
+            head: None,
+            ..parsed.clone()
+        };
+        assert!(headless.verify(&thp, &policy).is_err());
+        let empty = Answer {
+            head: None,
+            entries: Vec::new(),
+            ..parsed
+        };
+        assert!(empty.verify(&thp, &policy).unwrap().is_none());
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::keytab::{Enctype, Keytab, Principal};
 use crate::merkle;
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
-use crate::tlog::{Kind, LogId, Receipt, VaultAction, VaultEvent};
+use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
     DEFAULT_EPOCH, Descriptor, Limits, Recovered, ReleasedKeys, Reply, SessionKey, SessionToken,
@@ -573,6 +573,38 @@ pub trait Ledger: Send + Sync + fmt::Debug {
         subject: &[u8],
         body: &[u8],
     ) -> Result<Option<Appended>, DirectoryError>;
+
+    /// The log's current head, signed with `key` at `now`; none for an
+    /// empty log or a ledger that keeps none.
+    ///
+    /// # Errors
+    ///
+    /// Any signing failure.
+    fn signed_head(
+        &self,
+        key: &tang_pqc::SigningKey,
+        now: u64,
+    ) -> Result<Option<SignedHead>, DirectoryError> {
+        let _ = (key, now);
+        Ok(None)
+    }
+
+    /// Up to `max` leaves about `subject` from index `from`, among the
+    /// first `size` leaves, each with its inclusion path in that tree.
+    ///
+    /// # Errors
+    ///
+    /// Any storage failure, or a size beyond the log.
+    fn find(
+        &self,
+        subject: &[u8],
+        from: u64,
+        size: u64,
+        max: usize,
+    ) -> Result<Vec<Entry>, DirectoryError> {
+        let _ = (subject, from, size, max);
+        Ok(Vec::new())
+    }
 }
 
 /// A ledger that records nothing: the default, for servers without a log.
@@ -1194,6 +1226,9 @@ impl EnrollServer {
             (Operation::Keys, AuthType::Kerberos) => {
                 return self.keys_op(request, ss.as_ref(), &t, &body, directory);
             }
+            (Operation::Tlog, AuthType::Kerberos) => {
+                return self.tlog_op(request, ss.as_ref(), &t, &body, directory);
+            }
             (op, auth) => {
                 return Err(Refusal::because(format!(
                     "{op:?} with {auth:?} is not supported"
@@ -1397,6 +1432,61 @@ impl EnrollServer {
             .to_bytes()
             .map_err(|e| Refusal::because(e.to_string()))?;
         Ok(request.respond(ss, t, Some(&accepted.binding), &payload)?)
+    }
+
+    /// Answer a `tlog` lookup (`DESIGN-tlog.md` §6): the caller's own
+    /// entries — about a vault they own, or about their principal — with
+    /// proofs against the log's current signed head.
+    fn tlog_op(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let accepted = directory
+            .accept_user(body.authenticator.as_ref(), &cb)
+            .map_err(Refusal)?;
+        let caller: Principal = accepted.principal.parse()?;
+        if caller.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        let query = crate::tlog::Query::from_bytes(&body.extra)?;
+        let subject = if query.vault.is_empty() {
+            caller.to_string().into_bytes()
+        } else {
+            directory
+                .vaults_of(&caller)
+                .map_err(Refusal)?
+                .into_iter()
+                .find(|v| v.name == query.vault)
+                .ok_or_else(|| {
+                    Refusal::because(format!("{caller} has no vault {:?}", query.vault))
+                })?
+                .id
+                .as_bytes()
+                .to_vec()
+        };
+        let now = unix_seconds(SystemTime::now());
+        let head = self
+            .ledger
+            .signed_head(&self.keys.signing, now)
+            .map_err(Refusal)?;
+        let entries = match &head {
+            Some(h) => self
+                .ledger
+                .find(&subject, query.from, h.head.size, crate::tlog::MAX_ANSWER)
+                .map_err(Refusal)?,
+            None => Vec::new(),
+        };
+        let answer = crate::tlog::Answer {
+            signer: self.keys.signing.public().clone(),
+            head,
+            entries,
+        };
+        Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
     }
 
     /// Every server's escrow key, this one's own current key included
