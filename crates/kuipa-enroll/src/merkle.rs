@@ -1,12 +1,13 @@
 //! Merkle trees as in RFC 9162 §2.1 and the Merkle Tree Certificates
 //! drafts, through `synta-mtc` (hashing with OpenSSL): SHA-256, leaves
 //! hashed as `H(0x00 ‖ data)`, interior nodes as `H(0x01 ‖ left ‖ right)`,
-//! the left subtree holding the largest power of two below the size, and
-//! inclusion proofs verified as in §2.1.3.2.
+//! the left subtree holding the largest power of two below the size,
+//! inclusion proofs verified as in §2.1.3.2 and consistency proofs as in
+//! §2.1.4.2.
 
 use synta_mtc::crypto::{
-    HashAlgorithm, compute_root, generate_inclusion_proof, hash_leaf,
-    verify::verify_inclusion_proof,
+    HashAlgorithm, compute_root, generate_consistency_proof, generate_inclusion_proof, hash_leaf,
+    verify::{verify_consistency_proof, verify_inclusion_proof},
 };
 
 use crate::error::{Error, Result};
@@ -63,6 +64,39 @@ pub fn path(leaves: &[Hash], index: usize) -> Result<Vec<Hash>> {
 pub fn verify(leaf: &Hash, index: u64, size: u64, path: &[Hash], root: &Hash) -> Result<bool> {
     let path: Vec<Vec<u8>> = path.iter().map(|h| h.to_vec()).collect();
     Ok(verify_inclusion_proof(SHA256, index, size, leaf, &path, root).is_ok())
+}
+
+/// The proof that the tree over the first `old_size` of `leaves` is a
+/// prefix of the tree over all of them (RFC 9162 §2.1.4.1).
+///
+/// # Errors
+///
+/// [`Error::Malformed`] for an `old_size` of zero or beyond the tree.
+pub fn consistency(leaves: &[Hash], old_size: u64) -> Result<Vec<Hash>> {
+    let all: Vec<Vec<u8>> = leaves.iter().map(|l| l.to_vec()).collect();
+    generate_consistency_proof(SHA256, old_size, leaves.len() as u64, &all)
+        .map_err(|_| Error::Malformed("consistency sizes"))?
+        .iter()
+        .map(|h| hash(h))
+        .collect()
+}
+
+/// Whether the tree of `new_size` leaves with `new_root` extends the tree
+/// of `old_size` leaves with `old_root`, given the consistency `proof`
+/// (RFC 9162 §2.1.4.2).  Equal sizes need an empty proof and equal roots.
+///
+/// # Errors
+///
+/// None in practice; the signature matches the other tree functions.
+pub fn verify_consistency(
+    old_size: u64,
+    old_root: &Hash,
+    new_size: u64,
+    new_root: &Hash,
+    proof: &[Hash],
+) -> Result<bool> {
+    let proof: Vec<Vec<u8>> = proof.iter().map(|h| h.to_vec()).collect();
+    Ok(verify_consistency_proof(SHA256, old_size, old_root, new_size, new_root, &proof).is_ok())
 }
 
 #[cfg(test)]
@@ -122,6 +156,102 @@ mod tests {
             assert!(path(&l, n).is_err());
         }
         assert!(root(&[]).is_err());
+    }
+
+    /// RFC 9162 §2.1.4.2 written out directly, for comparison.
+    fn reference_consistency(
+        first: u64,
+        old_root: &Hash,
+        second: u64,
+        new_root: &Hash,
+        proof: &[Hash],
+    ) -> bool {
+        if first == 0 || first > second {
+            return false;
+        }
+        if first == second {
+            return proof.is_empty() && old_root == new_root;
+        }
+        // Step 1: a power-of-two first size starts from its own root.
+        let mut path: Vec<Hash> = proof.to_vec();
+        if first.is_power_of_two() {
+            path.insert(0, *old_root);
+        }
+        let Some((&start, rest)) = path.split_first() else {
+            return false;
+        };
+        let (mut fn_, mut sn) = (first - 1, second - 1);
+        while fn_ & 1 == 1 {
+            fn_ >>= 1;
+            sn >>= 1;
+        }
+        let (mut fr, mut sr) = (start, start);
+        for c in rest {
+            if sn == 0 {
+                return false;
+            }
+            if fn_ & 1 == 1 || fn_ == sn {
+                fr = node(c, &fr);
+                sr = node(c, &sr);
+                if fn_ & 1 == 0 {
+                    while fn_ & 1 == 0 && fn_ != 0 {
+                        fn_ >>= 1;
+                        sn >>= 1;
+                    }
+                }
+            } else {
+                sr = node(&sr, c);
+            }
+            fn_ >>= 1;
+            sn >>= 1;
+        }
+        fr == *old_root && sr == *new_root && sn == 0
+    }
+
+    #[test]
+    fn consistency_proofs() {
+        for size in 1..=33usize {
+            let l = leaves(size);
+            let new_root = root(&l).unwrap();
+            let n = size as u64;
+            for old in 1..=size {
+                let m = old as u64;
+                let old_root = root(&l[..old]).unwrap();
+                let p = consistency(&l, m).unwrap();
+                assert!(
+                    verify_consistency(m, &old_root, n, &new_root, &p).unwrap(),
+                    "{m} of {n}"
+                );
+                assert!(
+                    reference_consistency(m, &old_root, n, &new_root, &p),
+                    "reference {m} of {n}"
+                );
+                // A forked old tree, a tampered or truncated proof: all
+                // fail, under both implementations.
+                let forked = root(&leaves(old + 1)[1..]).unwrap();
+                assert!(!verify_consistency(m, &forked, n, &new_root, &p).unwrap());
+                assert!(!reference_consistency(m, &forked, n, &new_root, &p));
+                if let Some(first) = p.first() {
+                    let mut tampered = p.clone();
+                    tampered[0] = node(first, first);
+                    assert!(!verify_consistency(m, &old_root, n, &new_root, &tampered).unwrap());
+                    assert!(!verify_consistency(m, &old_root, n, &new_root, &p[1..]).unwrap());
+                }
+                // A proof does not fix the new size on its own (as with
+                // inclusion paths, the size is signed with the root), but
+                // both implementations judge a wrong one alike.
+                if m < n {
+                    assert_eq!(
+                        verify_consistency(m, &old_root, n - 1, &new_root, &p).unwrap(),
+                        reference_consistency(m, &old_root, n - 1, &new_root, &p),
+                        "size {} for {m} of {n}",
+                        n - 1
+                    );
+                }
+            }
+            assert!(consistency(&l, 0).is_err());
+            assert!(consistency(&l, n + 1).is_err());
+        }
     }
 
     #[test]
