@@ -96,16 +96,19 @@ extending it would take trust the fetch cannot supply. Between routine
 refreshes of a realm that renews claims daily, the whole log is one
 page.
 
-**Restart is a truncation, not an extension.** A head whose size is
-*lower* than the window's newest (the anchor restarted its log — a
-claim was dropped, §4.9.1) ends the old window: the old heads are
-dropped and the new head starts a fresh window, exactly as a
-first-time pin. The client reports the restart (`check` and `status`
-show it): the realm removed something, and the host's trust in the
-removed claim's anchor history ends with it. No signature fallback is
-forced — the new window's heads still prove everything the new tree
-covers — but the *reason* is visible, which the signature path cannot
-express (§4.9.6: it cannot distinguish a removal from an addition).
+**A shorter log is a fork.** Claim logs only grow: a dropped claim is
+retired by a tombstone (DESIGN-tlog.md §8, DESIGN.md §4.9.1), not by a
+restart. A head whose size is *lower* than the window's newest is a
+log that no longer contains the pinned history. It is not pinned, the
+window keeps its heads, and the client reports it.
+
+**Every pinned head brings its retired claims.** When a head joins a
+window, by first pin or by extension, the client reads the tombstones
+up to it from the head's signed vouch on the claim-log page. The
+vouch's entries must make the pinned root. The retired claims go into
+the pin file as a `retired <anchor> <leaf>…` line. A head proof for
+a retired claim proves nothing: it is in the tree, but no longer
+vouched for. A head whose retired claims cannot be read is not pinned.
 
 ### 1.4 Verification against a window
 
@@ -253,7 +256,7 @@ kuipa-audit split-view --server S1 --server S2 [--anchor THP]…
   decoded as above, and — for a host pin — whether the pinned head is
   current (the server's newest head extends it), stale (the server's
   tree has grown: the consistency check of §1.3, applied read-only),
-  or restarted (the server's tree is shorter).
+  or split (the server's tree is shorter: claim logs only grow).
   The served head is first checked as §4 says — its vouch must verify
   against the anchor's key, and the pages must hash to its root — so
   an unsigned or inconsistent head reports as *split*, a server that
@@ -328,7 +331,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 | compromised server serves its own tree as a head | client pins it (the advertisement verifies; same as the signature path) | a head no signature proves is never pinned (§3, §4); growth of a pinned window still passes §1.3's consistency check |
 | anchor key theft | head proofs bounded by pinned heads; signature path unbounded | unchanged (§4.9.6); audit (§5) reconstructs exactly what was covered |
 | mirror operator edits stored data | — | proofs stop verifying against client pins; no trust in the mirror |
-| realm removes a server | head restart; client silently re-pins | §1.3: restart reported by `check`/`status` |
+| realm removes a server | head restart; client silently re-pins | a tombstone: the next pinned head brings the retired claim, refused head-wise; signature proofs drop it at the next vouch |
 | rogue server feeds different trees to different clients | undetectable from the client | `kuipa-audit split-view` compares heads (with signed vouches) across servers |
 | frozen host's trust moves | impossible only by never refreshing | §2 makes it a checkable mode with named refusals |
 
@@ -337,6 +340,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 | member | where | form |
 |---|---|---|
 | repeated `<size> <root>` pairs, `frozen` marker | pin-file lines (§1.2, §2) | text, backwards compatible |
+| `retired <anchor> <leaf>…` | pin-file lines (§1.3) | text: the claims a pinned log retired |
 | `heads` | `TrustedRealm` JSON (§3) | as `RealmInfo.heads` |
 | `vouch` | claim-log page JSON (§4) | base64url signed IPVH v2 |
 
@@ -344,7 +348,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 
 * `kuipa-enroll` unit: window append/truncate rules; the consistency
   check (a real extension passes, a forged head that skips history
-  fails, a restart truncates and reports); frozen refusal reasons;
+  fails, a shorter log is refused and reported); frozen refusal reasons;
   `TrustedRealm` heads round-trip and the missing-member default.
 * `kuipa-tools` unit: pin grammar with windows and `frozen`
   (round-trip, ordering errors, the expiry/size disambiguation kept);
@@ -366,6 +370,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 ## What is deliberately not here
 
 * No global log, no monitor role, no new quorum (§4.9.6 stands).
-* No revocation (§4.7's limits stand; restart is observability).
+* No revocation beyond the claim log's own: a dropped claim is refused
+  head-wise once the host pins a head that retired it (§1.3).
 * No `ipa-ku3` string form — windows are host state, not a string.
 * No mirror-to-mirror gossip: one origin, fetch-only, operator-run.

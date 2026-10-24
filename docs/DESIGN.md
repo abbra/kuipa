@@ -207,8 +207,12 @@ tree of them, the way a Merkle Tree Certificates log signs its tree
 `0x01 ‖ left ‖ right` for nodes, leaves sorted):
 
 ```
-IPVH ‖ 1 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖ root(32)       signed, context "ipa-ku-enroll/v1 vouch"
+IPVH ‖ 1 ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖ root(32) ‖ live_size ‖ live_root(32)
+                                                    signed, context "ipa-ku-enroll/v1 vouch"
 ```
+
+(§4.9.1: `size`/`root` are the claim log's, `live_size`/`live_root` the
+tree of the claims vouched for now, which signature proofs prove.)
 
 A vouch lasts 7 days (at most 31 are accepted). The anchor vouches again
 at half life and whenever the set of claims it vouches for changes, at
@@ -698,17 +702,31 @@ does through `synta-mtc`). The anchor still signs, but what it signs is
 a **head**:
 
 ```
-IPVH  version 2: realm anchor(32) iat exp size(u64) root(32)
+IPVH  version 2: realm anchor(32) iat exp size(u64) root(32) live_size(u64) live_root(32)
 ```
 
-— the same fields as the v1 vouch statement, over the claim log
-instead of a re-sorted tree. The **vouch head** is `(anchor thumbprint,
-size, root)`. Re-vouching keeps the previous log's order and appends
-the new claims, so every prefix of the log is the tree an earlier
-vouch signed: a head pinned at any prefix keeps verifying, with the
-inclusion path recomputed inside that prefix. A vouch that must *drop*
-a claim (a removed server) restarts the log, so no old prefix stays
-valid — a pinned head must not prove a claim the realm dropped.
+The log's leaves are typed (DESIGN-tlog.md §1). A claim is a kind-1 leaf
+stamped with its `iat`. A dropped claim (a removed server, a renewed
+one) is retired by an appended **tombstone** leaf naming its index:
+nothing is ever removed. Re-vouching keeps the previous log and
+appends, so every prefix of the log is the tree an earlier vouch
+signed. A head pinned at any prefix keeps verifying, with the
+inclusion path recomputed inside that prefix, and a later head extends
+it by an RFC 9162 consistency proof. The **vouch head** is
+`(anchor thumbprint, size, root)`.
+
+A dropped claim is still in every later tree, so the vouch also signs
+the **live tree**, `(live_size, live_root)`, over the claims vouched for
+now, in log order. **Signature proofs** (§4.3) are inclusion in the
+live tree: a dropped claim stops proving by signature with the next
+vouch, as before. **Head proofs** have no signature, so the host carries
+what its pinned logs retired (DESIGN-tlog.md §8): it learns the
+tombstones whenever it pins a head, from the head's signed vouch
+(`IPSV` v2 carries its entries). It refuses a head proof for a retired
+claim. A pinned head must not prove a claim the realm dropped, and
+the host stops accepting one when it pins the head whose log retired
+it. That is what the restart achieved, without breaking the window's
+history.
 
 #### 4.9.2 The wire: a proof that skips the signature
 
@@ -2181,10 +2199,9 @@ IPKG  namespace(1) nickname alg_arg(1)                                          
 IPKR  value                                                                      keys answer (the handler's JSON)
 IPPS  sender receiver delegation(JSON) envelope token                           peer sync request
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
-IPVH  realm anchor(32) iat(u64) exp(u64) size(u64) root(32)                      vouch (signed)
-IPSV  vouch(IPVH) signature n(u64) [leaf(32)]                                    signed vouch with leaves
-IPVH  version 2 (§4.9): the same fields, over the append-only claim log          vouch head (claim log)
-IPSV  version 2 (§4.9): vouch(IPVH) signature n(u64) [leaf(32)]                  signed head, with the whole claim log in order: appending keeps the previous log, a drop restarts it
+IPVH  2 realm anchor(32) iat(u64) exp(u64) size(u64) root(32) live_size(u64) live_root(32)
+                                                                                 vouch (signed): the claim log's head and the live tree (§4.9.1)
+IPSV  2 vouch(IPVH) signature n(u64) [1 leaf(32) | 2 target(u64) time(u64)]      signed vouch with the whole claim log in order: claims and tombstones; nothing is removed
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
 IPAE  realm seq(u64) prev(32) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-256` of them under a domain-separation context; `prev` is the previous entry's head, `0…0` for the first)
@@ -2591,7 +2608,8 @@ a static table is the smallest surface to audit.
 | units, httpd snippet, config example | provided (`contrib/`) |
 | Tamarin model of the core exchange (pins and advertisement verification, join/rekey key schedule, OTP and Kerberos authenticators, sealed-keytab escrow): secrecy, server authentication, rekey forward secrecy, offline resistance, and the §13 attacks for a mis-delivered string and a stolen anchor | provided and proved (`contrib/tamarin/kuipa.spthy`, `tamarin-prover --prove`) |
 | vouch heads: claim logs, head proofs in advertisements and delegations, `?head=` selection with signature fallback, heads in pins and sealed responses, `ipa-ku2` strings, public claim logs (§4.9) | implemented, tested (claim logs and head proofs, tampering and stale heads, HTTP flows with a head-pinned client, pin-file round trips, KDC exchange) |
-| typed transparency logs (DESIGN-tlog.md): typed leaves, tombstones, signed heads, consistency proofs, witness cosignatures, the ledger of vault, escrow and Keys events with receipts (`IPVR` v2), the `tlog/` store and public `/ipa/ku/tlog/` routes, the `tlog` lookup, `kuipa tlog watch` with required cosignatures, `kuipa-audit tlog`, `kuipa-witness` | implemented, tested (RFC 9162 consistency against an independent transcription, tombstone rules, CNSA 2.0 refusing ML-DSA-44 witnesses, fail-closed appends, crash-truncated stores, routes over HTTP, lookups end to end, the watch against a real KDC and in the playground); the claim-log migration **not yet** |
+| claim logs on typed leaves with tombstones (DESIGN-tlog.md §8): `IPVH`/`IPSV` v2 with the live tree, signature proofs against it, retired claims learned by hosts at every pin and refused head-wise, a shrinking log refused as a fork | implemented, tested (tombstone rules, retired claims proving nothing by an old head, `retired_at` prefixes, the pin grammar's `retired` lines, a host enrolling against a log that retired a claim, the audit's split for a shorter tree, real-KDC re-vouching, the playground) |
+| typed transparency logs (DESIGN-tlog.md): typed leaves, tombstones, signed heads, consistency proofs, witness cosignatures, the ledger of vault, escrow and Keys events with receipts (`IPVR` v2), the `tlog/` store and public `/ipa/ku/tlog/` routes, the `tlog` lookup, `kuipa tlog watch` with required cosignatures, `kuipa-audit tlog`, `kuipa-witness` | implemented, tested (RFC 9162 consistency against an independent transcription, tombstone rules, CNSA 2.0 refusing ML-DSA-44 witnesses, fail-closed appends, crash-truncated stores, routes over HTTP, lookups end to end, the watch against a real KDC and in the playground); consistency proofs for claim-log windows **not yet** |
 | claim-log services: head windows with consistency-checked refresh, frozen-trust pins, cross-realm heads, the signed vouch in claim-log pages, `kuipa-audit`, `kuipa-mirror` (DESIGN-claim-logs.md) | implemented, tested (window merge and consistency rules, frozen refusals — every frozen anchor by its own head, trust install of a partner's heads *only where a signature proves them*, claim-log pages with their vouch, the audit's coverage states and split views over HTTP with the served head's signature checked, the mirror's sync/serve/no-route and cached head proofs with pages cached only under proved heads, expired pins trusted no more than absent ones, corrupt pin files refusing, the whole window travelling on `?head=`, fetch caps on oversized trees, playground session steps) |
 | vouchers (§9): `ml-dsa-blind` issuing, `kuipa-voucher`, bound and bearer vouchers, voucher joins | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | secrets transport (§18): the `keys` operation, handler execution with runas, `kuipa keys fetch`, the `cn=masters` and CA-role policy, a promotion scenario in the playground | implemented, tested; the LDAP policy check **not yet run against a FreeIPA server**; sealed lightweight-CA artifacts (§18.3) designed |

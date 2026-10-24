@@ -359,6 +359,7 @@ fn head_pinned_client_enrolls_without_any_signature() {
         REALM,
         &[*anchor.public().thumbprint()],
         &[s.head().unwrap()],
+        &[],
         &tang_pqc::Policy::default(),
         std::time::SystemTime::now(),
     )
@@ -2060,6 +2061,7 @@ fn a_frozen_pin_refuses_what_its_head_does_not_prove() {
         exp: None,
         heads: vec![head],
         frozen: true,
+        retired: Vec::new(),
     };
     kuipa_tools::paths::write_anchor_pins(
         &paths.anchors(),
@@ -2438,7 +2440,7 @@ fn a_window_grows_only_through_a_consistent_log() {
                 m[i].1 = None;
             }
         }
-        kuipa_tools::paths::merge_windows(&pins, &m)
+        kuipa_tools::paths::merge_windows(&pins, &m, &[])
     };
     assert!(!restarted);
     assert_eq!(
@@ -2518,7 +2520,7 @@ fn a_window_grows_only_through_a_consistent_log() {
             "the forged head skips the pinned history"
         );
     }
-    let (merged, _) = kuipa_tools::paths::merge_windows(&pins, &m);
+    let (merged, _) = kuipa_tools::paths::merge_windows(&pins, &m, &[]);
     assert_eq!(
         merged[0].heads,
         vec![head1, head2],
@@ -2600,7 +2602,7 @@ fn audit_reports_coverage_and_split_views() {
         report["anchors"][0]["state"]
             .as_str()
             .unwrap()
-            .starts_with("restarted"),
+            .starts_with("split: the server's tree is shorter"),
         "{report}"
     );
 
@@ -2722,7 +2724,8 @@ fn pins_for(
     Vec<kuipa_enroll::delegation::HeadPin>,
     Vec<tang_pqc::Thumbprint>,
 ) {
-    kuipa_tools::paths::pinned_windows(&paths.anchors()).unwrap()
+    let (anchors, heads, _, frozen) = kuipa_tools::paths::pinned_windows(&paths.anchors()).unwrap();
+    (anchors, heads, frozen)
 }
 
 /// Pin lines, oldest-first windows and freezes as written by hand.
@@ -2770,6 +2773,7 @@ fn an_expired_pin_is_no_trust_at_all() {
             exp: Some(now() - kuipa_enroll::delegation::CLOCK_SKEW - 1),
             heads: vec![head],
             frozen: true,
+            retired: Vec::new(),
         }],
     );
     assert_eq!(
@@ -2793,6 +2797,7 @@ fn an_expired_pin_is_no_trust_at_all() {
             exp: Some(now() + 3600),
             heads: vec![head],
             frozen: true,
+            retired: Vec::new(),
         }],
     );
     let (anchors, heads, frozen) = pins_for(&paths);
@@ -3025,12 +3030,14 @@ fn a_frozen_pin_needs_a_proof_by_its_own_head() {
                 exp: None,
                 heads: vec![f_head],
                 frozen: true,
+                retired: Vec::new(),
             },
             kuipa_tools::paths::Pin {
                 anchor: np,
                 exp: None,
                 heads: vec![n_head],
                 frozen: false,
+                retired: Vec::new(),
             },
         ],
     );
@@ -3065,12 +3072,14 @@ fn a_frozen_pin_needs_a_proof_by_its_own_head() {
                 exp: None,
                 heads: vec![f_head],
                 frozen: false,
+                retired: Vec::new(),
             },
             kuipa_tools::paths::Pin {
                 anchor: np,
                 exp: None,
                 heads: vec![n_head],
                 frozen: false,
+                retired: Vec::new(),
             },
         ],
     );
@@ -3155,12 +3164,14 @@ fn two_frozen_pins_must_both_prove_the_claim() {
                 exp: None,
                 heads: vec![f_head],
                 frozen: true,
+                retired: Vec::new(),
             },
             kuipa_tools::paths::Pin {
                 anchor: np,
                 exp: None,
                 heads: vec![n_head],
                 frozen: true,
+                retired: Vec::new(),
             },
         ],
     );
@@ -3191,12 +3202,14 @@ fn two_frozen_pins_must_both_prove_the_claim() {
                 exp: None,
                 heads: vec![(7, [9; 32])],
                 frozen: true,
+                retired: Vec::new(),
             },
             kuipa_tools::paths::Pin {
                 anchor: np,
                 exp: None,
                 heads: vec![n_head],
                 frozen: true,
+                retired: Vec::new(),
             },
         ],
     );
@@ -3272,6 +3285,7 @@ fn a_whole_window_travels_so_the_newest_head_proves() {
             exp: None,
             heads: vec![oldest, newest],
             frozen: true,
+            retired: Vec::new(),
         }],
     );
     let (anchors, heads, frozen) = pins_for(&paths);
@@ -3475,6 +3489,7 @@ fn a_head_beyond_the_fetch_cap_is_not_pinned() {
             exp: None,
             heads: vec![pinned],
             frozen: false,
+            retired: Vec::new(),
         }],
     );
     let budget = 64 * kuipa_enroll::server::MAX_CLAIM_LOG_PAGE;
@@ -3741,4 +3756,86 @@ fn a_witness_cosigns_only_heads_that_extend() {
     assert_eq!(cosigners(), 0);
     kuipa_tools::net::clear_thread_endpoints();
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_host_pins_what_its_anchors_logs_retired() {
+    // DESIGN-tlog.md §8: an anchor that drops a claim appends a tombstone
+    // instead of restarting its log.  A host pinning the head learns the
+    // retired claim from the page's vouch, whose entries make the pinned
+    // root, and records it next to the pin.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = *anchor.public().thumbprint();
+    let (keys, _, issued) = server_keys(&anchor, "window1.example.test");
+    let claim = issued.claim().unwrap();
+    // Only the proof by the vouch that retired a claim: `issue` carries
+    // one of its own.
+    let mut delegation = Delegation::new(&claim);
+    let gone = Delegation::issue(
+        &anchor,
+        REALM,
+        "gone.example.test",
+        SigningKey::generate(SignatureAlg::MlDsa65)
+            .unwrap()
+            .public(),
+        now() - 60,
+        now() + 86_400,
+    )
+    .unwrap()
+    .claim()
+    .unwrap();
+    let v1 = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap(), gone.leaf().unwrap()],
+        now() - 60,
+        now() + 86_400,
+        None,
+    )
+    .unwrap();
+    let v2 = SignedVouch::issue(
+        &anchor,
+        REALM,
+        [claim.leaf().unwrap()],
+        now() - 30,
+        now() + 86_400,
+        Some(&v1),
+    )
+    .unwrap();
+    assert_eq!(v2.retired(), &[gone.leaf().unwrap()]);
+    delegation.add(v2.proof(&claim, anchor.public()).unwrap());
+    let mut vouches = std::collections::HashMap::new();
+    vouches.insert(pin, v2.clone());
+    let server = Arc::new(EnrollServer::new(
+        keys,
+        window_info_of(&anchor),
+        delegation.clone(),
+    ));
+    server.publish(delegation, vec![pin], vouches);
+    let dir = Dir::default();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = spawn(app(server, dir));
+    kuipa_tools::net::set_thread_endpoint("window1.example.test", &url);
+
+    let paths = root("retired");
+    let mut s = string(&anchor, b"Secret123");
+    let otp = s.take_secret().unwrap();
+    flows::enroll_online(
+        &paths,
+        s.realm(),
+        &[*s.anchor()],
+        &[],
+        &[],
+        &Auth::LdapOtp(otp),
+        HOST,
+        &Deployment::servers(&["window1.example.test".to_owned()]),
+    )
+    .unwrap();
+    let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
+    assert_eq!(pins[0].heads, vec![v2.head()], "{pins:?}");
+    assert_eq!(pins[0].retired, vec![gone.leaf().unwrap()], "{pins:?}");
+    kuipa_tools::net::clear_thread_endpoints();
 }

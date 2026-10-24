@@ -317,7 +317,7 @@ impl<'a> Seal<'a> {
         // This host's pins, windows and freezes included (§1.4, §2): a
         // vault descriptor is fetched through a verified advertisement,
         // and a frozen pin must not fall back to a signature here.
-        let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
+        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
@@ -328,6 +328,7 @@ impl<'a> Seal<'a> {
             &public.realm,
             &anchors,
             &heads,
+            &retired,
             &frozen,
             known,
             Operation::Vault,
@@ -609,7 +610,7 @@ impl<'a> Seal<'a> {
     > {
         use kuipa_enroll::tlog::{LogId, MAX_ANSWER, Query};
 
-        let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
+        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
@@ -630,6 +631,7 @@ impl<'a> Seal<'a> {
                 &public.realm,
                 &anchors,
                 &heads,
+                &retired,
                 &frozen,
                 known,
                 Operation::Tlog,
@@ -731,7 +733,7 @@ impl<'a> Seal<'a> {
         let public = self.public()?;
         // The whole window travels and a frozen pin is enforced (§1.4,
         // §2): these advertisements are what sealing trusts.
-        let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
+        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let mut pins = anchors.clone();
@@ -747,6 +749,7 @@ impl<'a> Seal<'a> {
                 &public.realm,
                 &anchors,
                 &heads,
+                &retired,
                 &frozen,
                 known,
             ) else {
