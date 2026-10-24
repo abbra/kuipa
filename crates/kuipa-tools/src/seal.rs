@@ -13,12 +13,16 @@
 //!                       were fetched, for sealing offline
 //! ```
 //!
+//! `vaults/<name>.tlog` holds what `kuipa tlog watch` last verified of
+//! each server's transparency log for that vault (DESIGN-tlog.md §7).
+//!
 //! A re-authentication session (`kuipa seal unlock`) lives in the runtime
 //! directory (`$KUIPA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/kuipa`: tmpfs,
 //! the user's own, gone at logout): `sessions/<vault id>` holds the
 //! server's session token and the unwrapped device key until the session
 //! ends or `kuipa seal lock`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -159,7 +163,7 @@ impl UserPaths {
 
 /// The key that derives the device key file's encryption key.
 fn passphrase_key(passphrase: &[u8], salt: &[u8], iterations: u64) -> Result<SecretBuf, Error> {
-    let md = DigestAlg::fetch(c"SHA2-512", None)?;
+    let md = DigestAlg::fetch(tang_pqc::primitives::SHA512, None)?;
     let mut key = SecretBuf::with_len(32);
     Pbkdf2Builder::new(&md, passphrase, salt)
         .iterations(u32::try_from(iterations).map_err(|_| "PBKDF2 iterations out of range")?)
@@ -313,7 +317,7 @@ impl<'a> Seal<'a> {
         // This host's pins, windows and freezes included (§1.4, §2): a
         // vault descriptor is fetched through a verified advertisement,
         // and a frozen pin must not fall back to a signature here.
-        let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
+        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
@@ -324,6 +328,7 @@ impl<'a> Seal<'a> {
             &public.realm,
             &anchors,
             &heads,
+            &retired,
             &frozen,
             known,
             Operation::Vault,
@@ -343,7 +348,7 @@ impl<'a> Seal<'a> {
         )?;
         let mut verified = Vec::with_capacity(reply.descriptors.len());
         for d in reply.descriptors {
-            let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::default())?;
+            let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::from_system()?)?;
             self.user
                 .write(&self.user.vault(&v.vault().name)?, &d.to_bytes())?;
             verified.push(v);
@@ -483,6 +488,233 @@ impl<'a> Seal<'a> {
         Ok(SessionSealedFile::seal(&descriptor, contents)?.to_bytes())
     }
 
+    /// `kuipa tlog watch`: check every server's transparency log for
+    /// vault `name` (DESIGN-tlog.md §7).  Each server's answer must come
+    /// from its advertised key and prove its entries, and its head must
+    /// extend the one the last watch verified; then every entry since is
+    /// listed, and flagged when the descriptor this host stored does not
+    /// account for it — a device it does not list added or acting, a
+    /// device it lists removed, a policy or revocation it does not show.
+    /// The first watch of a server only sets the baseline: its history is
+    /// listed, not flagged.  With the host's trusted witnesses
+    /// (`kuipa tlog witnesses`), a head needs `required` of their
+    /// cosignatures: one with fewer is reported unwitnessed and not
+    /// recorded.  `ok` is false for any flag, a server whose log does not
+    /// extend what was seen, an unwitnessed head, or a server that could
+    /// not be checked: a watch that did not look is not a clean one.
+    ///
+    /// # Errors
+    ///
+    /// No stored descriptor (`kuipa seal show` fetches one), an unreadable
+    /// watch state, or any other error outside one server's answer.
+    pub fn watch(&self, name: &str) -> Result<Value, Error> {
+        let stored = self.stored(name)?.ok_or_else(|| {
+            format!("no descriptor of vault {name:?} here: run `kuipa seal show {name}` first")
+        })?;
+        let vault = stored.vault();
+        let expected = Expected {
+            devices: vault.devices.iter().map(|d| d.id.clone()).collect(),
+            policy: serde_json::to_vec(&vault.policy)?,
+            revoked: vault.state == kuipa_enroll::vault::State::Revoked,
+        };
+        let public = self.public()?;
+        let state_path = self.user.vaults().join(format!("{name}.tlog"));
+        let mut state: BTreeMap<String, Watched> = match fs::read(&state_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("{}: {e}", state_path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let trusted = crate::witness::Trusted::load(self.host)?;
+        let witnesses = trusted.keys()?;
+        let policy = tang_pqc::Policy::from_system()?;
+        let (mut events, mut forked, mut unreachable, mut baseline, mut unwitnessed) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut relogged = Vec::new();
+        for server in &public.servers {
+            let mut before = state.get(server).cloned();
+            let mut answer = self.watch_server(&public, server, name, before.as_ref());
+            // A server whose key moved to another category (a crypto
+            // policy change) keeps a new log: read it from its start, and
+            // flag everything in it, as for a log already watched.
+            let mut moved = false;
+            if let Err(WatchError::NewLog(old)) = &answer {
+                relogged.push(json!({ "server": server, "old_log": old }));
+                (before, moved) = (None, true);
+                answer = self.watch_server(&public, server, name, None);
+            }
+            let (entries, signed) = match answer {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(WatchError::Fork(why)) => {
+                    forked.push(json!({ "server": server, "error": why }));
+                    continue;
+                }
+                Err(WatchError::Other(e)) => {
+                    unreachable.push(json!({ "server": server, "error": e.to_string() }));
+                    continue;
+                }
+                Err(WatchError::NewLog(_)) => unreachable!("a fresh read has no log before it"),
+            };
+            let flag = before.is_some() || moved;
+            if !flag {
+                baseline.push(server.clone());
+            }
+            for e in &entries {
+                events.push(describe_event(server, e, &expected, flag));
+            }
+            // A head too few trusted witnesses cosigned may be a view
+            // shown to this reader alone: its entries are listed, but the
+            // watch does not advance past it, so the next one sees them
+            // again under a cosigned head.
+            let cosigners = signed.witnesses(&witnesses, &policy).len();
+            if cosigners < trusted.required {
+                unwitnessed.push(json!({
+                    "server": server,
+                    "cosigners": cosigners,
+                    "required": trusted.required,
+                }));
+                continue;
+            }
+            let head = signed.head;
+            state.insert(
+                server.clone(),
+                Watched {
+                    log: head.log.to_string(),
+                    size: head.size,
+                    root: tang_pqc::b64::encode(&head.root),
+                },
+            );
+        }
+        self.user
+            .write(&state_path, serde_json::to_vec_pretty(&state)?.as_slice())?;
+        let flagged = events
+            .iter()
+            .filter(|e| e["unexpected"] == Value::Bool(true))
+            .count();
+        Ok(json!({
+            "ok": flagged == 0 && forked.is_empty() && unreachable.is_empty()
+                && unwitnessed.is_empty(),
+            "vault": name,
+            "events": events,
+            "unexpected": flagged,
+            "forked": forked,
+            "unreachable": unreachable,
+            "unwitnessed": unwitnessed,
+            "baseline": baseline,
+            "relogged": relogged,
+        }))
+    }
+
+    /// One server's part of [`watch`](Self::watch): its entries for vault
+    /// `name` past what `before` saw, and its head; none for an empty log.
+    fn watch_server(
+        &self,
+        public: &PublicState,
+        server: &str,
+        name: &str,
+        before: Option<&Watched>,
+    ) -> Result<
+        Option<(
+            Vec<kuipa_enroll::tlog::Entry>,
+            kuipa_enroll::tlog::SignedHead,
+        )>,
+        WatchError,
+    > {
+        use kuipa_enroll::tlog::{LogId, MAX_ANSWER, Query};
+
+        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
+        let known = paths::read_epoch_from(&self.host.anchors())?;
+        let trust = flows::ca_trust(self.host)?;
+        let cred = self.cred()?;
+        let policy = tang_pqc::Policy::from_system()?;
+        let deployment = Deployment::servers(&[server.to_owned()]);
+        let mut from = before.map_or(0, |w| w.size);
+        let mut entries = Vec::new();
+        let mut last = None;
+        loop {
+            let extra = Query {
+                vault: name.into(),
+                from,
+            }
+            .to_bytes();
+            let (answer, _) = flows::exchange_with(
+                &deployment,
+                &trust,
+                &public.realm,
+                &anchors,
+                &heads,
+                &retired,
+                &frozen,
+                known,
+                Operation::Tlog,
+                |adv| {
+                    let p = Prepared::new(
+                        adv,
+                        Operation::Tlog,
+                        &public.fqdn,
+                        AuthType::Kerberos,
+                        &Enctype::DEFAULT,
+                    )?;
+                    let target = format!("ipa-ku@{}", adv.server());
+                    let (token, binding) = flows::gss_token(&cred, &target, &p.channel_binding()?)?;
+                    Ok(p.with_kerberos(binding).seal(&token, &[], &extra)?)
+                },
+                |pending, response, adv| Ok(pending.finish_tlog(response, adv, &policy)?),
+            )?;
+            let full = answer.entries.len() == MAX_ANSWER;
+            if let Some(e) = answer.entries.last() {
+                from = e.index + 1;
+            }
+            entries.extend(answer.entries);
+            last = answer.head.or(last);
+            if !full {
+                break;
+            }
+        }
+        let Some(signed) = last else {
+            return match before {
+                Some(_) => Err(WatchError::Fork("the log is empty now".into())),
+                None => Ok(None),
+            };
+        };
+        let head = signed.head;
+        // The head verified against the server's key, which also fixed
+        // the log's hash.
+        if head.log != LogId::of(&public.realm, server, head.log.alg())? {
+            return Err(WatchError::Fork(
+                "the answer is from another server's log".into(),
+            ));
+        }
+        if let Some(w) = before
+            && w.log != head.log.to_string()
+        {
+            return Err(WatchError::NewLog(w.log.clone()));
+        }
+        if let Some(w) = before {
+            let old_root = kuipa_enroll::merkle::Hash::from_slice(&tang_pqc::b64::decode(&w.root)?)
+                .map_err(|_| "a malformed root in the watch state")?;
+            let extends = match head.size.cmp(&w.size) {
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => head.root == old_root,
+                std::cmp::Ordering::Greater => {
+                    let endpoint = Endpoint::new(server, &trust)?;
+                    let proof = endpoint.tlog_consistency(&head.log, w.size, head.size)?;
+                    kuipa_enroll::merkle::verify_consistency(
+                        w.size, &old_root, head.size, &head.root, &proof,
+                    )?
+                }
+            };
+            if !extends {
+                return Err(WatchError::Fork(format!(
+                    "its head of {} leaves does not extend the {} seen before",
+                    head.size, w.size
+                )));
+            }
+        }
+        Ok(Some((entries, signed)))
+    }
+
     /// The stored descriptor of vault `name`, verified.
     fn stored(&self, name: &str) -> Result<Option<VerifiedDescriptor>, Error> {
         let Ok(bytes) = fs::read(self.user.vault(name)?) else {
@@ -493,7 +725,7 @@ impl<'a> Seal<'a> {
         Ok(Some(Descriptor::from_bytes(&bytes)?.verify(
             &public.realm,
             &anchors,
-            &tang_pqc::Policy::default(),
+            &tang_pqc::Policy::from_system()?,
         )?))
     }
 
@@ -520,7 +752,7 @@ impl<'a> Seal<'a> {
         let public = self.public()?;
         // The whole window travels and a frozen pin is enforced (§1.4,
         // §2): these advertisements are what sealing trusts.
-        let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
+        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let mut pins = anchors.clone();
@@ -536,6 +768,7 @@ impl<'a> Seal<'a> {
                 &public.realm,
                 &anchors,
                 &heads,
+                &retired,
                 &frozen,
                 known,
             ) else {
@@ -578,7 +811,7 @@ impl<'a> Seal<'a> {
                     &adv,
                     &public.realm,
                     &anchors,
-                    &tang_pqc::Policy::default(),
+                    &tang_pqc::Policy::from_system().ok()?,
                     at,
                 )
                 .ok()
@@ -749,8 +982,15 @@ impl<'a> Seal<'a> {
 
     /// Register `add` and retire `retire` on vault `name` (registered
     /// sealing).
-    fn register(&self, name: &str, add: &[[u8; 32]], retire: &[[u8; 32]]) -> Result<(), Error> {
-        let hex = |v: &[[u8; 32]]| v.iter().map(kuipa_enroll::vault::binding_hex).collect();
+    fn register(
+        &self,
+        name: &str,
+        add: &[kuipa_enroll::escrow::BindingHash],
+        retire: &[kuipa_enroll::escrow::BindingHash],
+    ) -> Result<(), Error> {
+        let hex = |v: &[kuipa_enroll::escrow::BindingHash]| {
+            v.iter().map(kuipa_enroll::vault::binding_hex).collect()
+        };
         self.op(&VaultOp::Register {
             name: name.into(),
             add: hex(add),
@@ -907,4 +1147,94 @@ pub fn describe(v: &VerifiedDescriptor) -> Value {
 
 fn describe_all(v: &[VerifiedDescriptor]) -> Value {
     json!({ "vaults": v.iter().map(describe).collect::<Vec<_>>() })
+}
+
+/// What `kuipa tlog watch` last verified of one server's log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Watched {
+    /// The log's id (hex).
+    log: String,
+    /// Its size then: entries below it were seen.
+    size: u64,
+    /// Its root then (base64url).
+    root: String,
+}
+
+/// Why one server's part of a watch failed.
+enum WatchError {
+    /// The server's log does not extend what was seen.
+    Fork(String),
+    /// The server keeps another log than the one seen (named): its key
+    /// moved to another category, which changes the log's hash and id.
+    NewLog(String),
+    /// Anything else: the server is unreachable, refuses, or errs.
+    Other(Error),
+}
+
+impl<E: Into<Error>> From<E> for WatchError {
+    fn from(e: E) -> Self {
+        Self::Other(e.into())
+    }
+}
+
+/// What the stored descriptor accounts for.
+struct Expected {
+    devices: BTreeSet<String>,
+    /// The policy's JSON, digested with each log's hash to compare.
+    policy: Vec<u8>,
+    revoked: bool,
+}
+
+/// One entry as `kuipa tlog watch` reports it; `flag` decides whether an
+/// unaccounted entry counts as unexpected (not on a baseline watch).
+fn describe_event(
+    server: &str,
+    e: &kuipa_enroll::tlog::Entry,
+    expected: &Expected,
+    flag: bool,
+) -> Value {
+    use kuipa_enroll::tlog::{VaultAction as A, VaultEvent};
+
+    let Ok(event) = VaultEvent::from_bytes(&e.leaf.body) else {
+        return json!({
+            "server": server, "index": e.index, "time": e.leaf.time,
+            "action": format!("kind {}", e.leaf.kind.0), "unexpected": false,
+        });
+    };
+    let device = event.device.as_deref();
+    let listed = device.is_some_and(|d| expected.devices.contains(d));
+    let unlisted = device.is_some() && !listed;
+    let (action, why) = match event.action {
+        A::Create => ("create", None),
+        A::SetPolicy => (
+            "set-policy",
+            primitives::digest(event.digest.alg().openssl_name(), &[&expected.policy])
+                .is_ok_and(|d| d != *event.digest)
+                .then_some("a policy the stored descriptor does not show"),
+        ),
+        A::Revoke => (
+            "revoke",
+            (!expected.revoked).then_some("the stored descriptor shows the vault enabled"),
+        ),
+        A::AddDevice => (
+            "add-device",
+            (!listed).then_some("a device the stored descriptor does not list"),
+        ),
+        A::RemoveDevice => (
+            "remove-device",
+            listed.then_some("a device the stored descriptor still lists"),
+        ),
+        A::Session => ("session", unlisted.then_some("an unlisted device")),
+        A::OfflineSession => ("offline-session", unlisted.then_some("an unlisted device")),
+        A::Release => ("release", unlisted.then_some("an unlisted device")),
+    };
+    json!({
+        "server": server,
+        "index": e.index,
+        "time": e.leaf.time,
+        "action": action,
+        "device": device,
+        "unexpected": flag && why.is_some(),
+        "why": why,
+    })
 }

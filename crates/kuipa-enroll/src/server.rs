@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use tang_pqc::wire::Writer;
@@ -16,7 +16,7 @@ use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::{Delegation, HeadPin, SignedVouch};
 use crate::epoch::{MAX_EPOCH_FETCH, SignedEpoch};
 use crate::error::Error;
-use crate::escrow::{self, EscrowRequest, RegisterParams};
+use crate::escrow::{self, BindingHash, EscrowRequest, RegisterParams};
 use crate::join::{
     AuthType, KerberosBinding, Operation, Request, RequestBody, Response, channel_binding,
 };
@@ -24,6 +24,7 @@ use crate::keytab::{Enctype, Keytab, Principal};
 use crate::merkle;
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
+use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
     DEFAULT_EPOCH, Descriptor, Limits, Recovered, ReleasedKeys, Reply, SessionKey, SessionToken,
@@ -130,7 +131,7 @@ pub trait Directory {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
     ) -> Result<(), DirectoryError>;
 
     /// Is `binding` registered for `principal` in its `kind` set, and is
@@ -143,7 +144,7 @@ pub trait Directory {
         &self,
         principal: &Principal,
         kind: escrow::Kind,
-        binding: &[u8; 32],
+        binding: &BindingHash,
     ) -> Result<bool, DirectoryError>;
 
     /// Accept `token` from `params.principal` itself (any principal of the
@@ -159,7 +160,7 @@ pub trait Directory {
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -217,6 +218,28 @@ pub trait Directory {
     /// Any failure.
     fn vault_limits(&self) -> Result<Limits, DirectoryError> {
         Ok(Limits::default())
+    }
+
+    /// The realm's signing policy (`DESIGN-sign.md`): who may sign for
+    /// which purpose.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default signing is not supported.
+    fn sign_policy(&self) -> Result<crate::sign::SignPolicy, DirectoryError> {
+        Err("signing is not supported by this directory".into())
+    }
+
+    /// The groups `principal` is a member of (user groups for a user,
+    /// host groups for a host), directly or not: the directory's
+    /// `memberOf`.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default groups are not supported.
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        let _ = principal;
+        Err("groups are not supported by this directory".into())
     }
 
     /// Store a new vault; refuse a name its owner already uses.
@@ -349,7 +372,11 @@ pub trait Directory {
     /// # Errors
     ///
     /// Any failure; by default trusts are not supported.
-    fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
+    fn add_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
         let _ = (hash, not_after);
         Err("trusts are not supported by this directory".into())
     }
@@ -359,7 +386,10 @@ pub trait Directory {
     /// # Errors
     ///
     /// An unknown, used or expired invitation, or any other failure.
-    fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+    fn consume_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+    ) -> Result<(), DirectoryError> {
         let _ = hash;
         Err("trusts are not supported by this directory".into())
     }
@@ -438,7 +468,7 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
     ) -> Result<(), DirectoryError> {
         (**self).register_escrow(principal, bindings)
     }
@@ -446,14 +476,14 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         &self,
         principal: &Principal,
         kind: escrow::Kind,
-        binding: &[u8; 32],
+        binding: &BindingHash,
     ) -> Result<bool, DirectoryError> {
         (**self).escrow_allowed(principal, kind, binding)
     }
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -480,6 +510,12 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn vault_limits(&self) -> Result<Limits, DirectoryError> {
         (**self).vault_limits()
+    }
+    fn sign_policy(&self) -> Result<crate::sign::SignPolicy, DirectoryError> {
+        (**self).sign_policy()
+    }
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        (**self).principal_groups(principal)
     }
     fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
         (**self).vault_add(vault)
@@ -523,10 +559,17 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     ) -> Result<Keytab, DirectoryError> {
         (**self).join_with_voucher(fqdn, hostgroup, salt, enctypes)
     }
-    fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
+    fn add_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
         (**self).add_trust_invitation(hash, not_after)
     }
-    fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+    fn consume_trust_invitation(
+        &self,
+        hash: &crate::trust::InvitationHash,
+    ) -> Result<(), DirectoryError> {
         (**self).consume_trust_invitation(hash)
     }
     fn record_trust(&self, partner: &TrustedRealm, secret: &[u8]) -> Result<(), DirectoryError> {
@@ -537,6 +580,82 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn trusted_realms(&self) -> Result<Vec<TrustedRealm>, DirectoryError> {
         (**self).trusted_realms()
+    }
+}
+
+/// Where a leaf landed in a [`Ledger`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Appended {
+    /// The log.
+    pub log: LogId,
+    /// The leaf's index.
+    pub index: u64,
+    /// The leaf's tree hash.
+    pub leaf: merkle::Hash,
+    /// The leaf's time.
+    pub time: u64,
+}
+
+/// Where the server records the events of `DESIGN-tlog.md`, implemented
+/// by the daemon over its log store.  The server appends after an
+/// operation's checks pass and before it answers, so nothing a logged
+/// operation releases leaves the server unrecorded; a failed append
+/// refuses the request.
+pub trait Ledger: Send + Sync + fmt::Debug {
+    /// Append a leaf of `kind` about `subject` (hashed into the leaf's
+    /// index by the ledger's key) and say where it landed; `None` when
+    /// this ledger keeps no log.
+    ///
+    /// # Errors
+    ///
+    /// Any storage failure.
+    fn append(
+        &self,
+        kind: Kind,
+        subject: &[u8],
+        body: &[u8],
+    ) -> Result<Option<Appended>, DirectoryError>;
+
+    /// The log's current head, signed with `key` at `now`; none for an
+    /// empty log or a ledger that keeps none.
+    ///
+    /// # Errors
+    ///
+    /// Any signing failure.
+    fn signed_head(
+        &self,
+        key: &tang_pqc::SigningKey,
+        now: u64,
+    ) -> Result<Option<SignedHead>, DirectoryError> {
+        let _ = (key, now);
+        Ok(None)
+    }
+
+    /// Up to `max` leaves about `subject` from index `from`, among the
+    /// first `size` leaves, each with its inclusion path in that tree.
+    ///
+    /// # Errors
+    ///
+    /// Any storage failure, or a size beyond the log.
+    fn find(
+        &self,
+        subject: &[u8],
+        from: u64,
+        size: u64,
+        max: usize,
+    ) -> Result<Vec<Entry>, DirectoryError> {
+        let _ = (subject, from, size, max);
+        Ok(Vec::new())
+    }
+}
+
+/// A ledger that records nothing: the default, for servers without a log.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoLedger;
+
+impl Ledger for NoLedger {
+    fn append(&self, _: Kind, _: &[u8], _: &[u8]) -> Result<Option<Appended>, DirectoryError> {
+        Ok(None)
     }
 }
 
@@ -585,8 +704,8 @@ pub const ADVERTISEMENT_VALIDITY: u64 = 7 * 24 * 3600;
 type AdvKey = (
     Option<Thumbprint>,
     Option<Thumbprint>,
-    Option<(u64, [u8; 32])>,
-    Option<[u8; 32]>,
+    Option<(u64, crate::epoch::EpochHead)>,
+    Option<merkle::Hash>,
 );
 
 /// Most claim-log leaves served in one page (§4.9): a page is for
@@ -603,8 +722,9 @@ pub struct ClaimLogPage {
     pub anchor: String,
     /// The size of the log at the head.
     pub size: u64,
-    /// The tree hash at the head.
-    pub root: [u8; 32],
+    /// The tree hash at the head: 32 bytes (SHA-256) or 48 (SHA-384),
+    /// as the anchor's key decides.
+    pub root: Vec<u8>,
     /// When the vouch that signed the head expires (Unix seconds).
     pub exp: u64,
     /// The base64url leaf hashes after the page's `from`, oldest first.
@@ -613,8 +733,8 @@ pub struct ClaimLogPage {
     /// base64url `IPSV` v2, public data — it travels in the exchange
     /// and every signature proof — so a reader can check that the head
     /// was signed at all, against the anchor's key from any
-    /// advertisement.  Absent for an older server.
-    pub vouch: Option<String>,
+    /// advertisement.
+    pub vouch: String,
 }
 
 impl ClaimLogPage {
@@ -638,12 +758,8 @@ impl ClaimLogPage {
         policy: &Policy,
         at: u64,
     ) -> crate::Result<HeadPin> {
-        let bytes = tang_pqc::b64::decode(
-            self.vouch
-                .as_ref()
-                .ok_or(Error::Malformed("claim log: head is not signed"))?,
-        )
-        .map_err(|_| Error::Malformed("claim log vouch"))?;
+        let bytes =
+            tang_pqc::b64::decode(&self.vouch).map_err(|_| Error::Malformed("claim log vouch"))?;
         let vouch = SignedVouch::from_bytes(&bytes)?;
         vouch.verify(key, policy)?;
         let anchor = self
@@ -651,7 +767,7 @@ impl ClaimLogPage {
             .parse::<Thumbprint>()
             .map_err(|_| Error::Malformed("claim log anchor"))?;
         let v = vouch.vouch();
-        if v.anchor != anchor || v.size != self.size || v.root != self.root {
+        if v.anchor != anchor || v.size != self.size || *v.root != *self.root {
             return Err(Error::Mismatch("claim log head"));
         }
         if !crate::delegation::valid_at(v.iat, v.exp, at) {
@@ -660,7 +776,7 @@ impl ClaimLogPage {
         Ok(HeadPin {
             anchor,
             size: self.size,
-            root: self.root,
+            root: v.root,
         })
     }
 }
@@ -689,6 +805,8 @@ struct Published {
 pub struct EnrollServer {
     keys: ServerKeys,
     info: RealmInfo,
+    policy: tang_pqc::Policy,
+    ledger: Arc<dyn Ledger>,
     published: RwLock<Published>,
 }
 
@@ -703,6 +821,8 @@ impl EnrollServer {
         Self {
             keys,
             info,
+            policy: tang_pqc::Policy::default(),
+            ledger: Arc::new(NoLedger),
             published: RwLock::new(Published {
                 delegation,
                 anchors,
@@ -712,6 +832,100 @@ impl EnrollServer {
                 epoch: Vec::new(),
             }),
         }
+    }
+
+    /// Accept only what `policy` allows from delegations, partners and
+    /// session tokens; the default is [`tang_pqc::Policy::default`].
+    #[must_use]
+    pub fn with_policy(mut self, policy: tang_pqc::Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Record vault, escrow and Keys events in `ledger`; the default
+    /// records nothing ([`NoLedger`]).
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Arc<dyn Ledger>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
+    /// Append an event to the ledger, and sign a receipt for where it
+    /// landed (none when the ledger keeps no log).
+    /// The hash of this server's log: its signing key's
+    /// ([`TreeHash::for_signer`](merkle::TreeHash::for_signer)).
+    fn tree_hash(&self) -> merkle::TreeHash {
+        merkle::TreeHash::for_signer(self.keys.signing.public().alg())
+    }
+
+    fn record(&self, kind: Kind, subject: &[u8], body: &[u8]) -> Result<Option<Receipt>, Refusal> {
+        let Some(a) = self.ledger.append(kind, subject, body).map_err(Refusal)? else {
+            return Ok(None);
+        };
+        Ok(Some(Receipt::issue(
+            &self.keys.signing,
+            a.log,
+            a.index,
+            a.leaf,
+            a.time,
+        )?))
+    }
+
+    /// Record `action` on `vault` as it is about to be stored: the device
+    /// added is its newest, and a policy set is recorded by its digest.
+    fn record_change(
+        &self,
+        vault: &Vault,
+        action: VaultAction,
+        device: Option<String>,
+    ) -> Result<Option<Receipt>, Refusal> {
+        let device = match action {
+            VaultAction::AddDevice => vault.devices.last().map(|d| d.id.clone()),
+            _ => device,
+        };
+        let digest = match action {
+            VaultAction::Create | VaultAction::SetPolicy => {
+                let policy = serde_json::to_vec(&vault.policy)
+                    .map_err(|e| Refusal::because(e.to_string()))?;
+                let alg = self.tree_hash();
+                merkle::Hash::from_slice(&tang_pqc::primitives::digest(
+                    alg.openssl_name(),
+                    &[&policy],
+                )?)?
+            }
+            _ => merkle::Hash::zero(self.tree_hash()),
+        };
+        self.record_vault(&vault.id, action, device.as_deref(), digest)
+    }
+
+    /// Record the release of a sealed file's server share, by its binding.
+    fn record_release(
+        &self,
+        request: &EscrowRequest,
+        device: Option<&crate::vault::Device>,
+        opened: &tang_pqc::OpenedRequest<'_>,
+    ) -> Result<Option<Receipt>, Refusal> {
+        // The release is logged by the escrow binding: the KEM suite's
+        // hash, as the log's own is the signer's.
+        let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
+        let device = device.map(|d| d.id.as_str());
+        self.record_vault(request.vault(), VaultAction::Release, device, binding)
+    }
+
+    /// Record a vault event about `vault`.
+    fn record_vault(
+        &self,
+        vault: &escrow::VaultId,
+        action: VaultAction,
+        device: Option<&str>,
+        digest: merkle::Hash,
+    ) -> Result<Option<Receipt>, Refusal> {
+        let event = VaultEvent {
+            action,
+            device: device.map(str::to_owned),
+            digest,
+        };
+        self.record(action.kind(), vault.as_bytes(), &event.to_bytes())
     }
 
     /// Replace the delegation and the trusted anchors, as decided by the
@@ -772,7 +986,7 @@ impl EnrollServer {
 
     /// The head of this server's anchor epoch log, if it has one.
     #[must_use]
-    pub fn epoch_head(&self) -> Option<(u64, [u8; 32])> {
+    pub fn epoch_head(&self) -> Option<(u64, crate::epoch::EpochHead)> {
         self.published()
             .epoch
             .last()
@@ -852,10 +1066,10 @@ impl EnrollServer {
         Some(ClaimLogPage {
             anchor: anchor.to_string(),
             size: v.size,
-            root: v.root,
+            root: v.root.to_vec(),
             exp: v.exp,
             leaves,
-            vouch: Some(tang_pqc::b64::encode(&vouch.to_bytes())),
+            vouch: tang_pqc::b64::encode(&vouch.to_bytes()),
         })
     }
 
@@ -933,17 +1147,18 @@ impl EnrollServer {
         }
         let delegation = delegation.select_with_heads(wanted, heads);
         let signer = (
-            delegation
-                .signers(&tang_pqc::Policy::default())
-                .first()
-                .copied(),
+            delegation.signers(&self.policy).first().copied(),
             delegation
                 .successions()
                 .first()
                 .and_then(|s| s.statement().ok())
                 .map(|s| s.old),
             epoch,
-            Some(merkle::leaf_hash(delegation.to_json().as_bytes())?),
+            // A cache key: any one hash will do.
+            Some(merkle::leaf_hash(
+                merkle::TreeHash::Sha384,
+                delegation.to_json().as_bytes(),
+            )?),
         );
         if let Some((adv, iat)) = published.advertisements.get(&signer)
             && now.saturating_sub(*iat) < ADVERTISEMENT_VALIDITY / 2
@@ -1066,6 +1281,12 @@ impl EnrollServer {
             (Operation::Keys, AuthType::Kerberos) => {
                 return self.keys_op(request, ss.as_ref(), &t, &body, directory);
             }
+            (Operation::Tlog, AuthType::Kerberos) => {
+                return self.tlog_op(request, ss.as_ref(), &t, &body, directory);
+            }
+            (Operation::Sign, AuthType::Kerberos) => {
+                return self.sign_op(request, ss.as_ref(), &t, &body, directory);
+            }
             (op, auth) => {
                 return Err(Refusal::because(format!(
                     "{op:?} with {auth:?} is not supported"
@@ -1169,6 +1390,8 @@ impl EnrollServer {
         let op = VaultOp::from_bytes(&body.extra)?;
         let now = unix_seconds(SystemTime::now());
         let delegation = self.delegation();
+        let mut event = vault_event(&op);
+        let mut receipts = Vec::new();
         let (mut vaults, session, released) = match op {
             VaultOp::Unlock {
                 name,
@@ -1177,13 +1400,28 @@ impl EnrollServer {
             } => {
                 let (vault, token, released) =
                     self.start_session(&owner, &name, &device, offline, now, directory)?;
+                // Nothing is released before the answer, which waits for
+                // the record.
+                if let Some((action, device)) = event.take() {
+                    receipts.extend(self.record_change(&vault, action, device)?);
+                }
                 (vec![vault], Some(token), released)
             }
-            op => (
-                Self::apply_vault_op(&owner, op, now, directory)?,
-                None,
-                None,
-            ),
+            op => {
+                // A change is recorded before the directory stores it, so a
+                // failed append leaves the vault as it was.
+                let mut record = |vault: &Vault| {
+                    if let Some((action, device)) = event.take() {
+                        receipts.extend(self.record_change(vault, action, device)?);
+                    }
+                    Ok(())
+                };
+                (
+                    Self::apply_vault_op(&owner, op, now, directory, &mut record)?,
+                    None,
+                    None,
+                )
+            }
         };
         for v in &mut vaults {
             if self.maintain_epochs(v, now, directory)? {
@@ -1214,6 +1452,7 @@ impl EnrollServer {
             descriptors,
             session,
             released,
+            receipts,
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
     }
@@ -1239,11 +1478,146 @@ impl EnrollServer {
         }
         let fetch = crate::keys::KeysFetch::from_bytes(&body.extra)?;
         let value = directory.fetch_key(&caller, &fetch).map_err(Refusal)?;
+        self.record(
+            Kind::KEYS_FETCH,
+            caller.to_string().as_bytes(),
+            &fetch
+                .to_bytes()
+                .map_err(|e| Refusal::because(e.to_string()))?,
+        )?;
         let answer = crate::keys::KeysAnswer { value };
         let payload = answer
             .to_bytes()
             .map_err(|e| Refusal::because(e.to_string()))?;
         Ok(request.respond(ss, t, Some(&accepted.binding), &payload)?)
+    }
+
+    /// Answer a signing request (`DESIGN-sign.md`): authenticate the
+    /// caller by their ticket, check the realm's signing policy against
+    /// the caller and its groups, record the statement in the log — no
+    /// log, no statement — and sign it with the log's position.
+    fn sign_op(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let accepted = directory
+            .accept_user(body.authenticator.as_ref(), &cb)
+            .map_err(Refusal)?;
+        let caller: Principal = accepted.principal.parse()?;
+        if caller.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        if directory.principal_locked(&caller).map_err(Refusal)? {
+            return Err(Refusal::because(format!("{caller} is locked or gone")));
+        }
+        let asked = crate::sign::Request::from_bytes(&body.extra)?;
+        let groups = directory.principal_groups(&caller).map_err(Refusal)?;
+        directory
+            .sign_policy()
+            .map_err(Refusal)?
+            .check(&caller, &groups, &asked.purpose)?;
+        let tree = self.tree_hash();
+        if let Some(d) = asked.digests.iter().find(|d| !d.alg.fits(tree)) {
+            return Err(Refusal::because(format!(
+                "a {:?} digest is weaker than this server's {tree:?} (the crypto policy)",
+                d.alg
+            )));
+        }
+        let leaves = asked.leaves(tree)?;
+        let batch_root = merkle::root(&leaves)?;
+        let now = unix_seconds(SystemTime::now());
+        let Some(appended) = self
+            .ledger
+            .append(
+                Kind::STATEMENT,
+                caller.to_string().as_bytes(),
+                &crate::sign::Statement::log_body(
+                    &asked.purpose,
+                    leaves.len() as u64,
+                    &batch_root,
+                    now,
+                ),
+            )
+            .map_err(Refusal)?
+        else {
+            return Err(Refusal::because(
+                "this server keeps no transparency log: it states nothing it cannot show",
+            ));
+        };
+        let statement = crate::sign::Statement {
+            realm: self.info.realm.clone(),
+            principal: caller.to_string(),
+            purpose: asked.purpose.clone(),
+            batch_size: leaves.len() as u64,
+            batch_root,
+            iat: now,
+            log: appended.log,
+            index: appended.index,
+        };
+        let signed =
+            crate::sign::SignedStatement::sign(&self.keys.signing, &self.delegation(), statement)?;
+        let answer = crate::sign::Answer::new(&asked, signed)?;
+        Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
+    }
+
+    /// Answer a `tlog` lookup (`DESIGN-tlog.md` §6): the caller's own
+    /// entries — about a vault they own, or about their principal — with
+    /// proofs against the log's current signed head.
+    fn tlog_op(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let accepted = directory
+            .accept_user(body.authenticator.as_ref(), &cb)
+            .map_err(Refusal)?;
+        let caller: Principal = accepted.principal.parse()?;
+        if caller.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        let query = crate::tlog::Query::from_bytes(&body.extra)?;
+        let subject = if query.vault.is_empty() {
+            caller.to_string().into_bytes()
+        } else {
+            directory
+                .vaults_of(&caller)
+                .map_err(Refusal)?
+                .into_iter()
+                .find(|v| v.name == query.vault)
+                .ok_or_else(|| {
+                    Refusal::because(format!("{caller} has no vault {:?}", query.vault))
+                })?
+                .id
+                .as_bytes()
+                .to_vec()
+        };
+        let now = unix_seconds(SystemTime::now());
+        let head = self
+            .ledger
+            .signed_head(&self.keys.signing, now)
+            .map_err(Refusal)?;
+        let entries = match &head {
+            Some(h) => self
+                .ledger
+                .find(&subject, query.from, h.head.size, crate::tlog::MAX_ANSWER)
+                .map_err(Refusal)?,
+            None => Vec::new(),
+        };
+        let answer = crate::tlog::Answer {
+            signer: self.keys.signing.public().clone(),
+            head,
+            entries,
+        };
+        Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
     }
 
     /// Every server's escrow key, this one's own current key included
@@ -1388,6 +1762,7 @@ impl EnrollServer {
         op: VaultOp,
         now: u64,
         directory: &dyn Directory,
+        record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
     ) -> Result<Vec<Vault>, Refusal> {
         let limits = directory.vault_limits().map_err(Refusal)?;
         let mine = directory.vaults_of(owner).map_err(Refusal)?;
@@ -1427,6 +1802,7 @@ impl EnrollServer {
                     session_keys: Vec::new(),
                     bindings: Vec::new(),
                 };
+                record(&vault)?;
                 directory.vault_add(&vault).map_err(Refusal)?;
                 return Ok(vec![vault]);
             }
@@ -1475,6 +1851,7 @@ impl EnrollServer {
                 vault
             }
         };
+        record(&vault)?;
         directory.vault_update(&vault).map_err(Refusal)?;
         Ok(vec![vault])
     }
@@ -1508,7 +1885,7 @@ impl EnrollServer {
             anchors,
             heads,
             epoch_seq: epoch.map_or(0, |(seq, _)| seq),
-            epoch_head: epoch.map_or([0; 32], |(_, head)| head),
+            epoch_head: epoch.map_or(crate::epoch::GENESIS, |(_, head)| head),
         })
     }
 
@@ -1561,9 +1938,9 @@ impl EnrollServer {
         }
         partner.validate_for(&self.info.realm, &self.anchors())?;
         let now = unix_seconds(SystemTime::now());
-        let delegation =
-            body.delegation
-                .verify_at(&partner.anchors, &tang_pqc::Policy::default(), now)?;
+        let delegation = body
+            .delegation
+            .verify_at(&partner.anchors, &self.policy, now)?;
         let signer = tang_pqc::VerifyingKey::from_jwk_json(body.signer_key.as_bytes())?;
         if delegation.realm != partner.realm || &delegation.key != signer.thumbprint() {
             return Err(Refusal::because(
@@ -1606,10 +1983,13 @@ impl EnrollServer {
                 request.commitment(),
             )
             .map_err(|_| Refusal::because("the binding is not committed to this vault"))?;
-        let Some(kind) = request.vault().machine_kind(request.principal())? else {
+        let Some(kind) = request
+            .vault()
+            .machine_kind(request.principal(), key.public().alg())?
+        else {
             return self.recover_vault(request, opened, directory);
         };
-        let binding = opened.ciphertext_hash().map_err(Error::from)?;
+        let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
         if !directory
             .escrow_allowed(request.principal(), kind, &binding)
             .map_err(Refusal)?
@@ -1622,7 +2002,9 @@ impl EnrollServer {
     }
 
     /// The vault half of [`recover`](Self::recover): check the vault and
-    /// its owner, then the policy's factors, and answer to the device.
+    /// its owner, then the policy's factors, record the release, and
+    /// answer to the device.  The recovery answer has no place for a
+    /// receipt: the owner finds the release in the log.
     fn recover_vault(
         &self,
         request: &EscrowRequest,
@@ -1665,7 +2047,7 @@ impl EnrollServer {
                 .check(
                     &self.info.realm,
                     &self.anchors(),
-                    &tang_pqc::Policy::default(),
+                    &self.policy,
                     request.vault(),
                     &vault.owner,
                     device,
@@ -1709,7 +2091,9 @@ impl EnrollServer {
             }
         }
         if vault.policy.sealing == crate::vault::Sealing::Registered {
-            let hash = crate::vault::binding_hex(&opened.ciphertext_hash().map_err(Error::from)?);
+            let hash = crate::vault::binding_hex(&BindingHash::from_slice(
+                &opened.ciphertext_hash().map_err(Error::from)?,
+            )?);
             if !vault.bindings.contains(&hash) {
                 return Err(Refusal::because(
                     "the file's binding is not registered (retired or never registered)",
@@ -1722,12 +2106,37 @@ impl EnrollServer {
         {
             return Err(Refusal::because("the vault's unlock limit is reached"));
         }
+        self.record_release(request, device, &opened)?;
         let response = opened.respond().map_err(Error::from)?;
         Ok(match device {
             Some(d) => Recovered::Device(VaultAnswer::seal(&d.public()?, request, &response)?),
             None => Recovered::Plain(response),
         })
     }
+}
+
+/// What a vault operation records in the ledger, with the device it names
+/// when the operation itself names one; reads change nothing and record
+/// nothing.
+fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
+    Some(match op {
+        VaultOp::Create { .. } => (VaultAction::Create, None),
+        VaultOp::SetPolicy { .. } => (VaultAction::SetPolicy, None),
+        VaultOp::Revoke { .. } => (VaultAction::Revoke, None),
+        VaultOp::AddDevice { .. } => (VaultAction::AddDevice, None),
+        VaultOp::RemoveDevice { id, .. } => (VaultAction::RemoveDevice, Some(id.clone())),
+        VaultOp::Unlock {
+            device, offline, ..
+        } => (
+            if *offline {
+                VaultAction::OfflineSession
+            } else {
+                VaultAction::Session
+            },
+            Some(device.clone()),
+        ),
+        VaultOp::Show { .. } | VaultOp::List | VaultOp::Register { .. } => return None,
+    })
 }
 
 /// With registered sealing: retire `retire` and register `add` on `vault`.
@@ -1789,7 +2198,12 @@ mod tests {
         let a2 = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         let thp1 = *t.anchor.public().thumbprint();
         let thp2 = *a2.public().thumbprint();
-        let leaf = t.delegation.claim().unwrap().leaf().unwrap();
+        let leaf = t
+            .delegation
+            .claim()
+            .unwrap()
+            .leaf(crate::merkle::TreeHash::Sha256)
+            .unwrap();
         let root = merkle::root(&[leaf]).unwrap();
         let mut vouches = HashMap::new();
         for a in [&t.anchor, &a2] {
@@ -1840,7 +2254,12 @@ mod tests {
     fn a_claim_log_page_verifies_its_head_against_the_anchor_key() {
         let t = test_realm("ipa1.example.test");
         let thp = *t.anchor.public().thumbprint();
-        let leaf = t.delegation.claim().unwrap().leaf().unwrap();
+        let leaf = t
+            .delegation
+            .claim()
+            .unwrap()
+            .leaf(crate::merkle::TreeHash::Sha256)
+            .unwrap();
         let mut vouches = HashMap::new();
         vouches.insert(
             thp,
@@ -1861,22 +2280,26 @@ mod tests {
         let head = page
             .verified_head(t.anchor.public(), &p, now())
             .expect("the served head is signed by the anchor");
-        assert_eq!((head.size, head.root), (page.size, page.root));
+        assert_eq!(
+            (head.size, head.root.to_vec()),
+            (page.size, page.root.clone())
+        );
 
         // A stranger's key proves nothing.
         let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         assert!(page.verified_head(stranger.public(), &p, now()).is_err());
         // A tampered head mismatches the signed vouch.
         let mut tampered = page.clone();
-        tampered.root = [9; 32];
+        tampered.root = vec![9; 32];
         assert!(
             tampered
                 .verified_head(t.anchor.public(), &p, now())
                 .is_err()
         );
-        // An older server's page carries no vouch: the head is unsigned.
+        // A page whose vouch is not the anchor's signed vouch proves no
+        // head.
         let mut unsigned = page.clone();
-        unsigned.vouch = None;
+        unsigned.vouch = String::new();
         assert!(
             unsigned
                 .verified_head(t.anchor.public(), &p, now())

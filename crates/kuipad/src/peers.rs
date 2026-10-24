@@ -25,6 +25,7 @@ use kuipa_enroll::delegation::{
     Claim, DEFAULT_VALIDITY, Delegation, SignedSuccession, SignedVouch, VOUCH_VALIDITY,
 };
 use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
+use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::server::Directory;
 use rustls::pki_types::CertificateDer;
 use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
@@ -164,7 +165,7 @@ pub struct Exchange {
     forked: AtomicBool,
     /// The contents the next epoch entry would carry and when they
     /// were first seen: minting waits for a full round of stability.
-    settling: Mutex<Option<([u8; 32], Instant)>>,
+    settling: Mutex<Option<(kuipa_enroll::epoch::EpochHead, Instant)>>,
     changed: Notify,
     client: reqwest::Client,
     /// The last failure per peer, so each is logged once.
@@ -199,7 +200,7 @@ pub fn initial_delegation(
     if let Some(d) = store.delegation()? {
         let usable = match anchor {
             Some(a) => d
-                .verify_at(&[*a.public().thumbprint()], &Policy::default(), at)
+                .verify_at(&[*a.public().thumbprint()], &Policy::from_system()?, at)
                 .is_ok_and(|v| v.key == *signing.thumbprint() && v.server == fqdn),
             None => d.claim().is_ok_and(|c| {
                 c.key == *signing.thumbprint() && c.server == fqdn && c.anchor.is_none()
@@ -273,7 +274,7 @@ impl Peers {
             client: http_client(&settings)?,
             settings,
             anchor,
-            policy: Policy::default(),
+            policy: Policy::from_system()?,
             server,
             directory,
             initiator,
@@ -368,7 +369,7 @@ impl Peers {
         };
         let trust = Trust::compute(&state, &own, &attested, &members, &x.policy, at)?;
         if let Some(anchor) = &x.anchor {
-            let leaves = trust.leaves()?;
+            let leaves = trust.leaves(TreeHash::for_signer(anchor.public().alg()))?;
             let current_vouch = state.vouch(anchor.public().thumbprint());
             let interval = x.settings.vouch_interval.as_secs();
             if anchors::needs_vouch(current_vouch, &leaves, at, interval) {
@@ -1001,7 +1002,7 @@ mod tests {
         let vouch = SignedVouch::issue(
             &anchor,
             "R",
-            [claim.leaf().unwrap()],
+            [claim.leaf(kuipa_enroll::merkle::TreeHash::Sha256).unwrap()],
             now(),
             now() + 100,
             None,
@@ -1026,7 +1027,7 @@ mod tests {
     }
 
     fn epoch_at(
-        prev: [u8; 32],
+        prev: kuipa_enroll::epoch::EpochHead,
         seq: u64,
         signers: &[&SigningKey],
     ) -> kuipa_enroll::epoch::SignedEpoch {
@@ -1037,7 +1038,7 @@ mod tests {
         kuipa_enroll::epoch::SignedEpoch::issue(signers[0], &entry).unwrap()
     }
 
-    fn head_of(signed: &kuipa_enroll::epoch::SignedEpoch) -> [u8; 32] {
+    fn head_of(signed: &kuipa_enroll::epoch::SignedEpoch) -> kuipa_enroll::epoch::EpochHead {
         signed.statement().unwrap().head().unwrap()
     }
 
@@ -1106,7 +1107,7 @@ mod tests {
     fn a_window_that_does_not_commit_to_our_head_is_a_fork() {
         let a = SigningKey::generate_preferred().unwrap();
         let ours = vec![epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&a])];
-        let e2 = epoch_at([9; 32], 2, &[&a]);
+        let e2 = epoch_at([9; 48], 2, &[&a]);
         let theirs = vec![e2.clone(), epoch_at(head_of(&e2), 3, &[&a])];
         let (merged, outcome) = merge_chain("R", &Policy::default(), &ours, &theirs);
         assert!(
@@ -1120,7 +1121,7 @@ mod tests {
     fn a_window_past_our_end_without_a_shared_entry_leaves_a_gap() {
         let a = SigningKey::generate_preferred().unwrap();
         let ours = vec![epoch_at(kuipa_enroll::epoch::GENESIS, 1, &[&a])];
-        let e5 = epoch_at([7; 32], 5, &[&a]);
+        let e5 = epoch_at([7; 48], 5, &[&a]);
         let theirs = vec![e5.clone(), epoch_at(head_of(&e5), 6, &[&a])];
         let (merged, outcome) = merge_chain("R", &Policy::default(), &ours, &theirs);
         assert!(

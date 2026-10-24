@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tang_pqc::{
-    Binding, Error, ExchangeKeyPair, KemAlg, RecoveryRequest, Server, SignatureAlg,
+    Binding, Error, ExchangeKeyPair, KemAlg, Policy, RecoveryRequest, Server, SignatureAlg,
     SignedAdvertisement, SigningKey, Thumbprint,
 };
 
@@ -133,6 +133,8 @@ fn cnsa_policy_falls_back_to_the_allowed_algorithms() {
     ));
     // ...and library choices fall back to what remains.
     assert_eq!(SignatureAlg::preferred().unwrap(), SignatureAlg::MlDsa87);
+    // The client policy derived from the system one is CNSA 2.0's.
+    assert_eq!(Policy::from_system().unwrap(), Policy::cnsa2());
     assert_eq!(KemAlg::preferred().unwrap(), KemAlg::MlKem1024);
     assert_eq!(
         SigningKey::generate_preferred().unwrap().public().alg(),
@@ -214,6 +216,10 @@ fn no_pq_policy_refuses_everything() {
     assert!(matches!(
         KemAlg::preferred(),
         Err(Error::NoAllowedAlgorithm("ML-KEM"))
+    ));
+    assert!(matches!(
+        Policy::from_system(),
+        Err(Error::NoAllowedAlgorithm(_))
     ));
     assert!(SigningKey::generate_preferred().is_err());
     for alg in SignatureAlg::ALL {

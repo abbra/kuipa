@@ -38,8 +38,8 @@ fn provision_and_recover_all_algorithms() {
             let s = setup(kem, sig);
             let wire = s.server.advertisement().unwrap().to_json();
             let adv = SignedAdvertisement::from_json(wire.as_bytes()).unwrap();
-            // Every suite, including ML-DSA-44 which the default policy refuses.
-            let policy = Policy::default().with_signature_algs(&SignatureAlg::ALL);
+            // Every suite; the default policy accepts all of them.
+            let policy = Policy::default();
             let (binding, key) = adv
                 .verify_with(&s.trusted, &policy)
                 .unwrap()
@@ -50,6 +50,13 @@ fn provision_and_recover_all_algorithms() {
             let recovered = recover(&s.server, &binding).unwrap();
             assert_eq!(key.as_ref(), recovered.as_ref(), "{kem:?}/{sig:?}");
             assert_eq!(key.as_ref().len(), tang_pqc::KEY_LEN);
+            // The binding's identity is the suite hash: SHA-384 for
+            // ML-KEM-1024 (CNSA 2.0), SHA-256 for ML-KEM-768.
+            assert_eq!(
+                Some(binding.ciphertext_hash().unwrap().len()),
+                tang_pqc::primitives::digest_len(kem.hash()),
+                "{kem:?}"
+            );
         }
     }
 }

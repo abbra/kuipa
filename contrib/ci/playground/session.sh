@@ -221,6 +221,49 @@ step 0 "Open it to standard output: only the plaintext arrives" \
     "token=playground-user"
 step 1 "A wrong passphrase does not open the device key" \
     'echo wrong > "$KUIPA_PLAYGROUND/wrong" && kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong"'
+
+section "Your vault's transparency log" \
+    "Every server logs each change to a vault and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the vault and flags what the vault description stored on this host does not account for; kuipa-audit tlog replays a server's whole log, naming nobody."
+step 0 "The first watch records where each log stands" \
+    'kuipa tlog watch personal' "baseline" "add-device" "release" "UTC" "0 unexpected"
+step 0 "Nothing new since: a quiet watch" \
+    'kuipa tlog watch personal' "0 unexpected"
+step 0 "A second device is registered from another home directory" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-laptop" kuipa seal device add personal --passphrase-file "$KUIPA_PLAYGROUND/pass"'
+step 1 "This host's watch flags the device it does not know" \
+    'kuipa tlog watch personal' "UNEXPECTED" "add-device" "1 unexpected"
+step 0 "Accept it: seal show stores the current description" \
+    'kuipa seal show personal'
+step 0 "The flag was reported once; the next watch is clean" \
+    'kuipa tlog watch personal' "0 unexpected"
+step 0 "Opening a file is logged as a release; --json keeps Unix times" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && w=$(kuipa --json tlog watch personal) && echo "$w" && grep -Eq "\"time\":[0-9]+[,}]" <<<"$w"' \
+    '"action":"release"' '"unexpected":0'
+step 0 "An auditor replays ipa1's whole log from its public routes" \
+    'kuipa-audit tlog --server ipa1.example.test --state "$KUIPA_PLAYGROUND/tlog-audit.json"' \
+    "verified" "vault-device" "escrow-release"
+step 0 "The next audit requires the log to extend the recorded head" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && kuipa-audit tlog --server ipa1.example.test --state "$KUIPA_PLAYGROUND/tlog-audit.json"' \
+    "verified" "recorded"
+step 0 "A witness cosigns both servers' heads, once each extends what it saw" \
+    'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test --server ipa2.example.test' \
+    "cosigned  ipa1.example.test"
+step 0 "The audit counts the witness's cosignature on ipa1's head" \
+    'kuipa-audit tlog --server ipa1.example.test --witness "$KUIPA_PLAYGROUND/witness/witness.pub.jwk"' \
+    "cosigned by" "1"
+step 0 "Nothing new: the witness has nothing to cosign" \
+    'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test' \
+    "unchanged"
+step 0 "This host trusts the witness, and requires its cosignature" \
+    'kuipa tlog witnesses --add "$KUIPA_PLAYGROUND/witness/witness.pub.jwk" --required 1' \
+    "A head needs 1 of 1"
+step 1 "A head the witness has not cosigned yet is not accepted" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && kuipa tlog watch personal' \
+    "UNWITNESSED" "0 of 1"
+step 0 "After the witness's next pass it is, and the watch moves on" \
+    'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test >/dev/null && kuipa tlog watch personal' \
+    "release" "0 unexpected"
+
 step 0 "A vault that allows hour-long sessions and 10 unlocks" \
     'kuipa seal create daily --require device,ticket --session-hours 1 --max-unlocks 10 && kuipa seal device add daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' \
     "unlocks allowed: 10"
@@ -245,6 +288,30 @@ step 0 "End the offline session" 'kuipa seal lock travel' "has ended"
 step 0 "Revoke the vault" 'kuipa seal revoke personal' "revoked"
 step 75 "No server opens a file of a revoked vault" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
+
+section "Signing under your ticket" \
+    "The realm states that the administrator, by their ticket, signed a release: kuipa sign asks a server, which checks the signing policy (the release group may sign blobs), logs the statement in its transparency log, and signs it.  Anyone with the realm's anchors verifies it offline."
+step 0 "Sign two files in one statement" \
+    'echo "release 1.0" > "$KUIPA_PLAYGROUND/release.tar" && echo "notes" > "$KUIPA_PLAYGROUND/notes.md" && kuipa sign blob "$KUIPA_PLAYGROUND/release.tar" "$KUIPA_PLAYGROUND/notes.md"' \
+    "Signed by admin@EXAMPLE.TEST for blob" "release.tar.kusig"
+step 0 "Verify one offline, as signed by the administrator" \
+    'kuipa sign verify "$KUIPA_PLAYGROUND/release.tar" --signer admin --purpose blob' \
+    "Good signature" "admin@EXAMPLE.TEST"
+step 1 "A changed file does not verify" \
+    'echo tampered >> "$KUIPA_PLAYGROUND/notes.md" && kuipa sign verify "$KUIPA_PLAYGROUND/notes.md"' \
+    "does not match"
+step 1 "Another signer than the one asked for is not accepted" \
+    'kuipa sign verify "$KUIPA_PLAYGROUND/release.tar" --signer bob' \
+    "not as asked"
+step fail "A purpose the policy does not name is refused" \
+    'kuipa sign blob --purpose rpm "$KUIPA_PLAYGROUND/release.tar"' \
+    "refused the request"
+step 0 "Sign a git commit, with kuipa-gitsign as git's x509 program" \
+    'g="$KUIPA_PLAYGROUND/repo" && git init -q "$g" && git -C "$g" config user.name Admin && git -C "$g" config user.email admin@example.test && git -C "$g" config gpg.format x509 && git -C "$g" config gpg.x509.program kuipa-gitsign && git -C "$g" config user.signingkey kuipa && echo hello > "$g/README" && git -C "$g" add README && git -C "$g" commit -q -S -m "Signed under a ticket" && git -C "$g" cat-file commit HEAD' \
+    "BEGIN SIGNED MESSAGE"
+step 0 "git verifies the commit offline" \
+    'git -C "$KUIPA_PLAYGROUND/repo" verify-commit HEAD' \
+    "Good signature by admin@EXAMPLE.TEST for git-commit"
 
 section "Failover" \
     "With ipa1 unreachable, web2 enrolls through ipa2: every server presents an advertisement that ipa1's anchor vouches for.  Enrolled, web2 must then keep verifying ipa2 with the anchors it pinned — not the one anchor of the enrollment string it was issued, whose server is the one that is down."

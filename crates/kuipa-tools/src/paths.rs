@@ -10,6 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use kuipa_enroll::delegation::CLOCK_SKEW;
+use kuipa_enroll::merkle::Hash;
 use serde::{Deserialize, Serialize};
 
 /// Client paths.
@@ -85,6 +86,14 @@ impl Paths {
     #[must_use]
     pub fn anchors(&self) -> PathBuf {
         self.at("etc/ipa/ku-anchors")
+    }
+
+    /// `/etc/ipa/ku-witnesses.json`: the transparency-log witnesses this
+    /// host trusts, and how many of them must cosign a head
+    /// (`kuipa tlog witnesses`); world-readable, like the anchors.
+    #[must_use]
+    pub fn witnesses(&self) -> PathBuf {
+        self.at("etc/ipa/ku-witnesses.json")
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -427,6 +436,7 @@ pub(crate) fn is_missing(e: &Error) -> bool {
 pub type Windows = (
     Vec<tang_pqc::Thumbprint>,
     Vec<kuipa_enroll::delegation::HeadPin>,
+    Vec<Hash>,
     Vec<tang_pqc::Thumbprint>,
 );
 
@@ -445,7 +455,7 @@ pub type Windows = (
 pub fn pinned_windows(path: &Path) -> Result<Windows, Error> {
     let pins = match live_pins(path) {
         Ok(pins) => pins,
-        Err(e) if is_missing(&e) => return Ok((Vec::new(), Vec::new(), Vec::new())),
+        Err(e) if is_missing(&e) => return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new())),
         Err(e) => return Err(e),
     };
     let anchors = pins.iter().map(|p| p.anchor).collect();
@@ -461,8 +471,14 @@ pub fn pinned_windows(path: &Path) -> Result<Windows, Error> {
                 })
         })
         .collect();
+    let mut retired: Vec<Hash> = pins
+        .iter()
+        .flat_map(|p| p.retired.iter().copied())
+        .collect();
+    retired.sort_unstable();
+    retired.dedup();
     let frozen = pins.iter().filter(|p| p.frozen).map(|p| p.anchor).collect();
-    Ok((anchors, heads, frozen))
+    Ok((anchors, heads, retired, frozen))
 }
 
 /// Every pin in an anchors file, `<thumbprint> [<expiry> [<size>
@@ -500,11 +516,16 @@ pub struct Pin {
     pub exp: Option<u64>,
     /// The pinned vouch heads (§4.9), oldest first: a window over the
     /// anchor's claim log.
-    pub heads: Vec<(u64, [u8; 32])>,
+    pub heads: Vec<(u64, Hash)>,
     /// The pin never falls back to a signature proof
     /// (DESIGN-claim-logs.md §2): what the heads cover is all it
     /// accepts, for the host's lifetime, moved only by an operator.
     pub frozen: bool,
+    /// The claims (leaf hashes) the anchor's log retired, as far as the
+    /// host has read it (`DESIGN-tlog.md` §8): still in every later
+    /// tree, they prove nothing head-wise.  Written as a `retired
+    /// <anchor> <leaf>…` line.
+    pub retired: Vec<Hash>,
 }
 
 /// Most heads kept in one pin's window (DESIGN-claim-logs.md §1.2):
@@ -513,23 +534,35 @@ pub struct Pin {
 pub const MAX_HEAD_WINDOW: usize = 4;
 
 /// Merge a verified advertisement's heads into the host's pins
-/// (DESIGN-claim-logs.md §1.2–§1.3): a head that extends a pin's
-/// window is appended (the window trimmed to [`MAX_HEAD_WINDOW`], the
-/// oldest dropped first); a head whose size is lower — the anchor
-/// restarted its log, a claim was dropped — ends the window and
-/// starts a fresh one; a head already in the window keeps it.  A pin
-/// with no head yet starts its window at the new one.  Frozen pins
-/// keep exactly what they had.  The consistency check (that the old
-/// window's heads are prefixes of the new tree) is the caller's, on
-/// the claim-log pages between the sizes; this only merges what
-/// verified.
+/// (DESIGN-claim-logs.md §1.2–§1.3, `DESIGN-tlog.md` §8): a head that
+/// extends a pin's window is appended (the window trimmed to
+/// [`MAX_HEAD_WINDOW`], the oldest dropped first), with the claims its
+/// log retired; a head already in the window keeps it.  A head whose
+/// size is lower is a log that no longer extends what the host pinned —
+/// claim logs only grow — and is not pinned: the window keeps what it
+/// had, and the fork is reported.  A pin with no head yet starts its
+/// window at the new one.  Frozen pins keep exactly what they had.  The
+/// consistency check, and learning the retired claims, are the
+/// caller's; this only merges what verified.
 ///
-/// Returns the merged pins and whether any window was truncated (a
-/// restart), for the caller to report.
+/// `retired` holds, per anchor, the claims the log at its new head
+/// retired; they join the pin's own.  Returns the merged pins and
+/// whether any anchor's log shrank, for the caller to report.
 #[must_use]
-pub fn merge_windows(pins: &[Pin], heads: &[AnchorHead]) -> (Vec<Pin>, bool) {
-    let mut restarted = false;
+pub fn merge_windows(
+    pins: &[Pin],
+    heads: &[AnchorHead],
+    retired: &[(tang_pqc::Thumbprint, Vec<Hash>)],
+) -> (Vec<Pin>, bool) {
+    let mut forked = false;
     let mut out = pins.to_vec();
+    let learned = |anchor: &tang_pqc::Thumbprint| {
+        retired
+            .iter()
+            .find(|(a, _)| a == anchor)
+            .map(|(_, r)| r.clone())
+            .unwrap_or_default()
+    };
     for (anchor, head) in heads {
         let Some(pin) = out.iter_mut().find(|p| &p.anchor == anchor) else {
             // A new anchor: its pin starts at the new head.
@@ -538,6 +571,7 @@ pub fn merge_windows(pins: &[Pin], heads: &[AnchorHead]) -> (Vec<Pin>, bool) {
                 exp: None,
                 heads: head.map_or_else(Vec::new, |h| vec![h]),
                 frozen: false,
+                retired: head.map_or_else(Vec::new, |_| learned(anchor)),
             });
             continue;
         };
@@ -552,20 +586,26 @@ pub fn merge_windows(pins: &[Pin], heads: &[AnchorHead]) -> (Vec<Pin>, bool) {
             continue; // Already pinned: the window keeps it.
         }
         match pin.heads.last() {
-            Some((newest, _)) if *newest < *size => {
+            Some((newest, _)) if *newest > *size => {
+                // Lower than the window's newest: the log no longer
+                // extends what was pinned.
+                forked = true;
+                continue;
+            }
+            Some(_) => {
                 pin.heads.push((*size, *root));
                 let cut = pin.heads.len().saturating_sub(MAX_HEAD_WINDOW);
                 pin.heads.drain(..cut);
             }
-            Some(_) => {
-                // Lower than the window's newest: the log restarted.
-                restarted = true;
-                pin.heads = vec![(*size, *root)];
-            }
             None => pin.heads = vec![(*size, *root)],
         }
+        for leaf in learned(anchor) {
+            if !pin.retired.contains(&leaf) {
+                pin.retired.push(leaf);
+            }
+        }
     }
-    (out, restarted)
+    (out, forked)
 }
 
 /// The anchor epoch watermark stored in an anchors file (§4.8): the
@@ -575,18 +615,21 @@ pub fn merge_windows(pins: &[Pin], heads: &[AnchorHead]) -> (Vec<Pin>, bool) {
 /// # Errors
 ///
 /// I/O errors or a malformed line.
-pub fn read_epoch_from(path: &Path) -> Result<Option<(u64, [u8; 32])>, Error> {
+pub fn read_epoch_from(
+    path: &Path,
+) -> Result<Option<(u64, kuipa_enroll::epoch::EpochHead)>, Error> {
     Ok(read_anchors_file(path)?.1)
 }
 
 /// What an anchors file holds: pins with optional expiries, and the
 /// optional epoch watermark (§4.8).
-type AnchorsFile = (Vec<Pin>, Option<(u64, [u8; 32])>);
+type AnchorsFile = (Vec<Pin>, Option<(u64, kuipa_enroll::epoch::EpochHead)>);
 
 fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
     let text = fs::read_to_string(path)?;
     let mut pins = Vec::new();
     let mut epoch = None;
+    let mut retired: Vec<(tang_pqc::Thumbprint, Vec<Hash>)> = Vec::new();
     for l in text
         .lines()
         .map(str::trim)
@@ -594,16 +637,23 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
     {
         let mut fields = l.split_whitespace();
         let first = fields.next().unwrap_or_default();
+        if first == "retired" {
+            let (anchor, leaves) = parse_retired(fields, l, path)?;
+            if retired.iter().any(|(a, _)| *a == anchor) {
+                return Err(format!("{}: duplicate retired line {l:?}", path.display()).into());
+            }
+            retired.push((anchor, leaves));
+            continue;
+        }
         if first == "epoch" {
             let seq = fields
                 .next()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| format!("{}: bad epoch sequence in {l:?}", path.display()))?;
-            let head = fields
+            let head: kuipa_enroll::epoch::EpochHead = fields
                 .next()
-                .map(str::parse)
-                .transpose()?
-                .map(|t: tang_pqc::Thumbprint| *t.as_bytes())
+                .and_then(|f| tang_pqc::b64::decode(f).ok())
+                .and_then(|h| h.try_into().ok())
                 .ok_or_else(|| format!("{}: bad epoch hash in {l:?}", path.display()))?;
             if fields.next().is_some() {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
@@ -676,9 +726,41 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
             exp,
             heads,
             frozen,
+            retired: Vec::new(),
         });
     }
+    for (anchor, leaves) in retired {
+        let pin = pins
+            .iter_mut()
+            .find(|p| p.anchor == anchor)
+            .ok_or_else(|| format!("{}: retired claims for unpinned {anchor}", path.display()))?;
+        pin.retired = leaves;
+    }
     Ok((pins, epoch))
+}
+
+/// A `retired <anchor> <leaf>…` line's anchor and claim leaves
+/// (`DESIGN-tlog.md` §8).
+///
+/// # Errors
+///
+/// A malformed anchor or leaf, or no leaf.
+fn parse_retired<'a>(
+    mut fields: impl Iterator<Item = &'a str>,
+    line: &str,
+    path: &Path,
+) -> Result<(tang_pqc::Thumbprint, Vec<Hash>), Error> {
+    let anchor: tang_pqc::Thumbprint = fields
+        .next()
+        .and_then(|a| a.parse().ok())
+        .ok_or_else(|| format!("{}: bad retired anchor in {line:?}", path.display()))?;
+    let leaves: Vec<Hash> = fields
+        .map(|f| parse_root(f, line, path))
+        .collect::<Result<_, _>>()?;
+    if leaves.is_empty() {
+        return Err(format!("{}: no retired claims in {line:?}", path.display()).into());
+    }
+    Ok((anchor, leaves))
 }
 
 fn parse_expiry(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
@@ -718,7 +800,7 @@ fn is_number(field: &str) -> bool {
 /// an expiry is never followed by a number that is itself followed by
 /// a thumbprint.
 fn looks_like_head(first: &str, second: &str) -> bool {
-    is_number(first) && second.parse::<tang_pqc::Thumbprint>().is_ok()
+    is_number(first) && decode_hash(second).is_some()
 }
 
 /// Parse `<size> <root>` pairs, oldest first.
@@ -726,7 +808,7 @@ fn looks_like_head(first: &str, second: &str) -> bool {
 /// # Errors
 ///
 /// A malformed size or root.
-fn parse_pairs(fields: &[&str], line: &str, path: &Path) -> Result<Vec<(u64, [u8; 32])>, Error> {
+fn parse_pairs(fields: &[&str], line: &str, path: &Path) -> Result<Vec<(u64, Hash)>, Error> {
     if !fields.len().is_multiple_of(2) {
         return Err(format!("{}: odd head fields in {line:?}", path.display()).into());
     }
@@ -747,7 +829,7 @@ fn parse_pairs(fields: &[&str], line: &str, path: &Path) -> Result<Vec<(u64, [u8
 /// # Errors
 ///
 /// A duplicate or shrinking head.
-fn check_window(heads: &[(u64, [u8; 32])], line: &str, path: &Path) -> Result<(), Error> {
+fn check_window(heads: &[(u64, Hash)], line: &str, path: &Path) -> Result<(), Error> {
     for pair in heads.windows(2) {
         if pair[1].0 <= pair[0].0 {
             return Err(format!("{}: head sizes must grow in {line:?}", path.display()).into());
@@ -756,11 +838,16 @@ fn check_window(heads: &[(u64, [u8; 32])], line: &str, path: &Path) -> Result<()
     Ok(())
 }
 
-fn parse_root(field: &str, line: &str, path: &Path) -> Result<[u8; 32], Error> {
-    field
-        .parse()
-        .map(|t: tang_pqc::Thumbprint| *t.as_bytes())
-        .map_err(|_| format!("{}: bad head root in {line:?}", path.display()).into())
+/// A tree hash in base64url: 32 bytes (SHA-256) or 48 (SHA-384).
+fn decode_hash(field: &str) -> Option<Hash> {
+    tang_pqc::b64::decode(field)
+        .ok()
+        .and_then(|b| Hash::from_slice(&b).ok())
+}
+
+fn parse_root(field: &str, line: &str, path: &Path) -> Result<Hash, Error> {
+    decode_hash(field)
+        .ok_or_else(|| format!("{}: bad head root in {line:?}", path.display()).into())
 }
 
 /// Write the pinned anchors.
@@ -780,7 +867,7 @@ pub fn write_anchors(paths: &Paths, anchors: &[tang_pqc::Thumbprint]) -> Result<
 pub fn write_anchors_epoch(
     paths: &Paths,
     anchors: &[tang_pqc::Thumbprint],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     write_anchors_epoch_with_heads(
         paths,
@@ -799,7 +886,7 @@ pub fn write_anchors_epoch(
 pub fn write_anchors_epoch_with_heads(
     paths: &Paths,
     anchors: &[AnchorHead],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     write_anchor_pins(
         &paths.anchors(),
@@ -811,6 +898,7 @@ pub fn write_anchors_epoch_with_heads(
                 exp: None,
                 heads: head.map_or_else(Vec::new, |h| vec![h]),
                 frozen: false,
+                retired: Vec::new(),
             })
             .collect::<Vec<_>>(),
         epoch,
@@ -819,7 +907,7 @@ pub fn write_anchors_epoch_with_heads(
 
 /// An anchor with its current vouch head (§4.9), as server responses
 /// deliver them: `None` where the server knew no head.
-pub type AnchorHead = (tang_pqc::Thumbprint, Option<(u64, [u8; 32])>);
+pub type AnchorHead = (tang_pqc::Thumbprint, Option<(u64, Hash)>);
 
 /// Write an anchors file with a `# comment` first line.
 ///
@@ -844,17 +932,13 @@ pub fn write_anchor_pins(
     path: &Path,
     comment: &str,
     pins: &[Pin],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     use std::fmt::Write as _; // appending to a String cannot fail
     let mut text = format!("# {comment}\n");
     if let Some((seq, head)) = epoch {
-        writeln!(
-            text,
-            "epoch {seq} {}",
-            tang_pqc::Thumbprint::from_bytes(head)
-        )
-        .expect("a String sink never fails");
+        writeln!(text, "epoch {seq} {}", tang_pqc::b64::encode(&head))
+            .expect("a String sink never fails");
     }
     for pin in pins {
         text.push_str(&pin.anchor.to_string());
@@ -862,11 +946,18 @@ pub fn write_anchor_pins(
             write!(text, " {e}").expect("a String sink never fails");
         }
         for (size, root) in &pin.heads {
-            write!(text, " {size} {}", tang_pqc::Thumbprint::from_bytes(*root))
+            write!(text, " {size} {}", tang_pqc::b64::encode(root))
                 .expect("a String sink never fails");
         }
         if pin.frozen {
             text.push_str(" frozen");
+        }
+        text.push('\n');
+    }
+    for pin in pins.iter().filter(|p| !p.retired.is_empty()) {
+        write!(text, "retired {}", pin.anchor).expect("a String sink never fails");
+        for leaf in &pin.retired {
+            write!(text, " {}", tang_pqc::b64::encode(leaf)).expect("a String sink never fails");
         }
         text.push('\n');
     }
@@ -883,17 +974,13 @@ pub fn write_anchor_thumbs(
     path: &Path,
     comment: &str,
     anchors: &[tang_pqc::Thumbprint],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     use std::fmt::Write as _; // appending to a String cannot fail
     let mut text = format!("# {comment}\n");
     if let Some((seq, head)) = epoch {
-        writeln!(
-            text,
-            "epoch {seq} {}",
-            tang_pqc::Thumbprint::from_bytes(head)
-        )
-        .expect("a String sink never fails");
+        writeln!(text, "epoch {seq} {}", tang_pqc::b64::encode(&head))
+            .expect("a String sink never fails");
     }
     for a in anchors {
         text.push_str(&a.to_string());
@@ -905,6 +992,11 @@ pub fn write_anchor_thumbs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A SHA-256-sized tree hash of `byte`s.
+    fn test_hash(byte: u8) -> Hash {
+        Hash::from_slice(&[byte; 32]).unwrap()
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)] // one pin-file grammar, one test
@@ -918,7 +1010,7 @@ mod tests {
             tang_pqc::Thumbprint::from_bytes([3; 32]),
         );
         let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
-        let head = tang_pqc::Thumbprint::from_bytes([9; 32]);
+        let head = tang_pqc::b64::encode(&[9; 48]);
         let text = format!(
             "# provisioned\n{a}\n\n{b} {}\n{c} {}\nepoch 7 {head}\n",
             now + 3600,
@@ -932,25 +1024,28 @@ mod tests {
                     anchor: a,
                     exp: None,
                     heads: Vec::new(),
-                    frozen: false
+                    frozen: false,
+                    retired: Vec::new(),
                 },
                 Pin {
                     anchor: b,
                     exp: Some(now + 3600),
                     heads: Vec::new(),
-                    frozen: false
+                    frozen: false,
+                    retired: Vec::new(),
                 },
                 Pin {
                     anchor: c,
                     exp: Some(now - CLOCK_SKEW - 1),
                     heads: Vec::new(),
-                    frozen: false
+                    frozen: false,
+                    retired: Vec::new(),
                 },
             ]
         );
         assert_eq!(
             read_epoch_from(&path).unwrap(),
-            Some((7, [9; 32])),
+            Some((7, [9; 48])),
             "the watermark rides with the pins"
         );
         assert_eq!(
@@ -1017,8 +1112,9 @@ mod tests {
             &[Pin {
                 anchor: a,
                 exp: None,
-                heads: vec![(5, [8; 32])],
+                heads: vec![(5, test_hash(8))],
                 frozen: false,
+                retired: Vec::new(),
             }],
             None,
         )
@@ -1028,8 +1124,9 @@ mod tests {
             vec![Pin {
                 anchor: a,
                 exp: None,
-                heads: vec![(5, [8; 32])],
+                heads: vec![(5, test_hash(8))],
                 frozen: false,
+                retired: Vec::new(),
             }]
         );
         write_anchor_pins(
@@ -1038,10 +1135,11 @@ mod tests {
             &[Pin {
                 anchor: a,
                 exp: Some(now + 3600),
-                heads: vec![(3, [4; 32])],
+                heads: vec![(3, test_hash(4))],
                 frozen: false,
+                retired: Vec::new(),
             }],
-            Some((3, [4; 32])),
+            Some((3, [4; 48])),
         )
         .unwrap();
         assert_eq!(
@@ -1049,19 +1147,29 @@ mod tests {
             vec![Pin {
                 anchor: a,
                 exp: Some(now + 3600),
-                heads: vec![(3, [4; 32])],
+                heads: vec![(3, test_hash(4))],
                 frozen: false,
+                retired: Vec::new(),
             }]
         );
-        assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 32])));
+        assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 48])));
+        // An epoch head is SHA-384: a head of any other length is
+        // malformed, a SHA-256-sized one included.
+        let text = fs::read_to_string(&path).unwrap();
+        for len in [tang_pqc::primitives::SHA256_LEN, 40] {
+            let odd = format!("epoch 10 {}\n", tang_pqc::b64::encode(&vec![1; len]));
+            fs::write(&path, format!("{text}{odd}")).unwrap();
+            assert!(read_epoch_from(&path).is_err(), "{len}");
+        }
 
         // A window round-trips: several heads, oldest first, and the
         // frozen marker (DESIGN-claim-logs.md §1.2, §2).
         let window = Pin {
             anchor: a,
             exp: Some(now + 3600),
-            heads: vec![(3, [4; 32]), (7, [5; 32]), (9, [6; 32])],
+            heads: vec![(3, test_hash(4)), (7, test_hash(5)), (9, test_hash(6))],
             frozen: true,
+            retired: Vec::new(),
         };
         write_anchor_pins(&path, "test", std::slice::from_ref(&window), None).unwrap();
         assert_eq!(read_anchor_pins(&path).unwrap(), vec![window]);
@@ -1080,19 +1188,21 @@ mod tests {
             Pin {
                 anchor: live,
                 exp: Some(now + 3600),
-                heads: vec![(3, [4; 32]), (7, [5; 32])],
+                heads: vec![(3, test_hash(4)), (7, test_hash(5))],
                 frozen: true,
+                retired: Vec::new(),
             },
             Pin {
                 anchor: expired,
                 exp: Some(now - CLOCK_SKEW - 1),
-                heads: vec![(9, [6; 32])],
+                heads: vec![(9, test_hash(6))],
                 frozen: true,
+                retired: Vec::new(),
             },
         ];
         write_anchor_pins(&path, "test", &pins, None).unwrap();
         assert_eq!(live_pins(&path).unwrap(), vec![pins[0].clone()]);
-        let (anchors, heads, frozen) = pinned_windows(&path).unwrap();
+        let (anchors, heads, _, frozen) = pinned_windows(&path).unwrap();
         assert_eq!(anchors, vec![live]);
         assert_eq!(
             heads,
@@ -1100,12 +1210,12 @@ mod tests {
                 kuipa_enroll::delegation::HeadPin {
                     anchor: live,
                     size: 3,
-                    root: [4; 32]
+                    root: test_hash(4)
                 },
                 kuipa_enroll::delegation::HeadPin {
                     anchor: live,
                     size: 7,
-                    root: [5; 32]
+                    root: test_hash(5)
                 },
             ],
             "the whole window of a live pin, oldest first (§1.4)"
@@ -1115,7 +1225,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert_eq!(
             pinned_windows(&path).unwrap(),
-            (Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         );
         fs::write(&path, format!("{live} +5\n")).unwrap();
         assert!(
@@ -1123,5 +1233,62 @@ mod tests {
             "a corrupt pin file fails closed"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retired_claims_round_trip_and_forks_are_not_pinned() {
+        let dir = std::env::temp_dir().join(format!("kuipa-retired-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("anchors");
+        let a = tang_pqc::Thumbprint::from_bytes([1; 32]);
+        let pin = Pin {
+            anchor: a,
+            exp: None,
+            heads: vec![(3, test_hash(7))],
+            frozen: false,
+            retired: vec![test_hash(5), test_hash(6)],
+        };
+        write_anchor_pins(&path, "test", std::slice::from_ref(&pin), None).unwrap();
+        assert_eq!(read_anchor_pins(&path).unwrap(), vec![pin.clone()]);
+        let (_, _, retired, _) = pinned_windows(&path).unwrap();
+        assert_eq!(retired, vec![test_hash(5), test_hash(6)]);
+        // A retired line needs a pinned anchor and at least one claim, once.
+        let leaf = tang_pqc::Thumbprint::from_bytes([5; 32]);
+        let other = tang_pqc::Thumbprint::from_bytes([2; 32]);
+        for bad in [
+            format!("{a}\nretired {a}\n"),
+            format!("{a}\nretired {other} {leaf}\n"),
+            format!("{a}\nretired {a} {leaf}\nretired {a} {leaf}\n"),
+            format!("{a}\nretired {a} nonsense\n"),
+        ] {
+            fs::write(&path, &bad).unwrap();
+            assert!(read_anchor_pins(&path).is_err(), "{bad:?}");
+        }
+
+        // A head that extends joins the window with what it retired; a
+        // shorter one is a fork, reported, and the window keeps its heads.
+        let learned = vec![(a, vec![test_hash(6), test_hash(8)])];
+        let (grown, forked) = merge_windows(
+            std::slice::from_ref(&pin),
+            &[(a, Some((5, test_hash(9))))],
+            &learned,
+        );
+        assert!(!forked);
+        assert_eq!(grown[0].heads, vec![(3, test_hash(7)), (5, test_hash(9))]);
+        assert_eq!(
+            grown[0].retired,
+            vec![test_hash(5), test_hash(6), test_hash(8)]
+        );
+        let (kept, forked) = merge_windows(&grown, &[(a, Some((2, test_hash(4))))], &[]);
+        assert!(forked);
+        assert_eq!(kept[0].heads, grown[0].heads);
+        // A new anchor starts its pin with what its first head retired.
+        let (fresh, _) = merge_windows(
+            &[],
+            &[(other, Some((1, test_hash(3))))],
+            &[(other, vec![test_hash(1)])],
+        );
+        assert_eq!(fresh[0].retired, vec![test_hash(1)]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

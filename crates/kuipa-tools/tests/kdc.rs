@@ -310,9 +310,13 @@ fn against_a_real_kdc() {
             trusts: Vec::new(),
         };
         own_anchors.push(*anchor.public().thumbprint());
-        let server = Arc::new(EnrollServer::new(keys, info, delegation));
         let key_dir = realm.dir.join(format!("keys-{fqdn}"));
         std::fs::create_dir_all(&key_dir).unwrap();
+        let alg = kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg());
+        let ledger =
+            Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, fqdn, alg).unwrap());
+        let server =
+            Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
         let settings = Settings {
             me: fqdn.into(),
             realm: REALM.into(),
@@ -349,6 +353,7 @@ fn against_a_real_kdc() {
                 limiter: kuipad::limit::Limiter::default(),
                 tang: None,
                 keys: None,
+                ledger: Some(ledger),
             }),
         );
         ipa.push(server);
@@ -508,7 +513,10 @@ fn against_a_real_kdc() {
             .is_symlink()
     );
     assert_eq!(std::fs::read(&secret).unwrap(), b"token=second\n");
-    assert_eq!(file_bindings(), Vec::<[u8; 32]>::new());
+    assert_eq!(
+        file_bindings(),
+        Vec::<kuipa_enroll::escrow::BindingHash>::new()
+    );
     std::fs::write(&stale, &sealed_secret).unwrap();
     assert!(
         flows::unseal_file(&a, &stale).is_err(),
@@ -519,7 +527,7 @@ fn against_a_real_kdc() {
     assert_eq!(std::fs::read(&http).unwrap(), http_keys);
     assert_eq!(
         directory.escrow.lock().unwrap()[&service],
-        Vec::<[u8; 32]>::new()
+        Vec::<kuipa_enroll::escrow::BindingHash>::new()
     );
     assert!(!paths::sealed_for(&http).exists());
 
@@ -574,6 +582,72 @@ fn against_a_real_kdc() {
     let bob_cc = format!("FILE:{}", bob_cc.display());
     let as_bob = Seal::new(&a, &home, Some(&bob_cc));
     assert!(as_bob.open(&sealed, Some(b"correct horse")).is_err());
+
+    // ── Her vault's transparency logs (DESIGN-tlog.md §7) ──
+    // The first watch sets the baseline: history listed, nothing flagged.
+    let first = seal.watch("personal").unwrap();
+    assert_eq!(first["ok"], true, "{first}");
+    assert!(!first["baseline"].as_array().unwrap().is_empty(), "{first}");
+    let actions: Vec<_> = first["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action"].as_str().unwrap().to_owned())
+        .collect();
+    for a in ["create", "add-device", "release"] {
+        assert!(actions.iter().any(|x| x == a), "{a} in {first}");
+    }
+    // Nothing new, nothing listed.
+    let quiet = seal.watch("personal").unwrap();
+    assert_eq!(quiet["ok"], true, "{quiet}");
+    assert!(quiet["events"].as_array().unwrap().is_empty(), "{quiet}");
+    // A device added elsewhere — her laptop, or someone holding her
+    // ticket — is not in this host's descriptor: flagged.
+    let laptop = UserPaths::new(realm.dir.join("alice-laptop"));
+    Seal::new(&a, &laptop, Some(&alice_cc))
+        .add_device("personal", b"battery staple")
+        .unwrap();
+    let flagged = seal.watch("personal").unwrap();
+    assert_eq!(flagged["ok"], false, "{flagged}");
+    assert_eq!(flagged["unexpected"], 1, "{flagged}");
+    assert_eq!(flagged["events"][0]["action"], "add-device", "{flagged}");
+    // Once she has looked (`show` stores the current descriptor), the
+    // next watch is clean: the entry was reported once.
+    seal.show("personal").unwrap();
+    let accepted = seal.watch("personal").unwrap();
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    // A server whose key changed category (a crypto policy change) keeps
+    // a new log under a new id: reported as such, read from its start, not
+    // a fork.
+    let state_path = home_dir_of(&realm).join("vaults/personal.tlog");
+    let mut watched: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    for w in watched.as_object_mut().unwrap().values_mut() {
+        w["log"] = "0".repeat(96).into();
+    }
+    std::fs::write(&state_path, serde_json::to_vec(&watched).unwrap()).unwrap();
+    let moved = seal.watch("personal").unwrap();
+    assert!(moved["forked"].as_array().unwrap().is_empty(), "{moved}");
+    assert!(!moved["relogged"].as_array().unwrap().is_empty(), "{moved}");
+    assert!(moved["baseline"].as_array().unwrap().is_empty(), "{moved}");
+    assert!(!moved["events"].as_array().unwrap().is_empty(), "{moved}");
+    // A log that does not extend what was seen is reported as forked.
+    let mut watched: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    for w in watched.as_object_mut().unwrap().values_mut() {
+        w["root"] = tang_pqc::b64::encode(&[9; 32]).into();
+    }
+    std::fs::write(&state_path, serde_json::to_vec(&watched).unwrap()).unwrap();
+    let diverged = seal.watch("personal").unwrap();
+    assert_eq!(diverged["ok"], false, "{diverged}");
+    assert!(
+        !diverged["forked"].as_array().unwrap().is_empty(),
+        "{diverged}"
+    );
+    // Bob cannot look up her vault: nothing checked, not clean.
+    let by_bob = as_bob.watch("personal").unwrap();
+    assert_eq!(by_bob["ok"], false, "{by_bob}");
+    assert!(by_bob["events"].as_array().unwrap().is_empty(), "{by_bob}");
     let listed = seal.list().unwrap();
     assert_eq!(listed["vaults"].as_array().unwrap().len(), 1);
     seal.revoke("personal").unwrap();
@@ -1000,4 +1074,9 @@ fn against_a_real_kdc() {
         ..forged.clone()
     };
     assert_eq!(post(&garbage), 403, "no valid token");
+}
+
+/// Alice's data directory in the test realm.
+fn home_dir_of(realm: &Realm) -> std::path::PathBuf {
+    realm.dir.join("alice-home")
 }

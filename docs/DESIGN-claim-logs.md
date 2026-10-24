@@ -48,9 +48,12 @@ The pin-file grammar gains the repeated head pair:
 ```
 
 Backwards compatible: one head is today's line; the parser keeps the
-disambiguation rule (the field after the first number is a thumbprint,
-so the first number is a size) for expiry-less lines, and a lone
-number stays an expiry. Heads in a line must strictly increase in
+disambiguation rule (the field after the first number is a hash, so the
+first number is a size) for expiry-less lines, and a lone number stays
+an expiry. Roots and retired leaves are base64url tree hashes: 32 bytes
+for an ML-DSA-65 anchor, 48 for an ML-DSA-87 one, whose claim log is
+SHA-384 (DESIGN.md §4.1.1). A head proof or signature proof against a
+root of the wrong hash for the anchor's key does not verify. Heads in a line must strictly increase in
 size; a duplicate or shrinking head is a parse error, not a silent
 drop — the file is an administrator's assertion and must round-trip
 exactly.
@@ -68,13 +71,14 @@ accepts it; for windows we do not have to, because the claim log gives
 us the check:
 
 **The consistency rule.** Before appending a new head `H2` over a
-pinned `H1` for the same anchor, the client fetches the anchor's claim
-log from index `H1.size` to `H2.size` (the pages between them, public
-per §4.9.5) and checks that the leaves hash to `H1.root` as a prefix
-of `H2.root` — an RFC 9162 consistency check between the two tree
-sizes, computable from the fetched leaves alone (rebuild `H1`'s tree
-from the first `H1.size` of them and compare roots, then `H2`'s from
-all). `merkle::root` does both. Only then is `H2` appended. If the
+pinned `H1` for the same anchor, the client reads the head's signed
+vouch from the anchor's claim-log page (public per §4.9.5). `IPSV` v2
+carries the whole log, claims and tombstones. The client checks that
+the first `H1.size` entries make `H1.root` and the first `H2.size` make
+`H2.root` (`SignedVouch::retired_at`, twice). This is an RFC 9162
+consistency check computed from the leaves themselves, and the same
+entries give the claims `H2`'s log retired (§1.4). Only then is `H2`
+appended. If the
 check fails the head is not pinned, the server is reported (it served
 a head that does not extend ours — the same split-view evidence the
 anchor-log watermark treats as a fork, §4.8), and the window keeps
@@ -86,26 +90,29 @@ history", which is the landmark-window property the MTC draft gives a
 relying party that keeps its landmarks (draft-ietf-plants-merkle-tree-certs
 §6.4): the past cannot change behind the window.
 
-The fetch is bounded, and it is a *whole-log* walk: the client keeps
-only the roots of its window, so the consistency of a new head can
-only be checked by rehashing from the first leaf — pages from 0 like
-the anchor log (`MAX_CLAIM_LOG_PAGE` each), at most
-`MAX_HEAD_FETCH_PAGES` (64) of them. An advertised head naming a
+The read is bounded, and it is the *whole log*: the client keeps only
+the roots of its window, so the consistency of a new head can only be
+checked by rehashing from the first leaf, at most
+`MAX_HEAD_FETCH_PAGES` (64) pages of `MAX_CLAIM_LOG_PAGE` leaves' worth.
+One request suffices, since the vouch carries every entry. An advertised head naming a
 larger tree is refused with a warning and the window stays as it is:
 extending it would take trust the fetch cannot supply. Between routine
 refreshes of a realm that renews claims daily, the whole log is one
 page.
 
-**Restart is a truncation, not an extension.** A head whose size is
-*lower* than the window's newest (the anchor restarted its log — a
-claim was dropped, §4.9.1) ends the old window: the old heads are
-dropped and the new head starts a fresh window, exactly as a
-first-time pin. The client reports the restart (`check` and `status`
-show it): the realm removed something, and the host's trust in the
-removed claim's anchor history ends with it. No signature fallback is
-forced — the new window's heads still prove everything the new tree
-covers — but the *reason* is visible, which the signature path cannot
-express (§4.9.6: it cannot distinguish a removal from an addition).
+**A shorter log is a fork.** Claim logs only grow: a dropped claim is
+retired by a tombstone (DESIGN-tlog.md §8, DESIGN.md §4.9.1), not by a
+restart. A head whose size is *lower* than the window's newest is a
+log that no longer contains the pinned history. It is not pinned, the
+window keeps its heads, and the client reports it.
+
+**Every pinned head brings its retired claims.** When a head joins a
+window, by first pin or by extension, the client reads the tombstones
+up to it from the head's signed vouch on the claim-log page. The
+vouch's entries must make the pinned root. The retired claims go into
+the pin file as a `retired <anchor> <leaf>…` line. A head proof for
+a retired claim proves nothing: it is in the tree, but no longer
+vouched for. A head whose retired claims cannot be read is not pinned.
 
 ### 1.4 Verification against a window
 
@@ -253,7 +260,7 @@ kuipa-audit split-view --server S1 --server S2 [--anchor THP]…
   decoded as above, and — for a host pin — whether the pinned head is
   current (the server's newest head extends it), stale (the server's
   tree has grown: the consistency check of §1.3, applied read-only),
-  or restarted (the server's tree is shorter).
+  or split (the server's tree is shorter: claim logs only grow).
   The served head is first checked as §4 says — its vouch must verify
   against the anchor's key, and the pages must hash to its root — so
   an unsigned or inconsistent head reports as *split*, a server that
@@ -328,7 +335,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 | compromised server serves its own tree as a head | client pins it (the advertisement verifies; same as the signature path) | a head no signature proves is never pinned (§3, §4); growth of a pinned window still passes §1.3's consistency check |
 | anchor key theft | head proofs bounded by pinned heads; signature path unbounded | unchanged (§4.9.6); audit (§5) reconstructs exactly what was covered |
 | mirror operator edits stored data | — | proofs stop verifying against client pins; no trust in the mirror |
-| realm removes a server | head restart; client silently re-pins | §1.3: restart reported by `check`/`status` |
+| realm removes a server | head restart; client silently re-pins | a tombstone: the next pinned head brings the retired claim, refused head-wise; signature proofs drop it at the next vouch |
 | rogue server feeds different trees to different clients | undetectable from the client | `kuipa-audit split-view` compares heads (with signed vouches) across servers |
 | frozen host's trust moves | impossible only by never refreshing | §2 makes it a checkable mode with named refusals |
 
@@ -337,6 +344,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 | member | where | form |
 |---|---|---|
 | repeated `<size> <root>` pairs, `frozen` marker | pin-file lines (§1.2, §2) | text, backwards compatible |
+| `retired <anchor> <leaf>…` | pin-file lines (§1.3) | text: the claims a pinned log retired |
 | `heads` | `TrustedRealm` JSON (§3) | as `RealmInfo.heads` |
 | `vouch` | claim-log page JSON (§4) | base64url signed IPVH v2 |
 
@@ -344,7 +352,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 
 * `kuipa-enroll` unit: window append/truncate rules; the consistency
   check (a real extension passes, a forged head that skips history
-  fails, a restart truncates and reports); frozen refusal reasons;
+  fails, a shorter log is refused and reported); frozen refusal reasons;
   `TrustedRealm` heads round-trip and the missing-member default.
 * `kuipa-tools` unit: pin grammar with windows and `frozen`
   (round-trip, ordering errors, the expiry/size disambiguation kept);
@@ -366,6 +374,7 @@ kuipa-mirror --origin https://ipa1.example.test \
 ## What is deliberately not here
 
 * No global log, no monitor role, no new quorum (§4.9.6 stands).
-* No revocation (§4.7's limits stand; restart is observability).
+* No revocation beyond the claim log's own: a dropped claim is refused
+  head-wise once the host pins a head that retired it (§1.3).
 * No `ipa-ku3` string form — windows are host state, not a string.
 * No mirror-to-mirror gossip: one origin, fetch-only, operator-run.

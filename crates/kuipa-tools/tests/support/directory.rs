@@ -23,9 +23,9 @@ pub struct KdcDirectory {
     /// Who may enroll and stage hosts with a ticket or a password.
     pub admins: HashSet<String>,
     pub otps: Mutex<HashMap<String, Vec<u8>>>,
-    pub escrow: Mutex<HashMap<String, Vec<[u8; 32]>>>,
+    pub escrow: Mutex<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     /// Escrow bindings of sealed files, by principal (§7.5).
-    pub escrow_files: Mutex<HashMap<String, Vec<[u8; 32]>>>,
+    pub escrow_files: Mutex<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     pub staged: Mutex<HashSet<String>>,
     pub servers: Vec<String>,
     /// Spent voucher salts.
@@ -33,7 +33,7 @@ pub struct KdcDirectory {
     /// Host groups and their members, as voucher joins add them.
     pub hostgroups: Mutex<HashMap<String, Vec<String>>>,
     /// Trust invitations (secret hash → not after).
-    pub invitations: Mutex<HashMap<[u8; 32], u64>>,
+    pub invitations: Mutex<HashMap<[u8; 48], u64>>,
     /// Recorded trusted realms.
     pub trusts: Mutex<Vec<TrustedRealm>>,
     /// User vaults.
@@ -53,6 +53,11 @@ pub struct KdcDirectory {
     pub key_secrets: Mutex<std::collections::BTreeMap<(u8, String), Vec<u8>>>,
     /// The realm's vault limits.
     pub limits: Mutex<kuipa_enroll::vault::Limits>,
+    /// The realm's signing policy (`DESIGN-sign.md`).
+    pub sign_policy: Mutex<kuipa_enroll::sign::SignPolicy>,
+    /// User groups by principal, as `memberOf` lists them (host groups
+    /// come from `hostgroups`).
+    pub groups: Mutex<HashMap<String, Vec<String>>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -90,6 +95,8 @@ impl KdcDirectory {
             ca_masters: Mutex::new(Vec::new()),
             key_secrets: Mutex::new(std::collections::BTreeMap::new()),
             limits: Mutex::new(kuipa_enroll::vault::Limits::default()),
+            sign_policy: Mutex::new(kuipa_enroll::sign::SignPolicy::default()),
+            groups: Mutex::new(HashMap::new()),
             creds,
         }
     }
@@ -246,7 +253,7 @@ impl Directory for KdcDirectory {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), DirectoryError> {
         self.escrow
             .lock()
@@ -259,7 +266,7 @@ impl Directory for KdcDirectory {
         &self,
         principal: &Principal,
         kind: Kind,
-        binding: &[u8; 32],
+        binding: &kuipa_enroll::escrow::BindingHash,
     ) -> Result<bool, DirectoryError> {
         let set = match kind {
             Kind::Keytab => &self.escrow,
@@ -275,7 +282,7 @@ impl Directory for KdcDirectory {
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -368,6 +375,34 @@ impl Directory for KdcDirectory {
         Ok(self.limits.lock().unwrap().clone())
     }
 
+    fn sign_policy(&self) -> Result<kuipa_enroll::sign::SignPolicy, DirectoryError> {
+        Ok(self.sign_policy.lock().unwrap().clone())
+    }
+
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        let name = principal.to_string();
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
+        if let [service, fqdn] = principal.components()
+            && service == "host"
+        {
+            groups.extend(
+                self.hostgroups
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, members)| members.iter().any(|m| m == fqdn))
+                    .map(|(g, _)| g.clone()),
+            );
+        }
+        Ok(groups)
+    }
+
     fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
         Ok(self.escrow_keys.lock().unwrap().clone())
     }
@@ -429,12 +464,12 @@ impl Directory for KdcDirectory {
         Ok(self.locked.lock().unwrap().contains(&principal.to_string()))
     }
 
-    fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
+    fn add_trust_invitation(&self, hash: &[u8; 48], not_after: u64) -> Result<(), DirectoryError> {
         self.invitations.lock().unwrap().insert(*hash, not_after);
         Ok(())
     }
 
-    fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+    fn consume_trust_invitation(&self, hash: &[u8; 48]) -> Result<(), DirectoryError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

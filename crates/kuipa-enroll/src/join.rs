@@ -28,6 +28,7 @@ use tang_pqc::wire::{Reader, Writer};
 use tang_pqc::{ExchangeKey, ExchangeKeyPair, KemAlg, Thumbprint};
 
 use crate::error::{Error, Result};
+use crate::escrow::BindingHash;
 use crate::keytab::{Enctype, Principal};
 use crate::payload::Enrollment;
 use crate::realm::VerifiedRealm;
@@ -53,6 +54,12 @@ pub enum Operation {
     /// `POST /ipa/ku/keys/{kid}`: a Kerberos-authenticated fetch of a
     /// named secret (§18.2).
     Keys,
+    /// `POST /ipa/ku/tlog/{kid}`: a lookup of the caller's own entries in
+    /// the server's transparency log (`DESIGN-tlog.md` §6).
+    Tlog,
+    /// `POST /ipa/ku/sign/{kid}`: a statement that the caller signed some
+    /// digests (`DESIGN-sign.md`).
+    Sign,
 }
 
 impl Operation {
@@ -64,6 +71,8 @@ impl Operation {
             Self::Register => "register",
             Self::Vault => "vault",
             Self::Keys => "keys",
+            Self::Tlog => "tlog",
+            Self::Sign => "sign",
         }
     }
 
@@ -75,7 +84,13 @@ impl Operation {
 
     const fn magic(self) -> [u8; 4] {
         match self {
-            Self::Join | Self::Rekey | Self::Register | Self::Vault | Self::Keys => *b"IPJQ",
+            Self::Join
+            | Self::Rekey
+            | Self::Register
+            | Self::Vault
+            | Self::Keys
+            | Self::Tlog
+            | Self::Sign => *b"IPJQ",
             Self::Stage => *b"IPSQ",
         }
     }
@@ -323,10 +338,27 @@ impl std::fmt::Debug for KerberosBinding {
 /// Length of a [`KerberosBinding`].
 pub const KERBEROS_BINDING_LEN: usize = 32;
 
+/// The length of every channel binding kuipa hands GSS-API.
+pub const CHANNEL_BINDING_LEN: usize = 32;
+
+/// A channel binding from `digest`: its first [`CHANNEL_BINDING_LEN`]
+/// bytes (a SHA-256 digest whole, a SHA-384 one truncated, as SP 800-107
+/// allows).
+///
+/// # Panics
+///
+/// For a digest shorter than a channel binding.
+#[must_use]
+pub fn channel_binding_of(digest: &[u8]) -> [u8; CHANNEL_BINDING_LEN] {
+    let mut cb = [0u8; CHANNEL_BINDING_LEN];
+    cb.copy_from_slice(&digest[..CHANNEL_BINDING_LEN]);
+    cb
+}
+
 /// The GSS-API pseudo-random function input for the [`KerberosBinding`] of
 /// an exchange with channel binding `cb`.
 #[must_use]
-pub fn kerberos_prf_input(cb: &[u8; 32]) -> Vec<u8> {
+pub fn kerberos_prf_input(cb: &[u8; CHANNEL_BINDING_LEN]) -> Vec<u8> {
     [b"ipa-ku-enroll/v1 rsp".as_slice(), cb].concat()
 }
 
@@ -365,7 +397,7 @@ fn response_key(
 /// The sealed part of a request.
 pub(crate) struct RequestBody {
     pub(crate) authenticator: SecretBuf,
-    pub(crate) registrations: Vec<[u8; 32]>,
+    pub(crate) registrations: Vec<BindingHash>,
     pub(crate) extra: Vec<u8>,
 }
 
@@ -378,7 +410,7 @@ impl RequestBody {
             .u8(u8::try_from(self.registrations.len())
                 .map_err(|_| Error::Malformed("too many registrations"))?);
         for r in &self.registrations {
-            w.fixed(r);
+            w.bytes(r);
         }
         w.bytes(&self.extra).bytes(self.authenticator.as_ref());
         Ok(SecretBuf::new(w.finish()))
@@ -389,7 +421,9 @@ impl RequestBody {
         if r.u8()? != auth_type.id() {
             return Err(Error::Malformed("request body"));
         }
-        let registrations = (0..r.u8()?).map(|_| r.fixed()).collect::<Result<_, _>>()?;
+        let registrations = (0..r.u8()?)
+            .map(|_| BindingHash::from_slice(r.bytes()?))
+            .collect::<Result<_>>()?;
         let extra = r.bytes()?.to_vec();
         let authenticator = SecretBuf::from_slice(r.bytes()?);
         r.finish()?;
@@ -542,7 +576,7 @@ impl Prepared {
     pub fn seal(
         mut self,
         authenticator: &[u8],
-        registrations: &[[u8; 32]],
+        registrations: &[BindingHash],
         extra: &[u8],
     ) -> Result<(Request, PendingJoin)> {
         check_binding(self.request.auth_type, self.kerberos.as_ref())?;
@@ -678,6 +712,53 @@ impl PendingJoin {
             return Err(Error::Mismatch("server"));
         }
         crate::keys::KeysAnswer::from_bytes(self.open(response)?.as_ref())
+    }
+
+    /// Finish a `tlog` lookup: decrypt the answer and check it — the head's
+    /// signature and every entry's proof — against the signing key
+    /// `realm` names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], [`Error::Mismatch`]
+    /// for another server or an entry the head does not include, or
+    /// [`Error::UntrustedAnchor`] for a bad head signature.
+    pub fn finish_tlog(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+        policy: &tang_pqc::Policy,
+    ) -> Result<crate::tlog::Answer> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        let answer = crate::tlog::Answer::from_bytes(self.open(response)?.as_ref())?;
+        answer.verify(realm.signer(), policy)?;
+        Ok(answer)
+    }
+
+    /// Finish a signing request: decrypt the answer and make the bundle of
+    /// each digest of `request`, checked against the statement's batch.
+    /// The bundles still verify only against the realm's anchors
+    /// ([`crate::sign::Bundle::verify`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], or [`Error::Mismatch`]
+    /// for another server or an answer that does not cover `request`.
+    pub fn finish_sign(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+        request: &crate::sign::Request,
+    ) -> Result<Vec<crate::sign::Bundle>> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        let answer = crate::sign::Answer::from_bytes(self.open(response)?.as_ref())?;
+        (0..request.digests.len())
+            .map(|i| answer.bundle(request, i))
+            .collect()
     }
 
     /// Finish a join or rekey: decrypt the enrollment, and check it is for

@@ -54,8 +54,8 @@ documented ways (§5).
 **Primitives:** all from OpenSSL via `native-ossl`:
 
 * ML-KEM-768 or ML-KEM-1024 (FIPS 203);
-* ML-DSA-65 or -87 (FIPS 204); ML-DSA-44 only if the client policy allows
-  it;
+* ML-DSA-44, -65 or -87 (FIPS 204); new keys prefer -65, and a CNSA 2.0
+  client policy accepts only -87;
 * HKDF (RFC 5869) with the suite hash `H`;
 * AES-256-GCM;
 * `RAND_priv_bytes`.
@@ -95,8 +95,9 @@ All keys are JOSE `"kty": "AKP"` keys (RFC 9964; §7 has the details).
   `protected ‖ "." ‖ payload`.
 * Signatures with `crit` are ignored.
 * The client `Policy` must be satisfied:
-  * the trusted key's algorithm is allowed (default ML-DSA-65/87;
-    `Policy::cnsa2()` allows only ML-DSA-87);
+  * the trusted key's algorithm is allowed (default ML-DSA-44/65/87;
+    `Policy::cnsa2()` allows only ML-DSA-87, and `Policy::from_system()`
+    narrows the default to what the system crypto policy allows);
   * the signature carries `iat`/`exp`, the advertisement is current within
     the allowed clock skew (default 5 minutes), and `exp − iat` is at most
     the maximum validity (default 30 days). `allow_unexpiring()` exists only

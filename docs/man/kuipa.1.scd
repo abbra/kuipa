@@ -305,6 +305,50 @@ End the vault's session on this host.
 Describe a vault.  *seal list* describes all your vaults;
 *seal revoke VAULT* revokes it: no file sealed to it opens any more.
 
+## tlog watch _VAULT_
+
+Check every server's transparency log for the vault, authenticated
+by your ticket, and list what happened since the last watch: devices
+added and removed, policy changes, sessions, and every release of a
+server's share of a sealed file.  Each server's answer must be signed
+by the key its verified advertisement names and prove every entry, and
+its log must extend the one the last watch saw.  An entry the vault
+descriptor stored on this host does not account for — a device it
+does not list added or acting, a device it lists removed, a policy it
+does not show — is flagged *UNEXPECTED*.  Run *seal show* to accept
+what you did elsewhere.  The first watch of a server sets the baseline
+and flags nothing.  With trusted witnesses (*tlog witnesses*), each
+head needs their cosignatures: one with fewer is *UNWITNESSED*, listed
+but not recorded, so run the watch again after the witnesses' next
+pass.  A server whose log id changed, because its key moved to another
+category with the crypto policy (SHA-256 logs for ML-DSA-65, SHA-384
+for ML-DSA-87), is *NEW LOG*: its new log is read and checked from its
+start.  Exits 1 for a flag, a log that does not extend what was seen
+(*FORKED*), an unwitnessed head, or a server that could not be checked.
+
+## sign blob [--purpose _P_] _FILE_...
+
+Have a realm server state that the principal of your ticket signed the
+files, for purpose _P_ (default *blob*), as the realm's signing policy
+allows; the statement is recorded in the server's transparency log.
+Each file gets a _FILE_*.kusig* bundle.  Files are digested with
+SHA-256, or SHA-384 when the system crypto policy allows only ML-DSA-87
+(CNSA 2.0); a CNSA server refuses SHA-256 digests.  See *kuipa-gitsign*
+for git commits.
+
+## sign verify _FILE_ [--signature _SIG_] [--signer _S_] [--purpose _P_]
+
+Verify _FILE_ against its bundle (default _FILE_*.kusig*) offline, with
+this host's pinned anchors, as of the time it was signed.  Exits 1 for
+another signer or purpose than asked for.
+
+## tlog witnesses [--add _JWK_] [--remove _THUMBPRINT_] [--required _N_]
+
+Show the transparency-log witnesses this host trusts, and how many
+must cosign a head for *tlog watch* to accept it.  As root, trust the
+witness whose public key is _JWK_ (from *kuipa-witness keygen*), stop
+trusting one, or set _N_; _N_ cannot exceed the witnesses trusted.
+
 # ENVIRONMENT
 
 *KUIPA_ENROLLMENT_FILE*
@@ -343,6 +387,10 @@ Describe a vault.  *seal list* describes all your vaults;
 */etc/ipa/ca.crt*
 	The IPA CA chain, used to verify the servers' TLS.
 
+*/etc/ipa/ku-witnesses.json*
+	The transparency-log witnesses this host trusts, and how many
+	must cosign a head (*tlog witnesses*).
+
 */var/lib/ipa-client/ku/state.json*
 	The client's persistent state: machine key, servers,
 	enrollment, protected keytabs and files.
@@ -370,7 +418,8 @@ Describe a vault.  *seal list* describes all your vaults;
 	keytab: the original path with *.sealed* appended.
 
 *~/.local/share/kuipa*
-	A user's device keys and vault state (*seal*).
+	A user's device keys and vault state (*seal*); *vaults/VAULT.tlog*
+	holds what *tlog watch* last verified of each server's log.
 
 # EXIT STATUS
 

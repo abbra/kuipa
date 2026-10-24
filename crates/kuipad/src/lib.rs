@@ -6,6 +6,7 @@ pub mod getkeytab;
 pub mod http;
 pub mod keys;
 pub mod keystore;
+pub mod ledger;
 pub mod limit;
 pub mod peers;
 pub mod tang;

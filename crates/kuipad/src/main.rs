@@ -23,6 +23,9 @@
 //!                                                trust the realm that issued F
 //! kuipad add-voucher-key --file JWK [--config FILE]
 //!                                                accept vouchers under a voucher key (§9)
+//! kuipad add-witness-key --file JWK [--config FILE]
+//!                                                accept the transparency-log cosignatures
+//!                                                of a witness (DESIGN-tlog.md §4)
 //! kuipad tang-keygen [--config FILE]   Tang keys: serve post-quantum Tang
 //!                                                at /ipa/ku/tang; prints the thumbprint
 //! kuipad tang-rotate [--config FILE]   retire the Tang keys, create new ones
@@ -147,7 +150,25 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     )?;
     let info = cfg.realm_info(servers, anchor.as_ref().map(|a| *a.public().thumbprint()))?;
     let ca_certs = info.ca_certs.clone();
-    let server = Arc::new(EnrollServer::new(keys, info, delegation));
+    let ledger = Arc::new(
+        kuipad::ledger::FileLedger::open(
+            &cfg.key_dir,
+            &cfg.realm,
+            &cfg.server,
+            kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg()),
+        )?
+        .with_witnesses(store.witness_keys()?),
+    );
+    eprintln!(
+        "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
+        ledger.id(),
+        ledger.size()
+    );
+    let server = Arc::new(
+        EnrollServer::new(keys, info, delegation)
+            .with_policy(tang_pqc::Policy::from_system()?)
+            .with_ledger(ledger.clone()),
+    );
     let settings = Settings {
         me: cfg.server.clone(),
         realm: cfg.realm.clone(),
@@ -195,22 +216,29 @@ async fn serve(cfg: Config) -> Result<(), Error> {
         limiter: kuipad::limit::Limiter::new(cfg.rate_limit),
         tang,
         keys: keys_service,
+        ledger: Some(ledger),
     }));
 
+    listen(app, &cfg.listen).await
+}
+
+/// Serve `app` on the socket-activated Unix socket, or else on `listen`
+/// (`unix:<path>` or a TCP address).
+async fn listen(app: axum::Router, listen: &str) -> Result<(), Error> {
     let mut fds = listenfd::ListenFd::from_env();
     if let Some(listener) = fds.take_unix_listener(0)? {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(listener)?;
         eprintln!("kuipad: serving on the socket-activated Unix socket");
         axum::serve(listener, app).await?;
-    } else if let Some(path) = cfg.listen.strip_prefix("unix:") {
+    } else if let Some(path) = listen.strip_prefix("unix:") {
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;
         eprintln!("kuipad: serving on {path}");
         axum::serve(listener, app).await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-        eprintln!("kuipad: serving on {}", cfg.listen);
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        eprintln!("kuipad: serving on {listen}");
         axum::serve(listener, app).await?;
     }
     Ok(())
@@ -244,7 +272,7 @@ fn enrollment_string(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), 
 
 /// The anchor's current vouch head (§4.9), from the stored delegation:
 /// the `(size, root)` its own proof's vouch signed.
-fn head_of(store: &KeyStore) -> Result<(u64, [u8; 32]), Error> {
+fn head_of(store: &KeyStore) -> Result<(u64, kuipa_enroll::merkle::Hash), Error> {
     let anchor = *store.anchor()?.public().thumbprint();
     let delegation = store.delegation()?.ok_or("no stored delegation")?;
     delegation.vouch_head(&anchor).ok_or_else(|| {
@@ -295,9 +323,11 @@ fn establish_trust(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Er
             .unwrap_or_else(|_| vec![cfg.server.clone()]),
         anchor.as_ref().map(|a| *a.public().thumbprint()),
     )?;
+    // What the system crypto policy allows, as tang_pqc's default narrows to.
+    let policy = tang_pqc::Policy::from_system()?;
     // The anchors this server's delegation is proven by.
-    info.anchors = delegation.signers(&tang_pqc::Policy::default());
-    let server = EnrollServer::new(keys, info, delegation);
+    info.anchors = delegation.signers(&policy);
+    let server = EnrollServer::new(keys, info, delegation).with_policy(policy);
     let (established, recorded) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -383,6 +413,12 @@ fn run(args: &Args) -> Result<(), Error> {
             for thp in TangKeys::new(&cfg.key_dir).thumbprints()? {
                 println!("{thp}");
             }
+            Ok(())
+        }
+        "add-witness-key" => {
+            let file = args.option("file").ok_or("--file is required")?;
+            println!("{}", store.add_witness_key(&std::fs::read(file)?)?);
+            eprintln!("kuipad: restart the daemon to accept cosignatures by it");
             Ok(())
         }
         "add-voucher-key" => {

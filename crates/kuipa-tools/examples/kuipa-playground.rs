@@ -149,6 +149,27 @@ fn run(args: &[String]) -> Result<(), Error> {
     }
     // The playground realm's administrators allow offline vault sessions.
     directory.limits.lock().unwrap().offline_sessions = true;
+    // And let the release group sign blobs (DESIGN-sign.md); the
+    // administrator is in it.
+    directory.sign_policy.lock().unwrap().purposes.insert(
+        "blob".into(),
+        kuipa_enroll::sign::Signers {
+            groups: vec!["release".into()],
+            ..kuipa_enroll::sign::Signers::default()
+        },
+    );
+    directory.sign_policy.lock().unwrap().purposes.insert(
+        "git-commit".into(),
+        kuipa_enroll::sign::Signers {
+            groups: vec!["release".into()],
+            ..kuipa_enroll::sign::Signers::default()
+        },
+    );
+    directory
+        .groups
+        .lock()
+        .unwrap()
+        .insert(ADMIN.into(), vec!["release".into()]);
     // The secrets transport (§18): ipa1 is the CA and renewal master, as
     // in a fresh IPA deployment, and holds the material a promoting
     // replica would fetch (the DM password hash, the RA agent key, a
@@ -332,6 +353,7 @@ fn start_trusted(
         limiter: kuipad::limit::Limiter::default(),
         tang: None,
         keys: None,
+        ledger: None,
     });
     let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -360,7 +382,7 @@ fn start_servers(
         .map(|(s, u)| format!("{s}={u}"))
         .collect();
 
-    let voucher_key = start_issuer(dir)?;
+    let (voucher_key, witness) = (start_issuer(dir)?, start_witness(dir)?);
 
     // Each server has its own anchor and exchanges it with the other.
     let mut anchors = Vec::new();
@@ -397,7 +419,10 @@ fn start_servers(
             trusts: Vec::new(),
         };
         anchors.push(*anchor.public().thumbprint());
-        let enroll = Arc::new(EnrollServer::new(keys, info, delegation));
+        let key_dir = dir.join(format!("keys-{server}"));
+        let ledger = start_ledger(&key_dir, server, &keys.signing, &witness)?;
+        let enroll =
+            Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
         let others: Vec<usize> = (0..SERVERS.len()).filter(|j| *j != i).collect();
         let settings = Settings {
             me: (*server).into(),
@@ -412,8 +437,6 @@ fn start_servers(
             ca_certs: vec![realm.chain.ca_der.clone()],
             vouch_interval: Duration::ZERO,
         };
-        let key_dir = dir.join(format!("keys-{server}"));
-        std::fs::create_dir_all(&key_dir)?;
         let tang = start_tang(dir, server, &key_dir, &urls[i])?;
         let initiator = Arc::new(KeytabInitiator::new(
             dir.join(format!("kuipa-{server}.keytab"))
@@ -436,6 +459,7 @@ fn start_servers(
             limiter: kuipad::limit::Limiter::default(),
             tang,
             keys: None,
+            ledger: Some(ledger),
         });
         rt.spawn(peers.run());
         rt.spawn(async move { axum::serve(listener, router(app)).await });
@@ -447,6 +471,34 @@ fn start_servers(
         endpoints,
         servers,
     })
+}
+
+/// A transparency-log witness (DESIGN-tlog.md §4) in
+/// `$KUIPA_PLAYGROUND/witness`: its private key (`witness.jwk`, for
+/// `kuipa-witness`) and public key (`witness.pub.jwk`, for audits);
+/// returns the key every server trusts.
+fn start_witness(dir: &Path) -> Result<tang_pqc::VerifyingKey, Error> {
+    let witness = dir.join("witness");
+    std::fs::create_dir_all(&witness)?;
+    let key = SigningKey::generate(SignatureAlg::MlDsa44)?;
+    kuipa_tools::paths::write_file(&witness.join("witness.jwk"), key.to_jwk()?.as_ref(), 0o600)?;
+    std::fs::write(witness.join("witness.pub.jwk"), key.public().to_jwk_json())?;
+    Ok(key.public().clone())
+}
+
+/// `server`'s transparency log, as kuipad keeps it, trusting `witness`;
+/// opening it creates the key directory.
+fn start_ledger(
+    key_dir: &Path,
+    server: &str,
+    signing: &tang_pqc::SigningKey,
+    witness: &tang_pqc::VerifyingKey,
+) -> Result<Arc<kuipad::ledger::FileLedger>, Error> {
+    let alg = kuipa_enroll::merkle::TreeHash::for_signer(signing.public().alg());
+    Ok(Arc::new(
+        kuipad::ledger::FileLedger::open(key_dir, REALM, server, alg)?
+            .with_witnesses(vec![witness.clone()]),
+    ))
 }
 
 /// A voucher issuer (§9) in `$KUIPA_PLAYGROUND/voucher`, with a quota of

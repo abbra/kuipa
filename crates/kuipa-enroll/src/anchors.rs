@@ -33,7 +33,7 @@ use tang_pqc::{Policy, Thumbprint, VerifyingKey, b64, primitives};
 
 use crate::delegation::{Claim, Delegation, SignedSuccession, SignedVouch, VOUCH_VALIDITY};
 use crate::error::{Error, Result};
-use crate::merkle::Hash;
+use crate::merkle::{Hash, TreeHash};
 
 /// How long a claim may wait for a vouch before it is dropped (seconds).
 const UNVOUCHED_GRACE: u64 = 3600;
@@ -72,7 +72,7 @@ pub fn needs_vouch(own: Option<&SignedVouch>, leaves: &[Hash], now: u64, interva
     let mut wanted = leaves.to_vec();
     wanted.sort_unstable();
     wanted.dedup();
-    let mut have = v.leaves().to_vec();
+    let mut have = v.live().to_vec();
     have.sort_unstable();
     have.dedup();
     if have == wanted {
@@ -137,7 +137,8 @@ impl Entry {
                     VerifyingKey::from_jwk_json(jwk.as_bytes())?.thumbprint()
                 )
             }
-            Self::Claim(c) => format!("c {}", b64::encode(&c.leaf()?)),
+            // A local key, not a log leaf: any one hash names the claim.
+            Self::Claim(c) => format!("c {}", b64::encode(&c.leaf(TreeHash::Sha384)?)),
             Self::Vouch(v) => format!("v {}", v.vouch().anchor),
             Self::Succession(s) => {
                 // Also checks that it encodes, for `value`.
@@ -708,13 +709,14 @@ impl Trust {
     }
 
     /// The leaves this server's anchor should vouch for: every trusted
-    /// claim, its own included.
+    /// claim, its own included, hashed with `alg` — the anchor key's
+    /// ([`TreeHash::for_signer`]).
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn leaves(&self) -> Result<Vec<Hash>> {
-        self.servers.values().map(Claim::leaf).collect()
+    pub fn leaves(&self, alg: TreeHash) -> Result<Vec<Hash>> {
+        self.servers.values().map(|c| c.leaf(alg)).collect()
     }
 
     /// This server's delegation: its claim with a proof from every trusted
@@ -766,7 +768,10 @@ pub struct PeerSync {
 }
 
 impl PeerSync {
-    /// The channel binding for the token: a hash of every other field.
+    /// The channel binding for the token: a hash of every other field,
+    /// SHA-384 under every policy (no single key decides it, and both
+    /// servers must agree), taken to the 32 bytes every channel binding
+    /// has.
     ///
     /// # Errors
     ///
@@ -787,15 +792,15 @@ impl PeerSync {
         for c in chain {
             w.bytes(c);
         }
-        Ok(primitives::sha256(&[SYNC_LABEL, &w.finish()])?)
+        let digest = primitives::sha384(&[SYNC_LABEL, &w.finish()])?;
+        Ok(crate::join::channel_binding_of(&digest))
     }
 
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::new(SYNC_MAGIC);
-        w.u8(2)
-            .str(&self.sender)
+        let mut w = Writer::with_version(SYNC_MAGIC, 2);
+        w.str(&self.sender)
             .str(&self.receiver)
             .str(&self.own.to_json())
             .bytes(&self.envelope)
@@ -813,10 +818,7 @@ impl PeerSync {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(buf, SYNC_MAGIC, "peer sync")?;
-        if r.u8()? != 2 {
-            return Err(Error::Malformed("peer sync version"));
-        }
+        let mut r = Reader::with_version(buf, SYNC_MAGIC, 2, "peer sync")?;
         let sender = r.str()?.into();
         let receiver = r.str()?.into();
         let own = Delegation::from_json(r.str()?.as_bytes())?;
@@ -965,7 +967,7 @@ mod tests {
                 .put(Entry::Claim(own.clone()), REALM, &p, NOW, clock)
                 .unwrap();
             let t = Trust::compute(state, &own, attested, all, &p, NOW).unwrap();
-            let leaves = t.leaves().unwrap();
+            let leaves = t.leaves(TreeHash::Sha256).unwrap();
             if self.anchored && needs_vouch(state.vouch(&self.thp()), &leaves, NOW, self.interval) {
                 let iat = next_vouch_iat(state.vouch(&self.thp()), NOW);
                 let previous = state.vouch(&self.thp()).cloned();
@@ -1164,12 +1166,12 @@ mod tests {
         assert!(t.servers().any(|s| s == "b"));
         let v = state.vouch(&a.thp()).unwrap();
         assert_eq!(v.leaves().len(), 1);
-        let leaves = t.leaves().unwrap();
+        let leaves = t.leaves(TreeHash::Sha256).unwrap();
         assert!(!needs_vouch(Some(v), &leaves, NOW + 10, 3600));
         assert!(needs_vouch(Some(v), &leaves, NOW + 3600, 3600));
         // A removal (here a renewed own claim replacing the old one) does
         // not wait.
-        let renewed = [a.claim(NOW + 5).leaf().unwrap()];
+        let renewed = [a.claim(NOW + 5).leaf(TreeHash::Sha256).unwrap()];
         assert!(needs_vouch(Some(v), &renewed, NOW + 10, 3600));
     }
 
@@ -1262,14 +1264,14 @@ mod tests {
             NOW + 100 + DEFAULT_VALIDITY / 3 * 2
         ));
         let v = state.vouch(&a.thp()).unwrap();
-        assert!(!needs_vouch(Some(v), v.leaves(), NOW, 0));
+        assert!(!needs_vouch(Some(v), v.live(), NOW, 0));
         assert!(needs_vouch(
             Some(v),
-            v.leaves(),
+            v.live(),
             v.vouch().iat + VOUCH_VALIDITY / 2,
             0
         ));
-        assert!(needs_vouch(Some(v), &[[9; 32]], NOW, 0));
+        assert!(needs_vouch(Some(v), &[crate::merkle::test_hash(9)], NOW, 0));
 
         // Advertising choice.
         let fresh = Delegation::new(&b.claim(NOW + 200));
@@ -1353,7 +1355,15 @@ mod tests {
             )
             .is_err()
         );
-        let forged = SignedVouch::issue(&b.anchor, REALM, [[1; 32]], NOW, NOW + 100, None).unwrap();
+        let forged = SignedVouch::issue(
+            &b.anchor,
+            REALM,
+            [crate::merkle::test_hash(1)],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
         let mut wrong_key = AnchorState::default();
         wrong_key
             .put(
@@ -1542,8 +1552,9 @@ mod tests {
                 .attest("ipa-ku/b@R", "a", &all, REALM, &policy, NOW)
                 .is_err()
         );
+        // Only version 2 parses.
         let mut tampered = sync.to_bytes();
-        tampered[4] = 2;
+        tampered[4] = 1;
         assert!(PeerSync::from_bytes(&tampered).is_err());
 
         // A server without an anchor sends its claim without a proof;

@@ -330,7 +330,7 @@ impl ServerKeys {
         delegation: &Delegation,
         iat: u64,
         exp: u64,
-        epoch: Option<(u64, [u8; 32])>,
+        epoch: Option<(u64, crate::epoch::EpochHead)>,
     ) -> Result<SignedAdvertisement> {
         let signing = [&self.signing];
         let mut builder = AdvertisementBuilder::new(&signing);
@@ -451,7 +451,7 @@ pub struct VerifiedRealm {
     /// checked against (§2 gate).
     claim: Claim,
     adv: Advertisement,
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, crate::epoch::EpochHead)>,
 }
 
 impl VerifiedRealm {
@@ -477,12 +477,14 @@ impl VerifiedRealm {
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
-        Self::verify_with_heads(adv, realm, anchors, &[], policy, now)
+        Self::verify_with_heads(adv, realm, anchors, &[], &[], policy, now)
     }
 
     /// [`verify`](Self::verify) with the client's pinned vouch heads
-    /// (§4.9): a delegation that carries a head proof for one of them is
-    /// accepted with no signature.  The heads do not replace the pins:
+    /// (§4.9) and the claims their logs retired, as the client learned
+    /// them: a delegation that carries a head proof for one of them, for a
+    /// claim not retired, is accepted with no signature.  The heads do not
+    /// replace the pins:
     /// an expired or absent head falls back to the signature proofs the
     /// advertisement also carries or the client asks for again.
     ///
@@ -494,6 +496,7 @@ impl VerifiedRealm {
         realm: &str,
         anchors: &[Thumbprint],
         heads: &[HeadPin],
+        retired: &[crate::merkle::Hash],
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
@@ -504,7 +507,8 @@ impl VerifiedRealm {
         let proved_heads = parsed.verified_heads(policy, unix_seconds(now));
         let head_proofs = parsed.head_proofs();
         let claim = parsed.claim()?;
-        let delegation = parsed.verify_at_with_heads(anchors, heads, policy, unix_seconds(now))?;
+        let delegation =
+            parsed.verify_at_with_heads(anchors, heads, retired, policy, unix_seconds(now))?;
         if delegation.realm != realm {
             return Err(Error::WrongRealm);
         }
@@ -514,13 +518,13 @@ impl VerifiedRealm {
         if info.realm != delegation.realm || info.server != delegation.server {
             return Err(Error::Mismatch("server identity"));
         }
-        // The epoch head is advisory here: an older server names none,
-        // and a mismatch with what the client stored is the flow's
+        // The epoch head is advisory here: a server with no epoch log yet
+        // names none, and a mismatch with what the client stored is the flow's
         // discovery, not a reason to reject this advertisement.
         let epoch = adv.member(MEMBER_EPOCH).and_then(|v| {
             let seq = v.get("seq")?.as_u64()?;
             let head = b64::decode(v.get("head")?.as_str()?).ok()?;
-            <[u8; 32]>::try_from(head.as_slice())
+            crate::epoch::EpochHead::try_from(head.as_slice())
                 .ok()
                 .filter(|_| seq > 0)
                 .map(|h| (seq, h))
@@ -547,6 +551,16 @@ impl VerifiedRealm {
     #[must_use]
     pub fn server(&self) -> &str {
         &self.delegation.server
+    }
+
+    /// The server signing key, as the verified advertisement carries it:
+    /// what its transparency-log heads and receipts verify with.
+    #[must_use]
+    pub fn signing_key(&self) -> Option<&VerifyingKey> {
+        self.adv
+            .signing_keys()
+            .iter()
+            .find(|k| k.thumbprint() == self.signer())
     }
 
     /// Thumbprint of the server signing key.
@@ -609,7 +623,7 @@ impl VerifiedRealm {
     /// The head of the server's anchor epoch log, if it named one
     /// (§4.8).
     #[must_use]
-    pub fn epoch(&self) -> Option<(u64, [u8; 32])> {
+    pub fn epoch(&self) -> Option<(u64, crate::epoch::EpochHead)> {
         self.epoch
     }
 
@@ -720,7 +734,7 @@ impl VerifiedRealm {
     ///
     /// [`Error::Mismatch`] when the server named an epoch and the
     /// enrollment carries a different one.
-    pub fn check_epoch(&self, epoch: (u64, [u8; 32])) -> Result<()> {
+    pub fn check_epoch(&self, epoch: (u64, crate::epoch::EpochHead)) -> Result<()> {
         if self.epoch.is_some_and(|e| e != epoch) {
             return Err(Error::Mismatch("anchor epoch"));
         }
@@ -1015,11 +1029,11 @@ pub(crate) mod tests {
     fn enrollment_epoch_must_match_the_advertisement() {
         let t = test_realm("ipa1.example.test");
         let v = verified(&t);
-        // This advertisement named no log: any watermark stands (an older
-        // server names none, §4.8).
-        v.check_epoch((7, [1; 32])).unwrap();
+        // This advertisement named no log: any watermark stands (a server
+        // with no epoch log yet names none, §4.8).
+        v.check_epoch((7, [1; 48])).unwrap();
         // One that names a log demands the same watermark.
-        let e = (3, [2; 32]);
+        let e = (3, [2; 48]);
         // Re-sign with an epoch member, as the server's advertisement does.
         let set = t
             .keys
@@ -1035,11 +1049,11 @@ pub(crate) mod tests {
         .unwrap();
         v.check_epoch(e).unwrap();
         assert!(matches!(
-            v.check_epoch((4, [2; 32])),
+            v.check_epoch((4, [2; 48])),
             Err(Error::Mismatch(_))
         ));
         assert!(matches!(
-            v.check_epoch((3, [3; 32])),
+            v.check_epoch((3, [3; 48])),
             Err(Error::Mismatch(_))
         ));
     }
@@ -1222,7 +1236,7 @@ pub(crate) mod tests {
         let head = HeadPin {
             anchor: a,
             size: 3,
-            root: [7; 32],
+            root: crate::merkle::test_hash(7),
         };
         let t = TrustedRealm {
             realm: "B.TEST".into(),
@@ -1280,7 +1294,11 @@ pub(crate) mod tests {
         let vouch = SignedVouch::issue(
             &t.anchor,
             "EXAMPLE.TEST",
-            [t.delegation.claim().unwrap().leaf().unwrap()],
+            [t.delegation
+                .claim()
+                .unwrap()
+                .leaf(crate::merkle::TreeHash::Sha256)
+                .unwrap()],
             now() - 60,
             now() + VOUCH_VALIDITY,
             None,

@@ -488,7 +488,7 @@ mod tests {
             anchors: Vec::new(),
             heads: Vec::new(),
             epoch_seq: 0,
-            epoch_head: [0; 32],
+            epoch_head: [0; 48],
         }
     }
 

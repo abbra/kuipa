@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use agirru_crdt::GenerationClock;
@@ -13,8 +14,12 @@ use kuipa_enroll::join::{
     AuthType, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
+use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
-use kuipa_enroll::server::{Accepted, Directory, DirectoryError, Staged, parse_stage_result};
+use kuipa_enroll::server::{
+    Accepted, Appended, Directory, DirectoryError, Ledger, Staged, parse_stage_result,
+};
+use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, SignedHead, VaultAction, VaultEvent};
 use kuipa_enroll::vault::{
     self, Descriptor, DeviceType, Factors, Level, Recovered, SealedVaultFile, TicketDelegation,
     Unlock, Vault, VaultOp,
@@ -45,8 +50,8 @@ struct MemoryDirectory {
     otps: RefCell<HashMap<String, Vec<u8>>>,
     kvno: RefCell<HashMap<String, u32>>,
     admins: HashSet<String>,
-    escrow: RefCell<HashMap<String, Vec<[u8; 32]>>>,
-    escrow_files: RefCell<HashMap<String, Vec<[u8; 32]>>>,
+    escrow: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
+    escrow_files: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     disabled: RefCell<HashSet<String>>,
     staged: RefCell<HashMap<String, Staged>>,
     vaults: RefCell<HashMap<VaultId, Vault>>,
@@ -59,6 +64,10 @@ struct MemoryDirectory {
     ca_masters: RefCell<Vec<String>>,
     /// The keys operation's secrets, by `namespace id/nickname`.
     key_secrets: RefCell<HashMap<(u8, String), Vec<u8>>>,
+    /// The signing policy (`DESIGN-sign.md`).
+    sign_policy: RefCell<kuipa_enroll::sign::SignPolicy>,
+    /// Groups by principal, as `memberOf` would list them.
+    groups: RefCell<HashMap<String, Vec<String>>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -174,7 +183,7 @@ impl Directory for MemoryDirectory {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), DirectoryError> {
         self.escrow
             .borrow_mut()
@@ -186,7 +195,7 @@ impl Directory for MemoryDirectory {
         &self,
         principal: &Principal,
         kind: Kind,
-        binding: &[u8; 32],
+        binding: &kuipa_enroll::escrow::BindingHash,
     ) -> Result<bool, DirectoryError> {
         let p = principal.to_string();
         let set = match kind {
@@ -200,7 +209,7 @@ impl Directory for MemoryDirectory {
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -298,6 +307,19 @@ impl Directory for MemoryDirectory {
 
     fn vault_limits(&self) -> Result<vault::Limits, DirectoryError> {
         Ok(self.limits.borrow().clone())
+    }
+
+    fn sign_policy(&self) -> Result<kuipa_enroll::sign::SignPolicy, DirectoryError> {
+        Ok(self.sign_policy.borrow().clone())
+    }
+
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        Ok(self
+            .groups
+            .borrow()
+            .get(&principal.to_string())
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
@@ -418,7 +440,9 @@ fn exchange(anchors: &[SigningKey], servers: &[EnrollServer], own: &[Delegation]
         Trust::compute(state, &claims[i], &attested, &members, &policy, now()).unwrap()
     };
     for (i, anchor) in anchors.iter().enumerate() {
-        let leaves = trust(&state, i).leaves().unwrap();
+        let leaves = trust(&state, i)
+            .leaves(TreeHash::for_signer(anchor.public().alg()))
+            .unwrap();
         let vouch = SignedVouch::issue(
             anchor,
             REALM,
@@ -954,7 +978,7 @@ fn register_request(
     adv: &VerifiedRealm,
     caller: &str,
     params: &RegisterParams,
-    bindings: &[[u8; 32]],
+    bindings: &[kuipa_enroll::escrow::BindingHash],
 ) -> (Request, PendingJoin) {
     let p = Prepared::new(
         adv,
@@ -986,7 +1010,7 @@ fn sealed_file_registered_by_its_principal() {
             .ok()
             .and_then(Recovered::into_plain)
     };
-    let seal = |contents: &[u8], retire: Vec<[u8; 32]>| {
+    let seal = |contents: &[u8], retire: Vec<kuipa_enroll::escrow::BindingHash>| {
         let (sealer, registrations) =
             Sealer::prepare(&service, Kind::File, &[&advs[0], &advs[1]]).unwrap();
         let bindings: Vec<_> = registrations.iter().map(|g| g.binding).collect();
@@ -1088,13 +1112,24 @@ fn bindings_open_only_under_what_they_commit_to() {
         })
         .unwrap();
     let req = &seen[0];
-    assert_eq!(req.vault(), &VaultId::machine(&host, Kind::Keytab).unwrap());
+    assert_eq!(
+        req.vault(),
+        &VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap()
+    );
 
     // Eve's own principal and machine vault, where the binding is registered.
-    let eves = renamed(req, &eve, &VaultId::machine(&eve, Kind::Keytab).unwrap());
+    let eves = renamed(
+        req,
+        &eve,
+        &VaultId::machine(&eve, Kind::Keytab, KemAlg::MlKem768).unwrap(),
+    );
     assert!(answer(&eves).is_err());
     // The host's file vault, where the binding is registered too.
-    let file = renamed(req, &host, &VaultId::machine(&host, Kind::File).unwrap());
+    let file = renamed(
+        req,
+        &host,
+        &VaultId::machine(&host, Kind::File, KemAlg::MlKem768).unwrap(),
+    );
     assert!(answer(&file).is_err());
     // A vault that does not exist.
     let none = renamed(req, &host, &VaultId::from_bytes([9; 16]));
@@ -1373,6 +1408,310 @@ fn user_vault_seals_and_opens_under_its_policy() {
 }
 
 /// Run a vault operation as `caller` and keep the whole reply.
+/// A ledger over an in-memory log, as the daemon keeps one on disk.
+#[derive(Debug)]
+struct MemoryLedger {
+    key: [u8; 32],
+    log: Mutex<(Log, Vec<Leaf>)>,
+}
+
+impl MemoryLedger {
+    /// The test servers sign with ML-DSA-65, so their logs are SHA-256.
+    fn new(server: &str) -> Self {
+        let id = LogId::of(REALM, server, TreeHash::Sha256).unwrap();
+        Self {
+            key: [7; 32],
+            log: Mutex::new((Log::new(id), Vec::new())),
+        }
+    }
+
+    fn leaves(&self) -> Vec<Leaf> {
+        self.log.lock().unwrap().1.clone()
+    }
+
+    fn head(&self) -> (Head, Log) {
+        let log = self.log.lock().unwrap().0.clone();
+        (log.head(now()).unwrap(), log)
+    }
+}
+
+impl Ledger for MemoryLedger {
+    fn append(
+        &self,
+        kind: tlog::Kind,
+        subject: &[u8],
+        body: &[u8],
+    ) -> Result<Option<Appended>, DirectoryError> {
+        let leaf = Leaf {
+            kind,
+            time: now(),
+            index: tlog::index(TreeHash::Sha256, &self.key, subject)?,
+            body: body.to_vec(),
+        };
+        let mut log = self.log.lock().unwrap();
+        let index = log.0.append(&leaf)?;
+        log.1.push(leaf.clone());
+        Ok(Some(Appended {
+            log: log.0.id(),
+            index,
+            leaf: leaf.hash()?,
+            time: leaf.time,
+        }))
+    }
+
+    fn signed_head(
+        &self,
+        key: &SigningKey,
+        now: u64,
+    ) -> Result<Option<SignedHead>, DirectoryError> {
+        let log = self.log.lock().unwrap();
+        if log.0.size() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(SignedHead::issue(key, log.0.head(now)?)?))
+    }
+
+    fn find(
+        &self,
+        subject: &[u8],
+        from: u64,
+        size: u64,
+        max: usize,
+    ) -> Result<Vec<tlog::Entry>, DirectoryError> {
+        let index = tlog::index(TreeHash::Sha256, &self.key, subject)?;
+        let log = self.log.lock().unwrap();
+        let size = usize::try_from(size)?;
+        let hashes = &log.0.hashes()[..size];
+        Ok(log.1[..size]
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(from)?)
+            .filter(|(_, l)| l.index == index)
+            .take(max)
+            .map(|(i, l)| tlog::Entry {
+                index: i as u64,
+                leaf: l.clone(),
+                path: kuipa_enroll::merkle::path(hashes, i).unwrap(),
+            })
+            .collect())
+    }
+}
+
+/// A `tlog` lookup by `caller` at server 0, checked by the client.
+fn tlog_lookup(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    caller: &str,
+    query: &tlog::Query,
+) -> Result<tlog::Answer, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Tlog,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &query.to_bytes())
+        .unwrap();
+    let response = r.send(0, Operation::Tlog, &request)?;
+    pending
+        .finish_tlog(&response, adv, &Policy::default())
+        .map_err(|_| ())
+}
+
+/// A ledger whose store has failed.
+#[derive(Debug)]
+struct BrokenLedger;
+
+impl Ledger for BrokenLedger {
+    fn append(
+        &self,
+        _: tlog::Kind,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<Option<Appended>, DirectoryError> {
+        Err("disk full".into())
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn vault_events_are_logged_with_receipts() {
+    let mut r = realm();
+    let ledger = Arc::new(MemoryLedger::new(SERVERS[0]));
+    let first = r.servers.remove(0).with_ledger(ledger.clone());
+    r.servers.insert(0, first);
+    let advs = [r.verify(0), r.verify(1)];
+    let adv = &advs[0];
+    let anchors = r.all_anchors();
+    let log_key = r.servers[0].keys().signing.public().clone();
+    let policy = vault::Policy {
+        factors: Factors {
+            device: Some(Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+
+    let created = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Create {
+            name: "personal".into(),
+            policy,
+        },
+    );
+    let added = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::AddDevice {
+            name: "personal".into(),
+            label: "laptop".into(),
+            kind: DeviceType::File,
+            alg: device.public().alg().id(),
+            key: tang_pqc::b64::encode(device.public().as_bytes()),
+        },
+    );
+    // Reads log nothing.
+    let shown = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Show {
+            name: "personal".into(),
+        },
+    );
+    assert!(shown.receipts.is_empty());
+
+    // Each change has one receipt, signed by the server and proven by the
+    // log's head.
+    let (head, log) = ledger.head();
+    for (reply, index) in [(&created, 0), (&added, 1)] {
+        let [receipt] = reply.receipts.as_slice() else {
+            panic!("one receipt per change");
+        };
+        receipt.verify(&log_key, &Policy::default()).unwrap();
+        assert_eq!(receipt.index, index);
+        assert!(
+            receipt
+                .proven_by(&head, &log.inclusion(index).unwrap())
+                .unwrap()
+        );
+    }
+    let v = added.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    let leaves = ledger.leaves();
+    assert_eq!(leaves[0].kind, tlog::Kind::VAULT_POLICY);
+    assert_eq!(leaves[1].kind, tlog::Kind::VAULT_DEVICE);
+    let event = VaultEvent::from_bytes(&leaves[1].body).unwrap();
+    assert_eq!(event.action, VaultAction::AddDevice);
+    assert_eq!(
+        event.device.as_deref(),
+        Some(v.vault().devices[0].id.as_str())
+    );
+
+    // Opening a sealed file logs the release on the server that answered.
+    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"x").unwrap();
+    let ask = |s: &str, req: &EscrowRequest| {
+        r.servers[usize::from(s == SERVERS[1])]
+            .recover(req, &r.dir)
+            .ok()
+            .map(|a| a.to_bytes())
+    };
+    let mut ticket = |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb));
+    sealed
+        .open(
+            Unlock {
+                device: Some(&device),
+                session: None,
+                ticket: Some(&mut ticket),
+            },
+            ask,
+        )
+        .unwrap();
+    let leaves = ledger.leaves();
+    let release = leaves.last().unwrap();
+    assert_eq!(release.kind, tlog::Kind::ESCROW_RELEASE);
+    let event = VaultEvent::from_bytes(&release.body).unwrap();
+    assert_eq!(event.action, VaultAction::Release);
+    assert_eq!(
+        event.device.as_deref(),
+        Some(v.vault().devices[0].id.as_str())
+    );
+
+    // Every leaf is indexed by the vault, and none names it or its owner.
+    let index = tlog::index(TreeHash::Sha256, &ledger.key, sealed.vault().as_bytes()).unwrap();
+    for leaf in &leaves {
+        assert_eq!(leaf.index, index);
+        let bytes = leaf.to_bytes();
+        for name in [&b"personal"[..], b"alice"] {
+            assert!(!bytes.windows(name.len()).any(|w| w == name));
+        }
+    }
+
+    // The owner looks their vault's entries up, with proofs the client
+    // checks against the head; pages on with `from`.
+    let lookup = |who: &str, vault: &str, from: u64| {
+        tlog_lookup(
+            &r,
+            adv,
+            who,
+            &tlog::Query {
+                vault: vault.into(),
+                from,
+            },
+        )
+    };
+    let answer = lookup(ALICE, "personal", 0).unwrap();
+    assert_eq!(answer.entries.len(), leaves.len());
+    assert_eq!(answer.entries[1].leaf, leaves[1]);
+    assert_eq!(lookup(ALICE, "personal", 2).unwrap().entries.len(), 1);
+    // Nothing is about Alice's principal; Bob cannot look up her vault.
+    assert!(lookup(ALICE, "", 0).unwrap().entries.is_empty());
+    assert!(lookup(BOB, "personal", 0).is_err());
+    // A tampered answer does not verify.
+    let mut forged = answer.clone();
+    forged.entries[0].leaf.body.push(0);
+    assert!(forged.verify(adv.signer(), &Policy::default()).is_err());
+
+    // A server whose ledger fails refuses the change, and does not make
+    // it: the vault is still enabled.
+    let first = r.servers.remove(0).with_ledger(Arc::new(BrokenLedger));
+    r.servers.insert(0, first);
+    assert!(
+        vault_op(
+            &r,
+            adv,
+            ALICE,
+            &VaultOp::Revoke {
+                name: "personal".into()
+            }
+        )
+        .is_err()
+    );
+    let shown = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Show {
+            name: "personal".into(),
+        },
+    );
+    let v = shown.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_eq!(v.vault().state, vault::State::Enabled);
+}
+
 fn vault_reply(r: &Realm, adv: &VerifiedRealm, caller: &str, op: &VaultOp) -> vault::Reply {
     let p = Prepared::new(
         adv,
@@ -1948,4 +2287,112 @@ fn keys_fetch_follows_the_masters_policy() {
         .to_bytes()
         .is_err()
     );
+}
+
+/// A signing request by `caller` at server 0, finished by the client.
+fn sign_as(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    caller: &str,
+    asked: &kuipa_enroll::sign::Request,
+) -> Result<Vec<kuipa_enroll::sign::Bundle>, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Sign,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &asked.to_bytes().unwrap())
+        .unwrap();
+    let response = r.send(0, Operation::Sign, &request)?;
+    pending.finish_sign(&response, adv, asked).map_err(|_| ())
+}
+
+#[test]
+fn signing_is_stated_logged_and_bound_by_policy() {
+    use kuipa_enroll::sign::{Digest, DigestAlg, Request as SignRequest, Signers};
+
+    let mut r = realm();
+    let asked = SignRequest {
+        purpose: "blob".into(),
+        digests: vec![
+            Digest::of(DigestAlg::Sha256, b"release-1.0.tar").unwrap(),
+            Digest::of(DigestAlg::Sha512, b"release-1.0.sig").unwrap(),
+        ],
+    };
+    let adv = r.verify(0);
+    // No log, no statement.
+    r.dir.sign_policy.borrow_mut().purposes.insert(
+        "blob".into(),
+        Signers {
+            users: vec!["alice".into()],
+            groups: vec!["release".into()],
+            ..Signers::default()
+        },
+    );
+    assert!(sign_as(&r, &adv, ALICE, &asked).is_err());
+
+    let ledger = Arc::new(MemoryLedger::new(SERVERS[0]));
+    let first = r.servers.remove(0).with_ledger(ledger.clone());
+    r.servers.insert(0, first);
+    let adv = r.verify(0);
+    let anchors = r.all_anchors();
+    let bundles = sign_as(&r, &adv, ALICE, &asked).unwrap();
+    assert_eq!(bundles.len(), 2);
+    let v = bundles[1]
+        .verify(b"release-1.0.sig", REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_eq!(v.principal.to_string(), ALICE);
+    assert_eq!(
+        (v.purpose.as_str(), v.server.as_str()),
+        ("blob", SERVERS[0])
+    );
+    assert!(
+        bundles[0]
+            .verify(b"release-1.0.sig", REALM, &anchors, &Policy::default())
+            .is_err()
+    );
+
+    // The statement is in the log, under Alice's index, naming nobody.
+    let leaves = ledger.leaves();
+    let leaf = &leaves[usize::try_from(v.index).unwrap()];
+    assert_eq!(leaf.kind, tlog::Kind::STATEMENT);
+    assert_eq!(
+        leaf.index,
+        tlog::index(TreeHash::Sha256, &ledger.key, ALICE.as_bytes()).unwrap()
+    );
+    assert!(!leaf.to_bytes().windows(5).any(|w| w == b"alice"));
+    // Alice finds it with a lookup of her principal's entries.
+    let mine = tlog_lookup(
+        &r,
+        &adv,
+        ALICE,
+        &tlog::Query {
+            vault: String::new(),
+            from: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(mine.entries.len(), 1);
+
+    // Bob may not sign for blob, until he joins the release group; nobody
+    // signs for an unknown purpose; a locked principal signs nothing.
+    assert!(sign_as(&r, &adv, BOB, &asked).is_err());
+    r.dir
+        .groups
+        .borrow_mut()
+        .insert(BOB.into(), vec!["release".into()]);
+    sign_as(&r, &adv, BOB, &asked).unwrap();
+    let other = SignRequest {
+        purpose: "git-commit".into(),
+        ..asked.clone()
+    };
+    assert!(sign_as(&r, &adv, ALICE, &other).is_err());
+    r.dir.disabled.borrow_mut().insert(ALICE.into());
+    assert!(sign_as(&r, &adv, ALICE, &asked).is_err());
 }

@@ -148,6 +148,33 @@ them from a machine that can:
 kuipa seal reseal personal ~/secrets/*.sealed
 ```
 
+### See who touched your vault
+
+Every server records each change to your vault, and each time it hands
+out its share of one of your files, in a public transparency log that it
+cannot rewrite unnoticed. To check it:
+
+```sh
+kuipa tlog watch personal
+```
+
+It lists everything since the last watch, server by server. Anything the
+vault description stored on this machine does not account for is marked
+`UNEXPECTED`: a device you don't know of added, or opening files, or a
+policy you didn't set. If you made the change yourself from another
+machine, `kuipa seal show personal` updates the description, and the
+next watch is clean. A server whose log no longer extends what you saw
+before is reported as `FORKED`, which means its log was rewritten. A
+server that changed to keys of another strength, as a change of the
+crypto policy makes it do, keeps a new log under a new id: that is
+`NEW LOG`, not a fork, and the new log is read and checked from its
+start. The first watch only records where each log stands; run it once soon after
+creating a vault. A periodic job (a systemd user timer, cron) can run it
+for you: it exits non-zero when something needs a look.
+
+The log never names you or your vault, only an opaque index, so anyone
+can audit it without learning whose vault an entry is about.
+
 ### You lost a laptop
 
 Remove its device from the vault, from any other machine (or ask an
@@ -275,7 +302,9 @@ in:
 * **Revoke** a user's vault or one of its devices; disabling the user stops
   all their vaults.
 * **Audit**: every open, unlock, device change and refusal is logged by the
-  server that handled it.
+  server that handled it. Opens, unlocks and changes also go to the
+  server's public transparency log (`/ipa/ku/tlog/`), where owners check
+  them with `kuipa tlog watch`.
 
 The administration commands belong to the FreeIPA integration and are not
 designed in detail yet.

@@ -129,7 +129,7 @@ pub fn signed_heads(adv_json: &[u8], at: u64) -> Vec<HeadPin> {
         .ok()
         .and_then(|adv| adv.unverified_member("delegation").ok().flatten())
         .and_then(|v| Delegation::from_value(v).ok())
-        .map(|d| d.verified_heads(&Policy::default(), at))
+        .and_then(|d| Policy::from_system().ok().map(|p| d.verified_heads(&p, at)))
         .unwrap_or_default()
 }
 
@@ -239,7 +239,7 @@ fn walk(
     let mut complete = false;
     for _ in 0..MAX_PAGES_PER_ANCHOR {
         let page = fetch(from)?;
-        if page.vouch.is_none() {
+        if page.vouch.is_empty() {
             eprintln!("kuipa-mirror: sync: {anchor}: the page head is not signed; not caching");
             return Ok(None);
         }
@@ -249,7 +249,7 @@ fn walk(
         }
         if !heads
             .iter()
-            .any(|h| h.anchor == *a && h.size == page.size && h.root == page.root)
+            .any(|h| h.anchor == *a && h.size == page.size && *h.root == *page.root)
         {
             eprintln!(
                 "kuipa-mirror: sync: {anchor}: the page head is not signed by the advertisement; not caching"
@@ -369,7 +369,11 @@ mod tests {
             retired: Vec::new(),
         };
         let server = EnrollServer::new(keys, info, delegation.clone());
-        let leaf = delegation.claim().unwrap().leaf().unwrap();
+        let leaf = delegation
+            .claim()
+            .unwrap()
+            .leaf(kuipa_enroll::merkle::TreeHash::Sha256)
+            .unwrap();
         let mut vouches = HashMap::new();
         vouches.insert(
             thp,
@@ -379,22 +383,16 @@ mod tests {
         (server, thp)
     }
 
-    fn page(
-        anchor: &str,
-        size: u64,
-        root: [u8; 32],
-        leaves: usize,
-        vouch: Option<String>,
-    ) -> ClaimLogPage {
+    fn page(anchor: &str, size: u64, root: [u8; 32], leaves: usize, vouch: &str) -> ClaimLogPage {
         ClaimLogPage {
             anchor: anchor.to_owned(),
             size,
-            root,
+            root: root.to_vec(),
             exp: unix_seconds(SystemTime::now()) + 3600,
             leaves: (0..leaves)
                 .map(|i| tang_pqc::b64::encode(&[u8::try_from(i).unwrap_or(255); 32]))
                 .collect(),
-            vouch,
+            vouch: vouch.to_owned(),
         }
     }
 
@@ -436,17 +434,9 @@ mod tests {
         let heads = vec![HeadPin {
             anchor: a,
             size: 400_000,
-            root,
+            root: kuipa_enroll::merkle::Hash::from_slice(&root).unwrap(),
         }];
-        let fetch = |_from: u64| {
-            Ok(page(
-                &anchor,
-                400_000,
-                root,
-                MAX_CLAIM_LOG_PAGE,
-                Some("v".into()),
-            ))
-        };
+        let fetch = |_from: u64| Ok(page(&anchor, 400_000, root, MAX_CLAIM_LOG_PAGE, "v"));
         let head = super::walk(&cache, &anchor, &a, &heads, fetch).unwrap();
         assert!(head.is_some(), "the signed head is still the log's head");
         let pages = cache.cached_pages(&anchor);
@@ -466,13 +456,13 @@ mod tests {
         let heads = vec![HeadPin {
             anchor: a,
             size: 4096,
-            root,
+            root: kuipa_enroll::merkle::Hash::from_slice(&root).unwrap(),
         }];
         let fetch = |from: u64| {
             Ok(if from == 0 {
-                page(&anchor, 4096, root, 4096, Some("v".into()))
+                page(&anchor, 4096, root, 4096, "v")
             } else {
-                page(&anchor, 4096, root, 0, Some("v".into()))
+                page(&anchor, 4096, root, 0, "v")
             })
         };
         assert!(
@@ -515,7 +505,7 @@ mod tests {
         // The same page with a tampered root: the advertisement does
         // not sign that head.
         let forged = ClaimLogPage {
-            root: [0xa5; 32],
+            root: vec![0xa5; 32],
             ..genuine.clone()
         };
         let cache = Cache::default();
@@ -528,7 +518,7 @@ mod tests {
 
         // A page whose head is not signed at all.
         let unsigned = ClaimLogPage {
-            vouch: None,
+            vouch: String::new(),
             ..genuine.clone()
         };
         let cache = Cache::default();

@@ -145,7 +145,7 @@ pub async fn advertisement(
         &adv,
         realm,
         anchors,
-        &Policy::default(),
+        &Policy::from_system()?,
         SystemTime::now(),
     )?)
 }
@@ -343,7 +343,7 @@ mod tests {
         HeadPin {
             anchor: Thumbprint::from_bytes([anchor; 32]),
             size,
-            root: [root; 32],
+            root: kuipa_enroll::merkle::Hash::from_slice(&[root; 32]).unwrap(),
         }
     }
 

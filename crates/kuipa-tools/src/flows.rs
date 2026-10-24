@@ -16,19 +16,20 @@ use kuipa_enroll::join::{
 };
 use kuipa_enroll::keys::{KeysFetch, Namespace, WrapAlg};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
+use kuipa_enroll::merkle::Hash;
 use kuipa_enroll::payload::Enrollment;
 use kuipa_enroll::realm::{Deployment, TrustedRealm, VerifiedRealm, krb5_realm_section};
 use kuipa_gssapi::{GssClientCred, GssError};
 use native_ossl::util::SecretBuf;
 use serde_json::{Value, json};
-use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, b64, unix_seconds};
 
 use crate::net::{Endpoint, NetError, Trust};
 use crate::paths::{self, Contents, Error, Holder, Paths, Pin, Protected, State};
 use crate::preauth;
 
 /// The anchor epoch watermark (§4.8): sequence number and head hash.
-type Epoch = (u64, [u8; 32]);
+type Epoch = (u64, kuipa_enroll::epoch::EpochHead);
 
 /// How an online join is authorised.
 pub enum Auth {
@@ -179,6 +180,7 @@ fn quorum_proof(
     realm: &str,
     a: &Thumbprint,
     window: &[HeadPin],
+    retired: &[Hash],
     frozen: bool,
 ) -> Result<VerifiedRealm, String> {
     if frozen {
@@ -191,7 +193,8 @@ fn quorum_proof(
                     realm,
                     std::slice::from_ref(a),
                     window,
-                    &Policy::default(),
+                    retired,
+                    &Policy::from_system().map_err(|e| e.to_string())?,
                     now(),
                 )
                 .map_err(|e| e.to_string())
@@ -205,7 +208,7 @@ fn quorum_proof(
                     &adv,
                     realm,
                     std::slice::from_ref(a),
-                    &Policy::default(),
+                    &Policy::from_system().map_err(|e| e.to_string())?,
                     now(),
                 )
                 .map_err(|e| e.to_string())
@@ -239,12 +242,14 @@ fn count_proof(
 }
 
 /// Fetch and verify one server's advertisement.
+#[allow(clippy::too_many_arguments)] // heads, retired claims and frozen travel with the anchors
 pub(crate) fn verified(
     server: &str,
     trust: &Trust,
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    retired: &[Hash],
     frozen: &[Thumbprint],
     known: Option<Epoch>,
 ) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), String> {
@@ -265,7 +270,8 @@ pub(crate) fn verified(
         realm,
         &pins,
         &wanted_heads,
-        &Policy::default(),
+        retired,
+        &Policy::from_system().map_err(|e| e.to_string())?,
         now(),
     )
     .map_err(|e| {
@@ -296,7 +302,7 @@ pub(crate) fn verified(
             // proof, even a valid one for this very claim, is what the
             // freeze removes.
             let window = window_of(&wanted_heads, a);
-            let proof = quorum_proof(&endpoint, realm, a, &window, frozen.contains(a));
+            let proof = quorum_proof(&endpoint, realm, a, &window, retired, frozen.contains(a));
             match proof {
                 Ok(proof) => {
                     if frozen.contains(a)
@@ -368,8 +374,13 @@ fn watermark_after(
             let mut reached = (seq, hash);
             while reached.0 < theirs {
                 let entries = endpoint.anchor_log(reached.0).map_err(|e| e.to_string())?;
-                reached =
-                    verify_chain(&entries, realm, anchors, Some(reached), &Policy::default())?;
+                reached = verify_chain(
+                    &entries,
+                    realm,
+                    anchors,
+                    Some(reached),
+                    &Policy::from_system().map_err(|e| e.to_string())?,
+                )?;
             }
             if reached != (theirs, theirs_head) {
                 return Err(format!(
@@ -476,8 +487,9 @@ fn exchange(
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    retired: &[Hash],
     frozen: &[Thumbprint],
-    known: Option<(u64, [u8; 32])>,
+    known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
 ) -> Result<(Enrollment, VerifiedRealm), Error> {
@@ -487,6 +499,7 @@ fn exchange(
         realm,
         anchors,
         heads,
+        retired,
         frozen,
         known,
         op,
@@ -507,23 +520,24 @@ pub(crate) fn exchange_with<T>(
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    retired: &[Hash],
     frozen: &[Thumbprint],
-    known: Option<(u64, [u8; 32])>,
+    known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
     finish: impl Fn(PendingJoin, &Response, &VerifiedRealm) -> Result<T, Error>,
 ) -> Result<(T, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        let (endpoint, adv, _) = match verified(server, trust, realm, anchors, heads, frozen, known)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(server = %server, "skipped, trying the next server: {e}");
-                skipped.push(format!("{server}: {e}"));
-                continue;
-            }
-        };
+        let (endpoint, adv, _) =
+            match verified(server, trust, realm, anchors, heads, retired, frozen, known) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(server = %server, "skipped, trying the next server: {e}");
+                    skipped.push(format!("{server}: {e}"));
+                    continue;
+                }
+            };
         check_deployment(server, &adv, deployment)?;
         // Once the advertisement verified, its CA authenticates TLS too.
         let endpoint = if matches!(trust, Trust::FirstContact) && crate::net::uses_tls(server) {
@@ -801,6 +815,10 @@ pub fn enroll_online(
     if deployment.servers.is_empty() {
         return Err("no server given (--server)".into());
     }
+    // What the pinned windows' logs retired (DESIGN-tlog.md §8); none for
+    // pins from an enrollment string.
+    let (_, _, retired, _) = paths::pinned_windows(&paths.anchors())?;
+    let retired = retired.as_slice();
     if anchors.is_empty() {
         return Err("no anchor to verify the realm with".into());
     }
@@ -822,6 +840,7 @@ pub fn enroll_online(
         realm,
         anchors,
         heads,
+        retired,
         frozen,
         None,
         op,
@@ -945,7 +964,7 @@ pub fn enroll_bundle(
         }
         None => paths::read_anchors(paths)?,
     };
-    let verified = Bundle::from_bytes(bundle)?.verify(&anchors, &Policy::default())?;
+    let verified = Bundle::from_bytes(bundle)?.verify(&anchors, &Policy::from_system()?)?;
     let fqdn = verified.bundle().fqdn().to_owned();
     tracing::debug!(
         "bundle verified: {:?} for {fqdn} from {}, valid until {}",
@@ -1020,12 +1039,11 @@ fn pins_to_merge(path: &std::path::Path) -> Result<Vec<paths::Pin>, Error> {
     }
 }
 
-/// Most claim-log pages one window extension reads (§4.9): past this many
-/// the gap between the pinned head and the new one is too wide to check
-/// from the leaves, and the head is not pinned
-/// (DESIGN-claim-logs.md §1.3).  [`MAX_HEAD_FETCH_PAGES`] pages of the
-/// server's page size (`kuipa_enroll::server::MAX_CLAIM_LOG_PAGE` leaves)
-/// cover far more growth than daily re-vouching produces.
+/// The bound on a window extension's log (§4.9), in claim-log pages: a
+/// head naming more leaves than [`MAX_HEAD_FETCH_PAGES`] pages of the
+/// server's page size (`kuipa_enroll::server::MAX_CLAIM_LOG_PAGE`) is not
+/// read, and not pinned (DESIGN-claim-logs.md §1.3) — far more growth
+/// than daily re-vouching produces.
 const MAX_HEAD_FETCH_PAGES: usize = 64;
 
 /// Drop heads that no anchor signature backs (DESIGN-claim-logs.md §4):
@@ -1044,8 +1062,9 @@ fn backed(
     pins: &[paths::Pin],
     heads: &[paths::AnchorHead],
     proved: &[HeadPin],
-) -> Vec<paths::AnchorHead> {
+) -> (Vec<paths::AnchorHead>, Vec<Retired>) {
     let mut out = Vec::with_capacity(heads.len());
+    let mut learned = Vec::new();
     for (anchor, head) in heads {
         let Some((size, root)) = head else {
             out.push((*anchor, None));
@@ -1074,15 +1093,29 @@ fn backed(
                             &adv,
                             realm,
                             std::slice::from_ref(anchor),
-                            &Policy::default(),
+                            &Policy::from_system().ok()?,
                             now(),
                         )
                         .ok()
                     })
                     .is_some_and(|v| v.proved_heads().contains(&want))
             });
-        if signed {
+        // A first head is pinned with what its log retired (DESIGN-tlog.md
+        // §8): unknown retirements would let it prove dropped claims.
+        let retired = if signed {
+            endpoint.and_then(|e| retired_for(e, anchor, *size, root))
+        } else {
+            None
+        };
+        if let Some(retired) = retired {
             out.push((*anchor, Some((*size, *root))));
+            learned.push((*anchor, retired));
+        } else if signed {
+            out.push((*anchor, None));
+            tracing::warn!(
+                anchor = %anchor,
+                "head {size} not pinned: what its claim log retired could not be read (DESIGN-tlog.md §8)"
+            );
         } else {
             // The anchor itself is still pinned — it came from a verified
             // response — only its head is refused.
@@ -1093,26 +1126,61 @@ fn backed(
             );
         }
     }
-    out
+    (out, learned)
 }
 
+/// The claims an anchor's log retired within its head `(size, root)`, a
+/// head the caller trusts: read from the signed vouch the claim-log page
+/// carries, whose entries must make that very root (DESIGN-tlog.md §8).
+/// `None` when the page carries no vouch, or none whose log makes it.
+fn retired_for(
+    endpoint: &Endpoint,
+    anchor: &Thumbprint,
+    size: u64,
+    root: &Hash,
+) -> Option<Vec<Hash>> {
+    served_vouch(endpoint, anchor)?
+        .retired_at(size, root)
+        .ok()
+        .flatten()
+}
+
+/// The signed vouch an anchor's claim-log page carries, with its whole
+/// log; **unverified** — its entries are believed only for making a root
+/// the caller trusts ([`SignedVouch::retired_at`](kuipa_enroll::delegation::SignedVouch::retired_at)).
+fn served_vouch(
+    endpoint: &Endpoint,
+    anchor: &Thumbprint,
+) -> Option<kuipa_enroll::delegation::SignedVouch> {
+    let page = endpoint.claim_log(anchor, 0).ok()?;
+    let bytes = tang_pqc::b64::decode(&page.vouch).ok()?;
+    let vouch = kuipa_enroll::delegation::SignedVouch::from_bytes(&bytes).ok()?;
+    (vouch.vouch().anchor == *anchor).then_some(vouch)
+}
+
+/// One anchor's retired claims, as learned for a head being pinned.
+type Retired = (Thumbprint, Vec<Hash>);
+
 /// Extend the host's pin windows with a verified advertisement's heads
-/// (DESIGN-claim-logs.md §1.3): for every anchor whose new head does
-/// not extend the window, fetch the claim-log pages of the whole log
-/// up to the new head and check that the first `newest` leaves hash
-/// to the pinned root and all of them to the new one — the RFC 9162
-/// consistency check between the two tree sizes, from the leaves
-/// alone.  A head that fails the check is not pinned and the window
-/// keeps what it had; a head whose size is lower (the log restarted)
-/// truncates the window in [`paths::merge_windows`], reported here.
+/// (DESIGN-claim-logs.md §1.3, DESIGN-tlog.md §8): for every anchor whose
+/// new head grows the window, read the head's signed vouch from the
+/// claim-log page — it carries the whole log, claims and tombstones —
+/// and check that its first `newest` entries make the pinned root and
+/// its first `size` the new one: the log provably contains the pinned
+/// history.  The same entries give the claims the new head's log
+/// retired, which join the window with it.  A head that fails is not
+/// pinned and the window keeps what it had.  A head whose size is
+/// lower — a log that no longer contains the pinned history — is refused
+/// by [`paths::merge_windows`] and reported here.
 ///
-/// The walk is bounded: at most [`MAX_HEAD_FETCH_PAGES`] pages, each of
-/// the anchor asked for.  A gap past that budget is not checked, and a
-/// page naming another anchor says nothing about this window.
+/// The check is bounded: a head naming more than
+/// [`MAX_HEAD_FETCH_PAGES`] pages' worth of leaves is not read, and a
+/// vouch by another anchor says nothing about this window.
 fn extend_windows(
     endpoint: &Endpoint,
     pins: &[paths::Pin],
     heads: &[paths::AnchorHead],
+    mut learned: Vec<Retired>,
 ) -> (Vec<paths::Pin>, bool) {
     let mut merged = heads.to_vec();
     for (i, (anchor, head)) in heads.iter().enumerate() {
@@ -1124,7 +1192,7 @@ fn extend_windows(
             continue; // No window yet: the first head needs no check.
         };
         if *size <= newest {
-            continue; // A repeat or a restart: merge_windows decides.
+            continue; // A repeat or a fork: merge_windows decides.
         }
         if *size > MAX_HEAD_FETCH_PAGES as u64 * kuipa_enroll::server::MAX_CLAIM_LOG_PAGE as u64 {
             tracing::warn!(
@@ -1135,88 +1203,35 @@ fn extend_windows(
             merged[i].1 = None;
             continue;
         }
-        let mut leaves = Vec::new();
-        let mut from = 0;
-        let mut pages = 0;
-        let complete = loop {
-            if pages == MAX_HEAD_FETCH_PAGES {
-                tracing::warn!(
-                    anchor = %anchor,
-                    "window not extended: the gap needs more than {MAX_HEAD_FETCH_PAGES} pages to check"
-                );
-                break false;
-            }
-            pages += 1;
-            match endpoint.claim_log(anchor, from) {
-                Ok(page) => {
-                    // A page of another anchor's log says nothing about
-                    // this window: the check cannot go on with it.
-                    if !page
-                        .anchor
-                        .parse::<Thumbprint>()
-                        .is_ok_and(|p| p == *anchor)
-                    {
-                        tracing::warn!(
-                            anchor = %anchor,
-                            "window not extended: the served page names {}",
-                            page.anchor
-                        );
-                        break false;
-                    }
-                    if page.leaves.is_empty() {
-                        break false;
-                    }
-                    for leaf in &page.leaves {
-                        if let Ok(bytes) = tang_pqc::b64::decode(leaf)
-                            && bytes.len() == 32
-                        {
-                            let mut h = [0u8; 32];
-                            h.copy_from_slice(&bytes);
-                            leaves.push(h);
-                        }
-                    }
-                    from += page.leaves.len() as u64;
-                    if from >= *size {
-                        break leaves.len() as u64 == *size;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        anchor = %anchor,
-                        "window not extended: claim log unreachable: {e}"
-                    );
-                    break false;
-                }
-            }
+        let vouch = served_vouch(endpoint, anchor);
+        let at = |n: u64, r: &Hash| {
+            vouch
+                .as_ref()
+                .and_then(|v| v.retired_at(n, r).ok().flatten())
         };
-        let prefix = usize::try_from(newest)
-            .ok()
-            .and_then(|n| leaves.get(..n))
-            .and_then(|l| kuipa_enroll::merkle::root(l).ok())
-            .is_some_and(|r| r == old_root);
-        let consistent =
-            complete && prefix && kuipa_enroll::merkle::root(&leaves).is_ok_and(|r| r == *root);
-        if !consistent {
+        if let (Some(_), Some(retired)) = (at(newest, &old_root), at(*size, root)) {
+            learned.push((*anchor, retired));
+        } else {
             tracing::warn!(
                 anchor = %anchor,
-                "window not extended: the served head does not contain the pinned history"
+                "window not extended: the served log does not contain the pinned history"
             );
             merged[i].1 = None;
         }
     }
-    paths::merge_windows(pins, &merged)
+    paths::merge_windows(pins, &merged, &learned)
 }
 
 /// Merge a verified response's heads into the host's pin file with the
 /// consistency check of [`extend_windows`]: the windows grow only
 /// through pages that provably contain the pinned history
-/// (DESIGN-claim-logs.md §1.3), and a restart is reported.  `issuer` is
+/// (DESIGN-claim-logs.md §1.3), and a log that shrank is reported.  `issuer` is
 /// the server the verified response came from, for the pages and for the
 /// signature backing of a head `proved` does not cover (§4).
 fn write_windows(
     paths: &Paths,
     pins: &[paths::Pin],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     realm: &str,
     issuer: &str,
     heads: &[paths::AnchorHead],
@@ -1236,14 +1251,14 @@ fn write_windows(
     } else {
         None
     };
-    let heads = backed(endpoint.as_ref(), realm, pins, heads, proved);
+    let (heads, learned) = backed(endpoint.as_ref(), realm, pins, heads, proved);
     // With no pins there is nothing to keep consistent: no pages to read.
-    let (pins, restarted) = match (&endpoint, pins.is_empty()) {
-        (Some(endpoint), false) => extend_windows(endpoint, pins, &heads),
-        _ => (paths::merge_windows(pins, &heads).0, false),
+    let (pins, forked) = match (&endpoint, pins.is_empty()) {
+        (Some(endpoint), false) => extend_windows(endpoint, pins, &heads, learned),
+        _ => (paths::merge_windows(pins, &heads, &learned).0, false),
     };
     paths::write_anchor_pins(&paths.anchors(), "kuipa realm anchors", &pins, epoch)?;
-    Ok(restarted)
+    Ok(forked)
 }
 
 /// Advertisements of every server of the realm that answers and describes
@@ -1254,6 +1269,7 @@ pub(crate) fn all_servers(
     trust: &Trust,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
+    retired: &[Hash],
     frozen: &[Thumbprint],
 ) -> Vec<VerifiedRealm> {
     let deployment = Deployment::servers(&state.servers);
@@ -1261,10 +1277,19 @@ pub(crate) fn all_servers(
         .servers
         .iter()
         .filter_map(|s| {
-            verified(s, trust, &state.realm, anchors, heads, frozen, None)
-                .ok()
-                .map(|(_, v, _)| v)
-                .filter(|v| check_deployment(s, v, &deployment).is_ok())
+            verified(
+                s,
+                trust,
+                &state.realm,
+                anchors,
+                heads,
+                retired,
+                frozen,
+                None,
+            )
+            .ok()
+            .map(|(_, v, _)| v)
+            .filter(|v| check_deployment(s, v, &deployment).is_ok())
         })
         .collect()
 }
@@ -1279,7 +1304,7 @@ pub(crate) fn all_servers(
 pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
     let holder = protect.unwrap_or(state.holder);
-    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm);
@@ -1296,7 +1321,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     let (sealer, registrations) = if holder == Holder::None {
         (None, Vec::new())
     } else {
-        let servers = all_servers(&state, &trust, &anchors, &heads, &frozen);
+        let servers = all_servers(&state, &trust, &anchors, &heads, &retired, &frozen);
         let refs: Vec<_> = servers.iter().collect();
         let (sealer, registered) = Sealer::prepare(&principal, Kind::Keytab, &refs)?;
         tracing::debug!(
@@ -1319,6 +1344,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         &state.realm,
         &anchors,
         &heads,
+        &retired,
         &frozen,
         known,
         Operation::Rekey,
@@ -1355,7 +1381,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         .copied()
         .zip(enrollment.heads.iter().copied())
         .collect::<Vec<_>>();
-    let restarted = write_windows(
+    let forked = write_windows(
         paths,
         &pins_to_merge(&paths.anchors())?,
         epoch,
@@ -1364,9 +1390,9 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         &heads,
         adv.proved_heads(),
     )?;
-    if restarted {
+    if forked {
         tracing::warn!(
-            "an anchor restarted its claim log: the realm removed something; the window starts fresh"
+            "an anchor's claim log no longer extends the pinned window: its head is not pinned"
         );
     }
     let mut servers = vec![enrollment.config.issuer.clone()];
@@ -1588,7 +1614,7 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
         nickname: nickname.to_owned(),
         alg,
     };
-    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm);
@@ -1603,6 +1629,7 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
         &state.realm,
         &anchors,
         &heads,
+        &retired,
         &frozen,
         known,
         Operation::Keys,
@@ -1656,7 +1683,9 @@ fn kind_of(contents: Contents) -> Kind {
 
 /// The bindings of the seal in `sealed`, to retire; none if it is gone or
 /// unreadable.
-fn sealed_bindings(sealed: &std::path::Path) -> Result<Vec<[u8; 32]>, Error> {
+fn sealed_bindings(
+    sealed: &std::path::Path,
+) -> Result<Vec<kuipa_enroll::escrow::BindingHash>, Error> {
     Ok(fs::read(sealed)
         .ok()
         .and_then(|b| Sealed::from_bytes(&b).ok())
@@ -1686,9 +1715,9 @@ fn register(
     state: &State,
     keytab: &std::path::Path,
     params: &RegisterParams,
-    bindings: &[[u8; 32]],
+    bindings: &[kuipa_enroll::escrow::BindingHash],
 ) -> Result<String, Error> {
-    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let cred = GssClientCred::from_keytab_initiate(
@@ -1709,6 +1738,7 @@ fn register(
         &state.realm,
         &anchors,
         &heads,
+        &retired,
         &frozen,
         known,
         Operation::Register,
@@ -1778,9 +1808,9 @@ fn protect_other(
         _ => Vec::new(),
     };
 
-    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let trust = ca_trust(paths)?;
-    let servers = all_servers(&state, &trust, &anchors, &heads, &frozen);
+    let servers = all_servers(&state, &trust, &anchors, &heads, &retired, &frozen);
     let refs: Vec<_> = servers.iter().collect();
     let (sealer, registrations) = Sealer::prepare(&principal, kind_of(contents), &refs)?;
     let bindings: Vec<_> = registrations.iter().map(|r| r.binding).collect();
@@ -2021,7 +2051,7 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
     let state = State::load(paths)?;
     // The whole window travels and the frozen anchors are named: §1.4 and
     // §2 are enforced here, not left to what the server happens to serve.
-    let (anchors, heads, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm).to_string();
@@ -2040,6 +2070,7 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
             &state.realm,
             &anchors,
             &heads,
+            &retired,
             &frozen,
             known,
         )
@@ -2124,7 +2155,8 @@ pub fn advertisements(
     let trust = Trust::FirstContact;
     let mut servers = Vec::new();
     for server in &deployment.servers {
-        let detail = match verified(server, &trust, realm, anchors, heads, &[], None).and_then(
+        // Read-only: what is shown is not pinned, so no retired claims.
+        let detail = match verified(server, &trust, realm, anchors, heads, &[], &[], None).and_then(
             |(endpoint, adv, _)| {
                 adv.check_deployment(deployment)
                     .map(|()| (endpoint, adv))
@@ -2319,7 +2351,7 @@ fn advertisement_detail(
         // `<seq> <hash>` form.
         "anchor_log_head": adv
             .epoch()
-            .map_or_else(String::new, |(seq, head)| format!("{seq} {}", Thumbprint::from_bytes(head))),
+            .map_or_else(String::new, |(seq, head)| format!("{seq} {}", b64::encode(&head))),
         "landmarks": landmarks,
     }))
 }
@@ -2339,9 +2371,9 @@ fn landmark_chain(
     let Some((head_seq, head)) = adv.epoch() else {
         return Ok(Vec::new());
     };
-    let policy = Policy::default();
+    let policy = Policy::from_system().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    let mut reached: Option<(u64, [u8; 32])> = None;
+    let mut reached: Option<(u64, kuipa_enroll::epoch::EpochHead)> = None;
     while reached != Some((head_seq, head)) {
         let page = endpoint
             .anchor_log(reached.map_or(0, |(seq, _)| seq))
@@ -2359,11 +2391,10 @@ fn landmark_chain(
                 .map_err(|_| "the anchor log is malformed".to_string())?;
             out.push(json!({
                 "seq": epoch.seq(),
-                "head": Thumbprint::from_bytes(
-                    epoch.head().map_err(|_| "cannot hash the anchor log".to_string())?,
-                )
-                .to_string(),
-                "prev": Thumbprint::from_bytes(epoch.prev()).to_string(),
+                "head": b64::encode(
+                    &epoch.head().map_err(|_| "cannot hash the anchor log".to_string())?,
+                ),
+                "prev": b64::encode(&epoch.prev()),
                 "anchors": epoch
                     .anchors()
                     .iter()
@@ -2407,12 +2438,15 @@ pub fn realm_info(
 ) -> Result<Value, Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
+        // Before enrollment: the heads come from the enrollment string,
+        // and nothing is known of what their logs retired.
         match verified(
             server,
             &Trust::FirstContact,
             realm,
             anchors,
             heads,
+            &[],
             &[],
             None,
         ) {
@@ -2493,7 +2527,7 @@ fn install_trust(
         .filter(|h| t.anchors.contains(&h.anchor))
         .map(|h| (h.anchor, Some((h.size, h.root))))
         .collect();
-    let backed_heads = backed(
+    let (backed_heads, learned) = backed(
         Some(endpoint),
         &t.realm,
         &previous,
@@ -2509,14 +2543,15 @@ fn install_trust(
                 exp: None,
                 heads: Vec::new(),
                 frozen: false,
+                retired: Vec::new(),
             });
         }
     }
-    let (pins, restarted) = paths::merge_windows(&pins, &backed_heads);
-    if restarted {
+    let (pins, forked) = paths::merge_windows(&pins, &backed_heads, &learned);
+    if forked {
         tracing::warn!(
             realm = %t.realm,
-            "a trusted anchor restarted its claim log: the realm removed something; the window starts fresh"
+            "a trusted anchor's claim log no longer extends the pinned window: its head is not pinned"
         );
     }
     paths::write_anchor_pins(
@@ -2564,6 +2599,12 @@ fn refresh_trust(
     // (DESIGN-claim-logs.md §3).  Only heads for anchors B lists,
     // whatever the wire carried.
     let heads = t.pins();
+    // What this host learned B's logs retired, from its installed pins.
+    let retired: Vec<Hash> = match paths::read_anchor_pins(&paths.trust_anchors(&t.realm)) {
+        Ok(pins) => pins.into_iter().flat_map(|p| p.retired).collect(),
+        Err(e) if paths::is_missing(&e) => Vec::new(),
+        Err(e) => return Err(e),
+    };
     let found = if errors.is_empty() {
         t.servers.iter().find_map(|s| {
             match verified(
@@ -2572,6 +2613,7 @@ fn refresh_trust(
                 &t.realm,
                 &t.anchors,
                 &heads,
+                &retired,
                 &[],
                 None,
             ) {
@@ -2631,7 +2673,7 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
     let state = State::load(paths)?;
     // This host's own pins, windows and freezes included: the fetch of
     // its own realm is verified under them like any other (§1.4, §2).
-    let (anchors, own_heads, own_frozen) = paths::pinned_windows(&paths.anchors())?;
+    let (anchors, own_heads, own_retired, own_frozen) = paths::pinned_windows(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let mut skipped = Vec::new();
     let own = state
@@ -2644,6 +2686,7 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
                 &state.realm,
                 &anchors,
                 &own_heads,
+                &own_retired,
                 &own_frozen,
                 None,
             ) {

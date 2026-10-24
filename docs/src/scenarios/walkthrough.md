@@ -311,6 +311,56 @@ decides with the calendar. Adding this host's device key lists it under
 (`token=playground-user` back on standard output), and a wrong
 passphrase is refused: `kuipa seal: wrong passphrase`.
 
+Each of those steps went into the transparency log of the server that
+handled it. `kuipa tlog watch personal` checks every server's log for
+the vault. The first watch lists the history and only records where
+each log stands:
+
+```
+        ok  ipa1.example.test #0 at 2026-10-24 12:30:16 UTC: create
+        ok  ipa1.example.test #1 at 2026-10-24 12:30:16 UTC: add-device device L_LxP5xhTXsQXtHSYqZqQIyZBjoFUtliO4nZOqL0UMk
+        ok  ipa1.example.test #2 at 2026-10-24 12:30:16 UTC: release device L_LxP5xhTXsQXtHSYqZqQIyZBjoFUtliO4nZOqL0UMk
+  baseline  ipa1.example.test: first watch, history not flagged
+Vault personal: 0 unexpected.
+```
+
+ipa2 handled nothing for this vault, so its log is empty and the watch
+has nothing to list from it. A second device registered from another
+data directory (`KUIPA_USER_DIR=…/admin-laptop`) is not in the vault
+description this host stored, so the next watch flags it and exits 1:
+
+```
+UNEXPECTED  ipa1.example.test #3 at 2026-10-24 12:30:17 UTC: add-device device hjrpLcMII4mUXrCDd8os2VrTEeXa1rwbAERAd0yzhjo (a device the stored descriptor does not list)
+Vault personal: 1 unexpected.
+```
+
+`kuipa seal show personal` stores the current description, which
+accepts the device. The next watch is clean, and the next open shows up
+as one more `release`.
+
+An auditor with no account replays a server's whole log from its public
+routes with `kuipa-audit tlog --server ipa1.example.test --state FILE`.
+It checks the head against the key ipa1's verified advertisement names,
+replays every leaf, and counts them by kind (`vault-device`,
+`escrow-release` and so on), without learning whose vault any of them
+concerns. Run again later, it requires the log to extend the head it
+recorded.
+
+The playground also runs a witness, whose key both servers trust
+(`kuipad add-witness-key` on a real server). `kuipa-witness run --once`
+cosigns each server's head that extends the last one it cosigned, and
+posts the cosignature back. ipa1's served head then carries it, and
+`kuipa-audit tlog --witness …/witness.pub.jwk` reports `cosigned by: 1`.
+A second pass finds nothing new (`unchanged`).
+
+Once the host trusts the witness and requires its cosignature
+(`kuipa tlog witnesses --add …/witness.pub.jwk --required 1`), the next
+open grows ipa1's log, and its re-signed head has no cosignature yet.
+The watch lists the new release, reports
+`UNWITNESSED  ipa1.example.test: 0 of 1 cosignatures`, and exits 1
+without recording the head. After the witness's next pass, the same
+watch is clean.
+
 A second vault allows hour-long sessions and ten unlocks
 (`--session-hours 1 --max-unlocks 10`, shown as `unlocks allowed: 10`
 and `longest session (seconds): 3600`). One unlock — passphrase and

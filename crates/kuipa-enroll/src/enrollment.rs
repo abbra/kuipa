@@ -24,6 +24,7 @@ use tang_pqc::Thumbprint;
 
 use crate::delegation::{CLOCK_SKEW, HeadPin};
 use crate::error::{Error, Result};
+use crate::merkle::Hash;
 use tang_pqc::b64;
 
 const PREFIX: &str = "ipa-ku1";
@@ -35,7 +36,7 @@ pub struct EnrollmentString {
     realm: String,
     anchor: Thumbprint,
     exp: u64,
-    head: Option<(u64, [u8; 32])>,
+    head: Option<(u64, Hash)>,
     secret: Option<Secret>,
 }
 
@@ -76,7 +77,7 @@ impl EnrollmentString {
     pub fn with_head(
         realm: &str,
         anchor: Thumbprint,
-        head: Option<(u64, [u8; 32])>,
+        head: Option<(u64, Hash)>,
         exp: u64,
         secret: Option<Secret>,
     ) -> Self {
@@ -134,7 +135,7 @@ impl EnrollmentString {
             let root = fields
                 .next()
                 .and_then(|r| b64::decode(r).ok())
-                .and_then(|r| <[u8; 32]>::try_from(r).ok())
+                .and_then(|r| Hash::from_slice(&r).ok())
                 .ok_or_else(malformed)?;
             Some((size, root))
         } else {
@@ -269,7 +270,8 @@ mod tests {
 
     #[test]
     fn round_trip_with_a_head() {
-        let root = [7; 32];
+        // A SHA-384 root: the string carries either length.
+        let root = Hash::from_slice(&[7; 48]).unwrap();
         let s = EnrollmentString::with_head(
             "EXAMPLE.TEST",
             thp(),
