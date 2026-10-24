@@ -14,12 +14,30 @@ printing `✓` for what it found and `○` for what is missing:
 | --- | --- |
 | `cargo` | everything |
 | `rustfmt`, `clippy` | the `fmt` and `clippy` jobs |
-| OpenSSL ≥ 3.5, krb5 and OpenLDAP development files | building (Fedora: `openssl-devel krb5-devel openldap-devel clang-devel`) |
-| `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` (MIT krb5 1.22 or later), MIT `pkinit.so` | `kdc-test`, `playground-test` and `interactive` (Fedora: `krb5-server krb5-workstation krb5-pkinit`) |
+| OpenSSL ≥ 3.5, krb5 and OpenLDAP development files, libclang | building (Fedora: `openssl-devel krb5-devel openldap-devel clang-devel`; bindgen needs libclang for native-ossl-sys) |
+| `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` (MIT krb5 1.22 or later), MIT `pkinit.so` | `kdc-test`, `playground-test` and `interactive` (Fedora: `krb5-server krb5-workstation krb5-pkinit`; macOS: `brew install krb5`, whose keg `bin`/`sbin` the script puts first on `PATH`) |
 | `python3` | `playground-test`, to render its report |
 | `rustup` with the MSRV toolchain | `msrv` (`rustup toolchain install 1.89`) |
 | `valgrind` | `--valgrind` only |
 | `actionlint` (or `yamllint` as a fallback) | `lint-workflows`; skipped with a warning if neither is installed |
+| Homebrew `heimdal` (macOS) | optional: a `KUIPA_KRB5_VENDOR=heimdal` build; the script adds only its `pkg-config` directory, never its `bin`, so the MIT KDC tools stay in front on `PATH` |
+
+## Kerberos vendor
+
+`KUIPA_KRB5_VENDOR=mit|heimdal` selects the Kerberos implementation the build
+scripts compile against; unset or `auto` means MIT when both are installed.
+The script validates the value up front — a typo fails before anything
+compiles — and exports it, so every job in one run sees the same vendor.
+
+The realms `kdc-test`, `playground-test` and `interactive` create are MIT
+ones (`kdb5_util`, `kadmin.local`, MIT's `pkinit.so`), so a Heimdal build
+cannot drive them: those three jobs report `SKIP` with that reason instead of
+failing, and `interactive` — which is not a job — fails outright. Everything
+else, including `test`, runs under either vendor.
+
+```sh
+KUIPA_KRB5_VENDOR=heimdal ./contrib/ci/local-ci.sh build clippy test
+```
 
 ## Running CI jobs
 
@@ -38,8 +56,8 @@ printing `✓` for what it found and `○` for what is missing:
 | `clippy` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` (includes the denied `incompatible_msrv` lint) | `build` |
 | `doc` | `cargo doc --workspace --no-deps --all-features`, with `RUSTDOCFLAGS=-D warnings` | `build` |
 | `test` | `cargo test --workspace --all-features`, without the real-KDC tests | `build` |
-| `kdc-test` | `cargo test -p kuipa-tools --test kdc --test trust --test voucher` with `KUIPA_REQUIRE_KDC=1`, so missing KDC tools fail the job instead of skipping the tests | `build` |
-| `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report/` (see below) | `build` |
+| `kdc-test` | `cargo test -p kuipa-tools --test kdc --test trust --test voucher` with `KUIPA_REQUIRE_KDC=1`, so missing KDC tools fail the job instead of skipping the tests; `SKIP` (not `FAIL`) under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
+| `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report/` (see below); `SKIP` under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
 | `msrv` (opt-in) | `cargo build --workspace --all-targets` with the `rust-version` toolchain | |
 
 Dependencies are run on demand: `local-ci.sh clippy` builds first. Inside
