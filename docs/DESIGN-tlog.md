@@ -15,7 +15,7 @@ hold such events, and the order in which it replaces the claim log.
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented (the cosign step) |
 | 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
 | 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow and Keys events, with receipts and lookups |
-| 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | planned |
+| 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | `kuipa tlog watch` implemented; the others planned |
 | 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
 
 ## 1. Typed leaves
@@ -193,11 +193,41 @@ A tlog-tiles layout, a C2SP signed-note checkpoint encoding, and a
 witness endpoint come with interoperable witnesses, once the ML-DSA note
 format is settled.
 
-## 7, 8. Next
+## 7. `kuipa tlog watch`
 
-* **Clients.** `kuipa tlog watch` flags device and escrow events the user
-  did not cause. `kuipa-audit tlog` checks consistency and tombstones.
-  `kuipa-mirror --witness` cosigns.
+An owner's monitor, run as the user with their ticket. For each server
+the host's `realm.json` lists, it does three things:
+- **Look up.** It runs `tlog` lookups for the vault from the size the
+  last watch saw, paging on `from`. `finish_tlog` checks each answer.
+- **Check the log extends.** The new head must extend the one last
+  seen: the same root at the same size, or a consistency proof from
+  `GET …/consistency` otherwise. A smaller log, an empty one, or another
+  server's log id counts as **forked**. The state is not advanced
+  past a fork.
+- **List and flag.** It lists every new entry, and flags those the vault
+  descriptor stored on this host does not account for:
+  - a device it does not list added, or starting a session or receiving
+    a release;
+  - a device it lists removed;
+  - a policy digest other than its policy's;
+  - a revocation while it shows the vault enabled.
+
+The first watch of a server is a baseline: history is listed, not
+flagged. `vaults/<name>.tlog` in the user's directory keeps, per server,
+the log id, size and root last verified. An unreadable state file is an
+error, not a fresh baseline, so a corrupted file cannot silence a watch.
+The result's `ok` is false for any flag, any fork, or any server that
+could not be checked, so the command exits non-zero, which suits a timer.
+
+What it cannot see: an entry a server leaves out of its answers (§6).
+It flags against the stored descriptor, so a change the owner made from
+another host is flagged until `kuipa seal show` stores the new
+descriptor.
+
+## 8. Next
+
+* **Clients.** `kuipa-audit tlog` checks consistency and tombstones over
+  the public log. `kuipa-mirror --witness` cosigns.
 * **Migration.** Claims are appended as kind-1 leaves, and a dropped
   claim becomes a tombstone instead of a restart. IPVH/IPSV are kept for
   pinned hosts until their windows age out.

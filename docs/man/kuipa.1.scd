@@ -305,6 +305,21 @@ End the vault's session on this host.
 Describe a vault.  *seal list* describes all your vaults;
 *seal revoke VAULT* revokes it: no file sealed to it opens any more.
 
+## tlog watch _VAULT_
+
+Check every server's transparency log for the vault, authenticated
+by your ticket, and list what happened since the last watch: devices
+added and removed, policy changes, sessions, and every release of a
+server's share of a sealed file.  Each server's answer must be signed
+by the key its verified advertisement names and prove every entry, and
+its log must extend the one the last watch saw.  An entry the vault
+descriptor stored on this host does not account for — a device it
+does not list added or acting, a device it lists removed, a policy it
+does not show — is flagged *UNEXPECTED*.  Run *seal show* to accept
+what you did elsewhere.  The first watch of a server sets the baseline
+and flags nothing.  Exits 1 for a flag, a log that does not extend what
+was seen (*FORKED*), or a server that could not be checked.
+
 # ENVIRONMENT
 
 *KUIPA_ENROLLMENT_FILE*
@@ -370,7 +385,8 @@ Describe a vault.  *seal list* describes all your vaults;
 	keytab: the original path with *.sealed* appended.
 
 *~/.local/share/kuipa*
-	A user's device keys and vault state (*seal*).
+	A user's device keys and vault state (*seal*); *vaults/VAULT.tlog*
+	holds what *tlog watch* last verified of each server's log.
 
 # EXIT STATUS
 
