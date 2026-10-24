@@ -178,6 +178,13 @@ pub enum GssError {
     /// `detail` says which method was wanted and why it could not be had.
     #[error("pre-authentication: {detail}")]
     Preauth { detail: String },
+
+    /// The Kerberos library this build is linked against has no equivalent of
+    /// `feature`.  Heimdal lacks MIT's credential-store, S4U2Self, responder
+    /// and thread-local-ccache extensions; builds that ask for one of them
+    /// fail here rather than half-working.
+    #[error("{feature} is not supported by the Kerberos library this build uses")]
+    Unsupported { feature: &'static str },
 }
 
 const GSS_S_CALL_INACCESSIBLE_READ: OmUint32 = 0x01000000;

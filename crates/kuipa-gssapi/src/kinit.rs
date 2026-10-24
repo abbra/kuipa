@@ -1,9 +1,8 @@
 //! An armoured AS exchange in process, with its own Kerberos configuration
 //! file: what `kinit -n` followed by `kinit -T` does, without touching
-//! `KRB5_CONFIG` or the default credential cache — and, like `kinit`, with
-//! every pre-authentication method the KDC offers, not only a password.
+//! `KRB5_CONFIG` or the default credential cache.
 //!
-//! # Pre-authentication
+//! # Pre-authentication, with MIT Kerberos
 //!
 //! [`ticket`] registers two libkrb5 callbacks:
 //!
@@ -28,6 +27,25 @@
 //! Both send every prompt and every line of a challenge through
 //! [`Preauth`], so the caller decides where a question is asked.  Answers
 //! are never traced.
+//!
+//! # Pre-authentication, with Heimdal
+//!
+//! Heimdal's libkrb5 has no responder callbacks, so [`ticket`] drives its
+//! step-by-step credential API instead: an anonymous PKINIT exchange for the
+//! FAST armour, then `krb5_init_creds_init` with the prompter below.
+//!
+//! * a **password**, asked through [`Preauth`] before the exchange starts,
+//!   since Heimdal's step API never prompts for the long-term password itself;
+//!   a secret the caller brought is used as is, and nothing is asked.
+//! * the **prompter**, which answers the expiration notices of
+//!   `krb5_process_last_request` and whatever a plugin asks for.
+//!
+//! What that leaves on the shelf, in a build against Heimdal: the OTP, IdP
+//! and RADIUS methods and the passkey and PKINIT client plugins have no
+//! responder to answer their questions, and their formats are MIT's, not
+//! Heimdal's; there are no thread-local credential caches and no S4U2Self.
+//! Password and anonymous-PKINIT FAST armoring — what enrollment needs —
+//! work.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -44,6 +62,8 @@ use crate::ffi;
 struct Context(ffi::Krb5Context);
 
 impl Context {
+    /// A context that reads `config` and nothing else.
+    #[cfg(mit_kerberos)]
     fn from_file(config: &Path) -> Result<Self, GssError> {
         let path = CString::new(config.as_os_str().as_encoded_bytes())
             .map_err(|_| GssError::NulInConfigPath)?;
@@ -71,6 +91,35 @@ impl Context {
             });
         }
         Ok(Self(ctx))
+    }
+
+    /// A context that reads `config` and nothing else.
+    ///
+    /// Heimdal has no profile handles: the list is given to a plain context,
+    /// which takes it as a NULL-terminated array of paths and re-reads the
+    /// defaults and realms from it.
+    #[cfg(heimdal_kerberos)]
+    fn from_file(config: &Path) -> Result<Self, GssError> {
+        let path = CString::new(config.as_os_str().as_encoded_bytes())
+            .map_err(|_| GssError::NulInConfigPath)?;
+        let mut ctx: ffi::Krb5Context = ptr::null_mut();
+        // SAFETY: ctx is a valid output pointer.
+        let ret = unsafe { ffi::krb5_init_context(&raw mut ctx) };
+        if ret != 0 {
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_init_context",
+            });
+        }
+        let ctx = Self(ctx);
+        // SAFETY: `paths` is NULL-terminated and both it and the string it
+        // points into outlive the call; Heimdal copies the paths it keeps.
+        let ret = unsafe {
+            let mut paths: [*mut c_char; 2] = [path.as_ptr().cast_mut(), ptr::null_mut()];
+            ffi::krb5_set_config_files(ctx.0, paths.as_mut_ptr())
+        };
+        ctx.check(ret, "krb5_set_config_files")?;
+        Ok(ctx)
     }
 
     /// `Err` with libkrb5's message for `code`, if it is not zero.
@@ -129,6 +178,7 @@ impl Context {
     /// for `service` (`None`: the TGS), with `opt`; the credentials go to
     /// the options' output ccache.  With `answers`, the exchange asks the
     /// caller's front end for anything the KDC requests.
+    #[cfg(mit_kerberos)]
     fn init_creds(
         &self,
         client: &Principal<'_>,
@@ -138,7 +188,7 @@ impl Context {
         answers: Option<&mut Answers<'_>>,
         msg: &'static str,
     ) -> Result<(), GssError> {
-        let mut creds = ffi::Krb5Creds([0u8; 128]);
+        let mut creds = ffi::Krb5Creds::new();
         let (prompter_fn, prompter_data) = match answers {
             Some(a) => (
                 Some(prompter as ffi::Krb5PrompterFn),
@@ -166,6 +216,100 @@ impl Context {
             ret
         };
         self.check(ret, msg)
+    }
+
+    /// The anonymous PKINIT ticket that armors the exchange to come.
+    ///
+    /// Heimdal's PKINIT takes its trust anchors from the realm's
+    /// `pkinit_anchors`, which [`Context::from_file`] just read; with no
+    /// client identity to present it proves nothing about the caller, which
+    /// is the point: it proves who the KDC is.
+    #[cfg(heimdal_kerberos)]
+    fn armour(&self, client: &Principal<'_>, out: &Ccache<'_>) -> Result<(), GssError> {
+        let opt = self.options()?;
+        // SAFETY: every handle is live; the options hold no string of ours.
+        unsafe {
+            ffi::krb5_get_init_creds_opt_set_anonymous(opt.1, 1);
+            // A minute, as `kinit` does for the cache given to `-T`: the
+            // armour is used once, immediately.
+            ffi::krb5_get_init_creds_opt_set_tkt_life(opt.1, 60);
+            ffi::krb5_get_init_creds_opt_set_pkinit(
+                self.0,
+                opt.1,
+                client.1,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ffi::KRB5_GIC_OPT_PKINIT_ANONYMOUS,
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+        }
+        let step = Step::new(self, client, None, &opt, None)?;
+        step.get("anonymous PKINIT")?;
+        step.report_last_request();
+        step.store(out, "krb5_init_creds_store (armour)")
+    }
+
+    /// The armoured exchange for `client`, giving `service` a ticket in
+    /// `out`.  `password` is the long-term key, if the caller brought one;
+    /// otherwise the front end is asked before the exchange starts, because
+    /// Heimdal's step API never prompts for the password itself.
+    // One argument per thing libkrb5's own step API takes: the principal,
+    // the password, the service, its realm, the armour, the output cache,
+    // the front end.
+    #[cfg(heimdal_kerberos)]
+    #[allow(clippy::too_many_arguments)]
+    fn exchange(
+        &self,
+        client: &Principal<'_>,
+        password: Option<&CStr>,
+        service: &CStr,
+        realm: &str,
+        armour: &Ccache<'_>,
+        out: &Ccache<'_>,
+        answers: &Answers<'_>,
+    ) -> Result<(), GssError> {
+        let opt = self.options()?;
+        // The realm's defaults for an init-creds exchange: `kinit` applies
+        // them, and `krb5_init_creds_init` does not when options are given.
+        let realm = CString::new(realm).map_err(|_| GssError::NulInUserPrincipal)?;
+        // SAFETY: opt is live; the realm string outlives the call, which
+        // copies what it takes.
+        unsafe {
+            ffi::krb5_get_init_creds_opt_set_default_flags(
+                self.0,
+                c"kinit".as_ptr(),
+                realm.as_ptr(),
+                opt.1,
+            );
+        }
+        let asked = password.map_or_else(
+            || answers.cstring("Password", answers.ask("Password", true)),
+            |_| None,
+        );
+        let password = password.or(asked.as_deref());
+        let step = Step::new(self, client, Some(answers), &opt, Some(password))?;
+        // SAFETY: every handle is live; the C strings outlive the exchange.
+        unsafe {
+            self.check(
+                ffi::krb5_init_creds_set_service(self.0, step.handle, service.as_ptr()),
+                "krb5_init_creds_set_service",
+            )?;
+            self.check(
+                ffi::krb5_init_creds_set_fast_ccache(self.0, step.handle, armour.1),
+                "krb5_init_creds_set_fast_ccache",
+            )?;
+        }
+        step.get("armoured AS exchange")?;
+        step.report_last_request();
+        step.store(out, "krb5_init_creds_store")?;
+        if let Some(asked) = asked {
+            wipe(asked.into_bytes());
+        }
+        Ok(())
     }
 }
 
@@ -210,6 +354,124 @@ impl Drop for Options<'_> {
     fn drop(&mut self) {
         // SAFETY: self.1 was allocated in this context.
         unsafe { ffi::krb5_get_init_creds_opt_free(self.0 .0, self.1) };
+    }
+}
+
+/// One step-by-step AS exchange of Heimdal's libkrb5: the handle, plus what
+/// keeps the prompter's data alive while libkrb5 may call it.
+#[cfg(heimdal_kerberos)]
+struct Step<'a, 'b> {
+    ctx: &'a Context,
+    /// The handle; only ever used through the methods below.
+    handle: ffi::Krb5InitCredsContext,
+    /// Borrowed so it cannot be dropped, or moved, while libkrb5 holds the
+    /// pointer handed to it as the prompter's data.  Never read here.
+    #[allow(dead_code)]
+    answers: Option<&'b Answers<'b>>,
+}
+
+#[cfg(heimdal_kerberos)]
+impl<'a, 'b> Step<'a, 'b> {
+    /// Start an exchange for `client`.  With `answers` the prompter of
+    /// [`prompter`] is registered for it, so an expiration notice, or a
+    /// plugin's PIN, reaches the caller's front end.
+    ///
+    /// `password` is set before anything can prompt: the step API never
+    /// asks for the long-term password itself, unlike the one-call wrapper.
+    fn new(
+        ctx: &'a Context,
+        client: &Principal<'_>,
+        answers: Option<&'b Answers<'b>>,
+        opt: &Options<'_>,
+        password: Option<Option<&CStr>>,
+    ) -> Result<Self, GssError> {
+        let (prompter_fn, prompter_data): (Option<ffi::Krb5PrompterFn>, *mut c_void) =
+            match &answers {
+                Some(a) => (
+                    Some(prompter as ffi::Krb5PrompterFn),
+                    ptr::from_ref(*a).cast::<c_void>().cast_mut(),
+                ),
+                None => (None, ptr::null_mut()),
+            };
+        let mut handle: ffi::Krb5InitCredsContext = ptr::null_mut();
+        // SAFETY: every handle is live; the C strings outlive the call; the
+        // prompter's data is `answers`, borrowed here for as long as the
+        // step lives.  On failure libkrb5 frees what it made and leaves the
+        // output pointer alone, so Drop has nothing to release.
+        let ret = unsafe {
+            ffi::krb5_init_creds_init(
+                ctx.0,
+                client.1,
+                prompter_fn,
+                prompter_data,
+                0,
+                opt.1,
+                &raw mut handle,
+            )
+        };
+        ctx.check(ret, "krb5_init_creds_init")?;
+        let step = Self {
+            ctx,
+            handle,
+            answers,
+        };
+        if let Some(password) = password {
+            // SAFETY: the handle is live; the string outlives the call,
+            // which copies it.
+            ctx.check(
+                unsafe {
+                    ffi::krb5_init_creds_set_password(
+                        ctx.0,
+                        step.handle,
+                        password.map_or(ptr::null(), CStr::as_ptr),
+                    )
+                },
+                "krb5_init_creds_set_password",
+            )?;
+        }
+        Ok(step)
+    }
+
+    /// Run the exchange through to a ticket.
+    fn get(&self, msg: &'static str) -> Result<(), GssError> {
+        // SAFETY: the handle is live.
+        self.ctx.check(
+            unsafe { ffi::krb5_init_creds_get(self.ctx.0, self.handle) },
+            msg,
+        )
+    }
+
+    /// Whatever the KDC's last reply had to say — an expired password, for
+    /// instance — through the prompter.  The options are not passed: they
+    /// are only read for a last-request callback kuipa does not set.
+    /// Nothing useful to do with the code.
+    fn report_last_request(&self) {
+        // SAFETY: the handle is live.
+        let ret =
+            unsafe { ffi::krb5_process_last_request(self.ctx.0, ptr::null_mut(), self.handle) };
+        if ret != 0 {
+            tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_process_last_request failed");
+        }
+    }
+
+    /// Cache the credentials collected in `out`.
+    fn store(&self, out: &Ccache<'_>, msg: &'static str) -> Result<(), GssError> {
+        // SAFETY: every handle is live; with the exchange complete the
+        // client principal is set, and the credentials are copied into the
+        // cache.
+        self.ctx.check(
+            unsafe { ffi::krb5_init_creds_store(self.ctx.0, self.handle, out.1) },
+            msg,
+        )
+    }
+}
+
+#[cfg(heimdal_kerberos)]
+impl Drop for Step<'_, '_> {
+    fn drop(&mut self) {
+        // SAFETY: the handle was made by krb5_init_creds_init, which only
+        // returns it set.
+        unsafe { ffi::krb5_init_creds_free(self.ctx.0, self.handle) };
     }
 }
 
@@ -288,6 +550,7 @@ impl Answers<'_> {
     }
 
     /// Whether some question was refused, so the exchange is over.
+    #[cfg(mit_kerberos)]
     fn failed(&self) -> bool {
         self.refused.borrow().is_some()
     }
@@ -327,6 +590,7 @@ impl Answers<'_> {
     }
 
     /// Show a challenge, offering it for scanning when it is a URL.
+    #[cfg(mit_kerberos)]
     fn show(&self, text: &str) {
         self.ui.info(text);
         if text.contains("://") {
@@ -335,6 +599,7 @@ impl Answers<'_> {
     }
 }
 
+#[cfg(mit_kerberos)]
 /// What the responder does with one question the KDC offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Handling {
@@ -348,6 +613,7 @@ enum Handling {
     Challenge,
 }
 
+#[cfg(mit_kerberos)]
 /// One question the KDC offered: its name, and libkrb5's pointer to the
 /// name it wants back in `krb5_responder_set_answer`.
 struct Question {
@@ -355,6 +621,7 @@ struct Question {
     ptr: *const c_char,
 }
 
+#[cfg(mit_kerberos)]
 /// The methods a password must not stand in for, strongest first.  FreeIPA
 /// offers a password alongside a token for a user who has both, and the
 /// password alone would authenticate the weaker factor.
@@ -366,6 +633,7 @@ const PASSWORDLESS: &[(&str, Handling)] = &[
     ("pkinit", Handling::Challenge),
 ];
 
+#[cfg(mit_kerberos)]
 /// The questions the responder answers: passwordless methods first, methods
 /// this build knows nothing about last, as generic challenges.
 ///
@@ -405,6 +673,7 @@ unsafe fn text(s: *const c_char) -> Cow<'static, str> {
         .into()
 }
 
+#[cfg(mit_kerberos)]
 /// The libkrb5 responder: answer, this round, the questions the KDC offered.
 ///
 /// A question this build cannot answer is left unanswered; libkrb5 then
@@ -486,6 +755,7 @@ unsafe extern "C" fn responder(
     0
 }
 
+#[cfg(mit_kerberos)]
 /// Answer the OTP question of a responder context.
 ///
 /// The first token the KDC offered is the one used, as FreeIPA offers one.
@@ -563,8 +833,10 @@ unsafe fn otp_challenge(
 }
 
 /// The libkrb5 prompter: client plugins that drive their own prompts — the
-/// PIN and device presence of a passkey — reach the same front end as the
-/// responder's questions instead of libkrb5's POSIX reader.
+/// PIN and device presence of a passkey, on a MIT build — reach the same
+/// front end as kuipa's own questions instead of libkrb5's POSIX reader.  On
+/// a Heimdal build it is what a password asked for up front, and the
+/// expiration notices of `krb5_process_last_request`, go through.
 ///
 /// # Safety
 ///
@@ -607,14 +879,14 @@ unsafe extern "C" fn prompter(
         // length is set to the number of bytes written.
         unsafe {
             let reply = &mut *prompt.reply;
-            let capacity = reply.length as usize;
+            let capacity = reply.reply_length();
             if capacity == 0 || reply.data.is_null() {
                 continue;
             }
             let len = answer.len().min(capacity - 1);
             ptr::copy_nonoverlapping(answer.as_ptr(), reply.data.cast::<u8>(), len);
             *reply.data.add(len) = 0;
-            reply.length = u32::try_from(len).unwrap_or(u32::MAX);
+            reply.set_reply_length(len);
         }
     }
     0
@@ -668,22 +940,33 @@ pub fn ticket(
     let ctx = Context::from_file(config)?;
 
     // The armour: an anonymous PKINIT ticket in a private ccache.  Nothing
-    // of the exchange to come asks anything of a human, so the armour needs
-    // no responder.
+    // of it asks anything of a human, so it needs no responder and no
+    // prompter.
     let armour = ctx.ccache(&format!("{ccache}-armour"))?;
     {
         let anonymous = ctx.principal(&format!("WELLKNOWN/ANONYMOUS@{realm}"))?;
-        let opt = ctx.options()?;
-        // SAFETY: opt and armour are live.
-        unsafe { ffi::krb5_get_init_creds_opt_set_anonymous(opt.1, 1) };
-        ctx.check(
-            unsafe { ffi::krb5_get_init_creds_opt_set_out_ccache(ctx.0, opt.1, armour.1) },
-            "krb5_get_init_creds_opt_set_out_ccache",
-        )?;
-        ctx.init_creds(&anonymous, None, None, &opt, None, "anonymous PKINIT")?;
+        #[cfg(mit_kerberos)]
+        {
+            let opt = ctx.options()?;
+            // SAFETY: opt and armour are live.
+            unsafe { ffi::krb5_get_init_creds_opt_set_anonymous(opt.1, 1) };
+            ctx.check(
+                unsafe { ffi::krb5_get_init_creds_opt_set_out_ccache(ctx.0, opt.1, armour.1) },
+                "krb5_get_init_creds_opt_set_out_ccache",
+            )?;
+            ctx.init_creds(&anonymous, None, None, &opt, None, "anonymous PKINIT")?;
+        }
+        #[cfg(heimdal_kerberos)]
+        ctx.armour(&anonymous, &armour)?;
     }
 
+    #[cfg(mit_kerberos)]
     let mut answers = Answers {
+        ui: preauth,
+        refused: RefCell::new(None),
+    };
+    #[cfg(heimdal_kerberos)]
+    let answers = Answers {
         ui: preauth,
         refused: RefCell::new(None),
     };
@@ -692,39 +975,56 @@ pub fn ticket(
     let result = (|| {
         let client = ctx.principal(principal)?;
         let out = ctx.ccache(ccache)?;
-        let opt = ctx.options()?;
-        // SAFETY: every handle is live; `answers` outlives the exchange
-        // below, which is the only thing that reads the pointer.
-        unsafe {
-            ctx.check(
-                ffi::krb5_get_init_creds_opt_set_responder(
-                    ctx.0,
-                    opt.1,
-                    Some(responder),
-                    ptr::from_mut(&mut answers).cast(),
-                ),
-                "krb5_get_init_creds_opt_set_responder",
-            )?;
-            ctx.check(
-                ffi::krb5_get_init_creds_opt_set_fast_ccache(ctx.0, opt.1, armour.1),
-                "krb5_get_init_creds_opt_set_fast_ccache",
-            )?;
-            ctx.check(
-                ffi::krb5_get_init_creds_opt_set_fast_flags(ctx.0, opt.1, ffi::KRB5_FAST_REQUIRED),
-                "krb5_get_init_creds_opt_set_fast_flags",
-            )?;
-            ctx.check(
-                ffi::krb5_get_init_creds_opt_set_out_ccache(ctx.0, opt.1, out.1),
-                "krb5_get_init_creds_opt_set_out_ccache",
-            )?;
+        #[cfg(mit_kerberos)]
+        {
+            let opt = ctx.options()?;
+            // SAFETY: every handle is live; `answers` outlives the exchange
+            // below, which is the only thing that reads the pointer.
+            unsafe {
+                ctx.check(
+                    ffi::krb5_get_init_creds_opt_set_responder(
+                        ctx.0,
+                        opt.1,
+                        Some(responder),
+                        ptr::from_mut(&mut answers).cast(),
+                    ),
+                    "krb5_get_init_creds_opt_set_responder",
+                )?;
+                ctx.check(
+                    ffi::krb5_get_init_creds_opt_set_fast_ccache(ctx.0, opt.1, armour.1),
+                    "krb5_get_init_creds_opt_set_fast_ccache",
+                )?;
+                ctx.check(
+                    ffi::krb5_get_init_creds_opt_set_fast_flags(
+                        ctx.0,
+                        opt.1,
+                        ffi::KRB5_FAST_REQUIRED,
+                    ),
+                    "krb5_get_init_creds_opt_set_fast_flags",
+                )?;
+                ctx.check(
+                    ffi::krb5_get_init_creds_opt_set_out_ccache(ctx.0, opt.1, out.1),
+                    "krb5_get_init_creds_opt_set_out_ccache",
+                )?;
+            }
+            ctx.init_creds(
+                &client,
+                password.as_deref(),
+                Some(&service),
+                &opt,
+                Some(&mut answers),
+                "armoured AS exchange",
+            )
         }
-        ctx.init_creds(
+        #[cfg(heimdal_kerberos)]
+        ctx.exchange(
             &client,
             password.as_deref(),
-            Some(&service),
-            &opt,
-            Some(&mut answers),
-            "armoured AS exchange",
+            &service,
+            realm,
+            &armour,
+            &out,
+            &answers,
         )
     })();
     armour.destroy();
@@ -796,6 +1096,7 @@ mod tests {
         }
     }
 
+    #[cfg(mit_kerberos)]
     #[test]
     fn a_password_never_stands_in_for_a_passwordless_method() {
         // The KDC offers both to a user with a token and a password; only
@@ -817,6 +1118,7 @@ mod tests {
         );
     }
 
+    #[cfg(mit_kerberos)]
     #[test]
     fn the_password_is_libkrb5_to_collect_not_the_responder() {
         assert_eq!(
@@ -843,28 +1145,12 @@ mod tests {
         };
         let mut buffers = [vec![0u8; 8], vec![0u8; 4]];
         let mut replies = [
-            ffi::Krb5Data {
-                magic: 0,
-                length: 8,
-                data: buffers[0].as_mut_ptr().cast(),
-            },
-            ffi::Krb5Data {
-                magic: 0,
-                length: 4,
-                data: buffers[1].as_mut_ptr().cast(),
-            },
+            ffi::Krb5Data::from_buffer(&mut buffers[0]),
+            ffi::Krb5Data::from_buffer(&mut buffers[1]),
         ];
         let prompts = [
-            ffi::Krb5Prompt {
-                prompt: c"Password".as_ptr(),
-                hidden: 1,
-                reply: &raw mut replies[0],
-            },
-            ffi::Krb5Prompt {
-                prompt: c"Passkey PIN".as_ptr(),
-                hidden: 0,
-                reply: &raw mut replies[1],
-            },
+            ffi::Krb5Prompt::new(c"Password", true, &mut replies[0]),
+            ffi::Krb5Prompt::new(c"Passkey PIN", false, &mut replies[1]),
         ];
         // SAFETY: the prompts, their reply buffers and the answers all
         // outlive the call.
@@ -887,13 +1173,10 @@ mod tests {
                 ("Passkey PIN".to_owned(), false)
             ],
         );
-        assert_eq!(
-            &buffers[0][..usize::try_from(replies[0].length).unwrap()],
-            b"hunter2"
-        );
+        assert_eq!(&buffers[0][..replies[0].reply_length()], b"hunter2");
         assert_eq!(buffers[0][7], 0, "the reply ends with a NUL byte");
         assert_eq!(
-            usize::try_from(replies[1].length).unwrap(),
+            replies[1].reply_length(),
             3,
             "the answer is cut to one less than the capacity"
         );
