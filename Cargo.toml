@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tang-pqc", "crates/kuipa-enroll", "crates/kuipa-gssapi", "crates/kuipa-ldap", "crates/kuipad", "crates/kuipa-tools", "crates/tang-pqc-clevis", "crates/ml-dsa-blind", "shims/rand"]
+members = ["crates/tang-pqc", "crates/kuipa-enroll", "crates/kuipa-gssapi", "crates/kuipa-ldap", "crates/kuipad", "crates/kuipa-tools", "crates/tang-pqc-clevis", "crates/ml-dsa-blind", "crates/ml-dsa-zk", "shims/rand"]
 resolver = "3"
 
 [workspace.package]

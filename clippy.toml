@@ -1,1 +1,1 @@
-doc-valid-idents = ["FreeIPA", "OpenSSL", "GSSAPI", "LDAPI", "SELinux", "S4U2Self", "S4U2Proxy", "IdP", ".."]
+doc-valid-idents = ["FreeIPA", "OpenSSL", "GSSAPI", "LDAPI", "SELinux", "S4U2Self", "S4U2Proxy", "IdP", "QuickSilver", ".."]
