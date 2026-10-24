@@ -615,13 +615,15 @@ pub fn merge_windows(
 /// # Errors
 ///
 /// I/O errors or a malformed line.
-pub fn read_epoch_from(path: &Path) -> Result<Option<(u64, [u8; 32])>, Error> {
+pub fn read_epoch_from(
+    path: &Path,
+) -> Result<Option<(u64, kuipa_enroll::epoch::EpochHead)>, Error> {
     Ok(read_anchors_file(path)?.1)
 }
 
 /// What an anchors file holds: pins with optional expiries, and the
 /// optional epoch watermark (§4.8).
-type AnchorsFile = (Vec<Pin>, Option<(u64, [u8; 32])>);
+type AnchorsFile = (Vec<Pin>, Option<(u64, kuipa_enroll::epoch::EpochHead)>);
 
 fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
     let text = fs::read_to_string(path)?;
@@ -648,15 +650,22 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| format!("{}: bad epoch sequence in {l:?}", path.display()))?;
-            let head = fields
+            let raw = fields
                 .next()
-                .map(str::parse)
-                .transpose()?
-                .map(|t: tang_pqc::Thumbprint| *t.as_bytes())
+                .and_then(|f| tang_pqc::b64::decode(f).ok())
                 .ok_or_else(|| format!("{}: bad epoch hash in {l:?}", path.display()))?;
             if fields.next().is_some() {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
             }
+            // A 32-byte head is a watermark from before epoch heads were
+            // SHA-384: it names no head this log can have, so it is no
+            // watermark, and the next verified advertisement sets one.
+            if raw.len() == tang_pqc::primitives::SHA256_LEN {
+                continue;
+            }
+            let head: kuipa_enroll::epoch::EpochHead = raw
+                .try_into()
+                .map_err(|_| format!("{}: bad epoch hash in {l:?}", path.display()))?;
             // Keep the newest, whatever order the lines are in.
             if epoch.is_none_or(|(s, _)| seq > s) {
                 epoch = Some((seq, head));
@@ -866,7 +875,7 @@ pub fn write_anchors(paths: &Paths, anchors: &[tang_pqc::Thumbprint]) -> Result<
 pub fn write_anchors_epoch(
     paths: &Paths,
     anchors: &[tang_pqc::Thumbprint],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     write_anchors_epoch_with_heads(
         paths,
@@ -885,7 +894,7 @@ pub fn write_anchors_epoch(
 pub fn write_anchors_epoch_with_heads(
     paths: &Paths,
     anchors: &[AnchorHead],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     write_anchor_pins(
         &paths.anchors(),
@@ -931,17 +940,13 @@ pub fn write_anchor_pins(
     path: &Path,
     comment: &str,
     pins: &[Pin],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     use std::fmt::Write as _; // appending to a String cannot fail
     let mut text = format!("# {comment}\n");
     if let Some((seq, head)) = epoch {
-        writeln!(
-            text,
-            "epoch {seq} {}",
-            tang_pqc::Thumbprint::from_bytes(head)
-        )
-        .expect("a String sink never fails");
+        writeln!(text, "epoch {seq} {}", tang_pqc::b64::encode(&head))
+            .expect("a String sink never fails");
     }
     for pin in pins {
         text.push_str(&pin.anchor.to_string());
@@ -977,17 +982,13 @@ pub fn write_anchor_thumbs(
     path: &Path,
     comment: &str,
     anchors: &[tang_pqc::Thumbprint],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
 ) -> Result<(), Error> {
     use std::fmt::Write as _; // appending to a String cannot fail
     let mut text = format!("# {comment}\n");
     if let Some((seq, head)) = epoch {
-        writeln!(
-            text,
-            "epoch {seq} {}",
-            tang_pqc::Thumbprint::from_bytes(head)
-        )
-        .expect("a String sink never fails");
+        writeln!(text, "epoch {seq} {}", tang_pqc::b64::encode(&head))
+            .expect("a String sink never fails");
     }
     for a in anchors {
         text.push_str(&a.to_string());
@@ -1017,7 +1018,7 @@ mod tests {
             tang_pqc::Thumbprint::from_bytes([3; 32]),
         );
         let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
-        let head = tang_pqc::Thumbprint::from_bytes([9; 32]);
+        let head = tang_pqc::b64::encode(&[9; 48]);
         let text = format!(
             "# provisioned\n{a}\n\n{b} {}\n{c} {}\nepoch 7 {head}\n",
             now + 3600,
@@ -1052,7 +1053,7 @@ mod tests {
         );
         assert_eq!(
             read_epoch_from(&path).unwrap(),
-            Some((7, [9; 32])),
+            Some((7, [9; 48])),
             "the watermark rides with the pins"
         );
         assert_eq!(
@@ -1146,7 +1147,7 @@ mod tests {
                 frozen: false,
                 retired: Vec::new(),
             }],
-            Some((3, [4; 32])),
+            Some((3, [4; 48])),
         )
         .unwrap();
         assert_eq!(
@@ -1159,7 +1160,18 @@ mod tests {
                 retired: Vec::new(),
             }]
         );
-        assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 32])));
+        assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 48])));
+        // A watermark from before SHA-384 epoch heads is no watermark; a
+        // head of another length is malformed.
+        let mut text = fs::read_to_string(&path).unwrap();
+        let legacy = format!("epoch 9 {}\n", tang_pqc::b64::encode(&[1; 32]));
+        text.push_str(&legacy);
+        fs::write(&path, &text).unwrap();
+        assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 48])));
+        let odd = format!("epoch 10 {}\n", tang_pqc::b64::encode(&[1; 40]));
+        text.push_str(&odd);
+        fs::write(&path, &text).unwrap();
+        assert!(read_epoch_from(&path).is_err());
 
         // A window round-trips: several heads, oldest first, and the
         // frozen marker (DESIGN-claim-logs.md §1.2, §2).

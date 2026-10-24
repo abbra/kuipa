@@ -31,7 +31,7 @@ use tang_pqc::{
 
 use crate::delegation::{Delegation, VerifiedDelegation};
 use crate::error::{Error, Result};
-use crate::escrow::{self, EscrowRequest, VaultId, commitment_data};
+use crate::escrow::{self, BindingHash, EscrowRequest, VaultId, commitment_data};
 use crate::keytab::Principal;
 use crate::realm::VerifiedRealm;
 use crate::tlog::Receipt;
@@ -58,7 +58,30 @@ const EPOCH_KEYS_MAGIC: [u8; 4] = *b"IPEK";
 /// How long an offline-session epoch lasts unless the policy says.
 pub const DEFAULT_EPOCH: u64 = 30 * 86_400;
 
-const HASH: &std::ffi::CStr = c"SHA2-256";
+/// The hash of a derivation from one KEM's shared secret: that KEM's
+/// suite hash (SHA-256 for ML-KEM-768, SHA-384 for ML-KEM-1024), named by
+/// the ciphertext's length, as every KEM-bound hash is (DESIGN.md §4.1.1).
+///
+/// # Errors
+///
+/// [`Error::Malformed`] for a ciphertext of no ML-KEM set.
+fn suite(ct: &[u8]) -> Result<&'static std::ffi::CStr> {
+    tang_pqc::KemAlg::ALL
+        .into_iter()
+        .find(|a| a.ciphertext_len() == ct.len())
+        .map(tang_pqc::KemAlg::hash)
+        .ok_or(Error::Malformed("KEM ciphertext"))
+}
+
+/// The hash of a derivation over several KEMs' shares: the strongest
+/// suite hash among them.
+fn strongest(algs: impl IntoIterator<Item = tang_pqc::KemAlg>) -> &'static std::ffi::CStr {
+    let strongest = algs
+        .into_iter()
+        .max_by_key(|a| primitives::digest_len(a.hash()))
+        .unwrap_or(tang_pqc::KemAlg::MlKem768);
+    strongest.hash()
+}
 
 /// What an attestation proved about a device key (§7.6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -416,7 +439,7 @@ pub const MAX_BINDINGS: usize = 4096;
 
 /// A binding hash as the vault stores it.
 #[must_use]
-pub fn binding_hex(hash: &[u8; 32]) -> String {
+pub fn binding_hex(hash: &BindingHash) -> String {
     use std::fmt::Write as _;
     hash.iter().fold(String::with_capacity(64), |mut s, b| {
         let _ = write!(s, "{b:02x}");
@@ -462,15 +485,16 @@ fn session_slot_key(
     server: &str,
     ct: &[u8],
 ) -> Result<SecretBuf> {
+    let hash = suite(ct)?;
     Ok(DOMAIN.derive_key(
-        HASH,
+        hash,
         &[secret],
         "session key",
         &[
             vault.as_bytes(),
             &epoch.to_be_bytes(),
             server.as_bytes(),
-            &primitives::digest(HASH, &[ct])?,
+            &primitives::digest(hash, &[ct])?,
         ],
     )?)
 }
@@ -578,11 +602,12 @@ pub struct ReleasedKeys {
 }
 
 fn released_key(secret: &[u8], vault: &VaultId, ct: &[u8]) -> Result<SecretBuf> {
+    let hash = suite(ct)?;
     Ok(DOMAIN.derive_key(
-        HASH,
+        hash,
         &[secret],
         "released keys",
-        &[vault.as_bytes(), &primitives::digest(HASH, &[ct])?],
+        &[vault.as_bytes(), &primitives::digest(hash, &[ct])?],
     )?)
 }
 
@@ -691,14 +716,15 @@ impl fmt::Debug for SessionSealedFile {
 }
 
 fn epoch_share_key(secret: &[u8], committed: &[u8], epoch: u64, ct: &[u8]) -> Result<SecretBuf> {
+    let hash = suite(ct)?;
     Ok(DOMAIN.derive_key(
-        HASH,
+        hash,
         &[secret],
         "epoch share",
         &[
             committed,
             &epoch.to_be_bytes(),
-            &primitives::digest(HASH, &[ct])?,
+            &primitives::digest(hash, &[ct])?,
         ],
     )?)
 }
@@ -727,7 +753,7 @@ impl SessionSealedFile {
         let (ct_e, secret_e) = current.public()?.encapsulate()?;
         let k_e = epoch_share_key(secret_e.as_ref(), &committed, current.epoch, &ct_e)?;
         let (devices, b) = device_slots(vault, &committed)?;
-        let dek = data_key(a.as_ref(), b.as_ref(), &committed)?;
+        let dek = data_key(suite(&ct_e)?, a.as_ref(), b.as_ref(), &committed)?;
         Ok(Self {
             wrapped_a: primitives::seal(k_e.as_ref(), a.as_ref())?.into(),
             ciphertext_e: ct_e.into(),
@@ -767,7 +793,12 @@ impl SessionSealedFile {
         )?;
         let a = primitives::open(k_e.as_ref(), &self.wrapped_a).map_err(|_| Error::BadResponse)?;
         let b = open_device_share(&self.devices, device, &committed)?;
-        let dek = data_key(a.as_ref(), b.as_ref(), &committed)?;
+        let dek = data_key(
+            suite(&self.ciphertext_e)?,
+            a.as_ref(),
+            b.as_ref(),
+            &committed,
+        )?;
         primitives::open(dek.as_ref(), &self.ciphertext).map_err(|_| Error::BadResponse)
     }
 
@@ -1420,12 +1451,13 @@ pub struct VaultAnswer {
     sealed: Box<[u8]>,
 }
 
-fn answer_key(secret: &[u8], request: &EscrowRequest) -> Result<SecretBuf> {
+fn answer_key(secret: &[u8], ct: &[u8], request: &EscrowRequest) -> Result<SecretBuf> {
+    let hash = suite(ct)?;
     Ok(DOMAIN.derive_key(
-        HASH,
+        hash,
         &[secret],
         "answer",
-        &[&primitives::digest(HASH, &[&request.to_bytes()])?],
+        &[&primitives::digest(hash, &[&request.to_bytes()])?],
     )?)
 }
 
@@ -1441,7 +1473,7 @@ impl VaultAnswer {
         response: &RecoveryResponse,
     ) -> Result<Self> {
         let (ciphertext, secret) = device.encapsulate()?;
-        let key = answer_key(secret.as_ref(), request)?;
+        let key = answer_key(secret.as_ref(), &ciphertext, request)?;
         Ok(Self {
             sealed: primitives::seal(key.as_ref(), &response.to_bytes())?.into(),
             ciphertext: ciphertext.into(),
@@ -1459,7 +1491,7 @@ impl VaultAnswer {
         request: &EscrowRequest,
     ) -> Result<RecoveryResponse> {
         let secret = device.decapsulate(&self.ciphertext)?;
-        let key = answer_key(secret.as_ref(), request)?;
+        let key = answer_key(secret.as_ref(), &self.ciphertext, request)?;
         let plain = primitives::open(key.as_ref(), &self.sealed).map_err(|_| Error::BadResponse)?;
         Ok(RecoveryResponse::from_bytes(plain.as_ref())?)
     }
@@ -1556,16 +1588,17 @@ impl fmt::Debug for SealedVaultFile {
 }
 
 fn device_key(secret: &[u8], committed: &[u8], id: &Thumbprint, ct: &[u8]) -> Result<SecretBuf> {
+    let hash = suite(ct)?;
     Ok(DOMAIN.derive_key(
-        HASH,
+        hash,
         &[secret],
         "device",
-        &[committed, id.as_bytes(), &primitives::digest(HASH, &[ct])?],
+        &[committed, id.as_bytes(), &primitives::digest(hash, &[ct])?],
     )?)
 }
 
-fn data_key(a: &[u8], b: &[u8], committed: &[u8]) -> Result<SecretBuf> {
-    Ok(DOMAIN.derive_key(HASH, &[a, b], "dek", &[committed])?)
+fn data_key(hash: &std::ffi::CStr, a: &[u8], b: &[u8], committed: &[u8]) -> Result<SecretBuf> {
+    Ok(DOMAIN.derive_key(hash, &[a, b], "dek", &[committed])?)
 }
 
 /// Makes the owner's GSS-API token for `ipa-ku@<server>` with the given
@@ -1629,7 +1662,8 @@ impl SealedVaultFile {
             });
         }
         let (devices, b) = device_slots(vault, &committed)?;
-        let dek = data_key(a.as_ref(), b.as_ref(), &committed)?;
+        let hash = strongest(slots.iter().map(|s| s.escrow_key.alg()));
+        let dek = data_key(hash, a.as_ref(), b.as_ref(), &committed)?;
         Ok(Self {
             principal,
             vault: vault.id,
@@ -1657,10 +1691,10 @@ impl SealedVaultFile {
     /// # Errors
     ///
     /// A crypto error.
-    pub fn bindings(&self) -> Result<Vec<[u8; 32]>> {
+    pub fn bindings(&self) -> Result<Vec<BindingHash>> {
         self.servers
             .iter()
-            .map(|s| Ok(s.binding.ciphertext_hash()?))
+            .map(|s| BindingHash::from_slice(&s.binding.ciphertext_hash()?))
             .collect()
     }
 
@@ -1732,7 +1766,8 @@ impl SealedVaultFile {
             };
             let a =
                 primitives::open(key.as_ref(), &slot.wrapped).map_err(|_| Error::BadResponse)?;
-            let dek = data_key(a.as_ref(), b.as_ref(), &committed)?;
+            let hash = strongest(self.servers.iter().map(|s| s.escrow_key.alg()));
+            let dek = data_key(hash, a.as_ref(), b.as_ref(), &committed)?;
             return primitives::open(dek.as_ref(), &self.ciphertext)
                 .map_err(|_| Error::BadResponse);
         }

@@ -513,7 +513,10 @@ fn against_a_real_kdc() {
             .is_symlink()
     );
     assert_eq!(std::fs::read(&secret).unwrap(), b"token=second\n");
-    assert_eq!(file_bindings(), Vec::<[u8; 32]>::new());
+    assert_eq!(
+        file_bindings(),
+        Vec::<kuipa_enroll::escrow::BindingHash>::new()
+    );
     std::fs::write(&stale, &sealed_secret).unwrap();
     assert!(
         flows::unseal_file(&a, &stale).is_err(),
@@ -524,7 +527,7 @@ fn against_a_real_kdc() {
     assert_eq!(std::fs::read(&http).unwrap(), http_keys);
     assert_eq!(
         directory.escrow.lock().unwrap()[&service],
-        Vec::<[u8; 32]>::new()
+        Vec::<kuipa_enroll::escrow::BindingHash>::new()
     );
     assert!(!paths::sealed_for(&http).exists());
 

@@ -161,10 +161,10 @@ fn run(command: Command) -> Result<(), Error> {
         } => {
             let days: u64 = days.parse()?;
             let binding = match binding {
-                Some(b) => b64::decode(&b)?
-                    .try_into()
-                    .map_err(|_| "--binding is not a binding")?,
-                None => [0; 32],
+                Some(b) => Some(b64::decode(&b)?)
+                    .filter(|b| kuipa_enroll::voucher::is_binding_len(b.len()))
+                    .ok_or("--binding is not a binding")?,
+                None => Vec::new(),
             };
             let now = unix_seconds(std::time::SystemTime::now());
             let validity = days
