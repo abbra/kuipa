@@ -2727,7 +2727,7 @@ a static table is the smallest surface to audit.
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
-| user vaults, unified recovery (§7.6) | designed |
+| user vaults, unified recovery (§7.6): vault model and descriptor, devices (passphrase files, PKCS#11 tokens), the ticket factor, sessions, offline sessions, unlock counts, registered sealing, machine vaults for host and service escrow, `kuipa seal` | implemented, tested against a real KDC; **not yet**: passkeys, attestation for the `hardware-*` levels, PAC delegation info for `ticket.delegation`; the LDAP side **not yet run against FreeIPA** |
 | gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change merged as gssapi/gssproxy#135, **awaiting an upstream release** |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 
