@@ -68,13 +68,14 @@ accepts it; for windows we do not have to, because the claim log gives
 us the check:
 
 **The consistency rule.** Before appending a new head `H2` over a
-pinned `H1` for the same anchor, the client fetches the anchor's claim
-log from index `H1.size` to `H2.size` (the pages between them, public
-per §4.9.5) and checks that the leaves hash to `H1.root` as a prefix
-of `H2.root` — an RFC 9162 consistency check between the two tree
-sizes, computable from the fetched leaves alone (rebuild `H1`'s tree
-from the first `H1.size` of them and compare roots, then `H2`'s from
-all). `merkle::root` does both. Only then is `H2` appended. If the
+pinned `H1` for the same anchor, the client reads the head's signed
+vouch from the anchor's claim-log page (public per §4.9.5). `IPSV` v2
+carries the whole log, claims and tombstones. The client checks that
+the first `H1.size` entries make `H1.root` and the first `H2.size` make
+`H2.root` (`SignedVouch::retired_at`, twice). This is an RFC 9162
+consistency check computed from the leaves themselves, and the same
+entries give the claims `H2`'s log retired (§1.4). Only then is `H2`
+appended. If the
 check fails the head is not pinned, the server is reported (it served
 a head that does not extend ours — the same split-view evidence the
 anchor-log watermark treats as a fork, §4.8), and the window keeps
@@ -86,11 +87,11 @@ history", which is the landmark-window property the MTC draft gives a
 relying party that keeps its landmarks (draft-ietf-plants-merkle-tree-certs
 §6.4): the past cannot change behind the window.
 
-The fetch is bounded, and it is a *whole-log* walk: the client keeps
-only the roots of its window, so the consistency of a new head can
-only be checked by rehashing from the first leaf — pages from 0 like
-the anchor log (`MAX_CLAIM_LOG_PAGE` each), at most
-`MAX_HEAD_FETCH_PAGES` (64) of them. An advertised head naming a
+The read is bounded, and it is the *whole log*: the client keeps only
+the roots of its window, so the consistency of a new head can only be
+checked by rehashing from the first leaf, at most
+`MAX_HEAD_FETCH_PAGES` (64) pages of `MAX_CLAIM_LOG_PAGE` leaves' worth.
+One request suffices, since the vouch carries every entry. An advertised head naming a
 larger tree is refused with a warning and the window stays as it is:
 extending it would take trust the fetch cannot supply. Between routine
 refreshes of a realm that renews claims daily, the whole log is one

@@ -320,11 +320,7 @@ takes this log's rules instead:
 
 Heads used without being pinned know nothing of retirements: an
 enrollment string's head before enrollment, `realm-info`, and the
-read-only `kuipa advertisement`. The window extension still walks the
-pages from index 0. Moving it to the consistency proofs of §3 is the
-next step.
-
-## Next
-
-* **Consistency proofs for claim-log windows**, instead of the walk
-  from index 0.
+read-only `kuipa advertisement`. Extending a window reads the head's
+vouch once and checks both prefixes against it: the old head's and the
+new one's. The vouch carries every entry, so the check needs no proof
+and no page walk.
