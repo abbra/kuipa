@@ -67,7 +67,8 @@ and can be used on their own.
 
 * Rust 1.89 or later
 * OpenSSL 3.5 or later (for ML-KEM and ML-DSA)
-* MIT Kerberos and OpenLDAP client libraries and headers
+* A Kerberos client library and headers — MIT Kerberos, or Heimdal with the
+  limitations below — and OpenLDAP client libraries and headers
 * A C compiler, libclang and pkg-config, used by the build scripts
 * For the real-KDC tests: `krb5kdc`, `kdb5_util` and `kadmin.local`
   (the tests are skipped when these are missing)
@@ -79,6 +80,68 @@ sudo dnf install cargo gcc clang-devel pkgconf-pkg-config \
     openssl-devel krb5-devel openldap-devel
 sudo dnf install krb5-server krb5-workstation krb5-pkinit   # real-KDC tests
 ```
+
+On macOS the build scripts find Homebrew's keg-only `krb5` and `openldap`
+themselves (`brew --prefix`), so no environment setup is needed:
+
+```sh
+brew install krb5 openldap        # real-KDC tests: krb5 provides krb5kdc
+brew install cyrus-sasl           # only for LDAP GSS-SPNEGO binds, see below
+```
+
+Both formulae are keg-only because macOS ships its own Kerberos (Heimdal) and
+LDAP, and the system copies lack the MIT responder structures and
+`ldap_sasl_interactive_bind`. `contrib/ci/local-ci.sh` additionally puts the
+keg `bin`/`sbin` first on `PATH`, so the KDC tests run MIT's `kinit` and
+`krb5kdc` rather than the system ones.
+
+### Kerberos vendor
+
+`KUIPA_KRB5_VENDOR=mit|heimdal` names the Kerberos implementation to compile
+against; unset (or `auto`) picks MIT when both are installed, because most of
+kuipa's runtime behaviour is MIT's.  Detection reads `pkg-config`, then
+`krb5-config --vendor`, then the Homebrew kegs; an unknown value is a build
+error.  `crates/kuipa-ldap` takes the vendor from kuipa-gssapi's detection and
+links the same implementation, so kuipa's own link line never carries two
+Kerberos libraries.
+
+```sh
+brew install heimdal                                     # keg-only, like krb5
+KUIPA_KRB5_VENDOR=heimdal cargo build --workspace
+```
+
+Heimdal supports the password and PKINIT preauthentication types, including
+FAST armoring (`krb5_init_creds_set_fast_ccache`).  It has no equivalent for
+the rest, and those raise `GssError::Unsupported` rather than half-working:
+
+| MIT-only | Effect on a Heimdal build |
+| --- | --- |
+| OTP, passkey, IdP and RADIUS prompts (`krb5_responder_*`) | no responder callback; those preauth types cannot be answered |
+| Thread-local ccache stores (`kuipa_gssapi::thread_ccache`) | the module is compiled out |
+| S4U2Self / S4U2Proxy credentials | `impersonate()` returns an error |
+| gssproxy credential stores (`gss_acquire_cred_from`) | no credential-store argument |
+| MIT-only credential-usage flags | those usages return an error |
+| `krb5kdc`, `kdb5_util`, `kadmin.local` | Homebrew's heimdal formula ships none; `kdc-test`, `playground-test` and `interactive` need a MIT build |
+
+The SASL mechanisms are not part of kuipa's link line: libsasl2 loads them at
+bind time, and Homebrew's OpenLDAP links Apple's `/usr/lib/libsasl2.2.dylib`.
+Its plugin directory `/usr/lib/sasl2` holds a GSSAPI plugin built against the
+system Kerberos framework, and it registers `GSSAPI` alone — kuipa's default
+bind asks for `GSS-SPNEGO`, which there comes back as `no worthy mechs found`,
+and a credential kuipa made with its MIT library would be handed to Apple's
+GSS library.  Homebrew's cyrus-sasl plugins are the fix:
+
+```sh
+brew install cyrus-sasl
+export SASL_PATH=/opt/homebrew/opt/cyrus-sasl/lib/sasl2
+```
+
+Apple's libsasl2 reads `SASL_PATH`: with it set, `sasl_listmech` on Apple's
+library returns `GSS-SPNEGO` and `GS2-KRB5` beside `GSSAPI`, and Homebrew's
+`libgssapiv2.so` links Homebrew's MIT Kerberos — so the mechanism kuipa asks
+for exists, and it runs on the implementation kuipa was built against.  A
+`GSSAPI` bind with the ticket already in the credential cache needs no injected
+credential, so Apple's own plugin can serve it too, through Apple's Kerberos.
 
 ## Building
 
