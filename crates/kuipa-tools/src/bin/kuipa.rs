@@ -274,6 +274,23 @@ enum Command {
         #[command(subcommand)]
         action: KeysAction,
     },
+    /// Check the realm's transparency logs for your own entries.
+    Tlog {
+        #[command(subcommand)]
+        action: TlogAction,
+    },
+}
+
+/// `kuipa tlog` subcommands.
+#[derive(Subcommand)]
+enum TlogAction {
+    /// Check every server's log for vault `vault`: list what happened
+    /// since the last watch, and flag what your stored descriptor does
+    /// not account for.  Exits non-zero for a flag or a forked log.
+    Watch {
+        /// The vault.
+        vault: String,
+    },
 }
 
 /// `kuipa keys` subcommands.
@@ -573,6 +590,7 @@ impl Command {
             Command::Leave => "leave",
             Command::Seal { .. } => "seal",
             Command::Keys { .. } => "keys",
+            Command::Tlog { .. } => "tlog",
         }
     }
 
@@ -1187,6 +1205,7 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
         "check" => render_check(value, paths),
         "complete" => render_complete(value),
         "rotate-keys" => render_rotated(value, "New host keys"),
+        "tlog" => render_tlog(value),
         "protect" if get(value, "contents").is_string() => render_protect_other(value),
         "protect" => render_protect(value),
         "unprotect" if get(value, "contents").is_string() => render_unprotect_other(value),
@@ -1202,6 +1221,46 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
         other => println!("{other}: {value}"),
     }
 }
+fn render_tlog(value: &Value) {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    for e in get(value, "events").as_array().into_iter().flatten() {
+        let mark = if e["unexpected"] == Value::Bool(true) {
+            "UNEXPECTED"
+        } else {
+            "ok"
+        };
+        let device = e["device"]
+            .as_str()
+            .map(|d| format!(" device {d}"))
+            .unwrap_or_default();
+        let why = e["why"]
+            .as_str()
+            .map(|w| format!(" ({w})"))
+            .unwrap_or_default();
+        println!(
+            "{mark:>10}  {} #{} at {}: {}{device}{why}",
+            text(&e["server"]),
+            e["index"],
+            e["time"],
+            text(&e["action"]),
+        );
+    }
+    for f in get(value, "forked").as_array().into_iter().flatten() {
+        println!("    FORKED  {}: {}", text(&f["server"]), text(&f["error"]));
+    }
+    for u in get(value, "unreachable").as_array().into_iter().flatten() {
+        println!("   skipped  {}: {}", text(&u["server"]), text(&u["error"]));
+    }
+    for s in get(value, "baseline").as_array().into_iter().flatten() {
+        println!("  baseline  {}: first watch, history not flagged", text(s));
+    }
+    println!(
+        "Vault {}: {} unexpected.",
+        text(get(value, "vault")),
+        get(value, "unexpected").as_u64().unwrap_or_default()
+    );
+}
+
 fn render_prepare(value: &Value, paths: &Paths) {
     println!(
         "A machine key for offline enrollment, made on this host and stored in {}:",
@@ -1741,6 +1800,12 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
 /// `kuipa keys fetch` (§18.4): the value on standard output, or in a
 /// file with `--out`.  Standard output only when it is not a terminal,
 /// as `kuipa-unseal` does (§10.5).
+fn run_tlog(paths: &Paths, action: &TlogAction) -> Result<Value, Error> {
+    let TlogAction::Watch { vault } = action;
+    let user = kuipa_tools::seal::UserPaths::from_env()?;
+    kuipa_tools::seal::Seal::new(paths, &user, None).watch(vault)
+}
+
 fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
     let KeysAction::Fetch { name, alg, out } = action;
     let value = flows::keys_fetch(paths, name, alg.as_deref())?;
@@ -1955,6 +2020,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Seal { action } => run_seal(&paths, action),
         Command::Keys { action } => run_keys(&paths, action),
+        Command::Tlog { action } => run_tlog(&paths, action),
         _ => run(&args),
     };
     match result {
