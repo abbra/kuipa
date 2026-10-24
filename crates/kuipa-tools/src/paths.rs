@@ -650,22 +650,14 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| format!("{}: bad epoch sequence in {l:?}", path.display()))?;
-            let raw = fields
+            let head: kuipa_enroll::epoch::EpochHead = fields
                 .next()
                 .and_then(|f| tang_pqc::b64::decode(f).ok())
+                .and_then(|h| h.try_into().ok())
                 .ok_or_else(|| format!("{}: bad epoch hash in {l:?}", path.display()))?;
             if fields.next().is_some() {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
             }
-            // A 32-byte head is a watermark from before epoch heads were
-            // SHA-384: it names no head this log can have, so it is no
-            // watermark, and the next verified advertisement sets one.
-            if raw.len() == tang_pqc::primitives::SHA256_LEN {
-                continue;
-            }
-            let head: kuipa_enroll::epoch::EpochHead = raw
-                .try_into()
-                .map_err(|_| format!("{}: bad epoch hash in {l:?}", path.display()))?;
             // Keep the newest, whatever order the lines are in.
             if epoch.is_none_or(|(s, _)| seq > s) {
                 epoch = Some((seq, head));
@@ -1161,17 +1153,14 @@ mod tests {
             }]
         );
         assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 48])));
-        // A watermark from before SHA-384 epoch heads is no watermark; a
-        // head of another length is malformed.
-        let mut text = fs::read_to_string(&path).unwrap();
-        let legacy = format!("epoch 9 {}\n", tang_pqc::b64::encode(&[1; 32]));
-        text.push_str(&legacy);
-        fs::write(&path, &text).unwrap();
-        assert_eq!(read_epoch_from(&path).unwrap(), Some((3, [4; 48])));
-        let odd = format!("epoch 10 {}\n", tang_pqc::b64::encode(&[1; 40]));
-        text.push_str(&odd);
-        fs::write(&path, &text).unwrap();
-        assert!(read_epoch_from(&path).is_err());
+        // An epoch head is SHA-384: a head of any other length is
+        // malformed, a SHA-256-sized one included.
+        let text = fs::read_to_string(&path).unwrap();
+        for len in [tang_pqc::primitives::SHA256_LEN, 40] {
+            let odd = format!("epoch 10 {}\n", tang_pqc::b64::encode(&vec![1; len]));
+            fs::write(&path, format!("{text}{odd}")).unwrap();
+            assert!(read_epoch_from(&path).is_err(), "{len}");
+        }
 
         // A window round-trips: several heads, oldest first, and the
         // frozen marker (DESIGN-claim-logs.md §1.2, §2).
