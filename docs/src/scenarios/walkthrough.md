@@ -311,6 +311,33 @@ decides with the calendar. Adding this host's device key lists it under
 (`token=playground-user` back on standard output), and a wrong
 passphrase is refused: `kuipa seal: wrong passphrase`.
 
+Each of those steps went into the transparency log of the server that
+handled it. `kuipa tlog watch personal` checks every server's log for
+the vault. The first watch lists the history and only records where
+each log stands:
+
+```
+        ok  ipa1.example.test #0 at 2026-10-24 12:30:16 UTC: create
+        ok  ipa1.example.test #1 at 2026-10-24 12:30:16 UTC: add-device device L_LxP5xhTXsQXtHSYqZqQIyZBjoFUtliO4nZOqL0UMk
+        ok  ipa1.example.test #2 at 2026-10-24 12:30:16 UTC: release device L_LxP5xhTXsQXtHSYqZqQIyZBjoFUtliO4nZOqL0UMk
+  baseline  ipa1.example.test: first watch, history not flagged
+Vault personal: 0 unexpected.
+```
+
+ipa2 handled nothing for this vault, so its log is empty and the watch
+has nothing to list from it. A second device registered from another
+data directory (`KUIPA_USER_DIR=…/admin-laptop`) is not in the vault
+description this host stored, so the next watch flags it and exits 1:
+
+```
+UNEXPECTED  ipa1.example.test #3 at 2026-10-24 12:30:17 UTC: add-device device hjrpLcMII4mUXrCDd8os2VrTEeXa1rwbAERAd0yzhjo (a device the stored descriptor does not list)
+Vault personal: 1 unexpected.
+```
+
+`kuipa seal show personal` stores the current description, which
+accepts the device. The next watch is clean, and the next open shows up
+as one more `release`.
+
 A second vault allows hour-long sessions and ten unlocks
 (`--session-hours 1 --max-unlocks 10`, shown as `unlocks allowed: 10`
 and `longest session (seconds): 3600`). One unlock — passphrase and

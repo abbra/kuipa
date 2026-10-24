@@ -398,7 +398,11 @@ fn start_servers(
             trusts: Vec::new(),
         };
         anchors.push(*anchor.public().thumbprint());
-        let enroll = Arc::new(EnrollServer::new(keys, info, delegation));
+        // Opening the server's transparency log creates its key directory.
+        let key_dir = dir.join(format!("keys-{server}"));
+        let ledger = Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, server)?);
+        let enroll =
+            Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
         let others: Vec<usize> = (0..SERVERS.len()).filter(|j| *j != i).collect();
         let settings = Settings {
             me: (*server).into(),
@@ -413,8 +417,6 @@ fn start_servers(
             ca_certs: vec![realm.chain.ca_der.clone()],
             vouch_interval: Duration::ZERO,
         };
-        let key_dir = dir.join(format!("keys-{server}"));
-        std::fs::create_dir_all(&key_dir)?;
         let tang = start_tang(dir, server, &key_dir, &urls[i])?;
         let initiator = Arc::new(KeytabInitiator::new(
             dir.join(format!("kuipa-{server}.keytab"))
@@ -437,7 +439,7 @@ fn start_servers(
             limiter: kuipad::limit::Limiter::default(),
             tang,
             keys: None,
-            ledger: None,
+            ledger: Some(ledger),
         });
         rt.spawn(peers.run());
         rt.spawn(async move { axum::serve(listener, router(app)).await });
