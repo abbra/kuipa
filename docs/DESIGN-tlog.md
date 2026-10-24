@@ -176,7 +176,7 @@ request:
 | vault created, policy set, revoked | 3 | vault id | `IPLV`: action, `H` of the policy (zeros for revoke) |
 | device added or removed | 2 | vault id | `IPLV`: action, the device's id |
 | session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |
-| server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` (SHA-256 in every profile, DESIGN.md §4.1.1) |
+| server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` (its KEM's suite hash, DESIGN.md §4.1.1) |
 | Keys fetch | 6 | the caller's principal | the `IPKG` fetch |
 
 Reads (`show`, `list`) and binding registration record nothing. Vault

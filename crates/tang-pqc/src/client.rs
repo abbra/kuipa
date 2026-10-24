@@ -293,14 +293,15 @@ impl Binding {
             .finish()
     }
 
-    /// SHA-256 of the binding's ciphertext: a stable identifier a server can
-    /// register without learning anything secret.
+    /// The suite hash of the binding's ciphertext (SHA-256 for ML-KEM-768,
+    /// SHA-384 for ML-KEM-1024, as the KEM's HKDF uses): a stable
+    /// identifier a server can register without learning anything secret.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn ciphertext_hash(&self) -> Result<[u8; 32]> {
-        primitives::sha256(&[&self.ciphertext])
+    pub fn ciphertext_hash(&self) -> Result<Vec<u8>> {
+        primitives::digest(self.alg.hash(), &[&self.ciphertext])
     }
 
     /// The context this binding was created with.

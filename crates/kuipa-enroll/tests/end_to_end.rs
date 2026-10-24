@@ -50,8 +50,8 @@ struct MemoryDirectory {
     otps: RefCell<HashMap<String, Vec<u8>>>,
     kvno: RefCell<HashMap<String, u32>>,
     admins: HashSet<String>,
-    escrow: RefCell<HashMap<String, Vec<[u8; 32]>>>,
-    escrow_files: RefCell<HashMap<String, Vec<[u8; 32]>>>,
+    escrow: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
+    escrow_files: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     disabled: RefCell<HashSet<String>>,
     staged: RefCell<HashMap<String, Staged>>,
     vaults: RefCell<HashMap<VaultId, Vault>>,
@@ -183,7 +183,7 @@ impl Directory for MemoryDirectory {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), DirectoryError> {
         self.escrow
             .borrow_mut()
@@ -195,7 +195,7 @@ impl Directory for MemoryDirectory {
         &self,
         principal: &Principal,
         kind: Kind,
-        binding: &[u8; 32],
+        binding: &kuipa_enroll::escrow::BindingHash,
     ) -> Result<bool, DirectoryError> {
         let p = principal.to_string();
         let set = match kind {
@@ -209,7 +209,7 @@ impl Directory for MemoryDirectory {
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -978,7 +978,7 @@ fn register_request(
     adv: &VerifiedRealm,
     caller: &str,
     params: &RegisterParams,
-    bindings: &[[u8; 32]],
+    bindings: &[kuipa_enroll::escrow::BindingHash],
 ) -> (Request, PendingJoin) {
     let p = Prepared::new(
         adv,
@@ -1010,7 +1010,7 @@ fn sealed_file_registered_by_its_principal() {
             .ok()
             .and_then(Recovered::into_plain)
     };
-    let seal = |contents: &[u8], retire: Vec<[u8; 32]>| {
+    let seal = |contents: &[u8], retire: Vec<kuipa_enroll::escrow::BindingHash>| {
         let (sealer, registrations) =
             Sealer::prepare(&service, Kind::File, &[&advs[0], &advs[1]]).unwrap();
         let bindings: Vec<_> = registrations.iter().map(|g| g.binding).collect();
@@ -1112,13 +1112,24 @@ fn bindings_open_only_under_what_they_commit_to() {
         })
         .unwrap();
     let req = &seen[0];
-    assert_eq!(req.vault(), &VaultId::machine(&host, Kind::Keytab).unwrap());
+    assert_eq!(
+        req.vault(),
+        &VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap()
+    );
 
     // Eve's own principal and machine vault, where the binding is registered.
-    let eves = renamed(req, &eve, &VaultId::machine(&eve, Kind::Keytab).unwrap());
+    let eves = renamed(
+        req,
+        &eve,
+        &VaultId::machine(&eve, Kind::Keytab, KemAlg::MlKem768).unwrap(),
+    );
     assert!(answer(&eves).is_err());
     // The host's file vault, where the binding is registered too.
-    let file = renamed(req, &host, &VaultId::machine(&host, Kind::File).unwrap());
+    let file = renamed(
+        req,
+        &host,
+        &VaultId::machine(&host, Kind::File, KemAlg::MlKem768).unwrap(),
+    );
     assert!(answer(&file).is_err());
     // A vault that does not exist.
     let none = renamed(req, &host, &VaultId::from_bytes([9; 16]));

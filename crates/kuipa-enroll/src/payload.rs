@@ -50,7 +50,7 @@ pub struct Enrollment {
     pub epoch_seq: u64,
     /// The hash of that last entry, for the host's watermark; zero when
     /// there is none.
-    pub epoch_head: [u8; 32],
+    pub epoch_head: crate::epoch::EpochHead,
 }
 
 fn count(n: usize) -> Result<u8> {
@@ -203,7 +203,7 @@ pub(crate) mod tests {
             ],
             heads: vec![Some((3, Hash::from_slice(&[4; 48]).unwrap())), None],
             epoch_seq: 7,
-            epoch_head: [9; 32],
+            epoch_head: [9; 48],
         };
         let bytes = e.to_bytes().unwrap();
         let back = Enrollment::from_bytes(bytes.as_ref()).unwrap();
@@ -211,7 +211,7 @@ pub(crate) mod tests {
         assert_eq!(back.ca_certs, e.ca_certs);
         assert_eq!(back.pkinit_anchors, e.pkinit_anchors);
         assert_eq!(back.anchors, e.anchors);
-        assert_eq!((back.epoch_seq, back.epoch_head), (7, [9; 32]));
+        assert_eq!((back.epoch_seq, back.epoch_head), (7, [9; 48]));
         assert_eq!(back.keytab.kvno(), Some(1));
         assert!(Enrollment::from_bytes(&bytes.as_ref()[..bytes.len() - 1]).is_err());
     }

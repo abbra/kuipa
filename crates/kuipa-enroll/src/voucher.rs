@@ -11,7 +11,8 @@
 //! the result is an ordinary signature on `salt ‖ m` with context
 //! [`SIGN_CONTEXT`], which the IPA server checks with the public key only.
 //! `binding` is [`binding`]`(ek_e)` of the ephemeral key the host will join
-//! with, or zeros for a bearer voucher.  A voucher creates one host: the
+//! with, or empty for a bearer voucher.  It is hashed with `ek_e`'s KEM
+//! suite hash: SHA-256 for ML-KEM-768, SHA-384 for ML-KEM-1024 (CNSA 2.0).  A voucher creates one host: the
 //! server refuses an existing FQDN and records the spent salt.
 //!
 //! ```text
@@ -52,8 +53,8 @@ pub struct Claims {
     pub not_before: u64,
     /// Unix seconds.
     pub not_after: u64,
-    /// [`binding`] of the host's ephemeral key, or zeros.
-    pub binding: [u8; 32],
+    /// [`binding`] of the host's ephemeral key (32 or 48 bytes), or empty.
+    pub binding: Vec<u8>,
 }
 
 impl Claims {
@@ -66,7 +67,7 @@ impl Claims {
             .str(&self.hostgroup)
             .u64(self.not_before)
             .u64(self.not_after)
-            .fixed(&self.binding)
+            .bytes(&self.binding)
             .finish()
     }
 
@@ -76,7 +77,7 @@ impl Claims {
             .str(&self.hostgroup)
             .u64(self.not_before)
             .u64(self.not_after)
-            .fixed(&self.binding);
+            .bytes(&self.binding);
     }
 
     fn get(r: &mut Reader) -> Result<Self> {
@@ -86,24 +87,44 @@ impl Claims {
             hostgroup: r.str()?.to_owned(),
             not_before: r.u64()?,
             not_after: r.u64()?,
-            binding: r.fixed()?,
+            binding: match r.bytes()? {
+                b if b.is_empty() || is_binding_len(b.len()) => b.to_vec(),
+                _ => return Err(Error::Malformed("voucher binding")),
+            },
         })
     }
 
     /// Whether it binds an ephemeral key.
     #[must_use]
     pub fn is_bound(&self) -> bool {
-        self.binding != [0; 32]
+        !self.binding.is_empty()
     }
 }
 
-/// The binding of an ephemeral encapsulation key (its raw bytes).
+/// Whether `len` is a [`binding`]'s length: a KEM suite hash's, SHA-256
+/// or SHA-384.
+#[must_use]
+pub fn is_binding_len(len: usize) -> bool {
+    tang_pqc::KemAlg::ALL
+        .into_iter()
+        .any(|a| primitives::digest_len(a.hash()) == Some(len))
+}
+
+/// The binding of an ephemeral encapsulation key (its raw bytes): its
+/// KEM's suite hash, named by the key's length.
 ///
 /// # Errors
 ///
-/// An OpenSSL error.
-pub fn binding(ephemeral_key: &[u8]) -> Result<[u8; 32]> {
-    Ok(primitives::sha256(&[BINDING_LABEL, ephemeral_key])?)
+/// [`Error::Malformed`] for a key of no ML-KEM set, or an OpenSSL error.
+pub fn binding(ephemeral_key: &[u8]) -> Result<Vec<u8>> {
+    let alg = tang_pqc::KemAlg::ALL
+        .into_iter()
+        .find(|a| a.encapsulation_key_len() == ephemeral_key.len())
+        .ok_or(Error::Malformed("ephemeral key"))?;
+    Ok(primitives::digest(
+        alg.hash(),
+        &[BINDING_LABEL, ephemeral_key],
+    )?)
 }
 
 /// A voucher: claims, the voucher key and the unblinded signature.
@@ -206,7 +227,7 @@ impl Voucher {
         key: &VerifyingKey,
         realm: &str,
         fqdn: &str,
-        ephemeral: &[u8; 32],
+        ephemeral: &[u8],
         now: u64,
     ) -> Result<&Claims> {
         let c = &self.claims;
@@ -214,7 +235,7 @@ impl Voucher {
         if key.thumbprint() != &self.key
             || c.realm != realm
             || !c.fqdn.eq_ignore_ascii_case(fqdn)
-            || (c.is_bound() && &c.binding != ephemeral)
+            || (c.is_bound() && c.binding != ephemeral)
             || now < c.not_before
             || now > c.not_after
             || key
@@ -239,11 +260,19 @@ pub fn alg_name(alg: SignatureAlg) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use tang_pqc::SigningKey;
+    use tang_pqc::{ExchangeKeyPair, KemAlg, SigningKey};
 
     use super::*;
 
-    fn claims(binding: [u8; 32]) -> Claims {
+    fn ek_of(alg: KemAlg) -> Vec<u8> {
+        ExchangeKeyPair::generate(alg)
+            .unwrap()
+            .public()
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn claims(binding: Vec<u8>) -> Claims {
         Claims {
             realm: "EXAMPLE.TEST".into(),
             fqdn: "web1.example.test".into(),
@@ -270,8 +299,14 @@ mod tests {
     #[test]
     fn round_trip_and_checks() {
         let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-        let ek = binding(b"ephemeral").unwrap();
-        let v = voucher(&key, claims([0; 32]));
+        let ek = binding(&ek_of(KemAlg::MlKem768)).unwrap();
+        assert_eq!(ek.len(), primitives::SHA256_LEN);
+        // An ML-KEM-1024 key (CNSA 2.0) is bound with SHA-384, and a key
+        // of no ML-KEM set is no key.
+        let cnsa = binding(&ek_of(KemAlg::MlKem1024)).unwrap();
+        assert_eq!(cnsa.len(), primitives::SHA384_LEN);
+        assert!(binding(b"ephemeral").is_err());
+        let v = voucher(&key, claims(Vec::new()));
         let v = Voucher::parse(v.encode().as_ref()).unwrap();
         let k = key.public();
         assert!(
@@ -307,13 +342,13 @@ mod tests {
         );
 
         // A bound voucher works with its ephemeral key only.
-        let bound = voucher(&key, claims(ek));
+        let bound = voucher(&key, claims(ek.clone()));
         assert!(
             bound
                 .verify(k, "EXAMPLE.TEST", "web1.example.test", &ek, 150)
                 .is_ok()
         );
-        let wrong = binding(b"other").unwrap();
+        let wrong = binding(&ek_of(KemAlg::MlKem768)).unwrap();
         assert!(
             bound
                 .verify(k, "EXAMPLE.TEST", "web1.example.test", &wrong, 150)

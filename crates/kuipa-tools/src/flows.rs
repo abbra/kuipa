@@ -22,14 +22,14 @@ use kuipa_enroll::realm::{Deployment, TrustedRealm, VerifiedRealm, krb5_realm_se
 use kuipa_gssapi::{GssClientCred, GssError};
 use native_ossl::util::SecretBuf;
 use serde_json::{Value, json};
-use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, b64, unix_seconds};
 
 use crate::net::{Endpoint, NetError, Trust};
 use crate::paths::{self, Contents, Error, Holder, Paths, Pin, Protected, State};
 use crate::preauth;
 
 /// The anchor epoch watermark (§4.8): sequence number and head hash.
-type Epoch = (u64, [u8; 32]);
+type Epoch = (u64, kuipa_enroll::epoch::EpochHead);
 
 /// How an online join is authorised.
 pub enum Auth {
@@ -489,7 +489,7 @@ fn exchange(
     heads: &[HeadPin],
     retired: &[Hash],
     frozen: &[Thumbprint],
-    known: Option<(u64, [u8; 32])>,
+    known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
 ) -> Result<(Enrollment, VerifiedRealm), Error> {
@@ -522,7 +522,7 @@ pub(crate) fn exchange_with<T>(
     heads: &[HeadPin],
     retired: &[Hash],
     frozen: &[Thumbprint],
-    known: Option<(u64, [u8; 32])>,
+    known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
     finish: impl Fn(PendingJoin, &Response, &VerifiedRealm) -> Result<T, Error>,
@@ -1231,7 +1231,7 @@ fn extend_windows(
 fn write_windows(
     paths: &Paths,
     pins: &[paths::Pin],
-    epoch: Option<(u64, [u8; 32])>,
+    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     realm: &str,
     issuer: &str,
     heads: &[paths::AnchorHead],
@@ -1683,7 +1683,9 @@ fn kind_of(contents: Contents) -> Kind {
 
 /// The bindings of the seal in `sealed`, to retire; none if it is gone or
 /// unreadable.
-fn sealed_bindings(sealed: &std::path::Path) -> Result<Vec<[u8; 32]>, Error> {
+fn sealed_bindings(
+    sealed: &std::path::Path,
+) -> Result<Vec<kuipa_enroll::escrow::BindingHash>, Error> {
     Ok(fs::read(sealed)
         .ok()
         .and_then(|b| Sealed::from_bytes(&b).ok())
@@ -1713,7 +1715,7 @@ fn register(
     state: &State,
     keytab: &std::path::Path,
     params: &RegisterParams,
-    bindings: &[[u8; 32]],
+    bindings: &[kuipa_enroll::escrow::BindingHash],
 ) -> Result<String, Error> {
     let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
@@ -2349,7 +2351,7 @@ fn advertisement_detail(
         // `<seq> <hash>` form.
         "anchor_log_head": adv
             .epoch()
-            .map_or_else(String::new, |(seq, head)| format!("{seq} {}", Thumbprint::from_bytes(head))),
+            .map_or_else(String::new, |(seq, head)| format!("{seq} {}", b64::encode(&head))),
         "landmarks": landmarks,
     }))
 }
@@ -2371,7 +2373,7 @@ fn landmark_chain(
     };
     let policy = Policy::from_system().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    let mut reached: Option<(u64, [u8; 32])> = None;
+    let mut reached: Option<(u64, kuipa_enroll::epoch::EpochHead)> = None;
     while reached != Some((head_seq, head)) {
         let page = endpoint
             .anchor_log(reached.map_or(0, |(seq, _)| seq))
@@ -2389,11 +2391,10 @@ fn landmark_chain(
                 .map_err(|_| "the anchor log is malformed".to_string())?;
             out.push(json!({
                 "seq": epoch.seq(),
-                "head": Thumbprint::from_bytes(
-                    epoch.head().map_err(|_| "cannot hash the anchor log".to_string())?,
-                )
-                .to_string(),
-                "prev": Thumbprint::from_bytes(epoch.prev()).to_string(),
+                "head": b64::encode(
+                    &epoch.head().map_err(|_| "cannot hash the anchor log".to_string())?,
+                ),
+                "prev": b64::encode(&epoch.prev()),
                 "anchors": epoch
                     .anchors()
                     .iter()

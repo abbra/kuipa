@@ -88,10 +88,17 @@ server starts a new log with a new id. The old log stays in
 `/var/lib/ipa/ku/tlog/` and keeps verifying under the old key. Witnesses
 and `kuipa tlog watch` see a new log, not a rewritten one.
 
-A few older fields are still SHA-256 under every policy: the escrow
-binding of a sealed file, the anchor epoch head, the voucher binding, and
-the hashes that authenticate anchor exchanges and trust invitations.
-Their formats fix 32 bytes. Moving them is planned.
+The rest follows the same way. What belongs to an ML-KEM exchange is
+hashed with that KEM's hash: a sealed file's bindings and keys, machine
+vault ids, the voucher binding. That is SHA-256 for ML-KEM-768, so files
+sealed under the default policy still open, and SHA-384 for ML-KEM-1024.
+What no key decides is SHA-384 under every policy: the anchor epoch
+chain, trust invitations, and the binding that authenticates anchor
+exchanges.
+
+Key thumbprints stay SHA-256 under every policy. They are RFC 7638's
+names for keys, as Clevis computes them, and every pin and enrollment
+string uses them.
 
 ## What still uses classical cryptography
 

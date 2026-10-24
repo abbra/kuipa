@@ -117,14 +117,17 @@ impl Invitation {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn secret_hash(&self) -> Result<[u8; 32]> {
+    pub fn secret_hash(&self) -> Result<InvitationHash> {
         secret_hash(self.secret.as_bytes())
     }
 }
 
-/// The stored form of an invitation secret.
-pub(crate) fn secret_hash(secret: &[u8]) -> Result<[u8; 32]> {
-    Ok(primitives::sha256(&[SECRET_LABEL, secret])?)
+/// The stored form of an invitation secret: SHA-384 under every policy,
+/// as no key decides it and a stored hash must outlive a policy change.
+pub type InvitationHash = [u8; primitives::SHA384_LEN];
+
+pub(crate) fn secret_hash(secret: &[u8]) -> Result<InvitationHash> {
+    Ok(primitives::sha384(&[SECRET_LABEL, secret])?)
 }
 
 /// Encode a realm's description: `realm ‖ domain ‖ n[server] ‖ n[anchor]`.
@@ -499,6 +502,7 @@ mod tests {
 
     use super::*;
     use crate::EnrollServer;
+    use crate::escrow::BindingHash;
     use crate::keytab::{Enctype, Keytab, Principal};
     use crate::realm::{RealmInfo, ServerKeys};
     use crate::server::{Directory, DirectoryError, Staged};
@@ -510,7 +514,7 @@ mod tests {
     /// A directory that only keeps invitations and trusts.
     #[derive(Default)]
     struct Trusts {
-        invitations: Mutex<HashMap<[u8; 32], u64>>,
+        invitations: Mutex<HashMap<[u8; 48], u64>>,
         recorded: Mutex<Vec<(TrustedRealm, Vec<u8>)>>,
     }
 
@@ -551,14 +555,14 @@ mod tests {
         ) -> Result<(Keytab, crate::join::KerberosBinding), DirectoryError> {
             unreachable!()
         }
-        fn register_escrow(&self, _: &Principal, _: &[[u8; 32]]) -> Result<(), DirectoryError> {
+        fn register_escrow(&self, _: &Principal, _: &[BindingHash]) -> Result<(), DirectoryError> {
             unreachable!()
         }
         fn escrow_allowed(
             &self,
             _: &Principal,
             _: crate::escrow::Kind,
-            _: &[u8; 32],
+            _: &BindingHash,
         ) -> Result<bool, DirectoryError> {
             unreachable!()
         }
@@ -570,13 +574,13 @@ mod tests {
         }
         fn add_trust_invitation(
             &self,
-            hash: &[u8; 32],
+            hash: &[u8; 48],
             not_after: u64,
         ) -> Result<(), DirectoryError> {
             self.invitations.lock().unwrap().insert(*hash, not_after);
             Ok(())
         }
-        fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+        fn consume_trust_invitation(&self, hash: &[u8; 48]) -> Result<(), DirectoryError> {
             match self.invitations.lock().unwrap().remove(hash) {
                 Some(not_after) if not_after > now() => Ok(()),
                 _ => Err("unknown, used or expired invitation".into()),

@@ -50,13 +50,19 @@ pub const MAX_EPOCH_FETCH: usize = 64;
 pub struct AnchorEpoch {
     realm: String,
     seq: u64,
-    prev: [u8; 32],
+    prev: EpochHead,
     anchors: Vec<Thumbprint>,
     successions: Vec<SignedSuccession>,
 }
 
+/// An epoch entry's head: SHA-384 of the entry under every crypto policy.
+/// The log is a chain several anchors sign, so no one key's category can
+/// pick its hash, and a chain must survive a policy change: SHA-384 is
+/// what every policy kuipa runs under allows (DESIGN.md §4.1.1).
+pub type EpochHead = [u8; primitives::SHA384_LEN];
+
 /// The first entry's predecessor: nothing.
-pub const GENESIS: [u8; 32] = [0; 32];
+pub const GENESIS: EpochHead = [0; primitives::SHA384_LEN];
 
 impl AnchorEpoch {
     /// The entry at sequence `seq`.  `prev` is the head of the entry at
@@ -67,7 +73,7 @@ impl AnchorEpoch {
     pub fn new(
         realm: &str,
         seq: u64,
-        prev: [u8; 32],
+        prev: EpochHead,
         anchors: impl IntoIterator<Item = Thumbprint>,
         successions: impl IntoIterator<Item = SignedSuccession>,
     ) -> Self {
@@ -93,7 +99,7 @@ impl AnchorEpoch {
     }
     /// The head of the entry before this one, or [`GENESIS`].
     #[must_use]
-    pub fn prev(&self) -> [u8; 32] {
+    pub fn prev(&self) -> EpochHead {
         self.prev
     }
 
@@ -191,8 +197,8 @@ impl AnchorEpoch {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn head(&self) -> Result<[u8; 32]> {
-        Ok(primitives::sha256(&[
+    pub fn head(&self) -> Result<EpochHead> {
+        Ok(primitives::sha384(&[
             EPOCH_HEAD_CONTEXT,
             &self.to_bytes()?,
         ])?)
@@ -346,13 +352,13 @@ pub fn verify_chain(
     entries: &[SignedEpoch],
     realm: &str,
     pins: &[Thumbprint],
-    known: Option<(u64, [u8; 32])>,
+    known: Option<(u64, EpochHead)>,
     policy: &Policy,
-) -> std::result::Result<(u64, [u8; 32]), String> {
+) -> std::result::Result<(u64, EpochHead), String> {
     if entries.is_empty() || entries.len() > MAX_EPOCH_FETCH {
         return Err("the anchor log answer is empty or too long".into());
     }
-    let (mut seq, mut head) = known.unwrap_or((0, [0; 32]));
+    let (mut seq, mut head) = known.unwrap_or((0, GENESIS));
     // §4.2: believed keys: the pins first, then the anchors of every
     // entry a believed key signed, entry by entry.
     let mut trusted: BTreeSet<Thumbprint> = pins.iter().copied().collect();
@@ -639,7 +645,7 @@ mod tests {
         let wm = (1, e1.head().unwrap());
         // In order, correctly signed, but committing to an entry this
         // host has never seen: its log is not a prefix of the answer.
-        let e2 = AnchorEpoch::new("R", 2, [7; 32], [thp(&a1)], []);
+        let e2 = AnchorEpoch::new("R", 2, [7; 48], [thp(&a1)], []);
         let signed = SignedEpoch::issue(&a1, &e2).unwrap();
         let err = verify_chain(
             std::slice::from_ref(&signed),

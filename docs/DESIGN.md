@@ -238,25 +238,51 @@ How it holds together:
 * **Tags still apply.** Claims are typed `IPLF` leaves in a claim log
   (`DESIGN-tlog.md` §8). Their unused index is zeros of `H`'s length.
 
+**Bound to a KEM: the KEM suite's hash.** What is derived from or names
+an ML-KEM operation is hashed with that KEM's suite hash, as its HKDF
+and transcript already are (§5.1, §17.4): SHA-256 for ML-KEM-768,
+SHA-384 for ML-KEM-1024. A ciphertext's or key's length names its KEM
+(1088 or 1568 bytes, 1184 or 1568), so no field says which.
+
+| what | hashed with the suite hash of | DESIGN |
+|---|---|---|
+| an escrow binding's identity `H(ct)`, registered and logged | the binding's escrow key | §7.2, `DESIGN-tlog.md` §6 |
+| a machine vault's id `V` | each slot's escrow key: a slot commits to the `V` of its own KEM | §7.6.8 |
+| the vault keys: server and device shares, session and epoch keys, answers | the ciphertext each derives from | §7.6 |
+| a vault file's data key, from two shares | the strongest KEM among its server slots | §7.6.4 |
+| the unlock ticket's channel binding | the recovery request's KEM | §7.6.5 |
+| a voucher's binding of `ek_e` | `ek_e`'s KEM | §9 |
+
+Under ML-KEM-768 these are the SHA-256 values they always were, so what
+is sealed under the default profile still opens.
+
+**No key decides: SHA-384 under every policy.** Some hashes are kept or
+chained across time, or both ends compute them without negotiating, so
+a hash that moved with the policy would orphan them. They are SHA-384,
+which every policy kuipa runs under allows:
+
+| what | DESIGN |
+|---|---|
+| the anchor epoch head and `prev`, a chain several anchors sign | §4.8 |
+| the trust invitation hash the inviting realm stores | §11.4, §17.4 |
+| the anchor exchange's peer channel binding | §4.2 |
+
+Hosts read a 32-byte epoch watermark written before this as no
+watermark; the next verified advertisement sets a SHA-384 one.
+
+**Channel bindings stay 32 bytes** (`CHANNEL_BINDING_LEN`), as GSS-API
+and the Kerberos PRF input take them: a SHA-384 digest is truncated to
+its first 32 bytes, as SP 800-107 allows.
+
 Hashes that the standard prescribes are kept as they are: ML-DSA's own
-SHAKE (FIPS 204), ML-KEM's SHA-3 and SHAKE (FIPS 203). The KEM suite's
-transcript and HKDF hash already follow the KEM the same way (§5.1,
-§17.4). `ml-dsa-zk` uses only AES-256 and SHA-512, and its proofs'
-soundness follows the policy the same way: λ = 128 while ML-DSA-44 or
-65 is allowed, λ = 256 under CNSA 2.0, with weaker proofs refused
-(`crates/ml-dsa-zk/DESIGN.md` §1).
+SHAKE (FIPS 204), ML-KEM's SHA-3 and SHAKE (FIPS 203). `ml-dsa-zk` uses
+only AES-256 and SHA-512, and its proofs' soundness follows the policy
+the same way: λ = 128 while ML-DSA-44 or 65 is allowed, λ = 256 under
+CNSA 2.0, with weaker proofs refused (`crates/ml-dsa-zk/DESIGN.md` §1).
 
-**Still SHA-256 in every profile.** These are older than the logs, and
-their formats fix 32 bytes. Moving them to the policy is open work
-(§16):
-
-* the escrow binding `H(ct)` (§7.2), which a vault release is logged by;
-* the anchor epoch head and `prev` (§4.8);
-* the voucher binding (§9);
-* the peer authentication digest (§4.2) and the trust invitation hash
-  (§11.4);
-* key thumbprints (RFC 7638), which name keys and are not a security
-  boundary of their own.
+**Still SHA-256: key thumbprints.** A thumbprint is RFC 7638's SHA-256
+of the key's JWK, and pins, kids and Clevis metadata name keys by it;
+`tang-pqc` keeps them as Clevis computes them (§16).
 
 ### 4.2 Delegations and the anchor exchange
 
@@ -334,8 +360,8 @@ anti-entropy gossip, `agirru-engine` 0.1.2) over `POST /ipa/ku/peer/sync`:
   envelope, and a GSS-API token that the sender, initiating with its own
   `ipa-ku/<sender>@REALM` key, creates for the service name
   `ipa-ku@<receiver>`; the token's channel binding is
-  `SHA-256("ipa-ku-enroll/v1 peer" ‖ sender ‖ receiver ‖ delegation ‖
-  envelope)` (§14). The receiver accepts the token with its own
+  the first 32 bytes of `SHA-384("ipa-ku-enroll/v1 peer" ‖ sender ‖
+  receiver ‖ delegation ‖ envelope)` (§4.1.1, §14). The receiver accepts the token with its own
   `ipa-ku/<receiver>@REALM` key, requires the initiator to be exactly
   `ipa-ku/<sender>@REALM`, the sender to be a member, the request to be
   addressed to itself, and the delegation to be the sender's own and proven
@@ -1155,7 +1181,7 @@ Tang servers are stateless; for a host keytab that would let a stolen disk
 unlock for as long as any server answers. The IPA server holds per-host
 state, so escrow uses it:
 
-* **Registration:** each binding's `H(ct)` (SHA-256) is sent in a join or
+* **Registration:** each binding's `H(ct)` (the KEM suite hash, §4.1.1) is sent in a join or
   rekey body and stored in `ipaKUEscrowBinding` on the host entry, replacing
   the previous set. Other keytabs and files register in a request of their
   own (§7.5).
@@ -1593,8 +1619,8 @@ Host and service keytabs and files sealed for machines (§7.1, §7.5) keep
 their behaviour, but their bindings carry the commitment and their recovery
 uses the request of §7.6.5:
 
-* `V` is derived, the first 16 bytes of `SHA-256("ipa-ku-enroll/v1
-  machine vault" ‖ kind ‖ P)`, and has no entry; its policy
+* `V` is derived, the first 16 bytes of `H("ipa-ku-enroll/v1
+  machine vault" ‖ kind ‖ P)`, `H` the escrow key's KEM suite hash, and has no entry; its policy
   is fixed: server share only, `sealing = registered` (each seal's binding
   registered, as `ipaKUEscrowBinding` and `ipaKUEscrowFileBinding` are
   today, so an old image stops opening), no sessions, no count.
@@ -1808,7 +1834,8 @@ on `salt ‖ m`:
 
 ```text
 m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ binding
-binding = SHA-256("ipa-ku-enroll/v1 voucher binding" ‖ ek_e)  or zeros
+binding = H("ipa-ku-enroll/v1 voucher binding" ‖ ek_e)  or empty
+          H: ek_e's KEM suite hash, SHA-256 (ML-KEM-768) or SHA-384 (ML-KEM-1024)
 ```
 
 The provisioner blinds `m` with `ml-dsa-blind` (`μ = SHAKE256(tr ‖ 0 ‖
@@ -2127,7 +2154,7 @@ runs on tokio's blocking pool.
 | vaults (§7.6) | accept the owner's token with `cb`; as the daemon: one entry `cn=<vault id>` under `cn=vaults,cn=kuipa,cn=etc` (`objectClass: ipaKUVault`, owner, name, policy JSON, one JSON value per device, state, `ipaKUVaultUnlocks` per server, `ipaKUVaultSessionKey` per epoch); each server's escrow public key as `ipaKUServerEscrowKey` on its `cn=masters` entry; searched one level by `ipaKUVaultOwner`; limits from `ipaKUVaultLimits` (JSON) on `cn=vault-limits,cn=kuipa,cn=etc`, defaults when absent; the owner's lock from `nsAccountLock` on their entry. Names are unique per owner as checked before the add; two servers creating the same name at once can both succeed |
 | registration (§7.5) | accept the token with `cb`, caller must be the principal; as the daemon: replace `ipaKUEscrowBinding`, or delete each retired value of `ipaKUEscrowFileBinding` (an absent one is no error) and add the new ones |
 | voucher join | as the daemon, after the voucher verified: search `ipaKUVoucherSpent` for the salt; add the host entry (as `host-add` lays it out) with it; add it as `member` of `cn=<group>,cn=hostgroups,cn=accounts`; `KEYTAB_GET` |
-| trust invitation | as the daemon: add `ipaKUTrustInvitation: <hex SHA-256 of the secret> <not after>` to `cn=trusts,cn=kuipa,cn=etc,<suffix>`; using it deletes that exact value, which only one server can do |
+| trust invitation | as the daemon: add `ipaKUTrustInvitation: <hex SHA-384 of the secret> <not after>` to `cn=trusts,cn=kuipa,cn=etc,<suffix>`; using it deletes that exact value, which only one server can do |
 | record a trust | as the daemon: add `krbtgt/<B>@<A>` and `krbtgt/<A>@<B>` under `cn=<A>,cn=kerberos,<suffix>` and give them keys from the trust secret with `KEYTAB_GET` and a password (as `ipa-getkeytab -P`); store the partner as JSON in `ipaKUTrustedRealm` |
 | servers | as the daemon: the `cn` of the entries under `cn=masters,cn=ipa,cn=etc` |
 | peer sync | accept the sync's token with the daemon's acceptor credential; return the initiator |
@@ -2242,11 +2269,11 @@ the signing key's category decides (§4.1.1).
 ```
 IPJQ  alg kid(32) realm fqdn auth_type(1) n(1) [enctype(i32)] ct ek_e sealed   join, rekey request
 IPSQ  same fields                                                                stage request
-IPRB  auth_type(1) n(1) [registration(32)] extra authenticator                  sealed request body
+IPRB  auth_type(1) n(1) [registration(h)] extra authenticator                   sealed request body (registration: a binding's KEM suite hash)
 IPJS  ct_e sealed                                                                response
 IPJP  realm domain basedn issuer n[server] n[ca_cert] n[pkinit_anchor]
       n[anchor(32) size(u64) root(h, empty when size is 0)]
-      epoch_seq(u64) epoch_head(32) keytab                                     enrollment payload
+      epoch_seq(u64) epoch_head(48) keytab                                     enrollment payload
 IPSX  mode(1) alg(1) ek_m not_after(u64)                                         staging parameters
 IPSP  bundle secret                                                              stage result
 IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)
@@ -2266,7 +2293,7 @@ IPDK  kdf(1) iterations(u64) salt(16) sealed                                    
 IPUS  principal vault(16) epoch(u64) ct_e wrapped_A m(1) [device(32) ct wrapped] sealed   file sealed for offline sessions
 IPEK  ct sealed(IPEK n(u64) [epoch(u64) private JWK])                          session keys released to a device
 IPVA  ct sealed                                                                  recovery answer encrypted to a device
-IPRP  principal kind(1) n(1) [retire(32)]                                        registration parameters
+IPRP  principal kind(1) n(1) [retire(h)]                                         registration parameters
 IPRA  principal                                                                  registration answer
 IPKG  namespace(1) nickname alg_arg(1)                                           keys operation data (§18.2)
       (namespace: 1 dm, 2 ra, 3 ca, 4 ca_wrapped, 5 lwca-store; alg_arg: a wrap
@@ -2279,11 +2306,11 @@ IPVH  2 realm anchor(32) iat(u64) exp(u64) size(u64) root(h) live_size(u64) live
 IPSV  2 vouch(IPVH) signature n(u64) [1 leaf(h) | 2 target(u64) time(u64)]       signed vouch with the whole claim log in order: claims and tombstones; nothing is removed
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
-IPAE  realm seq(u64) prev(32) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-256` of them under a domain-separation context; `prev` is the previous entry's head, `0…0` for the first)
+IPAE  realm seq(u64) prev(48) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-384` of them under a domain-separation context, in every profile; `prev` is the previous entry's head, `0…0` for the first)
 IEPS  entry(IPAE) signature n(u64) [key(JWK) signature]                    signed anchor epoch entry
 IPAS  n(u64) [tag(1) value]                                                      exchange state (1 key, 2 claim, 3 vouch, 4 succession)
-IPVM  realm fqdn hostgroup not_before(u64) not_after(u64) binding(32)          voucher message (no version)
-IPVO  key(32) realm fqdn hostgroup not_before(u64) not_after(u64) binding(32)
+IPVM  realm fqdn hostgroup not_before(u64) not_after(u64) binding             voucher message (no version; binding: empty, 32 or 48 bytes)
+IPVO  key(32) realm fqdn hostgroup not_before(u64) not_after(u64) binding
       salt(32) signature                                                         voucher
 IPTQ  alg kid(32) realm initiator ct ek_e sealed                                trust request
 IPTT  alg kid(32) signer(32) realm initiator H(ct) H(ek_e)                      trust transcript input (no version)
@@ -2311,8 +2338,8 @@ IPLR  signer(JWK) head(IPLS or empty) n(u64) [index(u64) leaf(IPLF) m(1) [hash(h
 `ct` is empty in bundle modes B and C, `recipient` all zeros outside mode A,
 `secret` empty outside mode B. The bundle signature covers `IPOB` up to and
 including the signer key. The `IPPS` token's channel binding is
-`SHA-256("ipa-ku-enroll/v1 peer" ‖ IPPS(sender, receiver, delegation,
-envelope))`, without version or token; the response is agirru's `Envelope`
+the first 32 bytes of `SHA-384("ipa-ku-enroll/v1 peer" ‖ IPPS(sender,
+receiver, delegation, envelope))`, without version or token; the response is agirru's `Envelope`
 (CBOR) whose state is an `IPAS` byte string. `TQBD`, `TQRQ` and `TQRS` are `tang-pqc`'s binding,
 recovery request and response.
 
@@ -2338,11 +2365,10 @@ recovery request and response.
 * **Custodia's JOSE message layer** has no post-quantum standard to move
   to (`draft-ietf-jose-pqc-kem` is still moving); §18 replaces the whole
   daemon on kuipa's envelope instead of waiting for one.
-* **SHA-256 left in a CNSA profile:** the escrow binding, the anchor
-  epoch head, the voucher binding, the peer authentication digest and the
-  trust invitation hash are SHA-256 whatever the crypto policy, with
-  32-byte fields in their formats (§4.1.1). Moving each to the signer's
-  or the KEM's hash is a format change of its own.
+* **Thumbprints in a CNSA profile:** key thumbprints are RFC 7638
+  SHA-256 under every policy (§4.1.1), as Clevis computes them. A CNSA
+  thumbprint (SHA-384 of the JWK) would change every pin, kid and
+  enrollment string, and Clevis metadata.
 * **Anchor exchange scale:** the state grows linearly with the number of
   anchors; with every server an anchor, 60 servers make 489 KB of state and
   321 KB of deltas per renewal round. Large realms should give the anchor

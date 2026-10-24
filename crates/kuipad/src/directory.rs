@@ -592,13 +592,16 @@ impl Directory for LdapDirectory {
     fn register_escrow(
         &self,
         principal: &Principal,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), DirectoryError> {
         let mut svc = self.service_conn()?;
         let entry = self
             .principal_entry(&mut svc, principal, &["objectClass"])?
             .ok_or_else(|| format!("no entry for {principal}"))?;
-        let values: Vec<&[u8]> = bindings.iter().map(<[u8; 32]>::as_slice).collect();
+        let values: Vec<&[u8]> = bindings
+            .iter()
+            .map(kuipa_enroll::merkle::Hash::as_bytes)
+            .collect();
         svc.modify_s(&entry.dn, &[(ModOp::Replace, ESCROW_ATTR, values)])?;
         Ok(())
     }
@@ -607,7 +610,7 @@ impl Directory for LdapDirectory {
         &self,
         principal: &Principal,
         kind: Kind,
-        binding: &[u8; 32],
+        binding: &kuipa_enroll::escrow::BindingHash,
     ) -> Result<bool, DirectoryError> {
         let attr = match kind {
             Kind::Keytab => ESCROW_ATTR,
@@ -628,14 +631,14 @@ impl Directory for LdapDirectory {
         let registered = entry
             .bin_attrs
             .get(&attr.to_lowercase())
-            .is_some_and(|v| v.iter().any(|b| b.as_slice() == binding));
+            .is_some_and(|v| v.iter().any(|b| b.as_slice() == binding.as_bytes()));
         Ok(!locked && registered)
     }
 
     fn register_with_gss(
         &self,
         params: &RegisterParams,
-        bindings: &[[u8; 32]],
+        bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<KerberosBinding, DirectoryError> {
@@ -650,7 +653,10 @@ impl Directory for LdapDirectory {
         let entry = self
             .principal_entry(&mut svc, principal, &["objectClass"])?
             .ok_or_else(|| format!("no entry for {principal}"))?;
-        let values: Vec<&[u8]> = bindings.iter().map(<[u8; 32]>::as_slice).collect();
+        let values: Vec<&[u8]> = bindings
+            .iter()
+            .map(kuipa_enroll::merkle::Hash::as_bytes)
+            .collect();
         match params.kind {
             Kind::Keytab => {
                 svc.modify_s(&entry.dn, &[(ModOp::Replace, ESCROW_ATTR, values)])?;
@@ -660,7 +666,7 @@ impl Directory for LdapDirectory {
                 for old in &params.retire {
                     match svc.modify_s(
                         &entry.dn,
-                        &[(ModOp::Delete, ESCROW_FILE_ATTR, vec![old.as_slice()])],
+                        &[(ModOp::Delete, ESCROW_FILE_ATTR, vec![old.as_bytes()])],
                     ) {
                         Ok(())
                         | Err(kuipa_ldap::LdapError::Protocol {
@@ -1101,7 +1107,11 @@ impl Directory for LdapDirectory {
         self.new_keys(&mut conn, &principal, enctypes)
     }
 
-    fn add_trust_invitation(&self, hash: &[u8; 32], not_after: u64) -> Result<(), DirectoryError> {
+    fn add_trust_invitation(
+        &self,
+        hash: &kuipa_enroll::trust::InvitationHash,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
         let value = format!("{} {not_after}", hex(hash));
         self.service_conn()?.modify_s(
             &self.trusts_dn(),
@@ -1110,7 +1120,10 @@ impl Directory for LdapDirectory {
         Ok(())
     }
 
-    fn consume_trust_invitation(&self, hash: &[u8; 32]) -> Result<(), DirectoryError> {
+    fn consume_trust_invitation(
+        &self,
+        hash: &kuipa_enroll::trust::InvitationHash,
+    ) -> Result<(), DirectoryError> {
         let prefix = format!("{} ", hex(hash));
         let value = self
             .trust_values(INVITATION_ATTR)?

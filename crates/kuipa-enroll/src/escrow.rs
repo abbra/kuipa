@@ -32,6 +32,11 @@ use crate::error::{Error, Result};
 use crate::keytab::{Keytab, Principal};
 use crate::realm::VerifiedRealm;
 
+/// A binding's identity: the suite hash of its ciphertext
+/// ([`Binding::ciphertext_hash`]), 32 bytes for ML-KEM-768 and 48 for
+/// ML-KEM-1024 (CNSA 2.0), as the KEM's HKDF hash goes.
+pub use crate::merkle::Hash as BindingHash;
+
 /// Domain of escrow bindings and recovery responses.
 pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 escrow");
 
@@ -99,32 +104,41 @@ impl VaultId {
         &self.0
     }
 
-    /// The machine vault of `principal`'s `kind` set:
-    /// `SHA-256("ipa-ku-enroll/v1 machine vault" ‖ kind ‖ principal)`,
-    /// truncated.
+    /// The machine vault of `principal`'s `kind` set, as escrowed to an
+    /// `alg` key: `H("ipa-ku-enroll/v1 machine vault" ‖ kind ‖ principal)`,
+    /// truncated, `H` the KEM's suite hash (SHA-256 for ML-KEM-768,
+    /// SHA-384 for ML-KEM-1024).
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn machine(principal: &Principal, kind: Kind) -> Result<Self> {
-        let digest = primitives::sha256(&[
-            b"ipa-ku-enroll/v1 machine vault",
-            &[kind.id()],
-            principal.to_string().as_bytes(),
-        ])?;
+    pub fn machine(principal: &Principal, kind: Kind, alg: tang_pqc::KemAlg) -> Result<Self> {
+        let digest = primitives::digest(
+            alg.hash(),
+            &[
+                b"ipa-ku-enroll/v1 machine vault",
+                &[kind.id()],
+                principal.to_string().as_bytes(),
+            ],
+        )?;
         let mut id = [0u8; 16];
         id.copy_from_slice(&digest[..16]);
         Ok(Self(id))
     }
 
-    /// Which machine vault of `principal` this is, if it is one.
+    /// Which machine vault of `principal` this is, if it is one, for a
+    /// request to an `alg` key.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn machine_kind(&self, principal: &Principal) -> Result<Option<Kind>> {
+    pub fn machine_kind(
+        &self,
+        principal: &Principal,
+        alg: tang_pqc::KemAlg,
+    ) -> Result<Option<Kind>> {
         for kind in [Kind::Keytab, Kind::File] {
-            if Self::machine(principal, kind)? == *self {
+            if Self::machine(principal, kind, alg)? == *self {
                 return Ok(Some(kind));
             }
         }
@@ -217,7 +231,7 @@ pub struct Registration {
     /// The server.
     pub server: String,
     /// `H(ct)` of the binding to that server.
-    pub binding: [u8; 32],
+    pub binding: BindingHash,
 }
 
 /// Bindings and a data key, made before what they will protect is known:
@@ -260,7 +274,6 @@ impl Sealer {
             return Err(Error::Missing("escrow servers"));
         }
         let ctx = context(principal);
-        let committed = commitment_data(principal, &VaultId::machine(principal, kind)?);
         let mut dek = SecretBuf::with_len(32);
         Rand::fill_private(dek.as_mut_slice())?;
         let mut slots = Vec::with_capacity(servers.len());
@@ -270,6 +283,9 @@ impl Sealer {
                 return Err(Error::WrongRealm);
             }
             let escrow_key = realm.escrow_key()?.clone();
+            // Each slot commits to the vault id of its own KEM's hash.
+            let vault = VaultId::machine(principal, kind, escrow_key.alg())?;
+            let committed = commitment_data(principal, &vault);
             let (binding, key, commitment) = realm.advertisement().provision_committed(
                 &ctx,
                 Some(escrow_key.kid()),
@@ -277,7 +293,7 @@ impl Sealer {
             )?;
             registrations.push(Registration {
                 server: realm.server().into(),
-                binding: binding.ciphertext_hash()?,
+                binding: BindingHash::from_slice(&binding.ciphertext_hash()?)?,
             });
             slots.push(Slot {
                 server: realm.server().into(),
@@ -378,10 +394,10 @@ impl Sealed {
     /// # Errors
     ///
     /// A crypto error.
-    pub fn bindings(&self) -> Result<Vec<[u8; 32]>> {
+    pub fn bindings(&self) -> Result<Vec<BindingHash>> {
         self.slots
             .iter()
-            .map(|s| Ok(s.binding.ciphertext_hash()?))
+            .map(|s| BindingHash::from_slice(&s.binding.ciphertext_hash()?))
             .collect()
     }
 
@@ -439,8 +455,8 @@ impl Sealed {
         &self,
         mut recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
     ) -> Result<SecretBuf> {
-        let vault = VaultId::machine(&self.principal, self.kind)?;
         for slot in &self.slots {
+            let vault = VaultId::machine(&self.principal, self.kind, slot.escrow_key.alg())?;
             let (request, pending) = slot.binding.recovery_request(&slot.escrow_key)?;
             let request = EscrowRequest::for_vault(
                 self.principal.clone(),
@@ -539,7 +555,7 @@ pub struct RegisterParams {
     /// [`Kind::File`]: they join the file set, and `retire` leaves it.
     pub kind: Kind,
     /// File bindings to remove: those of the seal being replaced or undone.
-    pub retire: Vec<[u8; 32]>,
+    pub retire: Vec<BindingHash>,
 }
 
 impl RegisterParams {
@@ -555,7 +571,7 @@ impl RegisterParams {
             .u8(u8::try_from(self.retire.len())
                 .map_err(|_| Error::Malformed("too many bindings to retire"))?);
         for b in &self.retire {
-            w.fixed(b);
+            w.bytes(b);
         }
         Ok(w.finish())
     }
@@ -569,7 +585,9 @@ impl RegisterParams {
         let mut r = Reader::new(bytes, REGISTER_MAGIC, "registration")?;
         let principal = r.str()?.parse()?;
         let kind = Kind::from_id(r.u8()?)?;
-        let retire = (0..r.u8()?).map(|_| r.fixed()).collect::<Result<_, _>>()?;
+        let retire = (0..r.u8()?)
+            .map(|_| BindingHash::from_slice(r.bytes()?))
+            .collect::<Result<_>>()?;
         r.finish()?;
         Ok(Self {
             principal,
@@ -672,21 +690,24 @@ impl EscrowRequest {
         &self.ticket
     }
 
-    /// The channel binding of the token: `SHA-256("ipa-ku-enroll/v1 vault
-    /// unlock" ‖ the request without its token)`.
+    /// The channel binding of the token: `H("ipa-ku-enroll/v1 vault
+    /// unlock" ‖ the request without its token)`, `H` the recovery KEM's
+    /// suite hash (SHA-256 for ML-KEM-768, SHA-384 for ML-KEM-1024),
+    /// taken to the 32 bytes every channel binding has.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn ticket_binding(&self) -> Result<[u8; 32]> {
+    pub fn ticket_binding(&self) -> Result<[u8; crate::join::CHANNEL_BINDING_LEN]> {
         let bare = Self {
             ticket: Vec::new(),
             ..self.clone()
         };
-        Ok(primitives::sha256(&[
-            b"ipa-ku-enroll/v1 vault unlock",
-            &bare.to_bytes(),
-        ])?)
+        let digest = primitives::digest(
+            self.request.alg().hash(),
+            &[b"ipa-ku-enroll/v1 vault unlock", &bare.to_bytes()],
+        )?;
+        Ok(crate::join::channel_binding_of(&digest))
     }
 
     /// The principal.
@@ -757,5 +778,35 @@ impl EscrowRequest {
             session,
             ticket,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tang_pqc::KemAlg;
+    use tang_pqc::primitives::sha256;
+
+    use super::*;
+
+    #[test]
+    fn machine_vault_ids_follow_the_escrow_kem() {
+        // ML-KEM-768 keeps the SHA-256 ids already sealed to; ML-KEM-1024
+        // (CNSA 2.0) gives a SHA-384 one, and each id names its own KEM.
+        let host: Principal = "host/web1.example.test@EXAMPLE.TEST".parse().unwrap();
+        let old = sha256(&[
+            b"ipa-ku-enroll/v1 machine vault",
+            &[Kind::Keytab.id()],
+            host.to_string().as_bytes(),
+        ])
+        .unwrap();
+        let v768 = VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap();
+        assert_eq!(v768.as_bytes(), &old[..16]);
+        let v1024 = VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem1024).unwrap();
+        assert_ne!(v768, v1024);
+        assert_eq!(
+            v1024.machine_kind(&host, KemAlg::MlKem1024).unwrap(),
+            Some(Kind::Keytab)
+        );
+        assert_eq!(v1024.machine_kind(&host, KemAlg::MlKem768).unwrap(), None);
     }
 }
