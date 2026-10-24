@@ -317,8 +317,18 @@ descriptor stored on this host does not account for — a device it
 does not list added or acting, a device it lists removed, a policy it
 does not show — is flagged *UNEXPECTED*.  Run *seal show* to accept
 what you did elsewhere.  The first watch of a server sets the baseline
-and flags nothing.  Exits 1 for a flag, a log that does not extend what
-was seen (*FORKED*), or a server that could not be checked.
+and flags nothing.  With trusted witnesses (*tlog witnesses*), each
+head needs their cosignatures: one with fewer is *UNWITNESSED*, listed
+but not recorded, so run the watch again after the witnesses' next
+pass.  Exits 1 for a flag, a log that does not extend what was seen
+(*FORKED*), an unwitnessed head, or a server that could not be checked.
+
+## tlog witnesses [--add _JWK_] [--remove _THUMBPRINT_] [--required _N_]
+
+Show the transparency-log witnesses this host trusts, and how many
+must cosign a head for *tlog watch* to accept it.  As root, trust the
+witness whose public key is _JWK_ (from *kuipa-witness keygen*), stop
+trusting one, or set _N_; _N_ cannot exceed the witnesses trusted.
 
 # ENVIRONMENT
 
@@ -357,6 +367,10 @@ was seen (*FORKED*), or a server that could not be checked.
 
 */etc/ipa/ca.crt*
 	The IPA CA chain, used to verify the servers' TLS.
+
+*/etc/ipa/ku-witnesses.json*
+	The transparency-log witnesses this host trusts, and how many
+	must cosign a head (*tlog witnesses*).
 
 */var/lib/ipa-client/ku/state.json*
 	The client's persistent state: machine key, servers,

@@ -87,6 +87,14 @@ impl Paths {
         self.at("etc/ipa/ku-anchors")
     }
 
+    /// `/etc/ipa/ku-witnesses.json`: the transparency-log witnesses this
+    /// host trusts, and how many of them must cosign a head
+    /// (`kuipa tlog witnesses`); world-readable, like the anchors.
+    #[must_use]
+    pub fn witnesses(&self) -> PathBuf {
+        self.at("etc/ipa/ku-witnesses.json")
+    }
+
     fn state_dir(&self) -> PathBuf {
         self.at("var/lib/ipa-client/ku")
     }

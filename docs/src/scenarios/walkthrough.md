@@ -353,6 +353,14 @@ posts the cosignature back. ipa1's served head then carries it, and
 `kuipa-audit tlog --witness …/witness.pub.jwk` reports `cosigned by: 1`.
 A second pass finds nothing new (`unchanged`).
 
+Once the host trusts the witness and requires its cosignature
+(`kuipa tlog witnesses --add …/witness.pub.jwk --required 1`), the next
+open grows ipa1's log, and its re-signed head has no cosignature yet.
+The watch lists the new release, reports
+`UNWITNESSED  ipa1.example.test: 0 of 1 cosignatures`, and exits 1
+without recording the head. After the witness's next pass, the same
+watch is clean.
+
 A second vault allows hour-long sessions and ten unlocks
 (`--session-hours 1 --max-unlocks 10`, shown as `unlocks allowed: 10`
 and `longest session (seconds): 3600`). One unlock — passphrase and
