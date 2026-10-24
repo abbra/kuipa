@@ -689,6 +689,7 @@ struct Published {
 pub struct EnrollServer {
     keys: ServerKeys,
     info: RealmInfo,
+    policy: tang_pqc::Policy,
     published: RwLock<Published>,
 }
 
@@ -703,6 +704,7 @@ impl EnrollServer {
         Self {
             keys,
             info,
+            policy: tang_pqc::Policy::default(),
             published: RwLock::new(Published {
                 delegation,
                 anchors,
@@ -712,6 +714,14 @@ impl EnrollServer {
                 epoch: Vec::new(),
             }),
         }
+    }
+
+    /// Accept only what `policy` allows from delegations, partners and
+    /// session tokens; the default is [`tang_pqc::Policy::default`].
+    #[must_use]
+    pub fn with_policy(mut self, policy: tang_pqc::Policy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Replace the delegation and the trusted anchors, as decided by the
@@ -933,10 +943,7 @@ impl EnrollServer {
         }
         let delegation = delegation.select_with_heads(wanted, heads);
         let signer = (
-            delegation
-                .signers(&tang_pqc::Policy::default())
-                .first()
-                .copied(),
+            delegation.signers(&self.policy).first().copied(),
             delegation
                 .successions()
                 .first()
@@ -1561,9 +1568,9 @@ impl EnrollServer {
         }
         partner.validate_for(&self.info.realm, &self.anchors())?;
         let now = unix_seconds(SystemTime::now());
-        let delegation =
-            body.delegation
-                .verify_at(&partner.anchors, &tang_pqc::Policy::default(), now)?;
+        let delegation = body
+            .delegation
+            .verify_at(&partner.anchors, &self.policy, now)?;
         let signer = tang_pqc::VerifyingKey::from_jwk_json(body.signer_key.as_bytes())?;
         if delegation.realm != partner.realm || &delegation.key != signer.thumbprint() {
             return Err(Refusal::because(
@@ -1665,7 +1672,7 @@ impl EnrollServer {
                 .check(
                     &self.info.realm,
                     &self.anchors(),
-                    &tang_pqc::Policy::default(),
+                    &self.policy,
                     request.vault(),
                     &vault.owner,
                     device,

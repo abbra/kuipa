@@ -143,7 +143,14 @@ fn row_for(
         .and_then(|v| Delegation::from_value(v).ok())
         .and_then(|d| d.claim().ok())
         .and_then(|claim| {
-            VerifiedRealm::verify(&adv, &claim.realm, &[anchor], &Policy::default(), now).ok()
+            VerifiedRealm::verify(
+                &adv,
+                &claim.realm,
+                &[anchor],
+                &Policy::from_system().ok()?,
+                now,
+            )
+            .ok()
         });
     let Some(verified) = verified else {
         return split("the advertisement does not verify against the pinned anchor".into());
@@ -336,9 +343,13 @@ fn self_consistent(adv: &tang_pqc::SignedAdvertisement, now: SystemTime) -> Resu
     )
     .map_err(|e| e.to_string())?;
     let claim = delegation.claim().map_err(|e| e.to_string())?;
-    adv.verify_at(&claim.key, &Policy::default(), now)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    adv.verify_at(
+        &claim.key,
+        &Policy::from_system().map_err(|e| e.to_string())?,
+        now,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Where the views disagree: an anchor served at different roots, an

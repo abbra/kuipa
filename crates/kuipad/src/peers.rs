@@ -199,7 +199,7 @@ pub fn initial_delegation(
     if let Some(d) = store.delegation()? {
         let usable = match anchor {
             Some(a) => d
-                .verify_at(&[*a.public().thumbprint()], &Policy::default(), at)
+                .verify_at(&[*a.public().thumbprint()], &Policy::from_system()?, at)
                 .is_ok_and(|v| v.key == *signing.thumbprint() && v.server == fqdn),
             None => d.claim().is_ok_and(|c| {
                 c.key == *signing.thumbprint() && c.server == fqdn && c.anchor.is_none()
@@ -273,7 +273,7 @@ impl Peers {
             client: http_client(&settings)?,
             settings,
             anchor,
-            policy: Policy::default(),
+            policy: Policy::from_system()?,
             server,
             directory,
             initiator,

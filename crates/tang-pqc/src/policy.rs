@@ -20,12 +20,17 @@ pub struct Policy {
 }
 
 impl Default for Policy {
-    /// ML-KEM-768/1024, ML-DSA-65/87, expiry required, at most 30 days of
+    /// ML-KEM-768/1024, ML-DSA-44/65/87, expiry required, at most 30 days of
     /// validity, 5 minutes of clock skew.
+    ///
+    /// ML-DSA-44 is accepted because transparency-log witnesses and CA
+    /// cosigners use it (C2SP tlog-witness, Chrome's quantum-resistant root
+    /// policy); new signing keys still prefer ML-DSA-65
+    /// ([`SignatureAlg::PREFERENCE`]).
     fn default() -> Self {
         Self {
             kems: KemAlg::ALL.to_vec(),
-            signature_algs: vec![SignatureAlg::MlDsa65, SignatureAlg::MlDsa87],
+            signature_algs: SignatureAlg::ALL.to_vec(),
             max_validity: Duration::from_secs(30 * 24 * 3600),
             clock_skew: Duration::from_secs(5 * 60),
             require_expiry: true,
@@ -42,6 +47,39 @@ impl Policy {
             signature_algs: vec![SignatureAlg::MlDsa87],
             ..Self::default()
         }
+    }
+
+    /// The default policy narrowed to what the system crypto policy allows,
+    /// so a CNSA 2.0 system policy yields [`cnsa2`](Self::cnsa2).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SystemPolicy`] if OpenSSL's configuration cannot be read, or
+    /// [`Error::NoAllowedAlgorithm`] if it allows no ML-KEM or no ML-DSA.
+    pub fn from_system() -> Result<Self> {
+        let mut kems = Vec::new();
+        for alg in KemAlg::ALL {
+            if alg.allowed_by_system()? {
+                kems.push(alg);
+            }
+        }
+        let mut signature_algs = Vec::new();
+        for alg in SignatureAlg::ALL {
+            if alg.allowed_by_system()? {
+                signature_algs.push(alg);
+            }
+        }
+        if kems.is_empty() {
+            return Err(Error::NoAllowedAlgorithm("ML-KEM"));
+        }
+        if signature_algs.is_empty() {
+            return Err(Error::NoAllowedAlgorithm("ML-DSA"));
+        }
+        Ok(Self {
+            kems,
+            signature_algs,
+            ..Self::default()
+        })
     }
 
     /// Accept only these KEMs for new bindings.
@@ -183,6 +221,7 @@ mod tests {
         assert!(p.allows_kem(KemAlg::MlKem1024) && !p.allows_kem(KemAlg::MlKem768));
         assert!(p.allows_signature(SignatureAlg::MlDsa87));
         assert!(!p.allows_signature(SignatureAlg::MlDsa65));
-        assert!(!Policy::default().allows_signature(SignatureAlg::MlDsa44));
+        assert!(!p.allows_signature(SignatureAlg::MlDsa44));
+        assert!(Policy::default().allows_signature(SignatureAlg::MlDsa44));
     }
 }
