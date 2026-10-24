@@ -38,6 +38,16 @@ let key_again = pending.finish(&server.recover(&request)?)?;
 Run the example with `cargo run -p tang-pqc --example escrow [768|1024]`.
 Requires OpenSSL ≥ 3.5.
 
+A symbolic model of the protocol (pins and advertisement verification,
+provisioning, the sealed recovery transport, and the P1/P2/P5 analysis
+of DESIGN.md) is in
+[`contrib/tamarin/tang-pqc.spthy`](../../contrib/tamarin/tang-pqc.spthy),
+for the Tamarin prover. `tamarin-prover --prove` verifies the
+two-factor, authenticated-setup, sealed-transport and response
+authentication properties, and reproduces the documented attacks: a
+mis-delivered `thp` with a stolen disk, and the disk holder querying
+the server (the P2 gap).
+
 ## License
 
 This crate is part of [kuipa](../../README.md). It is licensed under the
