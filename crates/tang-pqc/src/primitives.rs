@@ -101,6 +101,33 @@ impl Domain {
 /// AES-256-GCM tag length.
 pub const TAG_LEN: usize = 16;
 
+/// SHA-256, by its OpenSSL name.
+pub const SHA256: &CStr = c"SHA2-256";
+/// SHA-384, by its OpenSSL name.
+pub const SHA384: &CStr = c"SHA2-384";
+/// SHA-512, by its OpenSSL name.
+pub const SHA512: &CStr = c"SHA2-512";
+/// SHA-256's output length.
+pub const SHA256_LEN: usize = 32;
+/// SHA-384's output length.
+pub const SHA384_LEN: usize = 48;
+/// SHA-512's output length.
+pub const SHA512_LEN: usize = 64;
+
+/// The output length of `hash`, one of [`SHA256`], [`SHA384`] and
+/// [`SHA512`].
+#[must_use]
+pub fn digest_len(hash: &CStr) -> Option<usize> {
+    [
+        (SHA256, SHA256_LEN),
+        (SHA384, SHA384_LEN),
+        (SHA512, SHA512_LEN),
+    ]
+    .into_iter()
+    .find(|(name, _)| *name == hash)
+    .map(|(_, len)| len)
+}
+
 /// `hash` over the concatenation of `parts`.
 ///
 /// # Errors
@@ -123,9 +150,20 @@ pub fn digest(hash: &CStr, parts: &[&[u8]]) -> Result<Vec<u8>> {
 /// # Errors
 ///
 /// An OpenSSL error.
-pub fn sha256(parts: &[&[u8]]) -> Result<[u8; 32]> {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest(c"SHA2-256", parts)?);
+pub fn sha256(parts: &[&[u8]]) -> Result<[u8; SHA256_LEN]> {
+    let mut out = [0u8; SHA256_LEN];
+    out.copy_from_slice(&digest(SHA256, parts)?);
+    Ok(out)
+}
+
+/// SHA-384 over the concatenation of `parts`.
+///
+/// # Errors
+///
+/// An OpenSSL error.
+pub fn sha384(parts: &[&[u8]]) -> Result<[u8; SHA384_LEN]> {
+    let mut out = [0u8; SHA384_LEN];
+    out.copy_from_slice(&digest(SHA384, parts)?);
     Ok(out)
 }
 
@@ -217,13 +255,13 @@ mod tests {
     #[test]
     fn domains_separate_derivations() {
         let a = Domain::TANG
-            .derive_key(c"SHA2-256", &[b"ikm"], "key", &[b"x"])
+            .derive_key(SHA256, &[b"ikm"], "key", &[b"x"])
             .unwrap();
         let b = Domain::new("other/v1")
-            .derive_key(c"SHA2-256", &[b"ikm"], "key", &[b"x"])
+            .derive_key(SHA256, &[b"ikm"], "key", &[b"x"])
             .unwrap();
         let c = Domain::TANG
-            .derive_key(c"SHA2-256", &[b"ikm"], "response", &[b"x"])
+            .derive_key(SHA256, &[b"ikm"], "response", &[b"x"])
             .unwrap();
         assert_ne!(a.as_ref(), b.as_ref());
         assert_ne!(a.as_ref(), c.as_ref());
