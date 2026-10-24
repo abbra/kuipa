@@ -346,6 +346,13 @@ replays every leaf, and counts them by kind (`vault-device`,
 concerns. Run again later, it requires the log to extend the head it
 recorded.
 
+The playground also runs a witness, whose key both servers trust
+(`kuipad add-witness-key` on a real server). `kuipa-witness run --once`
+cosigns each server's head that extends the last one it cosigned, and
+posts the cosignature back. ipa1's served head then carries it, and
+`kuipa-audit tlog --witness …/witness.pub.jwk` reports `cosigned by: 1`.
+A second pass finds nothing new (`unchanged`).
+
 A second vault allows hour-long sessions and ten unlocks
 (`--session-hours 1 --max-unlocks 10`, shown as `unlocks allowed: 10`
 and `longest session (seconds): 3600`). One unlock — passphrase and

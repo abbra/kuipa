@@ -245,6 +245,15 @@ step 0 "An auditor replays ipa1's whole log from its public routes" \
 step 0 "The next audit requires the log to extend the recorded head" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && kuipa-audit tlog --server ipa1.example.test --state "$KUIPA_PLAYGROUND/tlog-audit.json"' \
     "verified" "recorded"
+step 0 "A witness cosigns both servers' heads, once each extends what it saw" \
+    'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test --server ipa2.example.test' \
+    "cosigned  ipa1.example.test"
+step 0 "The audit counts the witness's cosignature on ipa1's head" \
+    'kuipa-audit tlog --server ipa1.example.test --witness "$KUIPA_PLAYGROUND/witness/witness.pub.jwk"' \
+    "cosigned by" "1"
+step 0 "Nothing new: the witness has nothing to cosign" \
+    'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test' \
+    "unchanged"
 
 step 0 "A vault that allows hour-long sessions and 10 unlocks" \
     'kuipa seal create daily --require device,ticket --session-hours 1 --max-unlocks 10 && kuipa seal device add daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' \

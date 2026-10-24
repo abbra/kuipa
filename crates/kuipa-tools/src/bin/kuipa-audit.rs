@@ -92,6 +92,10 @@ enum Command {
         /// run's log to extend it.
         #[arg(long, value_name = "FILE")]
         state: Option<std::path::PathBuf>,
+        /// A witness's public JWK file whose cosignatures to count;
+        /// repeatable.
+        #[arg(long, value_name = "JWK")]
+        witness: Vec<std::path::PathBuf>,
     },
 }
 
@@ -137,27 +141,11 @@ fn main() -> ExitCode {
             server,
             anchor,
             state,
-        } => {
-            let anchors: Result<Vec<tang_pqc::Thumbprint>, _> =
-                anchor.iter().map(|a| a.parse()).collect();
-            let Ok(anchors) = anchors else {
-                eprintln!("kuipa-audit tlog: bad --anchor thumbprint");
-                return ExitCode::from(2);
-            };
-            match audit::tlog(server, &anchors, state.as_deref()) {
-                Ok(v) => {
-                    let clean = !v["state"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .starts_with("forked");
-                    (v, clean)
-                }
-                Err(e) => {
-                    eprintln!("kuipa-audit tlog: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
+            witness,
+        } => match tlog(server, anchor, witness, state.as_deref()) {
+            Ok(report) => report,
+            Err(status) => return status,
+        },
         Command::SplitView { server } => {
             if server.is_empty() {
                 eprintln!("kuipa-audit split-view: --server is required (repeat for each)");
@@ -185,6 +173,46 @@ fn main() -> ExitCode {
     } else {
         ExitCode::from(2)
     }
+}
+
+/// `kuipa-audit tlog`: the report and whether it is clean, or the exit
+/// status for bad arguments (2) or a failed audit (1), reported.
+fn tlog(
+    server: &str,
+    anchor: &[String],
+    witness: &[std::path::PathBuf],
+    state: Option<&std::path::Path>,
+) -> Result<(serde_json::Value, bool), ExitCode> {
+    let witnesses: Result<Vec<tang_pqc::VerifyingKey>, String> = witness
+        .iter()
+        .map(|p| {
+            std::fs::read(p)
+                .map_err(|e| e.to_string())
+                .and_then(|b| tang_pqc::VerifyingKey::from_jwk_json(&b).map_err(|e| e.to_string()))
+                .map_err(|e| format!("{}: {e}", p.display()))
+        })
+        .collect();
+    let witnesses = witnesses.map_err(|e| {
+        eprintln!("kuipa-audit tlog: {e}");
+        ExitCode::from(2)
+    })?;
+    let anchors: Vec<tang_pqc::Thumbprint> = anchor
+        .iter()
+        .map(|a| a.parse())
+        .collect::<Result<_, _>>()
+        .map_err(|_| {
+            eprintln!("kuipa-audit tlog: bad --anchor thumbprint");
+            ExitCode::from(2)
+        })?;
+    let v = audit::tlog(server, &anchors, &witnesses, state).map_err(|e| {
+        eprintln!("kuipa-audit tlog: {e}");
+        ExitCode::FAILURE
+    })?;
+    let clean = !v["state"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("forked");
+    Ok((v, clean))
 }
 
 /// Parse `--pinned-head "THP SIZE ROOT"` arguments.
@@ -279,6 +307,9 @@ fn render(command: &Command, value: &serde_json::Value) {
             }
             if let Some(p) = value.get("previous") {
                 rows.row("recorded", format_head(p));
+            }
+            if let Some(w) = get("witnesses").as_array() {
+                rows.row("cosigned by", w.len().to_string());
             }
             if let Some(kinds) = get("kinds").as_object() {
                 let list: Vec<String> = kinds.iter().map(|(k, n)| format!("{k} {n}")).collect();
