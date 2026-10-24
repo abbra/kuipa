@@ -72,7 +72,7 @@ pub fn needs_vouch(own: Option<&SignedVouch>, leaves: &[Hash], now: u64, interva
     let mut wanted = leaves.to_vec();
     wanted.sort_unstable();
     wanted.dedup();
-    let mut have = v.leaves().to_vec();
+    let mut have = v.live().to_vec();
     have.sort_unstable();
     have.dedup();
     if have == wanted {
@@ -1262,10 +1262,10 @@ mod tests {
             NOW + 100 + DEFAULT_VALIDITY / 3 * 2
         ));
         let v = state.vouch(&a.thp()).unwrap();
-        assert!(!needs_vouch(Some(v), v.leaves(), NOW, 0));
+        assert!(!needs_vouch(Some(v), v.live(), NOW, 0));
         assert!(needs_vouch(
             Some(v),
-            v.leaves(),
+            v.live(),
             v.vouch().iat + VOUCH_VALIDITY / 2,
             0
         ));

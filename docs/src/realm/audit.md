@@ -26,8 +26,10 @@ kuipa-audit split-view --server ipa1.example.test --server ipa2.example.test
 
 `coverage` reports, per pinned anchor, whether the server's log is
 **current** with the pin, grew **past** it (the pin is stale), differs
-**at the same size** or is **shorter** (the log restarted — the realm
-removed something), with both sides' sizes and roots. `split-view`
+**at the same size**, or is **shorter**, with both sides' sizes and
+roots. Claim logs only grow: a removed server's claim is retired by a
+tombstone, not cut out. A shorter log is a split, like a different root
+at the same size. `split-view`
 names every anchor two servers answer differently, with each side's
 head and the signed vouch that commits to it — the claim-log
 counterpart of a forked anchor log.

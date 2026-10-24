@@ -477,12 +477,14 @@ impl VerifiedRealm {
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
-        Self::verify_with_heads(adv, realm, anchors, &[], policy, now)
+        Self::verify_with_heads(adv, realm, anchors, &[], &[], policy, now)
     }
 
     /// [`verify`](Self::verify) with the client's pinned vouch heads
-    /// (§4.9): a delegation that carries a head proof for one of them is
-    /// accepted with no signature.  The heads do not replace the pins:
+    /// (§4.9) and the claims their logs retired, as the client learned
+    /// them: a delegation that carries a head proof for one of them, for a
+    /// claim not retired, is accepted with no signature.  The heads do not
+    /// replace the pins:
     /// an expired or absent head falls back to the signature proofs the
     /// advertisement also carries or the client asks for again.
     ///
@@ -494,6 +496,7 @@ impl VerifiedRealm {
         realm: &str,
         anchors: &[Thumbprint],
         heads: &[HeadPin],
+        retired: &[crate::merkle::Hash],
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
@@ -504,7 +507,8 @@ impl VerifiedRealm {
         let proved_heads = parsed.verified_heads(policy, unix_seconds(now));
         let head_proofs = parsed.head_proofs();
         let claim = parsed.claim()?;
-        let delegation = parsed.verify_at_with_heads(anchors, heads, policy, unix_seconds(now))?;
+        let delegation =
+            parsed.verify_at_with_heads(anchors, heads, retired, policy, unix_seconds(now))?;
         if delegation.realm != realm {
             return Err(Error::WrongRealm);
         }

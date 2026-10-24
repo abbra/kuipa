@@ -16,7 +16,7 @@ hold such events, and the order in which it replaces the claim log.
 | 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
 | 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow and Keys events, with receipts and lookups |
 | 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | implemented |
-| 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
+| 8 | claim-log migration | claims as kind-1 leaves, tombstones instead of restarts, the live tree, retired claims on hosts | implemented |
 
 ## 1. Typed leaves
 
@@ -288,8 +288,43 @@ The report is `verified`, `empty`, `forked: …` (exit status 2), or
 `unchecked: …` for a log larger than one run reads (2²⁰ leaves). It
 counts the leaves by kind, and names nobody. Leaves carry only indexes.
 
-## 8. Next
+## 8. Claim logs on typed leaves
 
-* **Migration.** Claims are appended as kind-1 leaves, and a dropped
-  claim becomes a tombstone instead of a restart. IPVH/IPSV are kept for
-  pinned hosts until their windows age out.
+An anchor's claim log (DESIGN.md §4.9) stays **anchor-signed**, so it
+does not move into the server's own log. A claim is an anchor vouching
+for a server, and the server's own key cannot vouch for itself. It
+takes this log's rules instead:
+- **Typed leaves.** A claim is a kind-1 leaf (`Leaf{kind: 1, time:
+  iat, index: 0, body: IPDC}`).
+- **Tombstones, not restarts.** A claim no longer vouched for is
+  retired by a tombstone leaf naming its index, stamped with the
+  vouch's `iat`, under the reason "claim dropped". `IPSV` v2 carries the
+  entries, both claims and tombstones, and replays them under the same
+  rules as `Log`: a claim is appended only while not live, and a
+  tombstone retires an earlier live claim. A claim vouched for again
+  is appended again.
+- **The live tree.** `IPVH` v2 signs the log's `(size, root)` and the
+  live tree's `(live_size, live_root)`. Signature proofs are inclusion
+  in the live tree, so a dropped claim stops proving at the next vouch.
+- **Retired claims on hosts.** Head proofs carry no signature. When a
+  host pins a head, on first pin or when extending a window, it reads
+  the head's signed vouch from the claim-log page, checks that its
+  first `size` entries make the pinned root
+  (`SignedVouch::retired_at`), and records the claims they retired as
+  a `retired` line beside the pin. `verify_with_heads` refuses a head
+  proof for a retired claim. A head whose retired claims cannot be
+  read is not pinned.
+- **Forks.** A log shorter than the window's newest head is refused
+  and reported, and the audit reports it as a split. Before, it was a
+  restart and the window started over.
+
+Heads used without being pinned know nothing of retirements: an
+enrollment string's head before enrollment, `realm-info`, and the
+read-only `kuipa advertisement`. The window extension still walks the
+pages from index 0. Moving it to the consistency proofs of §3 is the
+next step.
+
+## Next
+
+* **Consistency proofs for claim-log windows**, instead of the walk
+  from index 0.

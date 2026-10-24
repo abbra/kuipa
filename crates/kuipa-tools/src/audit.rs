@@ -55,8 +55,8 @@ pub fn claim_log(server: &str, anchor: &str, from: u64) -> Result<Value, Error> 
 /// names them.  Each anchor's report says whether the server's newest
 /// head extends the pinned one (current), the server's tree has grown
 /// beyond it (stale — with the consistency check applied read-only),
-/// is shorter (restarted), is not backed by the anchor's signature
-/// (split), or is longer than the walk can see (unchecked).
+/// is shorter or not backed by the anchor's signature (split: claim
+/// logs only grow), or is longer than the walk can see (unchecked).
 ///
 /// Each anchor is asked for its own advertisement and verified against
 /// its own pin: only heads the delegation proves **by signature**
@@ -85,6 +85,7 @@ pub fn coverage(
                 exp: None,
                 heads: vec![(*size, *root)],
                 frozen: false,
+                retired: Vec::new(),
             })
             .collect()
     };
@@ -177,7 +178,9 @@ fn row_for(
         return row("split: the served head is not signed by the anchor".into());
     }
     if page.size < newest {
-        return row("restarted: the server's tree is shorter".into());
+        // Claim logs only grow (DESIGN-tlog.md §8): a shorter tree is a
+        // log that does not contain the pinned history.
+        return row("split: the server's tree is shorter than the pinned head".into());
     }
     if page.size == newest {
         return row(if page.root == pinned_root {
@@ -398,8 +401,8 @@ fn disagreements(views: &[ServerView]) -> Vec<Value> {
 }
 
 /// Whether a report is clean: a coverage whose every anchor row reads
-/// `current` or `stale` — a split, an `unchecked` log, a restarted
-/// tree, a missing claim log and an unpinned head are all not clean —
+/// `current` or `stale` — a split (a shorter or unsigned tree), an
+/// `unchecked` log, a missing claim log and an unpinned head are all not clean —
 /// and a split-view with no disagreement, no malformed anchor, and no
 /// server whose advertisement failed self-consistency.  The binary's
 /// exit status follows it.
@@ -452,7 +455,7 @@ mod tests {
         for state in [
             "split: the served head is not signed by the anchor",
             "unchecked: log larger than 262144 leaves",
-            "restarted: the server's tree is shorter",
+            "split: the server's tree is shorter than the pinned head",
             "no claim log served: HTTP 404",
             "no head pinned",
         ] {
