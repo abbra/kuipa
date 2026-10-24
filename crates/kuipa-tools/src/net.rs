@@ -411,6 +411,56 @@ impl Endpoint {
         serde_json::from_slice(&body).map_err(|e| NetError::Other(format!("claim log: {e}")))
     }
 
+    /// `GET tlog/{log}/head`: the server's signed head, **unverified**;
+    /// none while its log is empty.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`], or a malformed head.
+    pub fn tlog_head(
+        &self,
+        log: &kuipa_enroll::tlog::LogId,
+    ) -> Result<Option<kuipa_enroll::tlog::SignedHead>, NetError> {
+        let url = format!("{}tlog/{log}/head", self.base);
+        match self.send("GET", &url, self.client.get(&url), 0) {
+            Ok(body) => kuipa_enroll::tlog::SignedHead::from_bytes(&body)
+                .map(Some)
+                .map_err(|e| NetError::Other(format!("tlog head: {e}"))),
+            // `send` reports a 404 as unreachable, for failover; here it
+            // means the log is still empty.
+            Err(NetError::Unreachable(m)) if m.starts_with("HTTP 404") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `GET tlog/{log}/leaves?from=<from>`: one page of the server's
+    /// leaves, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`NetError`], or a malformed leaf.
+    pub fn tlog_leaves(
+        &self,
+        log: &kuipa_enroll::tlog::LogId,
+        from: u64,
+    ) -> Result<Vec<kuipa_enroll::tlog::Leaf>, NetError> {
+        let url = format!("{}tlog/{log}/leaves?from={from}", self.base);
+        let body = self.send("GET", &url, self.client.get(&url), 0)?;
+        let malformed = || NetError::Other("tlog leaves: malformed page".into());
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| malformed())?;
+        value["leaves"]
+            .as_array()
+            .ok_or_else(malformed)?
+            .iter()
+            .map(|l| {
+                l.as_str()
+                    .and_then(|l| b64::decode(l).ok())
+                    .and_then(|l| kuipa_enroll::tlog::Leaf::from_bytes(&l).ok())
+                    .ok_or_else(malformed)
+            })
+            .collect()
+    }
+
     /// `GET tlog/{log}/consistency?from=<old>&size=<size>`: the proof
     /// that the server's log at `old` leaves is a prefix of its log at
     /// `size` (DESIGN-tlog.md §5).

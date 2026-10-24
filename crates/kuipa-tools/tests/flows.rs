@@ -3596,3 +3596,83 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     assert_eq!(status, 404);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A server named `fqdn` with its own transparency log in `dir`, served
+/// for this test's thread.
+fn tlog_server(
+    anchor: &SigningKey,
+    fqdn: &str,
+    dir: &std::path::Path,
+) -> Arc<kuipad::ledger::FileLedger> {
+    let (keys, info, delegation) = server_keys(anchor, fqdn);
+    let ledger = Arc::new(kuipad::ledger::FileLedger::open(dir, REALM, fqdn).unwrap());
+    let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
+    let url = spawn(Arc::new(App {
+        server,
+        peers: None,
+        limiter: kuipad::limit::Limiter::default(),
+        tang: None,
+        keys: None,
+        ledger: Some(ledger.clone()),
+        directory: Dir::default(),
+    }));
+    kuipa_tools::net::set_thread_endpoint(fqdn, &url);
+    ledger
+}
+
+#[test]
+fn audit_replays_a_servers_transparency_log() {
+    // DESIGN-tlog.md §5: kuipa-audit tlog checks a server's head against
+    // the key its verified advertisement names, replays every leaf, and
+    // with a state file requires the next run's log to extend this one.
+    use kuipa_enroll::server::Ledger;
+    use kuipa_enroll::tlog::Kind;
+
+    let base = std::env::temp_dir().join(format!("kuipa-flows-audit-tlog-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let state = base.join("audited.json");
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let pin = [*anchor.public().thumbprint()];
+    let fqdn = "tlogaudit1.example.test";
+    let audit = || kuipa_tools::audit::tlog(fqdn, &pin, Some(&state)).unwrap();
+
+    let ledger = tlog_server(&anchor, fqdn, &base.join("one"));
+    assert_eq!(audit()["state"], "empty");
+    for i in 0..3u8 {
+        ledger.append(Kind::VAULT_DEVICE, b"v", &[i]).unwrap();
+    }
+    ledger.append(Kind::KEYS_FETCH, b"host", b"x").unwrap();
+    let first = audit();
+    assert_eq!(first["state"], "verified", "{first}");
+    assert_eq!(first["size"], 4, "{first}");
+    assert_eq!(first["kinds"]["vault-device"], 3, "{first}");
+    assert_eq!(first["kinds"]["keys-fetch"], 1, "{first}");
+
+    // The log grew: still verified, and it extends what was recorded.
+    ledger.append(Kind::ESCROW_RELEASE, b"v", b"y").unwrap();
+    let grown = audit();
+    assert_eq!(grown["state"], "verified", "{grown}");
+    assert_eq!(grown["previous"]["size"], 4, "{grown}");
+
+    // Another anchor does not verify the advertisement: no report.
+    let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    assert!(kuipa_tools::audit::tlog(fqdn, &[*stranger.public().thumbprint()], None).is_err());
+
+    // The same server answering from a different log — its history
+    // rewritten — is forked against the recorded head.
+    let rewritten = tlog_server(&anchor, fqdn, &base.join("two"));
+    for i in 0..6u8 {
+        rewritten.append(Kind::VAULT_POLICY, b"v", &[i]).unwrap();
+    }
+    let forked = audit();
+    assert!(
+        forked["state"].as_str().unwrap().starts_with("forked"),
+        "{forked}"
+    );
+    // Without the state file, the rewritten log is consistent in itself.
+    let alone = kuipa_tools::audit::tlog(fqdn, &pin, None).unwrap();
+    assert_eq!(alone["state"], "verified", "{alone}");
+    kuipa_tools::net::clear_thread_endpoints();
+    let _ = std::fs::remove_dir_all(&base);
+}
