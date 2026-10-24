@@ -12,8 +12,8 @@ Baum and Beckmann build such a proof over unmodified ML-DSA with VOLE in
 the head, at about 1 MB (ePrint 2026/2473).
 
 This crate is that road's first stretch:
-- a VOLE-in-the-head proof core (FAEST-style, λ = 128) for **boolean
-  circuits**;
+- a VOLE-in-the-head proof core (FAEST-style, λ = 128 or 256) for
+  **boolean circuits**;
 - a Keccak-f\[1600\] gadget for the hashing ML-DSA verification does.
 
 Everything cryptographic comes from OpenSSL, and only from CNSA 2.0's
@@ -26,19 +26,35 @@ FAQ), so the proof never hashes with them. The Keccak-f gadget is
 different: it *evaluates* ML-DSA's own SHAKE as part of the statement,
 which FIPS 204 prescribes.
 
-The soundness parameter is λ = 128. That is below the category-5
-strength of the rest of a CNSA 2.0 deployment (AES-256, ML-DSA-87). A
-λ = 256 parameter set, with GF(2²⁵⁶) and 32 trees, is the open question
-for the CNSA profile.
+**The level follows the crypto policy.** The soundness parameter λ is
+chosen the way the rest of kuipa chooses its ML-DSA parameter set and
+hash (`docs/DESIGN.md` §4.1.1), from the system crypto policy:
+
+| policy | `Level` | field | trees | Keccak-f preimage proof |
+|---|---|---|---|---|
+| allows ML-DSA-44 or ML-DSA-65 | `L128` (NIST category 1) | GF(2¹²⁸), `x¹²⁸ + x⁷ + x² + x + 1` | 16 | 85,814 B |
+| allows only ML-DSA-87 (CNSA 2.0) | `L256` (category 5) | GF(2²⁵⁶), `x²⁵⁶ + x¹⁰ + x⁵ + x² + 1` | 32 | 172,486 B |
+
+`prove` proves at the policy's level, and `verify` refuses a proof below
+it (`Error::Weak`), so a CNSA verifier never accepts a λ = 128 proof,
+however valid. A stronger proof satisfies a weaker policy. `prove_at`
+and `verify_at` name a level explicitly. The level is the byte after
+the magic, and the transcript absorbs it first, so a proof cannot be
+relabelled. GF(2²⁵⁶) uses FAEST-256's modulus, and its unit tests check
+that it is irreducible (Rabin's test). Seeds (32 bytes), the salt and
+SHA-512 commitments already suit λ = 256, so only the field, the number
+of trees and the mask lengths change.
 
 **Research prototype. Not reviewed.**
 
 ## 2. The protocol
 
-Parameters: τ = 16 trees of depth 8 (256 leaves each), so Δ has
-16 × 8 = 128 bits. `L = ℓ + 256`, where ℓ is the witness bits (inputs and
-AND outputs), followed by 128 QuickSilver mask bits and 128 VOLE-check
-mask bits.
+Parameters: τ = λ/8 trees of depth 8 (256 leaves each), so Δ has
+τ × 8 = λ bits: 16 trees at λ = 128, 32 at λ = 256. `L = ℓ + 2λ`, where
+ℓ is the witness bits (inputs and AND outputs), followed by λ
+QuickSilver mask bits and λ VOLE-check mask bits. The description below
+writes λ = 128, as GF(2¹²⁸) and 128 columns. At λ = 256, read GF(2²⁵⁶)
+and 256 columns.
 
 1. **Trees.** For each tree, a root seed is derived from a secret
    master seed. It is expanded as a GGM tree, each node's two 32-byte
@@ -102,13 +118,14 @@ This is the VOLEitH argument FAEST relies on; it is not re-proven here.
 The Keccak-f\[1600\] preimage statement ("I know a state whose image
 is this") has 38,400 AND gates.
 
-| statement | witness bits | proof | prove | verify |
-|---|---|---|---|---|
-| Keccak-f\[1600\] preimage | 40,000 | 85,813 B | ~60 ms | ~36 ms |
+| statement | λ | witness bits | proof | prove | verify |
+|---|---|---|---|---|---|
+| Keccak-f\[1600\] preimage | 128 | 40,000 | 85,814 B | ~64 ms | ~36 ms |
+| Keccak-f\[1600\] preimage | 256 | 40,000 | 172,486 B | ~92 ms | ~90 ms |
 
 These are release builds on an Apple M-series laptop. The proof is about
-`15·L/8` bytes of corrections plus `ℓ/8` of witness: about two bytes per
-committed bit.
+`(τ−1)·L/8` bytes of corrections plus `ℓ/8` of witness: about two bytes
+per committed bit at λ = 128, four at λ = 256.
 
 ## 4. The way to an ML-DSA statement
 
