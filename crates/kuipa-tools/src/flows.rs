@@ -1153,7 +1153,7 @@ fn served_vouch(
     anchor: &Thumbprint,
 ) -> Option<kuipa_enroll::delegation::SignedVouch> {
     let page = endpoint.claim_log(anchor, 0).ok()?;
-    let bytes = tang_pqc::b64::decode(page.vouch.as_ref()?).ok()?;
+    let bytes = tang_pqc::b64::decode(&page.vouch).ok()?;
     let vouch = kuipa_enroll::delegation::SignedVouch::from_bytes(&bytes).ok()?;
     (vouch.vouch().anchor == *anchor).then_some(vouch)
 }

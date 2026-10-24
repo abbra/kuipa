@@ -186,14 +186,13 @@ pub struct Vouch {
 }
 
 impl Vouch {
-    /// Encode: `IPVH ‖ 1 ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖
+    /// Encode: `IPVH ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖
     /// root ‖ live_size ‖ live_root`, the roots length prefixed (32 bytes
     /// for SHA-256, 48 for SHA-384, as the anchor's key decides); these
     /// are the signed bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        Writer::new(VOUCH_MAGIC)
-            .u8(2)
+        Writer::with_version(VOUCH_MAGIC, 2)
             .str(&self.realm)
             .fixed(self.anchor.as_bytes())
             .u64(self.iat)
@@ -211,10 +210,7 @@ impl Vouch {
     ///
     /// [`Error::Malformed`], also for an empty or too long validity period.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(buf, VOUCH_MAGIC, "vouch")?;
-        if r.u8()? != 2 {
-            return Err(Error::Malformed("vouch version"));
-        }
+        let mut r = Reader::with_version(buf, VOUCH_MAGIC, 2, "vouch")?;
         let vouch = Self {
             realm: r.str()?.into(),
             anchor: Thumbprint::from_bytes(r.fixed()?),
@@ -548,14 +544,13 @@ impl SignedVouch {
         )))
     }
 
-    /// Encode: `IPSV ‖ 1 ‖ 2 ‖ vouch ‖ signature ‖ n(u64) ‖ [entry]`, an
+    /// Encode: `IPSV ‖ 2 ‖ vouch ‖ signature ‖ n(u64) ‖ [entry]`, an
     /// entry `1 ‖ leaf(32)` for a claim or `2 ‖ target(u64) ‖ time(u64)`
     /// for a tombstone.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::new(SIGNED_VOUCH_MAGIC);
-        w.u8(2)
-            .bytes(&self.vouch.to_bytes())
+        let mut w = Writer::with_version(SIGNED_VOUCH_MAGIC, 2);
+        w.bytes(&self.vouch.to_bytes())
             .bytes(&self.signature)
             .u64(self.entries.len() as u64);
         for e in &self.entries {
@@ -573,10 +568,7 @@ impl SignedVouch {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(buf, SIGNED_VOUCH_MAGIC, "signed vouch")?;
-        if r.u8()? != 2 {
-            return Err(Error::Malformed("signed vouch version"));
-        }
+        let mut r = Reader::with_version(buf, SIGNED_VOUCH_MAGIC, 2, "signed vouch")?;
         let vouch = Vouch::from_bytes(r.bytes()?)?;
         let signature = r.bytes()?.to_vec();
         let n = r.u64()?;
