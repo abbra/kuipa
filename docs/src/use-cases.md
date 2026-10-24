@@ -17,6 +17,13 @@ shows how.
 | **planned** | designed or proposed, not built yet |
 | **research** | needs cryptography that is still being worked out |
 
+"Works" means kuipa does it, tested against a real Kerberos KDC. It
+does not mean a FreeIPA release does it yet. kuipa has not run against
+a real FreeIPA server, and the FreeIPA side (its LDAP schema, access
+controls, `ipa` commands and installer options) is still to be written.
+The open work, use case by use case, is in `TODO.md` at the top of the
+source tree.
+
 ## At a glance
 
 | use case | for | status |
@@ -236,7 +243,8 @@ signing, which kuipa does not change. See [Signing under your ticket](user/signi
 ## Planned
 
 These are designed or proposed, not built. They reuse what kuipa already
-has, and the ones marked *needs* depend on another item first.
+has, and the ones marked *needs* depend on another item first. Each is
+an entry in `TODO.md`.
 
 ### Log in offline without a crackable password cache
 
