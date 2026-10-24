@@ -23,7 +23,7 @@
 //!    leaves but leaf `Δᵢ` of each tree (its co-path, and the hidden
 //!    leaf's commitment, so the verifier checks the commitment digest).
 //!
-//! Challenges come from a SHAKE256 transcript over the circuit, the
+//! Challenges come from a SHA-512 transcript over the circuit, the
 //! public outputs and every prover message.  The length layout is
 //! `L = ℓ + 256`: `ℓ` witness bits, 128 QuickSilver mask bits, 128 VOLE
 //! check mask bits.
@@ -32,7 +32,7 @@ use native_ossl::rand::Rand;
 
 use crate::circuit::{Circuit, Gate};
 use crate::gf128::Gf;
-use crate::primitives::{Prg, Seed, Transcript, shake};
+use crate::primitives::{Hash, Prg, Seed, Transcript, hash};
 use crate::{Error, Result};
 
 /// Trees.
@@ -59,17 +59,17 @@ fn xor_into(acc: &mut [u8], r: &[u8]) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Opening {
     copath: [Seed; DEPTH],
-    hidden: [u8; 32],
+    hidden: Hash,
 }
 
 /// A proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proof {
     salt: [u8; 32],
-    h_com: [u8; 32],
+    h_com: Hash,
     corrections: Vec<Vec<u8>>,
     u_hash: Gf,
-    h_v: [u8; 32],
+    h_v: Hash,
     d: Vec<u8>,
     a0: Gf,
     a1: Gf,
@@ -98,18 +98,17 @@ impl Layout {
 }
 
 fn node_seed(master: &Seed, tree: usize) -> Result<Seed> {
-    let mut out = [0u8; 16];
-    shake(
+    let h = hash(
         "ml-dsa-zk/v1 tree root",
         &[master, &(tree as u64).to_le_bytes()],
-        &mut out,
     )?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h[..32]);
     Ok(out)
 }
 
-fn commit(salt: &[u8; 32], tree: usize, leaf: usize, seed: &Seed) -> Result<[u8; 32]> {
-    let mut out = [0u8; 32];
-    shake(
+fn commit(salt: &[u8; 32], tree: usize, leaf: usize, seed: &Seed) -> Result<Hash> {
+    hash(
         "ml-dsa-zk/v1 leaf",
         &[
             salt,
@@ -117,9 +116,7 @@ fn commit(salt: &[u8; 32], tree: usize, leaf: usize, seed: &Seed) -> Result<[u8;
             &(leaf as u64).to_le_bytes(),
             seed,
         ],
-        &mut out,
-    )?;
-    Ok(out)
+    )
 }
 
 /// The universal hash of the VOLE check: `Σ_{j<ℓ+128} bitⱼ·χʲ⁺¹ +
@@ -147,11 +144,9 @@ fn powers(chi: Gf, n: usize) -> Vec<Gf> {
     out
 }
 
-fn column_digest(hashes: &[Gf]) -> Result<[u8; 32]> {
+fn column_digest(hashes: &[Gf]) -> Result<Hash> {
     let bytes: Vec<u8> = hashes.iter().flat_map(|h| h.to_bytes()).collect();
-    let mut out = [0u8; 32];
-    shake("ml-dsa-zk/v1 columns", &[&bytes], &mut out)?;
-    Ok(out)
+    hash("ml-dsa-zk/v1 columns", &[&bytes])
 }
 
 /// The rows `Σ_c bitⱼ(column c)·xᶜ`.
@@ -175,7 +170,7 @@ fn transcript_start(
     circuit: &Circuit,
     outputs: &[bool],
     salt: &[u8; 32],
-    h_com: &[u8; 32],
+    h_com: &Hash,
     corrections: &[Vec<u8>],
 ) -> Result<Transcript> {
     let mut t = Transcript::new(DOMAIN)?;
@@ -211,17 +206,17 @@ pub fn prove(circuit: &Circuit, input: &[bool]) -> Result<(Proof, Vec<bool>)> {
     let prg = Prg::new()?;
     let mut salt = [0u8; 32];
     Rand::fill(&mut salt)?;
-    let mut master = [0u8; 16];
+    let mut master = [0u8; 32];
     Rand::fill_private(&mut master)?;
 
     // 1. The trees, their leaves' commitments, u and the columns.
     let mut trees: Vec<Vec<Seed>> = Vec::with_capacity(TAU);
-    let mut coms = Vec::with_capacity(TAU * LEAVES * 32);
+    let mut coms = Vec::with_capacity(TAU * LEAVES * 64);
     let mut us: Vec<Vec<u8>> = Vec::with_capacity(TAU);
     let mut columns = vec![vec![0u8; layout.lbytes]; TAU * DEPTH];
     let mut r = vec![0u8; layout.lbytes];
     for i in 0..TAU {
-        let mut nodes = vec![[0u8; 16]; 2 * LEAVES];
+        let mut nodes = vec![[0u8; 32]; 2 * LEAVES];
         nodes[1] = node_seed(&master, i)?;
         for n in 1..LEAVES {
             let (a, b) = prg.children(&nodes[n])?;
@@ -243,8 +238,7 @@ pub fn prove(circuit: &Circuit, input: &[bool]) -> Result<(Proof, Vec<bool>)> {
         us.push(u);
         trees.push(nodes);
     }
-    let mut h_com = [0u8; 32];
-    shake("ml-dsa-zk/v1 commitments", &[&salt, &coms], &mut h_com)?;
+    let h_com = hash("ml-dsa-zk/v1 commitments", &[&salt, &coms])?;
     // The bits past L are never read; zero them, for one encoding.
     let tail = if layout.l.is_multiple_of(8) {
         0xff
@@ -336,7 +330,7 @@ pub fn prove(circuit: &Circuit, input: &[bool]) -> Result<(Proof, Vec<bool>)> {
         .enumerate()
         .map(|(i, nodes)| {
             let hidden = usize::from(delta[i]);
-            let mut copath = [[0u8; 16]; DEPTH];
+            let mut copath = [[0u8; 32]; DEPTH];
             let mut n = LEAVES + hidden;
             for slot in &mut copath {
                 *slot = nodes[n ^ 1];
@@ -402,7 +396,7 @@ pub fn verify(circuit: &Circuit, outputs: &[bool], proof: &Proof) -> Result<()> 
 
     // The opened leaves, their commitments, and the columns of Q.
     let prg = Prg::new()?;
-    let mut coms = Vec::with_capacity(TAU * LEAVES * 32);
+    let mut coms = Vec::with_capacity(TAU * LEAVES * 64);
     let mut columns = vec![vec![0u8; layout.lbytes]; TAU * DEPTH];
     let mut r = vec![0u8; layout.lbytes];
     for (i, opening) in proof.openings.iter().enumerate() {
@@ -443,12 +437,7 @@ pub fn verify(circuit: &Circuit, outputs: &[bool], proof: &Proof) -> Result<()> 
             }
         }
     }
-    let mut h_com = [0u8; 32];
-    shake(
-        "ml-dsa-zk/v1 commitments",
-        &[&proof.salt, &coms],
-        &mut h_com,
-    )?;
+    let h_com = hash("ml-dsa-zk/v1 commitments", &[&proof.salt, &coms])?;
     if h_com != proof.h_com {
         return Err(Error::Invalid);
     }
@@ -530,14 +519,15 @@ impl Proof {
     #[must_use]
     pub fn size(circuit: &Circuit) -> usize {
         let layout = Layout::of(circuit);
+        // magic, salt, h_com, corrections, ũ, h_V, d, A₀ and A₁, openings
         5 + 32
-            + 32
+            + 64
             + (TAU - 1) * layout.lbytes
             + 16
-            + 32
+            + 64
             + layout.dbytes
             + 32
-            + TAU * (DEPTH * 16 + 32)
+            + TAU * (DEPTH * 32 + 64)
     }
 
     /// Parse a proof for `circuit`.  Unused bits past the vectors'
@@ -563,24 +553,25 @@ impl Proof {
         };
         let arr32 = |s: &[u8]| -> [u8; 32] { s.try_into().expect("32 bytes") };
         let arr16 = |s: &[u8]| -> [u8; 16] { s.try_into().expect("16 bytes") };
+        let arr64 = |s: &[u8]| -> Hash { s.try_into().expect("64 bytes") };
         let salt = arr32(take(32));
-        let h_com = arr32(take(32));
+        let h_com = arr64(take(64));
         let corrections: Vec<Vec<u8>> =
             (0..TAU - 1).map(|_| take(layout.lbytes).to_vec()).collect();
         let u_hash = Gf::from_bytes(arr16(take(16)));
-        let h_v = arr32(take(32));
+        let h_v = arr64(take(64));
         let d = take(layout.dbytes).to_vec();
         let a0 = Gf::from_bytes(arr16(take(16)));
         let a1 = Gf::from_bytes(arr16(take(16)));
         let openings = (0..TAU)
             .map(|_| {
-                let mut copath = [[0u8; 16]; DEPTH];
+                let mut copath = [[0u8; 32]; DEPTH];
                 for s in &mut copath {
-                    *s = arr16(take(16));
+                    *s = arr32(take(32));
                 }
                 Opening {
                     copath,
-                    hidden: arr32(take(32)),
+                    hidden: arr64(take(64)),
                 }
             })
             .collect();
