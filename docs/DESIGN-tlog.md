@@ -15,7 +15,7 @@ hold such events, and the order in which it replaces the claim log.
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented (the cosign step) |
 | 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
 | 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow and Keys events, with receipts and lookups |
-| 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | `kuipa tlog watch` implemented; the others planned |
+| 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | `kuipa tlog watch` and `kuipa-audit tlog` implemented; the witness planned |
 | 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
 
 ## 1. Typed leaves
@@ -224,10 +224,28 @@ It flags against the stored descriptor, so a change the owner made from
 another host is flagged until `kuipa seal show` stores the new
 descriptor.
 
+### `kuipa-audit tlog`
+
+A public auditor's check of one server's whole log. It needs no
+account, and only `--state` writes, to the file it names:
+1. It verifies the server's advertisement against the given anchors, or
+   the host's pinned ones. The advertisement names the server's signing
+   key, and the served head must carry that key's signature.
+2. It fetches every leaf and replays the log, so the tombstone rules
+   apply. The replayed root must be the head's root.
+3. With `--state FILE`, the recorded root must be the root of the same
+   prefix of the replayed log. The auditor holds every leaf, so this is
+   a direct recomputation rather than a proof. The new head is then
+   recorded.
+
+The report is `verified`, `empty`, `forked: …` (exit status 2), or
+`unchecked: …` for a log larger than one run reads (2²⁰ leaves). It
+counts the leaves by kind, and names nobody. Leaves carry only indexes.
+
 ## 8. Next
 
-* **Clients.** `kuipa-audit tlog` checks consistency and tombstones over
-  the public log. `kuipa-mirror --witness` cosigns.
+* **Witnesses.** `kuipa-mirror --witness` cosigns heads that extend
+  the last it cosigned, and servers serve the cosignatures.
 * **Migration.** Claims are appended as kind-1 leaves, and a dropped
   claim becomes a tombstone instead of a restart. IPVH/IPSV are kept for
   pinned hosts until their windows age out.

@@ -549,6 +549,16 @@ impl VerifiedRealm {
         &self.delegation.server
     }
 
+    /// The server signing key, as the verified advertisement carries it:
+    /// what its transparency-log heads and receipts verify with.
+    #[must_use]
+    pub fn signing_key(&self) -> Option<&VerifyingKey> {
+        self.adv
+            .signing_keys()
+            .iter()
+            .find(|k| k.thumbprint() == self.signer())
+    }
+
     /// Thumbprint of the server signing key.
     #[must_use]
     pub fn signer(&self) -> &Thumbprint {
