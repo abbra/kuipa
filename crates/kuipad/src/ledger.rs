@@ -26,7 +26,7 @@ use kuipa_enroll::merkle::{self, Hash};
 use kuipa_enroll::server::{Appended, DirectoryError, Ledger};
 use kuipa_enroll::tlog::{self, Entry, Kind, Leaf, Log, LogId, SignedHead};
 use native_ossl::rand::Rand;
-use tang_pqc::{SigningKey, unix_seconds};
+use tang_pqc::{Policy, SigningKey, VerifyingKey, unix_seconds};
 
 use crate::keystore::write_private;
 
@@ -47,7 +47,19 @@ pub struct FileLedger {
     id: LogId,
     key: [u8; 32],
     path: PathBuf,
+    witnesses: Vec<VerifyingKey>,
     inner: Mutex<Inner>,
+}
+
+/// What [`FileLedger::cosign`] made of a witness's submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cosigned {
+    /// This many trusted cosignatures are now on the served head.
+    Accepted(usize),
+    /// The submission is not for the head being served: fetch it again.
+    Stale,
+    /// No cosignature on it is by a trusted witness, or verifies.
+    Untrusted,
 }
 
 #[derive(Debug)]
@@ -98,6 +110,7 @@ impl FileLedger {
             id,
             key,
             path,
+            witnesses: Vec::new(),
             inner: Mutex::new(Inner {
                 log,
                 leaves,
@@ -180,6 +193,44 @@ impl FileLedger {
             inner.head = Some(head);
         }
         Ok(inner.head.clone())
+    }
+
+    /// Accept cosignatures by `witnesses` only (none by default).
+    #[must_use]
+    pub fn with_witnesses(mut self, witnesses: Vec<VerifyingKey>) -> Self {
+        self.witnesses = witnesses;
+        self
+    }
+
+    /// Add the trusted witnesses' cosignatures on `submitted` to the head
+    /// being served, when `submitted` is that head: served heads then
+    /// carry them until the next re-signing, and a witness cosigns again.
+    #[must_use]
+    pub fn cosign(&self, submitted: &SignedHead, policy: &Policy) -> Cosigned {
+        let trusted = submitted.witnesses(&self.witnesses, policy);
+        let mut inner = self.inner();
+        let Some(head) = inner.head.as_mut() else {
+            return Cosigned::Stale;
+        };
+        if head.head != submitted.head || head.signature != submitted.signature {
+            return Cosigned::Stale;
+        }
+        // A submission repeats the cosignatures it was served with: only
+        // a trusted one the served head does not carry yet is new.
+        let new: Vec<_> = submitted
+            .cosignatures
+            .iter()
+            .filter(|c| trusted.contains(&c.witness) && !head.cosignatures.contains(c))
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return Cosigned::Untrusted;
+        }
+        for c in new {
+            head.cosignatures.retain(|o| o.witness != c.witness);
+            head.cosignatures.push(c);
+        }
+        Cosigned::Accepted(head.witnesses(&self.witnesses, policy).len())
     }
 
     /// The file the leaves are kept in.
@@ -417,6 +468,48 @@ mod tests {
             [] as [kuipa_enroll::tlog::Entry; 0]
         );
         assert!(Ledger::find(&ledger, b"a", 0, 9, 10).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cosignatures_land_only_on_the_served_head() {
+        let dir = temp("cosign");
+        let witness = SigningKey::generate(SignatureAlg::MlDsa44).unwrap();
+        let stranger = SigningKey::generate(SignatureAlg::MlDsa44).unwrap();
+        let ledger = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test")
+            .unwrap()
+            .with_witnesses(vec![witness.public().clone()]);
+        let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let policy = Policy::default();
+        ledger.append(Kind::VAULT_DEVICE, b"v", b"a").unwrap();
+        let served = ledger.signed_head(&key, 100).unwrap().unwrap();
+
+        let mut by_stranger = served.clone();
+        by_stranger.cosign(&stranger, 101).unwrap();
+        assert_eq!(ledger.cosign(&by_stranger, &policy), Cosigned::Untrusted);
+        let mut by_witness = served.clone();
+        by_witness.cosign(&witness, 101).unwrap();
+        by_witness.cosign(&stranger, 101).unwrap();
+        assert_eq!(ledger.cosign(&by_witness, &policy), Cosigned::Accepted(1));
+        // The served head carries the trusted cosignature, not the other.
+        let now = ledger.signed_head(&key, 102).unwrap().unwrap();
+        assert_eq!(now.cosignatures.len(), 1);
+        assert_eq!(now.witnesses(&[witness.public().clone()], &policy).len(), 1);
+        // A stranger resubmitting the served head, with the trusted
+        // cosignature it was served, adds nothing.
+        let mut replayed = now.clone();
+        replayed.cosign(&stranger, 102).unwrap();
+        assert_eq!(ledger.cosign(&replayed, &policy), Cosigned::Untrusted);
+
+        // Once the log grows the head is re-signed: an old cosignature is
+        // for a head no longer served.
+        ledger.append(Kind::VAULT_DEVICE, b"v", b"b").unwrap();
+        let next = ledger.signed_head(&key, 103).unwrap().unwrap();
+        assert_eq!(
+            next.cosignatures,
+            [] as [kuipa_enroll::tlog::Cosignature; 0]
+        );
+        assert_eq!(ledger.cosign(&by_witness, &policy), Cosigned::Stale);
         let _ = fs::remove_dir_all(&dir);
     }
 }

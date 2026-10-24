@@ -361,7 +361,7 @@ fn start_servers(
         .map(|(s, u)| format!("{s}={u}"))
         .collect();
 
-    let voucher_key = start_issuer(dir)?;
+    let (voucher_key, witness) = (start_issuer(dir)?, start_witness(dir)?);
 
     // Each server has its own anchor and exchanges it with the other.
     let mut anchors = Vec::new();
@@ -398,9 +398,8 @@ fn start_servers(
             trusts: Vec::new(),
         };
         anchors.push(*anchor.public().thumbprint());
-        // Opening the server's transparency log creates its key directory.
         let key_dir = dir.join(format!("keys-{server}"));
-        let ledger = Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, server)?);
+        let ledger = start_ledger(&key_dir, server, &witness)?;
         let enroll =
             Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
         let others: Vec<usize> = (0..SERVERS.len()).filter(|j| *j != i).collect();
@@ -451,6 +450,32 @@ fn start_servers(
         endpoints,
         servers,
     })
+}
+
+/// A transparency-log witness (DESIGN-tlog.md §4) in
+/// `$KUIPA_PLAYGROUND/witness`: its private key (`witness.jwk`, for
+/// `kuipa-witness`) and public key (`witness.pub.jwk`, for audits);
+/// returns the key every server trusts.
+fn start_witness(dir: &Path) -> Result<tang_pqc::VerifyingKey, Error> {
+    let witness = dir.join("witness");
+    std::fs::create_dir_all(&witness)?;
+    let key = SigningKey::generate(SignatureAlg::MlDsa44)?;
+    kuipa_tools::paths::write_file(&witness.join("witness.jwk"), key.to_jwk()?.as_ref(), 0o600)?;
+    std::fs::write(witness.join("witness.pub.jwk"), key.public().to_jwk_json())?;
+    Ok(key.public().clone())
+}
+
+/// `server`'s transparency log, as kuipad keeps it, trusting `witness`;
+/// opening it creates the key directory.
+fn start_ledger(
+    key_dir: &Path,
+    server: &str,
+    witness: &tang_pqc::VerifyingKey,
+) -> Result<Arc<kuipad::ledger::FileLedger>, Error> {
+    Ok(Arc::new(
+        kuipad::ledger::FileLedger::open(key_dir, REALM, server)?
+            .with_witnesses(vec![witness.clone()]),
+    ))
 }
 
 /// A voucher issuer (§9) in `$KUIPA_PLAYGROUND/voucher`, with a quota of

@@ -13,3 +13,4 @@ pub mod seal;
 pub mod text;
 pub mod trace;
 pub mod voucher;
+pub mod witness;

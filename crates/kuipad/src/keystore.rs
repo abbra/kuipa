@@ -15,6 +15,7 @@
 //!                      rotated anchor's private key is gone
 //! peers.state          the anchor exchange state (§4.2)
 //! tlog/                the transparency log and its index key (`ledger`)
+//! witness-<thp>.jwk    a witness whose cosignatures the log accepts
 //! ```
 
 use std::fs;
@@ -157,6 +158,39 @@ impl KeyStore {
         let thp = *key.thumbprint();
         fs::write(self.path(&format!("voucher-{thp}.jwk")), key.to_jwk_json())?;
         Ok(thp)
+    }
+
+    /// Accept transparency-log cosignatures by the witness whose public
+    /// key is `jwk` (DESIGN-tlog.md §4), stored as `witness-<thumbprint>.jwk`.
+    /// Returns the thumbprint.  Remove the file to stop accepting them.
+    ///
+    /// # Errors
+    ///
+    /// Not a public ML-DSA JWK, or an I/O error.
+    pub fn add_witness_key(&self, jwk: &[u8]) -> Result<Thumbprint, Error> {
+        let value: serde_json::Value = serde_json::from_slice(jwk)?;
+        if value.get("priv").is_some() {
+            return Err("give the witness key's public JWK, not the private key".into());
+        }
+        let key = VerifyingKey::from_jwk_json(jwk)?;
+        let thp = *key.thumbprint();
+        fs::write(self.path(&format!("witness-{thp}.jwk")), key.to_jwk_json())?;
+        Ok(thp)
+    }
+
+    /// The witnesses whose cosignatures the log accepts.
+    ///
+    /// # Errors
+    ///
+    /// I/O, or a malformed witness key file.
+    pub fn witness_keys(&self) -> Result<Vec<VerifyingKey>, Error> {
+        let mut keys = Vec::new();
+        for name in self.names()? {
+            if name.starts_with("witness-") {
+                keys.push(VerifyingKey::from_jwk_json(&fs::read(self.path(&name))?)?);
+            }
+        }
+        Ok(keys)
     }
 
     /// Generate this server's anchor, a signing key, and one join and one

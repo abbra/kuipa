@@ -557,6 +557,9 @@ const MAX_TLOG_LEAVES: u64 = 1 << 20;
 /// run verified must be the root of the same prefix now (the log only
 /// grew), and the new head is recorded.
 ///
+/// `witnesses` are the cosigners the report counts: `witnesses` lists
+/// those of them whose cosignatures on the served head verify.
+///
 /// The report's `state` is `verified`, `empty`, `forked: …` (the head
 /// is not the replayed log's, or does not extend what was recorded),
 /// or `unchecked: …` (the log is larger than one run reads).
@@ -568,6 +571,7 @@ const MAX_TLOG_LEAVES: u64 = 1 << 20;
 pub fn tlog(
     server: &str,
     anchors: &[tang_pqc::Thumbprint],
+    witnesses: &[tang_pqc::VerifyingKey],
     state: Option<&std::path::Path>,
 ) -> Result<Value, Error> {
     let endpoint = Endpoint::new(server, &Trust::FirstContact)?;
@@ -590,10 +594,16 @@ pub fn tlog(
         ));
     }
     let head = signed.head;
+    let cosigned: Vec<String> = signed
+        .witnesses(witnesses, &policy)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     let mut summary = json!({
         "size": head.size,
         "root": tang_pqc::b64::encode(&head.root),
         "time": head.time,
+        "witnesses": cosigned,
     });
     if head.size > MAX_TLOG_LEAVES {
         return Ok(report(
@@ -616,7 +626,7 @@ pub fn tlog(
 
 /// The log of the server whose advertisement verifies against `anchors`
 /// (the host's pinned ones when none are given), and its signing key.
-fn advertised_log(
+pub(crate) fn advertised_log(
     endpoint: &Endpoint,
     anchors: &[tang_pqc::Thumbprint],
     policy: &Policy,
