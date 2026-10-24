@@ -712,11 +712,15 @@ mod tests {
 
     #[test]
     fn policy_restricts_algorithms() {
-        // ML-DSA-44 is below the default policy.
+        // The default policy accepts ML-DSA-44; a narrowed one does not.
         let (adv, thp) = adv_with(SignatureAlg::MlDsa44, KemAlg::MlKem768, Some(fresh()));
-        assert!(matches!(adv.verify(&thp), Err(Error::Policy(_))));
-        let permissive = Policy::default().with_signature_algs(&SignatureAlg::ALL);
-        adv.verify_with(&thp, &permissive).unwrap();
+        adv.verify(&thp).unwrap();
+        let strict =
+            Policy::default().with_signature_algs(&[SignatureAlg::MlDsa65, SignatureAlg::MlDsa87]);
+        assert!(matches!(
+            adv.verify_with(&thp, &strict),
+            Err(Error::Policy(_))
+        ));
 
         // CNSA 2.0 drops ML-KEM-768 exchange keys, leaving nothing to bind to.
         let (adv, thp) = adv_with(SignatureAlg::MlDsa87, KemAlg::MlKem768, Some(fresh()));

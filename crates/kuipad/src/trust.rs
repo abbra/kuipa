@@ -145,7 +145,7 @@ pub async fn advertisement(
         &adv,
         realm,
         anchors,
-        &Policy::default(),
+        &Policy::from_system()?,
         SystemTime::now(),
     )?)
 }

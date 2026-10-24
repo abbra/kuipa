@@ -191,7 +191,7 @@ fn quorum_proof(
                     realm,
                     std::slice::from_ref(a),
                     window,
-                    &Policy::default(),
+                    &Policy::from_system().map_err(|e| e.to_string())?,
                     now(),
                 )
                 .map_err(|e| e.to_string())
@@ -205,7 +205,7 @@ fn quorum_proof(
                     &adv,
                     realm,
                     std::slice::from_ref(a),
-                    &Policy::default(),
+                    &Policy::from_system().map_err(|e| e.to_string())?,
                     now(),
                 )
                 .map_err(|e| e.to_string())
@@ -265,7 +265,7 @@ pub(crate) fn verified(
         realm,
         &pins,
         &wanted_heads,
-        &Policy::default(),
+        &Policy::from_system().map_err(|e| e.to_string())?,
         now(),
     )
     .map_err(|e| {
@@ -368,8 +368,13 @@ fn watermark_after(
             let mut reached = (seq, hash);
             while reached.0 < theirs {
                 let entries = endpoint.anchor_log(reached.0).map_err(|e| e.to_string())?;
-                reached =
-                    verify_chain(&entries, realm, anchors, Some(reached), &Policy::default())?;
+                reached = verify_chain(
+                    &entries,
+                    realm,
+                    anchors,
+                    Some(reached),
+                    &Policy::from_system().map_err(|e| e.to_string())?,
+                )?;
             }
             if reached != (theirs, theirs_head) {
                 return Err(format!(
@@ -945,7 +950,7 @@ pub fn enroll_bundle(
         }
         None => paths::read_anchors(paths)?,
     };
-    let verified = Bundle::from_bytes(bundle)?.verify(&anchors, &Policy::default())?;
+    let verified = Bundle::from_bytes(bundle)?.verify(&anchors, &Policy::from_system()?)?;
     let fqdn = verified.bundle().fqdn().to_owned();
     tracing::debug!(
         "bundle verified: {:?} for {fqdn} from {}, valid until {}",
@@ -1074,7 +1079,7 @@ fn backed(
                             &adv,
                             realm,
                             std::slice::from_ref(anchor),
-                            &Policy::default(),
+                            &Policy::from_system().ok()?,
                             now(),
                         )
                         .ok()
@@ -2339,7 +2344,7 @@ fn landmark_chain(
     let Some((head_seq, head)) = adv.epoch() else {
         return Ok(Vec::new());
     };
-    let policy = Policy::default();
+    let policy = Policy::from_system().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     let mut reached: Option<(u64, [u8; 32])> = None;
     while reached != Some((head_seq, head)) {

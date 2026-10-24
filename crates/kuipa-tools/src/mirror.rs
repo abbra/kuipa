@@ -129,7 +129,7 @@ pub fn signed_heads(adv_json: &[u8], at: u64) -> Vec<HeadPin> {
         .ok()
         .and_then(|adv| adv.unverified_member("delegation").ok().flatten())
         .and_then(|v| Delegation::from_value(v).ok())
-        .map(|d| d.verified_heads(&Policy::default(), at))
+        .and_then(|d| Policy::from_system().ok().map(|p| d.verified_heads(&p, at)))
         .unwrap_or_default()
 }
 

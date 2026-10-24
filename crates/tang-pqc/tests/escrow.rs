@@ -38,8 +38,8 @@ fn provision_and_recover_all_algorithms() {
             let s = setup(kem, sig);
             let wire = s.server.advertisement().unwrap().to_json();
             let adv = SignedAdvertisement::from_json(wire.as_bytes()).unwrap();
-            // Every suite, including ML-DSA-44 which the default policy refuses.
-            let policy = Policy::default().with_signature_algs(&SignatureAlg::ALL);
+            // Every suite; the default policy accepts all of them.
+            let policy = Policy::default();
             let (binding, key) = adv
                 .verify_with(&s.trusted, &policy)
                 .unwrap()

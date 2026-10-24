@@ -343,7 +343,7 @@ impl<'a> Seal<'a> {
         )?;
         let mut verified = Vec::with_capacity(reply.descriptors.len());
         for d in reply.descriptors {
-            let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::default())?;
+            let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::from_system()?)?;
             self.user
                 .write(&self.user.vault(&v.vault().name)?, &d.to_bytes())?;
             verified.push(v);
@@ -493,7 +493,7 @@ impl<'a> Seal<'a> {
         Ok(Some(Descriptor::from_bytes(&bytes)?.verify(
             &public.realm,
             &anchors,
-            &tang_pqc::Policy::default(),
+            &tang_pqc::Policy::from_system()?,
         )?))
     }
 
@@ -578,7 +578,7 @@ impl<'a> Seal<'a> {
                     &adv,
                     &public.realm,
                     &anchors,
-                    &tang_pqc::Policy::default(),
+                    &tang_pqc::Policy::from_system().ok()?,
                     at,
                 )
                 .ok()

@@ -295,9 +295,11 @@ fn establish_trust(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Er
             .unwrap_or_else(|_| vec![cfg.server.clone()]),
         anchor.as_ref().map(|a| *a.public().thumbprint()),
     )?;
+    // What the system crypto policy allows, as tang_pqc's default narrows to.
+    let policy = tang_pqc::Policy::from_system()?;
     // The anchors this server's delegation is proven by.
-    info.anchors = delegation.signers(&tang_pqc::Policy::default());
-    let server = EnrollServer::new(keys, info, delegation);
+    info.anchors = delegation.signers(&policy);
+    let server = EnrollServer::new(keys, info, delegation).with_policy(policy);
     let (established, recorded) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?

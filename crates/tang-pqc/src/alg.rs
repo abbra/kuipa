@@ -173,7 +173,8 @@ impl SignatureAlg {
     pub const ALL: [Self; 3] = [Self::MlDsa44, Self::MlDsa65, Self::MlDsa87];
 
     /// Order in which the library picks an algorithm for new signing keys.
-    /// ML-DSA-44 is left out: the default client policy does not accept it.
+    /// ML-DSA-44 is left out of new keys; the default client policy still
+    /// accepts it, for witnesses and cosigners that use it.
     pub const PREFERENCE: [Self; 2] = [Self::MlDsa65, Self::MlDsa87];
 
     /// FIPS 204 parameter set number.
