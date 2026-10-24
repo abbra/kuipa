@@ -42,6 +42,8 @@ mod kinit;
 mod status;
 mod thread_ccache;
 
+#[cfg(heimdal_kerberos)]
+use std::ffi::c_char;
 use std::ffi::{CStr, CString};
 use std::ptr;
 
@@ -96,8 +98,10 @@ pub fn reacquire_initiator_cred(mode: &InitiatorCredMode) -> Result<GssClientCre
 /// Server-side GSSAPI credential, acquired from a keytab at startup.
 ///
 /// The underlying `gss_cred_id_t` is safe to use from multiple threads
-/// simultaneously for `gss_accept_sec_context` calls (MIT Kerberos guarantees
-/// this for acceptor credentials).
+/// simultaneously for `gss_accept_sec_context` calls: MIT documents that
+/// guarantee for acceptor credentials, and Heimdal gives it by keeping the
+/// `krb5_context` in thread-specific storage and reading the credential
+/// without writing it.
 ///
 /// Drop releases the credential handle via `gss_release_cred`.
 pub struct GssServerCred {
@@ -123,6 +127,15 @@ unsafe impl Send for GssServerCred {}
 #[cfg(mit_kerberos)]
 unsafe impl Sync for GssServerCred {}
 
+// SAFETY: Heimdal's `gss_accept_sec_context` reads the acceptor credential
+// without writing it — the principal and keytab handle are set at acquire
+// time — and each call gets its own `krb5_context` (Heimdal keeps it in
+// thread-specific storage) and its own keytab cursor, which opens its own
+// file descriptor under an advisory lock.  Concurrent accepts on one
+// acceptor credential therefore share no mutable state.
+#[cfg(heimdal_kerberos)]
+unsafe impl Sync for GssServerCred {}
+
 impl Drop for GssServerCred {
     fn drop(&mut self) {
         if !self.raw.is_null() {
@@ -143,20 +156,35 @@ impl GssServerCred {
     /// passing `"HTTP"` is usually sufficient for a single-homed host.
     /// Use `"HTTP@fully.qualified.hostname"` to be explicit.
     ///
-    /// Uses `gss_acquire_cred_from()` (RFC 5587) with a credential store entry
-    /// `{key="keytab", value=keytab_file}`, which avoids any environment-variable
-    /// mutation and is safe to call from multiple threads.
+    /// Under MIT Kerberos this calls `gss_acquire_cred_from()` (RFC 5587) with
+    /// a credential store entry `{key="keytab", value=keytab_file}`, which
+    /// avoids any environment-variable mutation and is safe to call from
+    /// multiple threads.
+    ///
+    /// Under Heimdal there is no credential store: the keytab is resolved with
+    /// `krb5_kt_resolve` and imported with `gss_krb5_import_cred`, which yields
+    /// an ACCEPT credential with no principal of its own.  Heimdal then matches
+    /// each request against the ticket's own server name, so any principal
+    /// present in the keytab is accepted and `service_name` is not used to
+    /// select one ([`Self::principal_name`] returns `None`).
     ///
     /// # Errors
     ///
     /// - [`GssError::NulInServiceName`] — `service_name` contains a NUL byte.
     /// - [`GssError::NulInKeytabPath`] — `keytab_file` contains a NUL byte.
     /// - [`GssError::ImportName`] — `gss_import_name` rejected the service name.
-    /// - [`GssError::AcquireCred`] — `gss_acquire_cred_from` failed (keytab
+    /// - [`GssError::AcquireCred`] — credential acquisition failed (keytab
     ///   missing, wrong principal, or Kerberos library error).
+    /// - [`GssError::Krb5`] — Heimdal could not open the keytab.
     pub fn acquire(service_name: &str, keytab_file: &str) -> Result<Self, GssError> {
         // Validate strings first so NUL-byte errors are reported before any I/O.
+        #[cfg(mit_kerberos)]
         let svc_cstr = CString::new(service_name).map_err(|_| GssError::NulInServiceName)?;
+        // Heimdal's acceptor credential carries no principal, so the service
+        // name is validated and then dropped — but a NUL in it is still the
+        // caller's bug and must be reported the same way.
+        #[cfg(heimdal_kerberos)]
+        CString::new(service_name).map_err(|_| GssError::NulInServiceName)?;
         let kt_cstr = CString::new(keytab_file).map_err(|_| GssError::NulInKeytabPath)?;
 
         // Pre-flight readability check before calling into the GSSAPI library so that a
@@ -167,12 +195,22 @@ impl GssServerCred {
             source: e,
         })?;
 
+        #[cfg(mit_kerberos)]
+        return Self::acquire_mit(&svc_cstr, &kt_cstr);
+        #[cfg(heimdal_kerberos)]
+        return Self::acquire_heimdal(&kt_cstr);
+    }
+
+    /// The MIT path: a credential store naming the keytab for both the accept
+    /// and the initiate half.
+    #[cfg(mit_kerberos)]
+    fn acquire_mit(svc_cstr: &CStr, kt_cstr: &CStr) -> Result<Self, GssError> {
         let mut minor: ffi::OmUint32 = 0;
 
         // Import "service_name" as a host-based service name.
         let svc_oid = ffi::gss_c_nt_hostbased_service();
         let svc_buf = ffi::GssBufferDesc {
-            length: svc_cstr.as_bytes().len(),
+            length: svc_cstr.to_bytes().len(),
             // SAFETY: gss_import_name treats input_name_buffer as read-only per
             // RFC 2744 §2; *const → *mut cast is safe for C APIs with that contract.
             #[allow(clippy::as_ptr_cast_mut)]
@@ -332,6 +370,69 @@ impl GssServerCred {
         Ok(GssServerCred { raw: cred_handle })
     }
 
+    /// The Heimdal path: resolve the keytab and import it as an ACCEPT
+    /// credential.  With no principal passed to `gss_krb5_import_cred` the
+    /// credential has no name of its own, and Heimdal looks the keytab up by
+    /// the server principal named in each request's ticket.
+    #[cfg(heimdal_kerberos)]
+    fn acquire_heimdal(kt_cstr: &CStr) -> Result<Self, GssError> {
+        // SAFETY: every handle is initialised here and released on every path,
+        // including the failure paths, in reverse order of acquisition.
+        unsafe {
+            let mut ctx: ffi::Krb5Context = ptr::null_mut();
+            let ret = ffi::krb5_init_context(&raw mut ctx);
+            if ret != 0 {
+                tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
+                return Err(GssError::Krb5 {
+                    code: ret,
+                    msg: "krb5_init_context",
+                });
+            }
+
+            let mut keytab: ffi::Krb5Keytab = ptr::null_mut();
+            let ret = ffi::krb5_kt_resolve(ctx, kt_cstr.as_ptr(), &raw mut keytab);
+            if ret != 0 {
+                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+                ffi::krb5_free_error_message(ctx, errmsg_ptr);
+                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_resolve failed");
+                ffi::krb5_free_context(ctx);
+                return Err(GssError::Krb5 {
+                    code: ret,
+                    msg: "krb5_kt_resolve",
+                });
+            }
+
+            let mut minor: ffi::OmUint32 = 0;
+            let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
+            let major = ffi::gss_krb5_import_cred(
+                &raw mut minor,
+                ptr::null_mut(), // ccache: this credential only accepts
+                ptr::null_mut(), // no principal: match whatever the ticket names
+                keytab,
+                &raw mut cred_handle,
+            );
+            let error_minor = minor;
+            ffi::krb5_kt_close(ctx, keytab);
+            ffi::krb5_free_context(ctx);
+
+            if major != ffi::GSS_S_COMPLETE {
+                if !cred_handle.is_null() {
+                    // SAFETY: set by gss_krb5_import_cred.
+                    ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle);
+                }
+                let detail = format_gss_status(major, error_minor);
+                tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_krb5_import_cred (acceptor keytab) failed");
+                return Err(GssError::AcquireCred {
+                    detail,
+                    major,
+                    minor: error_minor,
+                });
+            }
+            Ok(GssServerCred { raw: cred_handle })
+        }
+    }
+
     /// Acquire a server credential for `service_name` via gssproxy.
     ///
     /// Calls `gss_acquire_cred_from()` with a null credential store, which is
@@ -340,13 +441,27 @@ impl GssServerCred {
     /// intercepts the call and supplies credentials from the configured keytab
     /// without requiring the process to have direct keytab file access.
     ///
+    /// gssproxy is a MIT Kerberos mechanism; a Heimdal build has no
+    /// credential-store proxy to talk to, so this reports
+    /// [`GssError::Unsupported`] and the caller should use
+    /// [`Self::acquire`] with the keytab path instead.
+    ///
     /// # Errors
     ///
-    /// - [`GssError::NulInServiceName`] — `service_name` contains a NUL byte.
-    /// - [`GssError::ImportName`] — `gss_import_name` rejected the service name.
+    /// - [`GssError::Unsupported`] — this build links Heimdal.
     /// - [`GssError::AcquireCred`] — gssproxy denied the request, the service
     ///   has no gssproxy entry, or the Kerberos library returned an error.
     pub fn from_gssproxy(_service_name: &str) -> Result<Self, GssError> {
+        #[cfg(heimdal_kerberos)]
+        return Err(GssError::Unsupported {
+            feature: "gssproxy credential acquisition",
+        });
+        #[cfg(mit_kerberos)]
+        return Self::from_gssproxy_mit();
+    }
+
+    #[cfg(mit_kerberos)]
+    fn from_gssproxy_mit() -> Result<Self, GssError> {
         let mut minor: ffi::OmUint32 = 0;
 
         let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
@@ -530,7 +645,9 @@ impl GssClientCred {
     /// The calling process must already hold a valid TGT (e.g. from `kinit`).
     /// No keytab is required.  Passing `GSS_C_NO_CRED_STORE` (NULL) for the
     /// credential store makes MIT Kerberos use the ambient ccache, identical
-    /// to calling `gss_acquire_cred()` with default arguments.
+    /// to calling `gss_acquire_cred()` with default arguments.  Heimdal's
+    /// `gss_acquire_cred` with no name does the same: the default ccache first,
+    /// falling back to the default keytab.
     ///
     /// `for_impersonation` controls the GSSAPI credential usage flag:
     /// - `false` → `GSS_C_INITIATE` — for pure initiator use (LDAP bind,
@@ -543,11 +660,29 @@ impl GssClientCred {
     ///   credential as `input_cred_handle`, triggering an AS exchange; only
     ///   pass `true` when the impersonator role is actually required.
     ///
+    /// A Heimdal build has no S4U2Self, so `for_impersonation == true` reports
+    /// [`GssError::Unsupported`].
+    ///
     /// # Errors
     ///
+    /// - [`GssError::Unsupported`] — `for_impersonation` under Heimdal.
     /// - [`GssError::AcquireCred`] — no valid TGT in the ccache, or the
     ///   Kerberos library returned an error.
     pub fn from_ccache(for_impersonation: bool) -> Result<Self, GssError> {
+        #[cfg(heimdal_kerberos)]
+        if for_impersonation {
+            return Err(GssError::Unsupported {
+                feature: "S4U2Self impersonation credentials",
+            });
+        }
+        #[cfg(mit_kerberos)]
+        return Self::from_ccache_mit(for_impersonation);
+        #[cfg(heimdal_kerberos)]
+        return Self::from_ccache_heimdal();
+    }
+
+    #[cfg(mit_kerberos)]
+    fn from_ccache_mit(for_impersonation: bool) -> Result<Self, GssError> {
         let mut minor: ffi::OmUint32 = 0;
         let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
         let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
@@ -599,16 +734,68 @@ impl GssClientCred {
         Ok(GssClientCred { raw: cred_handle })
     }
 
+    /// The Heimdal path: `gss_acquire_cred` with no name reads the default
+    /// ccache (`KRB5CCNAME`), and only falls back to the default keytab if the
+    /// ccache holds nothing usable.
+    #[cfg(heimdal_kerberos)]
+    fn from_ccache_heimdal() -> Result<Self, GssError> {
+        let mut minor: ffi::OmUint32 = 0;
+        let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
+
+        // SAFETY: minor and cred_handle are valid locals; GSS_C_NO_NAME and
+        // GSS_C_NO_OID_SET are null.
+        let major = unsafe {
+            ffi::gss_acquire_cred(
+                &raw mut minor,
+                ptr::null_mut(), // desired_name = GSS_C_NO_NAME → default principal
+                0,               // GSS_C_INDEFINITE
+                ffi::GSS_C_NO_OID_SET,
+                ffi::GSS_C_INITIATE,
+                &raw mut cred_handle,
+                ptr::null_mut(), // actual_mechs
+                ptr::null_mut(), // time_rec
+            )
+        };
+
+        if major != ffi::GSS_S_COMPLETE {
+            if !cred_handle.is_null() {
+                unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
+            }
+            let detail = format_gss_status(major, minor);
+            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "gss_acquire_cred (default ccache) failed");
+            return Err(GssError::AcquireCred {
+                detail,
+                major,
+                minor,
+            });
+        }
+
+        Ok(GssClientCred { raw: cred_handle })
+    }
+
     /// Acquire an initiator credential from the keytab at `keytab_file`.
     ///
-    /// Passes `desired_name = NULL` so the GSSAPI library selects the credential
-    /// from the keytab that can obtain a service ticket for the requested target.
-    /// Uses `gss_acquire_cred_from()` (RFC 5587) with `GSS_C_INITIATE`.
+    /// Under MIT Kerberos this passes `desired_name = NULL` so the library
+    /// selects from the keytab whichever credential can obtain a service ticket
+    /// for the requested target, using `gss_acquire_cred_from()` (RFC 5587)
+    /// with `GSS_C_INITIATE`.  The keytab is consulted lazily: no TGT is
+    /// acquired until the credential is first used.
+    ///
+    /// Heimdal has no credential store and no lazy keytab initiator, so this
+    /// reads the *first* entry of the keytab, obtains a TGT for that principal
+    /// now, stores it in a private in-process ccache, and imports that ccache
+    /// as an INITIATE credential.  Which principal that is therefore depends on
+    /// the keytab's entry order, and concurrent calls share one ccache name —
+    /// pass an explicit principal with
+    /// [`Self::from_keytab_initiate_named`] when the choice matters.
     ///
     /// # Errors
     ///
     /// - [`GssError::NulInKeytabPath`] — `keytab_file` contains a NUL byte.
-    /// - [`GssError::AcquireCred`] — `gss_acquire_cred_from` failed (keytab
+    /// - [`GssError::KeytabNotReadable`] — keytab file cannot be opened.
+    /// - [`GssError::Krb5`] — Heimdal could not read the keytab or obtain the
+    ///   TGT.
+    /// - [`GssError::AcquireCred`] — credential acquisition failed (keytab
     ///   missing, no usable credential, or Kerberos library error).
     pub fn from_keytab(keytab_file: &str) -> Result<Self, GssError> {
         let kt_cstr = CString::new(keytab_file).map_err(|_| GssError::NulInKeytabPath)?;
@@ -618,8 +805,15 @@ impl GssClientCred {
             source: e,
         })?;
 
-        let mut minor: ffi::OmUint32 = 0;
+        #[cfg(mit_kerberos)]
+        return Self::from_keytab_mit(&kt_cstr);
+        #[cfg(heimdal_kerberos)]
+        return Self::from_keytab_heimdal(&kt_cstr);
+    }
 
+    #[cfg(mit_kerberos)]
+    fn from_keytab_mit(kt_cstr: &CStr) -> Result<Self, GssError> {
+        let mut minor: ffi::OmUint32 = 0;
         let key_keytab = c"keytab";
         let mut element = ffi::GssKeyValueElementDesc {
             key: key_keytab.as_ptr(),
@@ -665,7 +859,7 @@ impl GssClientCred {
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
             let detail = format_gss_status(major, error_minor);
-            tracing::warn!(keytab = keytab_file, major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (keytab) failed");
+            tracing::warn!(keytab = %kt_cstr.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (keytab) failed");
             return Err(GssError::AcquireCred {
                 detail,
                 major,
@@ -676,21 +870,47 @@ impl GssClientCred {
         Ok(GssClientCred { raw: cred_handle })
     }
 
+    /// The Heimdal path: name the principal from the keytab's first entry, get
+    /// its TGT into a private in-process ccache, and import that ccache.
+    #[cfg(heimdal_kerberos)]
+    fn from_keytab_heimdal(kt_cstr: &CStr) -> Result<Self, GssError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ccache_name = CString::new(format!(
+            "MEMORY:kuipa-keytab-initiator-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+        .expect("no NUL in a generated name");
+
+        let principal = keytab_first_principal(kt_cstr)?;
+        tgt_into_ccache(kt_cstr, &principal, &ccache_name)?;
+        let cred_handle = acquire_initiator_from_ccache(&ccache_name)?;
+        Ok(GssClientCred { raw: cred_handle })
+    }
+
     /// Acquire a combined initiator+acceptor credential from the keytab at `keytab_file`.
     ///
-    /// Sets both `{"client_keytab": path}` (for `GSS_C_INITIATE`) and
-    /// `{"keytab": path}` (for `GSS_C_ACCEPT`) in the credential store, then calls
-    /// `gss_acquire_cred_from()` with `GSS_C_BOTH`.  MIT Kerberos uses `client_keytab`
-    /// to obtain a TGT automatically (no `kinit` required); gssproxy, when active, is
-    /// told exactly which keytab to use for both roles via the same two keys.
+    /// Under MIT Kerberos this sets both `{"client_keytab": path}` (for
+    /// `GSS_C_INITIATE`) and `{"keytab": path}` (for `GSS_C_ACCEPT`) in the
+    /// credential store, then calls `gss_acquire_cred_from()` with
+    /// `GSS_C_BOTH`.  MIT uses `client_keytab` to obtain a TGT automatically
+    /// (no `kinit` required); gssproxy, when active, is told exactly which
+    /// keytab to use for both roles via the same two keys.  `desired_name =
+    /// NULL` lets the library choose the principal from the keytab.
     ///
-    /// `desired_name = NULL` lets the library choose the principal from the keytab.
+    /// Under Heimdal there is no credential store: the TGT for the keytab's
+    /// first principal is obtained into `ccache` (or a private in-process
+    /// ccache when none is named), and ccache plus keytab are imported together
+    /// as a credential of both usages.  The principal is thus chosen by the
+    /// keytab's entry order rather than by the request.
     ///
     /// # Errors
     ///
     /// - [`GssError::NulInKeytabPath`] — `keytab_file` contains a NUL byte.
     /// - [`GssError::NulInCcacheName`] — `ccache` contains a NUL byte.
-    /// - [`GssError::AcquireCred`] — `gss_acquire_cred_from` failed.  In
+    /// - [`GssError::Krb5`] — Heimdal could not read the keytab or obtain the
+    ///   TGT.
+    /// - [`GssError::AcquireCred`] — credential acquisition failed.  In
     ///   gssproxy mode the daemon reads the keytab; the process itself does not
     ///   need read permission on the file.
     pub fn from_keytab_combined(keytab_file: &str, ccache: Option<&str>) -> Result<Self, GssError> {
@@ -700,8 +920,20 @@ impl GssClientCred {
             .transpose()
             .map_err(|_| GssError::NulInCcacheName)?;
 
+        #[cfg(mit_kerberos)]
+        return Self::from_keytab_combined_mit(&kt_cstr, cc_cstr.as_deref(), ccache);
+        #[cfg(heimdal_kerberos)]
+        return Self::from_keytab_combined_heimdal(&kt_cstr, cc_cstr.as_deref());
+    }
+
+    #[cfg(mit_kerberos)]
+    fn from_keytab_combined_mit(
+        kt_cstr: &CStr,
+        cc_cstr: Option<&CStr>,
+        ccache: Option<&str>,
+    ) -> Result<Self, GssError> {
         tracing::debug!(
-            keytab = keytab_file,
+            keytab = %kt_cstr.to_string_lossy(),
             ccache,
             "gss_acquire_cred_from client_keytab+keytab+ccache GSS_C_BOTH"
         );
@@ -727,7 +959,7 @@ impl GssClientCred {
                 value: kt_cstr.as_ptr(),
             },
         ];
-        if let Some(ref cc) = cc_cstr {
+        if let Some(cc) = cc_cstr {
             elements.push(ffi::GssKeyValueElementDesc {
                 key: key_ccache.as_ptr(),
                 value: cc.as_ptr(),
@@ -773,7 +1005,7 @@ impl GssClientCred {
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
             let detail = format_gss_status(major, error_minor);
-            tracing::warn!(keytab = keytab_file, major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (keytab combined) failed");
+            tracing::warn!(keytab = %kt_cstr.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (keytab combined) failed");
             return Err(GssError::AcquireCred {
                 detail,
                 major,
@@ -782,11 +1014,103 @@ impl GssClientCred {
         }
 
         tracing::debug!(
-            keytab = keytab_file,
+            keytab = %kt_cstr.to_string_lossy(),
             lifetime_secs = time_rec,
             "gss_acquire_cred_from ok"
         );
         Ok(GssClientCred { raw: cred_handle })
+    }
+
+    /// The Heimdal path: TGT for the keytab's first principal into a ccache,
+    /// then import ccache and keytab as one credential of both usages.
+    #[cfg(heimdal_kerberos)]
+    fn from_keytab_combined_heimdal(
+        kt_cstr: &CStr,
+        ccache: Option<&CStr>,
+    ) -> Result<Self, GssError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let private_ccache = CString::new(format!(
+            "MEMORY:kuipa-keytab-both-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+        .expect("no NUL in a generated name");
+        let ccache_name = ccache.unwrap_or(&private_ccache);
+
+        let principal = keytab_first_principal(kt_cstr)?;
+        tgt_into_ccache(kt_cstr, &principal, ccache_name)?;
+
+        // SAFETY: each handle is initialised here and released on every path in
+        // reverse order of acquisition.
+        unsafe {
+            let mut ctx: ffi::Krb5Context = ptr::null_mut();
+            let ret = ffi::krb5_init_context(&raw mut ctx);
+            if ret != 0 {
+                tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
+                return Err(GssError::Krb5 {
+                    code: ret,
+                    msg: "krb5_init_context",
+                });
+            }
+
+            let mut cc_h: ffi::Krb5Ccache = ptr::null_mut();
+            let ret = ffi::krb5_cc_resolve(ctx, ccache_name.as_ptr(), &raw mut cc_h);
+            if ret != 0 {
+                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+                ffi::krb5_free_error_message(ctx, errmsg_ptr);
+                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_resolve failed");
+                ffi::krb5_free_context(ctx);
+                return Err(GssError::Krb5 {
+                    code: ret,
+                    msg: "krb5_cc_resolve",
+                });
+            }
+
+            let mut keytab: ffi::Krb5Keytab = ptr::null_mut();
+            let ret = ffi::krb5_kt_resolve(ctx, kt_cstr.as_ptr(), &raw mut keytab);
+            if ret != 0 {
+                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+                ffi::krb5_free_error_message(ctx, errmsg_ptr);
+                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_resolve failed");
+                ffi::krb5_cc_close(ctx, cc_h);
+                ffi::krb5_free_context(ctx);
+                return Err(GssError::Krb5 {
+                    code: ret,
+                    msg: "krb5_kt_resolve",
+                });
+            }
+
+            let mut minor: ffi::OmUint32 = 0;
+            let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
+            let major = ffi::gss_krb5_import_cred(
+                &raw mut minor,
+                cc_h,
+                ptr::null_mut(),
+                keytab,
+                &raw mut cred_handle,
+            );
+            let error_minor = minor;
+            ffi::krb5_kt_close(ctx, keytab);
+            ffi::krb5_cc_close(ctx, cc_h);
+            ffi::krb5_free_context(ctx);
+
+            if major != ffi::GSS_S_COMPLETE {
+                if !cred_handle.is_null() {
+                    // SAFETY: set by gss_krb5_import_cred.
+                    ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle);
+                }
+                let detail = format_gss_status(major, error_minor);
+                tracing::warn!(keytab = %kt_cstr.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_krb5_import_cred (keytab combined) failed");
+                return Err(GssError::AcquireCred {
+                    detail,
+                    major,
+                    minor: error_minor,
+                });
+            }
+            Ok(GssClientCred { raw: cred_handle })
+        }
     }
 
     /// Acquire an initiator credential by getting a TGT from `keytab_file` for
@@ -823,182 +1147,8 @@ impl GssClientCred {
             source: e,
         })?;
 
-        // SAFETY: each pointer is initialised before use; on error we clean up in
-        // reverse-acquisition order (no double-free, no leak).
-        unsafe {
-            let mut ctx: ffi::Krb5Context = ptr::null_mut();
-            let ret = ffi::krb5_init_context(&raw mut ctx);
-            if ret != 0 {
-                tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_init_context",
-                });
-            }
-
-            let mut principal_h: ffi::Krb5Principal = ptr::null_mut();
-            let ret = ffi::krb5_parse_name(ctx, principal_cstr.as_ptr(), &raw mut principal_h);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_parse_name failed");
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_parse_name",
-                });
-            }
-
-            let mut kt: ffi::Krb5Keytab = ptr::null_mut();
-            let ret = ffi::krb5_kt_resolve(ctx, kt_cstr.as_ptr(), &raw mut kt);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_resolve failed");
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_kt_resolve",
-                });
-            }
-
-            let ccache_name = c"MEMORY:kuipa-initiator";
-            let mut ccache: ffi::Krb5Ccache = ptr::null_mut();
-            let ret = ffi::krb5_cc_resolve(ctx, ccache_name.as_ptr(), &raw mut ccache);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_resolve failed");
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_cc_resolve",
-                });
-            }
-
-            let ret = ffi::krb5_cc_initialize(ctx, ccache, principal_h);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_initialize failed");
-                ffi::krb5_cc_close(ctx, ccache);
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_cc_initialize",
-                });
-            }
-
-            let mut creds = ffi::Krb5Creds([0u8; 128]);
-            let ret = ffi::krb5_get_init_creds_keytab(
-                ctx,
-                &raw mut creds,
-                principal_h,
-                kt,
-                0,
-                ptr::null(),
-                ptr::null_mut(),
-            );
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_get_init_creds_keytab failed");
-                ffi::krb5_cc_close(ctx, ccache);
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_get_init_creds_keytab",
-                });
-            }
-
-            let store_ret = ffi::krb5_cc_store_cred(ctx, ccache, &raw mut creds);
-            ffi::krb5_free_cred_contents(ctx, &raw mut creds);
-            if store_ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, store_ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{store_ret:#010x}"), errmsg, "krb5_cc_store_cred failed");
-                ffi::krb5_cc_close(ctx, ccache);
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: store_ret,
-                    msg: "krb5_cc_store_cred",
-                });
-            }
-            ffi::krb5_cc_close(ctx, ccache);
-            ffi::krb5_kt_close(ctx, kt);
-            ffi::krb5_free_principal(ctx, principal_h);
-            ffi::krb5_free_context(ctx);
-        }
-
-        // Acquire GSSAPI initiator credential from the MEMORY: ccache.
-        let key_ccache = c"ccache";
-        let ccache_name = c"MEMORY:kuipa-initiator";
-        let mut element = ffi::GssKeyValueElementDesc {
-            key: key_ccache.as_ptr(),
-            value: ccache_name.as_ptr(),
-        };
-        let cred_store = ffi::GssKeyValueSetDesc {
-            count: 1,
-            elements: &raw mut element,
-        };
-
-        let mut minor: ffi::OmUint32 = 0;
-        let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
-        let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
-        let mut time_rec: ffi::OmUint32 = 0;
-
-        // SAFETY: cred_store elements point to live c-string literals; output
-        // pointers are valid stack locals.
-        let major = unsafe {
-            ffi::gss_acquire_cred_from(
-                &raw mut minor,
-                ptr::null_mut(), // desired_name = GSS_C_NO_NAME
-                0,               // GSS_C_INDEFINITE
-                ffi::GSS_C_NO_OID_SET,
-                ffi::GSS_C_INITIATE,
-                &raw const cred_store,
-                &raw mut cred_handle,
-                &raw mut actual_mechs,
-                &raw mut time_rec,
-            )
-        };
-
-        let error_minor = minor;
-        // SAFETY: actual_mechs is non-null only when set by gss_acquire_cred_from.
-        unsafe {
-            if !actual_mechs.is_null() {
-                ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs);
-            }
-        }
-
-        if major != ffi::GSS_S_COMPLETE {
-            if !cred_handle.is_null() {
-                // SAFETY: set by gss_acquire_cred_from.
-                unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
-            }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (initiator ccache) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
-        }
+        tgt_into_ccache(&kt_cstr, &principal_cstr, DEFAULT_INITIATOR_CCACHE)?;
+        let cred_handle = acquire_initiator_from_ccache(DEFAULT_INITIATOR_CCACHE)?;
 
         Ok(GssClientCred { raw: cred_handle })
     }
@@ -1032,180 +1182,8 @@ impl GssClientCred {
             source: e,
         })?;
 
-        // SAFETY: each pointer is initialised before use; on error we clean up in
-        // reverse-acquisition order (no double-free, no leak).
-        unsafe {
-            let mut ctx: ffi::Krb5Context = ptr::null_mut();
-            let ret = ffi::krb5_init_context(&raw mut ctx);
-            if ret != 0 {
-                tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_init_context",
-                });
-            }
-
-            let mut principal_h: ffi::Krb5Principal = ptr::null_mut();
-            let ret = ffi::krb5_parse_name(ctx, principal_cstr.as_ptr(), &raw mut principal_h);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_parse_name failed");
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_parse_name",
-                });
-            }
-
-            let mut kt: ffi::Krb5Keytab = ptr::null_mut();
-            let ret = ffi::krb5_kt_resolve(ctx, kt_cstr.as_ptr(), &raw mut kt);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_resolve failed");
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_kt_resolve",
-                });
-            }
-
-            let mut ccache: ffi::Krb5Ccache = ptr::null_mut();
-            let ret = ffi::krb5_cc_resolve(ctx, ccache_cstr.as_ptr(), &raw mut ccache);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_resolve failed");
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_cc_resolve",
-                });
-            }
-
-            let ret = ffi::krb5_cc_initialize(ctx, ccache, principal_h);
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_initialize failed");
-                ffi::krb5_cc_close(ctx, ccache);
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_cc_initialize",
-                });
-            }
-
-            let mut creds = ffi::Krb5Creds([0u8; 128]);
-            let ret = ffi::krb5_get_init_creds_keytab(
-                ctx,
-                &raw mut creds,
-                principal_h,
-                kt,
-                0,
-                ptr::null(),
-                ptr::null_mut(),
-            );
-            if ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_get_init_creds_keytab failed");
-                ffi::krb5_cc_close(ctx, ccache);
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: ret,
-                    msg: "krb5_get_init_creds_keytab",
-                });
-            }
-
-            let store_ret = ffi::krb5_cc_store_cred(ctx, ccache, &raw mut creds);
-            ffi::krb5_free_cred_contents(ctx, &raw mut creds);
-            if store_ret != 0 {
-                let errmsg_ptr = ffi::krb5_get_error_message(ctx, store_ret);
-                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
-                ffi::krb5_free_error_message(ctx, errmsg_ptr);
-                tracing::warn!(code = %format_args!("{store_ret:#010x}"), errmsg, "krb5_cc_store_cred failed");
-                ffi::krb5_cc_close(ctx, ccache);
-                ffi::krb5_kt_close(ctx, kt);
-                ffi::krb5_free_principal(ctx, principal_h);
-                ffi::krb5_free_context(ctx);
-                return Err(GssError::Krb5 {
-                    code: store_ret,
-                    msg: "krb5_cc_store_cred",
-                });
-            }
-            ffi::krb5_cc_close(ctx, ccache);
-            ffi::krb5_kt_close(ctx, kt);
-            ffi::krb5_free_principal(ctx, principal_h);
-            ffi::krb5_free_context(ctx);
-        }
-
-        // Acquire GSSAPI initiator credential from the named ccache.
-        let key_ccache = c"ccache";
-        let mut element = ffi::GssKeyValueElementDesc {
-            key: key_ccache.as_ptr(),
-            value: ccache_cstr.as_ptr(),
-        };
-        let cred_store = ffi::GssKeyValueSetDesc {
-            count: 1,
-            elements: &raw mut element,
-        };
-
-        let mut minor: ffi::OmUint32 = 0;
-        let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
-        let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
-        let mut time_rec: ffi::OmUint32 = 0;
-
-        // SAFETY: cred_store elements point to live CString values held on the
-        // stack; output pointers are valid stack locals.
-        let major = unsafe {
-            ffi::gss_acquire_cred_from(
-                &raw mut minor,
-                ptr::null_mut(), // desired_name = GSS_C_NO_NAME
-                0,               // GSS_C_INDEFINITE
-                ffi::GSS_C_NO_OID_SET,
-                ffi::GSS_C_INITIATE,
-                &raw const cred_store,
-                &raw mut cred_handle,
-                &raw mut actual_mechs,
-                &raw mut time_rec,
-            )
-        };
-
-        let error_minor = minor;
-        // SAFETY: actual_mechs is non-null only when set by gss_acquire_cred_from.
-        unsafe {
-            if !actual_mechs.is_null() {
-                ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs);
-            }
-        }
-
-        if major != ffi::GSS_S_COMPLETE {
-            if !cred_handle.is_null() {
-                // SAFETY: set by gss_acquire_cred_from.
-                unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
-            }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (named initiator ccache) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
-        }
+        tgt_into_ccache(&kt_cstr, &principal_cstr, &ccache_cstr)?;
+        let cred_handle = acquire_initiator_from_ccache(&ccache_cstr)?;
 
         Ok(GssClientCred { raw: cred_handle })
     }
@@ -1223,13 +1201,30 @@ impl GssClientCred {
     /// automatically performs S4U2Proxy to obtain an LDAP ticket on behalf of
     /// the user.
     ///
+    /// S4U2Self is a MIT Kerberos extension; a Heimdal build reports
+    /// [`GssError::Unsupported`] instead.
+    ///
     /// # Errors
     ///
+    /// - [`GssError::Unsupported`] — this build links Heimdal.
     /// - [`GssError::NulInUserPrincipal`] — `user_principal` contains a NUL byte.
     /// - [`GssError::ImportName`] — `gss_import_name` rejected the principal.
     /// - [`GssError::ImpersonateCred`] — `gss_acquire_cred_impersonate_name` failed
     ///   (KDC policy, missing delegation config, or unknown principal).
     pub fn impersonate(initiator: &GssClientCred, user_principal: &str) -> Result<Self, GssError> {
+        #[cfg(mit_kerberos)]
+        return Self::impersonate_mit(initiator, user_principal);
+        #[cfg(heimdal_kerberos)]
+        {
+            let _ = (&initiator, user_principal);
+            Err(GssError::Unsupported {
+                feature: "S4U2Self (gss_acquire_cred_impersonate_name)",
+            })
+        }
+    }
+
+    #[cfg(mit_kerberos)]
+    fn impersonate_mit(initiator: &GssClientCred, user_principal: &str) -> Result<Self, GssError> {
         let principal_cstr =
             CString::new(user_principal).map_err(|_| GssError::NulInUserPrincipal)?;
         let mut minor: ffi::OmUint32 = 0;
@@ -1237,7 +1232,7 @@ impl GssClientCred {
         // Import the user principal as a Kerberos principal name.
         let principal_oid = ffi::gss_krb5_nt_principal_name();
         let principal_buf = ffi::GssBufferDesc {
-            length: principal_cstr.as_bytes().len(),
+            length: principal_cstr.to_bytes().len(),
             // SAFETY: gss_import_name treats the buffer as read-only.
             #[allow(clippy::as_ptr_cast_mut)]
             value: principal_cstr.as_ptr() as *mut _,
@@ -1330,11 +1325,21 @@ impl GssClientCred {
     /// # Errors
     ///
     /// - [`GssError::NulInCcacheName`] — `ccache_name` contains a NUL byte.
-    /// - [`GssError::AcquireCred`] — `gss_acquire_cred_from` failed (the ccache
-    ///   does not exist or contains no usable credential).
+    /// - [`GssError::AcquireCred`] — acquisition failed (the ccache does not
+    ///   exist or contains no usable credential).
     pub fn from_named_ccache(ccache_name: &str) -> Result<Self, GssError> {
         let ccache_cstr = CString::new(ccache_name).map_err(|_| GssError::NulInCcacheName)?;
 
+        #[cfg(mit_kerberos)]
+        return Self::from_named_ccache_mit(&ccache_cstr);
+        #[cfg(heimdal_kerberos)]
+        return Ok(GssClientCred {
+            raw: acquire_initiator_from_ccache(&ccache_cstr)?,
+        });
+    }
+
+    #[cfg(mit_kerberos)]
+    fn from_named_ccache_mit(ccache_cstr: &CStr) -> Result<Self, GssError> {
         let key_ccache = c"ccache";
         let mut element = ffi::GssKeyValueElementDesc {
             key: key_ccache.as_ptr(),
@@ -1380,7 +1385,7 @@ impl GssClientCred {
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
             let detail = format_gss_status(major, error_minor);
-            tracing::warn!(ccache = ccache_name, major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (named ccache) failed");
+            tracing::warn!(ccache = %ccache_cstr.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (named ccache) failed");
             return Err(GssError::AcquireCred {
                 detail,
                 major,
@@ -1394,16 +1399,32 @@ impl GssClientCred {
     /// Store this credential into the named Kerberos credential cache.
     ///
     /// `ccache_name` should be a `MEMORY:` ccache name (e.g. `"MEMORY:kuipa-7"`).
-    /// After storing, call [`set_thread_ccache`] so that the SASL GSSAPI plugin
-    /// finds this credential when it calls `gss_acquire_cred` on the same thread.
+    /// Under MIT Kerberos, after storing, call [`set_thread_ccache`] so that
+    /// the SASL GSSAPI plugin finds this credential when it calls
+    /// `gss_acquire_cred` on the same thread; Heimdal has no thread-local
+    /// ccache, so there the credential is only visible to code that names the
+    /// ccache itself.
+    ///
+    /// Heimdal copies the ccache behind the credential with
+    /// `gss_krb5_copy_ccache`; a credential obtained from a keytab alone has no
+    /// ccache and cannot be stored.
     ///
     /// # Errors
     ///
     /// - [`GssError::NulInCcacheName`] — `ccache_name` contains a NUL byte.
-    /// - [`GssError::StoreCred`] — `gss_store_cred_into` failed.
+    /// - [`GssError::StoreCred`] — the store failed.
+    /// - [`GssError::Krb5`] — Heimdal could not open `ccache_name`.
     pub fn store_into_ccache(&self, ccache_name: &str) -> Result<(), GssError> {
         let ccache_cstr = CString::new(ccache_name).map_err(|_| GssError::NulInCcacheName)?;
 
+        #[cfg(mit_kerberos)]
+        return self.store_into_ccache_mit(&ccache_cstr, ccache_name);
+        #[cfg(heimdal_kerberos)]
+        return self.store_into_ccache_heimdal(&ccache_cstr);
+    }
+
+    #[cfg(mit_kerberos)]
+    fn store_into_ccache_mit(&self, ccache_cstr: &CStr, ccache_name: &str) -> Result<(), GssError> {
         let key_ccache = c"ccache";
         let mut element = ffi::GssKeyValueElementDesc {
             key: key_ccache.as_ptr(),
@@ -1453,13 +1474,67 @@ impl GssClientCred {
         Ok(())
     }
 
-    /// Export this credential as a complete MIT ccache file.
+    /// The Heimdal path: copy the credential's own ccache into `ccache_name`.
+    /// Heimdal's copy initialises the destination itself, so no
+    /// `krb5_cc_initialize` is needed.
+    #[cfg(heimdal_kerberos)]
+    fn store_into_ccache_heimdal(&self, ccache_cstr: &CStr) -> Result<(), GssError> {
+        // SAFETY: the context and ccache are initialised here and released on
+        // every path; self.raw is a live credential.
+        unsafe {
+            let mut ctx: ffi::Krb5Context = ptr::null_mut();
+            let ret = ffi::krb5_init_context(&raw mut ctx);
+            if ret != 0 {
+                tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
+                return Err(GssError::Krb5 {
+                    code: ret,
+                    msg: "krb5_init_context",
+                });
+            }
+
+            let mut ccache: ffi::Krb5Ccache = ptr::null_mut();
+            let ret = ffi::krb5_cc_resolve(ctx, ccache_cstr.as_ptr(), &raw mut ccache);
+            if ret != 0 {
+                let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+                let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+                ffi::krb5_free_error_message(ctx, errmsg_ptr);
+                tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_resolve failed");
+                ffi::krb5_free_context(ctx);
+                return Err(GssError::Krb5 {
+                    code: ret,
+                    msg: "krb5_cc_resolve",
+                });
+            }
+
+            let mut minor: ffi::OmUint32 = 0;
+            let major = ffi::gss_krb5_copy_ccache(&raw mut minor, self.raw, ccache);
+            let error_minor = minor;
+            ffi::krb5_cc_close(ctx, ccache);
+            ffi::krb5_free_context(ctx);
+
+            if major != ffi::GSS_S_COMPLETE {
+                let detail = format_gss_status(major, error_minor);
+                tracing::warn!(ccache = %ccache_cstr.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_krb5_copy_ccache failed");
+                return Err(GssError::StoreCred {
+                    detail,
+                    major,
+                    minor: error_minor,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// Export this credential as a complete credential-cache file.
     ///
     /// Stores the GSSAPI credential into a temporary `FILE:` ccache via
-    /// `gss_store_cred_into`, reads the file bytes, and deletes the file.
+    /// [`Self::store_into_ccache`], reads the file bytes, and deletes the file.
     /// This approach works under both direct keytab and gssproxy modes
     /// (unlike `MEMORY:` ccaches, which are invisible to the local krb5
     /// library when gssproxy manages the credential).
+    ///
+    /// The bytes are in the ccache format of the Kerberos library this build
+    /// links: MIT's under `mit_kerberos`, Heimdal's under `heimdal_kerberos`.
     ///
     /// The temporary file is created by us, exclusively and mode 0600
     /// *before* any credential is stored into it, with an unguessable
@@ -1540,6 +1615,378 @@ impl GssClientCred {
     }
 }
 
+/// The in-process ccache [`GssClientCred::from_keytab_initiate`] stores its TGT in.
+const DEFAULT_INITIATOR_CCACHE: &CStr = c"MEMORY:kuipa-initiator";
+
+/// Get a TGT from `kt` for `principal` and store it in the `MEMORY:` ccache
+/// named `ccache_name`.  Takes borrowed C strings so that either an owned
+/// [`CString`] or a static [`CStr`] name works on both vendors.
+///
+/// Shared by [`GssClientCred::from_keytab_initiate`] and
+/// [`GssClientCred::from_keytab_initiate_named`], which differ only in the
+/// ccache name and in how they turn the stored TGT into a GSSAPI initiator
+/// credential.
+///
+/// # Errors
+///
+/// - [`GssError::Krb5`] — the context, principal, keytab, ccache, TGT or
+///   store step failed.
+fn tgt_into_ccache(kt: &CStr, principal: &CStr, ccache_name: &CStr) -> Result<(), GssError> {
+    // SAFETY: each pointer is initialised before use; on error we clean up in
+    // reverse-acquisition order (no double-free, no leak).
+    unsafe {
+        let mut ctx: ffi::Krb5Context = ptr::null_mut();
+        let ret = ffi::krb5_init_context(&raw mut ctx);
+        if ret != 0 {
+            tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_init_context",
+            });
+        }
+
+        let mut principal_h: ffi::Krb5Principal = ptr::null_mut();
+        let ret = ffi::krb5_parse_name(ctx, principal.as_ptr(), &raw mut principal_h);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_parse_name failed");
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_parse_name",
+            });
+        }
+
+        let mut kt_h: ffi::Krb5Keytab = ptr::null_mut();
+        let ret = ffi::krb5_kt_resolve(ctx, kt.as_ptr(), &raw mut kt_h);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_resolve failed");
+            ffi::krb5_free_principal(ctx, principal_h);
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_kt_resolve",
+            });
+        }
+
+        let mut ccache: ffi::Krb5Ccache = ptr::null_mut();
+        let ret = ffi::krb5_cc_resolve(ctx, ccache_name.as_ptr(), &raw mut ccache);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_resolve failed");
+            ffi::krb5_kt_close(ctx, kt_h);
+            ffi::krb5_free_principal(ctx, principal_h);
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_cc_resolve",
+            });
+        }
+
+        let ret = ffi::krb5_cc_initialize(ctx, ccache, principal_h);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_initialize failed");
+            ffi::krb5_cc_close(ctx, ccache);
+            ffi::krb5_kt_close(ctx, kt_h);
+            ffi::krb5_free_principal(ctx, principal_h);
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_cc_initialize",
+            });
+        }
+
+        let mut creds = ffi::Krb5Creds::new();
+        let ret = ffi::krb5_get_init_creds_keytab(
+            ctx,
+            &raw mut creds,
+            principal_h,
+            kt_h,
+            0,
+            ptr::null(),
+            ptr::null_mut(),
+        );
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_get_init_creds_keytab failed");
+            ffi::krb5_cc_close(ctx, ccache);
+            ffi::krb5_kt_close(ctx, kt_h);
+            ffi::krb5_free_principal(ctx, principal_h);
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_get_init_creds_keytab",
+            });
+        }
+
+        let store_ret = ffi::krb5_cc_store_cred(ctx, ccache, &raw mut creds);
+        ffi::krb5_free_cred_contents(ctx, &raw mut creds);
+        if store_ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, store_ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{store_ret:#010x}"), errmsg, "krb5_cc_store_cred failed");
+            ffi::krb5_cc_close(ctx, ccache);
+            ffi::krb5_kt_close(ctx, kt_h);
+            ffi::krb5_free_principal(ctx, principal_h);
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: store_ret,
+                msg: "krb5_cc_store_cred",
+            });
+        }
+        ffi::krb5_cc_close(ctx, ccache);
+        ffi::krb5_kt_close(ctx, kt_h);
+        ffi::krb5_free_principal(ctx, principal_h);
+        ffi::krb5_free_context(ctx);
+    }
+    Ok(())
+}
+
+/// The printable name of the first principal in the keytab `kt`, allocated
+/// here as a [`CString`].
+///
+/// For a caller that brought a keytab but named no principal: Heimdal has no
+/// credential store that picks the principal for us, so the keytab's own
+/// entry order decides which principal the TGT is asked for.
+///
+/// # Errors
+///
+/// - [`GssError::Krb5`] — the keytab could not be opened, has no entries, or
+///   its principal could not be printed.
+#[cfg(heimdal_kerberos)]
+fn keytab_first_principal(kt: &CStr) -> Result<CString, GssError> {
+    // SAFETY: every handle is initialised here and released on every path, in
+    // reverse order of acquisition; the unparsed name is copied out before the
+    // context that allocated it is freed.
+    unsafe {
+        let mut ctx: ffi::Krb5Context = ptr::null_mut();
+        let ret = ffi::krb5_init_context(&raw mut ctx);
+        if ret != 0 {
+            tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_init_context",
+            });
+        }
+
+        let mut kt_h: ffi::Krb5Keytab = ptr::null_mut();
+        let ret = ffi::krb5_kt_resolve(ctx, kt.as_ptr(), &raw mut kt_h);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_resolve failed");
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_kt_resolve",
+            });
+        }
+
+        let mut cursor = ffi::Krb5KtCursor::new();
+        let ret = ffi::krb5_kt_start_seq_get(ctx, kt_h, &raw mut cursor);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_start_seq_get failed");
+            ffi::krb5_kt_close(ctx, kt_h);
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_kt_start_seq_get",
+            });
+        }
+
+        let mut entry = ffi::Krb5KtEntry::new();
+        let ret = ffi::krb5_kt_next_entry(ctx, kt_h, &raw mut entry, &raw mut cursor);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_kt_next_entry failed");
+            ffi::krb5_kt_end_seq_get(ctx, kt_h, &raw mut cursor);
+            ffi::krb5_kt_close(ctx, kt_h);
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_kt_next_entry",
+            });
+        }
+
+        let mut name: *mut c_char = ptr::null_mut();
+        let ret = ffi::krb5_unparse_name(ctx, entry.principal, &raw mut name);
+        ffi::krb5_kt_free_entry(ctx, &raw mut entry);
+        ffi::krb5_kt_end_seq_get(ctx, kt_h, &raw mut cursor);
+        ffi::krb5_kt_close(ctx, kt_h);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_unparse_name failed");
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_unparse_name",
+            });
+        }
+
+        // SAFETY: name is the NUL-terminated string krb5_unparse_name made; it
+        // is copied out and freed before the context goes.
+        let principal = CString::new(CStr::from_ptr(name).to_bytes())
+            .expect("an unparsed name has no interior NUL byte");
+        ffi::krb5_free_unparsed_name(ctx, name);
+        ffi::krb5_free_context(ctx);
+        Ok(principal)
+    }
+}
+
+#[cfg(mit_kerberos)]
+/// Acquire a Kerberos initiator credential from the `MEMORY:`/`FILE:` ccache
+/// named `ccache_name`, via MIT's `gss_acquire_cred_from` credential store.
+///
+/// # Errors
+///
+/// - [`GssError::AcquireCred`] — acquisition failed.
+fn acquire_initiator_from_ccache(ccache_name: &CStr) -> Result<ffi::GssCredIdT, GssError> {
+    let key_ccache = c"ccache";
+    let mut element = ffi::GssKeyValueElementDesc {
+        key: key_ccache.as_ptr(),
+        value: ccache_name.as_ptr(),
+    };
+    let cred_store = ffi::GssKeyValueSetDesc {
+        count: 1,
+        elements: &raw mut element,
+    };
+
+    let mut minor: ffi::OmUint32 = 0;
+    let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
+    let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
+    let mut time_rec: ffi::OmUint32 = 0;
+
+    // SAFETY: cred_store elements point to live C strings; output pointers are
+    // valid stack locals.
+    let major = unsafe {
+        ffi::gss_acquire_cred_from(
+            &raw mut minor,
+            ptr::null_mut(), // desired_name = GSS_C_NO_NAME
+            0,               // GSS_C_INDEFINITE
+            ffi::GSS_C_NO_OID_SET,
+            ffi::GSS_C_INITIATE,
+            &raw const cred_store,
+            &raw mut cred_handle,
+            &raw mut actual_mechs,
+            &raw mut time_rec,
+        )
+    };
+
+    let error_minor = minor;
+    // SAFETY: actual_mechs is non-null only when set by gss_acquire_cred_from.
+    unsafe {
+        if !actual_mechs.is_null() {
+            ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs);
+        }
+    }
+
+    if major != ffi::GSS_S_COMPLETE {
+        if !cred_handle.is_null() {
+            // SAFETY: set by gss_acquire_cred_from.
+            unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
+        }
+        let detail = format_gss_status(major, error_minor);
+        tracing::warn!(ccache = %ccache_name.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (initiator ccache) failed");
+        return Err(GssError::AcquireCred {
+            detail,
+            major,
+            minor: error_minor,
+        });
+    }
+    Ok(cred_handle)
+}
+
+#[cfg(heimdal_kerberos)]
+/// Acquire a Kerberos initiator credential from the ccache named
+/// `ccache_name`, via Heimdal's `gss_krb5_import_cred`.
+///
+/// Heimdal has no credential-store mechanism; importing a ccache handle
+/// yields an INITIATE credential whose principal is the ccache's own
+/// client.  Heimdal re-resolves the ccache by name inside its own context,
+/// so the handle we pass is only needed for the duration of the call.
+///
+/// # Errors
+///
+/// - [`GssError::AcquireCred`] — the ccache could not be opened, parsed, or
+///   imported.
+fn acquire_initiator_from_ccache(ccache_name: &CStr) -> Result<ffi::GssCredIdT, GssError> {
+    // SAFETY: all handles are initialised here and released on every path.
+    unsafe {
+        let mut ctx: ffi::Krb5Context = ptr::null_mut();
+        let ret = ffi::krb5_init_context(&raw mut ctx);
+        if ret != 0 {
+            tracing::warn!(code = %format_args!("{ret:#010x}"), "krb5_init_context failed");
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_init_context",
+            });
+        }
+
+        let mut ccache: ffi::Krb5Ccache = ptr::null_mut();
+        let ret = ffi::krb5_cc_resolve(ctx, ccache_name.as_ptr(), &raw mut ccache);
+        if ret != 0 {
+            let errmsg_ptr = ffi::krb5_get_error_message(ctx, ret);
+            let errmsg = CStr::from_ptr(errmsg_ptr).to_string_lossy().into_owned();
+            ffi::krb5_free_error_message(ctx, errmsg_ptr);
+            tracing::warn!(code = %format_args!("{ret:#010x}"), errmsg, "krb5_cc_resolve failed");
+            ffi::krb5_free_context(ctx);
+            return Err(GssError::Krb5 {
+                code: ret,
+                msg: "krb5_cc_resolve",
+            });
+        }
+
+        let mut minor: ffi::OmUint32 = 0;
+        let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
+        let major = ffi::gss_krb5_import_cred(
+            &raw mut minor,
+            ccache,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &raw mut cred_handle,
+        );
+        let error_minor = minor;
+        ffi::krb5_cc_close(ctx, ccache);
+        ffi::krb5_free_context(ctx);
+
+        if major != ffi::GSS_S_COMPLETE {
+            if !cred_handle.is_null() {
+                // Set by gss_krb5_import_cred; already inside the unsafe block.
+                ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle);
+            }
+            let detail = format_gss_status(major, error_minor);
+            tracing::warn!(ccache = %ccache_name.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_krb5_import_cred (initiator ccache) failed");
+            return Err(GssError::AcquireCred {
+                detail,
+                major,
+                minor: error_minor,
+            });
+        }
+        Ok(cred_handle)
+    }
+}
+
 // ── GssClientContext ──────────────────────────────────────────────────────────
 
 /// In-progress GSSAPI client-side security context for multi-round-trip exchange.
@@ -1609,7 +2056,7 @@ impl GssClientContext {
         let svc_cstr = CString::new(target_service).map_err(|_| GssError::NulInTargetName)?;
         let mut minor: ffi::OmUint32 = 0;
         let svc_buf = ffi::GssBufferDesc {
-            length: svc_cstr.as_bytes().len(),
+            length: svc_cstr.to_bytes().len(),
             // SAFETY: gss_import_name treats the buffer as read-only.
             #[allow(clippy::as_ptr_cast_mut)]
             value: svc_cstr.as_ptr() as *mut _,
@@ -2110,10 +2557,28 @@ pub enum InitStep {
 ///
 /// # Errors
 ///
+/// - [`GssError::Unsupported`] — this build links Heimdal, which has no
+///   `gss_acquire_cred_impersonate_name`.
 /// - [`GssError::NulInUserPrincipal`] — `user_principal` contains a NUL byte.
 /// - [`GssError::ImportName`] — `gss_import_name` rejected the principal.
 /// - [`GssError::ImpersonateCred`] — `gss_acquire_cred_impersonate_name` failed.
 pub fn impersonate_with_server_cred(
+    server: &GssServerCred,
+    user_principal: &str,
+) -> Result<GssClientCred, GssError> {
+    #[cfg(mit_kerberos)]
+    return impersonate_with_server_cred_mit(server, user_principal);
+    #[cfg(heimdal_kerberos)]
+    {
+        let _ = (server, user_principal);
+        Err(GssError::Unsupported {
+            feature: "S4U2Self (gss_acquire_cred_impersonate_name)",
+        })
+    }
+}
+
+#[cfg(mit_kerberos)]
+fn impersonate_with_server_cred_mit(
     server: &GssServerCred,
     user_principal: &str,
 ) -> Result<GssClientCred, GssError> {
@@ -2122,7 +2587,7 @@ pub fn impersonate_with_server_cred(
 
     let principal_oid = ffi::gss_krb5_nt_principal_name();
     let principal_buf = ffi::GssBufferDesc {
-        length: principal_cstr.as_bytes().len(),
+        length: principal_cstr.to_bytes().len(),
         #[allow(clippy::as_ptr_cast_mut)]
         value: principal_cstr.as_ptr() as *mut _,
     };
