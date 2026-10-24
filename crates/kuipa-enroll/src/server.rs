@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use tang_pqc::wire::Writer;
@@ -24,6 +24,7 @@ use crate::keytab::{Enctype, Keytab, Principal};
 use crate::merkle;
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
+use crate::tlog::{Kind, LogId, Receipt, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
     DEFAULT_EPOCH, Descriptor, Limits, Recovered, ReleasedKeys, Reply, SessionKey, SessionToken,
@@ -540,6 +541,50 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
 }
 
+/// Where a leaf landed in a [`Ledger`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Appended {
+    /// The log.
+    pub log: LogId,
+    /// The leaf's index.
+    pub index: u64,
+    /// The leaf's tree hash.
+    pub leaf: merkle::Hash,
+    /// The leaf's time.
+    pub time: u64,
+}
+
+/// Where the server records the events of `DESIGN-tlog.md`, implemented
+/// by the daemon over its log store.  The server appends after an
+/// operation's checks pass and before it answers, so nothing a logged
+/// operation releases leaves the server unrecorded; a failed append
+/// refuses the request.
+pub trait Ledger: Send + Sync + fmt::Debug {
+    /// Append a leaf of `kind` about `subject` (hashed into the leaf's
+    /// index by the ledger's key) and say where it landed; `None` when
+    /// this ledger keeps no log.
+    ///
+    /// # Errors
+    ///
+    /// Any storage failure.
+    fn append(
+        &self,
+        kind: Kind,
+        subject: &[u8],
+        body: &[u8],
+    ) -> Result<Option<Appended>, DirectoryError>;
+}
+
+/// A ledger that records nothing: the default, for servers without a log.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoLedger;
+
+impl Ledger for NoLedger {
+    fn append(&self, _: Kind, _: &[u8], _: &[u8]) -> Result<Option<Appended>, DirectoryError> {
+        Ok(None)
+    }
+}
+
 /// A refused request.  Send the client an empty `403`; log the reason.
 #[derive(Debug)]
 pub struct Refusal(DirectoryError);
@@ -690,6 +735,7 @@ pub struct EnrollServer {
     keys: ServerKeys,
     info: RealmInfo,
     policy: tang_pqc::Policy,
+    ledger: Arc<dyn Ledger>,
     published: RwLock<Published>,
 }
 
@@ -705,6 +751,7 @@ impl EnrollServer {
             keys,
             info,
             policy: tang_pqc::Policy::default(),
+            ledger: Arc::new(NoLedger),
             published: RwLock::new(Published {
                 delegation,
                 anchors,
@@ -722,6 +769,80 @@ impl EnrollServer {
     pub fn with_policy(mut self, policy: tang_pqc::Policy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Record vault, escrow and Keys events in `ledger`; the default
+    /// records nothing ([`NoLedger`]).
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Arc<dyn Ledger>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
+    /// Append an event to the ledger, and sign a receipt for where it
+    /// landed (none when the ledger keeps no log).
+    fn record(&self, kind: Kind, subject: &[u8], body: &[u8]) -> Result<Option<Receipt>, Refusal> {
+        let Some(a) = self.ledger.append(kind, subject, body).map_err(Refusal)? else {
+            return Ok(None);
+        };
+        Ok(Some(Receipt::issue(
+            &self.keys.signing,
+            a.log,
+            a.index,
+            a.leaf,
+            a.time,
+        )?))
+    }
+
+    /// Record `action` on `vault` as it is about to be stored: the device
+    /// added is its newest, and a policy set is recorded by its digest.
+    fn record_change(
+        &self,
+        vault: &Vault,
+        action: VaultAction,
+        device: Option<String>,
+    ) -> Result<Option<Receipt>, Refusal> {
+        let device = match action {
+            VaultAction::AddDevice => vault.devices.last().map(|d| d.id.clone()),
+            _ => device,
+        };
+        let digest = match action {
+            VaultAction::Create | VaultAction::SetPolicy => {
+                let policy = serde_json::to_vec(&vault.policy)
+                    .map_err(|e| Refusal::because(e.to_string()))?;
+                tang_pqc::primitives::sha256(&[&policy])?
+            }
+            _ => [0; 32],
+        };
+        self.record_vault(&vault.id, action, device.as_deref(), digest)
+    }
+
+    /// Record the release of a sealed file's server share, by its binding.
+    fn record_release(
+        &self,
+        request: &EscrowRequest,
+        device: Option<&crate::vault::Device>,
+        opened: &tang_pqc::OpenedRequest<'_>,
+    ) -> Result<Option<Receipt>, Refusal> {
+        let binding = opened.ciphertext_hash().map_err(Error::from)?;
+        let device = device.map(|d| d.id.as_str());
+        self.record_vault(request.vault(), VaultAction::Release, device, binding)
+    }
+
+    /// Record a vault event about `vault`.
+    fn record_vault(
+        &self,
+        vault: &escrow::VaultId,
+        action: VaultAction,
+        device: Option<&str>,
+        digest: merkle::Hash,
+    ) -> Result<Option<Receipt>, Refusal> {
+        let event = VaultEvent {
+            action,
+            device: device.map(str::to_owned),
+            digest,
+        };
+        self.record(action.kind(), vault.as_bytes(), &event.to_bytes())
     }
 
     /// Replace the delegation and the trusted anchors, as decided by the
@@ -1176,6 +1297,8 @@ impl EnrollServer {
         let op = VaultOp::from_bytes(&body.extra)?;
         let now = unix_seconds(SystemTime::now());
         let delegation = self.delegation();
+        let mut event = vault_event(&op);
+        let mut receipts = Vec::new();
         let (mut vaults, session, released) = match op {
             VaultOp::Unlock {
                 name,
@@ -1184,13 +1307,28 @@ impl EnrollServer {
             } => {
                 let (vault, token, released) =
                     self.start_session(&owner, &name, &device, offline, now, directory)?;
+                // Nothing is released before the answer, which waits for
+                // the record.
+                if let Some((action, device)) = event.take() {
+                    receipts.extend(self.record_change(&vault, action, device)?);
+                }
                 (vec![vault], Some(token), released)
             }
-            op => (
-                Self::apply_vault_op(&owner, op, now, directory)?,
-                None,
-                None,
-            ),
+            op => {
+                // A change is recorded before the directory stores it, so a
+                // failed append leaves the vault as it was.
+                let mut record = |vault: &Vault| {
+                    if let Some((action, device)) = event.take() {
+                        receipts.extend(self.record_change(vault, action, device)?);
+                    }
+                    Ok(())
+                };
+                (
+                    Self::apply_vault_op(&owner, op, now, directory, &mut record)?,
+                    None,
+                    None,
+                )
+            }
         };
         for v in &mut vaults {
             if self.maintain_epochs(v, now, directory)? {
@@ -1221,6 +1359,7 @@ impl EnrollServer {
             descriptors,
             session,
             released,
+            receipts,
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
     }
@@ -1246,6 +1385,13 @@ impl EnrollServer {
         }
         let fetch = crate::keys::KeysFetch::from_bytes(&body.extra)?;
         let value = directory.fetch_key(&caller, &fetch).map_err(Refusal)?;
+        self.record(
+            Kind::KEYS_FETCH,
+            caller.to_string().as_bytes(),
+            &fetch
+                .to_bytes()
+                .map_err(|e| Refusal::because(e.to_string()))?,
+        )?;
         let answer = crate::keys::KeysAnswer { value };
         let payload = answer
             .to_bytes()
@@ -1395,6 +1541,7 @@ impl EnrollServer {
         op: VaultOp,
         now: u64,
         directory: &dyn Directory,
+        record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
     ) -> Result<Vec<Vault>, Refusal> {
         let limits = directory.vault_limits().map_err(Refusal)?;
         let mine = directory.vaults_of(owner).map_err(Refusal)?;
@@ -1434,6 +1581,7 @@ impl EnrollServer {
                     session_keys: Vec::new(),
                     bindings: Vec::new(),
                 };
+                record(&vault)?;
                 directory.vault_add(&vault).map_err(Refusal)?;
                 return Ok(vec![vault]);
             }
@@ -1482,6 +1630,7 @@ impl EnrollServer {
                 vault
             }
         };
+        record(&vault)?;
         directory.vault_update(&vault).map_err(Refusal)?;
         Ok(vec![vault])
     }
@@ -1629,7 +1778,9 @@ impl EnrollServer {
     }
 
     /// The vault half of [`recover`](Self::recover): check the vault and
-    /// its owner, then the policy's factors, and answer to the device.
+    /// its owner, then the policy's factors, record the release, and
+    /// answer to the device.  The recovery answer has no place for a
+    /// receipt: the owner finds the release in the log.
     fn recover_vault(
         &self,
         request: &EscrowRequest,
@@ -1729,12 +1880,37 @@ impl EnrollServer {
         {
             return Err(Refusal::because("the vault's unlock limit is reached"));
         }
+        self.record_release(request, device, &opened)?;
         let response = opened.respond().map_err(Error::from)?;
         Ok(match device {
             Some(d) => Recovered::Device(VaultAnswer::seal(&d.public()?, request, &response)?),
             None => Recovered::Plain(response),
         })
     }
+}
+
+/// What a vault operation records in the ledger, with the device it names
+/// when the operation itself names one; reads change nothing and record
+/// nothing.
+fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
+    Some(match op {
+        VaultOp::Create { .. } => (VaultAction::Create, None),
+        VaultOp::SetPolicy { .. } => (VaultAction::SetPolicy, None),
+        VaultOp::Revoke { .. } => (VaultAction::Revoke, None),
+        VaultOp::AddDevice { .. } => (VaultAction::AddDevice, None),
+        VaultOp::RemoveDevice { id, .. } => (VaultAction::RemoveDevice, Some(id.clone())),
+        VaultOp::Unlock {
+            device, offline, ..
+        } => (
+            if *offline {
+                VaultAction::OfflineSession
+            } else {
+                VaultAction::Session
+            },
+            Some(device.clone()),
+        ),
+        VaultOp::Show { .. } | VaultOp::List | VaultOp::Register { .. } => return None,
+    })
 }
 
 /// With registered sealing: retire `retire` and register `add` on `vault`.
