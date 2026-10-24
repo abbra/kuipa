@@ -14,8 +14,8 @@ hold such events, and the order in which it replaces the claim log.
 | 3 | signed heads, consistency proofs | RFC 9162 consistency instead of refetching | implemented |
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented (the cosign step) |
 | 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
-| 6 | producers and lookups | vault, Keys, signing and token events; the `log` operation | producers for vault, escrow and Keys events implemented, with receipts; lookups planned |
-| 7 | clients | `kuipa log watch`, `kuipa-audit log`, `kuipa-mirror --witness` | planned |
+| 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | producers for vault, escrow and Keys events implemented, with receipts; lookups planned |
+| 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | planned |
 | 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
 
 ## 1. Typed leaves
@@ -158,10 +158,10 @@ The routes are public, like the claim log:
 
 | method | path | response |
 |---|---|---|
-| GET | `/ipa/ku/log/{id}/head` | the current `IPLS` (404 while the log is empty) |
-| GET | `/ipa/ku/log/{id}/leaves?from=i` | JSON `{from, leaves}`: up to 4096 base64url `IPLF` |
-| GET | `/ipa/ku/log/{id}/proof?index=i&size=n` | JSON `{path}`: leaf `i` in the tree of `n` leaves |
-| GET | `/ipa/ku/log/{id}/consistency?from=m&size=n` | JSON `{proof}`: the tree of `m` leaves is a prefix of the tree of `n` |
+| GET | `/ipa/ku/tlog/{id}/head` | the current `IPLS` (404 while the log is empty) |
+| GET | `/ipa/ku/tlog/{id}/leaves?from=i` | JSON `{from, leaves}`: up to 4096 base64url `IPLF` |
+| GET | `/ipa/ku/tlog/{id}/proof?index=i&size=n` | JSON `{path}`: leaf `i` in the tree of `n` leaves |
+| GET | `/ipa/ku/tlog/{id}/consistency?from=m&size=n` | JSON `{proof}`: the tree of `m` leaves is a prefix of the tree of `n` |
 
 Proofs are served at any size up to the current one, the size of a head
 the client holds, so a client never needs the newest head to check an
@@ -173,12 +173,12 @@ format is settled.
 
 ## 7, 8. Next
 
-* **Lookups.** The Kerberos-authenticated `log` operation (`IPLQ`/`IPLR`)
+* **Lookups.** The Kerberos-authenticated `tlog` operation (`IPLQ`/`IPLR`)
   returns a caller's own entries with inclusion proofs. Per-user
   completeness is not proven. Omissions are left to public auditing and
   witnesses; a prefix-tree map would need a post-quantum VRF.
-* **Clients.** `kuipa log watch` flags device and escrow events the user
-  did not cause. `kuipa-audit log` checks consistency and tombstones.
+* **Clients.** `kuipa tlog watch` flags device and escrow events the user
+  did not cause. `kuipa-audit tlog` checks consistency and tombstones.
   `kuipa-mirror --witness` cosigns.
 * **Migration.** Claims are appended as kind-1 leaves, and a dropped
   claim becomes a tombstone instead of a restart. IPVH/IPSV are kept for
