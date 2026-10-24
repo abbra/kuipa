@@ -1,10 +1,18 @@
-# Auditing and mirroring the claim logs
+# Auditing and mirroring
 
-The vouch-head exchange leaves a public record behind: each anchor's
-claims, in a Merkle tree whose head the anchor signs. Two tools read
-that record — one for the person who wants to know what the realm
-vouched for, one for the site that wants proof service without anchor
-keys.
+The realm keeps two public, append-only records:
+
+* **Claim logs.** Each anchor's claims about the realm's servers, in a
+  Merkle tree whose head the anchor signs. They say which servers the
+  realm vouched for.
+* **Transparency logs.** Each server's record of what it did with users'
+  and hosts' secrets: vault changes, releases of vault keys, replica
+  secret fetches and signing statements. Leaves name no one; an index stands
+  for the vault or principal. See
+  [below](#the-transparency-log-and-its-witnesses).
+
+`kuipa-audit` checks both. `kuipa-mirror` serves the claim logs to a
+site that wants proof service without anchor keys.
 
 ## kuipa-audit
 
@@ -75,3 +83,57 @@ stop verifying for new verifications — the clients' own clocks decide,
 and the mirror, serving signed bytes as received, cannot lie about it.
 A mirror extends a site's proof capacity, not its availability of
 trust.
+
+## The transparency log and its witnesses
+
+Every server appends an entry to its transparency log before it changes
+a vault, releases a vault's key share, hands out a replica secret or
+signs a statement. If the entry cannot be written, the request is
+refused. Opening a sealed host or service keytab is not logged yet. Users
+check the entries about their own vaults with `kuipa tlog watch`
+([Sealing your own files](../user/sealing.md#see-who-touched-your-vault)).
+Anyone can read the whole log at `/ipa/ku/tlog/<log id>/`, with no
+login.
+
+A log is only useful if everyone sees the same one. A server could show
+one history to its auditors and another to a user. **Witnesses** stop
+that from going unnoticed. A witness is a small program, run by someone
+other than the realm's administrators (a partner site, an audit team),
+that fetches each server's signed head and cosigns it only if it extends
+the last head it cosigned:
+
+```sh
+# The witness, once: a key. It prints the public key to hand out.
+kuipa-witness keygen --key /var/lib/witness/witness.jwk > witness.pub.jwk
+
+# Each IPA server accepts its cosignatures, and serves heads with them.
+kuipad add-witness-key --file witness.pub.jwk
+systemctl restart kuipad
+
+# The witness, from then on: one pass a minute.
+kuipa-witness run --key /var/lib/witness/witness.jwk \
+    --state /var/lib/witness/state.json \
+    --server ipa1.example.test --server ipa2.example.test
+```
+
+Hosts decide how many cosignatures they require. A head with fewer is
+reported as `UNWITNESSED` by `kuipa tlog watch` and not accepted:
+
+```sh
+kuipa tlog witnesses --add witness.pub.jwk --required 1   # as root
+```
+
+An auditor replays a whole log and checks it against the server's
+signed head. With `--state`, each run also checks that the log still
+extends the head the last run saw:
+
+```sh
+kuipa-audit tlog --server ipa1.example.test \
+    --state /var/lib/audit/ipa1.json \
+    --witness witness.pub.jwk --required 1
+```
+
+A witness key is ML-DSA-44 by default, as public witness networks use,
+and ML-DSA-87 under a CNSA 2.0 crypto policy. A server whose crypto
+policy changes the strength of its keys starts a new log under a new id;
+`kuipa tlog watch` reports it as `NEW LOG`, not as a fork.

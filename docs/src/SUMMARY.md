@@ -2,6 +2,7 @@
 
 [Introduction](introduction.md)
 
+- [What kuipa is for](use-cases.md)
 - [Concepts](concepts.md)
 - [What kuipa protects](security.md)
 - [Quick start](quickstart.md)

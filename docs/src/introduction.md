@@ -16,10 +16,18 @@ cryptography wherever they travel or rest:
 * **Your own files.** Users seal files to a vault of their own, under a
   policy they choose: a copy opens only with their device, their login,
   and a server that agrees.
+* **Signing under your login.** Users and CI sign files and git commits
+  by their Kerberos ticket, with no signing key to guard.
+* **A record anyone can check.** Every server logs what it does with
+  users' and hosts' secrets in a public, append-only log, which users
+  watch for their own entries and independent witnesses cosign.
 * **Offline enrollment, vouchers, trusted realms and Tang.** Hosts can be
   staged in advance and enroll without network access, join from an
   autoscaler with single-use vouchers, accept users of trusted realms, and
   unlock encrypted disks against the realm's servers.
+
+[What kuipa is for](use-cases.md) lists every use case, for whom, and
+how far along each one is.
 
 kuipa changes how secrets travel and are stored, not how they are made:
 Kerberos, the KDC and FreeIPA's key creation stay as they are. All

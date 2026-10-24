@@ -28,6 +28,8 @@ usage.
 | `status` | the host's state, from its files |
 | `check [--server S]` | every server, the delegations, a `kinit`, the sealed keytabs and files; exit 1 on a problem |
 | `leave` | remove kuipa's state, writing protected keytabs and files back in plain form |
+| `keys fetch NAMESPACE/NICKNAME [--out F] [--alg A]` | on a new IPA replica: fetch a named secret (`dm`, `ra`, `ca`, `ca_wrapped`, `lwca`) by the host's keytab |
+| `tlog witnesses [--add JWK] [--remove THP] [--required N]` | the transparency-log witnesses this host trusts, and how many must cosign a head (changes need root) |
 
 ## kuipa seal (users)
 
@@ -44,6 +46,25 @@ usage.
 | `retire VAULT SEALED…` | with registered sealing: make every copy of these unopenable |
 | `unlock VAULT [--offline]` / `lock VAULT` | start or end a session on this host |
 | `show VAULT` / `list` / `revoke VAULT` | describe or revoke vaults |
+
+## kuipa tlog and kuipa sign (users)
+
+| command | does |
+|---|---|
+| `tlog watch VAULT` | what every server logged about your vault since the last watch; flags what your stored description does not account for |
+| `sign blob [--purpose P] FILE…` | have a realm server state, under your ticket, that you signed the files; writes `FILE.kusig` |
+| `sign verify FILE [--signature S] [--signer U] [--purpose P]` | check a signature offline with this host's pinned anchors |
+
+## kuipa-gitsign
+
+Signs and verifies git commits and tags as git's `gpg.x509.program`,
+under your ticket (purpose `git-commit`, or `$KUIPA_GITSIGN_PURPOSE`):
+
+```sh
+git config gpg.format x509
+git config gpg.x509.program kuipa-gitsign
+git config user.signingkey kuipa     # any value: the ticket decides
+```
 
 ## kuipa-unseal
 
@@ -67,14 +88,22 @@ usage.
 
 ## kuipa-audit
 
-Read-only reports on a realm's claim logs (no keys, no writes; exit
-status 2 for a split view):
+Read-only reports on a realm's claim logs and transparency logs (no
+keys, no writes; exit status 2 for a split view):
 
 | invocation | does |
 |---|---|
 | `claim-log --server S --anchor THP [--from N]` | one anchor's claim-log page, decoded: leaves, the head, the signed vouch |
 | `coverage --server S [--anchor THP…] [--pinned-head "THP SIZE ROOT"…]` | what the pinned heads cover, and whether the server's log extends them |
 | `split-view --server S1 --server S2…` | the heads each server answers, and where they disagree |
+| `tlog --server S [--state F] [--witness JWK… --required N]` | a server's whole transparency log, replayed and checked against its head; with `--state`, that it extends the last run's; with witnesses, that enough cosigned it |
+
+## kuipa-witness
+
+| invocation | does |
+|---|---|
+| `keygen --key F [--alg ml-dsa-44]` | make a witness key; print its public JWK for `kuipad add-witness-key` and `kuipa tlog witnesses --add` |
+| `run --key F --state F --server S… [--once] [--interval N]` | cosign each server's transparency-log head once it extends the last one this witness cosigned |
 
 ## kuipa-mirror
 
@@ -94,6 +123,7 @@ status 2 for a split view):
 | `rotate-anchor [--days N]` | replace the anchor, with a succession valid N days (default 400) |
 | `prune-keys [--join-days N] [--escrow-days N]` | delete keys retired longer ago (default 14 and 400 days) |
 | `add-voucher-key --file JWK` | accept vouchers under a voucher key |
+| `add-witness-key --file JWK` | accept transparency-log cosignatures by a witness |
 | `trust-invitation [--days N]` | invite another realm to trust this one |
 | `establish-trust --invitation-file F --server S…` | trust the realm that issued an invitation |
 | `tang-keygen` / `tang-rotate` / `tang-thp` | the post-quantum Tang service's keys |
