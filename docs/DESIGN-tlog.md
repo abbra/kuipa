@@ -126,9 +126,21 @@ every 60 s, and heads are re-signed at least hourly. A rewritten log is
 reported `forked` and is never cosigned again, until someone removes its
 state entry by hand.
 
-`kuipa-audit tlog --witness JWK…` counts the trusted cosignatures on the
-served head. Clients do not yet require any; that waits for a host-side
-list of trusted witnesses.
+`kuipa-audit tlog --witness JWK… [--required K]` counts the trusted
+cosignatures on the served head; fewer than K is not a clean report.
+
+**Required cosignatures.** A host's trusted witnesses, and how many of
+them must cosign a head, are in `/etc/ipa/ku-witnesses.json`. The file
+is world-readable like the anchors, and root manages it with
+`kuipa tlog witnesses --add JWK | --remove THP | --required K`.
+`kuipa tlog watch` then needs K trusted cosignatures on each server's
+head. A head with fewer is reported **unwitnessed**: its entries are
+listed, but the watch does not record it, so the next watch sees them
+again under a cosigned head. Such a head may be a view shown to this
+reader alone, which only witnesses can rule out. Right after a log
+grows, its new head has no cosignatures until the witnesses' next
+pass, so a watch run in that gap is unwitnessed. Run it again after the
+pass.
 
 **Algorithms follow the deployment.** The verifier's `tang_pqc::Policy`
 comes from the system crypto policy (`Policy::from_system`).
@@ -278,8 +290,6 @@ counts the leaves by kind, and names nobody. Leaves carry only indexes.
 
 ## 8. Next
 
-* **Required cosignatures.** A host-side list of trusted witnesses, and
-  `kuipa tlog watch` requiring K of them on each head.
 * **Migration.** Claims are appended as kind-1 leaves, and a dropped
   claim becomes a tombstone instead of a restart. IPVH/IPSV are kept for
   pinned hosts until their windows age out.

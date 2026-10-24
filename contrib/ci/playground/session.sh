@@ -254,6 +254,15 @@ step 0 "The audit counts the witness's cosignature on ipa1's head" \
 step 0 "Nothing new: the witness has nothing to cosign" \
     'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test' \
     "unchanged"
+step 0 "This host trusts the witness, and requires its cosignature" \
+    'kuipa tlog witnesses --add "$KUIPA_PLAYGROUND/witness/witness.pub.jwk" --required 1' \
+    "A head needs 1 of 1"
+step 1 "A head the witness has not cosigned yet is not accepted" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && kuipa tlog watch personal' \
+    "UNWITNESSED" "0 of 1"
+step 0 "After the witness's next pass it is, and the watch moves on" \
+    'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test >/dev/null && kuipa tlog watch personal' \
+    "release" "0 unexpected"
 
 step 0 "A vault that allows hour-long sessions and 10 unlocks" \
     'kuipa seal create daily --require device,ticket --session-hours 1 --max-unlocks 10 && kuipa seal device add daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' \

@@ -495,9 +495,12 @@ impl<'a> Seal<'a> {
     /// account for it — a device it does not list added or acting, a
     /// device it lists removed, a policy or revocation it does not show.
     /// The first watch of a server only sets the baseline: its history is
-    /// listed, not flagged.  `ok` is false for any flag, a server whose
-    /// log does not extend what was seen, or a server that could not be
-    /// checked: a watch that did not look is not a clean one.
+    /// listed, not flagged.  With the host's trusted witnesses
+    /// (`kuipa tlog witnesses`), a head needs `required` of their
+    /// cosignatures: one with fewer is reported unwitnessed and not
+    /// recorded.  `ok` is false for any flag, a server whose log does not
+    /// extend what was seen, an unwitnessed head, or a server that could
+    /// not be checked: a watch that did not look is not a clean one.
     ///
     /// # Errors
     ///
@@ -521,11 +524,15 @@ impl<'a> Seal<'a> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e.into()),
         };
-        let (mut events, mut forked, mut unreachable, mut baseline) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let trusted = crate::witness::Trusted::load(self.host)?;
+        let witnesses = trusted.keys()?;
+        let policy = tang_pqc::Policy::from_system()?;
+        let (mut events, mut forked, mut unreachable, mut baseline, mut unwitnessed) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for server in &public.servers {
             let before = state.get(server).cloned();
-            let (entries, head) = match self.watch_server(&public, server, name, before.as_ref()) {
+            let (entries, signed) = match self.watch_server(&public, server, name, before.as_ref())
+            {
                 Ok(Some(found)) => found,
                 Ok(None) => continue,
                 Err(WatchError::Fork(why)) => {
@@ -543,6 +550,20 @@ impl<'a> Seal<'a> {
             for e in &entries {
                 events.push(describe_event(server, e, &expected, before.is_some()));
             }
+            // A head too few trusted witnesses cosigned may be a view
+            // shown to this reader alone: its entries are listed, but the
+            // watch does not advance past it, so the next one sees them
+            // again under a cosigned head.
+            let cosigners = signed.witnesses(&witnesses, &policy).len();
+            if cosigners < trusted.required {
+                unwitnessed.push(json!({
+                    "server": server,
+                    "cosigners": cosigners,
+                    "required": trusted.required,
+                }));
+                continue;
+            }
+            let head = signed.head;
             state.insert(
                 server.clone(),
                 Watched {
@@ -559,12 +580,14 @@ impl<'a> Seal<'a> {
             .filter(|e| e["unexpected"] == Value::Bool(true))
             .count();
         Ok(json!({
-            "ok": flagged == 0 && forked.is_empty() && unreachable.is_empty(),
+            "ok": flagged == 0 && forked.is_empty() && unreachable.is_empty()
+                && unwitnessed.is_empty(),
             "vault": name,
             "events": events,
             "unexpected": flagged,
             "forked": forked,
             "unreachable": unreachable,
+            "unwitnessed": unwitnessed,
             "baseline": baseline,
         }))
     }
@@ -577,8 +600,13 @@ impl<'a> Seal<'a> {
         server: &str,
         name: &str,
         before: Option<&Watched>,
-    ) -> Result<Option<(Vec<kuipa_enroll::tlog::Entry>, kuipa_enroll::tlog::Head)>, WatchError>
-    {
+    ) -> Result<
+        Option<(
+            Vec<kuipa_enroll::tlog::Entry>,
+            kuipa_enroll::tlog::SignedHead,
+        )>,
+        WatchError,
+    > {
         use kuipa_enroll::tlog::{LogId, MAX_ANSWER, Query};
 
         let (anchors, heads, frozen) = paths::pinned_windows(&self.host.anchors())?;
@@ -624,17 +652,18 @@ impl<'a> Seal<'a> {
                 from = e.index + 1;
             }
             entries.extend(answer.entries);
-            last = answer.head.map(|h| h.head).or(last);
+            last = answer.head.or(last);
             if !full {
                 break;
             }
         }
-        let Some(head) = last else {
+        let Some(signed) = last else {
             return match before {
                 Some(_) => Err(WatchError::Fork("the log is empty now".into())),
                 None => Ok(None),
             };
         };
+        let head = signed.head;
         if head.log != LogId::of(&public.realm, server)? {
             return Err(WatchError::Fork(
                 "the answer is from another server's log".into(),
@@ -662,7 +691,7 @@ impl<'a> Seal<'a> {
                 )));
             }
         }
-        Ok(Some((entries, head)))
+        Ok(Some((entries, signed)))
     }
 
     /// The stored descriptor of vault `name`, verified.
