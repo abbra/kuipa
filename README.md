@@ -164,6 +164,16 @@ section of the session.
 [A traced session](docs/src/scenarios/walkthrough.md) explains one step
 by step.
 
+A symbolic model of the enrollment protocol's core exchange (anchor
+pins, advertisement verification, the ML-KEM join and rekey key
+schedule, OTP and Kerberos authenticators, sealed-keytab escrow) is in
+[`contrib/tamarin/kuipa.spthy`](contrib/tamarin/kuipa.spthy), for the
+Tamarin prover. `tamarin-prover --prove contrib/tamarin/kuipa.spthy`
+verifies secrecy, server authentication, rekey forward secrecy and
+sealed-keytab offline resistance, and reproduces the two attacks
+DESIGN §13 predicts for a mis-delivered enrollment string and a stolen
+anchor. The model's header documents its abstractions.
+
 ## Documentation
 
 The user documentation is an mdBook in [`docs/`](docs/src/SUMMARY.md):
