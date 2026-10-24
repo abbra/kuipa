@@ -13,8 +13,10 @@
 //! * [`proof`]: [`prove`] and [`verify`].
 //! * [`keccak`]: Keccak-f\[1600\] as a circuit.
 //!
-//! Everything cryptographic comes from OpenSSL: AES-128-CTR expands the
-//! GGM trees, SHAKE256 commits and drives Fiat–Shamir.
+//! Everything cryptographic comes from OpenSSL, and from CNSA 2.0's
+//! general-purpose algorithms only: AES-256-CTR expands the GGM trees,
+//! SHA-512 commits and drives Fiat–Shamir.  Keccak appears only as what
+//! a statement evaluates (ML-DSA's own SHAKE), never as the proof's hash.
 
 pub mod circuit;
 pub mod gf128;

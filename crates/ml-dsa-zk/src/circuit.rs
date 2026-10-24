@@ -3,7 +3,7 @@
 //! in the proof; each AND costs one committed bit and one QuickSilver
 //! constraint.
 
-use crate::primitives::shake;
+use crate::primitives::hash;
 use crate::{Error, Result};
 
 /// A wire: an input, or a gate's output, numbered in creation order.
@@ -154,13 +154,13 @@ impl Circuit {
         Ok((wires, outputs))
     }
 
-    /// The circuit's identity, for the transcript: SHAKE256 of its
+    /// The circuit's identity, for the transcript: SHA-512 of its
     /// description.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn digest(&self) -> Result<[u8; 32]> {
+    pub fn digest(&self) -> Result<crate::primitives::Hash> {
         let mut bytes = Vec::with_capacity(9 * self.gates.len() + 8 * self.outputs.len() + 4);
         bytes.extend_from_slice(&self.inputs.to_le_bytes());
         for g in &self.gates {
@@ -176,8 +176,6 @@ impl Circuit {
         for w in &self.outputs {
             bytes.extend_from_slice(&w.to_le_bytes());
         }
-        let mut out = [0u8; 32];
-        shake("ml-dsa-zk/v1 circuit", &[&bytes], &mut out)?;
-        Ok(out)
+        hash("ml-dsa-zk/v1 circuit", &[&bytes])
     }
 }

@@ -1,29 +1,36 @@
-//! What the proofs take from OpenSSL: AES-128-CTR as the PRG that
-//! expands tree nodes and leaves, and SHAKE256 for commitments and the
-//! Fiat–Shamir transcript.
+//! What the proofs take from OpenSSL, CNSA 2.0's general-purpose
+//! algorithms only: AES-256-CTR as the PRG that expands tree nodes and
+//! leaves, and SHA-512 for commitments, digests and the Fiat–Shamir
+//! transcript.  SHA-3 and SHAKE are not used: CNSA 2.0 allows them only
+//! inside an algorithm that prescribes them, as ML-DSA does — which is
+//! why the [`keccak`](crate::keccak) gadget *evaluates* Keccak in the
+//! statement, while the proof itself never hashes with it.
 
 use native_ossl::cipher::CipherAlg;
 use native_ossl::digest::{DigestAlg, DigestCtx};
 
 use crate::Result;
 
-/// A 128-bit seed.
-pub type Seed = [u8; 16];
+/// A 256-bit seed: an AES-256 key.
+pub type Seed = [u8; 32];
 
-/// AES-128-CTR under `key`, IV zero: the PRG.
+/// A SHA-512 output.
+pub type Hash = [u8; 64];
+
+/// AES-256-CTR under `key`, IV zero: the PRG.
 pub struct Prg {
     alg: CipherAlg,
 }
 
 impl Prg {
-    /// Fetch AES-128-CTR.
+    /// Fetch AES-256-CTR.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
     pub fn new() -> Result<Self> {
         Ok(Self {
-            alg: CipherAlg::fetch(c"AES-128-CTR", None)?,
+            alg: CipherAlg::fetch(c"AES-256-CTR", None)?,
         })
     }
 
@@ -45,29 +52,18 @@ impl Prg {
     ///
     /// An OpenSSL error.
     pub fn children(&self, node: &Seed) -> Result<(Seed, Seed)> {
-        let mut out = [0u8; 32];
+        let mut out = [0u8; 64];
         self.expand(node, &mut out)?;
-        let mut left = [0u8; 16];
-        let mut right = [0u8; 16];
-        left.copy_from_slice(&out[..16]);
-        right.copy_from_slice(&out[16..]);
+        let mut left = [0u8; 32];
+        let mut right = [0u8; 32];
+        left.copy_from_slice(&out[..32]);
+        right.copy_from_slice(&out[32..]);
         Ok((left, right))
     }
 }
 
-/// SHAKE256 over domain-separated, length-prefixed parts.
-///
-/// # Errors
-///
-/// An OpenSSL error.
-pub fn shake(domain: &str, parts: &[&[u8]], out: &mut [u8]) -> Result<()> {
-    let mut ctx = DigestAlg::fetch(c"SHAKE256", None)?.new_context()?;
-    absorb(&mut ctx, domain.as_bytes())?;
-    for p in parts {
-        absorb(&mut ctx, p)?;
-    }
-    ctx.finish_xof(out)?;
-    Ok(())
+fn sha512() -> Result<DigestCtx> {
+    Ok(DigestAlg::fetch(c"SHA2-512", None)?.new_context()?)
 }
 
 fn absorb(ctx: &mut DigestCtx, data: &[u8]) -> Result<()> {
@@ -76,8 +72,30 @@ fn absorb(ctx: &mut DigestCtx, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// A Fiat–Shamir transcript: every prover message is absorbed, length
-/// prefixed under a label, and challenges are squeezed from a copy.
+fn finish(ctx: &mut DigestCtx) -> Result<Hash> {
+    let mut out = [0u8; 64];
+    ctx.finish(&mut out)?;
+    Ok(out)
+}
+
+/// SHA-512 over domain-separated, length-prefixed parts.
+///
+/// # Errors
+///
+/// An OpenSSL error.
+pub fn hash(domain: &str, parts: &[&[u8]]) -> Result<Hash> {
+    let mut ctx = sha512()?;
+    absorb(&mut ctx, domain.as_bytes())?;
+    for p in parts {
+        absorb(&mut ctx, p)?;
+    }
+    finish(&mut ctx)
+}
+
+/// A Fiat–Shamir transcript over SHA-512: every prover message is
+/// absorbed, length prefixed under a label.  A challenge is the counter
+/// mode `SHA-512(state ‖ label ‖ i)`, `i = 0, 1, …`, over a copy of the
+/// state, and is absorbed in turn, so later challenges depend on it.
 pub struct Transcript {
     ctx: DigestCtx,
 }
@@ -89,7 +107,7 @@ impl Transcript {
     ///
     /// An OpenSSL error.
     pub fn new(domain: &str) -> Result<Self> {
-        let mut ctx = DigestAlg::fetch(c"SHAKE256", None)?.new_context()?;
+        let mut ctx = sha512()?;
         absorb(&mut ctx, domain.as_bytes())?;
         Ok(Self { ctx })
     }
@@ -104,16 +122,19 @@ impl Transcript {
         absorb(&mut self.ctx, data)
     }
 
-    /// A challenge of `out.len()` bytes under `label`; it is absorbed
-    /// too, so later challenges depend on it.
+    /// A challenge of `out.len()` bytes under `label`.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
     pub fn challenge(&mut self, label: &str, out: &mut [u8]) -> Result<()> {
-        let mut copy = self.ctx.fork()?;
-        absorb(&mut copy, label.as_bytes())?;
-        copy.finish_xof(out)?;
+        for (i, chunk) in out.chunks_mut(64).enumerate() {
+            let mut copy = self.ctx.fork()?;
+            absorb(&mut copy, label.as_bytes())?;
+            absorb(&mut copy, &(i as u64).to_le_bytes())?;
+            let block = finish(&mut copy)?;
+            chunk.copy_from_slice(&block[..chunk.len()]);
+        }
         self.absorb(label, out)
     }
 }
