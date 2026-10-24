@@ -36,8 +36,11 @@ const TOMBSTONE_MAGIC: [u8; 4] = *b"IPLT";
 const HEAD_MAGIC: [u8; 4] = *b"IPLH";
 const SIGNED_HEAD_MAGIC: [u8; 4] = *b"IPLS";
 const COSIGNATURE_MAGIC: [u8; 4] = *b"IPLC";
+const RECEIPT_MAGIC: [u8; 4] = *b"IPLP";
+const VAULT_EVENT_MAGIC: [u8; 4] = *b"IPLV";
 const HEAD_CONTEXT: &[u8] = b"ipa-ku-log/v1 head";
 const COSIGNATURE_CONTEXT: &[u8] = b"ipa-ku-log/v1 cosignature";
+const RECEIPT_CONTEXT: &[u8] = b"ipa-ku-log/v1 receipt";
 const LOG_ID_CONTEXT: &[u8] = b"ipa-ku-log/v1 id";
 
 /// Largest leaf body accepted.
@@ -590,6 +593,204 @@ pub fn witness(
     head.cosign(key, time)
 }
 
+/// A server's signed promise that it appended a leaf: where it landed,
+/// for a client to check later against a head ([`Receipt::proven_by`]).
+/// Signed, unlike the sealed answer that carries it, so a client can show
+/// a third party a promise the log does not keep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    /// The log.
+    pub log: LogId,
+    /// The leaf's index.
+    pub index: u64,
+    /// The leaf's tree hash.
+    pub leaf: Hash,
+    /// When it was appended (Unix seconds).
+    pub time: u64,
+    /// The server's signature over the fields above.
+    pub signature: Vec<u8>,
+}
+
+impl Receipt {
+    fn statement(log: &LogId, index: u64, leaf: &Hash, time: u64) -> Vec<u8> {
+        Writer::new(RECEIPT_MAGIC)
+            .fixed(&log.0)
+            .u64(index)
+            .fixed(leaf)
+            .u64(time)
+            .finish()
+    }
+
+    /// Sign a receipt with the log's key.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error, or the system policy refusing the key.
+    pub fn issue(key: &SigningKey, log: LogId, index: u64, leaf: Hash, time: u64) -> Result<Self> {
+        let signature =
+            key.sign_with_context(&Self::statement(&log, index, &leaf, time), RECEIPT_CONTEXT)?;
+        Ok(Self {
+            log,
+            index,
+            leaf,
+            time,
+            signature,
+        })
+    }
+
+    /// Check the signature with the log's key.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UntrustedAnchor`] for a bad signature or an algorithm
+    /// `policy` refuses.
+    pub fn verify(&self, key: &VerifyingKey, policy: &Policy) -> Result<()> {
+        if !policy.allows_signature(key.alg()) {
+            return Err(Error::UntrustedAnchor);
+        }
+        let statement = Self::statement(&self.log, self.index, &self.leaf, self.time);
+        key.verify_with_context(&statement, RECEIPT_CONTEXT, &self.signature)
+            .map_err(|_| Error::UntrustedAnchor)
+    }
+
+    /// Whether `head` holds the promised leaf, by its inclusion `path`.
+    /// A head of the same log that is large enough and does not hold it
+    /// proves the server broke its promise.
+    ///
+    /// # Errors
+    ///
+    /// None in practice; the signature matches the tree functions.
+    pub fn proven_by(&self, head: &Head, path: &[Hash]) -> Result<bool> {
+        Ok(head.log == self.log
+            && self.index < head.size
+            && merkle::verify(&self.leaf, self.index, head.size, path, &head.root)?)
+    }
+
+    /// `IPLP ‖ 1 ‖ log(32) ‖ index ‖ leaf(32) ‖ time ‖ signature`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Writer::new(RECEIPT_MAGIC)
+            .fixed(&self.log.0)
+            .u64(self.index)
+            .fixed(&self.leaf)
+            .u64(self.time)
+            .bytes(&self.signature)
+            .finish()
+    }
+
+    /// Parse a receipt, **unverified**.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, RECEIPT_MAGIC, "log receipt")?;
+        let receipt = Self {
+            log: LogId(r.fixed()?),
+            index: r.u64()?,
+            leaf: r.fixed()?,
+            time: r.u64()?,
+            signature: r.bytes()?.to_vec(),
+        };
+        r.finish()?;
+        Ok(receipt)
+    }
+}
+
+/// What a vault event did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VaultAction {
+    /// The vault was created.
+    Create = 1,
+    /// Its policy was replaced.
+    SetPolicy = 2,
+    /// It was revoked.
+    Revoke = 3,
+    /// A device was registered.
+    AddDevice = 4,
+    /// A device was removed.
+    RemoveDevice = 5,
+    /// A re-authentication session was started.
+    Session = 6,
+    /// An offline session released the vault's session keys.
+    OfflineSession = 7,
+    /// A server share of a sealed file was released.
+    Release = 8,
+}
+
+impl VaultAction {
+    /// The kind of leaf that records it.
+    #[must_use]
+    pub const fn kind(self) -> Kind {
+        match self {
+            Self::Create | Self::SetPolicy | Self::Revoke => Kind::VAULT_POLICY,
+            Self::AddDevice | Self::RemoveDevice => Kind::VAULT_DEVICE,
+            Self::Session | Self::OfflineSession | Self::Release => Kind::ESCROW_RELEASE,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self> {
+        Ok(match code {
+            1 => Self::Create,
+            2 => Self::SetPolicy,
+            3 => Self::Revoke,
+            4 => Self::AddDevice,
+            5 => Self::RemoveDevice,
+            6 => Self::Session,
+            7 => Self::OfflineSession,
+            8 => Self::Release,
+            _ => return Err(Error::Malformed("vault event action")),
+        })
+    }
+}
+
+/// The body of a vault leaf.  It names no vault and no owner — the leaf's
+/// index stands for the vault — only what happened: the device involved,
+/// and a digest of the policy set or of the file's binding released.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultEvent {
+    /// What happened.
+    pub action: VaultAction,
+    /// The device's id, if one was involved.
+    pub device: Option<String>,
+    /// SHA-256 of the policy set, the binding released, or zeros.
+    pub digest: Hash,
+}
+
+impl VaultEvent {
+    /// `IPLV ‖ 1 ‖ action(1) ‖ device (empty for none) ‖ digest(32)`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Writer::new(VAULT_EVENT_MAGIC)
+            .u8(self.action as u8)
+            .str(self.device.as_deref().unwrap_or_default())
+            .fixed(&self.digest)
+            .finish()
+    }
+
+    /// Parse a vault leaf's body.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, VAULT_EVENT_MAGIC, "vault event")?;
+        let action = VaultAction::from_code(r.u8()?)?;
+        let device = match r.str()? {
+            "" => None,
+            d => Some(d.to_owned()),
+        };
+        let digest = r.fixed()?;
+        r.finish()?;
+        Ok(Self {
+            action,
+            device,
+            digest,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tang_pqc::SignatureAlg;
@@ -796,5 +997,75 @@ mod tests {
         let mut dup = next.clone();
         dup.cosignatures.push(next.cosignatures[0].clone());
         assert!(SignedHead::from_bytes(&dup.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn receipts_are_signed_promises_heads_keep_or_break() {
+        let server = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let policy = Policy::default();
+        let (mut log, leaves) = log_of(3);
+        let receipt = Receipt::issue(&server, log.id(), 2, leaves[2].hash().unwrap(), T).unwrap();
+        let parsed = Receipt::from_bytes(&receipt.to_bytes()).unwrap();
+        assert_eq!(parsed, receipt);
+        parsed.verify(server.public(), &policy).unwrap();
+        assert!(parsed.verify(server.public(), &Policy::cnsa2()).is_err());
+        let mut moved = parsed.clone();
+        moved.index = 1;
+        assert!(moved.verify(server.public(), &policy).is_err());
+
+        // A later head still holds the leaf; a head of another log, one too
+        // small, or one without the leaf does not.
+        log.append(&leaf(Kind::CLAIM, 9)).unwrap();
+        let head = log.head(T + 1).unwrap();
+        assert!(
+            receipt
+                .proven_by(&head, &log.inclusion(2).unwrap())
+                .unwrap()
+        );
+        let (small, _) = log_of(2);
+        let small_head = small.head(T).unwrap();
+        assert!(!receipt.proven_by(&small_head, &[]).unwrap());
+        let other = Head {
+            log: LogId([9; 32]),
+            ..head
+        };
+        assert!(
+            !receipt
+                .proven_by(&other, &log.inclusion(2).unwrap())
+                .unwrap()
+        );
+        let (_, others) = log_of(4);
+        let broken = Receipt {
+            leaf: others[3].hash().unwrap(),
+            ..receipt
+        };
+        assert!(!broken.proven_by(&head, &log.inclusion(2).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn vault_events_round_trip_and_map_to_kinds() {
+        for (action, kind) in [
+            (VaultAction::Create, Kind::VAULT_POLICY),
+            (VaultAction::RemoveDevice, Kind::VAULT_DEVICE),
+            (VaultAction::Release, Kind::ESCROW_RELEASE),
+        ] {
+            assert_eq!(action.kind(), kind);
+            for device in [None, Some("dev-1".to_owned())] {
+                let e = VaultEvent {
+                    action,
+                    device,
+                    digest: [3; 32],
+                };
+                assert_eq!(VaultEvent::from_bytes(&e.to_bytes()).unwrap(), e);
+            }
+        }
+        let mut bad = VaultEvent {
+            action: VaultAction::Revoke,
+            device: None,
+            digest: [0; 32],
+        }
+        .to_bytes();
+        bad[5] = 99;
+        assert!(VaultEvent::from_bytes(&bad).is_err());
     }
 }

@@ -14,7 +14,7 @@ hold such events, and the order in which it replaces the claim log.
 | 3 | signed heads, consistency proofs | RFC 9162 consistency instead of refetching | implemented |
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented (the cosign step) |
 | 5 | storage and serving | tiles under `/var/lib/ipa/ku/log/`, public routes | planned |
-| 6 | producers and lookups | vault, Keys, signing and token events; the `log` operation | planned |
+| 6 | producers and lookups | vault, Keys, signing and token events; the `log` operation | producers for vault, escrow and Keys events implemented, with receipts; lookups planned |
 | 7 | clients | `kuipa log watch`, `kuipa-audit log`, `kuipa-mirror --witness` | planned |
 | 8 | claim-log migration | claims become kind-1 leaves; IPVH retires | planned |
 
@@ -101,7 +101,39 @@ comes from the system crypto policy (`Policy::from_system`).
 - Under CNSA 2.0, only ML-DSA-87 counts, both for the log key and for
   witnesses.
 
-## 5–8. Next
+## 6. Producers and receipts
+
+`EnrollServer` takes a `Ledger` (`with_ledger`). The default,
+`NoLedger`, records nothing; `kuipad` will implement one over its store
+(§5). Each event is appended after the operation's checks pass and
+before anything is stored or answered. A failed append refuses the
+request:
+- a vault change is not stored;
+- an escrow share or offline session key is not released.
+
+| event | kind | subject | body |
+|---|---|---|---|
+| vault created, policy set, revoked | 3 | vault id | `IPLV`: action, SHA-256 of the policy (zeros for revoke) |
+| device added or removed | 2 | vault id | `IPLV`: action, the device's id |
+| session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |
+| server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` |
+| Keys fetch | 6 | the caller's principal | the `IPKG` fetch |
+
+Reads (`show`, `list`) and binding registration record nothing. Vault
+bodies never name the vault or its owner: the leaf's index stands for
+the vault. Opening machine (keytab) bindings is not recorded yet.
+
+A **receipt** (`IPLP`) is the server's signature, under
+`ipa-ku-log/v1 receipt`, over `log ‖ index ‖ leaf hash ‖ time`. Vault
+answers carry one per change, which is why `IPVR` moves to version 2.
+The signature is separate from the sealed answer around it, so a client
+can show a third party a promise the log did not keep. `proven_by`
+checks a receipt against a head and its inclusion path. A head of the
+same log that is large enough but does not hold the leaf is evidence
+against the server. Escrow releases and Keys fetches have no receipt in
+their answers; owners find them through lookups.
+
+## 5, 7, 8. Next
 
 * **Storage and serving.** The log lives in a `kuipad` tile store under
   `/var/lib/ipa/ku/log/<log id>/`, laid out as tlog-tiles. Routes:
@@ -109,9 +141,6 @@ comes from the system crypto policy (`Policy::from_system`).
   a witness endpoint for `kuipad` acting as one. A C2SP signed-note
   checkpoint encoding is added for interoperable witnesses once the
   ML-DSA note format is settled.
-* **Producers.** `EnrollServer` gains a `Ledger` that the vault and Keys
-  handlers append to, and later the signing and token handlers. Answers
-  carry a receipt: the log, the index and the leaf hash.
 * **Lookups.** The Kerberos-authenticated `log` operation (`IPLQ`/`IPLR`)
   returns a caller's own entries with inclusion proofs. Per-user
   completeness is not proven. Omissions are left to public auditing and
