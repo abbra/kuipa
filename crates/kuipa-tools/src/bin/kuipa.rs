@@ -291,6 +291,18 @@ enum TlogAction {
         /// The vault.
         vault: String,
     },
+    /// Show the witnesses this host trusts; as root, change them.
+    Witnesses {
+        /// Trust the witness whose public JWK is in FILE.
+        #[arg(long, value_name = "FILE")]
+        add: Option<std::path::PathBuf>,
+        /// Stop trusting the witness with this thumbprint.
+        #[arg(long, value_name = "THUMBPRINT")]
+        remove: Option<String>,
+        /// How many trusted witnesses must cosign a head.
+        #[arg(long, value_name = "N")]
+        required: Option<usize>,
+    },
 }
 
 /// `kuipa keys` subcommands.
@@ -1223,6 +1235,22 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
 }
 fn render_tlog(value: &Value) {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    if value.get("vault").is_none() {
+        // `kuipa tlog witnesses`
+        let list = get(value, "witnesses")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for w in &list {
+            println!("witness {}", text(w));
+        }
+        println!(
+            "A head needs {} of {} trusted witnesses' cosignatures.",
+            get(value, "required"),
+            list.len()
+        );
+        return;
+    }
     for e in get(value, "events").as_array().into_iter().flatten() {
         let mark = if e["unexpected"] == Value::Bool(true) {
             "UNEXPECTED"
@@ -1250,6 +1278,14 @@ fn render_tlog(value: &Value) {
     }
     for f in get(value, "forked").as_array().into_iter().flatten() {
         println!("    FORKED  {}: {}", text(&f["server"]), text(&f["error"]));
+    }
+    for u in get(value, "unwitnessed").as_array().into_iter().flatten() {
+        println!(
+            "UNWITNESSED  {}: {} of {} cosignatures; run again after the witnesses' next pass",
+            text(&u["server"]),
+            u["cosigners"],
+            u["required"]
+        );
     }
     for u in get(value, "unreachable").as_array().into_iter().flatten() {
         println!("   skipped  {}: {}", text(&u["server"]), text(&u["error"]));
@@ -1804,9 +1840,17 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
 /// file with `--out`.  Standard output only when it is not a terminal,
 /// as `kuipa-unseal` does (§10.5).
 fn run_tlog(paths: &Paths, action: &TlogAction) -> Result<Value, Error> {
-    let TlogAction::Watch { vault } = action;
-    let user = kuipa_tools::seal::UserPaths::from_env()?;
-    kuipa_tools::seal::Seal::new(paths, &user, None).watch(vault)
+    match action {
+        TlogAction::Watch { vault } => {
+            let user = kuipa_tools::seal::UserPaths::from_env()?;
+            kuipa_tools::seal::Seal::new(paths, &user, None).watch(vault)
+        }
+        TlogAction::Witnesses {
+            add,
+            remove,
+            required,
+        } => kuipa_tools::witness::manage(paths, add.as_deref(), remove.as_deref(), *required),
+    }
 }
 
 fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {

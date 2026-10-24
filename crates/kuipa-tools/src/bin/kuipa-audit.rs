@@ -96,6 +96,10 @@ enum Command {
         /// repeatable.
         #[arg(long, value_name = "JWK")]
         witness: Vec<std::path::PathBuf>,
+        /// How many of the `--witness` keys must have cosigned the head
+        /// for a clean report (default 0).
+        #[arg(long, default_value = "0")]
+        required: usize,
     },
 }
 
@@ -142,7 +146,8 @@ fn main() -> ExitCode {
             anchor,
             state,
             witness,
-        } => match tlog(server, anchor, witness, state.as_deref()) {
+            required,
+        } => match tlog(server, anchor, witness, *required, state.as_deref()) {
             Ok(report) => report,
             Err(status) => return status,
         },
@@ -181,6 +186,7 @@ fn tlog(
     server: &str,
     anchor: &[String],
     witness: &[std::path::PathBuf],
+    required: usize,
     state: Option<&std::path::Path>,
 ) -> Result<(serde_json::Value, bool), ExitCode> {
     let witnesses: Result<Vec<tang_pqc::VerifyingKey>, String> = witness
@@ -208,10 +214,12 @@ fn tlog(
         eprintln!("kuipa-audit tlog: {e}");
         ExitCode::FAILURE
     })?;
+    let cosigners = v["witnesses"].as_array().map_or(0, Vec::len);
     let clean = !v["state"]
         .as_str()
         .unwrap_or_default()
-        .starts_with("forked");
+        .starts_with("forked")
+        && cosigners >= required;
     Ok((v, clean))
 }
 
