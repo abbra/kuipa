@@ -1038,12 +1038,11 @@ fn pins_to_merge(path: &std::path::Path) -> Result<Vec<paths::Pin>, Error> {
     }
 }
 
-/// Most claim-log pages one window extension reads (§4.9): past this many
-/// the gap between the pinned head and the new one is too wide to check
-/// from the leaves, and the head is not pinned
-/// (DESIGN-claim-logs.md §1.3).  [`MAX_HEAD_FETCH_PAGES`] pages of the
-/// server's page size (`kuipa_enroll::server::MAX_CLAIM_LOG_PAGE` leaves)
-/// cover far more growth than daily re-vouching produces.
+/// The bound on a window extension's log (§4.9), in claim-log pages: a
+/// head naming more leaves than [`MAX_HEAD_FETCH_PAGES`] pages of the
+/// server's page size (`kuipa_enroll::server::MAX_CLAIM_LOG_PAGE`) is not
+/// read, and not pinned (DESIGN-claim-logs.md §1.3) — far more growth
+/// than daily re-vouching produces.
 const MAX_HEAD_FETCH_PAGES: usize = 64;
 
 /// Drop heads that no anchor signature backs (DESIGN-claim-logs.md §4):
@@ -1139,34 +1138,43 @@ fn retired_for(
     size: u64,
     root: &[u8; 32],
 ) -> Option<Vec<[u8; 32]>> {
+    served_vouch(endpoint, anchor)?
+        .retired_at(size, root)
+        .ok()
+        .flatten()
+}
+
+/// The signed vouch an anchor's claim-log page carries, with its whole
+/// log; **unverified** — its entries are believed only for making a root
+/// the caller trusts ([`SignedVouch::retired_at`](kuipa_enroll::delegation::SignedVouch::retired_at)).
+fn served_vouch(
+    endpoint: &Endpoint,
+    anchor: &Thumbprint,
+) -> Option<kuipa_enroll::delegation::SignedVouch> {
     let page = endpoint.claim_log(anchor, 0).ok()?;
     let bytes = tang_pqc::b64::decode(page.vouch.as_ref()?).ok()?;
     let vouch = kuipa_enroll::delegation::SignedVouch::from_bytes(&bytes).ok()?;
-    if vouch.vouch().anchor != *anchor {
-        return None;
-    }
-    vouch.retired_at(size, root).ok().flatten()
+    (vouch.vouch().anchor == *anchor).then_some(vouch)
 }
 
 /// One anchor's retired claims, as learned for a head being pinned.
 type Retired = (Thumbprint, Vec<[u8; 32]>);
 
 /// Extend the host's pin windows with a verified advertisement's heads
-/// (DESIGN-claim-logs.md §1.3): for every anchor whose new head does
-/// not extend the window, fetch the claim-log pages of the whole log
-/// up to the new head and check that the first `newest` leaves hash
-/// to the pinned root and all of them to the new one — the RFC 9162
-/// consistency check between the two tree sizes, from the leaves
-/// alone.  A head that passes joins the window with the claims its
-/// log retired, read by [`retired_for`]; a head that fails, or whose
-/// retired claims cannot be read, is not pinned and the window keeps
-/// what it had.  A head whose size is lower — a log that no longer
-/// contains the pinned history — is refused by [`paths::merge_windows`]
-/// and reported here.
+/// (DESIGN-claim-logs.md §1.3, DESIGN-tlog.md §8): for every anchor whose
+/// new head grows the window, read the head's signed vouch from the
+/// claim-log page — it carries the whole log, claims and tombstones —
+/// and check that its first `newest` entries make the pinned root and
+/// its first `size` the new one: the log provably contains the pinned
+/// history.  The same entries give the claims the new head's log
+/// retired, which join the window with it.  A head that fails is not
+/// pinned and the window keeps what it had.  A head whose size is
+/// lower — a log that no longer contains the pinned history — is refused
+/// by [`paths::merge_windows`] and reported here.
 ///
-/// The walk is bounded: at most [`MAX_HEAD_FETCH_PAGES`] pages, each of
-/// the anchor asked for.  A gap past that budget is not checked, and a
-/// page naming another anchor says nothing about this window.
+/// The check is bounded: a head naming more than
+/// [`MAX_HEAD_FETCH_PAGES`] pages' worth of leaves is not read, and a
+/// vouch by another anchor says nothing about this window.
 fn extend_windows(
     endpoint: &Endpoint,
     pins: &[paths::Pin],
@@ -1194,83 +1202,18 @@ fn extend_windows(
             merged[i].1 = None;
             continue;
         }
-        let mut leaves = Vec::new();
-        let mut from = 0;
-        let mut pages = 0;
-        let complete = loop {
-            if pages == MAX_HEAD_FETCH_PAGES {
-                tracing::warn!(
-                    anchor = %anchor,
-                    "window not extended: the gap needs more than {MAX_HEAD_FETCH_PAGES} pages to check"
-                );
-                break false;
-            }
-            pages += 1;
-            match endpoint.claim_log(anchor, from) {
-                Ok(page) => {
-                    // A page of another anchor's log says nothing about
-                    // this window: the check cannot go on with it.
-                    if !page
-                        .anchor
-                        .parse::<Thumbprint>()
-                        .is_ok_and(|p| p == *anchor)
-                    {
-                        tracing::warn!(
-                            anchor = %anchor,
-                            "window not extended: the served page names {}",
-                            page.anchor
-                        );
-                        break false;
-                    }
-                    if page.leaves.is_empty() {
-                        break false;
-                    }
-                    for leaf in &page.leaves {
-                        if let Ok(bytes) = tang_pqc::b64::decode(leaf)
-                            && bytes.len() == 32
-                        {
-                            let mut h = [0u8; 32];
-                            h.copy_from_slice(&bytes);
-                            leaves.push(h);
-                        }
-                    }
-                    from += page.leaves.len() as u64;
-                    if from >= *size {
-                        break leaves.len() as u64 == *size;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        anchor = %anchor,
-                        "window not extended: claim log unreachable: {e}"
-                    );
-                    break false;
-                }
-            }
+        let vouch = served_vouch(endpoint, anchor);
+        let at = |n: u64, r: &[u8; 32]| {
+            vouch
+                .as_ref()
+                .and_then(|v| v.retired_at(n, r).ok().flatten())
         };
-        let prefix = usize::try_from(newest)
-            .ok()
-            .and_then(|n| leaves.get(..n))
-            .and_then(|l| kuipa_enroll::merkle::root(l).ok())
-            .is_some_and(|r| r == old_root);
-        let consistent =
-            complete && prefix && kuipa_enroll::merkle::root(&leaves).is_ok_and(|r| r == *root);
-        if !consistent {
-            tracing::warn!(
-                anchor = %anchor,
-                "window not extended: the served head does not contain the pinned history"
-            );
-            merged[i].1 = None;
-            continue;
-        }
-        // The new head joins the window with what its log retired
-        // (DESIGN-tlog.md §8), or not at all.
-        if let Some(retired) = retired_for(endpoint, anchor, *size, root) {
+        if let (Some(_), Some(retired)) = (at(newest, &old_root), at(*size, root)) {
             learned.push((*anchor, retired));
         } else {
             tracing::warn!(
                 anchor = %anchor,
-                "window not extended: what the claim log retired could not be read"
+                "window not extended: the served log does not contain the pinned history"
             );
             merged[i].1 = None;
         }
