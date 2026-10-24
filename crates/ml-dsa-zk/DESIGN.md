@@ -16,8 +16,20 @@ This crate is that road's first stretch:
   circuits**;
 - a Keccak-f\[1600\] gadget for the hashing ML-DSA verification does.
 
-Everything cryptographic comes from OpenSSL: AES-128-CTR as the PRG,
-SHAKE256 for commitments and the transcript. The code is safe Rust.
+Everything cryptographic comes from OpenSSL, and only from CNSA 2.0's
+general-purpose algorithms: AES-256-CTR as the PRG, and SHA-512 for
+commitments, digests and the transcript. The code is safe Rust.
+
+CNSA 2.0 does not approve SHA-3 or SHAKE as general-purpose hashes. It
+allows them only where an approved algorithm prescribes them (CNSA 2.0
+FAQ), so the proof never hashes with them. The Keccak-f gadget is
+different: it *evaluates* ML-DSA's own SHAKE as part of the statement,
+which FIPS 204 prescribes.
+
+The soundness parameter is λ = 128. That is below the category-5
+strength of the rest of a CNSA 2.0 deployment (AES-256, ML-DSA-87). A
+λ = 256 parameter set, with GF(2²⁵⁶) and 32 trees, is the open question
+for the CNSA profile.
 
 **Research prototype. Not reviewed.**
 
@@ -29,9 +41,9 @@ AND outputs), followed by 128 QuickSilver mask bits and 128 VOLE-check
 mask bits.
 
 1. **Trees.** For each tree, a root seed is derived from a secret
-   master seed. It is expanded as a GGM tree, each node's children
-   being AES-128-CTR of the node. Each leaf `x` is committed as
-   `com = SHAKE256("leaf" ‖ salt ‖ i ‖ x ‖ seed)` and expanded to `L`
+   master seed. It is expanded as a GGM tree, each node's two 32-byte
+   children being AES-256-CTR of the node. Each leaf `x` is committed as
+   `com = SHA-512("leaf" ‖ salt ‖ i ‖ x ‖ seed)` and expanded to `L`
    bits `rₓ`. Tree `i` gives `uᵢ = ⊕ₓ rₓ`, and columns `b = 0..7` given
    by `⊕_{x : bitᵦ(x)} rₓ`. The prover sends `h_com`, the digest of all
    commitments, and the corrections `cᵢ = u₀ ⊕ uᵢ` for `i ≥ 1`. Row `j`
@@ -66,9 +78,11 @@ The verifier then:
    against `h_V`;
 5. checks QuickSilver with `K_j = q_j + d_j·Δ`.
 
-Challenges come from one SHAKE256 transcript. It absorbs the circuit's
+Challenges come from one SHA-512 transcript. It absorbs the circuit's
 digest, the public outputs, the salt and every prover message in order,
-and squeezes χ, η and Δ.
+length-prefixed and labelled. A challenge is the counter mode
+`SHA-512(state ‖ label ‖ i)` over a copy of the state, absorbed in turn,
+for χ, η and Δ.
 
 **Why the column-wise check.** A wrong correction `cᵢ` shifts tree i's
 columns by `eᵢ·Δ_b`. Because the hash is GF(2)-linear and checked per
@@ -90,7 +104,7 @@ is this") has 38,400 AND gates.
 
 | statement | witness bits | proof | prove | verify |
 |---|---|---|---|---|
-| Keccak-f\[1600\] preimage | 40,000 | 83,189 B | ~63 ms | ~35 ms |
+| Keccak-f\[1600\] preimage | 40,000 | 85,813 B | ~60 ms | ~36 ms |
 
 These are release builds on an Apple M-series laptop. The proof is about
 `15·L/8` bytes of corrections plus `ℓ/8` of witness: about two bytes per
