@@ -1,11 +1,16 @@
-//! Thread-local Kerberos credential cache management (MIT Kerberos).
+//! Thread-local Kerberos credential cache management, where the library has
+//! it: MIT Kerberos gives each thread its own credential cache name.
 
+#[cfg(mit_kerberos)]
 use std::ffi::{CStr, CString};
+#[cfg(mit_kerberos)]
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::GssError;
+#[cfg(mit_kerberos)]
 use crate::ffi;
+#[cfg(mit_kerberos)]
 use crate::status::format_gss_status;
 
 /// Set the thread-local Kerberos credential cache for GSSAPI calls (MIT Kerberos).
@@ -18,6 +23,11 @@ use crate::status::format_gss_status;
 /// Typically called from a `tokio::task::spawn_blocking` closure immediately
 /// before an LDAP SASL GSSAPI bind, and again after the bind to restore the
 /// old name.
+///
+/// A build against Heimdal has no per-thread credential cache name to set —
+/// MIT alone exposes `gss_krb5_ccache_name` — and reports
+/// [`GssError::Unsupported`].
+#[cfg(mit_kerberos)]
 pub fn set_thread_ccache(name: Option<&str>) -> Result<Option<String>, GssError> {
     let name_cstr = name
         .map(CString::new)
@@ -57,6 +67,17 @@ pub fn set_thread_ccache(name: Option<&str>) -> Result<Option<String>, GssError>
         )
     };
     Ok(old)
+}
+
+/// A build against Heimdal has no per-thread credential cache name: MIT
+/// Kerberos alone exposes `gss_krb5_ccache_name`, so there is nothing to
+/// set.  Callers that need a per-task cache on a Heimdal build pass its name
+/// to the credential itself instead.
+#[cfg(heimdal_kerberos)]
+pub fn set_thread_ccache(_name: Option<&str>) -> Result<Option<String>, GssError> {
+    Err(GssError::Unsupported {
+        feature: "a thread-local credential cache (`gss_krb5_ccache_name`, MIT Kerberos only)",
+    })
 }
 
 /// Generate a unique `MEMORY:` credential cache name for the calling thread.
