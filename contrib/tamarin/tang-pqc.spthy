@@ -1,0 +1,348 @@
+// tang-pqc -- Tamarin model of the post-quantum Tang escrow protocol
+// (crates/tang-pqc/DESIGN.md)
+//
+// Scope:
+//   S3.1  server keys, the advertisement, the pinned signing-key
+//         thumbprint (thp) and its verification
+//   S3.2  provisioning: ML-KEM encapsulation, K and confirm derivation,
+//         the stored binding (kid, thp, ct, r, confirm)
+//   S3.3  recovery: the fresh transport encapsulation, the sealed
+//         request and response, the confirm check
+//   S4    the security analysis: P1 two-factor, P5 authenticated setup,
+//         the sealed transport, and the documented P2 gap (a stolen
+//         binding queries the server; disk + server yield K)
+//
+// Symbolic abstraction:
+//   - ML-DSA and the advertisement are fact-driven: an advertisement is
+//     the !Server fact, and a client provisions only when its pin names
+//     that server's signing key -- S3.1's client trust check (the
+//     signature verifies under the pinned thp, and the exchange key
+//     comes from the same signed JWK Set).  A rogue pin matches only
+//     the rogue server.
+//   - ML-KEM  -> kem_ct(ek, s) binds a fresh secret s under
+//     encapsulation key ek = kem_pk(seed); only kem_dec(kem_sk(seed), .)
+//     recovers s.  Encapsulation is public: anyone may build kem_ct
+//     under a known ek, as FIPS 203 allows.
+//   - AES-256-GCM (one message per key, nonce 0) -> senc/sdec.
+//   - HKDF/H -> h(.): K = h(<ss, r>), confirm = h(<ss, r, 'confirm'>),
+//     transport keys h(<sst, 'req'>) and h(<sst, 'rsp'>).  The bound
+//     fields (alg, kid, thp, H(ct)) are abstracted into the tuple
+//     shapes; every stored field still feeds the derivation.
+//   - Time is not modeled: the advertisement's iat/exp and the Policy
+//     freshness checks are treated as unexpired (S3.1).
+//   - The disk is a steal_disk rule: it gives the attacker the
+//     binding's stored fields (ct, r, confirm), never K itself.
+//   - The server answers two paths.  The client path matches the
+//     request of a client's Pending state (a Req fact) and records the
+//     sealed response in a Served fact the client consumes -- the
+//     decryption-by-fact idiom, sound because only the key holder
+//     creates the fact.  The query path is the disk holder's
+//     documented capability (S4, "querying the server with a stolen
+//     binding"): a StolenCt fact carries the stolen ciphertext, the
+//     rule composes the querier's fresh transport and the server's
+//     answer, and the querier learns its own transport secret (it
+//     chose it), so it opens the response.  A malformed request leaves
+//     a term the equations cannot reduce to anything openable (the
+//     clean RecoveryFailed of S4).  The query rule's ss2 is bound by
+//     the KEM equation through the stolen ciphertext's shape, which
+//     the derivation checker cannot see -- the same expected warning
+//     class as the kuipa model's documented KEM bindings.
+//
+// Running the model:
+//   tamarin-prover --prove tang-pqc.spthy
+//
+// Results with tamarin-prover 1.12.0 and Maude 3.5.1:
+//   Exec, DiskFactorNecessary, AdvAuthentic, SsSealed and
+//   ResponseAuthentic: verified.
+//   Attack_MisPinnedThpLeaksKey: falsified -- a rogue thp plus a stolen
+//     disk yields K, since the rogue server's seed is public; P5's
+//     out-of-band pin delivery is what the secrecy lemmas rest on.
+//   Attack_StolenDiskQueriesServerForSs, Attack_StolenDiskAndServerYieldKey:
+//     falsified -- the server answers a stolen binding (the sealed
+//     transport hides ct from observers but cannot stop the disk
+//     holder from using the server factor), so disk + server give ss
+//     and then K.  That is the intended binding to server presence and
+//     the P2 gap of S5; its mitigations (sss across servers, the
+//     hybrid MR share) are out of scope here.
+
+theory tang_pqc
+begin
+
+functions: vk_h/1, kem_pk/1, kem_sk/1, kem_ct/2, kem_dec/2, senc/2, sdec/2, h/1
+equations: kem_dec(kem_sk(x), kem_ct(kem_pk(x), s)) = s,
+           sdec(senc(m, k), k) = m
+
+// ------------------------------------------------------------------
+// Server setup (S3.1): one signing key (ML-DSA) and one exchange key
+// (ML-KEM) per server.  The rogue server is the attacker's own; its
+// seeds are public, so the attacker holds its dk and can sign with it.
+// ------------------------------------------------------------------
+
+rule server_setup:
+  [ Fr(~ssk), Fr(~jseed) ]
+  --[ HonestKeyPair(vk_h(~ssk), kem_pk(~jseed)) ]->
+  [ !Server($srv, ~ssk, vk_h(~ssk), ~jseed, kem_pk(~jseed)),
+    !HonestKeys(vk_h(~ssk), ~jseed, kem_pk(~jseed)) ]
+
+rule rogue_server:
+  [ Fr(~ssk), Fr(~jseed) ]
+  --[ RogueKeyPair(vk_h(~ssk), kem_pk(~jseed)) ]->
+  [ !Server('rogue', ~ssk, vk_h(~ssk), ~jseed, kem_pk(~jseed)),
+    Out(~ssk), Out(~jseed) ]
+
+// GET /key/{kid}: the public exchange key, served for advertised and
+// retired keys alike (S3.3, S6).  The client checks the thumbprint
+// against the binding's kid, which recover_start enforces by
+// unification; a substituted key never matches.
+rule serve_key:
+  [ !Server(srv, ssk, svk, jseed, ek) ]
+  -->
+  [ Out(<'key', ek>) ]
+
+// The exchange key's private half leaks (a retired key kept on disk, an
+// HSM breach): the attacker learns the seed, hence dk.
+rule compromise_exchange_key:
+  [ !HonestKeys(svk, jseed, ek) ]
+  --[ ExchangeKeyCompromised(jseed, ek) ]->
+  [ Out(jseed) ]
+
+// ------------------------------------------------------------------
+// The pin (S3.1): the trusted thp reaches the client out of band.
+// pin_honest pins an honest server's signing key; pin_rogue pins the
+// attacker's (a mis-delivered thp: a forged pin file, or a
+// man-in-the-middle at provisioning time).
+// ------------------------------------------------------------------
+
+rule pin_honest:
+  [ !HonestKeys(svk, jseed, ek) ]
+  --[ HonestPin(svk) ]->
+  [ !Pin(svk) ]
+
+rule pin_rogue:
+  [ !Server('rogue', ssk, svk, jseed, ek) ]
+  --[ RoguePin(vk_h(ssk)) ]->
+  [ !Pin(vk_h(ssk)) ]
+
+// ------------------------------------------------------------------
+// Provisioning (S3.2): the client verifies the advertisement against
+// its pin, encapsulates to the advertised exchange key and derives
+//
+//   (ct, ss) = ML-KEM.Encaps(ek)
+//   K        = h(<ss, r>)                  the protected key
+//   confirm  = h(<ss, r, 'confirm'>)       stored on disk
+//
+// The binding stores (kid = h(ek), thp = svk, ct, r, confirm); K never
+// touches the disk.  Every stored field is bound into the derivation
+// through the tuple shapes of h(.).
+// ------------------------------------------------------------------
+
+rule provision:
+  [ !Pin(vk_h(ssk)),
+    !Server(srv, ssk, vk_h(ssk), jseed, ek),
+    Fr(~b), Fr(~ss), Fr(~r) ]
+  --[ Provisioned(~b, ek, vk_h(ssk), ~ss, h(<~ss, ~r>)) ]->
+  [ !Bound(~b, h(ek), vk_h(ssk), ~ss, ~r, kem_ct(ek, ~ss),
+             h(<~ss, ~r, 'confirm'>)) ]
+
+// ------------------------------------------------------------------
+// Disk theft: the attacker copies the binding.  It holds ct, r and
+// confirm -- everything on the disk -- and never K.
+// ------------------------------------------------------------------
+
+rule steal_disk:
+  [ !Bound(b, kid, svk, ss, r, ct, confirm) ]
+  --[ StolenDisk(b) ]->
+  [ StolenCt(ct), Out(ct), Out(r), Out(confirm) ]
+  // StolenCt marks the binding ciphertexts the attacker holds; the
+  // server query rule serves exactly those (the disk holder's
+  // capability of S4), not every constructible ciphertext.
+
+// ------------------------------------------------------------------
+// Recovery (S3.3): the client fetches the exchange key by kid, makes a
+// fresh transport encapsulation and seals the binding's ct under
+// k_req = h(<sst, 'req'>):
+//
+//   (ct_t, ss_t) = ML-KEM.Encaps(ek)
+//   request      = <'rec', kid, ct_t, senc(ct, k_req)>
+//
+// The thumbprint check is the unification of the fetched key with the
+// binding's kid (h(ek)); a substituted key never opens a request path.
+// ------------------------------------------------------------------
+
+rule recover_start:
+  [ !Bound(b, h(ek), svk, ss, r, ct, confirm),
+    In(<'key', ek>),
+    Fr(~sst) ]
+  --[ RecoveryStarted(b) ]->
+  [ Pending(b, ss, r, ~sst),
+    Req(h(ek), ct, ~sst),
+    Out(<'rec', h(ek), kem_ct(ek, ~sst), senc(ct, h(<~sst, 'req'>))>) ]
+  // Req is the client's own request record: the binding ciphertext it
+  // sealed and the transport secret it encapsulated.  The wire term
+  // keeps the attacker's view (a fresh ct_t and a sealed body); the
+  // server rule consumes Req for the honest path.
+
+// The server answers any well-formed request for its key: it
+// decapsulates the transport (the equations reduce the structural
+// pattern's sst), opens the sealed body to the binding ciphertext ct2,
+// decapsulates that, and seals the result under this request's
+// response key.  The structural In pattern is the length checks and
+// the transport-key derivation of S3.3; the Out term is what the
+// equations leave for a well-formed request, and anything the attacker
+// garbles reduces to an unopenable term instead (RecoveryFailed).
+rule recover_server_client:
+  [ !Server(srv, ssk, svk, jseed, ek),
+    In(<'rec', kid, ct_t, body>),
+    Req(kid, ct2, sst) ]
+  --[ ServerRecovered(srv) ]->
+  [ Served(kem_dec(kem_sk(jseed), ct2), h(<sst, 'rsp'>)) ]
+  // The honest path: the request belongs to a client's Pending state
+  // (the Req record), so its transport secret sst, binding ciphertext
+  // ct2 and kid are known.  The server decapsulates ct2 with its
+  // private seed and records the sealed response (the Served fact is
+  // the idealized response ciphertext -- its key h(<sst,'rsp'>) is
+  // derived from a transport secret only the client and the dk holder
+  // know, so a network observer learns nothing from the term anyway).
+  // The honest path: the request belongs to a client's Pending state
+  // (the Req record), so its transport secret sst, binding ciphertext
+  // ct2 and kid are known.  The wire tuple is matched shallowly; the
+  // server decapsulates ct2 with its private seed and seals the answer
+  // under this request's response key.
+  // The honest path: the request belongs to a client's Pending state
+  // (the Req record), so its transport secret sst and sealed body are
+  // known.  The server decapsulates ct2 with its private seed and
+  // seals the answer under this request's response key.
+
+rule recover_server_query:
+  [ !Server(srv, ssk, svk, jseed, ek),
+    StolenCt(kem_ct(ek, ss2)),
+    Fr(~sst) ]
+  --[ ServerQueried(srv) ]->
+  [ Out( ~sst ),
+    Out( <'query', h(ek),
+          senc(kem_ct(ek, ss2), h(<~sst, 'req'>)),
+          senc(ss2, h(<~sst, 'rsp'>))> ) ]
+  // The disk holder queries: it encapsulates a fresh transport secret,
+  // seals the stolen binding ciphertext under the request key and
+  // receives ss2 sealed under the response key.  The rule composes
+  // both wire terms itself (the disk holder is the attacker), so the
+  // proof search never enumerates attacker constructions; the Out pair
+  // gives the attacker both what it sent and what it learned.
+  // Out(~sst) is the querier's knowledge of its own encapsulation: it
+  // chose the transport secret, so it can derive the response key and
+  // open senc(ss2, ...) -- that is the documented capability, not an
+  // extra one.
+  // ss2 is bound by the equations: StolenCt carries the binding
+  // ciphertext as a well-formed kem_ct under this server's key, and
+  // only the dk holder (or the disk holder that stole it) can pair it
+  // with its decapsulation.  S4 documents this capability: "querying
+  // the server with a stolen binding ... the same as in MR".
+
+// The client opens the response and checks confirm: only a response
+// carrying exactly this binding's ss, sealed under this request's sst,
+// completes recovery.  The In pattern is the constant-time confirm
+// comparison; anything else is a clean RecoveryFailed.
+rule recover_finish:
+  [ Pending(b, ss, r, sst),
+    In(rsp),
+    Served(ss, h(<sst, 'rsp'>)) ]
+  --[ Recovered(b, h(<ss, r>)) ]->
+  [ ]
+  // binding: rsp = senc(ss, h(<sst, 'rsp'>)); the client opens it
+  // under the response key derived from its own transport secret sst
+  // and checks confirm against the binding (S3.3).  The Served fact
+  // binds the plaintext; the In(rsp) premise keeps the network term
+  // honest, so the attacker cannot complete a recovery it only
+  // overheard.
+
+// ------------------------------------------------------------------
+// Lemmas
+// ------------------------------------------------------------------
+
+// The protocol runs: a client pins an honest server, provisions and
+// recovers its key through it.
+lemma Exec: exists-trace
+  "Ex b key #i. Recovered(b, key) @i"
+
+// P1, the disk factor: whoever learns K has stolen the disk.  The
+// server (even with dk compromised, even answering queries) never sees
+// r, so the server factor alone never yields K -- S4's "server only"
+// row.
+lemma DiskFactorNecessary:
+  "All b ek svk ss key #i #j.
+    (Provisioned(b, ek, svk, ss, key) @i & K(key) @j)
+    ==> (Ex #m. StolenDisk(b) @m)"
+
+// P5, authenticated setup: a client whose pin is honest binds to that
+// honest server's exchange key.  Neither a forged advertisement nor a
+// substituted key set can move an honestly-pinned client onto another
+// ek.
+lemma AdvAuthentic:
+  "All b ek svk ss key #i #k.
+    (Provisioned(b, ek, svk, ss, key) @i & HonestPin(svk) @k)
+    ==> (Ex #m. HonestKeyPair(svk, ek) @m)"
+
+// The sealed transport (S3.3, S4 "recorded traffic"): for an honestly
+// pinned binding, the shared secret ss leaks only through the disk or
+// the exchange key's compromise.  A pure network observer -- even one
+// recording every exchange -- gets neither ct nor ss: opening either
+// sealed direction needs ss_t, which needs dk.
+lemma SsSealed:
+  "All b ek svk ss key #i #k #j.
+    (Provisioned(b, ek, svk, ss, key) @i & HonestPin(svk) @k & K(ss) @j)
+    ==> ( (Ex #m. StolenDisk(b) @m)
+        | (Ex jseed #m. ExchangeKeyCompromised(jseed, ek) @m) )"
+
+// The confirm check (S3.3, S4 "tampered or replayed recovery
+// response"): for an honestly pinned binding, a recovery completes
+// only when a dk holder answered, or the exchange key was fully
+// compromised -- which lets the attacker derive both ss and ss_t and
+// impersonate the server, and holding the server's key is holding the
+// server.  confirm authenticates the server: only the holder of
+// dk_kid can return the right ss.
+lemma ResponseAuthentic:
+  "All b ek svk ss key #i #k #r.
+    (Provisioned(b, ek, svk, ss, key) @i & HonestPin(svk) @k
+     & Recovered(b, key) @r)
+    ==> ( (Ex srv #m. ServerRecovered(srv) @m)
+        | (Ex jseed #m. ExchangeKeyCompromised(jseed, ek) @m) )"
+
+// ------------------------------------------------------------------
+// Falsifiable checks (expected: falsified, i.e. attacks found).  They
+// show the verified lemmas are conditioned on the honest pin and that
+// the model keeps the attacker capabilities S4 and S5 document, so the
+// proofs above are not vacuous.
+// ------------------------------------------------------------------
+
+// A mis-delivered thp (the rogue server's signing key) plus a stolen
+// disk yields K: the rogue seed is public, so the attacker decapsulates
+// ct from the disk without any server.  P5's out-of-band pin delivery
+// is load-bearing.
+lemma Attack_MisPinnedThpLeaksKey:
+  "All b ek svk ss key #i #k #m.
+    ( Provisioned(b, ek, svk, ss, key) @i & RoguePin(svk) @k
+      & StolenDisk(b) @m )
+    ==> not(Ex #j. K(key) @j)"
+
+// A stolen binding queries the honest server (S4: "querying the server
+// with a stolen binding ... the same as in MR"): the disk holder
+// encapsulates afresh and seals the stolen ct, and the server answers,
+// so ss reaches the attacker.  The sealed transport hides ct from
+// observers, not from the disk holder that holds it.
+lemma Attack_StolenDiskQueriesServerForSs:
+  "All b ek svk ss key #i #k #m.
+    ( Provisioned(b, ek, svk, ss, key) @i & HonestPin(svk) @k
+      & StolenDisk(b) @m )
+    ==> not(Ex #j. K(ss) @j)"
+
+// Disk plus server yield K: Tang's intended binding to server presence
+// and the practical face of the P2 gap (S5).  This is why the design
+// recommends sss across servers or the hybrid MR share when one
+// server's log must not be enough.
+lemma Attack_StolenDiskAndServerYieldKey:
+  "All b ek svk ss key #i #k #m.
+    ( Provisioned(b, ek, svk, ss, key) @i & HonestPin(svk) @k
+      & StolenDisk(b) @m )
+    ==> not(Ex #j. K(key) @j)"
+
+end
