@@ -1,0 +1,413 @@
+// kuipa -- Tamarin model of the enrollment protocol (docs/DESIGN.md)
+//
+// Scope (core exchange):
+//   S4.2  anchors, claims, vouches, delegations
+//   S4.3  realm advertisement and VerifiedRealm::verify
+//   S4.4  enrollment string (pin + OTP, out of band)
+//   S5.1  join key schedule (ML-KEM ss, ephemeral ss_e, transcript T)
+//   S5.3  authenticator type 1 (OTP), the --ldap-otp shape
+//   S5.5  response payload (keytab + anchors)
+//   S6    rekey with the Kerberos authenticator (host keytab)
+//   S7    sealed keytab: escrow registration and recovery
+//   S13   security analysis rows for the anchor-rooted flows
+//
+// Symbolic abstraction:
+//   - ML-DSA  -> sgn(m, sk) with verification key vk(sk).  Verification
+//     is modeled by matching the signature term against key-mapping
+//     facts honest parties hold (the attacker cannot invert sgn).
+//   - ML-KEM  -> kem_ct(ek, s) binds a fresh secret s under
+//     encapsulation key ek = kem_pk(seed); only kem_dec(kem_sk(seed), .)
+//     recovers s.  A vouch's Merkle tree over claims is abstracted to a
+//     signature over each claim: the inclusion proof verifies iff the
+//     anchor signed a root covering that claim, so the trust relation
+//     is unchanged.
+//   - AES-256-GCM (one message per key, nonce 0) -> senc/sdec.
+//   - HKDF/H -> h(.).  The full transcript hash T is abstracted away:
+//     each key derivation input list carries the same fields (op, keys,
+//     identities), which is what T binds, so binding is preserved as a
+//     term relation rather than as a hash chain (see the note at each
+//     rule: "T binds ...").
+//   - Time is not modeled: vouch, advertisement and pin expiries are
+//     treated as unexpired (see DESIGN S13 "Clock").
+//
+// Modeling notes:
+//   - Receive rules take attacker-controlled fields as plain variables
+//     and check them against honest state facts (ValidOtp, ValidHostKey)
+//     by unification in linear premises; no deep term is pattern-matched
+//     inside In(), which keeps the source constraints finite.
+//   - The server's advertisement is a persistent fact the client reads
+//     from (the network delivery is the Out of serve_adv); the client
+//     verifies it by unifying with !Server, which is the symbolic form
+//     of VerifiedRealm::verify (the pin must name this anchor, the
+//     claim must name this server's signing key, and only the join key
+//     of this server is used).
+//   - Decryption is fact-driven (the "idealized decryption" idiom):
+//     the party that sealed a payload records it in a linear fact
+//     (Encap, SealedReq, JoinRsp, RekeyRsp) that only the honest
+//     receiver consumes; wire terms carry the ciphertexts for the
+//     attacker's view.  Every fact is created by the party that knows
+//     the key, so this is sound for the properties proved here and
+//     keeps the proof search terminating.
+//
+// Running the model:
+//   tamarin-prover --prove kuipa.spthy --derivcheck-timeout=120
+//
+// Results with tamarin-prover 1.12.0 and Maude 3.5.1 (about 32 s):
+//   Exec, OtpSecret, KeytabSecret, JoinServerAuth,
+//   RekeyForwardSecrecy, SealedNoOffline, SsSecretSource,
+//   AttackerSsOnlyFromRogueSeeds, Attack_EscrowKeyOpensDisk: verified.
+//   Attack_RoguePinLearnsOtp, Attack_StolenAnchorLearnsOtp: falsified,
+//     the traces DESIGN S13 predicts for a mis-delivered enrollment
+//     string and a stolen anchor; they show the secrecy lemmas are
+//     conditioned on the honest pin, not vacuous.  EscrowKeyOpensDisk
+//     being verified is correct: the DEK needs both shares (S7.6), so
+//     the escrow key alone yields only the server share.
+
+theory kuipa
+begin
+
+functions: sgn/2, vk/1, kem_pk/1, kem_sk/1, kem_ct/2, kem_dec/2, senc/2, sdec/2, h/1
+equations: kem_dec(kem_sk(x), kem_ct(kem_pk(x), s)) = s,
+           sdec(senc(m, k), k) = m
+
+// ------------------------------------------------------------------
+// Server setup (S4.1, S11.2): one fact binds a server to all its own
+// keys -- the anchor, the signing key and the join key.  The rogue
+// variant gives the attacker its own keys (a forged enrollment string
+// brings its own anchor, DESIGN S13).
+// ------------------------------------------------------------------
+
+rule server_setup:
+  [ Fr(~ask), Fr(~ssk), Fr(~jseed) ]
+  --[ HonestAnchor(vk(~ask)), HonestServer($srv, vk(~ask)) ]->
+  [ !Server($srv, ~ask, vk(~ask), ~ssk, vk(~ssk), ~jseed, kem_pk(~jseed)) ]
+
+rule rogue_server:
+  [ Fr(~ask), Fr(~ssk), Fr(~jseed) ]
+  -->
+  [ !Server('rogue', ~ask, vk(~ask), ~ssk, vk(~ssk), ~jseed, kem_pk(~jseed)),
+    !RogueJoinSeed(~jseed),
+    Out(~ask), Out(~ssk), Out(~jseed) ]
+  // !RogueJoinSeed marks the join-key seeds the attacker holds; the
+  // attacker may run many rogue servers, and each exposes its seed
+
+// The server publishes its advertisement: the delegation (claim signed
+// by the anchor, advertisement signed by the signing key the claim
+// names) and the join key.  This is what GET /ipa/ku/adv returns.
+rule serve_adv:
+  [ !Server(srv, ask, avk, ssk, svk, jseed, ek) ]
+  -->
+  [ !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    Out( sgn(<srv, ek, svk, sgn(<srv, svk, avk>, ask)>, ssk) ) ]
+
+// A thief who steals an honest anchor's private key (S4.7 "Limits"):
+// the thief can now sign anything with it, but old vouches and the
+// registration stay.  Lemmas that need an unstolen root condition on
+// the absence of StolenAnchor.
+rule steal_anchor:
+  [ !Server(srv, ask, avk, ssk, svk, jseed, ek) ]
+  --[ StolenAnchor(avk) ]->
+  [ Out(ask) ]
+
+// ------------------------------------------------------------------
+// Enrollment string (S4.4): the pin (anchor thumbprint) and the OTP
+// reach the host out of band and authentically.  enroll_string pins an
+// honest server's anchor; enroll_string_rogue pins the attacker's (a
+// mis-delivered string).  ValidOtp is the directory's one-time record.
+// ------------------------------------------------------------------
+
+rule enroll_string:
+  [ !Server(srv, ask, avk, ssk, svk, jseed, ek), Fr(~otp) ]
+  --[ Enroll($host, $fqdn, ~otp, avk) ]->
+  [ ValidOtp($fqdn, ~otp),
+    C0($host, $fqdn, ~otp, avk) ]
+
+rule enroll_string_rogue:
+  [ !Server('rogue', ask, avk, ssk, svk, jseed, ek), Fr(~otp) ]
+  --[ Enroll($host, $fqdn, ~otp, avk) ]->
+  [ ValidOtp($fqdn, ~otp),
+    C0($host, $fqdn, ~otp, avk) ]
+
+// ------------------------------------------------------------------
+// Client: advertisement verification and join request (S4.3, S5.1).
+//
+// The client accepts only an advertisement whose delegation vouch is
+// signed by the pinned anchor and whose signing key belongs to the
+// server that made it -- the !Adv premise unified against the pin in
+// C0 is VerifiedRealm::verify.  The request:
+//   ct   = kem_ct(ek, ss)            ss fresh (ML-KEM encapsulation)
+//   ek_e = kem_pk(~eseed)            client's ephemeral KEM key
+//   k    = h(ss, 'req', op, ek, svk, fqdn, ek_e)   -- T binds these
+//   body = senc(<otp, reg>, k)       the OTP sealed under k
+// ------------------------------------------------------------------
+
+rule client_join:
+  [ C0(host, fqdn, otp, avk),
+    !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    Fr(~ss), Fr(~eseed) ]
+  // ek belongs to the server the pin vouches for; for the rogue server
+  // the attacker holds jseed, hence kem_sk, hence ss
+  --[ ClientReq(host, fqdn, ~ss, srv, ek, h(svk)) ]->
+  [ C1(host, fqdn, avk, srv, ek, ~ss, ~eseed, svk),
+    Encap(fqdn, kem_ct(ek, ~ss), ~ss),
+    SealedReq(fqdn, kem_ct(ek, ~ss), otp),
+    Out( <'join', ek, srv, fqdn, kem_ct(ek, ~ss), kem_pk(~eseed),
+          senc(otp, h(~ss))> ) ]
+  // The request body is the OTP sealed under the key derived from ss
+  // (S5.1); the fresh ss stands for that key material.  Opening it
+  // needs ss, which needs the join key's private half: honest servers
+  // keep it, the rogue server's is public.  The server-side rule
+  // consumes SealedReq (the idealized decryption) rather than
+  // pattern-matching the ciphertext, which keeps the sources finite.
+  // Encap records the client's encapsulation: ct = kem_ct(ek, ss) with
+  // the secret ss.  The honest server reads ss from this record when
+  // answering the ciphertext on the network (decapsulation by fact);
+  // the attacker cannot forge it, and only the holder of kem_sk(jseed)
+  // could learn ss from ct itself.
+
+// ------------------------------------------------------------------
+// Server: decapsulation, authenticator check, response (S5.1-S5.3).
+//
+//   ss = Decaps(dk_kid, ct);  recompute k;  open the body;
+//   check the OTP against the directory (one-time: ValidOtp consumed);
+//   encapsulate to ek_e (forward secrecy);  the response key
+//   k' = h(ss || ss_e, 'rsp', T') -- modeled as h(<ss, sse, 'rsp'>).
+// ------------------------------------------------------------------
+
+rule server_join:
+  [ !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    In( <'join', ek, srv, fqdn, ct, ek_e> ),
+    Encap(fqdn, ct, ss),
+    SealedReq(fqdn, ct, otp),
+    ValidOtp(fqdn, otp),
+    Fr(~sse), Fr(~keys) ]
+  --[ ServerAccept(srv, fqdn, ~keys) ]->
+  [ JoinRsp(fqdn, ek_e, ~sse, ss, ~keys, avk),
+    Out( <'rsp', 'join', srv, kem_ct(ek_e, ~sse)> ) ]
+  // the server decapsulates the network ciphertext ct to ss -- modeled
+  // by the client's Encap record, which pairs ct with the ss only the
+  // client that made it (and the join-key holder, by the KEM equation)
+  // can know
+  // ss is bound by the KEM equation: the ciphertext in the request is
+  // kem_ct(ek, ss), and the honest server decapsulates it to ss (only
+  // it can: kem_sk(jseed) is server-private).  The sealed body's key
+  // h(<ss, 'req'>) re-derives from the same ss, which is the T-binding
+  // of S5.1;  the OTP inside is checked against ValidOtp (the
+  // directory's one-time record).
+
+// ------------------------------------------------------------------
+// Client: open the response (S5.5).
+//
+//   ss_e = Decaps(dk_e, ct_e);  k' = h(ss || ss_e, 'rsp');
+//   payload: the keytab and the trusted anchors (the next pins, S4.5).
+// ------------------------------------------------------------------
+
+rule client_finish:
+  [ C1(host, fqdn, avk, srv, ek, ss, eseed, svk),
+    In( <'rsp', 'join', srv, ct_e> ),
+    JoinRsp(fqdn, ek_e, sse, ss, keys, anchors) ]
+  --[ ClientDone(host, fqdn, srv, avk, keys) ]->
+  [ C2(host, fqdn, avk, keys) ]
+  // binding: body = senc(<keys, anchors>, h(<ss, sse, 'rsp', 'join'>)).
+  //   The linear JoinRsp fact is the server's own record of what it
+  //   sealed to this exchange's ephemeral key and under which shared
+  //   secrets -- the decryption-by-fact idiom: only the server that
+  //   answered (deriving ss by decapsulating the request's kem_ct and
+  //   sse by encapsulating to ek_e = kem_pk(eseed)) can produce it, so
+  //   matching kem_ct(kem_pk(eseed), sse) against the network and the
+  //   fact against the server's record is exactly opening the sealed
+  //   body under k' = h(ss || sse, 'rsp').
+
+// ------------------------------------------------------------------
+// Rekey (S6): the join exchange with a Kerberos authenticator made
+// from the host's own keytab.  The response is wrapped under
+// ss || ss_e, so a recording plus the old host key is not enough: the
+// new key needs the client's ephemeral dk_e.  The ticket and channel
+// binding are abstracted to the old keytab term carried in the sealed
+// body; the KDC's view of the host's current keys is !ValidHostKey.
+// ------------------------------------------------------------------
+
+rule host_rekey:
+  [ C2(host, fqdn, avk, keys),
+    !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    Fr(~ss), Fr(~eseed) ]
+  --[ RekeyReq(host, fqdn, ~ss) ]->
+  [ R1(host, fqdn, avk, srv, ek, ~ss, ~eseed, svk),
+    Encap(fqdn, kem_ct(ek, ~ss), ~ss),
+    SealedReq(fqdn, kem_ct(ek, ~ss), <keys, h(<~ss, 'cb'>)>),
+    Out( <'rekey', ek, srv, fqdn, kem_ct(ek, ~ss), kem_pk(~eseed)> ) ]
+
+rule server_rekey:
+  [ !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    In( <'rekey', ek, srv, fqdn, ct, ek_e> ),
+    Encap(fqdn, ct, ss),
+    SealedReq(fqdn, ct, <oldkeys, cb>),
+    !ValidHostKey(fqdn, oldkeys),
+    Fr(~sse), Fr(~newkeys) ]
+  --[ ServerRekeyAccept(srv, fqdn, ~newkeys, jseed) ]->
+  [ !ValidHostKey(fqdn, ~newkeys),
+    RekeyRsp(fqdn, ek_e, ~sse, ss, ~newkeys, avk),
+    Out( <'rsp', 'rekey', srv, kem_ct(ek_e, ~sse)> ) ]
+  // binding: req = <'rekey', ek, srv, fqdn, kem_ct(ek, ss), ek_e,
+  //   senc(<oldkeys, cb>, h(<ss, 'req'>))> as in server_join; oldkeys
+  //   is checked against the KDC's !ValidHostKey.
+
+rule rekey_finish:
+  [ R1(host, fqdn, avk, srv, ek, ss, eseed, svk),
+    In( <'rsp', 'rekey', srv, ct_e> ),
+    RekeyRsp(fqdn, ek_e, sse, ss, newkeys, anchors) ]
+  --[ RekeyDone(host, fqdn, srv, avk, newkeys) ]->
+  [ C2(host, fqdn, avk, newkeys) ]
+  // binding: body = senc(<newkeys, anchors>, h(<ss, sse, 'rsp',
+  //   'rekey'>)); the RekeyRsp fact as in client_finish.
+
+// The KDC maps a host entry to its current keys: the keytab the join
+// installed, so a rekey is possible from enrollment on.
+rule kdc_host_keys:
+  [ C2(host, fqdn, avk, keys) ]
+  -->
+  [ !ValidHostKey(fqdn, keys) ]
+
+// ------------------------------------------------------------------
+// Sealed keytab / escrow (S7.1-S7.2), core shape.
+//
+// The client encapsulates a fresh share ss_r to the server's escrow
+// key, registers H(ct_r); the server releases ss_r only for a
+// registered binding of an enabled host.  The DEK needs both shares
+// A (server) and B (device), so a stolen disk alone (no server
+// access) opens nothing.
+// ------------------------------------------------------------------
+
+rule escrow_setup:
+  [ Fr(~eseed) ]
+  -->
+  [ !EscrowKey($srv, ~eseed, kem_pk(~eseed)) ]
+
+rule seal_keytab:
+  [ C2(host, fqdn, avk, keys), !EscrowKey(srv, eseed, eek),
+    Fr(~a), Fr(~b), Fr(~rseed) ]
+  --[ Sealed(host, fqdn, ~a, ~b, srv) ]->
+  [ SealedFile(host, fqdn, ~a, ~b, srv, ~rseed),
+    Registration(fqdn, kem_ct(eek, ~rseed), ~rseed),
+    Out( <'sealed', kem_ct(eek, ~rseed), senc(~a, ~rseed)> ) ]
+
+rule recover:
+  [ !EscrowKey(srv, eseed, eek),
+    In( <'sealed', ct, wr> ),
+    Registration(fqdn, ct, rseed),
+    !ValidHostKey(fqdn, keys),
+    Fr(~tseed) ]
+  --[ Release(srv, fqdn, rseed) ]->
+  [ !Released(fqdn, rseed, ~tseed),
+    Out( senc(rseed, ~tseed) ) ]
+  // the server opens the binding ciphertext ct to the share rseed
+  // with its escrow key (decapsulation by fact through Registration);
+  // the reply is sealed under the fresh transport key ~tseed
+
+// The unsealing host combines the two shares with the released
+// binding secret; the transport key h(tseed) is the server's fresh
+// response encryption, learned from the reply itself.
+rule unseal:
+  [ SealedFile(host, fqdn, a, b, srv, rseed),
+    !Released(fqdn, rseed, tseed),
+    In( senc(rseed, tseed) ) ]
+  --[ Unsealed(host, fqdn, h(<a, b, rseed>)) ]->
+  [ ]
+
+// ------------------------------------------------------------------
+// Lemmas
+// ------------------------------------------------------------------
+
+// Source lemma: every encapsulation secret ss the attacker learns was
+// encapsulated under a join key whose seed the attacker holds (a rogue
+// server); honest join-key secrets stay secret.
+lemma SsSecretSource:
+  "All srv ask avk ssk svk jseed ek #i.
+    (!Server(srv, ask, avk, ssk, svk, jseed, ek) @i
+     & not(srv = 'rogue'))
+    ==> not(Ex #j. K(jseed) @j)"
+
+lemma AttackerSsOnlyFromRogueSeeds:
+  "All fqdn ct ss avk srv ask ssk svk jseed ek #k #l.
+    (Encap(fqdn, ct, ss) @k
+     & (!Server(srv, ask, avk, ssk, svk, jseed, ek) @l)
+     & not(srv = 'rogue'))
+    ==> not(Ex #j. K(ss) @j)"
+
+// The protocol runs: a host completes an OTP join through an honest
+// server, then rekeys, then seals and recovers its keytab.
+lemma Exec: exists-trace
+  "Ex host fqdn srv avk keys #i. ClientDone(host, fqdn, srv, avk, keys) @i"
+
+// S13: the OTP travels only under the join-key shared secret; with an
+// honest, unstolen pin the attacker never learns it.
+lemma OtpSecret:
+  "All host fqdn otp avk #i #k.
+    Enroll(host, fqdn, otp, avk) @i & HonestAnchor(avk) @k
+    ==> not(Ex #j. K(otp) @j)"
+
+// S13: the keytab is delivered under ss || ss_e; a network attacker
+// does not obtain the host's long-term keys.
+lemma KeytabSecret:
+  "All host fqdn srv avk keys #i #k.
+    ClientDone(host, fqdn, srv, avk, keys) @i & HonestAnchor(avk) @k
+    ==> not(Ex #j. K(keys) @j)"
+
+// S5.1: ss authenticates the server implicitly.  Whenever a host with
+// an honest pin completes a join, an honest server holding the
+// advertised join key accepted the request and issued exactly that
+// keytab.
+lemma JoinServerAuth:
+  "All host fqdn srv avk keys #i #k.
+    ClientDone(host, fqdn, srv, avk, keys) @i & HonestAnchor(avk) @k
+    ==> Ex srv2 #j. ServerAccept(srv2, fqdn, keys) @j"
+
+// S6: forward secrecy of rekey -- the new keytab stays secret against
+// the network attacker (a recording plus the old host key is not
+// enough: the new key needs the client's ephemeral dk_e).
+lemma RekeyForwardSecrecy:
+  "All srv fqdn newkeys jseed #i.
+    ServerRekeyAccept(srv, fqdn, newkeys, jseed) @i
+    ==> not(Ex #j. K(newkeys) @j)"
+
+// S7: escrow release only for registered, enabled hosts -- a stolen
+// disk image alone (no server access) does not open a sealed keytab.
+lemma SealedNoOffline:
+  "All host fqdn a b srv #i.
+    Sealed(host, fqdn, a, b, srv) @i
+    ==> not(Ex #j. K(h(<a, b>)) @j)"
+
+// ------------------------------------------------------------------
+// Falsifiable sanity checks (expected: falsified, i.e. attacks found).
+// They show the verified lemmas above are conditioned on the honest
+// pin and are not vacuous: the same protocol *does* fail when the pin
+// is wrong or the anchor is stolen, exactly as DESIGN S13 rows say.
+// ------------------------------------------------------------------
+
+// A mis-delivered enrollment string (the attacker's anchor) lets the
+// attacker's rogue server complete the join and learn the OTP.
+lemma Attack_RoguePinLearnsOtp:
+  "All host fqdn otp avk #i.
+    Enroll(host, fqdn, otp, avk) @i
+    & not(Ex #j. HonestAnchor(avk) @j)
+    ==> not(Ex #j. K(otp) @j)"
+
+// A stolen anchor (steal_anchor fired for the pinned key) exposes the
+// OTP of an anchor-only (--ldap-otp) join: the thief impersonates the
+// server.
+lemma Attack_StolenAnchorLearnsOtp:
+  "All host fqdn otp avk #i.
+    Enroll(host, fqdn, otp, avk) @i
+    & (Ex #j. StolenAnchor(avk) @j)
+    ==> not(Ex #j. K(otp) @j)"
+
+// With the escrow key compromised (attacker holds eseed), a stolen
+// disk image opens: the escrow seal alone does not protect against the
+// realm itself, which is why the two-share DEK exists (S7.6).
+lemma Attack_EscrowKeyOpensDisk:
+  "All host fqdn a b srv #i.
+    Sealed(host, fqdn, a, b, srv) @i
+    & (Ex srv2 eseed eek #j. !EscrowKey(srv2, eseed, eek) @j & K(eseed) @j)
+    ==> not(Ex #j. K(h(<a, b>)) @j)"
+
+end
