@@ -2009,7 +2009,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/peer/sync` | `IPPS` → agirru envelope (CBOR); servers only (§4.2) |
 | GET | `/ipa/ku/anchor-log?from=n` | → epoch-log entries and the anchors' current vouch heads (§4.8, §4.9) |
 | GET | `/ipa/ku/claim-log/{anchor}?from=i` | → one anchor's claim-log page (§4.9.5) |
-| GET | `/ipa/ku/log/{id}/head`, `…/leaves?from=i`, `…/proof?index=i&size=n`, `…/consistency?from=m&size=n` | → the server's transparency log: `IPLS`, and JSON pages of leaves and proofs (DESIGN-tlog.md §5) |
+| GET | `/ipa/ku/tlog/{id}/head`, `…/leaves?from=i`, `…/proof?index=i&size=n`, `…/consistency?from=m&size=n` | → the server's transparency log: `IPLS`, and JSON pages of leaves and proofs (DESIGN-tlog.md §5) |
 | POST | `/ipa/ku/trust/{kid}` | `IPTQ` → `IPTS` (§17.4) |
 | GET | `/ipa/ku/tang/adv`, `/ipa/ku/tang/adv/{thp}` | → Tang advertisement (`application/jose+json`) (§11.5) |
 | GET | `/ipa/ku/tang/key/{kid}` | → Tang exchange key (`application/jwk+json`) (§11.5) |

@@ -33,7 +33,7 @@ use crate::tang::Tang;
 /// certificate, base64-encoded, stay well under a megabyte.
 const BODY_LIMIT: usize = 1024 * 1024;
 
-/// Most leaves in one page of `GET log/{id}/leaves`.
+/// Most leaves in one page of `GET tlog/{id}/leaves`.
 const MAX_LOG_PAGE: usize = 4096;
 
 /// Most anchors a client may name in `GET adv`.
@@ -119,10 +119,10 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
-        .route("/ipa/ku/log/{id}/head", get(log_head::<D>))
-        .route("/ipa/ku/log/{id}/leaves", get(log_leaves::<D>))
-        .route("/ipa/ku/log/{id}/proof", get(log_proof::<D>))
-        .route("/ipa/ku/log/{id}/consistency", get(log_consistency::<D>))
+        .route("/ipa/ku/tlog/{id}/head", get(log_head::<D>))
+        .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves::<D>))
+        .route("/ipa/ku/tlog/{id}/proof", get(log_proof::<D>))
+        .route("/ipa/ku/tlog/{id}/consistency", get(log_consistency::<D>))
         .route("/ipa/ku/trust/{kid}", post(establish_trust::<D>))
         .route("/ipa/ku/tang/adv", get(tang_advertisement::<D>))
         .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for::<D>))
