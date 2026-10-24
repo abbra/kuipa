@@ -10,6 +10,7 @@ pub mod paths;
 pub mod pkcs11;
 pub mod preauth;
 pub mod seal;
+pub mod sign;
 pub mod text;
 pub mod trace;
 pub mod voucher;

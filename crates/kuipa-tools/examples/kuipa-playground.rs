@@ -149,6 +149,27 @@ fn run(args: &[String]) -> Result<(), Error> {
     }
     // The playground realm's administrators allow offline vault sessions.
     directory.limits.lock().unwrap().offline_sessions = true;
+    // And let the release group sign blobs (DESIGN-sign.md); the
+    // administrator is in it.
+    directory.sign_policy.lock().unwrap().purposes.insert(
+        "blob".into(),
+        kuipa_enroll::sign::Signers {
+            groups: vec!["release".into()],
+            ..kuipa_enroll::sign::Signers::default()
+        },
+    );
+    directory.sign_policy.lock().unwrap().purposes.insert(
+        "git-commit".into(),
+        kuipa_enroll::sign::Signers {
+            groups: vec!["release".into()],
+            ..kuipa_enroll::sign::Signers::default()
+        },
+    );
+    directory
+        .groups
+        .lock()
+        .unwrap()
+        .insert(ADMIN.into(), vec!["release".into()]);
     // The secrets transport (§18): ipa1 is the CA and renewal master, as
     // in a fresh IPA deployment, and holds the material a promoting
     // replica would fetch (the DM password hash, the RA agent key, a

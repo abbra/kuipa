@@ -63,6 +63,10 @@ struct MemoryDirectory {
     ca_masters: RefCell<Vec<String>>,
     /// The keys operation's secrets, by `namespace id/nickname`.
     key_secrets: RefCell<HashMap<(u8, String), Vec<u8>>>,
+    /// The signing policy (`DESIGN-sign.md`).
+    sign_policy: RefCell<kuipa_enroll::sign::SignPolicy>,
+    /// Groups by principal, as `memberOf` would list them.
+    groups: RefCell<HashMap<String, Vec<String>>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -302,6 +306,19 @@ impl Directory for MemoryDirectory {
 
     fn vault_limits(&self) -> Result<vault::Limits, DirectoryError> {
         Ok(self.limits.borrow().clone())
+    }
+
+    fn sign_policy(&self) -> Result<kuipa_enroll::sign::SignPolicy, DirectoryError> {
+        Ok(self.sign_policy.borrow().clone())
+    }
+
+    fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
+        Ok(self
+            .groups
+            .borrow()
+            .get(&principal.to_string())
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
@@ -2254,4 +2271,112 @@ fn keys_fetch_follows_the_masters_policy() {
         .to_bytes()
         .is_err()
     );
+}
+
+/// A signing request by `caller` at server 0, finished by the client.
+fn sign_as(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    caller: &str,
+    asked: &kuipa_enroll::sign::Request,
+) -> Result<Vec<kuipa_enroll::sign::Bundle>, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Sign,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &asked.to_bytes().unwrap())
+        .unwrap();
+    let response = r.send(0, Operation::Sign, &request)?;
+    pending.finish_sign(&response, adv, asked).map_err(|_| ())
+}
+
+#[test]
+fn signing_is_stated_logged_and_bound_by_policy() {
+    use kuipa_enroll::sign::{Digest, DigestAlg, Request as SignRequest, Signers};
+
+    let mut r = realm();
+    let asked = SignRequest {
+        purpose: "blob".into(),
+        digests: vec![
+            Digest::of(DigestAlg::Sha256, b"release-1.0.tar").unwrap(),
+            Digest::of(DigestAlg::Sha512, b"release-1.0.sig").unwrap(),
+        ],
+    };
+    let adv = r.verify(0);
+    // No log, no statement.
+    r.dir.sign_policy.borrow_mut().purposes.insert(
+        "blob".into(),
+        Signers {
+            users: vec!["alice".into()],
+            groups: vec!["release".into()],
+            ..Signers::default()
+        },
+    );
+    assert!(sign_as(&r, &adv, ALICE, &asked).is_err());
+
+    let ledger = Arc::new(MemoryLedger::new(SERVERS[0]));
+    let first = r.servers.remove(0).with_ledger(ledger.clone());
+    r.servers.insert(0, first);
+    let adv = r.verify(0);
+    let anchors = r.all_anchors();
+    let bundles = sign_as(&r, &adv, ALICE, &asked).unwrap();
+    assert_eq!(bundles.len(), 2);
+    let v = bundles[1]
+        .verify(b"release-1.0.sig", REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_eq!(v.principal.to_string(), ALICE);
+    assert_eq!(
+        (v.purpose.as_str(), v.server.as_str()),
+        ("blob", SERVERS[0])
+    );
+    assert!(
+        bundles[0]
+            .verify(b"release-1.0.sig", REALM, &anchors, &Policy::default())
+            .is_err()
+    );
+
+    // The statement is in the log, under Alice's index, naming nobody.
+    let leaves = ledger.leaves();
+    let leaf = &leaves[usize::try_from(v.index).unwrap()];
+    assert_eq!(leaf.kind, tlog::Kind::STATEMENT);
+    assert_eq!(
+        leaf.index,
+        tlog::index(&ledger.key, ALICE.as_bytes()).unwrap()
+    );
+    assert!(!leaf.to_bytes().windows(5).any(|w| w == b"alice"));
+    // Alice finds it with a lookup of her principal's entries.
+    let mine = tlog_lookup(
+        &r,
+        &adv,
+        ALICE,
+        &tlog::Query {
+            vault: String::new(),
+            from: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(mine.entries.len(), 1);
+
+    // Bob may not sign for blob, until he joins the release group; nobody
+    // signs for an unknown purpose; a locked principal signs nothing.
+    assert!(sign_as(&r, &adv, BOB, &asked).is_err());
+    r.dir
+        .groups
+        .borrow_mut()
+        .insert(BOB.into(), vec!["release".into()]);
+    sign_as(&r, &adv, BOB, &asked).unwrap();
+    let other = SignRequest {
+        purpose: "git-commit".into(),
+        ..asked.clone()
+    };
+    assert!(sign_as(&r, &adv, ALICE, &other).is_err());
+    r.dir.disabled.borrow_mut().insert(ALICE.into());
+    assert!(sign_as(&r, &adv, ALICE, &asked).is_err());
 }

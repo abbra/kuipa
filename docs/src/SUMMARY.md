@@ -25,6 +25,7 @@
 # Users
 
 - [Sealing your own files](user/sealing.md)
+- [Signing under your ticket](user/signing.md)
 
 # Scenarios
 
