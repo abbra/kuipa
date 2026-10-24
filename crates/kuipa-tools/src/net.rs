@@ -485,7 +485,7 @@ impl Endpoint {
             .map(|h| {
                 h.as_str()
                     .and_then(|h| b64::decode(h).ok())
-                    .and_then(|h| h.try_into().ok())
+                    .and_then(|h| kuipa_enroll::merkle::Hash::from_slice(&h).ok())
                     .ok_or_else(malformed)
             })
             .collect()

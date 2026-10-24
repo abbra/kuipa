@@ -164,8 +164,11 @@ vault description stored on this machine does not account for is marked
 policy you didn't set. If you made the change yourself from another
 machine, `kuipa seal show personal` updates the description, and the
 next watch is clean. A server whose log no longer extends what you saw
-before is reported as `FORKED`, which means its log was rewritten. The
-first watch only records where each log stands; run it once soon after
+before is reported as `FORKED`, which means its log was rewritten. A
+server that changed to keys of another strength, as a change of the
+crypto policy makes it do, keeps a new log under a new id: that is
+`NEW LOG`, not a fork, and the new log is read and checked from its
+start. The first watch only records where each log stands; run it once soon after
 creating a vault. A periodic job (a systemd user timer, cron) can run it
 for you: it exits non-zero when something needs a look.
 

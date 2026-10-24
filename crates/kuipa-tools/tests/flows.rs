@@ -14,6 +14,7 @@ use kuipa_enroll::delegation::{Delegation, SignedVouch};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::epoch::{AnchorEpoch, SignedEpoch};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
+use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::payload::{Enrollment, RealmConfig};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys};
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
@@ -153,6 +154,19 @@ fn traced<T>(f: impl FnOnce() -> T) -> (T, String) {
     (out, text)
 }
 
+/// The tree hash of the ML-DSA-65 keys these tests sign with.
+const S256: TreeHash = TreeHash::Sha256;
+
+/// A SHA-256-sized tree hash of `byte`s.
+fn test_hash(byte: u8) -> kuipa_enroll::merkle::Hash {
+    kuipa_enroll::merkle::Hash::from_slice(&[byte; 32]).unwrap()
+}
+
+/// The hash of the log `keys` sign.
+fn tree(keys: &ServerKeys) -> TreeHash {
+    TreeHash::for_signer(keys.signing.public().alg())
+}
+
 fn server_keys(anchor: &SigningKey, fqdn: &str) -> (ServerKeys, RealmInfo, Delegation) {
     let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let delegation = Delegation::issue(
@@ -270,7 +284,11 @@ fn string(anchor: &SigningKey, secret: &[u8]) -> EnrollmentString {
 }
 
 /// A v2 enrollment string pinning the anchor's vouch head (§4.9).
-fn string_with_head(anchor: &SigningKey, head: (u64, [u8; 32]), secret: &[u8]) -> EnrollmentString {
+fn string_with_head(
+    anchor: &SigningKey,
+    head: (u64, kuipa_enroll::merkle::Hash),
+    secret: &[u8],
+) -> EnrollmentString {
     EnrollmentString::with_head(
         REALM,
         *anchor.public().thumbprint(),
@@ -289,7 +307,7 @@ fn head_pinned_client_enrolls_without_any_signature() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -374,7 +392,7 @@ fn a_stale_head_falls_back_to_the_signature_proof() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -398,7 +416,7 @@ fn a_stale_head_falls_back_to_the_signature_proof() {
     // the server cannot serve a head proof, and serves the signature
     // proof instead.  The client pins the anchor by thumbprint too, so
     // verification succeeds through the signature.
-    let mut s = string_with_head(&anchor, (7, [9; 32]), b"Secret123");
+    let mut s = string_with_head(&anchor, (7, test_hash(9)), b"Secret123");
     let otp = s.take_secret().unwrap();
     let (result, trace) = traced(|| {
         flows::enroll_online(
@@ -1395,7 +1413,7 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
     let vouch = SignedVouch::issue(
         &other,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -1659,7 +1677,7 @@ fn trusted_realms_pins_and_uses_the_partners_heads() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -1714,7 +1732,7 @@ fn trusted_realms_pins_and_uses_the_partners_heads() {
     let b_vouch = SignedVouch::issue(
         &b,
         "B.TEST",
-        [b_claim.leaf().unwrap()],
+        [b_claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -1861,7 +1879,7 @@ fn a_mirror_serves_what_it_cached_and_no_authenticated_route() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2035,7 +2053,7 @@ fn a_frozen_pin_refuses_what_its_head_does_not_prove() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2113,7 +2131,7 @@ fn a_frozen_pin_refuses_what_its_head_does_not_prove() {
         let v = SignedVouch::issue(
             &anchor,
             REALM,
-            [c.leaf().unwrap()],
+            [c.leaf(S256).unwrap()],
             now(),
             now() + 86_400,
             None,
@@ -2217,7 +2235,7 @@ fn the_claim_log_carries_the_heads_signed_vouch() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2260,15 +2278,13 @@ fn the_claim_log_carries_the_heads_signed_vouch() {
         .verify(anchor.public(), &tang_pqc::Policy::default())
         .unwrap();
     // And the page's leaves hash to the vouch's head.
-    let leaves: Vec<[u8; 32]> = page["leaves"]
+    let leaves: Vec<kuipa_enroll::merkle::Hash> = page["leaves"]
         .as_array()
         .unwrap()
         .iter()
         .map(|l| {
             let bytes = tang_pqc::b64::decode(l.as_str().unwrap()).unwrap();
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&bytes);
-            h
+            kuipa_enroll::merkle::Hash::from_slice(&bytes).unwrap()
         })
         .collect();
     assert_eq!(
@@ -2310,7 +2326,7 @@ fn a_window_grows_only_through_a_consistent_log() {
     let v1 = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2366,7 +2382,7 @@ fn a_window_grows_only_through_a_consistent_log() {
     let v2 = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap(), other_claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap(), other_claim.leaf(S256).unwrap()],
         now(),
         now() + 86_400,
         Some(&vouch_of(&server, pin)),
@@ -2414,10 +2430,8 @@ fn a_window_grows_only_through_a_consistent_log() {
                         }
                         for leaf in &page.leaves {
                             if let Ok(bytes) = tang_pqc::b64::decode(leaf)
-                                && bytes.len() == 32
+                                && let Ok(h) = kuipa_enroll::merkle::Hash::from_slice(&bytes)
                             {
-                                let mut h = [0u8; 32];
-                                h.copy_from_slice(&bytes);
                                 leaves.push(h);
                             }
                         }
@@ -2461,7 +2475,7 @@ fn a_window_grows_only_through_a_consistent_log() {
     let v3 = SignedVouch::issue(
         &anchor,
         REALM,
-        [other_claim.leaf().unwrap(), claim.leaf().unwrap()],
+        [other_claim.leaf(S256).unwrap(), claim.leaf(S256).unwrap()],
         now(),
         now() + 86_400,
         None,
@@ -2493,10 +2507,8 @@ fn a_window_grows_only_through_a_consistent_log() {
                     }
                     for leaf in &page.leaves {
                         if let Ok(bytes) = tang_pqc::b64::decode(leaf)
-                            && bytes.len() == 32
+                            && let Ok(h) = kuipa_enroll::merkle::Hash::from_slice(&bytes)
                         {
-                            let mut h = [0u8; 32];
-                            h.copy_from_slice(&bytes);
                             leaves.push(h);
                         }
                     }
@@ -2565,7 +2577,7 @@ fn audit_reports_coverage_and_split_views() {
     let v1 = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2587,7 +2599,8 @@ fn audit_reports_coverage_and_split_views() {
         kuipa_tools::audit::coverage("audit1.example.test", &[(pin, head1.0, head1.1)]).unwrap();
     assert_eq!(report["anchors"][0]["state"], "current", "{report}");
     let report =
-        kuipa_tools::audit::coverage("audit1.example.test", &[(pin, head1.0, [7; 32])]).unwrap();
+        kuipa_tools::audit::coverage("audit1.example.test", &[(pin, head1.0, test_hash(7))])
+            .unwrap();
     assert!(
         report["anchors"][0]["state"]
             .as_str()
@@ -2623,7 +2636,7 @@ fn audit_reports_coverage_and_split_views() {
     let v2 = SignedVouch::issue(
         &anchor,
         REALM,
-        [other_claim.leaf().unwrap(), claim.leaf().unwrap()],
+        [other_claim.leaf(S256).unwrap(), claim.leaf(S256).unwrap()],
         now(),
         now() + 86_400,
         None,
@@ -2746,7 +2759,7 @@ fn an_expired_pin_is_no_trust_at_all() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2830,7 +2843,7 @@ fn a_forged_partner_head_is_not_pinned() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2857,7 +2870,7 @@ fn a_forged_partner_head_is_not_pinned() {
     let b_vouch = SignedVouch::issue(
         &b,
         "B.TEST",
-        [b_claim.leaf().unwrap()],
+        [b_claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -2906,7 +2919,7 @@ fn a_forged_partner_head_is_not_pinned() {
         heads: vec![kuipa_enroll::delegation::HeadPin {
             anchor: b_pin,
             size: 99,
-            root: [7; 32],
+            root: test_hash(7),
         }],
     }];
     info.validate().unwrap();
@@ -2948,7 +2961,7 @@ fn a_forged_partner_head_is_not_pinned() {
         pins[0]
             .heads
             .iter()
-            .all(|(size, root)| *size != 99 && *root != [7; 32]),
+            .all(|(size, root)| *size != 99 && *root != test_hash(7)),
         "a forged head was pinned: {:?}",
         pins[0].heads
     );
@@ -2989,14 +3002,15 @@ fn a_frozen_pin_needs_a_proof_by_its_own_head() {
     let (keys, _, delegation) = server_keys(&f, "mixed1.example.test");
     let claim = delegation.claim().unwrap();
     // F vouches for a log that does not contain this claim at all.
-    let other = kuipa_enroll::merkle::leaf_hash(b"another claim entirely").unwrap();
+    let other =
+        kuipa_enroll::merkle::leaf_hash(TreeHash::Sha256, b"another claim entirely").unwrap();
     let f_vouch = SignedVouch::issue(&f, REALM, [other], now() - 60, now() + 86_400, None).unwrap();
     let f_head = f_vouch.head();
     // N vouches for the claim the server advertises.
     let n_vouch = SignedVouch::issue(
         &n,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -3117,7 +3131,7 @@ fn two_frozen_pins_must_both_prove_the_claim() {
     let f_vouch = SignedVouch::issue(
         &f,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -3126,7 +3140,7 @@ fn two_frozen_pins_must_both_prove_the_claim() {
     let n_vouch = SignedVouch::issue(
         &n,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -3200,7 +3214,7 @@ fn two_frozen_pins_must_both_prove_the_claim() {
             kuipa_tools::paths::Pin {
                 anchor: fp,
                 exp: None,
-                heads: vec![(7, [9; 32])],
+                heads: vec![(7, test_hash(9))],
                 frozen: true,
                 retired: Vec::new(),
             },
@@ -3248,11 +3262,12 @@ fn a_whole_window_travels_so_the_newest_head_proves() {
     let claim = delegation.claim().unwrap();
     // The claim is the second leaf: the pinned window's oldest head, over
     // the first leaf alone, cannot prove it.
-    let older = kuipa_enroll::merkle::leaf_hash(b"an earlier enrollment").unwrap();
+    let older =
+        kuipa_enroll::merkle::leaf_hash(TreeHash::Sha256, b"an earlier enrollment").unwrap();
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [older, claim.leaf().unwrap()],
+        [older, claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -3338,7 +3353,7 @@ fn bundle_enroll(
     anchor: &SigningKey,
     keys: &ServerKeys,
     delegation: &Delegation,
-    heads: Vec<Option<(u64, [u8; 32])>>,
+    heads: Vec<Option<(u64, kuipa_enroll::merkle::Hash)>>,
     issuer: &str,
 ) -> Result<serde_json::Value, kuipa_tools::paths::Error> {
     let _ = flows::prepare(paths, false, HOST);
@@ -3391,7 +3406,7 @@ fn a_payload_head_nothing_signed_is_not_pinned() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -3416,7 +3431,7 @@ fn a_payload_head_nothing_signed_is_not_pinned() {
         &anchor,
         &bundle_keys,
         &bundle_delegation,
-        vec![Some((9, [9; 32]))],
+        vec![Some((9, test_hash(9)))],
         "back1.example.test",
     )
     .unwrap();
@@ -3461,7 +3476,7 @@ fn a_head_beyond_the_fetch_cap_is_not_pinned() {
     let vouch = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -3479,7 +3494,7 @@ fn a_head_beyond_the_fetch_cap_is_not_pinned() {
     serve_as("cap1.example.test", app(server, Dir::default()));
 
     // A window of one leaf, and a payload head past the budget.
-    let leaf = kuipa_enroll::merkle::leaf_hash(b"the pinned leaf").unwrap();
+    let leaf = kuipa_enroll::merkle::leaf_hash(TreeHash::Sha256, b"the pinned leaf").unwrap();
     let pinned = (1, kuipa_enroll::merkle::root(&[leaf]).unwrap());
     let paths = root("fetch-cap");
     write_pins(
@@ -3538,8 +3553,9 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, info, delegation) = server_keys(&anchor, "tlog1.example.test");
     let signer = keys.signing.public().clone();
-    let ledger =
-        Arc::new(kuipad::ledger::FileLedger::open(&dir, REALM, "tlog1.example.test").unwrap());
+    let ledger = Arc::new(
+        kuipad::ledger::FileLedger::open(&dir, REALM, "tlog1.example.test", tree(&keys)).unwrap(),
+    );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
     let url = spawn(Arc::new(App {
         server,
@@ -3557,7 +3573,7 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     let json = |path: &str| -> serde_json::Value {
         serde_json::from_slice(&get(path).bytes().unwrap()).unwrap()
     };
-    let hashes = |v: &serde_json::Value| -> Vec<[u8; 32]> {
+    let hashes = |v: &serde_json::Value| -> Vec<kuipa_enroll::merkle::Hash> {
         v.as_array()
             .unwrap()
             .iter()
@@ -3602,7 +3618,7 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     assert_eq!(get("proof?index=1").status(), 400);
     assert_eq!(get("proof?index=7&size=5").status(), 404);
     assert_eq!(get("consistency?from=2&size=9").status(), 404);
-    let other = kuipa_enroll::tlog::LogId::of(REALM, "elsewhere").unwrap();
+    let other = kuipa_enroll::tlog::LogId::of(REALM, "elsewhere", TreeHash::Sha256).unwrap();
     let status = http
         .get(format!("{url}/ipa/ku/tlog/{other}/head"))
         .send()
@@ -3622,7 +3638,7 @@ fn tlog_server(
 ) -> Arc<kuipad::ledger::FileLedger> {
     let (keys, info, delegation) = server_keys(anchor, fqdn);
     let ledger = Arc::new(
-        kuipad::ledger::FileLedger::open(dir, REALM, fqdn)
+        kuipad::ledger::FileLedger::open(dir, REALM, fqdn, tree(&keys))
             .unwrap()
             .with_witnesses(witnesses.iter().map(|w| w.public().clone()).collect()),
     );
@@ -3787,7 +3803,7 @@ fn a_host_pins_what_its_anchors_logs_retired() {
     let v1 = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap(), gone.leaf().unwrap()],
+        [claim.leaf(S256).unwrap(), gone.leaf(S256).unwrap()],
         now() - 60,
         now() + 86_400,
         None,
@@ -3796,13 +3812,13 @@ fn a_host_pins_what_its_anchors_logs_retired() {
     let v2 = SignedVouch::issue(
         &anchor,
         REALM,
-        [claim.leaf().unwrap()],
+        [claim.leaf(S256).unwrap()],
         now() - 30,
         now() + 86_400,
         Some(&v1),
     )
     .unwrap();
-    assert_eq!(v2.retired(), &[gone.leaf().unwrap()]);
+    assert_eq!(v2.retired(), &[gone.leaf(S256).unwrap()]);
     delegation.add(v2.proof(&claim, anchor.public()).unwrap());
     let mut vouches = std::collections::HashMap::new();
     vouches.insert(pin, v2.clone());
@@ -3836,6 +3852,6 @@ fn a_host_pins_what_its_anchors_logs_retired() {
     .unwrap();
     let pins = kuipa_tools::paths::read_anchor_pins(&paths.anchors()).unwrap();
     assert_eq!(pins[0].heads, vec![v2.head()], "{pins:?}");
-    assert_eq!(pins[0].retired, vec![gone.leaf().unwrap()], "{pins:?}");
+    assert_eq!(pins[0].retired, vec![gone.leaf(S256).unwrap()], "{pins:?}");
     kuipa_tools::net::clear_thread_endpoints();
 }

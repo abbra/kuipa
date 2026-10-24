@@ -20,6 +20,11 @@ release-1.0.txt -> release-1.0.txt.kusig
 Signed by alice@EXAMPLE.TEST for blob at 2026-10-24 13:30:02 UTC, stated by ipa1.example.test (log 3f2a… #41).
 ```
 
+The files are digested with SHA-256, or with SHA-384 when the host's
+crypto policy is CNSA 2.0. A CNSA realm signs with ML-DSA-87 and refuses
+SHA-256 digests. Bundles made under either policy verify anywhere that
+pins the realm's anchors and whose own policy allows the signer's key.
+
 The purpose (`blob` by default, `--purpose` otherwise) must be one the
 realm's signing policy lets you sign for. Your administrators decide
 who signs what, by name or by group.

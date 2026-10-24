@@ -36,7 +36,7 @@ use tang_pqc::wire::{Reader, Writer};
 use tang_pqc::{Policy, SigningKey, Thumbprint, VerifyingKey, b64};
 
 use crate::error::{Error, Result};
-use crate::merkle::{self, Hash};
+use crate::merkle::{self, Hash, TreeHash};
 
 /// Accepted clock skew, in seconds.
 pub const CLOCK_SKEW: u64 = 300;
@@ -139,18 +139,19 @@ impl Claim {
         Ok(claim)
     }
 
-    /// Its leaf hash in vouch trees: a typed log leaf of kind
+    /// Its leaf hash in a claim log of `alg` — the vouching anchor's
+    /// ([`TreeHash::for_signer`]): a typed log leaf of kind
     /// [`Kind::CLAIM`](crate::tlog::Kind::CLAIM), stamped with its `iat`,
     /// so a claim can never be read as another kind of leaf.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn leaf(&self) -> Result<Hash> {
+    pub fn leaf(&self, alg: TreeHash) -> Result<Hash> {
         crate::tlog::Leaf {
             kind: crate::tlog::Kind::CLAIM,
             time: self.iat,
-            index: [0; 32],
+            index: Hash::zero(alg),
             body: self.to_bytes(),
         }
         .hash()
@@ -186,7 +187,9 @@ pub struct Vouch {
 
 impl Vouch {
     /// Encode: `IPVH ‖ 1 ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖
-    /// root(32) ‖ live_size ‖ live_root(32)`; these are the signed bytes.
+    /// root ‖ live_size ‖ live_root`, the roots length prefixed (32 bytes
+    /// for SHA-256, 48 for SHA-384, as the anchor's key decides); these
+    /// are the signed bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(VOUCH_MAGIC)
@@ -196,9 +199,9 @@ impl Vouch {
             .u64(self.iat)
             .u64(self.exp)
             .u64(self.size)
-            .fixed(&self.root)
+            .bytes(&self.root)
             .u64(self.live_size)
-            .fixed(&self.live_root)
+            .bytes(&self.live_root)
             .finish()
     }
 
@@ -218,10 +221,13 @@ impl Vouch {
             iat: r.u64()?,
             exp: r.u64()?,
             size: r.u64()?,
-            root: r.fixed()?,
+            root: Hash::from_slice(r.bytes()?)?,
             live_size: r.u64()?,
-            live_root: r.fixed()?,
+            live_root: Hash::from_slice(r.bytes()?)?,
         };
+        if vouch.root.alg() != vouch.live_root.alg() {
+            return Err(Error::Malformed("vouch roots of two hashes"));
+        }
         r.finish()?;
         check_period(vouch.iat, vouch.exp, MAX_VOUCH_VALIDITY, "vouch validity")?;
         Ok(vouch)
@@ -257,11 +263,12 @@ impl LogEntry {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn hash(&self) -> Result<Hash> {
+    pub fn hash(&self, alg: TreeHash) -> Result<Hash> {
         match self {
-            Self::Claim(h) => Ok(*h),
+            Self::Claim(h) if h.alg() == alg => Ok(*h),
+            Self::Claim(_) => Err(Error::Malformed("vouch: a claim of another hash")),
             Self::Tombstone { target, time } => {
-                crate::tlog::Leaf::tombstone(*time, *target, CLAIM_DROPPED).hash()
+                crate::tlog::Leaf::tombstone(alg, *time, *target, CLAIM_DROPPED).hash()
             }
         }
     }
@@ -276,7 +283,7 @@ struct Replayed {
     retired: Vec<Hash>,
 }
 
-fn replay(entries: &[LogEntry]) -> Result<Replayed> {
+fn replay(entries: &[LogEntry], alg: TreeHash) -> Result<Replayed> {
     let mut leaves = Vec::with_capacity(entries.len());
     let mut live: Vec<(u64, Hash)> = Vec::new();
     let mut retired = Vec::new();
@@ -298,7 +305,7 @@ fn replay(entries: &[LogEntry]) -> Result<Replayed> {
                 }
             }
         }
-        leaves.push(e.hash()?);
+        leaves.push(e.hash(alg)?);
     }
     let live: Vec<Hash> = live.into_iter().map(|(_, h)| h).collect();
     retired.retain(|h| !live.contains(h));
@@ -343,8 +350,9 @@ impl SignedVouch {
         previous: Option<&SignedVouch>,
     ) -> Result<Self> {
         check_period(iat, exp, MAX_VOUCH_VALIDITY, "vouch validity")?;
+        let alg = TreeHash::for_signer(anchor.public().alg());
         let entries = continue_log(leaves, previous, iat);
-        let replayed = replay(&entries)?;
+        let replayed = replay(&entries, alg)?;
         let vouch = Vouch {
             realm: realm.into(),
             anchor: *anchor.public().thumbprint(),
@@ -370,6 +378,12 @@ impl SignedVouch {
     #[must_use]
     pub fn vouch(&self) -> &Vouch {
         &self.vouch
+    }
+
+    /// The claim log's hash: the anchor key's ([`TreeHash::for_signer`]).
+    #[must_use]
+    pub fn alg(&self) -> TreeHash {
+        self.vouch.root.alg()
     }
 
     /// The claim log's leaf hashes, in log order.
@@ -416,7 +430,7 @@ impl SignedVouch {
         if merkle::root(&self.leaves[..n])? != *root {
             return Ok(None);
         }
-        Ok(Some(replay(&self.entries[..n])?.retired))
+        Ok(Some(replay(&self.entries[..n], self.alg())?.retired))
     }
 
     /// Check it against the anchor's `key`: the key's thumbprint, the
@@ -434,7 +448,7 @@ impl SignedVouch {
         }
         key.verify_with_context(&self.vouch.to_bytes(), VOUCH_CONTEXT, &self.signature)
             .map_err(|_| Error::UntrustedAnchor)?;
-        let replayed = replay(&self.entries)?;
+        let replayed = replay(&self.entries, self.alg())?;
         if replayed.leaves.len() as u64 != self.vouch.size
             || replayed.live.len() as u64 != self.vouch.live_size
             || merkle::root(&replayed.leaves)? != self.vouch.root
@@ -451,7 +465,7 @@ impl SignedVouch {
     ///
     /// An OpenSSL error.
     pub fn covers(&self, claim: &Claim) -> Result<bool> {
-        Ok(self.live.contains(&claim.leaf()?))
+        Ok(self.live.contains(&claim.leaf(self.alg())?))
     }
 
     /// The proof that it covers `claim`, by the anchor with `key`; `None`
@@ -461,7 +475,7 @@ impl SignedVouch {
     ///
     /// An OpenSSL error.
     pub fn proof(&self, claim: &Claim, key: &VerifyingKey) -> Result<Option<Proof>> {
-        let leaf = claim.leaf()?;
+        let leaf = claim.leaf(self.alg())?;
         let Some(index) = self.live.iter().position(|l| *l == leaf) else {
             return Ok(None);
         };
@@ -509,7 +523,7 @@ impl SignedVouch {
         {
             return Ok(None);
         }
-        let leaf = claim.leaf()?;
+        let leaf = claim.leaf(self.alg())?;
         let n = prefix.unwrap_or(0);
         // Live within the prefix: its last appearance there, and no
         // tombstone for it inside the prefix.
@@ -546,7 +560,7 @@ impl SignedVouch {
             .u64(self.entries.len() as u64);
         for e in &self.entries {
             match e {
-                LogEntry::Claim(h) => w.u8(1).fixed(h),
+                LogEntry::Claim(h) => w.u8(1).bytes(h),
                 LogEntry::Tombstone { target, time } => w.u8(2).u64(*target).u64(*time),
             };
         }
@@ -572,7 +586,7 @@ impl SignedVouch {
         let mut entries = Vec::new();
         for _ in 0..n {
             entries.push(match r.u8()? {
-                1 => LogEntry::Claim(r.fixed()?),
+                1 => LogEntry::Claim(Hash::from_slice(r.bytes()?)?),
                 2 => LogEntry::Tombstone {
                     target: r.u64()?,
                     time: r.u64()?,
@@ -581,7 +595,7 @@ impl SignedVouch {
             });
         }
         r.finish()?;
-        let replayed = replay(&entries)?;
+        let replayed = replay(&entries, vouch.root.alg())?;
         Ok(Self {
             vouch,
             signature,
@@ -924,12 +938,16 @@ impl Proof {
         let path: Vec<Hash> = self
             .path
             .iter()
-            .map(|h| b64::decode(h).ok()?.try_into().ok())
+            .map(|h| Hash::from_slice(&b64::decode(h).ok()?).ok())
             .collect::<Option<_>>()?;
         // Signature proofs are inclusion in the live tree: a claim the
-        // anchor dropped stops proving with the next vouch.
+        // anchor dropped stops proving with the next vouch.  The tree's
+        // hash is the anchor key's.
+        if vouch.live_root.alg() != TreeHash::for_signer(key.alg()) {
+            return None;
+        }
         merkle::verify(
-            &claim.leaf().ok()?,
+            &claim.leaf(vouch.live_root.alg()).ok()?,
             self.index,
             vouch.live_size,
             &path,
@@ -986,7 +1004,7 @@ impl HeadPin {
             .get("root")
             .and_then(Value::as_str)
             .and_then(|r| b64::decode(r).ok())
-            .and_then(|r| <[u8; 32]>::try_from(r).ok())
+            .and_then(|r| Hash::from_slice(&r).ok())
             .ok_or_else(malformed)?;
         Ok(Self { anchor, size, root })
     }
@@ -1003,7 +1021,7 @@ impl HeadPin {
         Ok(proof.anchor() == &self.anchor
             && proof.size == self.size
             && merkle::verify(
-                &claim.leaf()?,
+                &claim.leaf(self.root.alg())?,
                 proof.index,
                 self.size,
                 &proof.decode_path()?,
@@ -1095,7 +1113,7 @@ impl HeadProof {
     fn decode_path(&self) -> Result<Vec<Hash>> {
         self.path
             .iter()
-            .map(|h| b64::decode(h).ok().and_then(|b| b.try_into().ok()))
+            .map(|h| b64::decode(h).ok().and_then(|b| Hash::from_slice(&b).ok()))
             .collect::<Option<_>>()
             .ok_or(Error::Malformed("head proof path"))
     }
@@ -1106,12 +1124,13 @@ impl HeadProof {
     /// claims the host learned the pinned logs retired — proves nothing:
     /// it is still in every later tree, but no longer vouched for.
     fn check(&self, claim: &Claim, heads: &[HeadPin], retired: &[Hash]) -> Option<Thumbprint> {
-        if claim.leaf().is_ok_and(|l| retired.contains(&l)) {
-            return None;
-        }
-        heads
-            .iter()
-            .find_map(|h| h.check(claim, self).ok().filter(|b| *b).map(|_| h.anchor))
+        heads.iter().find_map(|h| {
+            // The claim's leaf in this head's log, of the head's hash.
+            let retired_here = claim
+                .leaf(h.root.alg())
+                .map_or(true, |l| retired.contains(&l));
+            (!retired_here && h.check(claim, self).ok()?).then_some(h.anchor)
+        })
     }
 }
 
@@ -1206,7 +1225,7 @@ impl Delegation {
         let vouch = SignedVouch::issue(
             anchor,
             realm,
-            [claim.leaf()?],
+            [claim.leaf(TreeHash::for_signer(anchor.public().alg()))?],
             iat,
             (iat + VOUCH_VALIDITY).min(exp),
             None,
@@ -1789,7 +1808,11 @@ mod tests {
             .enumerate()
             .map(|(i, s)| claim(&anchor, &format!("s{i}"), s))
             .collect();
-        let leaves = |n: usize| claims[..n].iter().map(|c| c.leaf().unwrap());
+        let leaves = |n: usize| {
+            claims[..n]
+                .iter()
+                .map(|c| c.leaf(TreeHash::Sha256).unwrap())
+        };
 
         // The first vouch covers two claims; a head pinned at it.
         let v1 = SignedVouch::issue(&anchor, "R", leaves(2), NOW, NOW + 100, None).unwrap();
@@ -1830,7 +1853,7 @@ mod tests {
         );
         // A head the log does not make (wrong root, or too long) is
         // refused: no head proof at all.
-        let wrong = (head1.size, [9; 32]);
+        let wrong = (head1.size, crate::merkle::test_hash(9));
         assert!(v2.head_proof(&claims[0], &thp, wrong).unwrap().is_none());
         let beyond = (v2.leaves().len() as u64 + 1, v2.vouch().root);
         assert!(v2.head_proof(&claims[0], &thp, beyond).unwrap().is_none());
@@ -1848,7 +1871,7 @@ mod tests {
             .collect();
         let leaves = |keep: &[usize]| {
             keep.iter()
-                .map(|i| claims[*i].leaf().unwrap())
+                .map(|i| claims[*i].leaf(TreeHash::Sha256).unwrap())
                 .collect::<Vec<_>>()
         };
 
@@ -1926,7 +1949,7 @@ mod tests {
         let anchor = key();
         let sign = |entries: Vec<LogEntry>| {
             // A vouch over any entries, signed honestly over what they make.
-            let replayed = replay(&entries);
+            let replayed = replay(&entries, TreeHash::Sha256);
             replayed.map(|r| {
                 let vouch = Vouch {
                     realm: "R".into(),
@@ -1936,7 +1959,7 @@ mod tests {
                     size: r.leaves.len() as u64,
                     root: merkle::root(&r.leaves).unwrap(),
                     live_size: r.live.len() as u64,
-                    live_root: merkle::root(&r.live).unwrap_or([0; 32]),
+                    live_root: merkle::root(&r.live).unwrap_or(crate::merkle::test_hash(0)),
                 };
                 let signature = anchor
                     .sign_with_context(&vouch.to_bytes(), VOUCH_CONTEXT)
@@ -1952,7 +1975,7 @@ mod tests {
             })
         };
         let t = |target| LogEntry::Tombstone { target, time: NOW };
-        let c = |n: u8| LogEntry::Claim([n; 32]);
+        let c = |n: u8| LogEntry::Claim(crate::merkle::test_hash(n));
         // A tombstone for a later index, for a tombstone, twice; a claim
         // appended while live: none replays.
         for bad in [
@@ -1968,7 +1991,10 @@ mod tests {
         good.verify(anchor.public(), &Policy::default()).unwrap();
         let parsed = SignedVouch::from_bytes(&good.to_bytes()).unwrap();
         assert_eq!(parsed, good);
-        assert_eq!(parsed.live(), &[[2; 32], [1; 32]]);
+        assert_eq!(
+            parsed.live(),
+            &[crate::merkle::test_hash(2), crate::merkle::test_hash(1)]
+        );
         // A tampered entry no longer makes the signed trees.
         let mut tampered = good.clone();
         tampered.entries[1] = c(3);
@@ -1991,15 +2017,25 @@ mod tests {
         let b = claim(&anchor, "b.example.test", &key());
         let a = claim(&anchor, "a.example.test", &key());
 
-        let v1 =
-            SignedVouch::issue(&anchor, "R", [b.leaf().unwrap()], NOW, NOW + 100, None).unwrap();
+        let v1 = SignedVouch::issue(
+            &anchor,
+            "R",
+            [b.leaf(TreeHash::Sha256).unwrap()],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
         let pinned = v1.head();
 
         // "a" joins and sorts before "b": the caller hands [a, b].
         let v2 = SignedVouch::issue(
             &anchor,
             "R",
-            [a.leaf().unwrap(), b.leaf().unwrap()],
+            [
+                a.leaf(TreeHash::Sha256).unwrap(),
+                b.leaf(TreeHash::Sha256).unwrap(),
+            ],
             NOW + 1,
             NOW + 101,
             Some(&v1),
@@ -2007,7 +2043,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             v2.leaves(),
-            &[b.leaf().unwrap(), a.leaf().unwrap()],
+            &[
+                b.leaf(TreeHash::Sha256).unwrap(),
+                a.leaf(TreeHash::Sha256).unwrap()
+            ],
             "the old log keeps its order; the new claim appends"
         );
         assert!(v2.covers(&b).unwrap());
@@ -2029,13 +2068,23 @@ mod tests {
         let v = SignedVouch::issue(
             &anchor,
             "R",
-            [c1.leaf().unwrap(), c2.leaf().unwrap(), c1.leaf().unwrap()],
+            [
+                c1.leaf(TreeHash::Sha256).unwrap(),
+                c2.leaf(TreeHash::Sha256).unwrap(),
+                c1.leaf(TreeHash::Sha256).unwrap(),
+            ],
             NOW,
             NOW + 100,
             None,
         )
         .unwrap();
-        assert_eq!(v.leaves(), &[c1.leaf().unwrap(), c2.leaf().unwrap()]);
+        assert_eq!(
+            v.leaves(),
+            &[
+                c1.leaf(TreeHash::Sha256).unwrap(),
+                c2.leaf(TreeHash::Sha256).unwrap()
+            ]
+        );
         v.verify(anchor.public(), &Policy::default())
             .unwrap_or_else(|e| panic!("an issued vouch must survive verify: {e}"));
     }
@@ -2047,9 +2096,20 @@ mod tests {
         let anchor = key();
         let thp = *anchor.public().thumbprint();
         let c = claim(&anchor, "a", &key());
-        let v =
-            SignedVouch::issue(&anchor, "R", [c.leaf().unwrap()], NOW, NOW + 100, None).unwrap();
-        assert!(v.head_proof(&c, &thp, (0, [0; 32])).unwrap().is_none());
+        let v = SignedVouch::issue(
+            &anchor,
+            "R",
+            [c.leaf(TreeHash::Sha256).unwrap()],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
+        assert!(
+            v.head_proof(&c, &thp, (0, crate::merkle::test_hash(0)))
+                .unwrap()
+                .is_none()
+        );
     }
 
     // The heads a delegation proves by signature (§4.9.6): an advertised
@@ -2069,7 +2129,7 @@ mod tests {
         )
         .unwrap();
         let p = Policy::default();
-        let leaf = d.claim().unwrap().leaf().unwrap();
+        let leaf = d.claim().unwrap().leaf(TreeHash::Sha256).unwrap();
         assert_eq!(
             d.verified_heads(&p, NOW),
             vec![HeadPin {
@@ -2100,7 +2160,10 @@ mod tests {
         let v = SignedVouch::issue(
             &anchor,
             "R",
-            [c.leaf().unwrap(), c2.leaf().unwrap()],
+            [
+                c.leaf(TreeHash::Sha256).unwrap(),
+                c2.leaf(TreeHash::Sha256).unwrap(),
+            ],
             NOW,
             NOW + 100,
             None,
@@ -2181,6 +2244,58 @@ mod tests {
     }
 
     #[test]
+    fn a_cnsa_anchor_keeps_a_sha_384_claim_log() {
+        // An ML-DSA-87 anchor (CNSA 2.0) hashes its claim log with
+        // SHA-384: the vouch's roots are 48 bytes, the delegation's
+        // proof verifies under CNSA, and SHA-256 leaves are refused.
+        let anchor = SigningKey::generate(SignatureAlg::MlDsa87).unwrap();
+        let server = SigningKey::generate(SignatureAlg::MlDsa87).unwrap();
+        let d = Delegation::issue(
+            &anchor,
+            "R",
+            "ipa1.r",
+            server.public(),
+            NOW,
+            NOW + DEFAULT_VALIDITY,
+        )
+        .unwrap();
+        let d = Delegation::from_json(d.to_json().as_bytes()).unwrap();
+        let pinned = [*anchor.public().thumbprint()];
+        d.verify_at(&pinned, &Policy::cnsa2(), NOW + 10).unwrap();
+        let c = claim(&anchor, "ipa1.r", &server);
+        let v = SignedVouch::issue(
+            &anchor,
+            "R",
+            [c.leaf(TreeHash::Sha384).unwrap()],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
+        let v = SignedVouch::from_bytes(&v.to_bytes()).unwrap();
+        assert_eq!(v.alg(), TreeHash::Sha384);
+        assert_eq!((v.vouch().root.len(), v.vouch().live_root.len()), (48, 48));
+        assert!(v.covers(&c).unwrap());
+        let head = (v.vouch().size, v.vouch().root);
+        assert!(
+            v.head_proof(&c, anchor.public().thumbprint(), head)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            SignedVouch::issue(
+                &anchor,
+                "R",
+                [c.leaf(TreeHash::Sha256).unwrap()],
+                NOW,
+                NOW + 100,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn one_vouch_covers_many_claims() {
         let anchors: Vec<_> = (0..3).map(|_| key()).collect();
         let signing: Vec<_> = (0..3).map(|_| key()).collect();
@@ -2191,7 +2306,7 @@ mod tests {
         let v = SignedVouch::issue(
             &anchors[0],
             "R",
-            claims.iter().map(|c| c.leaf().unwrap()),
+            claims.iter().map(|c| c.leaf(TreeHash::Sha256).unwrap()),
             NOW,
             NOW + VOUCH_VALIDITY,
             None,
@@ -2222,8 +2337,15 @@ mod tests {
         let (own, other, signing) = (key(), key(), key());
         let c = claim(&own, "s", &signing);
         let vouch = |a: &SigningKey| {
-            SignedVouch::issue(a, "R", [c.leaf().unwrap()], NOW, NOW + VOUCH_VALIDITY, None)
-                .unwrap()
+            SignedVouch::issue(
+                a,
+                "R",
+                [c.leaf(TreeHash::Sha256).unwrap()],
+                NOW,
+                NOW + VOUCH_VALIDITY,
+                None,
+            )
+            .unwrap()
         };
         let mut d = Delegation::new(&c);
         d.add(vouch(&own).proof(&c, own.public()).unwrap());
@@ -2263,15 +2385,29 @@ mod tests {
         ));
         // A vouch for another realm.
         let claim = d.claim().unwrap();
-        let other = SignedVouch::issue(&anchor, "X", [claim.leaf().unwrap()], NOW, NOW + 100, None)
-            .unwrap();
+        let other = SignedVouch::issue(
+            &anchor,
+            "X",
+            [claim.leaf(TreeHash::Sha256).unwrap()],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
         let mut d2 = Delegation::new(&claim);
         d2.add(other.proof(&claim, anchor.public()).unwrap());
         assert!(d2.verify_at(&pinned, &Policy::default(), NOW).is_err());
         // Leaves that do not make the signed tree.
-        let mut sv =
-            SignedVouch::issue(&anchor, "R", [[1; 32], [2; 32]], NOW, NOW + 100, None).unwrap();
-        sv.entries[1] = LogEntry::Claim([3; 32]);
+        let mut sv = SignedVouch::issue(
+            &anchor,
+            "R",
+            [crate::merkle::test_hash(1), crate::merkle::test_hash(2)],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
+        sv.entries[1] = LogEntry::Claim(crate::merkle::test_hash(3));
         assert!(sv.verify(anchor.public(), &Policy::default()).is_err());
     }
 }

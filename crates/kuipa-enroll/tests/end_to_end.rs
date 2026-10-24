@@ -14,6 +14,7 @@ use kuipa_enroll::join::{
     AuthType, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
+use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::{
     Accepted, Appended, Directory, DirectoryError, Ledger, Staged, parse_stage_result,
@@ -439,7 +440,9 @@ fn exchange(anchors: &[SigningKey], servers: &[EnrollServer], own: &[Delegation]
         Trust::compute(state, &claims[i], &attested, &members, &policy, now()).unwrap()
     };
     for (i, anchor) in anchors.iter().enumerate() {
-        let leaves = trust(&state, i).leaves().unwrap();
+        let leaves = trust(&state, i)
+            .leaves(TreeHash::for_signer(anchor.public().alg()))
+            .unwrap();
         let vouch = SignedVouch::issue(
             anchor,
             REALM,
@@ -1402,10 +1405,12 @@ struct MemoryLedger {
 }
 
 impl MemoryLedger {
+    /// The test servers sign with ML-DSA-65, so their logs are SHA-256.
     fn new(server: &str) -> Self {
+        let id = LogId::of(REALM, server, TreeHash::Sha256).unwrap();
         Self {
             key: [7; 32],
-            log: Mutex::new((Log::new(LogId::of(REALM, server).unwrap()), Vec::new())),
+            log: Mutex::new((Log::new(id), Vec::new())),
         }
     }
 
@@ -1429,7 +1434,7 @@ impl Ledger for MemoryLedger {
         let leaf = Leaf {
             kind,
             time: now(),
-            index: tlog::index(&self.key, subject)?,
+            index: tlog::index(TreeHash::Sha256, &self.key, subject)?,
             body: body.to_vec(),
         };
         let mut log = self.log.lock().unwrap();
@@ -1462,7 +1467,7 @@ impl Ledger for MemoryLedger {
         size: u64,
         max: usize,
     ) -> Result<Vec<tlog::Entry>, DirectoryError> {
-        let index = tlog::index(&self.key, subject)?;
+        let index = tlog::index(TreeHash::Sha256, &self.key, subject)?;
         let log = self.log.lock().unwrap();
         let size = usize::try_from(size)?;
         let hashes = &log.0.hashes()[..size];
@@ -1633,7 +1638,7 @@ fn vault_events_are_logged_with_receipts() {
     );
 
     // Every leaf is indexed by the vault, and none names it or its owner.
-    let index = tlog::index(&ledger.key, sealed.vault().as_bytes()).unwrap();
+    let index = tlog::index(TreeHash::Sha256, &ledger.key, sealed.vault().as_bytes()).unwrap();
     for leaf in &leaves {
         assert_eq!(leaf.index, index);
         let bytes = leaf.to_bytes();
@@ -2348,7 +2353,7 @@ fn signing_is_stated_logged_and_bound_by_policy() {
     assert_eq!(leaf.kind, tlog::Kind::STATEMENT);
     assert_eq!(
         leaf.index,
-        tlog::index(&ledger.key, ALICE.as_bytes()).unwrap()
+        tlog::index(TreeHash::Sha256, &ledger.key, ALICE.as_bytes()).unwrap()
     );
     assert!(!leaf.to_bytes().windows(5).any(|w| w == b"alice"));
     // Alice finds it with a lookup of her principal's entries.

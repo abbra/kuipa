@@ -343,7 +343,7 @@ mod tests {
         HeadPin {
             anchor: Thumbprint::from_bytes([anchor; 32]),
             size,
-            root: [root; 32],
+            root: kuipa_enroll::merkle::Hash::from_slice(&[root; 32]).unwrap(),
         }
     }
 

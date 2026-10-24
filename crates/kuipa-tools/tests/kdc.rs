@@ -312,7 +312,9 @@ fn against_a_real_kdc() {
         own_anchors.push(*anchor.public().thumbprint());
         let key_dir = realm.dir.join(format!("keys-{fqdn}"));
         std::fs::create_dir_all(&key_dir).unwrap();
-        let ledger = Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, fqdn).unwrap());
+        let alg = kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg());
+        let ledger =
+            Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, fqdn, alg).unwrap());
         let server =
             Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
         let settings = Settings {
@@ -611,8 +613,22 @@ fn against_a_real_kdc() {
     seal.show("personal").unwrap();
     let accepted = seal.watch("personal").unwrap();
     assert_eq!(accepted["ok"], true, "{accepted}");
-    // A log that does not extend what was seen is reported as forked.
+    // A server whose key changed category (a crypto policy change) keeps
+    // a new log under a new id: reported as such, read from its start, not
+    // a fork.
     let state_path = home_dir_of(&realm).join("vaults/personal.tlog");
+    let mut watched: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    for w in watched.as_object_mut().unwrap().values_mut() {
+        w["log"] = "0".repeat(96).into();
+    }
+    std::fs::write(&state_path, serde_json::to_vec(&watched).unwrap()).unwrap();
+    let moved = seal.watch("personal").unwrap();
+    assert!(moved["forked"].as_array().unwrap().is_empty(), "{moved}");
+    assert!(!moved["relogged"].as_array().unwrap().is_empty(), "{moved}");
+    assert!(moved["baseline"].as_array().unwrap().is_empty(), "{moved}");
+    assert!(!moved["events"].as_array().unwrap().is_empty(), "{moved}");
+    // A log that does not extend what was seen is reported as forked.
     let mut watched: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
     for w in watched.as_object_mut().unwrap().values_mut() {

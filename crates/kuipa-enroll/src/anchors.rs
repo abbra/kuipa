@@ -33,7 +33,7 @@ use tang_pqc::{Policy, Thumbprint, VerifyingKey, b64, primitives};
 
 use crate::delegation::{Claim, Delegation, SignedSuccession, SignedVouch, VOUCH_VALIDITY};
 use crate::error::{Error, Result};
-use crate::merkle::Hash;
+use crate::merkle::{Hash, TreeHash};
 
 /// How long a claim may wait for a vouch before it is dropped (seconds).
 const UNVOUCHED_GRACE: u64 = 3600;
@@ -137,7 +137,8 @@ impl Entry {
                     VerifyingKey::from_jwk_json(jwk.as_bytes())?.thumbprint()
                 )
             }
-            Self::Claim(c) => format!("c {}", b64::encode(&c.leaf()?)),
+            // A local key, not a log leaf: any one hash names the claim.
+            Self::Claim(c) => format!("c {}", b64::encode(&c.leaf(TreeHash::Sha384)?)),
             Self::Vouch(v) => format!("v {}", v.vouch().anchor),
             Self::Succession(s) => {
                 // Also checks that it encodes, for `value`.
@@ -708,13 +709,14 @@ impl Trust {
     }
 
     /// The leaves this server's anchor should vouch for: every trusted
-    /// claim, its own included.
+    /// claim, its own included, hashed with `alg` — the anchor key's
+    /// ([`TreeHash::for_signer`]).
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn leaves(&self) -> Result<Vec<Hash>> {
-        self.servers.values().map(Claim::leaf).collect()
+    pub fn leaves(&self, alg: TreeHash) -> Result<Vec<Hash>> {
+        self.servers.values().map(|c| c.leaf(alg)).collect()
     }
 
     /// This server's delegation: its claim with a proof from every trusted
@@ -965,7 +967,7 @@ mod tests {
                 .put(Entry::Claim(own.clone()), REALM, &p, NOW, clock)
                 .unwrap();
             let t = Trust::compute(state, &own, attested, all, &p, NOW).unwrap();
-            let leaves = t.leaves().unwrap();
+            let leaves = t.leaves(TreeHash::Sha256).unwrap();
             if self.anchored && needs_vouch(state.vouch(&self.thp()), &leaves, NOW, self.interval) {
                 let iat = next_vouch_iat(state.vouch(&self.thp()), NOW);
                 let previous = state.vouch(&self.thp()).cloned();
@@ -1164,12 +1166,12 @@ mod tests {
         assert!(t.servers().any(|s| s == "b"));
         let v = state.vouch(&a.thp()).unwrap();
         assert_eq!(v.leaves().len(), 1);
-        let leaves = t.leaves().unwrap();
+        let leaves = t.leaves(TreeHash::Sha256).unwrap();
         assert!(!needs_vouch(Some(v), &leaves, NOW + 10, 3600));
         assert!(needs_vouch(Some(v), &leaves, NOW + 3600, 3600));
         // A removal (here a renewed own claim replacing the old one) does
         // not wait.
-        let renewed = [a.claim(NOW + 5).leaf().unwrap()];
+        let renewed = [a.claim(NOW + 5).leaf(TreeHash::Sha256).unwrap()];
         assert!(needs_vouch(Some(v), &renewed, NOW + 10, 3600));
     }
 
@@ -1269,7 +1271,7 @@ mod tests {
             v.vouch().iat + VOUCH_VALIDITY / 2,
             0
         ));
-        assert!(needs_vouch(Some(v), &[[9; 32]], NOW, 0));
+        assert!(needs_vouch(Some(v), &[crate::merkle::test_hash(9)], NOW, 0));
 
         // Advertising choice.
         let fresh = Delegation::new(&b.claim(NOW + 200));
@@ -1353,7 +1355,15 @@ mod tests {
             )
             .is_err()
         );
-        let forged = SignedVouch::issue(&b.anchor, REALM, [[1; 32]], NOW, NOW + 100, None).unwrap();
+        let forged = SignedVouch::issue(
+            &b.anchor,
+            REALM,
+            [crate::merkle::test_hash(1)],
+            NOW,
+            NOW + 100,
+            None,
+        )
+        .unwrap();
         let mut wrong_key = AnchorState::default();
         wrong_key
             .put(
