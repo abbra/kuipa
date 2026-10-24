@@ -101,8 +101,8 @@ impl KemAlg {
     #[must_use]
     pub const fn hash(self) -> &'static CStr {
         match self {
-            Self::MlKem768 => c"SHA2-256",
-            Self::MlKem1024 => c"SHA2-384",
+            Self::MlKem768 => crate::primitives::SHA256,
+            Self::MlKem1024 => crate::primitives::SHA384,
         }
     }
 

@@ -97,9 +97,9 @@ impl DigestAlg {
     #[must_use]
     pub const fn output_len(self) -> usize {
         match self {
-            Self::Sha256 => 32,
-            Self::Sha384 => 48,
-            Self::Sha512 => 64,
+            Self::Sha256 => tang_pqc::primitives::SHA256_LEN,
+            Self::Sha384 => tang_pqc::primitives::SHA384_LEN,
+            Self::Sha512 => tang_pqc::primitives::SHA512_LEN,
         }
     }
 
@@ -107,9 +107,9 @@ impl DigestAlg {
     #[must_use]
     pub const fn openssl_name(self) -> &'static std::ffi::CStr {
         match self {
-            Self::Sha256 => c"SHA2-256",
-            Self::Sha384 => c"SHA2-384",
-            Self::Sha512 => c"SHA2-512",
+            Self::Sha256 => tang_pqc::primitives::SHA256,
+            Self::Sha384 => tang_pqc::primitives::SHA384,
+            Self::Sha512 => tang_pqc::primitives::SHA512,
         }
     }
 }

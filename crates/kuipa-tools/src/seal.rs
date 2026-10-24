@@ -163,7 +163,7 @@ impl UserPaths {
 
 /// The key that derives the device key file's encryption key.
 fn passphrase_key(passphrase: &[u8], salt: &[u8], iterations: u64) -> Result<SecretBuf, Error> {
-    let md = DigestAlg::fetch(c"SHA2-512", None)?;
+    let md = DigestAlg::fetch(tang_pqc::primitives::SHA512, None)?;
     let mut key = SecretBuf::with_len(32);
     Pbkdf2Builder::new(&md, passphrase, salt)
         .iterations(u32::try_from(iterations).map_err(|_| "PBKDF2 iterations out of range")?)
