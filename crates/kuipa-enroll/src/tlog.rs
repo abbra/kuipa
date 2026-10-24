@@ -196,7 +196,7 @@ impl Tombstone {
 pub fn index(alg: TreeHash, key: &[u8; 32], subject: &[u8]) -> Result<Hash> {
     let mut mac = HmacCtx::new(&DigestAlg::fetch(alg.openssl_name(), None)?, key)?;
     mac.update(subject)?;
-    let mut out = [0u8; 48];
+    let mut out = [0u8; primitives::SHA384_LEN];
     let n = mac.finish(&mut out)?;
     if n != alg.output_len() {
         return Err(Error::Malformed("log index"));
@@ -247,9 +247,13 @@ impl std::str::FromStr for LogId {
 
     fn from_str(s: &str) -> Result<Self> {
         let bytes = s.as_bytes();
-        // Hex digits only: from_str_radix would also take a sign.  64 for
-        // a SHA-256 log, 96 for a SHA-384 one.
-        if !matches!(bytes.len(), 64 | 96) || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        // Hex digits only: from_str_radix would also take a sign.  Two per
+        // byte of a SHA-256 or SHA-384 id.
+        let digits = bytes.len() / 2;
+        if !bytes.len().is_multiple_of(2)
+            || TreeHash::of_len(digits).is_none()
+            || !bytes.iter().all(u8::is_ascii_hexdigit)
+        {
             return Err(Error::Malformed("log id"));
         }
         let mut id = vec![0u8; bytes.len() / 2];

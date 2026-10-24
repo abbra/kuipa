@@ -16,6 +16,7 @@ use synta_mtc::crypto::{
     verify::{verify_consistency_proof, verify_inclusion_proof},
 };
 use tang_pqc::SignatureAlg;
+use tang_pqc::primitives::{SHA256, SHA256_LEN, SHA384, SHA384_LEN};
 
 use crate::error::{Error, Result};
 
@@ -44,8 +45,8 @@ impl TreeHash {
     #[must_use]
     pub const fn output_len(self) -> usize {
         match self {
-            Self::Sha256 => 32,
-            Self::Sha384 => 48,
+            Self::Sha256 => SHA256_LEN,
+            Self::Sha384 => SHA384_LEN,
         }
     }
 
@@ -53,8 +54,8 @@ impl TreeHash {
     #[must_use]
     pub const fn openssl_name(self) -> &'static std::ffi::CStr {
         match self {
-            Self::Sha256 => c"SHA2-256",
-            Self::Sha384 => c"SHA2-384",
+            Self::Sha256 => SHA256,
+            Self::Sha384 => SHA384,
         }
     }
 
@@ -69,8 +70,8 @@ impl TreeHash {
     #[must_use]
     pub const fn of_len(len: usize) -> Option<Self> {
         match len {
-            32 => Some(Self::Sha256),
-            48 => Some(Self::Sha384),
+            SHA256_LEN => Some(Self::Sha256),
+            SHA384_LEN => Some(Self::Sha384),
             _ => None,
         }
     }
@@ -80,8 +81,8 @@ impl TreeHash {
 /// bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hash {
-    len: u8,
-    bytes: [u8; 48],
+    len: usize,
+    bytes: [u8; SHA384_LEN],
 }
 
 impl Hash {
@@ -92,10 +93,10 @@ impl Hash {
     /// [`Error::Malformed`] for a length that is neither algorithm's.
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
         TreeHash::of_len(bytes.len()).ok_or(Error::Malformed("tree hash"))?;
-        let mut out = [0u8; 48];
+        let mut out = [0u8; SHA384_LEN];
         out[..bytes.len()].copy_from_slice(bytes);
         Ok(Self {
-            len: u8::try_from(bytes.len()).map_err(|_| Error::Malformed("tree hash"))?,
+            len: bytes.len(),
             bytes: out,
         })
     }
@@ -104,18 +105,15 @@ impl Hash {
     #[must_use]
     pub const fn zero(alg: TreeHash) -> Self {
         Self {
-            len: match alg {
-                TreeHash::Sha256 => 32,
-                TreeHash::Sha384 => 48,
-            },
-            bytes: [0; 48],
+            len: alg.output_len(),
+            bytes: [0; SHA384_LEN],
         }
     }
 
     /// Its algorithm.
     #[must_use]
     pub const fn alg(&self) -> TreeHash {
-        if self.len == 48 {
+        if self.len == SHA384_LEN {
             TreeHash::Sha384
         } else {
             TreeHash::Sha256
@@ -125,7 +123,7 @@ impl Hash {
     /// Its bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
+        &self.bytes[..self.len]
     }
 }
 
