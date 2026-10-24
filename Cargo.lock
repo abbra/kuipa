@@ -1131,6 +1131,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ml-dsa-zk"
+version = "0.1.0"
+dependencies = [
+ "native-ossl",
+]
+
+[[package]]
 name = "moka"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"

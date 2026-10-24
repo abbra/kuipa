@@ -1,0 +1,16 @@
+[package]
+name = "ml-dsa-zk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "VOLE-in-the-head zero-knowledge proofs over boolean circuits, toward unlinkable ML-DSA blind signatures (research prototype)"
+keywords = ["zero-knowledge", "vole", "faest", "post-quantum"]
+categories = ["cryptography"]
+readme = "README.md"
+
+[dependencies]
+native-ossl.workspace = true
+
+[lints]
+workspace = true
