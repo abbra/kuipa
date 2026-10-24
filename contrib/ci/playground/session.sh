@@ -50,21 +50,40 @@ step_timeout="${KUIPA_STEP_TIMEOUT:-120}"
 
 # section TITLE TEXT: start a group of steps, with a sentence explaining it.
 section() { section="$1"; section_text="$2"; }
+# Nanoseconds since the epoch, on a `date` that may lack %N (older BSD).
+now_ns() {
+    local t
+    t=$(date +%s%N 2>/dev/null) || t=""
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$t"
+    else
+        printf '%s000000000\n' "$(date +%s)"
+    fi
+}
 
 # The process IDs of every descendant of process $1, leaving out process
-# $2 and its own descendants, from /proc (no procps needed).
+# $2 and its own descendants: from /proc where it exists, otherwise from
+# `pgrep -P`, which macOS ships.
 descendants() {
-    local stat rest ppid pid
-    for stat in /proc/[0-9]*/stat; do
-        pid="${stat#/proc/}" pid="${pid%/stat}"
-        [[ "$pid" == "$2" ]] && continue
-        rest="$(cat "$stat" 2>/dev/null)" || continue
-        rest="${rest##*) }"
-        read -r _ ppid _ <<< "$rest"
-        if [[ "$ppid" == "$1" ]]; then
-            echo "$pid"
-            descendants "$pid" "$2"
-        fi
+    local stat rest ppid pid kid
+    if [[ -d /proc ]]; then
+        for stat in /proc/[0-9]*/stat; do
+            pid="${stat#/proc/}" pid="${pid%/stat}"
+            [[ "$pid" == "$2" ]] && continue
+            rest="$(cat "$stat" 2>/dev/null)" || continue
+            rest="${rest##*) }"
+            read -r _ ppid _ <<< "$rest"
+            if [[ "$ppid" == "$1" ]]; then
+                echo "$pid"
+                descendants "$pid" "$2"
+            fi
+        done
+        return
+    fi
+    for kid in $(pgrep -P "$1" 2>/dev/null); do
+        [[ "$kid" == "$2" ]] && continue
+        echo "$kid"
+        descendants "$kid" "$2"
     done
 }
 
@@ -100,8 +119,8 @@ step() {
     mkdir -p "$d"
     printf '%s\n' "$cmd" > "$d/command"
     local offset t0 t1 rc dog shell="$BASHPID"
-    offset=$(stat -c %s "$server_log" 2>/dev/null || echo 0)
-    t0=$(date +%s%N)
+    offset=$(wc -c < "$server_log" 2>/dev/null || echo 0)
+    t0=$(now_ns)
     # $shell is taken here: in the background job $BASHPID would be the
     # watchdog's own.
     watchdog "$shell" "$d/timed-out" &
@@ -110,7 +129,7 @@ step() {
     rc=$?
     kill "$dog" 2>/dev/null
     wait "$dog" 2>/dev/null
-    t1=$(date +%s%N)
+    t1=$(now_ns)
     tail -c +"$((offset + 1))" "$server_log" > "$d/server.log" 2>/dev/null || true
 
     local ok=0 timed_out=0 text
@@ -124,7 +143,10 @@ step() {
     fi
     for text in "$@"; do
         printf '%s\n' "$text" >> "$d/expect"
-        if ! cat "$d/stdout" "$d/stderr" | grep -qF -- "$text"; then
+        # Not `cat … | grep -q`: BSD grep stops reading at the first match,
+        # and under pipefail the pipeline's status is then cat's SIGPIPE,
+        # which reads as a failure even though the text was found.
+        if ! grep -qF -- "$text" "$d/stdout" "$d/stderr"; then
             printf '%s\n' "$text" >> "$d/missing"
             ok=0
         fi
