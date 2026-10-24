@@ -29,7 +29,7 @@ use tang_pqc::wire::{Reader, Writer};
 use tang_pqc::{Policy, SigningKey, Thumbprint, VerifyingKey, primitives};
 
 use crate::error::{Error, Result};
-use crate::merkle::{self, Hash};
+use crate::merkle::{self, Hash, TreeHash};
 
 const LEAF_MAGIC: [u8; 4] = *b"IPLF";
 const TOMBSTONE_MAGIC: [u8; 4] = *b"IPLT";
@@ -85,20 +85,21 @@ pub struct Leaf {
     pub kind: Kind,
     /// When the server logged it (Unix seconds).
     pub time: u64,
-    /// The subject's [`index`], or zeros for none.
-    pub index: [u8; 32],
+    /// The subject's [`index`], or zeros for none; of the log's hash.
+    pub index: Hash,
     /// The kind's own encoding.
     pub body: Vec<u8>,
 }
 
 impl Leaf {
-    /// `IPLF ‖ 1 ‖ kind(2) ‖ time ‖ index(32) ‖ body`.
+    /// `IPLF ‖ 1 ‖ kind(2) ‖ time ‖ index ‖ body`, the index 32 or 48
+    /// bytes, length prefixed.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(LEAF_MAGIC)
             .fixed(&self.kind.0.to_be_bytes())
             .u64(self.time)
-            .fixed(&self.index)
+            .bytes(&self.index)
             .bytes(&self.body)
             .finish()
     }
@@ -112,7 +113,7 @@ impl Leaf {
         let mut r = Reader::new(bytes, LEAF_MAGIC, "log leaf")?;
         let kind = Kind(u16::from_be_bytes(r.fixed()?));
         let time = r.u64()?;
-        let index = r.fixed()?;
+        let index = Hash::from_slice(r.bytes()?)?;
         let body = r.bytes()?;
         if body.len() > MAX_BODY {
             return Err(Error::Malformed("log leaf body"));
@@ -127,22 +128,22 @@ impl Leaf {
         })
     }
 
-    /// The leaf's tree hash.
+    /// The leaf's tree hash, under its index's algorithm — the log's.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
     pub fn hash(&self) -> Result<Hash> {
-        merkle::leaf_hash(&self.to_bytes())
+        merkle::leaf_hash(self.index.alg(), &self.to_bytes())
     }
 
-    /// A tombstone for the leaf at `target`.
+    /// A tombstone for the leaf at `target`, in a log of `alg`.
     #[must_use]
-    pub fn tombstone(time: u64, target: u64, reason: &str) -> Self {
+    pub fn tombstone(alg: TreeHash, time: u64, target: u64, reason: &str) -> Self {
         Self {
             kind: Kind::TOMBSTONE,
             time,
-            index: [0; 32],
+            index: Hash::zero(alg),
             body: Tombstone {
                 target,
                 reason: reason.to_owned(),
@@ -186,43 +187,51 @@ impl Tombstone {
     }
 }
 
-/// The opaque index of `subject` under the realm's index key:
-/// `HMAC-SHA-256(key, subject)`.
+/// The opaque index of `subject` under the server's index key, in a log
+/// of `alg`: `HMAC-H(key, subject)`, `H` the log's hash.
 ///
 /// # Errors
 ///
 /// An OpenSSL error.
-pub fn index(key: &[u8; 32], subject: &[u8]) -> Result<[u8; 32]> {
-    let mut mac = HmacCtx::new(&DigestAlg::fetch(c"SHA2-256", None)?, key)?;
+pub fn index(alg: TreeHash, key: &[u8; 32], subject: &[u8]) -> Result<Hash> {
+    let mut mac = HmacCtx::new(&DigestAlg::fetch(alg.openssl_name(), None)?, key)?;
     mac.update(subject)?;
-    let mut out = [0u8; 32];
-    if mac.finish(&mut out)? != out.len() {
+    let mut out = [0u8; 48];
+    let n = mac.finish(&mut out)?;
+    if n != alg.output_len() {
         return Err(Error::Malformed("log index"));
     }
-    Ok(out)
+    Hash::from_slice(&out[..n])
 }
 
-/// A log's identity: one per server, stable across key rotations.
+/// A log's identity: one per server, stable across key rotations.  Its
+/// length names the log's hash ([`TreeHash`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LogId(pub [u8; 32]);
+pub struct LogId(pub Hash);
 
 impl LogId {
-    /// The log of `server` in `realm`:
-    /// `SHA-256("ipa-ku-log/v1 id" ‖ len(realm) ‖ realm ‖ server)`.
+    /// The log of `server` in `realm`, hashed with `alg` — the hash of the
+    /// server key that signs it ([`TreeHash::for_signer`]):
+    /// `H("ipa-ku-log/v1 id" ‖ len(realm) ‖ realm ‖ server)`.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn of(realm: &str, server: &str) -> Result<Self> {
+    pub fn of(realm: &str, server: &str, alg: TreeHash) -> Result<Self> {
         let len = u32::try_from(realm.len())
             .map_err(|_| Error::Malformed("realm"))?
             .to_be_bytes();
-        Ok(Self(primitives::sha256(&[
-            LOG_ID_CONTEXT,
-            &len,
-            realm.as_bytes(),
-            server.as_bytes(),
-        ])?))
+        let digest = primitives::digest(
+            alg.openssl_name(),
+            &[LOG_ID_CONTEXT, &len, realm.as_bytes(), server.as_bytes()],
+        )?;
+        Ok(Self(Hash::from_slice(&digest)?))
+    }
+
+    /// The log's hash.
+    #[must_use]
+    pub fn alg(&self) -> TreeHash {
+        self.0.alg()
     }
 }
 
@@ -238,16 +247,17 @@ impl std::str::FromStr for LogId {
 
     fn from_str(s: &str) -> Result<Self> {
         let bytes = s.as_bytes();
-        // Hex digits only: from_str_radix would also take a sign.
-        if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        // Hex digits only: from_str_radix would also take a sign.  64 for
+        // a SHA-256 log, 96 for a SHA-384 one.
+        if !matches!(bytes.len(), 64 | 96) || !bytes.iter().all(u8::is_ascii_hexdigit) {
             return Err(Error::Malformed("log id"));
         }
-        let mut id = [0u8; 32];
-        for (out, pair) in id.iter_mut().zip(bytes.chunks_exact(2)) {
+        let mut id = vec![0u8; bytes.len() / 2];
+        for (out, pair) in id.iter_mut().zip(bytes.as_chunks::<2>().0) {
             let pair = std::str::from_utf8(pair).map_err(|_| Error::Malformed("log id"))?;
             *out = u8::from_str_radix(pair, 16).map_err(|_| Error::Malformed("log id"))?;
         }
-        Ok(Self(id))
+        Ok(Self(Hash::from_slice(&id)?))
     }
 }
 
@@ -290,6 +300,12 @@ impl Log {
     #[must_use]
     pub fn id(&self) -> LogId {
         self.id
+    }
+
+    /// The log's hash.
+    #[must_use]
+    pub fn alg(&self) -> TreeHash {
+        self.id.alg()
     }
 
     /// How many leaves it holds.
@@ -336,6 +352,9 @@ impl Log {
     ///
     /// As [`append`](Self::append).
     pub fn check(&self, leaf: &Leaf) -> Result<Option<u64>> {
+        if leaf.index.alg() != self.alg() {
+            return Err(Error::Malformed("log leaf of another hash"));
+        }
         if leaf.kind != Kind::TOMBSTONE {
             return Ok(None);
         }
@@ -407,13 +426,14 @@ pub struct Head {
 }
 
 impl Head {
-    /// `IPLH ‖ 1 ‖ log(32) ‖ size ‖ root(32) ‖ time`.
+    /// `IPLH ‖ 1 ‖ log ‖ size ‖ root ‖ time`; `log` and `root` are hashes of
+    /// the log's algorithm, 32 or 48 bytes, length prefixed.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(HEAD_MAGIC)
-            .fixed(&self.log.0)
+            .bytes(&self.log.0)
             .u64(self.size)
-            .fixed(&self.root)
+            .bytes(&self.root)
             .u64(self.time)
             .finish()
     }
@@ -426,9 +446,9 @@ impl Head {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, HEAD_MAGIC, "log head")?;
         let head = Self {
-            log: LogId(r.fixed()?),
+            log: LogId(Hash::from_slice(r.bytes()?)?),
             size: r.u64()?,
-            root: r.fixed()?,
+            root: Hash::from_slice(r.bytes()?)?,
             time: r.u64()?,
         };
         r.finish()?;
@@ -510,10 +530,15 @@ impl SignedHead {
     ///
     /// # Errors
     ///
-    /// [`Error::UntrustedAnchor`] for a bad signature or an algorithm
-    /// `policy` refuses.
+    /// [`Error::UntrustedAnchor`] for a bad signature, an algorithm
+    /// `policy` refuses, or a log hashed otherwise than `key` decides
+    /// ([`TreeHash::for_signer`]).
     pub fn verify(&self, key: &VerifyingKey, policy: &Policy) -> Result<()> {
-        if !policy.allows_signature(key.alg()) {
+        let tree = TreeHash::for_signer(key.alg());
+        if !policy.allows_signature(key.alg())
+            || self.head.log.alg() != tree
+            || self.head.root.alg() != tree
+        {
             return Err(Error::UntrustedAnchor);
         }
         key.verify_with_context(&self.head.to_bytes(), HEAD_CONTEXT, &self.signature)
@@ -688,10 +713,12 @@ impl Receipt {
     ///
     /// # Errors
     ///
-    /// [`Error::UntrustedAnchor`] for a bad signature or an algorithm
-    /// `policy` refuses.
+    /// [`Error::UntrustedAnchor`] for a bad signature, an algorithm
+    /// `policy` refuses, or a log hashed otherwise than `key` decides.
     pub fn verify(&self, key: &VerifyingKey, policy: &Policy) -> Result<()> {
-        if !policy.allows_signature(key.alg()) {
+        let tree = TreeHash::for_signer(key.alg());
+        if !policy.allows_signature(key.alg()) || self.log.alg() != tree || self.leaf.alg() != tree
+        {
             return Err(Error::UntrustedAnchor);
         }
         let statement = Self::statement(&self.log, self.index, &self.leaf, self.time);
@@ -712,13 +739,14 @@ impl Receipt {
             && merkle::verify(&self.leaf, self.index, head.size, path, &head.root)?)
     }
 
-    /// `IPLP ‖ 1 ‖ log(32) ‖ index ‖ leaf(32) ‖ time ‖ signature`.
+    /// `IPLP ‖ 1 ‖ log ‖ index ‖ leaf ‖ time ‖ signature`, hashes length
+    /// prefixed.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(RECEIPT_MAGIC)
-            .fixed(&self.log.0)
+            .bytes(&self.log.0)
             .u64(self.index)
-            .fixed(&self.leaf)
+            .bytes(&self.leaf)
             .u64(self.time)
             .bytes(&self.signature)
             .finish()
@@ -732,9 +760,9 @@ impl Receipt {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, RECEIPT_MAGIC, "log receipt")?;
         let receipt = Self {
-            log: LogId(r.fixed()?),
+            log: LogId(Hash::from_slice(r.bytes()?)?),
             index: r.u64()?,
-            leaf: r.fixed()?,
+            leaf: Hash::from_slice(r.bytes()?)?,
             time: r.u64()?,
             signature: r.bytes()?.to_vec(),
         };
@@ -805,13 +833,14 @@ pub struct VaultEvent {
 }
 
 impl VaultEvent {
-    /// `IPLV ‖ 1 ‖ action(1) ‖ device (empty for none) ‖ digest(32)`.
+    /// `IPLV ‖ 1 ‖ action(1) ‖ device (empty for none) ‖ digest`, the digest
+    /// length prefixed.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(VAULT_EVENT_MAGIC)
             .u8(self.action as u8)
             .str(self.device.as_deref().unwrap_or_default())
-            .fixed(&self.digest)
+            .bytes(&self.digest)
             .finish()
     }
 
@@ -827,7 +856,7 @@ impl VaultEvent {
             "" => None,
             d => Some(d.to_owned()),
         };
-        let digest = r.fixed()?;
+        let digest = Hash::from_slice(r.bytes()?)?;
         r.finish()?;
         Ok(Self {
             action,
@@ -898,7 +927,7 @@ pub struct Answer {
 
 impl Answer {
     /// `IPLR ‖ 1 ‖ signer(JWK) ‖ head (IPLS, empty for none) ‖ n(u64) ‖
-    /// [index ‖ leaf(IPLF) ‖ m(1) ‖ [hash(32)]]`.
+    /// [index ‖ leaf(IPLF) ‖ m(1) ‖ [hash]]`, hashes length prefixed.
     ///
     /// # Panics
     ///
@@ -920,7 +949,7 @@ impl Answer {
             w.u64(e.index).bytes(&e.leaf.to_bytes());
             w.u8(u8::try_from(e.path.len()).expect("short paths"));
             for h in &e.path {
-                w.fixed(h);
+                w.bytes(h);
             }
         }
         w.finish()
@@ -948,8 +977,8 @@ impl Answer {
             let index = r.u64()?;
             let leaf = Leaf::from_bytes(r.bytes()?)?;
             let path = (0..r.u8()?)
-                .map(|_| r.fixed())
-                .collect::<std::result::Result<_, _>>()?;
+                .map(|_| Hash::from_slice(r.bytes()?))
+                .collect::<Result<_>>()?;
             entries.push(Entry { index, leaf, path });
         }
         r.finish()?;
@@ -1000,14 +1029,14 @@ mod tests {
     const T: u64 = 1_800_000_000;
 
     fn id() -> LogId {
-        LogId::of("EXAMPLE.TEST", "ipa1.example.test").unwrap()
+        LogId::of("EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256).unwrap()
     }
 
     fn leaf(kind: Kind, n: u8) -> Leaf {
         Leaf {
             kind,
             time: T + u64::from(n),
-            index: [n; 32],
+            index: crate::merkle::test_hash(n),
             body: vec![n; 3],
         }
     }
@@ -1044,27 +1073,32 @@ mod tests {
 
     #[test]
     fn indexes_are_keyed_and_log_ids_separate_servers() {
-        let a = index(&[1; 32], b"vault-1").unwrap();
-        assert_eq!(a, index(&[1; 32], b"vault-1").unwrap());
-        assert_ne!(a, index(&[2; 32], b"vault-1").unwrap());
-        assert_ne!(a, index(&[1; 32], b"vault-2").unwrap());
+        let a = index(TreeHash::Sha256, &[1; 32], b"vault-1").unwrap();
+        assert_eq!(a, index(TreeHash::Sha256, &[1; 32], b"vault-1").unwrap());
+        assert_ne!(a, index(TreeHash::Sha256, &[2; 32], b"vault-1").unwrap());
+        assert_ne!(a, index(TreeHash::Sha256, &[1; 32], b"vault-2").unwrap());
         assert_ne!(
             id(),
-            LogId::of("EXAMPLE.TEST", "ipa2.example.test").unwrap()
+            LogId::of("EXAMPLE.TEST", "ipa2.example.test", TreeHash::Sha256).unwrap()
         );
         assert_eq!(id().to_string().parse::<LogId>().unwrap(), id());
         for bad in ["", "zz", &"0".repeat(63), &"g".repeat(64), &"+f".repeat(32)] {
             assert!(bad.parse::<LogId>().is_err(), "{bad:?}");
         }
         // The realm is length-prefixed: no shifting bytes between fields.
-        assert_ne!(LogId::of("A", "BC").unwrap(), LogId::of("AB", "C").unwrap());
+        assert_ne!(
+            LogId::of("A", "BC", TreeHash::Sha256).unwrap(),
+            LogId::of("AB", "C", TreeHash::Sha256).unwrap()
+        );
     }
 
     #[test]
     fn tombstones_append_instead_of_restarting() {
         let (mut log, _) = log_of(3);
         let before = log.head(T).unwrap();
-        let i = log.append(&Leaf::tombstone(T + 9, 1, "renewed")).unwrap();
+        let i = log
+            .append(&Leaf::tombstone(TreeHash::Sha256, T + 9, 1, "renewed"))
+            .unwrap();
         assert_eq!(i, 3);
         assert!(log.is_retired(1) && !log.is_retired(0));
         // The new head extends the old one.
@@ -1077,12 +1111,15 @@ mod tests {
 
         // Not twice, not a tombstone, not beyond the log.
         for target in [1, 3, 9] {
-            assert!(log.append(&Leaf::tombstone(T, target, "x")).is_err());
+            assert!(
+                log.append(&Leaf::tombstone(TreeHash::Sha256, T, target, "x"))
+                    .is_err()
+            );
         }
         assert_eq!(log.size(), 4);
         let garbled = Leaf {
             body: vec![1, 2, 3],
-            ..Leaf::tombstone(T, 0, "x")
+            ..Leaf::tombstone(TreeHash::Sha256, T, 0, "x")
         };
         assert!(log.append(&garbled).is_err());
 
@@ -1090,7 +1127,7 @@ mod tests {
         let leaves = [
             leaf(Kind::CLAIM, 0),
             leaf(Kind::CLAIM, 1),
-            Leaf::tombstone(T, 0, "dropped"),
+            Leaf::tombstone(TreeHash::Sha256, T, 0, "dropped"),
         ];
         let replayed = Log::replay(id(), &leaves).unwrap();
         assert!(replayed.is_retired(0));
@@ -1114,7 +1151,7 @@ mod tests {
         assert!(head.extends(&old, &proof).unwrap());
         // Another log, an earlier time, a fork: refused.
         let other = Head {
-            log: LogId([9; 32]),
+            log: LogId(crate::merkle::test_hash(9)),
             ..old
         };
         assert!(!head.extends(&other, &proof).unwrap());
@@ -1230,7 +1267,7 @@ mod tests {
         let small_head = small.head(T).unwrap();
         assert!(!receipt.proven_by(&small_head, &[]).unwrap());
         let other = Head {
-            log: LogId([9; 32]),
+            log: LogId(crate::merkle::test_hash(9)),
             ..head
         };
         assert!(
@@ -1244,6 +1281,78 @@ mod tests {
             ..receipt
         };
         assert!(!broken.proven_by(&head, &log.inclusion(2).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn a_cnsa_log_is_sha_384_throughout() {
+        // Under a CNSA 2.0 policy the server key is ML-DSA-87, so the log
+        // id, the subject index, every tree hash and every proof are
+        // SHA-384, and nothing SHA-256 gets in.
+        let server = SigningKey::generate(SignatureAlg::MlDsa87).unwrap();
+        let alg = TreeHash::for_signer(server.public().alg());
+        assert_eq!(alg, TreeHash::Sha384);
+        let cnsa = LogId::of("EXAMPLE.TEST", "ipa1.example.test", alg).unwrap();
+        assert_eq!(cnsa.to_string().len(), 96);
+        assert_eq!(cnsa.to_string().parse::<LogId>().unwrap(), cnsa);
+        assert_ne!(cnsa.0.as_bytes(), id().0.as_bytes());
+        let leaves: Vec<Leaf> = (0..5u8)
+            .map(|n| Leaf {
+                kind: Kind::VAULT_DEVICE,
+                time: T,
+                index: index(alg, &[1; 32], &[n]).unwrap(),
+                body: vec![n],
+            })
+            .collect();
+        assert_eq!(leaves[0].index.len(), 48);
+        let mut log = Log::replay(cnsa, &leaves[..3]).unwrap();
+        let old = log.head(T).unwrap();
+        for l in &leaves[3..] {
+            log.append(l).unwrap();
+        }
+        let head = log.head(T + 1).unwrap();
+        assert_eq!(head.root.len(), 48);
+        assert_eq!(Head::from_bytes(&head.to_bytes()).unwrap(), head);
+        assert!(
+            head.includes(&leaves[4], 4, &log.inclusion(4).unwrap())
+                .unwrap()
+        );
+        assert!(head.extends(&old, &log.consistency(3).unwrap()).unwrap());
+
+        let signed = SignedHead::issue(&server, head).unwrap();
+        signed.verify(server.public(), &Policy::cnsa2()).unwrap();
+        let receipt = Receipt::issue(&server, cnsa, 4, leaves[4].hash().unwrap(), T).unwrap();
+        let receipt = Receipt::from_bytes(&receipt.to_bytes()).unwrap();
+        receipt.verify(server.public(), &Policy::cnsa2()).unwrap();
+
+        // A category 3 key never signs a SHA-384 log, nor a category 5
+        // key a SHA-256 one: the signer's key decides the hash.
+        let weaker = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let mismatched = SignedHead::issue(&weaker, head).unwrap();
+        assert!(
+            mismatched
+                .verify(weaker.public(), &Policy::default())
+                .is_err()
+        );
+        let receipt = Receipt::issue(&weaker, cnsa, 4, leaves[4].hash().unwrap(), T).unwrap();
+        assert!(receipt.verify(weaker.public(), &Policy::default()).is_err());
+        let (short, _) = log_of(2);
+        let short = SignedHead::issue(&server, short.head(T).unwrap()).unwrap();
+        assert!(short.verify(server.public(), &Policy::default()).is_err());
+
+        // A SHA-256 leaf does not join a SHA-384 log, and a SHA-256 proof
+        // does not prove into it.
+        assert!(log.append(&leaf(Kind::VAULT_DEVICE, 1)).is_err());
+        assert!(
+            log.append(&Leaf::tombstone(TreeHash::Sha256, T, 0, "x"))
+                .is_err()
+        );
+        log.append(&Leaf::tombstone(alg, T, 0, "x")).unwrap();
+        let (small, _) = log_of(4);
+        assert!(
+            !head
+                .includes(&leaves[1], 1, &small.inclusion(1).unwrap())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1310,7 +1419,7 @@ mod tests {
                 let e = VaultEvent {
                     action,
                     device,
-                    digest: [3; 32],
+                    digest: crate::merkle::test_hash(3),
                 };
                 assert_eq!(VaultEvent::from_bytes(&e.to_bytes()).unwrap(), e);
             }
@@ -1318,7 +1427,7 @@ mod tests {
         let mut bad = VaultEvent {
             action: VaultAction::Revoke,
             device: None,
-            digest: [0; 32],
+            digest: crate::merkle::test_hash(0),
         }
         .to_bytes();
         bad[5] = 99;

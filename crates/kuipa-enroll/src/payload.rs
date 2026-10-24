@@ -7,6 +7,7 @@ use tang_pqc::wire::{Reader, Writer};
 
 use crate::error::{Error, Result};
 use crate::keytab::Keytab;
+use crate::merkle::Hash;
 
 const MAGIC: [u8; 4] = *b"IPJP";
 
@@ -43,7 +44,7 @@ pub struct Enrollment {
     /// `None` where the issuing server knew no head for the anchor.
     /// Clients pin them next to the thumbprints, and check a delegation
     /// against a head with no signature at all.
-    pub heads: Vec<Option<(u64, [u8; 32])>>,
+    pub heads: Vec<Option<(u64, Hash)>>,
     /// The sequence number of the issuing server's anchor epoch log
     /// (§4.8); `0` when it kept none.
     pub epoch_seq: u64,
@@ -85,13 +86,15 @@ impl Enrollment {
         w.u8(count(self.anchors.len())?);
         for (a, head) in self.anchors.iter().zip(&self.heads) {
             w.fixed(a.as_bytes());
-            // A head is `(size, root)`; an absent one is a zero size.
+            // A head is `(size, root)`, the root length prefixed (its
+            // length names its hash); an absent one is a zero size and an
+            // empty root.
             match head {
                 Some((size, root)) => {
-                    w.u64(*size).fixed(root);
+                    w.u64(*size).bytes(root);
                 }
                 None => {
-                    w.u64(0).fixed(&[0; 32]);
+                    w.u64(0).bytes(&[]);
                 }
             }
         }
@@ -128,8 +131,12 @@ impl Enrollment {
         for _ in 0..n {
             anchors.push(Thumbprint::from_bytes(r.fixed()?));
             let size = r.u64()?;
-            let root = r.fixed()?;
-            heads.push((size != 0).then_some((size, root)));
+            let root = r.bytes()?;
+            heads.push(if size == 0 {
+                None
+            } else {
+                Some((size, Hash::from_slice(root)?))
+            });
         }
         let (epoch_seq, epoch_head) = (r.u64()?, r.fixed()?);
         let keytab = Keytab::from_mit(r.bytes()?)?;
@@ -194,7 +201,7 @@ pub(crate) mod tests {
                 Thumbprint::from_bytes([1; 32]),
                 Thumbprint::from_bytes([2; 32]),
             ],
-            heads: vec![Some((3, [4; 32])), None],
+            heads: vec![Some((3, Hash::from_slice(&[4; 48]).unwrap())), None],
             epoch_seq: 7,
             epoch_head: [9; 32],
         };

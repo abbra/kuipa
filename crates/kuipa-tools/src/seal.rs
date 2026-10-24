@@ -514,7 +514,7 @@ impl<'a> Seal<'a> {
         let vault = stored.vault();
         let expected = Expected {
             devices: vault.devices.iter().map(|d| d.id.clone()).collect(),
-            policy: primitives::sha256(&[&serde_json::to_vec(&vault.policy)?])?,
+            policy: serde_json::to_vec(&vault.policy)?,
             revoked: vault.state == kuipa_enroll::vault::State::Revoked,
         };
         let public = self.public()?;
@@ -530,10 +530,20 @@ impl<'a> Seal<'a> {
         let policy = tang_pqc::Policy::from_system()?;
         let (mut events, mut forked, mut unreachable, mut baseline, mut unwitnessed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut relogged = Vec::new();
         for server in &public.servers {
-            let before = state.get(server).cloned();
-            let (entries, signed) = match self.watch_server(&public, server, name, before.as_ref())
-            {
+            let mut before = state.get(server).cloned();
+            let mut answer = self.watch_server(&public, server, name, before.as_ref());
+            // A server whose key moved to another category (a crypto
+            // policy change) keeps a new log: read it from its start, and
+            // flag everything in it, as for a log already watched.
+            let mut moved = false;
+            if let Err(WatchError::NewLog(old)) = &answer {
+                relogged.push(json!({ "server": server, "old_log": old }));
+                (before, moved) = (None, true);
+                answer = self.watch_server(&public, server, name, None);
+            }
+            let (entries, signed) = match answer {
                 Ok(Some(found)) => found,
                 Ok(None) => continue,
                 Err(WatchError::Fork(why)) => {
@@ -544,12 +554,14 @@ impl<'a> Seal<'a> {
                     unreachable.push(json!({ "server": server, "error": e.to_string() }));
                     continue;
                 }
+                Err(WatchError::NewLog(_)) => unreachable!("a fresh read has no log before it"),
             };
-            if before.is_none() {
+            let flag = before.is_some() || moved;
+            if !flag {
                 baseline.push(server.clone());
             }
             for e in &entries {
-                events.push(describe_event(server, e, &expected, before.is_some()));
+                events.push(describe_event(server, e, &expected, flag));
             }
             // A head too few trusted witnesses cosigned may be a view
             // shown to this reader alone: its entries are listed, but the
@@ -590,6 +602,7 @@ impl<'a> Seal<'a> {
             "unreachable": unreachable,
             "unwitnessed": unwitnessed,
             "baseline": baseline,
+            "relogged": relogged,
         }))
     }
 
@@ -666,14 +679,20 @@ impl<'a> Seal<'a> {
             };
         };
         let head = signed.head;
-        if head.log != LogId::of(&public.realm, server)? {
+        // The head verified against the server's key, which also fixed
+        // the log's hash.
+        if head.log != LogId::of(&public.realm, server, head.log.alg())? {
             return Err(WatchError::Fork(
                 "the answer is from another server's log".into(),
             ));
         }
+        if let Some(w) = before
+            && w.log != head.log.to_string()
+        {
+            return Err(WatchError::NewLog(w.log.clone()));
+        }
         if let Some(w) = before {
-            let old_root: [u8; 32] = tang_pqc::b64::decode(&w.root)?
-                .try_into()
+            let old_root = kuipa_enroll::merkle::Hash::from_slice(&tang_pqc::b64::decode(&w.root)?)
                 .map_err(|_| "a malformed root in the watch state")?;
             let extends = match head.size.cmp(&w.size) {
                 std::cmp::Ordering::Less => false,
@@ -1138,6 +1157,9 @@ struct Watched {
 enum WatchError {
     /// The server's log does not extend what was seen.
     Fork(String),
+    /// The server keeps another log than the one seen (named): its key
+    /// moved to another category, which changes the log's hash and id.
+    NewLog(String),
     /// Anything else: the server is unreachable, refuses, or errs.
     Other(Error),
 }
@@ -1151,7 +1173,8 @@ impl<E: Into<Error>> From<E> for WatchError {
 /// What the stored descriptor accounts for.
 struct Expected {
     devices: BTreeSet<String>,
-    policy: [u8; 32],
+    /// The policy's JSON, digested with each log's hash to compare.
+    policy: Vec<u8>,
     revoked: bool,
 }
 
@@ -1178,7 +1201,8 @@ fn describe_event(
         A::Create => ("create", None),
         A::SetPolicy => (
             "set-policy",
-            (event.digest != expected.policy)
+            primitives::digest(event.digest.alg().openssl_name(), &[&expected.policy])
+                .is_ok_and(|d| d != *event.digest)
                 .then_some("a policy the stored descriptor does not show"),
         ),
         A::Revoke => (

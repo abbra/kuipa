@@ -69,7 +69,7 @@ pub fn claim_log(server: &str, anchor: &str, from: u64) -> Result<Value, Error> 
 /// [`Error`] when no server answers.
 pub fn coverage(
     server: &str,
-    given: &[(tang_pqc::Thumbprint, u64, [u8; 32])],
+    given: &[(tang_pqc::Thumbprint, u64, merkle::Hash)],
 ) -> Result<Value, Error> {
     let endpoint = Endpoint::new(server, &Trust::FirstContact)?;
     let pins: Vec<paths::Pin> = if given.is_empty() {
@@ -119,7 +119,7 @@ fn row_for(
     endpoint: &Endpoint,
     anchor: tang_pqc::Thumbprint,
     newest: u64,
-    pinned_root: [u8; 32],
+    pinned_root: merkle::Hash,
     now: SystemTime,
     cap: usize,
 ) -> Value {
@@ -173,7 +173,7 @@ fn row_for(
     if !verified
         .proved_heads()
         .iter()
-        .any(|h| h.anchor == anchor && h.size == page.size && h.root == page.root)
+        .any(|h| h.anchor == anchor && h.size == page.size && *h.root == *page.root)
     {
         return row("split: the served head is not signed by the anchor".into());
     }
@@ -183,7 +183,7 @@ fn row_for(
         return row("split: the server's tree is shorter than the pinned head".into());
     }
     if page.size == newest {
-        return row(if page.root == pinned_root {
+        return row(if *page.root == *pinned_root {
             "current".into()
         } else {
             "split: the served head differs at the same size".into()
@@ -228,14 +228,17 @@ fn row_for(
     })
 }
 
-/// The page's leaves as hashes; entries that are not 32-byte hashes are
-/// skipped, so malformed entries cannot fake a prefix.
-fn page_leaves(page: &ClaimLogPage) -> Vec<[u8; 32]> {
+/// The page's leaves as hashes; entries that are not hashes of the
+/// head's algorithm are skipped, so malformed entries cannot fake a
+/// prefix.
+fn page_leaves(page: &ClaimLogPage) -> Vec<merkle::Hash> {
     page.leaves
         .iter()
         .filter_map(|leaf| {
             let bytes = tang_pqc::b64::decode(leaf).ok()?;
-            <[u8; 32]>::try_from(bytes.as_slice()).ok()
+            merkle::Hash::from_slice(&bytes)
+                .ok()
+                .filter(|h| h.len() == page.root.len())
         })
         .collect()
 }
@@ -652,8 +655,10 @@ pub(crate) fn advertised_log(
         .signing_key()
         .ok_or("the advertisement carries no signing key")?
         .clone();
+    // The log is hashed as the server's signing key decides.
+    let alg = merkle::TreeHash::for_signer(key.alg());
     Ok((
-        kuipa_enroll::tlog::LogId::of(&realm, verified.server())?,
+        kuipa_enroll::tlog::LogId::of(&realm, verified.server(), alg)?,
         key,
     ))
 }
@@ -730,9 +735,9 @@ fn check_recorded(
     };
     let id = head.log.to_string();
     if let Some(before) = audited.get(&id) {
-        let old: Option<[u8; 32]> = tang_pqc::b64::decode(&before.root)
+        let old: Option<merkle::Hash> = tang_pqc::b64::decode(&before.root)
             .ok()
-            .and_then(|r| r.try_into().ok());
+            .and_then(|r| merkle::Hash::from_slice(&r).ok());
         let prefix = usize::try_from(before.size)
             .ok()
             .filter(|s| *s > 0 && *s <= replayed.hashes().len());

@@ -188,6 +188,73 @@ is still answered, so requests made against the previous advertisement,
 and sealed keytabs bound to it, keep working until `prune-keys` deletes it
 (§11.2).
 
+#### 4.1.1 The hash follows the signer, and the signer the crypto policy
+
+The system crypto policy decides which ML-DSA keys a server makes and
+accepts (`tang_pqc::Policy::from_system`): under a CNSA 2.0 policy only
+ML-DSA-87. kuipa adds no setting of its own for hashes. Everything a key
+signs over is hashed as **that key's category** decides, the way the
+ML-KEM suite already picks its HKDF hash (§5.1):
+
+| signer | category | tree hash `H` | length |
+|---|---|---|---|
+| ML-DSA-44 | 2 | SHA-256 | 32 bytes |
+| ML-DSA-65 | 3 | SHA-256 | 32 bytes |
+| ML-DSA-87 | 5 (CNSA 2.0) | SHA-384 | 48 bytes |
+
+CNSA 2.0 approves SHA-384 and SHA-512 as general-purpose hashes, and
+neither SHA-256, SHA-3 nor SHAKE (CNSA 2.0 FAQ). So a CNSA deployment
+uses no SHA-256 for any of these:
+
+| what | hashed with `H` of | DESIGN |
+|---|---|---|
+| claim log trees, leaves and proofs: `root`, `live_root`, head proofs, signature proofs | the vouching anchor's key | §4.2, §4.9, `DESIGN-claim-logs.md` |
+| transparency log id, leaf hashes, heads, inclusion and consistency proofs, receipts | the server's signing key | `DESIGN-tlog.md` §1–§6 |
+| the subject index `HMAC-H(k_index, subject)` | the server's signing key | `DESIGN-tlog.md` §1 |
+| a vault event's policy digest | the server's signing key | `DESIGN-tlog.md` §6 |
+| a signing statement's batch tree and paths | the server's signing key | `DESIGN-sign.md` §1 |
+
+How it holds together:
+
+* **A hash's length names it.** Every tree hash on the wire is length
+  prefixed, 32 or 48 bytes, so a verifier needs no extra field to know
+  which hash it holds. A tree, path or proof that mixes the two is
+  malformed, and never verifies.
+* **The signature binds the hash.** A verifier checks that the hash is
+  the one the signing key's category decides: a vouch, log head,
+  receipt or signing statement signed by an ML-DSA-87 key over SHA-256
+  hashes (or by ML-DSA-65 over SHA-384) is refused, even with a valid
+  signature. There is no downgrade inside one key.
+* **The log id includes the hash.** `LogId` is computed with `H`, so it
+  is 32 or 48 bytes (64 or 96 hex digits in routes and directories). A
+  server whose key moves to another category, as a crypto policy change
+  forces, starts a new log under a new id, in its own directory. The old
+  log stays on disk and keeps verifying against the old key, and
+  auditors and witnesses see a new log, not a rewritten one.
+* **Claim logs move with their anchor.** An anchor's claim log has the
+  anchor's hash. Rotating to an anchor of another category is a
+  succession (§4.7), whose new anchor starts its own log, so one log
+  never holds both hashes.
+* **Tags still apply.** Claims are typed `IPLF` leaves in a claim log
+  (`DESIGN-tlog.md` §8). Their unused index is zeros of `H`'s length.
+
+Hashes that the standard prescribes are kept as they are: ML-DSA's own
+SHAKE (FIPS 204), ML-KEM's SHA-3 and SHAKE (FIPS 203). The KEM suite's
+transcript and HKDF hash already follow the KEM the same way (§5.1,
+§17.4). `ml-dsa-zk` uses only AES-256 and SHA-512.
+
+**Still SHA-256 in every profile.** These are older than the logs, and
+their formats fix 32 bytes. Moving them to the policy is open work
+(§16):
+
+* the escrow binding `H(ct)` (§7.2), which a vault release is logged by;
+* the anchor epoch head and `prev` (§4.8);
+* the voucher binding (§9);
+* the peer authentication digest (§4.2) and the trust invitation hash
+  (§11.4);
+* key thumbprints (RFC 7638), which name keys and are not a security
+  boundary of their own.
+
 ### 4.2 Delegations and the anchor exchange
 
 A server's **claim** names its realm, its FQDN, its own anchor and the
@@ -202,12 +269,13 @@ The server renews it at two thirds of its lifetime, or when its signing
 key changes. Claims are not signed by themselves. Each anchor
 **vouches** for a set of claims with one ML-DSA signature over a Merkle
 tree of them, the way a Merkle Tree Certificates log signs its tree
-(built and proven with `synta-mtc`; RFC 9162 hashing: SHA-256 over
+(built and proven with `synta-mtc`; RFC 9162 hashing: `H` over
 `0x00 ‖ claim` for leaves and
-`0x01 ‖ left ‖ right` for nodes, leaves sorted):
+`0x01 ‖ left ‖ right` for nodes, leaves sorted). `H` is the anchor
+key's hash, SHA-256 for ML-DSA-65 and SHA-384 for ML-DSA-87 (§4.1.1):
 
 ```
-IPVH ‖ 1 ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖ root(32) ‖ live_size ‖ live_root(32)
+IPVH ‖ 1 ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖ root(h) ‖ live_size ‖ live_root(h)
                                                     signed, context "ipa-ku-enroll/v1 vouch"
 ```
 
@@ -2164,7 +2232,9 @@ rev. 2 derivation over two approved KEM secrets.
 
 `magic(4) ‖ version(1)=1 ‖ fields`; variable fields are a big-endian `u32`
 length and the bytes; strings UTF-8; lists a `u8` count. KEM ids: `0x01`
-ML-KEM-768, `0x02` ML-KEM-1024. Thumbprints are 32 raw bytes.
+ML-KEM-768, `0x02` ML-KEM-1024. Thumbprints are 32 raw bytes. `(h)` is a
+tree hash, a variable field of 32 bytes (SHA-256) or 48 (SHA-384), as
+the signing key's category decides (§4.1.1).
 
 ```
 IPJQ  alg kid(32) realm fqdn auth_type(1) n(1) [enctype(i32)] ct ek_e sealed   join, rekey request
@@ -2172,7 +2242,8 @@ IPSQ  same fields                                                               
 IPRB  auth_type(1) n(1) [registration(32)] extra authenticator                  sealed request body
 IPJS  ct_e sealed                                                                response
 IPJP  realm domain basedn issuer n[server] n[ca_cert] n[pkinit_anchor]
-      n[anchor(32)] epoch_seq(u64) epoch_head(32) keytab                   enrollment payload
+      n[anchor(32) size(u64) root(h, empty when size is 0)]
+      epoch_seq(u64) epoch_head(32) keytab                                     enrollment payload
 IPSX  mode(1) alg(1) ek_m not_after(u64)                                         staging parameters
 IPSP  bundle secret                                                              stage result
 IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)
@@ -2200,9 +2271,9 @@ IPKG  namespace(1) nickname alg_arg(1)                                          
 IPKR  value                                                                      keys answer (the handler's JSON)
 IPPS  sender receiver delegation(JSON) envelope token                           peer sync request
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
-IPVH  2 realm anchor(32) iat(u64) exp(u64) size(u64) root(32) live_size(u64) live_root(32)
+IPVH  2 realm anchor(32) iat(u64) exp(u64) size(u64) root(h) live_size(u64) live_root(h)
                                                                                  vouch (signed): the claim log's head and the live tree (§4.9.1)
-IPSV  2 vouch(IPVH) signature n(u64) [1 leaf(32) | 2 target(u64) time(u64)]      signed vouch with the whole claim log in order: claims and tombstones; nothing is removed
+IPSV  2 vouch(IPVH) signature n(u64) [1 leaf(h) | 2 target(u64) time(u64)]       signed vouch with the whole claim log in order: claims and tombstones; nothing is removed
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
 IPAE  realm seq(u64) prev(32) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-256` of them under a domain-separation context; `prev` is the previous entry's head, `0…0` for the first)
@@ -2217,21 +2288,21 @@ IPTB  secret realm domain n[server] n[anchor(32)] delegation(JSON)
       signer_key(JWK) signature                                                  sealed trust request body (no version)
 IPTS  ct_e sealed                                                                trust response
 IPTP  realm domain n[server] n[anchor(32)]                                       sealed trust response payload (no version)
-IPLF  kind(2) time(u64) index(32) body                                          typed log leaf (DESIGN-tlog.md §1)
+IPLF  kind(2) time(u64) index(h) body                                           typed log leaf (DESIGN-tlog.md §1)
 IPLT  target(u64) reason                                                        tombstone body (DESIGN-tlog.md §2)
-IPLH  log(32) size(u64) root(32) time(u64)                                      log head (signed, DESIGN-tlog.md §3)
+IPLH  log(h) size(u64) root(h) time(u64)                                        log head (signed, DESIGN-tlog.md §3)
 IPLC  time(u64) head(IPLH)                                                      what a witness cosigns (never sent)
 IPLS  head(IPLH) signature n(1) [witness(32) time(u64) signature]                signed log head with cosignatures
-IPLP  log(32) index(u64) leaf(32) time(u64) signature                         receipt: a signed promise that a leaf was appended
-IPLV  action(1) device leaf-digest(32)                                         vault event body (kinds 2–4; device empty for none)
+IPLP  log(h) index(u64) leaf(h) time(u64) signature                           receipt: a signed promise that a leaf was appended
+IPLV  action(1) device digest(h)                                              vault event body (kinds 2–4; device empty for none; a release's digest is the 32-byte escrow binding)
 IPGQ  purpose n(u64) [alg(1) digest]                                           signing request (DESIGN-sign.md §1)
 IPGL  alg(1) digest                                                             a digest's batch leaf (hashed, never sent)
-IPGS  realm principal purpose batch_size(u64) batch_root(32) iat(u64) log(32) index(u64)
+IPGS  realm principal purpose batch_size(u64) batch_root(h) iat(u64) log(h) index(u64)
                                                                                  signing statement (signed: IPGS ‖ statement ‖ delegation ‖ signer key); as a log body, purpose batch_size batch_root iat only
-IPGR  statement delegation signer_key signature n(u64) [m(1) [hash(32)]]        signing answer: the statement and each digest's batch path
-IPGB  statement delegation signer_key signature digest index(u64) m(1) [hash(32)]   signature bundle, one per digest
+IPGR  statement delegation signer_key signature n(u64) [m(1) [hash(h)]]         signing answer: the statement and each digest's batch path
+IPGB  statement delegation signer_key signature digest index(u64) m(1) [hash(h)]    signature bundle, one per digest
 IPLQ  vault from(u64)                                                           tlog lookup (vault empty: the caller's principal)
-IPLR  signer(JWK) head(IPLS or empty) n(u64) [index(u64) leaf(IPLF) m(1) [hash(32)]]   tlog lookup answer
+IPLR  signer(JWK) head(IPLS or empty) n(u64) [index(u64) leaf(IPLF) m(1) [hash(h)]]    tlog lookup answer
 ```
 
 `ct` is empty in bundle modes B and C, `recipient` all zeros outside mode A,
@@ -2264,6 +2335,11 @@ recovery request and response.
 * **Custodia's JOSE message layer** has no post-quantum standard to move
   to (`draft-ietf-jose-pqc-kem` is still moving); §18 replaces the whole
   daemon on kuipa's envelope instead of waiting for one.
+* **SHA-256 left in a CNSA profile:** the escrow binding, the anchor
+  epoch head, the voucher binding, the peer authentication digest and the
+  trust invitation hash are SHA-256 whatever the crypto policy, with
+  32-byte fields in their formats (§4.1.1). Moving each to the signer's
+  or the KEM's hash is a format change of its own.
 * **Anchor exchange scale:** the state grows linearly with the number of
   anchors; with every server an anchor, 60 servers make 489 KB of state and
   321 KB of deltas per renewal round. Large realms should give the anchor

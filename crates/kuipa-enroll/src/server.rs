@@ -691,7 +691,7 @@ type AdvKey = (
     Option<Thumbprint>,
     Option<Thumbprint>,
     Option<(u64, [u8; 32])>,
-    Option<[u8; 32]>,
+    Option<merkle::Hash>,
 );
 
 /// Most claim-log leaves served in one page (§4.9): a page is for
@@ -708,8 +708,9 @@ pub struct ClaimLogPage {
     pub anchor: String,
     /// The size of the log at the head.
     pub size: u64,
-    /// The tree hash at the head.
-    pub root: [u8; 32],
+    /// The tree hash at the head: 32 bytes (SHA-256) or 48 (SHA-384),
+    /// as the anchor's key decides.
+    pub root: Vec<u8>,
     /// When the vouch that signed the head expires (Unix seconds).
     pub exp: u64,
     /// The base64url leaf hashes after the page's `from`, oldest first.
@@ -756,7 +757,7 @@ impl ClaimLogPage {
             .parse::<Thumbprint>()
             .map_err(|_| Error::Malformed("claim log anchor"))?;
         let v = vouch.vouch();
-        if v.anchor != anchor || v.size != self.size || v.root != self.root {
+        if v.anchor != anchor || v.size != self.size || *v.root != *self.root {
             return Err(Error::Mismatch("claim log head"));
         }
         if !crate::delegation::valid_at(v.iat, v.exp, at) {
@@ -765,7 +766,7 @@ impl ClaimLogPage {
         Ok(HeadPin {
             anchor,
             size: self.size,
-            root: self.root,
+            root: v.root,
         })
     }
 }
@@ -841,6 +842,12 @@ impl EnrollServer {
 
     /// Append an event to the ledger, and sign a receipt for where it
     /// landed (none when the ledger keeps no log).
+    /// The hash of this server's log: its signing key's
+    /// ([`TreeHash::for_signer`](merkle::TreeHash::for_signer)).
+    fn tree_hash(&self) -> merkle::TreeHash {
+        merkle::TreeHash::for_signer(self.keys.signing.public().alg())
+    }
+
     fn record(&self, kind: Kind, subject: &[u8], body: &[u8]) -> Result<Option<Receipt>, Refusal> {
         let Some(a) = self.ledger.append(kind, subject, body).map_err(Refusal)? else {
             return Ok(None);
@@ -870,9 +877,13 @@ impl EnrollServer {
             VaultAction::Create | VaultAction::SetPolicy => {
                 let policy = serde_json::to_vec(&vault.policy)
                     .map_err(|e| Refusal::because(e.to_string()))?;
-                tang_pqc::primitives::sha256(&[&policy])?
+                let alg = self.tree_hash();
+                merkle::Hash::from_slice(&tang_pqc::primitives::digest(
+                    alg.openssl_name(),
+                    &[&policy],
+                )?)?
             }
-            _ => [0; 32],
+            _ => merkle::Hash::zero(self.tree_hash()),
         };
         self.record_vault(&vault.id, action, device.as_deref(), digest)
     }
@@ -884,7 +895,9 @@ impl EnrollServer {
         device: Option<&crate::vault::Device>,
         opened: &tang_pqc::OpenedRequest<'_>,
     ) -> Result<Option<Receipt>, Refusal> {
-        let binding = opened.ciphertext_hash().map_err(Error::from)?;
+        // The release is logged by the escrow binding, which is SHA-256
+        // in every suite (`tang-pqc`), whatever the log's own hash.
+        let binding = merkle::Hash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
         let device = device.map(|d| d.id.as_str());
         self.record_vault(request.vault(), VaultAction::Release, device, binding)
     }
@@ -1043,7 +1056,7 @@ impl EnrollServer {
         Some(ClaimLogPage {
             anchor: anchor.to_string(),
             size: v.size,
-            root: v.root,
+            root: v.root.to_vec(),
             exp: v.exp,
             leaves,
             vouch: Some(tang_pqc::b64::encode(&vouch.to_bytes())),
@@ -1131,7 +1144,11 @@ impl EnrollServer {
                 .and_then(|s| s.statement().ok())
                 .map(|s| s.old),
             epoch,
-            Some(merkle::leaf_hash(delegation.to_json().as_bytes())?),
+            // A cache key: any one hash will do.
+            Some(merkle::leaf_hash(
+                merkle::TreeHash::Sha384,
+                delegation.to_json().as_bytes(),
+            )?),
         );
         if let Some((adv, iat)) = published.advertisements.get(&signer)
             && now.saturating_sub(*iat) < ADVERTISEMENT_VALIDITY / 2
@@ -1494,7 +1511,14 @@ impl EnrollServer {
             .sign_policy()
             .map_err(Refusal)?
             .check(&caller, &groups, &asked.purpose)?;
-        let leaves = asked.leaves()?;
+        let tree = self.tree_hash();
+        if let Some(d) = asked.digests.iter().find(|d| !d.alg.fits(tree)) {
+            return Err(Refusal::because(format!(
+                "a {:?} digest is weaker than this server's {tree:?} (the crypto policy)",
+                d.alg
+            )));
+        }
+        let leaves = asked.leaves(tree)?;
         let batch_root = merkle::root(&leaves)?;
         let now = unix_seconds(SystemTime::now());
         let Some(appended) = self
@@ -2159,7 +2183,12 @@ mod tests {
         let a2 = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         let thp1 = *t.anchor.public().thumbprint();
         let thp2 = *a2.public().thumbprint();
-        let leaf = t.delegation.claim().unwrap().leaf().unwrap();
+        let leaf = t
+            .delegation
+            .claim()
+            .unwrap()
+            .leaf(crate::merkle::TreeHash::Sha256)
+            .unwrap();
         let root = merkle::root(&[leaf]).unwrap();
         let mut vouches = HashMap::new();
         for a in [&t.anchor, &a2] {
@@ -2210,7 +2239,12 @@ mod tests {
     fn a_claim_log_page_verifies_its_head_against_the_anchor_key() {
         let t = test_realm("ipa1.example.test");
         let thp = *t.anchor.public().thumbprint();
-        let leaf = t.delegation.claim().unwrap().leaf().unwrap();
+        let leaf = t
+            .delegation
+            .claim()
+            .unwrap()
+            .leaf(crate::merkle::TreeHash::Sha256)
+            .unwrap();
         let mut vouches = HashMap::new();
         vouches.insert(
             thp,
@@ -2231,14 +2265,17 @@ mod tests {
         let head = page
             .verified_head(t.anchor.public(), &p, now())
             .expect("the served head is signed by the anchor");
-        assert_eq!((head.size, head.root), (page.size, page.root));
+        assert_eq!(
+            (head.size, head.root.to_vec()),
+            (page.size, page.root.clone())
+        );
 
         // A stranger's key proves nothing.
         let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         assert!(page.verified_head(stranger.public(), &p, now()).is_err());
         // A tampered head mismatches the signed vouch.
         let mut tampered = page.clone();
-        tampered.root = [9; 32];
+        tampered.root = vec![9; 32];
         assert!(
             tampered
                 .verified_head(t.anchor.public(), &p, now())

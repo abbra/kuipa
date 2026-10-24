@@ -735,7 +735,8 @@ mod tests {
     #[test]
     fn heads_from_the_query() {
         let a = Thumbprint::from_bytes([1; 32]);
-        let root = [7; 32];
+        // A SHA-384 root: a head names either length.
+        let root = kuipa_enroll::merkle::Hash::from_slice(&[7; 48]).unwrap();
         let head = format!("head={a}.12.{}", b64::encode(&root));
         assert_eq!(
             wanted_heads(Some(&format!("{head}&head=junk&head={a}."))),

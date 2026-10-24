@@ -20,8 +20,17 @@ hold such events, and the order in which it replaces the claim log.
 
 ## 1. Typed leaves
 
-A leaf is `IPLF ‖ 1 ‖ kind(2) ‖ time(u64) ‖ index(32) ‖ body` and its
-tree hash is RFC 9162's `H(0x00 ‖ leaf)`. The kind sits inside the hashed
+**The hash `H`.** A log is hashed with its server signing key's hash:
+SHA-256 for ML-DSA-44 and 65, SHA-384 for ML-DSA-87 (DESIGN.md §4.1.1).
+A CNSA 2.0 crypto policy allows only ML-DSA-87, so a CNSA log is SHA-384
+throughout: its id, leaf hashes, indexes, heads, proofs and receipts.
+Every hash on the wire below is length prefixed, 32 or 48 bytes, and a
+verifier refuses a head or receipt whose hashes are not those of the
+key that signed it.
+
+A leaf is `IPLF ‖ 1 ‖ kind(2) ‖ time(u64) ‖ index(h) ‖ body` and its
+tree hash is RFC 9162's `H(0x00 ‖ leaf)`. A leaf whose index is not of
+the log's hash does not join the log. The kind sits inside the hashed
 bytes, so two leaves with the same body but different kinds are
 different leaves. A claim leaf can therefore never be read as a vault
 event. Unknown kinds parse, so mirrors and monitors keep working when a
@@ -38,20 +47,23 @@ server logs kinds they do not know yet.
 | 7 | token key epoch |
 | 0xFFFF | tombstone (§2) |
 
-`index` is `HMAC-SHA-256(k_index, subject)`. The subject is a vault id
+`index` is `HMAC-H(k_index, subject)`. The subject is a vault id
 or a principal, and `k_index` is the logging server's own key (§5). The
 index lets the public log be mirrored and audited without listing who
 it is about. Only the server that logged a leaf, answering an
 authenticated lookup (§6), maps a subject to it. Servers use different
 keys, so an auditor reading two servers' logs cannot tell that two
-leaves concern the same vault. Leaves without a subject use zeros.
+leaves concern the same vault. Leaves without a subject use zeros of
+`H`'s length.
 
-Each server keeps its own log, `LogId = SHA-256("ipa-ku-log/v1 id" ‖
-len(realm) ‖ realm ‖ server)`. Events go to the log of the server that
-handled them, so replicas never need to agree on one order. Clients
-query every server, as they already fetch every server's claim log.
-The id does not depend on the signing key, so a key rotation continues
-the log rather than forking it.
+Each server keeps its own log, `LogId = H("ipa-ku-log/v1 id" ‖
+len(realm) ‖ realm ‖ server)`, 32 or 48 bytes. Events go to the log of
+the server that handled them, so replicas never need to agree on one
+order. Clients query every server, as they already fetch every server's
+claim log. A key rotation within one category continues the log rather
+than forking it. A rotation to another category, as a crypto policy
+change forces, changes `H` and so the id: the server starts a new log,
+and the old one stays on disk and verifiable under the old key.
 
 ## 2. Tombstones
 
@@ -68,7 +80,7 @@ disappears once claims move here (§8).
 
 ## 3. Signed heads and consistency
 
-A head is `IPLH ‖ 1 ‖ log(32) ‖ size(u64) ‖ root(32) ‖ time(u64)`, never
+A head is `IPLH ‖ 1 ‖ log(h) ‖ size(u64) ‖ root(h) ‖ time(u64)`, never
 of size zero. The server signs it with its delegation-vouched key under
 the ML-DSA context `ipa-ku-log/v1 head`. `Head::extends` holds when the
 log is the same, the size and time do not shrink, and the RFC 9162
@@ -161,10 +173,10 @@ request:
 
 | event | kind | subject | body |
 |---|---|---|---|
-| vault created, policy set, revoked | 3 | vault id | `IPLV`: action, SHA-256 of the policy (zeros for revoke) |
+| vault created, policy set, revoked | 3 | vault id | `IPLV`: action, `H` of the policy (zeros for revoke) |
 | device added or removed | 2 | vault id | `IPLV`: action, the device's id |
 | session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |
-| server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` |
+| server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` (SHA-256 in every profile, DESIGN.md §4.1.1) |
 | Keys fetch | 6 | the caller's principal | the `IPKG` fetch |
 
 Reads (`show`, `list`) and binding registration record nothing. Vault
@@ -191,7 +203,7 @@ vault ‖ from(u64)`:
 Nobody can look up another principal's entries, so auditors work from
 the public log (§5). The answer is `IPLR ‖ 1 ‖ signer(JWK) ‖ head(IPLS,
 empty for an empty log) ‖ n(u64) ‖ [index ‖ leaf(IPLF) ‖ m(1) ‖
-[hash(32)]]`. Each entry carries its inclusion path in the head. At most
+[hash(h)]]`. Each entry carries its inclusion path in the head. At most
 1024 entries come in one answer, and the client pages on with `from`.
 
 The client accepts an answer only if three checks pass:
@@ -212,7 +224,8 @@ tlog/index.key          the server's index key: 32 random bytes, 0600
 tlog/<log id>/leaves    the leaves in order, each a u32 length ‖ IPLF
 ```
 
-The log id is in lowercase hex. A leaf is checked (`Log::check`),
+The log id is in lowercase hex: 64 digits for a SHA-256 log, 96 for a
+SHA-384 one. A leaf is checked (`Log::check`),
 written and synced before it joins the in-memory log, so an append the
 server acknowledged survives a crash. A record cut short by a crash
 mid-write was never acknowledged, and is dropped when the store opens.

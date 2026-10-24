@@ -63,6 +63,36 @@ to retire them.
 | a released offline-session key | that epoch's session files, for as long as it keeps the key | — |
 | root on the user's machine while a file is open or a session is unlocked | the open files and the session's keys | the same |
 
+## Algorithms and the crypto policy
+
+kuipa has no algorithm setting of its own: the system crypto policy
+(`update-crypto-policies`) decides. It decides which ML-KEM and ML-DSA
+parameter sets servers make and hosts accept, and from those follows
+every hash a signature covers:
+
+| policy | signing keys | KEM | trees, logs, indexes, signing batches | digests `kuipa sign` makes |
+|---|---|---|---|---|
+| `DEFAULT`, or any policy that allows ML-DSA-65 | ML-DSA-65 (ML-DSA-44 accepted from witnesses) | ML-KEM-768 | SHA-256 | SHA-256 |
+| a CNSA 2.0 policy | ML-DSA-87 only | ML-KEM-1024 | SHA-384 | SHA-384 |
+
+Under CNSA 2.0 nothing that a signature covers rests on SHA-256, SHA-3
+or SHAKE, which CNSA does not approve as general-purpose hashes. The
+exceptions are where a standard prescribes its own hash, as ML-DSA and
+ML-KEM do internally. A server refuses a SHA-256 digest to sign, and
+hosts refuse a head, receipt or statement whose hashes do not match the
+category of the key that signed it.
+
+**Changing the policy** on a server moves it to new keys of the new
+category. A server's transparency log is tied to its hash, so the
+server starts a new log with a new id. The old log stays in
+`/var/lib/ipa/ku/tlog/` and keeps verifying under the old key. Witnesses
+and `kuipa tlog watch` see a new log, not a rewritten one.
+
+A few older fields are still SHA-256 under every policy: the escrow
+binding of a sealed file, the anchor epoch head, the voucher binding, and
+the hashes that authenticate anchor exchanges and trust invitations.
+Their formats fix 32 bytes. Moving them is planned.
+
 ## What still uses classical cryptography
 
 kuipa protects what travels and rests between hosts and the realm's

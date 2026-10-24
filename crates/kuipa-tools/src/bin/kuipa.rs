@@ -1355,6 +1355,13 @@ fn render_tlog(value: &Value) {
     for f in get(value, "forked").as_array().into_iter().flatten() {
         println!("    FORKED  {}: {}", text(&f["server"]), text(&f["error"]));
     }
+    for r in get(value, "relogged").as_array().into_iter().flatten() {
+        println!(
+            "   NEW LOG  {}: replaces log {} (its key changed category, as a crypto policy change does); read from its start",
+            text(&r["server"]),
+            text(&r["old_log"])
+        );
+    }
     for u in get(value, "unwitnessed").as_array().into_iter().flatten() {
         println!(
             "UNWITNESSED  {}: {} of {} cosignatures; run again after the witnesses' next pass",

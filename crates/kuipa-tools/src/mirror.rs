@@ -249,7 +249,7 @@ fn walk(
         }
         if !heads
             .iter()
-            .any(|h| h.anchor == *a && h.size == page.size && h.root == page.root)
+            .any(|h| h.anchor == *a && h.size == page.size && *h.root == *page.root)
         {
             eprintln!(
                 "kuipa-mirror: sync: {anchor}: the page head is not signed by the advertisement; not caching"
@@ -369,7 +369,11 @@ mod tests {
             retired: Vec::new(),
         };
         let server = EnrollServer::new(keys, info, delegation.clone());
-        let leaf = delegation.claim().unwrap().leaf().unwrap();
+        let leaf = delegation
+            .claim()
+            .unwrap()
+            .leaf(kuipa_enroll::merkle::TreeHash::Sha256)
+            .unwrap();
         let mut vouches = HashMap::new();
         vouches.insert(
             thp,
@@ -389,7 +393,7 @@ mod tests {
         ClaimLogPage {
             anchor: anchor.to_owned(),
             size,
-            root,
+            root: root.to_vec(),
             exp: unix_seconds(SystemTime::now()) + 3600,
             leaves: (0..leaves)
                 .map(|i| tang_pqc::b64::encode(&[u8::try_from(i).unwrap_or(255); 32]))
@@ -436,7 +440,7 @@ mod tests {
         let heads = vec![HeadPin {
             anchor: a,
             size: 400_000,
-            root,
+            root: kuipa_enroll::merkle::Hash::from_slice(&root).unwrap(),
         }];
         let fetch = |_from: u64| {
             Ok(page(
@@ -466,7 +470,7 @@ mod tests {
         let heads = vec![HeadPin {
             anchor: a,
             size: 4096,
-            root,
+            root: kuipa_enroll::merkle::Hash::from_slice(&root).unwrap(),
         }];
         let fetch = |from: u64| {
             Ok(if from == 0 {
@@ -515,7 +519,7 @@ mod tests {
         // The same page with a tampered root: the advertisement does
         // not sign that head.
         let forged = ClaimLogPage {
-            root: [0xa5; 32],
+            root: vec![0xa5; 32],
             ..genuine.clone()
         };
         let cache = Cache::default();

@@ -22,6 +22,7 @@
 //! Exit status: 0 a clean report, 1 an error, 2 a report that found a
 //! split view or a forked transparency log.
 
+use kuipa_enroll::merkle::Hash;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -224,7 +225,7 @@ fn tlog(
 }
 
 /// Parse `--pinned-head "THP SIZE ROOT"` arguments.
-fn heads(given: &[String]) -> Result<Vec<(tang_pqc::Thumbprint, u64, [u8; 32])>, String> {
+fn heads(given: &[String]) -> Result<Vec<(tang_pqc::Thumbprint, u64, Hash)>, String> {
     let mut out = Vec::new();
     for g in given {
         let mut fields = g.split_whitespace();
@@ -236,8 +237,12 @@ fn heads(given: &[String]) -> Result<Vec<(tang_pqc::Thumbprint, u64, [u8; 32])>,
         let anchor: tang_pqc::Thumbprint =
             a.parse().map_err(|_| format!("bad thumbprint in {g:?}"))?;
         let size: u64 = s.parse().map_err(|_| format!("bad size in {g:?}"))?;
-        let root: tang_pqc::Thumbprint = r.parse().map_err(|_| format!("bad root in {g:?}"))?;
-        out.push((anchor, size, *root.as_bytes()));
+        // 32 bytes for a SHA-256 log, 48 for a SHA-384 one.
+        let root = tang_pqc::b64::decode(r)
+            .ok()
+            .and_then(|r| Hash::from_slice(&r).ok())
+            .ok_or_else(|| format!("bad root in {g:?}"))?;
+        out.push((anchor, size, root));
     }
     Ok(out)
 }

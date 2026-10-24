@@ -26,7 +26,7 @@ use tang_pqc::{Policy as CryptoPolicy, SigningKey, Thumbprint, VerifyingKey};
 use crate::delegation::{Delegation, VerifiedDelegation};
 use crate::error::{Error, Result};
 use crate::keytab::Principal;
-use crate::merkle::{self, Hash};
+use crate::merkle::{self, Hash, TreeHash};
 use crate::tlog::LogId;
 
 const REQUEST_MAGIC: [u8; 4] = *b"IPGQ";
@@ -72,6 +72,27 @@ impl DigestAlg {
         })
     }
 
+    /// The digest a client should use where `policy` holds: SHA-256 while
+    /// it allows a category 2 or 3 signer, SHA-384 when it allows only
+    /// ML-DSA-87 (CNSA 2.0, which approves no SHA-256).
+    #[must_use]
+    pub fn for_policy(policy: &tang_pqc::Policy) -> Self {
+        use tang_pqc::SignatureAlg as S;
+        if policy.allows_signature(S::MlDsa44) || policy.allows_signature(S::MlDsa65) {
+            Self::Sha256
+        } else {
+            Self::Sha384
+        }
+    }
+
+    /// Whether a statement whose batch is hashed with `tree` may cover a
+    /// digest of this algorithm: never one shorter than the tree hash, so
+    /// a SHA-384 (CNSA) signer covers SHA-384 and SHA-512 digests only.
+    #[must_use]
+    pub const fn fits(self, tree: TreeHash) -> bool {
+        self.output_len() >= tree.output_len()
+    }
+
     /// The digest length.
     #[must_use]
     pub const fn output_len(self) -> usize {
@@ -115,13 +136,15 @@ impl Digest {
         })
     }
 
-    /// Its leaf in a statement's batch tree: `H(0x00 ‖ IPGL ‖ 1 ‖ alg ‖ value)`.
+    /// Its leaf in a statement's batch tree of `tree`, the signing
+    /// server's hash: `H(0x00 ‖ IPGL ‖ 1 ‖ alg ‖ value)`.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn leaf(&self) -> Result<Hash> {
+    pub fn leaf(&self, tree: TreeHash) -> Result<Hash> {
         merkle::leaf_hash(
+            tree,
             &Writer::new(LEAF_MAGIC)
                 .u8(self.alg.id())
                 .bytes(&self.value)
@@ -207,13 +230,13 @@ impl Request {
         Ok(Self { purpose, digests })
     }
 
-    /// The batch tree's leaves, in order.
+    /// The batch tree's leaves under `tree`, in order.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn leaves(&self) -> Result<Vec<Hash>> {
-        self.digests.iter().map(Digest::leaf).collect()
+    pub fn leaves(&self, tree: TreeHash) -> Result<Vec<Hash>> {
+        self.digests.iter().map(|d| d.leaf(tree)).collect()
     }
 }
 
@@ -244,9 +267,9 @@ impl Statement {
             .str(&self.principal)
             .str(&self.purpose)
             .u64(self.batch_size)
-            .fixed(&self.batch_root)
+            .bytes(&self.batch_root)
             .u64(self.iat)
-            .fixed(&self.log.0)
+            .bytes(&self.log.0)
             .u64(self.index);
     }
 
@@ -256,9 +279,9 @@ impl Statement {
             principal: r.str()?.to_owned(),
             purpose: r.str()?.to_owned(),
             batch_size: r.u64()?,
-            batch_root: r.fixed()?,
+            batch_root: Hash::from_slice(r.bytes()?)?,
             iat: r.u64()?,
-            log: LogId(r.fixed()?),
+            log: LogId(Hash::from_slice(r.bytes()?)?),
             index: r.u64()?,
         })
     }
@@ -350,6 +373,11 @@ impl SignedStatement {
         if !policy.allows_signature(key.alg()) {
             return Err(Error::UntrustedAnchor);
         }
+        // The batch and the log are hashed as the signer's key decides.
+        let tree = TreeHash::for_signer(key.alg());
+        if s.batch_root.alg() != tree || s.log.alg() != tree {
+            return Err(Error::Mismatch("statement hash"));
+        }
         key.verify_with_context(
             &Self::signed_part(s, &self.delegation, &self.signer_key),
             STATEMENT_CONTEXT,
@@ -405,14 +433,15 @@ impl Answer {
     ///
     /// An OpenSSL error.
     pub fn new(request: &Request, statement: SignedStatement) -> Result<Self> {
-        let leaves = request.leaves()?;
+        let leaves = request.leaves(statement.statement.batch_root.alg())?;
         let paths = (0..leaves.len())
             .map(|i| merkle::path(&leaves, i))
             .collect::<Result<_>>()?;
         Ok(Self { statement, paths })
     }
 
-    /// `IPGR ‖ 1 ‖ statement ‖ n(u64) ‖ [m(1) ‖ hash(32)·m]`.
+    /// `IPGR ‖ 1 ‖ statement ‖ n(u64) ‖ [m(1) ‖ hash·m]`, each hash length
+    /// prefixed.
     ///
     /// # Panics
     ///
@@ -425,7 +454,7 @@ impl Answer {
         for p in &self.paths {
             w.u8(u8::try_from(p.len()).expect("short paths"));
             for h in p {
-                w.fixed(h);
+                w.bytes(h);
             }
         }
         w.finish()
@@ -445,9 +474,9 @@ impl Answer {
             .ok_or(Error::Malformed("signing answer"))?;
         let paths = (0..n)
             .map(|_| -> Result<Vec<Hash>> {
-                Ok((0..r.u8()?)
-                    .map(|_| r.fixed())
-                    .collect::<std::result::Result<_, _>>()?)
+                (0..r.u8()?)
+                    .map(|_| Hash::from_slice(r.bytes()?))
+                    .collect::<Result<_>>()
             })
             .collect::<Result<_>>()?;
         r.finish()?;
@@ -513,7 +542,7 @@ impl Bundle {
     fn in_batch(&self) -> Result<bool> {
         let s = &self.statement.statement;
         merkle::verify(
-            &self.digest.leaf()?,
+            &self.digest.leaf(s.batch_root.alg())?,
             self.index,
             s.batch_size,
             &self.path,
@@ -549,6 +578,18 @@ impl Bundle {
             return Err(Error::Mismatch("signing batch"));
         }
         let delegation = self.statement.verify(realm, anchors, policy)?;
+        // The statement verified, so the batch is hashed as its key
+        // decides; the digest may not be weaker.
+        if !self
+            .digest
+            .alg
+            .fits(self.statement.statement.batch_root.alg())
+        {
+            return Err(Error::Policy(format!(
+                "a {:?} digest is weaker than the signer's hash",
+                self.digest.alg
+            )));
+        }
         let s = &self.statement.statement;
         Ok(Verified {
             principal: s.principal.parse()?,
@@ -560,7 +601,8 @@ impl Bundle {
         })
     }
 
-    /// `IPGB ‖ 1 ‖ statement ‖ digest ‖ index ‖ m(1) ‖ [hash(32)]`.
+    /// `IPGB ‖ 1 ‖ statement ‖ digest ‖ index ‖ m(1) ‖ [hash]`, each hash
+    /// length prefixed.
     ///
     /// # Panics
     ///
@@ -573,7 +615,7 @@ impl Bundle {
         w.u64(self.index)
             .u8(u8::try_from(self.path.len()).expect("short paths"));
         for h in &self.path {
-            w.fixed(h);
+            w.bytes(h);
         }
         w.finish()
     }
@@ -589,8 +631,8 @@ impl Bundle {
         let digest = Digest::read(&mut r)?;
         let index = r.u64()?;
         let path = (0..r.u8()?)
-            .map(|_| r.fixed())
-            .collect::<std::result::Result<_, _>>()?;
+            .map(|_| Hash::from_slice(r.bytes()?))
+            .collect::<Result<_>>()?;
         r.finish()?;
         Ok(Self {
             statement,
@@ -672,8 +714,12 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     fn setup() -> (SigningKey, SigningKey, Delegation) {
-        let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-        let server = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        setup_with(SignatureAlg::MlDsa65)
+    }
+
+    fn setup_with(alg: SignatureAlg) -> (SigningKey, SigningKey, Delegation) {
+        let anchor = SigningKey::generate(alg).unwrap();
+        let server = SigningKey::generate(alg).unwrap();
         let delegation = Delegation::issue(
             &anchor,
             REALM,
@@ -696,7 +742,11 @@ mod tests {
     }
 
     fn statement(r: &Request) -> Statement {
-        let leaves = r.leaves().unwrap();
+        statement_in(r, TreeHash::Sha256)
+    }
+
+    fn statement_in(r: &Request, tree: TreeHash) -> Statement {
+        let leaves = r.leaves(tree).unwrap();
         Statement {
             realm: REALM.into(),
             principal: "alice@EXAMPLE.TEST".into(),
@@ -704,7 +754,7 @@ mod tests {
             batch_size: leaves.len() as u64,
             batch_root: merkle::root(&leaves).unwrap(),
             iat: NOW,
-            log: LogId([4; 32]),
+            log: LogId::of(REALM, "ipa1.example.test", tree).unwrap(),
             index: 7,
         }
     }
@@ -780,6 +830,55 @@ mod tests {
         // CNSA 2.0 refuses the ML-DSA-65 signer.
         let b = answer.bundle(&req, 0).unwrap();
         assert!(b.verify(&[0], REALM, &anchors, &Policy::cnsa2()).is_err());
+    }
+
+    #[test]
+    fn a_cnsa_statement_hashes_its_batch_with_sha_384() {
+        // An ML-DSA-87 server under CNSA 2.0: SHA-384 batch tree and log,
+        // SHA-384 digests of the data; a SHA-256 batch from that key is
+        // refused even with a valid signature.
+        let (anchor, server, delegation) = setup_with(SignatureAlg::MlDsa87);
+        let anchors = [*anchor.public().thumbprint()];
+        let req = Request {
+            purpose: "blob".into(),
+            digests: (0..3u8)
+                .map(|i| Digest::of(DigestAlg::Sha384, &[i]).unwrap())
+                .collect(),
+        };
+        let s = statement_in(&req, TreeHash::Sha384);
+        assert_eq!(s.batch_root.len(), 48);
+        let signed = SignedStatement::sign(&server, &delegation, s).unwrap();
+        let answer = Answer::from_bytes(&Answer::new(&req, signed).unwrap().to_bytes()).unwrap();
+        for i in 0..3u8 {
+            let bundle =
+                Bundle::from_bytes(&answer.bundle(&req, usize::from(i)).unwrap().to_bytes())
+                    .unwrap();
+            bundle
+                .verify(&[i], REALM, &anchors, &Policy::cnsa2())
+                .unwrap();
+        }
+        let weak = SignedStatement::sign(&server, &delegation, statement(&req)).unwrap();
+        assert!(weak.verify(REALM, &anchors, &Policy::cnsa2()).is_err());
+
+        // A SHA-256 digest under that signer is refused, though the
+        // statement and the batch verify; the client picks SHA-384.
+        let short = request(2);
+        let signed =
+            SignedStatement::sign(&server, &delegation, statement_in(&short, TreeHash::Sha384))
+                .unwrap();
+        let bundle = Answer::new(&short, signed)
+            .unwrap()
+            .bundle(&short, 0)
+            .unwrap();
+        assert!(
+            bundle
+                .verify(&[0], REALM, &anchors, &Policy::cnsa2())
+                .is_err()
+        );
+        assert_eq!(DigestAlg::for_policy(&Policy::cnsa2()), DigestAlg::Sha384);
+        assert_eq!(DigestAlg::for_policy(&Policy::default()), DigestAlg::Sha256);
+        assert!(DigestAlg::Sha512.fits(TreeHash::Sha384));
+        assert!(!DigestAlg::Sha256.fits(TreeHash::Sha384));
     }
 
     #[test]

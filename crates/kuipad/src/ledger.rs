@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use kuipa_enroll::merkle::{self, Hash};
+use kuipa_enroll::merkle::{self, Hash, TreeHash};
 use kuipa_enroll::server::{Appended, DirectoryError, Ledger};
 use kuipa_enroll::tlog::{self, Entry, Kind, Leaf, Log, LogId, SignedHead};
 use native_ossl::rand::Rand;
@@ -71,19 +71,23 @@ struct Inner {
 }
 
 impl FileLedger {
-    /// Open, or create, the log of `server` in `realm` under `key_dir`.
+    /// Open, or create, the log of `server` in `realm` under `key_dir`,
+    /// hashed with `alg` — the server key's ([`TreeHash::for_signer`]).
+    /// The hash is part of the log's identity: a server whose key moves
+    /// to another category (a crypto policy change) starts a new log, in
+    /// its own directory, and the old one stays on disk for auditors.
     ///
     /// # Errors
     ///
     /// I/O, or a store whose leaves do not form a valid log.
-    pub fn open(key_dir: &Path, realm: &str, server: &str) -> Result<Self, Error> {
+    pub fn open(key_dir: &Path, realm: &str, server: &str, alg: TreeHash) -> Result<Self, Error> {
         let dir = key_dir.join("tlog");
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&dir)?;
         let key = index_key(&dir.join("index.key"))?;
-        let id = LogId::of(realm, server)?;
+        let id = LogId::of(realm, server, alg)?;
         let log_dir = dir.join(id.to_string());
         fs::DirBuilder::new()
             .recursive(true)
@@ -188,6 +192,14 @@ impl FileLedger {
             h.head.size == inner.log.size()
                 && now.saturating_sub(h.head.time) < HEAD_INTERVAL.as_secs()
         });
+        if TreeHash::for_signer(key.public().alg()) != inner.log.alg() {
+            return Err(format!(
+                "log {} is not hashed as a {} key signs",
+                self.id,
+                key.public().alg().jose_name()
+            )
+            .into());
+        }
         if !fresh {
             let head = SignedHead::issue(key, inner.log.head(now)?)?;
             inner.head = Some(head);
@@ -250,7 +262,7 @@ impl Ledger for FileLedger {
         let leaf = Leaf {
             kind,
             time: unix_seconds(SystemTime::now()),
-            index: tlog::index(&self.key, subject)?,
+            index: tlog::index(self.id.alg(), &self.key, subject)?,
             body: body.to_vec(),
         };
         let bytes = leaf.to_bytes();
@@ -288,7 +300,7 @@ impl Ledger for FileLedger {
         size: u64,
         max: usize,
     ) -> Result<Vec<Entry>, DirectoryError> {
-        let index = tlog::index(&self.key, subject)?;
+        let index = tlog::index(self.id.alg(), &self.key, subject)?;
         let inner = self.inner();
         let hashes = prefix(inner.log.hashes(), size)?;
         let from = usize::try_from(from)?;
@@ -369,7 +381,8 @@ mod tests {
     #[test]
     fn appends_survive_a_reopen_and_a_torn_write() {
         let dir = temp("reopen");
-        let ledger = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test").unwrap();
+        let ledger =
+            FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256).unwrap();
         for i in 0..3u8 {
             let a = ledger
                 .append(Kind::VAULT_DEVICE, b"vault", &[i])
@@ -384,7 +397,8 @@ mod tests {
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(&[0, 0, 0, 40, 1, 2]).unwrap();
         drop(f);
-        let reopened = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test").unwrap();
+        let reopened =
+            FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256).unwrap();
         assert_eq!(reopened.size(), 3);
         let a = reopened
             .append(Kind::KEYS_FETCH, b"host", b"x")
@@ -392,7 +406,8 @@ mod tests {
             .unwrap();
         assert_eq!(a.index, 3);
         drop(reopened);
-        let again = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test").unwrap();
+        let again =
+            FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256).unwrap();
         let leaves = again.leaves(0, 10);
         assert_eq!(leaves.len(), 4);
         assert_eq!(leaves[3].kind, Kind::KEYS_FETCH);
@@ -405,14 +420,17 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes[4] = b'X';
         fs::write(&path, bytes).unwrap();
-        assert!(FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test").is_err());
+        assert!(
+            FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256).is_err()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn heads_and_proofs_at_any_served_size() {
         let dir = temp("heads");
-        let ledger = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test").unwrap();
+        let ledger =
+            FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256).unwrap();
         let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         assert!(ledger.signed_head(&key, 100).unwrap().is_none());
         ledger.append(Kind::VAULT_POLICY, b"v", b"a").unwrap();
@@ -448,7 +466,8 @@ mod tests {
     #[test]
     fn finds_a_subjects_leaves_up_to_a_head() {
         let dir = temp("find");
-        let ledger = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test").unwrap();
+        let ledger =
+            FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256).unwrap();
         for (i, subject) in [b"a", b"b", b"a", b"a"].iter().enumerate() {
             let body = [u8::try_from(i).unwrap()];
             ledger.append(Kind::VAULT_DEVICE, *subject, &body).unwrap();
@@ -476,7 +495,7 @@ mod tests {
         let dir = temp("cosign");
         let witness = SigningKey::generate(SignatureAlg::MlDsa44).unwrap();
         let stranger = SigningKey::generate(SignatureAlg::MlDsa44).unwrap();
-        let ledger = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test")
+        let ledger = FileLedger::open(&dir, "EXAMPLE.TEST", "ipa1.example.test", TreeHash::Sha256)
             .unwrap()
             .with_witnesses(vec![witness.public().clone()]);
         let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
