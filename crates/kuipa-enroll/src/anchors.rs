@@ -799,9 +799,8 @@ impl PeerSync {
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::new(SYNC_MAGIC);
-        w.u8(2)
-            .str(&self.sender)
+        let mut w = Writer::with_version(SYNC_MAGIC, 2);
+        w.str(&self.sender)
             .str(&self.receiver)
             .str(&self.own.to_json())
             .bytes(&self.envelope)
@@ -819,10 +818,7 @@ impl PeerSync {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(buf, SYNC_MAGIC, "peer sync")?;
-        if r.u8()? != 2 {
-            return Err(Error::Malformed("peer sync version"));
-        }
+        let mut r = Reader::with_version(buf, SYNC_MAGIC, 2, "peer sync")?;
         let sender = r.str()?.into();
         let receiver = r.str()?.into();
         let own = Delegation::from_json(r.str()?.as_bytes())?;
@@ -1556,8 +1552,9 @@ mod tests {
                 .attest("ipa-ku/b@R", "a", &all, REALM, &policy, NOW)
                 .is_err()
         );
+        // Only version 2 parses.
         let mut tampered = sync.to_bytes();
-        tampered[4] = 2;
+        tampered[4] = 1;
         assert!(PeerSync::from_bytes(&tampered).is_err());
 
         // A server without an anchor sends its claim without a proof;

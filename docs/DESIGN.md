@@ -301,7 +301,7 @@ tree of them, the way a Merkle Tree Certificates log signs its tree
 key's hash, SHA-256 for ML-DSA-65 and SHA-384 for ML-DSA-87 (§4.1.1):
 
 ```
-IPVH ‖ 1 ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖ root(h) ‖ live_size ‖ live_root(h)
+IPVH ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖ root(h) ‖ live_size ‖ live_root(h)
                                                     signed, context "ipa-ku-enroll/v1 vouch"
 ```
 
@@ -2296,11 +2296,11 @@ IPKG  namespace(1) nickname alg_arg(1)                                          
       (namespace: 1 dm, 2 ra, 3 ca, 4 ca_wrapped, 5 lwca-store; alg_arg: a wrap
        algorithm selector for ca_wrapped, 0 none; nickname: a string)
 IPKR  value                                                                      keys answer (the handler's JSON)
-IPPS  sender receiver delegation(JSON) envelope token                           peer sync request
+IPPS  version 2: sender receiver delegation(JSON) envelope token n(u64) [epoch entry]   peer sync request (the sender's epoch chain tail, §4.8)
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
-IPVH  2 realm anchor(32) iat(u64) exp(u64) size(u64) root(h) live_size(u64) live_root(h)
+IPVH  version 2: realm anchor(32) iat(u64) exp(u64) size(u64) root(h) live_size(u64) live_root(h)
                                                                                  vouch (signed): the claim log's head and the live tree (§4.9.1)
-IPSV  2 vouch(IPVH) signature n(u64) [1 leaf(h) | 2 target(u64) time(u64)]       signed vouch with the whole claim log in order: claims and tombstones; nothing is removed
+IPSV  version 2: vouch(IPVH) signature n(u64) [1 leaf(h) | 2 target(u64) time(u64)]       signed vouch with the whole claim log in order: claims and tombstones; nothing is removed
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
 IPAE  realm seq(u64) prev(48) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-384` of them under a domain-separation context, in every profile; `prev` is the previous entry's head, `0…0` for the first)

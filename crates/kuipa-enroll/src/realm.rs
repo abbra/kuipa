@@ -518,8 +518,8 @@ impl VerifiedRealm {
         if info.realm != delegation.realm || info.server != delegation.server {
             return Err(Error::Mismatch("server identity"));
         }
-        // The epoch head is advisory here: an older server names none,
-        // and a mismatch with what the client stored is the flow's
+        // The epoch head is advisory here: a server with no epoch log yet
+        // names none, and a mismatch with what the client stored is the flow's
         // discovery, not a reason to reject this advertisement.
         let epoch = adv.member(MEMBER_EPOCH).and_then(|v| {
             let seq = v.get("seq")?.as_u64()?;
@@ -1029,8 +1029,8 @@ pub(crate) mod tests {
     fn enrollment_epoch_must_match_the_advertisement() {
         let t = test_realm("ipa1.example.test");
         let v = verified(&t);
-        // This advertisement named no log: any watermark stands (an older
-        // server names none, §4.8).
+        // This advertisement named no log: any watermark stands (a server
+        // with no epoch log yet names none, §4.8).
         v.check_epoch((7, [1; 48])).unwrap();
         // One that names a log demands the same watermark.
         let e = (3, [2; 48]);

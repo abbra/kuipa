@@ -239,7 +239,7 @@ fn walk(
     let mut complete = false;
     for _ in 0..MAX_PAGES_PER_ANCHOR {
         let page = fetch(from)?;
-        if page.vouch.is_none() {
+        if page.vouch.is_empty() {
             eprintln!("kuipa-mirror: sync: {anchor}: the page head is not signed; not caching");
             return Ok(None);
         }
@@ -383,13 +383,7 @@ mod tests {
         (server, thp)
     }
 
-    fn page(
-        anchor: &str,
-        size: u64,
-        root: [u8; 32],
-        leaves: usize,
-        vouch: Option<String>,
-    ) -> ClaimLogPage {
+    fn page(anchor: &str, size: u64, root: [u8; 32], leaves: usize, vouch: &str) -> ClaimLogPage {
         ClaimLogPage {
             anchor: anchor.to_owned(),
             size,
@@ -398,7 +392,7 @@ mod tests {
             leaves: (0..leaves)
                 .map(|i| tang_pqc::b64::encode(&[u8::try_from(i).unwrap_or(255); 32]))
                 .collect(),
-            vouch,
+            vouch: vouch.to_owned(),
         }
     }
 
@@ -442,15 +436,7 @@ mod tests {
             size: 400_000,
             root: kuipa_enroll::merkle::Hash::from_slice(&root).unwrap(),
         }];
-        let fetch = |_from: u64| {
-            Ok(page(
-                &anchor,
-                400_000,
-                root,
-                MAX_CLAIM_LOG_PAGE,
-                Some("v".into()),
-            ))
-        };
+        let fetch = |_from: u64| Ok(page(&anchor, 400_000, root, MAX_CLAIM_LOG_PAGE, "v"));
         let head = super::walk(&cache, &anchor, &a, &heads, fetch).unwrap();
         assert!(head.is_some(), "the signed head is still the log's head");
         let pages = cache.cached_pages(&anchor);
@@ -474,9 +460,9 @@ mod tests {
         }];
         let fetch = |from: u64| {
             Ok(if from == 0 {
-                page(&anchor, 4096, root, 4096, Some("v".into()))
+                page(&anchor, 4096, root, 4096, "v")
             } else {
-                page(&anchor, 4096, root, 0, Some("v".into()))
+                page(&anchor, 4096, root, 0, "v")
             })
         };
         assert!(
@@ -532,7 +518,7 @@ mod tests {
 
         // A page whose head is not signed at all.
         let unsigned = ClaimLogPage {
-            vouch: None,
+            vouch: String::new(),
             ..genuine.clone()
         };
         let cache = Cache::default();

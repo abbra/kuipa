@@ -733,8 +733,8 @@ pub struct ClaimLogPage {
     /// base64url `IPSV` v2, public data — it travels in the exchange
     /// and every signature proof — so a reader can check that the head
     /// was signed at all, against the anchor's key from any
-    /// advertisement.  Absent for an older server.
-    pub vouch: Option<String>,
+    /// advertisement.
+    pub vouch: String,
 }
 
 impl ClaimLogPage {
@@ -758,12 +758,8 @@ impl ClaimLogPage {
         policy: &Policy,
         at: u64,
     ) -> crate::Result<HeadPin> {
-        let bytes = tang_pqc::b64::decode(
-            self.vouch
-                .as_ref()
-                .ok_or(Error::Malformed("claim log: head is not signed"))?,
-        )
-        .map_err(|_| Error::Malformed("claim log vouch"))?;
+        let bytes =
+            tang_pqc::b64::decode(&self.vouch).map_err(|_| Error::Malformed("claim log vouch"))?;
         let vouch = SignedVouch::from_bytes(&bytes)?;
         vouch.verify(key, policy)?;
         let anchor = self
@@ -1073,7 +1069,7 @@ impl EnrollServer {
             root: v.root.to_vec(),
             exp: v.exp,
             leaves,
-            vouch: Some(tang_pqc::b64::encode(&vouch.to_bytes())),
+            vouch: tang_pqc::b64::encode(&vouch.to_bytes()),
         })
     }
 
@@ -2300,9 +2296,10 @@ mod tests {
                 .verified_head(t.anchor.public(), &p, now())
                 .is_err()
         );
-        // An older server's page carries no vouch: the head is unsigned.
+        // A page whose vouch is not the anchor's signed vouch proves no
+        // head.
         let mut unsigned = page.clone();
-        unsigned.vouch = None;
+        unsigned.vouch = String::new();
         assert!(
             unsigned
                 .verified_head(t.anchor.public(), &p, now())
