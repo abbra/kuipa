@@ -26,6 +26,14 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 - [ ] Run the `tang-pqc` pin under real Clevis: `clevis luks bind` on a
       LUKS2 volume, `clevis luks unlock`, `clevis luks regen` after
       `tang-rotate`, and unlocking at boot from the dracut module (§10.7).
+- [ ] Check emitted log heads and cosignatures with a C2SP
+      tlog-witness implementation, once the ML-DSA note format is
+      settled (`DESIGN-tlog.md` §6).
+- [ ] Extend the Tamarin model (`contrib/tamarin/kuipa.spthy`) beyond the
+      core exchange: user vaults and the unified recovery request (§7.6),
+      vouchers (§9), trust establishment (§17.4), signing statements
+      (`DESIGN-sign.md`). Re-prove whenever a modelled flow changes;
+      encodings and hash choices are abstracted and need no re-proof.
 
 ## Protocol and implementation
 
@@ -63,10 +71,9 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       refused outside `cn=masters`, joins, fetches the promotion set).
 - [ ] Secrets transport, remaining: run the LDAP policy check against a
       real FreeIPA server (`cn=masters`, the CA role); sealed
-      lightweight-CA artifacts (`lwca-store`, the
+      lightweight-CA artifacts (an `lwca-store` handler, the
       `cn=lwca,cn=kuipa,cn=etc` container) and the Dogtag-side ML-KEM
-      import; the `kuipad.json` `keys` section documented in the example
-      configuration.
+      import. (The `keys` section is in `contrib/kuipad.json.example`.)
 - [x] gssproxy as the keytab holder in `kuipa protect`, once gssproxy's
       `keytab_loader` is merged (§7.4): write the service's gssproxy
       configuration (`cred_store = keytab:MEMORY:<name>`, `keytab_loader =
@@ -81,6 +88,60 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       `/etc/ipa/ku-anchors`.
 - [ ] S4U2Proxy with the caller's evidence ticket instead of protocol
       transition (§16).
+- [x] Typed transparency logs (`DESIGN-tlog.md`): typed leaves,
+      tombstones, signed heads, consistency proofs, witness cosignatures
+      (`kuipa-witness`, required counts on hosts), vault, escrow, Keys and
+      signing events with receipts, `kuipa tlog watch`, `kuipa-audit tlog`;
+      claim logs migrated onto typed leaves.
+- [ ] Transparency logs, remaining: the tlog-tiles layout and a C2SP
+      signed-note checkpoint with a witness endpoint (§6); logging the
+      opening of machine (keytab) bindings, which only vault releases are
+      today; mirroring the logs in `kuipa-mirror`; token-key epochs
+      (kind 7) once tokens exist.
+- [x] Kerberos-bound signing (`DESIGN-sign.md`): the `sign` operation,
+      the signing policy with `memberOf` groups, batches, offline bundles,
+      `kuipa sign`, `kuipa-gitsign`.
+- [ ] Signing, remaining: per-principal rate limits in the signing
+      policy; PAC groups in place of `memberOf` (with the PAC work above).
+      RPM and OCI keep their OpenPGP signing and are out of scope.
+- [x] Hashes and proof levels follow the system crypto policy
+      (`DESIGN.md` §4.1.1): signer-bound data by the key's category,
+      KEM-bound data by the KEM, keyless values SHA-384; `ml-dsa-zk` at
+      λ = 256 under CNSA 2.0. RFC 7638 thumbprints stay SHA-256 by
+      decision (Clevis).
+- [ ] Unlinkable tokens (`ml-dsa-blind/DESIGN.md` §6,
+      `ml-dsa-zk/DESIGN.md` §4), in order:
+  - [x] 1. VOLE-in-the-head proofs over boolean circuits, a Keccak-f
+        gadget, AES-256/SHA-512 only, λ by the crypto policy.
+  - [ ] 2. VOLE over an extension of `F_q` for `Z_q` arithmetic
+        (Baum–Beckmann, ePrint 2026/2473).
+  - [ ] 3. Conversions between committed bits and `Z_q` values.
+  - [ ] 4. The ML-DSA verification circuit, ML-DSA-87 first.
+  - [ ] 5. `BlindSignature::anonymize()` behind a `zk` feature; the token
+        protocol (`IPNQ`/`IPNR`/`IPNT`, per-principal quotas, spent sets,
+        token keys logged as kind 7).
+  - [ ] 6. Proof-of-work grinding on Δ, a soundness bound for the
+        parameters, constant-time review, and review by someone else.
+
+## Planned use cases
+
+From the book's [What kuipa is for](docs/src/use-cases.md); each needs a
+design first.
+
+- [ ] Offline logins without a crackable SSSD cache: a Kerberos-bound
+      operation arms a host while online with a signed offline grant (one
+      user, one host, a window) and a per-user TPM-sealed object; needs the
+      TPM factor.
+- [ ] Shared and group vaults (several owners, or a host group).
+- [ ] Recovery slots held by a helpdesk group, also escrowing LUKS and
+      backup recovery keys.
+- [ ] M-of-N approvals for break-glass releases, recorded in the
+      transparency log.
+- [ ] Short-lived CI runner identities: leases on top of vouchers, and
+      pipeline secrets sealed to them.
+- [ ] Recipes in the book: Ansible vault passwords, `systemd-creds` and
+      container secrets, `tang-pqc` file encryption, `realm-info` for
+      unenrolled machines.
 
 ## Outside this workspace
 
