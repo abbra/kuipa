@@ -5,6 +5,10 @@ edition = "2021"
 rust-version.workspace = true
 description = "GSSAPI bindings (from ahdapa-gssapi): accept/init contexts with channel bindings, keytab and S4U2Proxy credentials"
 license.workspace = true
+# Registered so dependents read the detected Kerberos vendor from
+# `DEP_KRB5_VENDOR` instead of re-running detection: kuipa-ldap must link the
+# same Kerberos implementation this crate was compiled against.
+links = "krb5"
 
 [dependencies]
 libc = "0.2"
