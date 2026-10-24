@@ -2004,6 +2004,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/stage/{kid}` | `IPSQ` → `IPJS` (payload `IPSP`) |
 | POST | `/ipa/ku/register/{kid}` | `IPJQ` (operation data `IPRP`) → `IPJS` (payload `IPRA`) (§7.5) |
 | POST | `/ipa/ku/keys/{kid}` | `IPJQ` (operation data `IPKG`) → `IPJS` (payload `IPKR`) (§18) |
+| POST | `/ipa/ku/tlog/{kid}` | `IPJQ` (operation data `IPLQ`) → `IPJS` (payload `IPLR`): the caller's own transparency-log entries (DESIGN-tlog.md §6) |
 | POST | `/ipa/ku/vault/{kid}` | `IPJQ` (operation data: a JSON vault operation) → `IPJS` (payload `IPVR`) (§7.6) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
 | POST | `/ipa/ku/peer/sync` | `IPPS` → agirru envelope (CBOR); servers only (§4.2) |
@@ -2205,6 +2206,8 @@ IPLC  time(u64) head(IPLH)                                                      
 IPLS  head(IPLH) signature n(1) [witness(32) time(u64) signature]                signed log head with cosignatures
 IPLP  log(32) index(u64) leaf(32) time(u64) signature                         receipt: a signed promise that a leaf was appended
 IPLV  action(1) device leaf-digest(32)                                         vault event body (kinds 2–4; device empty for none)
+IPLQ  vault from(u64)                                                           tlog lookup (vault empty: the caller's principal)
+IPLR  signer(JWK) head(IPLS or empty) n(u64) [index(u64) leaf(IPLF) m(1) [hash(32)]]   tlog lookup answer
 ```
 
 `ct` is empty in bundle modes B and C, `recipient` all zeros outside mode A,

@@ -53,6 +53,9 @@ pub enum Operation {
     /// `POST /ipa/ku/keys/{kid}`: a Kerberos-authenticated fetch of a
     /// named secret (§18.2).
     Keys,
+    /// `POST /ipa/ku/tlog/{kid}`: a lookup of the caller's own entries in
+    /// the server's transparency log (`DESIGN-tlog.md` §6).
+    Tlog,
 }
 
 impl Operation {
@@ -64,6 +67,7 @@ impl Operation {
             Self::Register => "register",
             Self::Vault => "vault",
             Self::Keys => "keys",
+            Self::Tlog => "tlog",
         }
     }
 
@@ -75,7 +79,9 @@ impl Operation {
 
     const fn magic(self) -> [u8; 4] {
         match self {
-            Self::Join | Self::Rekey | Self::Register | Self::Vault | Self::Keys => *b"IPJQ",
+            Self::Join | Self::Rekey | Self::Register | Self::Vault | Self::Keys | Self::Tlog => {
+                *b"IPJQ"
+            }
             Self::Stage => *b"IPSQ",
         }
     }
@@ -678,6 +684,29 @@ impl PendingJoin {
             return Err(Error::Mismatch("server"));
         }
         crate::keys::KeysAnswer::from_bytes(self.open(response)?.as_ref())
+    }
+
+    /// Finish a `tlog` lookup: decrypt the answer and check it — the head's
+    /// signature and every entry's proof — against the signing key
+    /// `realm` names.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], [`Error::Mismatch`]
+    /// for another server or an entry the head does not include, or
+    /// [`Error::UntrustedAnchor`] for a bad head signature.
+    pub fn finish_tlog(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+        policy: &tang_pqc::Policy,
+    ) -> Result<crate::tlog::Answer> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        let answer = crate::tlog::Answer::from_bytes(self.open(response)?.as_ref())?;
+        answer.verify(realm.signer(), policy)?;
+        Ok(answer)
     }
 
     /// Finish a join or rekey: decrypt the enrollment, and check it is for
