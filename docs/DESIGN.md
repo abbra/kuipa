@@ -267,9 +267,6 @@ which every policy kuipa runs under allows:
 | the trust invitation hash the inviting realm stores | §11.4, §17.4 |
 | the anchor exchange's peer channel binding | §4.2 |
 
-Hosts read a 32-byte epoch watermark written before this as no
-watermark; the next verified advertisement sets a SHA-384 one.
-
 **Channel bindings stay 32 bytes** (`CHANNEL_BINDING_LEN`), as GSS-API
 and the Kerberos PRF input take them: a SHA-384 digest is truncated to
 its first 32 bytes, as SP 800-107 allows.
