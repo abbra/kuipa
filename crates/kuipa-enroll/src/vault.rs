@@ -34,6 +34,7 @@ use crate::error::{Error, Result};
 use crate::escrow::{self, EscrowRequest, VaultId, commitment_data};
 use crate::keytab::Principal;
 use crate::realm::VerifiedRealm;
+use crate::tlog::Receipt;
 
 /// Domain of vault derivations: the data key, device shares, answers.
 pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 vault");
@@ -46,6 +47,8 @@ pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault session";
 
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
+/// Version 2 adds the receipts of the events an operation logged.
+const REPLY_VERSION: u8 = 2;
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
 const SESSION_MAGIC: [u8; 4] = *b"IPST";
@@ -1167,18 +1170,20 @@ pub struct Reply {
     pub session: Option<SessionToken>,
     /// The vault's session keys, released to the device.
     pub released: Option<ReleasedKeys>,
+    /// Receipts for the events the operation logged (`DESIGN-tlog.md`).
+    pub receipts: Vec<Receipt>,
 }
 
 impl Reply {
-    /// Encode: `IPVR n(u64) [descriptor] session` (session empty without
-    /// one).
+    /// Encode: `IPVR` version 2, `n(u64) [descriptor] session released
+    /// m(u8) [receipt]` (session and released empty without one).
     ///
     /// # Panics
     ///
     /// Never for fewer than 2⁶⁴ descriptors.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::new(REPLY_MAGIC);
+        let mut w = Writer::with_version(REPLY_MAGIC, REPLY_VERSION);
         w.u64(u64::try_from(self.descriptors.len()).expect("few descriptors"));
         for d in &self.descriptors {
             w.bytes(&d.to_bytes());
@@ -1197,6 +1202,10 @@ impl Reply {
                 .map(ReleasedKeys::to_bytes)
                 .unwrap_or_default(),
         );
+        w.u8(u8::try_from(self.receipts.len()).expect("few receipts"));
+        for receipt in &self.receipts {
+            w.bytes(&receipt.to_bytes());
+        }
         w.finish()
     }
 
@@ -1206,7 +1215,7 @@ impl Reply {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, REPLY_MAGIC, "vault reply")?;
+        let mut r = Reader::with_version(bytes, REPLY_MAGIC, REPLY_VERSION, "vault reply")?;
         let n = r.u64()?;
         let mut descriptors = Vec::new();
         for _ in 0..n {
@@ -1220,11 +1229,15 @@ impl Reply {
             [] => None,
             b => Some(ReleasedKeys::from_bytes(b)?),
         };
+        let receipts = (0..r.u8()?)
+            .map(|_| Receipt::from_bytes(r.bytes()?))
+            .collect::<Result<_>>()?;
         r.finish()?;
         Ok(Self {
             descriptors,
             session,
             released,
+            receipts,
         })
     }
 }

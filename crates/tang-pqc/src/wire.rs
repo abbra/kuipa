@@ -13,9 +13,15 @@ impl Writer {
     /// Start a message with its 4-byte magic and the format version.
     #[must_use]
     pub fn new(magic: [u8; 4]) -> Self {
+        Self::with_version(magic, VERSION)
+    }
+
+    /// Start a message with its magic and a later version of its format.
+    #[must_use]
+    pub fn with_version(magic: [u8; 4], version: u8) -> Self {
         let mut buf = Vec::with_capacity(4096);
         buf.extend_from_slice(&magic);
-        buf.push(VERSION);
+        buf.push(version);
         Self(buf)
     }
 
@@ -74,8 +80,22 @@ impl<'a> Reader<'a> {
     ///
     /// [`Error::Malformed`] for another magic or version.
     pub fn new(buf: &'a [u8], magic: [u8; 4], what: &'static str) -> Result<Self> {
+        Self::with_version(buf, magic, VERSION, what)
+    }
+
+    /// Check the magic and a later version of the format.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for another magic or version.
+    pub fn with_version(
+        buf: &'a [u8],
+        magic: [u8; 4],
+        version: u8,
+        what: &'static str,
+    ) -> Result<Self> {
         let mut r = Self { buf, what };
-        if r.fixed::<4>()? != magic || r.u8()? != VERSION {
+        if r.fixed::<4>()? != magic || r.u8()? != version {
             return Err(Error::Malformed(what));
         }
         Ok(r)
@@ -198,5 +218,16 @@ mod tests {
         let truncated = Writer::new(*b"TEST").bytes(b"abc").finish();
         let mut r = Reader::new(&truncated[..truncated.len() - 1], *b"TEST", "test").unwrap();
         assert!(r.bytes().is_err());
+    }
+
+    #[test]
+    fn versions_are_checked() {
+        let v2 = Writer::with_version(*b"TEST", 2).u8(1).finish();
+        assert_eq!(v2[4], 2);
+        assert!(Reader::new(&v2, *b"TEST", "test").is_err());
+        let mut r = Reader::with_version(&v2, *b"TEST", 2, "test").unwrap();
+        assert_eq!(r.u8().unwrap(), 1);
+        let v1 = Writer::new(*b"TEST").finish();
+        assert!(Reader::with_version(&v1, *b"TEST", 2, "test").is_err());
     }
 }

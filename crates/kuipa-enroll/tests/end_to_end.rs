@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use agirru_crdt::GenerationClock;
@@ -14,7 +15,10 @@ use kuipa_enroll::join::{
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
-use kuipa_enroll::server::{Accepted, Directory, DirectoryError, Staged, parse_stage_result};
+use kuipa_enroll::server::{
+    Accepted, Appended, Directory, DirectoryError, Ledger, Staged, parse_stage_result,
+};
+use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, VaultAction, VaultEvent};
 use kuipa_enroll::vault::{
     self, Descriptor, DeviceType, Factors, Level, Recovered, SealedVaultFile, TicketDelegation,
     Unlock, Vault, VaultOp,
@@ -1373,6 +1377,220 @@ fn user_vault_seals_and_opens_under_its_policy() {
 }
 
 /// Run a vault operation as `caller` and keep the whole reply.
+/// A ledger over an in-memory log, as the daemon keeps one on disk.
+#[derive(Debug)]
+struct MemoryLedger {
+    key: [u8; 32],
+    log: Mutex<(Log, Vec<Leaf>)>,
+}
+
+impl MemoryLedger {
+    fn new(server: &str) -> Self {
+        Self {
+            key: [7; 32],
+            log: Mutex::new((Log::new(LogId::of(REALM, server).unwrap()), Vec::new())),
+        }
+    }
+
+    fn leaves(&self) -> Vec<Leaf> {
+        self.log.lock().unwrap().1.clone()
+    }
+
+    fn head(&self) -> (Head, Log) {
+        let log = self.log.lock().unwrap().0.clone();
+        (log.head(now()).unwrap(), log)
+    }
+}
+
+impl Ledger for MemoryLedger {
+    fn append(
+        &self,
+        kind: tlog::Kind,
+        subject: &[u8],
+        body: &[u8],
+    ) -> Result<Option<Appended>, DirectoryError> {
+        let leaf = Leaf {
+            kind,
+            time: now(),
+            index: tlog::index(&self.key, subject)?,
+            body: body.to_vec(),
+        };
+        let mut log = self.log.lock().unwrap();
+        let index = log.0.append(&leaf)?;
+        log.1.push(leaf.clone());
+        Ok(Some(Appended {
+            log: log.0.id(),
+            index,
+            leaf: leaf.hash()?,
+            time: leaf.time,
+        }))
+    }
+}
+
+/// A ledger whose store has failed.
+#[derive(Debug)]
+struct BrokenLedger;
+
+impl Ledger for BrokenLedger {
+    fn append(
+        &self,
+        _: tlog::Kind,
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<Option<Appended>, DirectoryError> {
+        Err("disk full".into())
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn vault_events_are_logged_with_receipts() {
+    let mut r = realm();
+    let ledger = Arc::new(MemoryLedger::new(SERVERS[0]));
+    let first = r.servers.remove(0).with_ledger(ledger.clone());
+    r.servers.insert(0, first);
+    let advs = [r.verify(0), r.verify(1)];
+    let adv = &advs[0];
+    let anchors = r.all_anchors();
+    let log_key = r.servers[0].keys().signing.public().clone();
+    let policy = vault::Policy {
+        factors: Factors {
+            device: Some(Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+
+    let created = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Create {
+            name: "personal".into(),
+            policy,
+        },
+    );
+    let added = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::AddDevice {
+            name: "personal".into(),
+            label: "laptop".into(),
+            kind: DeviceType::File,
+            alg: device.public().alg().id(),
+            key: tang_pqc::b64::encode(device.public().as_bytes()),
+        },
+    );
+    // Reads log nothing.
+    let shown = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Show {
+            name: "personal".into(),
+        },
+    );
+    assert_eq!(shown.receipts, [] as [kuipa_enroll::tlog::Receipt; 0]);
+
+    // Each change has one receipt, signed by the server and proven by the
+    // log's head.
+    let (head, log) = ledger.head();
+    for (reply, index) in [(&created, 0), (&added, 1)] {
+        let [receipt] = reply.receipts.as_slice() else {
+            panic!("one receipt per change");
+        };
+        receipt.verify(&log_key, &Policy::default()).unwrap();
+        assert_eq!(receipt.index, index);
+        assert!(
+            receipt
+                .proven_by(&head, &log.inclusion(index).unwrap())
+                .unwrap()
+        );
+    }
+    let v = added.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    let leaves = ledger.leaves();
+    assert_eq!(leaves[0].kind, tlog::Kind::VAULT_POLICY);
+    assert_eq!(leaves[1].kind, tlog::Kind::VAULT_DEVICE);
+    let event = VaultEvent::from_bytes(&leaves[1].body).unwrap();
+    assert_eq!(event.action, VaultAction::AddDevice);
+    assert_eq!(
+        event.device.as_deref(),
+        Some(v.vault().devices[0].id.as_str())
+    );
+
+    // Opening a sealed file logs the release on the server that answered.
+    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"x").unwrap();
+    let ask = |s: &str, req: &EscrowRequest| {
+        r.servers[usize::from(s == SERVERS[1])]
+            .recover(req, &r.dir)
+            .ok()
+            .map(|a| a.to_bytes())
+    };
+    let mut ticket = |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb));
+    sealed
+        .open(
+            Unlock {
+                device: Some(&device),
+                session: None,
+                ticket: Some(&mut ticket),
+            },
+            ask,
+        )
+        .unwrap();
+    let leaves = ledger.leaves();
+    let release = leaves.last().unwrap();
+    assert_eq!(release.kind, tlog::Kind::ESCROW_RELEASE);
+    let event = VaultEvent::from_bytes(&release.body).unwrap();
+    assert_eq!(event.action, VaultAction::Release);
+    assert_eq!(
+        event.device.as_deref(),
+        Some(v.vault().devices[0].id.as_str())
+    );
+
+    // Every leaf is indexed by the vault, and none names it or its owner.
+    let index = tlog::index(&ledger.key, sealed.vault().as_bytes()).unwrap();
+    for leaf in &leaves {
+        assert_eq!(leaf.index, index);
+        let bytes = leaf.to_bytes();
+        for name in [&b"personal"[..], b"alice"] {
+            assert!(!bytes.windows(name.len()).any(|w| w == name));
+        }
+    }
+
+    // A server whose ledger fails refuses the change, and does not make
+    // it: the vault is still enabled.
+    let first = r.servers.remove(0).with_ledger(Arc::new(BrokenLedger));
+    r.servers.insert(0, first);
+    assert!(
+        vault_op(
+            &r,
+            adv,
+            ALICE,
+            &VaultOp::Revoke {
+                name: "personal".into()
+            }
+        )
+        .is_err()
+    );
+    let shown = vault_reply(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Show {
+            name: "personal".into(),
+        },
+    );
+    let v = shown.descriptors[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_eq!(v.vault().state, vault::State::Enabled);
+}
+
 fn vault_reply(r: &Realm, adv: &VerifiedRealm, caller: &str, op: &VaultOp) -> vault::Reply {
     let p = Prepared::new(
         adv,

@@ -2163,7 +2163,8 @@ IPEQ  principal vault(16) commitment(32) recovery(TQRQ) device session ticket   
 IPUF  principal vault(16) n(1) [server binding(TQBD) ek commitment(32) wrapped]
       m(1) [device(32) ct wrapped] sealed                                        file sealed to a user vault
 IPVD  body(JSON) delegation(JSON) signer_key(JWK) signature                      vault descriptor (signed: IPVD without the signature)
-IPVR  n(u64) [descriptor(IPVD)] session                                          vault operation answer (session: empty or IPST)
+IPVR  version 2: n(u64) [descriptor(IPVD)] session released m(1) [receipt(IPLP)]
+                                                                                 vault operation answer (session: empty or IPST; released: empty or IPEK; one receipt per logged change, DESIGN-tlog.md §6)
 IPST  signed(IPST: vault(16) owner device(32) not_after(u64) delegation signer_key) signature   re-authentication session token
 IPSS  token(IPST) device_key(private JWK) n(u64) [epoch(u64) private JWK]       a client's session file in its runtime directory (never sent)
 IPDK  kdf(1) iterations(u64) salt(16) sealed                                    a user's device key file (never sent)
@@ -2201,6 +2202,8 @@ IPLT  target(u64) reason                                                        
 IPLH  log(32) size(u64) root(32) time(u64)                                      log head (signed, DESIGN-tlog.md §3)
 IPLC  time(u64) head(IPLH)                                                      what a witness cosigns (never sent)
 IPLS  head(IPLH) signature n(1) [witness(32) time(u64) signature]                signed log head with cosignatures
+IPLP  log(32) index(u64) leaf(32) time(u64) signature                         receipt: a signed promise that a leaf was appended
+IPLV  action(1) device leaf-digest(32)                                         vault event body (kinds 2–4; device empty for none)
 ```
 
 `ct` is empty in bundle modes B and C, `recipient` all zeros outside mode A,
