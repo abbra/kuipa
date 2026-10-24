@@ -48,9 +48,12 @@ The pin-file grammar gains the repeated head pair:
 ```
 
 Backwards compatible: one head is today's line; the parser keeps the
-disambiguation rule (the field after the first number is a thumbprint,
-so the first number is a size) for expiry-less lines, and a lone
-number stays an expiry. Heads in a line must strictly increase in
+disambiguation rule (the field after the first number is a hash, so the
+first number is a size) for expiry-less lines, and a lone number stays
+an expiry. Roots and retired leaves are base64url tree hashes: 32 bytes
+for an ML-DSA-65 anchor, 48 for an ML-DSA-87 one, whose claim log is
+SHA-384 (DESIGN.md §4.1.1). A head proof or signature proof against a
+root of the wrong hash for the anchor's key does not verify. Heads in a line must strictly increase in
 size; a duplicate or shrinking head is a parse error, not a silent
 drop — the file is an administrator's assertion and must round-trip
 exactly.

@@ -83,7 +83,10 @@ fn sign(args: &[String]) -> Result<(), Error> {
     let purpose = std::env::var("KUIPA_GITSIGN_PURPOSE").unwrap_or_else(|_| "git-commit".into());
     let asked = Request {
         purpose,
-        digests: vec![Digest::of(DigestAlg::Sha256, &payload()?)?],
+        digests: vec![Digest::of(
+            DigestAlg::for_policy(&tang_pqc::Policy::from_system()?),
+            &payload()?,
+        )?],
     };
     let host = Paths::from_env();
     let bundles = kuipa_tools::sign::request(&host, None, &asked)?;

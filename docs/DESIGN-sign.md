@@ -22,7 +22,17 @@ verifies the statement offline.
 labelled `sign` in the transcript. Its data is `IPGQ ‖ 1 ‖ purpose ‖
 n(u64) ‖ [alg(1) ‖ digest]`, with up to 256 SHA-256, SHA-384 or SHA-512
 digests. A purpose is lowercase letters, digits and `-`, at most 64
-bytes. The server, in order:
+bytes.
+
+**Hashes follow the crypto policy** (DESIGN.md §4.1.1). The batch tree
+is hashed with `H`, the server key's hash: SHA-256 for ML-DSA-65,
+SHA-384 for ML-DSA-87. The client digests with SHA-256 while the host's
+crypto policy allows a category 2 or 3 signer, and with SHA-384 when it
+allows only ML-DSA-87 (CNSA 2.0). A digest shorter than `H` is refused:
+by the server before it logs anything, and by every verifier. So a CNSA
+statement never rests on SHA-256.
+
+The server, in order:
 
 1. Authenticates the caller by its ticket and refuses a locked
    principal.
@@ -47,7 +57,9 @@ bytes. The server, in order:
    statement`, with the log's position in it:
 
 ```
-IPGS  realm principal purpose batch_size(u64) batch_root(32) iat(u64) log(32) index(u64)
+IPGS  realm principal purpose batch_size(u64) batch_root(h) iat(u64) log(h) index(u64)
+
+h: 32 bytes (SHA-256) or 48 (SHA-384), length prefixed, as the key decides
 ```
 
 The answer `IPGR` is the signed statement (with the server's delegation
@@ -62,7 +74,10 @@ cover the request.
 A bundle verifies with the realm's anchors and nothing else. The
 verifier checks four things:
 - the data's digest is the bundle's;
-- the digest is in the statement's batch, at its index;
+- the digest is in the statement's batch, at its index, and is no
+  shorter than the batch's hash;
+- the batch root and log id are hashed as the signer key's category
+  decides;
 - the delegation in the statement verifies against the anchors **as
   of the statement's `iat`**, as offline enrollment bundles do (§8.4),
   and its key is the statement's signer, with an algorithm the policy

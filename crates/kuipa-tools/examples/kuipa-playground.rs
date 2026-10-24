@@ -420,7 +420,7 @@ fn start_servers(
         };
         anchors.push(*anchor.public().thumbprint());
         let key_dir = dir.join(format!("keys-{server}"));
-        let ledger = start_ledger(&key_dir, server, &witness)?;
+        let ledger = start_ledger(&key_dir, server, &keys.signing, &witness)?;
         let enroll =
             Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
         let others: Vec<usize> = (0..SERVERS.len()).filter(|j| *j != i).collect();
@@ -491,10 +491,12 @@ fn start_witness(dir: &Path) -> Result<tang_pqc::VerifyingKey, Error> {
 fn start_ledger(
     key_dir: &Path,
     server: &str,
+    signing: &tang_pqc::SigningKey,
     witness: &tang_pqc::VerifyingKey,
 ) -> Result<Arc<kuipad::ledger::FileLedger>, Error> {
+    let alg = kuipa_enroll::merkle::TreeHash::for_signer(signing.public().alg());
     Ok(Arc::new(
-        kuipad::ledger::FileLedger::open(key_dir, REALM, server)?
+        kuipad::ledger::FileLedger::open(key_dir, REALM, server, alg)?
             .with_witnesses(vec![witness.clone()]),
     ))
 }

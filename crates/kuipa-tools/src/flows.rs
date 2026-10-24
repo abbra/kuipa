@@ -16,6 +16,7 @@ use kuipa_enroll::join::{
 };
 use kuipa_enroll::keys::{KeysFetch, Namespace, WrapAlg};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
+use kuipa_enroll::merkle::Hash;
 use kuipa_enroll::payload::Enrollment;
 use kuipa_enroll::realm::{Deployment, TrustedRealm, VerifiedRealm, krb5_realm_section};
 use kuipa_gssapi::{GssClientCred, GssError};
@@ -179,7 +180,7 @@ fn quorum_proof(
     realm: &str,
     a: &Thumbprint,
     window: &[HeadPin],
-    retired: &[[u8; 32]],
+    retired: &[Hash],
     frozen: bool,
 ) -> Result<VerifiedRealm, String> {
     if frozen {
@@ -248,7 +249,7 @@ pub(crate) fn verified(
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
-    retired: &[[u8; 32]],
+    retired: &[Hash],
     frozen: &[Thumbprint],
     known: Option<Epoch>,
 ) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), String> {
@@ -486,7 +487,7 @@ fn exchange(
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
-    retired: &[[u8; 32]],
+    retired: &[Hash],
     frozen: &[Thumbprint],
     known: Option<(u64, [u8; 32])>,
     op: Operation,
@@ -519,7 +520,7 @@ pub(crate) fn exchange_with<T>(
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
-    retired: &[[u8; 32]],
+    retired: &[Hash],
     frozen: &[Thumbprint],
     known: Option<(u64, [u8; 32])>,
     op: Operation,
@@ -1136,8 +1137,8 @@ fn retired_for(
     endpoint: &Endpoint,
     anchor: &Thumbprint,
     size: u64,
-    root: &[u8; 32],
-) -> Option<Vec<[u8; 32]>> {
+    root: &Hash,
+) -> Option<Vec<Hash>> {
     served_vouch(endpoint, anchor)?
         .retired_at(size, root)
         .ok()
@@ -1158,7 +1159,7 @@ fn served_vouch(
 }
 
 /// One anchor's retired claims, as learned for a head being pinned.
-type Retired = (Thumbprint, Vec<[u8; 32]>);
+type Retired = (Thumbprint, Vec<Hash>);
 
 /// Extend the host's pin windows with a verified advertisement's heads
 /// (DESIGN-claim-logs.md §1.3, DESIGN-tlog.md §8): for every anchor whose
@@ -1203,7 +1204,7 @@ fn extend_windows(
             continue;
         }
         let vouch = served_vouch(endpoint, anchor);
-        let at = |n: u64, r: &[u8; 32]| {
+        let at = |n: u64, r: &Hash| {
             vouch
                 .as_ref()
                 .and_then(|v| v.retired_at(n, r).ok().flatten())
@@ -1268,7 +1269,7 @@ pub(crate) fn all_servers(
     trust: &Trust,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
-    retired: &[[u8; 32]],
+    retired: &[Hash],
     frozen: &[Thumbprint],
 ) -> Vec<VerifiedRealm> {
     let deployment = Deployment::servers(&state.servers);
@@ -2598,7 +2599,7 @@ fn refresh_trust(
     // whatever the wire carried.
     let heads = t.pins();
     // What this host learned B's logs retired, from its installed pins.
-    let retired: Vec<[u8; 32]> = match paths::read_anchor_pins(&paths.trust_anchors(&t.realm)) {
+    let retired: Vec<Hash> = match paths::read_anchor_pins(&paths.trust_anchors(&t.realm)) {
         Ok(pins) => pins.into_iter().flat_map(|p| p.retired).collect(),
         Err(e) if paths::is_missing(&e) => Vec::new(),
         Err(e) => return Err(e),

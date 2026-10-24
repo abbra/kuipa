@@ -320,7 +320,10 @@ what you did elsewhere.  The first watch of a server sets the baseline
 and flags nothing.  With trusted witnesses (*tlog witnesses*), each
 head needs their cosignatures: one with fewer is *UNWITNESSED*, listed
 but not recorded, so run the watch again after the witnesses' next
-pass.  Exits 1 for a flag, a log that does not extend what was seen
+pass.  A server whose log id changed, because its key moved to another
+category with the crypto policy (SHA-256 logs for ML-DSA-65, SHA-384
+for ML-DSA-87), is *NEW LOG*: its new log is read and checked from its
+start.  Exits 1 for a flag, a log that does not extend what was seen
 (*FORKED*), an unwitnessed head, or a server that could not be checked.
 
 ## sign blob [--purpose _P_] _FILE_...
@@ -328,8 +331,10 @@ pass.  Exits 1 for a flag, a log that does not extend what was seen
 Have a realm server state that the principal of your ticket signed the
 files, for purpose _P_ (default *blob*), as the realm's signing policy
 allows; the statement is recorded in the server's transparency log.
-Each file gets a _FILE_*.kusig* bundle.  See *kuipa-gitsign* for git
-commits.
+Each file gets a _FILE_*.kusig* bundle.  Files are digested with
+SHA-256, or SHA-384 when the system crypto policy allows only ML-DSA-87
+(CNSA 2.0); a CNSA server refuses SHA-256 digests.  See *kuipa-gitsign*
+for git commits.
 
 ## sign verify _FILE_ [--signature _SIG_] [--signer _S_] [--purpose _P_]
 

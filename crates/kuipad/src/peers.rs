@@ -25,6 +25,7 @@ use kuipa_enroll::delegation::{
     Claim, DEFAULT_VALIDITY, Delegation, SignedSuccession, SignedVouch, VOUCH_VALIDITY,
 };
 use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
+use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::server::Directory;
 use rustls::pki_types::CertificateDer;
 use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
@@ -368,7 +369,7 @@ impl Peers {
         };
         let trust = Trust::compute(&state, &own, &attested, &members, &x.policy, at)?;
         if let Some(anchor) = &x.anchor {
-            let leaves = trust.leaves()?;
+            let leaves = trust.leaves(TreeHash::for_signer(anchor.public().alg()))?;
             let current_vouch = state.vouch(anchor.public().thumbprint());
             let interval = x.settings.vouch_interval.as_secs();
             if anchors::needs_vouch(current_vouch, &leaves, at, interval) {
@@ -1001,7 +1002,7 @@ mod tests {
         let vouch = SignedVouch::issue(
             &anchor,
             "R",
-            [claim.leaf().unwrap()],
+            [claim.leaf(kuipa_enroll::merkle::TreeHash::Sha256).unwrap()],
             now(),
             now() + 100,
             None,

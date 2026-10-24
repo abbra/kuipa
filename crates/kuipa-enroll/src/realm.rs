@@ -1236,7 +1236,7 @@ pub(crate) mod tests {
         let head = HeadPin {
             anchor: a,
             size: 3,
-            root: [7; 32],
+            root: crate::merkle::test_hash(7),
         };
         let t = TrustedRealm {
             realm: "B.TEST".into(),
@@ -1294,7 +1294,11 @@ pub(crate) mod tests {
         let vouch = SignedVouch::issue(
             &t.anchor,
             "EXAMPLE.TEST",
-            [t.delegation.claim().unwrap().leaf().unwrap()],
+            [t.delegation
+                .claim()
+                .unwrap()
+                .leaf(crate::merkle::TreeHash::Sha256)
+                .unwrap()],
             now() - 60,
             now() + VOUCH_VALIDITY,
             None,

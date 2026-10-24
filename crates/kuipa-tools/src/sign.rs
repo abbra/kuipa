@@ -40,10 +40,11 @@ pub fn sign_files(
     purpose: &str,
     files: &[PathBuf],
 ) -> Result<Value, Error> {
+    let alg = DigestAlg::for_policy(&tang_pqc::Policy::from_system()?);
     let mut digests = Vec::with_capacity(files.len());
     for f in files {
         let data = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
-        digests.push(Digest::of(DigestAlg::Sha256, &data)?);
+        digests.push(Digest::of(alg, &data)?);
     }
     let asked = Request {
         purpose: purpose.to_owned(),

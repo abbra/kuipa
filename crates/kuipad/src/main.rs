@@ -151,8 +151,13 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     let info = cfg.realm_info(servers, anchor.as_ref().map(|a| *a.public().thumbprint()))?;
     let ca_certs = info.ca_certs.clone();
     let ledger = Arc::new(
-        kuipad::ledger::FileLedger::open(&cfg.key_dir, &cfg.realm, &cfg.server)?
-            .with_witnesses(store.witness_keys()?),
+        kuipad::ledger::FileLedger::open(
+            &cfg.key_dir,
+            &cfg.realm,
+            &cfg.server,
+            kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg()),
+        )?
+        .with_witnesses(store.witness_keys()?),
     );
     eprintln!(
         "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
@@ -267,7 +272,7 @@ fn enrollment_string(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), 
 
 /// The anchor's current vouch head (§4.9), from the stored delegation:
 /// the `(size, root)` its own proof's vouch signed.
-fn head_of(store: &KeyStore) -> Result<(u64, [u8; 32]), Error> {
+fn head_of(store: &KeyStore) -> Result<(u64, kuipa_enroll::merkle::Hash), Error> {
     let anchor = *store.anchor()?.public().thumbprint();
     let delegation = store.delegation()?.ok_or("no stored delegation")?;
     delegation.vouch_head(&anchor).ok_or_else(|| {
