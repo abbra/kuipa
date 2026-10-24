@@ -147,7 +147,21 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     )?;
     let info = cfg.realm_info(servers, anchor.as_ref().map(|a| *a.public().thumbprint()))?;
     let ca_certs = info.ca_certs.clone();
-    let server = Arc::new(EnrollServer::new(keys, info, delegation));
+    let ledger = Arc::new(kuipad::ledger::FileLedger::open(
+        &cfg.key_dir,
+        &cfg.realm,
+        &cfg.server,
+    )?);
+    eprintln!(
+        "kuipad: transparency log {} at /ipa/ku/log ({} leaves)",
+        ledger.id(),
+        ledger.size()
+    );
+    let server = Arc::new(
+        EnrollServer::new(keys, info, delegation)
+            .with_policy(tang_pqc::Policy::from_system()?)
+            .with_ledger(ledger.clone()),
+    );
     let settings = Settings {
         me: cfg.server.clone(),
         realm: cfg.realm.clone(),
@@ -195,22 +209,29 @@ async fn serve(cfg: Config) -> Result<(), Error> {
         limiter: kuipad::limit::Limiter::new(cfg.rate_limit),
         tang,
         keys: keys_service,
+        ledger: Some(ledger),
     }));
 
+    listen(app, &cfg.listen).await
+}
+
+/// Serve `app` on the socket-activated Unix socket, or else on `listen`
+/// (`unix:<path>` or a TCP address).
+async fn listen(app: axum::Router, listen: &str) -> Result<(), Error> {
     let mut fds = listenfd::ListenFd::from_env();
     if let Some(listener) = fds.take_unix_listener(0)? {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(listener)?;
         eprintln!("kuipad: serving on the socket-activated Unix socket");
         axum::serve(listener, app).await?;
-    } else if let Some(path) = cfg.listen.strip_prefix("unix:") {
+    } else if let Some(path) = listen.strip_prefix("unix:") {
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;
         eprintln!("kuipad: serving on {path}");
         axum::serve(listener, app).await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-        eprintln!("kuipad: serving on {}", cfg.listen);
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        eprintln!("kuipad: serving on {listen}");
         axum::serve(listener, app).await?;
     }
     Ok(())

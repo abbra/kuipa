@@ -218,6 +218,7 @@ fn app(server: Arc<EnrollServer>, directory: Dir) -> Arc<App<Dir>> {
         limiter: kuipad::limit::Limiter::default(),
         tang: None,
         keys: None,
+        ledger: None,
         directory,
     })
 }
@@ -635,6 +636,7 @@ fn guessing_is_rate_limited_per_host() {
             }),
             tang: None,
             keys: None,
+            ledger: None,
         }),
     );
     let guess = |otp: &[u8]| {
@@ -1509,6 +1511,7 @@ fn post_quantum_tang_over_http() {
             limiter: Limiter::default(),
             tang: keys.server().unwrap().map(Arc::new),
             keys: None,
+            ledger: None,
         }))
     };
     let _ = rustls_native_ossl::default_provider().install_default();
@@ -3505,4 +3508,91 @@ fn a_head_beyond_the_fetch_cap_is_not_pinned() {
         "{trace}"
     );
     kuipa_tools::net::clear_thread_endpoints();
+}
+
+#[test]
+fn the_tlog_routes_serve_heads_leaves_and_proofs() {
+    // DESIGN-tlog.md §5: a server's log is public — its signed head, its
+    // leaves, and inclusion and consistency proofs at any size a client
+    // holds a head for — and only under the log's own id.
+    use kuipa_enroll::server::Ledger;
+    use kuipa_enroll::tlog::{Kind, Leaf, SignedHead};
+
+    let dir = std::env::temp_dir().join(format!("kuipa-flows-tlog-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, info, delegation) = server_keys(&anchor, "tlog1.example.test");
+    let signer = keys.signing.public().clone();
+    let ledger =
+        Arc::new(kuipad::ledger::FileLedger::open(&dir, REALM, "tlog1.example.test").unwrap());
+    let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
+    let url = spawn(Arc::new(App {
+        server,
+        peers: None,
+        limiter: kuipad::limit::Limiter::default(),
+        tang: None,
+        keys: None,
+        ledger: Some(ledger.clone()),
+        directory: Dir::default(),
+    }));
+    let _ = rustls_native_ossl::default_provider().install_default();
+    let http = reqwest::blocking::Client::new();
+    let base = format!("{url}/ipa/ku/log/{}", ledger.id());
+    let get = |path: &str| http.get(format!("{base}/{path}")).send().unwrap();
+    let json = |path: &str| -> serde_json::Value {
+        serde_json::from_slice(&get(path).bytes().unwrap()).unwrap()
+    };
+    let hashes = |v: &serde_json::Value| -> Vec<[u8; 32]> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                tang_pqc::b64::decode(h.as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            })
+            .collect()
+    };
+
+    // Nothing logged yet: no head to serve.
+    assert_eq!(get("head").status(), 404);
+    for i in 0..2u8 {
+        ledger.append(Kind::VAULT_DEVICE, b"vault", &[i]).unwrap();
+    }
+    let old = SignedHead::from_bytes(&get("head").bytes().unwrap()).unwrap();
+    old.verify(&signer, &tang_pqc::Policy::default()).unwrap();
+    for i in 0..3u8 {
+        ledger.append(Kind::ESCROW_RELEASE, b"vault", &[i]).unwrap();
+    }
+    let new = SignedHead::from_bytes(&get("head").bytes().unwrap()).unwrap();
+    assert_eq!((old.head.size, new.head.size), (2, 5));
+
+    let leaves: Vec<Leaf> = json("leaves?from=0")["leaves"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| Leaf::from_bytes(&tang_pqc::b64::decode(l.as_str().unwrap()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(leaves.len(), 5);
+    assert_eq!(json("leaves?from=4")["leaves"].as_array().unwrap().len(), 1);
+    let path = hashes(&json("proof?index=1&size=2")["path"]);
+    assert!(old.head.includes(&leaves[1], 1, &path).unwrap());
+    let path = hashes(&json("proof?index=4&size=5")["path"]);
+    assert!(new.head.includes(&leaves[4], 4, &path).unwrap());
+    let proof = hashes(&json("consistency?from=2&size=5")["proof"]);
+    assert!(new.head.extends(&old.head, &proof).unwrap());
+
+    // Bad or missing numbers, sizes beyond the log, another log's id.
+    assert_eq!(get("proof?index=1").status(), 400);
+    assert_eq!(get("proof?index=7&size=5").status(), 404);
+    assert_eq!(get("consistency?from=2&size=9").status(), 404);
+    let other = kuipa_enroll::tlog::LogId::of(REALM, "elsewhere").unwrap();
+    let status = http
+        .get(format!("{url}/ipa/ku/log/{other}/head"))
+        .send()
+        .unwrap()
+        .status();
+    assert_eq!(status, 404);
+    let _ = std::fs::remove_dir_all(&dir);
 }
