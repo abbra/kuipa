@@ -1237,11 +1237,14 @@ fn render_tlog(value: &Value) {
             .as_str()
             .map(|w| format!(" ({w})"))
             .unwrap_or_default();
+        let when = e["time"]
+            .as_u64()
+            .and_then(kuipa_tools::text::date)
+            .unwrap_or_default();
         println!(
-            "{mark:>10}  {} #{} at {}: {}{device}{why}",
+            "{mark:>10}  {} #{} at {when}: {}{device}{why}",
             text(&e["server"]),
             e["index"],
-            e["time"],
             text(&e["action"]),
         );
     }

@@ -221,6 +221,25 @@ step 0 "Open it to standard output: only the plaintext arrives" \
     "token=playground-user"
 step 1 "A wrong passphrase does not open the device key" \
     'echo wrong > "$KUIPA_PLAYGROUND/wrong" && kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong"'
+
+section "Your vault's transparency log" \
+    "Every server logs each change to a vault and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the vault and flags what the vault description stored on this host does not account for."
+step 0 "The first watch records where each log stands" \
+    'kuipa tlog watch personal' "baseline" "add-device" "release" "UTC" "0 unexpected"
+step 0 "Nothing new since: a quiet watch" \
+    'kuipa tlog watch personal' "0 unexpected"
+step 0 "A second device is registered from another home directory" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-laptop" kuipa seal device add personal --passphrase-file "$KUIPA_PLAYGROUND/pass"'
+step 1 "This host's watch flags the device it does not know" \
+    'kuipa tlog watch personal' "UNEXPECTED" "add-device" "1 unexpected"
+step 0 "Accept it: seal show stores the current description" \
+    'kuipa seal show personal'
+step 0 "The flag was reported once; the next watch is clean" \
+    'kuipa tlog watch personal' "0 unexpected"
+step 0 "Opening a file is logged as a release; --json keeps Unix times" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && w=$(kuipa --json tlog watch personal) && echo "$w" && grep -Eq "\"time\":[0-9]+[,}]" <<<"$w"' \
+    '"action":"release"' '"unexpected":0'
+
 step 0 "A vault that allows hour-long sessions and 10 unlocks" \
     'kuipa seal create daily --require device,ticket --session-hours 1 --max-unlocks 10 && kuipa seal device add daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' \
     "unlocks allowed: 10"
