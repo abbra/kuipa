@@ -338,6 +338,14 @@ Vault personal: 1 unexpected.
 accepts the device. The next watch is clean, and the next open shows up
 as one more `release`.
 
+An auditor with no account replays a server's whole log from its public
+routes with `kuipa-audit tlog --server ipa1.example.test --state FILE`.
+It checks the head against the key ipa1's verified advertisement names,
+replays every leaf, and counts them by kind (`vault-device`,
+`escrow-release` and so on), without learning whose vault any of them
+concerns. Run again later, it requires the log to extend the head it
+recorded.
+
 A second vault allows hour-long sessions and ten unlocks
 (`--session-hours 1 --max-unlocks 10`, shown as `unlocks allowed: 10`
 and `longest session (seconds): 3600`). One unlock — passphrase and

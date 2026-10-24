@@ -532,3 +532,217 @@ mod tests {
         assert_eq!(d[0]["malformed"][0], "s1");
     }
 }
+
+/// What `kuipa-audit tlog --state` keeps of one server's log between
+/// runs: the size and root it last verified.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Audited {
+    log: String,
+    size: u64,
+    root: String,
+}
+
+/// Leaves one `kuipa-audit tlog` run reads at most: past that the log is
+/// reported `unchecked` rather than guessed at.
+const MAX_TLOG_LEAVES: u64 = 1 << 20;
+
+/// `kuipa-audit tlog`: one server's whole transparency log, checked
+/// from its public routes (DESIGN-tlog.md §5).
+///
+/// The server's advertisement is verified against `anchors` (the
+/// host's pinned anchors when none are given), which names the server's
+/// signing key; the served head must carry that key's signature.  Every
+/// leaf is then fetched and the log replayed — tombstone rules included
+/// — and its root must be the head's.  With `state`, the root the last
+/// run verified must be the root of the same prefix now (the log only
+/// grew), and the new head is recorded.
+///
+/// The report's `state` is `verified`, `empty`, `forked: …` (the head
+/// is not the replayed log's, or does not extend what was recorded),
+/// or `unchecked: …` (the log is larger than one run reads).
+///
+/// # Errors
+///
+/// [`Error`] when the server cannot be reached, its advertisement does
+/// not verify, or the state file cannot be read or written.
+pub fn tlog(
+    server: &str,
+    anchors: &[tang_pqc::Thumbprint],
+    state: Option<&std::path::Path>,
+) -> Result<Value, Error> {
+    let endpoint = Endpoint::new(server, &Trust::FirstContact)?;
+    let policy = Policy::from_system()?;
+    let (log, key) = advertised_log(&endpoint, anchors, &policy)?;
+    let report = |state: String, extra: Value| {
+        let mut v = json!({ "server": server, "log": log.to_string(), "state": state });
+        if let (Some(v), Some(extra)) = (v.as_object_mut(), extra.as_object()) {
+            v.extend(extra.clone());
+        }
+        v
+    };
+    let Some(signed) = endpoint.tlog_head(&log)? else {
+        return Ok(report("empty".into(), json!({})));
+    };
+    if signed.verify(&key, &policy).is_err() {
+        return Ok(report(
+            "forked: the head is not signed by the advertised key".into(),
+            json!({}),
+        ));
+    }
+    let head = signed.head;
+    let mut summary = json!({
+        "size": head.size,
+        "root": tang_pqc::b64::encode(&head.root),
+        "time": head.time,
+    });
+    if head.size > MAX_TLOG_LEAVES {
+        return Ok(report(
+            format!("unchecked: {} leaves, more than one run reads", head.size),
+            summary,
+        ));
+    }
+    let (leaves, replayed) = match replay_served(&endpoint, &head)? {
+        Ok(replay) => replay,
+        Err(why) => return Ok(report(format!("forked: {why}"), summary)),
+    };
+    summary["kinds"] = json!(kind_counts(&leaves));
+    if let Some(path) = state
+        && let Some(why) = check_recorded(path, &head, &replayed, &mut summary)?
+    {
+        return Ok(report(format!("forked: {why}"), summary));
+    }
+    Ok(report("verified".into(), summary))
+}
+
+/// The log of the server whose advertisement verifies against `anchors`
+/// (the host's pinned ones when none are given), and its signing key.
+fn advertised_log(
+    endpoint: &Endpoint,
+    anchors: &[tang_pqc::Thumbprint],
+    policy: &Policy,
+) -> Result<(kuipa_enroll::tlog::LogId, tang_pqc::VerifyingKey), Error> {
+    let anchors = if anchors.is_empty() {
+        paths::read_anchors(&Paths::from_env())
+            .map_err(|e| format!("no anchors given and none pinned on this host (--anchor): {e}"))?
+    } else {
+        anchors.to_vec()
+    };
+    let adv = endpoint.advertisement(&anchors)?;
+    let realm = adv
+        .unverified_member("delegation")?
+        .and_then(|v| Delegation::from_value(v).ok())
+        .and_then(|d| d.claim().ok())
+        .ok_or("the advertisement carries no delegation")?
+        .realm;
+    let verified = VerifiedRealm::verify(&adv, &realm, &anchors, policy, SystemTime::now())?;
+    let key = verified
+        .signing_key()
+        .ok_or("the advertisement carries no signing key")?
+        .clone();
+    Ok((
+        kuipa_enroll::tlog::LogId::of(&realm, verified.server())?,
+        key,
+    ))
+}
+
+/// Every leaf up to `head`, and the log they replay to; or why they do
+/// not make the head's log.
+fn replay_served(
+    endpoint: &Endpoint,
+    head: &kuipa_enroll::tlog::Head,
+) -> Result<Result<(Vec<kuipa_enroll::tlog::Leaf>, kuipa_enroll::tlog::Log), String>, Error> {
+    let mut leaves = Vec::new();
+    while (leaves.len() as u64) < head.size {
+        let page = endpoint.tlog_leaves(&head.log, leaves.len() as u64)?;
+        if page.is_empty() {
+            break;
+        }
+        leaves.extend(page);
+    }
+    leaves.truncate(usize::try_from(head.size)?);
+    if (leaves.len() as u64) < head.size {
+        return Ok(Err(format!(
+            "the head names {} leaves, the log serves {}",
+            head.size,
+            leaves.len()
+        )));
+    }
+    let replayed = match kuipa_enroll::tlog::Log::replay(head.log, &leaves) {
+        Ok(l) => l,
+        Err(e) => return Ok(Err(format!("the leaves break the log's rules: {e}"))),
+    };
+    if replayed.root()? != head.root {
+        return Ok(Err("the head is not the root of the leaves served".into()));
+    }
+    Ok(Ok((leaves, replayed)))
+}
+
+/// How many leaves of each kind, by name.
+fn kind_counts(leaves: &[kuipa_enroll::tlog::Leaf]) -> BTreeMap<String, u64> {
+    use kuipa_enroll::tlog::Kind;
+
+    let mut kinds = BTreeMap::new();
+    for l in leaves {
+        let name = match l.kind {
+            Kind::CLAIM => "claim".into(),
+            Kind::VAULT_DEVICE => "vault-device".into(),
+            Kind::VAULT_POLICY => "vault-policy".into(),
+            Kind::ESCROW_RELEASE => "escrow-release".into(),
+            Kind::STATEMENT => "statement".into(),
+            Kind::KEYS_FETCH => "keys-fetch".into(),
+            Kind::TOKEN_KEY => "token-key".into(),
+            Kind::TOMBSTONE => "tombstone".into(),
+            Kind(other) => format!("kind {other}"),
+        };
+        *kinds.entry(name).or_default() += 1;
+    }
+    kinds
+}
+
+/// With a state file: the recorded root must be the root of the same
+/// prefix of `replayed` (the log only grew); then `head` is recorded.
+/// Returns why not, leaving the file as it was, or none.
+fn check_recorded(
+    path: &std::path::Path,
+    head: &kuipa_enroll::tlog::Head,
+    replayed: &kuipa_enroll::tlog::Log,
+    summary: &mut Value,
+) -> Result<Option<String>, Error> {
+    let mut audited: BTreeMap<String, Audited> = match std::fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let id = head.log.to_string();
+    if let Some(before) = audited.get(&id) {
+        let old: Option<[u8; 32]> = tang_pqc::b64::decode(&before.root)
+            .ok()
+            .and_then(|r| r.try_into().ok());
+        let prefix = usize::try_from(before.size)
+            .ok()
+            .filter(|s| *s > 0 && *s <= replayed.hashes().len());
+        let extends = match (old, prefix) {
+            (Some(old), Some(n)) => merkle::root(&replayed.hashes()[..n])? == old,
+            _ => false,
+        };
+        summary["previous"] = json!({ "size": before.size, "root": before.root });
+        if !extends {
+            return Ok(Some(format!(
+                "the log does not extend the {} leaves recorded",
+                before.size
+            )));
+        }
+    }
+    audited.insert(
+        id.clone(),
+        Audited {
+            log: id,
+            size: head.size,
+            root: tang_pqc::b64::encode(&head.root),
+        },
+    );
+    paths::write_file(path, &serde_json::to_vec_pretty(&audited)?, 0o644)?;
+    Ok(None)
+}

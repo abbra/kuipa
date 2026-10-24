@@ -223,7 +223,7 @@ step 1 "A wrong passphrase does not open the device key" \
     'echo wrong > "$KUIPA_PLAYGROUND/wrong" && kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong"'
 
 section "Your vault's transparency log" \
-    "Every server logs each change to a vault and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the vault and flags what the vault description stored on this host does not account for."
+    "Every server logs each change to a vault and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the vault and flags what the vault description stored on this host does not account for; kuipa-audit tlog replays a server's whole log, naming nobody."
 step 0 "The first watch records where each log stands" \
     'kuipa tlog watch personal' "baseline" "add-device" "release" "UTC" "0 unexpected"
 step 0 "Nothing new since: a quiet watch" \
@@ -239,6 +239,12 @@ step 0 "The flag was reported once; the next watch is clean" \
 step 0 "Opening a file is logged as a release; --json keeps Unix times" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && w=$(kuipa --json tlog watch personal) && echo "$w" && grep -Eq "\"time\":[0-9]+[,}]" <<<"$w"' \
     '"action":"release"' '"unexpected":0'
+step 0 "An auditor replays ipa1's whole log from its public routes" \
+    'kuipa-audit tlog --server ipa1.example.test --state "$KUIPA_PLAYGROUND/tlog-audit.json"' \
+    "verified" "vault-device" "escrow-release"
+step 0 "The next audit requires the log to extend the recorded head" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && kuipa-audit tlog --server ipa1.example.test --state "$KUIPA_PLAYGROUND/tlog-audit.json"' \
+    "verified" "recorded"
 
 step 0 "A vault that allows hour-long sessions and 10 unlocks" \
     'kuipa seal create daily --require device,ticket --session-hours 1 --max-unlocks 10 && kuipa seal device add daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' \

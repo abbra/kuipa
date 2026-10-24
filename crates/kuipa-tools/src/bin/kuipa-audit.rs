@@ -1,5 +1,5 @@
 //! `kuipa-audit`: read-only reports on a realm's claim logs
-//! (DESIGN-claim-logs.md §5).
+//! (DESIGN-claim-logs.md §5) and transparency logs (DESIGN-tlog.md §7).
 //!
 //! ```text
 //! kuipa-audit claim-log  --server S --anchor THP [--from N]
@@ -11,12 +11,16 @@
 //! kuipa-audit split-view --server S1 --server S2…
 //!                          the heads each server answers, and where
 //!                          they disagree
+//! kuipa-audit tlog       --server S [--anchor THP…] [--state FILE]
+//!                          a server's whole transparency log, replayed
+//!                          against its signed head (DESIGN-tlog.md §5)
 //! ```
 //!
 //! The tool fetches only public endpoints and writes nothing: it is
-//! `curl` plus the tree math.  `--json` prints the report as one JSON
-//! object instead of rows.  Exit status: 0 a clean report, 1 an error,
-//! 2 a report that found a split view.
+//! `curl` plus the tree math; only `tlog --state` writes, to the file it
+//! names.  `--json` prints the report as one JSON object instead of rows.
+//! Exit status: 0 a clean report, 1 an error, 2 a report that found a
+//! split view or a forked transparency log.
 
 use std::process::ExitCode;
 
@@ -26,7 +30,7 @@ use kuipa_tools::audit;
 #[derive(Parser)]
 #[command(
     name = "kuipa-audit",
-    about = "Read-only reports on a realm's claim logs.",
+    about = "Read-only reports on a realm's claim logs and transparency logs.",
     after_help = "The tool fetches only public endpoints (the advertisement, the anchor log \
 and the claim-log pages) and checks what it fetches against heads — pinned or given. \
 It holds no keys and writes nothing."
@@ -74,6 +78,21 @@ enum Command {
         #[arg(long)]
         server: Vec<String>,
     },
+    /// A server's whole transparency log: its head checked against the
+    /// signing key its verified advertisement names, every leaf replayed.
+    Tlog {
+        /// The server to ask.
+        #[arg(long)]
+        server: String,
+        /// Anchors to verify the advertisement with; repeatable.
+        /// Default: this host's pinned anchors.
+        #[arg(long)]
+        anchor: Vec<String>,
+        /// Record the verified head in this file, and require the next
+        /// run's log to extend it.
+        #[arg(long, value_name = "FILE")]
+        state: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -114,6 +133,31 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
+        Command::Tlog {
+            server,
+            anchor,
+            state,
+        } => {
+            let anchors: Result<Vec<tang_pqc::Thumbprint>, _> =
+                anchor.iter().map(|a| a.parse()).collect();
+            let Ok(anchors) = anchors else {
+                eprintln!("kuipa-audit tlog: bad --anchor thumbprint");
+                return ExitCode::from(2);
+            };
+            match audit::tlog(server, &anchors, state.as_deref()) {
+                Ok(v) => {
+                    let clean = !v["state"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("forked");
+                    (v, clean)
+                }
+                Err(e) => {
+                    eprintln!("kuipa-audit tlog: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         Command::SplitView { server } => {
             if server.is_empty() {
                 eprintln!("kuipa-audit split-view: --server is required (repeat for each)");
@@ -224,6 +268,23 @@ fn render(command: &Command, value: &serde_json::Value) {
                 }
                 r.print();
             }
+        }
+        Command::Tlog { .. } => {
+            rows.field("server", &get("server"));
+            rows.field("log", &get("log"));
+            rows.field("state", &get("state"));
+            if get("size").is_u64() {
+                rows.row("head", format_head(value));
+                rows.until("signed", &get("time"));
+            }
+            if let Some(p) = value.get("previous") {
+                rows.row("recorded", format_head(p));
+            }
+            if let Some(kinds) = get("kinds").as_object() {
+                let list: Vec<String> = kinds.iter().map(|(k, n)| format!("{k} {n}")).collect();
+                rows.row("leaves", list.join(", "));
+            }
+            rows.print();
         }
         Command::SplitView { .. } => {
             rows.print();
