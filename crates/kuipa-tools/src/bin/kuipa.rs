@@ -831,10 +831,11 @@ impl Args {
             // An enrolled host trusts what it pinned for this realm, not
             // the string's single anchor of the day it was issued.
             let enrolled = paths::State::load(paths).is_ok_and(|s| s.realm == string.realm());
-            let (pinned, pinned_heads, frozen) = if enrolled {
+            // Retired claims are read where the pins are used (enroll_online).
+            let (pinned, pinned_heads, _, frozen) = if enrolled {
                 paths::pinned_windows(&paths.anchors())?
             } else {
-                (Vec::new(), Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
             let string_head = string.head();
             let pins = Pins {
@@ -862,7 +863,7 @@ impl Args {
             };
             return Err(format!("--realm: {why} pinned anchors in {}", file.display()).into());
         }
-        let (anchors, heads, frozen) = paths::pinned_windows(&file)?;
+        let (anchors, heads, _, frozen) = paths::pinned_windows(&file)?;
         let pins = Pins {
             realm: realm.to_owned(),
             anchors,

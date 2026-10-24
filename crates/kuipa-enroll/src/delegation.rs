@@ -4,11 +4,16 @@
 //! * A **claim** states, for one server, its realm, its own anchor and the
 //!   thumbprint of its signing key, with a validity period.  It is small
 //!   and unsigned.
-//! * A **vouch** is one anchor's signature over a Merkle tree (RFC 9162
-//!   hashing, as in Merkle Tree Certificates) of the claims it vouches for:
-//!   one ML-DSA signature per anchor, however many servers it covers.  Every
-//!   server's anchor vouches for its own claim and for every claim it
-//!   trusts ([`crate::anchors`]).
+//! * A **vouch** is one anchor's signature over two Merkle trees (RFC 9162
+//!   hashing, as in Merkle Tree Certificates): its append-only **claim
+//!   log**, whose dropped claims are retired by tombstones rather than
+//!   removed (`DESIGN-tlog.md` §8), and the **live tree** of the claims it
+//!   vouches for now.  One ML-DSA signature per anchor, however many
+//!   servers it covers.  Every server's anchor vouches for its own claim
+//!   and for every claim it trusts ([`crate::anchors`]).  Signature proofs
+//!   are inclusion in the live tree, so a dropped claim stops proving at
+//!   once; head proofs are inclusion in a pinned log head, checked with
+//!   the retired claims the host learned (§4.9).
 //! * A **proof** shows that one anchor vouched for a claim: the anchor's
 //!   public key, the signed vouch and the claim's inclusion path.
 //!
@@ -134,13 +139,21 @@ impl Claim {
         Ok(claim)
     }
 
-    /// Its leaf hash in vouch trees.
+    /// Its leaf hash in vouch trees: a typed log leaf of kind
+    /// [`Kind::CLAIM`](crate::tlog::Kind::CLAIM), stamped with its `iat`,
+    /// so a claim can never be read as another kind of leaf.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
     pub fn leaf(&self) -> Result<Hash> {
-        merkle::leaf_hash(&self.to_bytes())
+        crate::tlog::Leaf {
+            kind: crate::tlog::Kind::CLAIM,
+            time: self.iat,
+            index: [0; 32],
+            body: self.to_bytes(),
+        }
+        .hash()
     }
 
     /// Whether it is valid at `at`, with clock skew.
@@ -161,25 +174,31 @@ pub struct Vouch {
     pub iat: u64,
     /// Expires at (Unix seconds).
     pub exp: u64,
-    /// Number of leaves.
+    /// Number of leaves in the claim log.
     pub size: u64,
-    /// Tree hash.
+    /// The claim log's tree hash.
     pub root: Hash,
+    /// Number of claims vouched for now.
+    pub live_size: u64,
+    /// The live tree's hash.
+    pub live_root: Hash,
 }
 
 impl Vouch {
-    /// Encode: `IPVH ‖ 1 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖ root(32)`;
-    /// these are the signed bytes.
+    /// Encode: `IPVH ‖ 1 ‖ 2 ‖ realm ‖ anchor(32) ‖ iat ‖ exp ‖ size ‖
+    /// root(32) ‖ live_size ‖ live_root(32)`; these are the signed bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(VOUCH_MAGIC)
-            .u8(1)
+            .u8(2)
             .str(&self.realm)
             .fixed(self.anchor.as_bytes())
             .u64(self.iat)
             .u64(self.exp)
             .u64(self.size)
             .fixed(&self.root)
+            .u64(self.live_size)
+            .fixed(&self.live_root)
             .finish()
     }
 
@@ -190,7 +209,7 @@ impl Vouch {
     /// [`Error::Malformed`], also for an empty or too long validity period.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, VOUCH_MAGIC, "vouch")?;
-        if r.u8()? != 1 {
+        if r.u8()? != 2 {
             return Err(Error::Malformed("vouch version"));
         }
         let vouch = Self {
@@ -200,6 +219,8 @@ impl Vouch {
             exp: r.u64()?,
             size: r.u64()?,
             root: r.fixed()?,
+            live_size: r.u64()?,
+            live_root: r.fixed()?,
         };
         r.finish()?;
         check_period(vouch.iat, vouch.exp, MAX_VOUCH_VALIDITY, "vouch validity")?;
@@ -213,24 +234,101 @@ impl Vouch {
     }
 }
 
-/// A signed vouch with its leaves, as servers exchange it.
+/// One entry of an anchor's claim log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogEntry {
+    /// A claim, by its leaf hash ([`Claim::leaf`]).
+    Claim(Hash),
+    /// The claim at `target` is no longer vouched for, from `time`.
+    Tombstone {
+        /// The retired claim's index in the log.
+        target: u64,
+        /// When (the `iat` of the vouch that dropped it).
+        time: u64,
+    },
+}
+
+/// The reason every claim-log tombstone carries.
+const CLAIM_DROPPED: &str = "claim dropped";
+
+impl LogEntry {
+    /// Its leaf hash: a claim's own, or a typed tombstone leaf's.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn hash(&self) -> Result<Hash> {
+        match self {
+            Self::Claim(h) => Ok(*h),
+            Self::Tombstone { target, time } => {
+                crate::tlog::Leaf::tombstone(*time, *target, CLAIM_DROPPED).hash()
+            }
+        }
+    }
+}
+
+/// A claim log's leaf hashes, its live claims in log order, and the
+/// claims it retired; checked: a claim is appended only while not live,
+/// and a tombstone retires an earlier live claim.
+struct Replayed {
+    leaves: Vec<Hash>,
+    live: Vec<Hash>,
+    retired: Vec<Hash>,
+}
+
+fn replay(entries: &[LogEntry]) -> Result<Replayed> {
+    let mut leaves = Vec::with_capacity(entries.len());
+    let mut live: Vec<(u64, Hash)> = Vec::new();
+    let mut retired = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        match e {
+            LogEntry::Claim(h) => {
+                if live.iter().any(|(_, l)| l == h) {
+                    return Err(Error::Malformed("vouch: a claim already live"));
+                }
+                live.push((i as u64, *h));
+            }
+            LogEntry::Tombstone { target, .. } => {
+                let Some(at) = live.iter().position(|(t, _)| t == target) else {
+                    return Err(Error::Malformed("vouch: a tombstone for no live claim"));
+                };
+                let (_, h) = live.remove(at);
+                if !retired.contains(&h) {
+                    retired.push(h);
+                }
+            }
+        }
+        leaves.push(e.hash()?);
+    }
+    let live: Vec<Hash> = live.into_iter().map(|(_, h)| h).collect();
+    retired.retain(|h| !live.contains(h));
+    Ok(Replayed {
+        leaves,
+        live,
+        retired,
+    })
+}
+
+/// A signed vouch with its claim log, as servers exchange it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedVouch {
     vouch: Vouch,
     signature: Vec<u8>,
+    entries: Vec<LogEntry>,
+    /// Derived from `entries`.
     leaves: Vec<Hash>,
+    live: Vec<Hash>,
+    retired: Vec<Hash>,
 }
 
 impl SignedVouch {
     /// Vouch, as `anchor`, for the claims with these `leaves` in `realm`,
-    /// valid from `iat` to `exp`.  The leaves are the anchor's **claim
-    /// log** (§4.9): deduplicated, in log order.  They extend the previous
-    /// vouch's log where they can — the old log kept, in its order, with
-    /// new claims appended — and start a fresh log where they cannot
-    /// (a claim dropped, an unknown previous log).  The tree is over that
-    /// order, so every prefix of the log is the tree an earlier vouch
-    /// signed: a head pinned at that prefix verifies without the
-    /// signature.
+    /// valid from `iat` to `exp`.  The **claim log** (§4.9,
+    /// `DESIGN-tlog.md` §8) is the previous vouch's, extended: a claim no
+    /// longer vouched for is retired by an appended tombstone stamped
+    /// `iat`, and a new claim is appended.  Nothing is ever removed, so
+    /// every earlier head is a prefix of this one.  The live tree is over
+    /// the claims vouched for now, in log order.
     ///
     /// # Errors
     ///
@@ -245,20 +343,26 @@ impl SignedVouch {
         previous: Option<&SignedVouch>,
     ) -> Result<Self> {
         check_period(iat, exp, MAX_VOUCH_VALIDITY, "vouch validity")?;
-        let leaves = continue_log(leaves, previous);
+        let entries = continue_log(leaves, previous, iat);
+        let replayed = replay(&entries)?;
         let vouch = Vouch {
             realm: realm.into(),
             anchor: *anchor.public().thumbprint(),
             iat,
             exp,
-            size: leaves.len() as u64,
-            root: merkle::root(&leaves)?,
+            size: replayed.leaves.len() as u64,
+            root: merkle::root(&replayed.leaves)?,
+            live_size: replayed.live.len() as u64,
+            live_root: merkle::root(&replayed.live)?,
         };
         let signature = anchor.sign_with_context(&vouch.to_bytes(), VOUCH_CONTEXT)?;
         Ok(Self {
             vouch,
             signature,
-            leaves,
+            entries,
+            leaves: replayed.leaves,
+            live: replayed.live,
+            retired: replayed.retired,
         })
     }
 
@@ -268,34 +372,73 @@ impl SignedVouch {
         &self.vouch
     }
 
-    /// The leaves, sorted.
+    /// The claim log's leaf hashes, in log order.
     #[must_use]
     pub fn leaves(&self) -> &[Hash] {
         &self.leaves
     }
 
+    /// The claim log's entries, in log order.
+    #[must_use]
+    pub fn entries(&self) -> &[LogEntry] {
+        &self.entries
+    }
+
+    /// The claims vouched for now, in log order: the live tree's leaves.
+    #[must_use]
+    pub fn live(&self) -> &[Hash] {
+        &self.live
+    }
+
+    /// The claims the log retired and has not vouched for again.
+    #[must_use]
+    pub fn retired(&self) -> &[Hash] {
+        &self.retired
+    }
+
+    /// The claims retired within the log's first `size` entries, when
+    /// those make `root`: what a host pinning the head `(size, root)`
+    /// learns from this vouch's entries.  The entries are believed for
+    /// making the pinned root, not for the vouch's signature, so a host
+    /// learns from any page that carries them.  `None` for a head this
+    /// log does not extend.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn retired_at(&self, size: u64, root: &Hash) -> Result<Option<Vec<Hash>>> {
+        let Some(n) = usize::try_from(size)
+            .ok()
+            .filter(|n| *n > 0 && *n <= self.leaves.len())
+        else {
+            return Ok(None);
+        };
+        if merkle::root(&self.leaves[..n])? != *root {
+            return Ok(None);
+        }
+        Ok(Some(replay(&self.entries[..n])?.retired))
+    }
+
     /// Check it against the anchor's `key`: the key's thumbprint, the
-    /// policy, the signature, and that the leaves are unique and make the
-    /// signed tree, in their log order.
+    /// policy, the signature, and that the entries follow the log's rules
+    /// and make both signed trees.
     ///
     /// # Errors
     ///
     /// [`Error::UntrustedAnchor`] for another anchor's key or a bad
-    /// signature, [`Error::Malformed`] for leaves that do not make the tree.
+    /// signature, [`Error::Malformed`] for entries that do not make the
+    /// trees.
     pub fn verify(&self, key: &VerifyingKey, policy: &Policy) -> Result<()> {
         if key.thumbprint() != &self.vouch.anchor || !policy.allows_signature(key.alg()) {
             return Err(Error::UntrustedAnchor);
         }
         key.verify_with_context(&self.vouch.to_bytes(), VOUCH_CONTEXT, &self.signature)
             .map_err(|_| Error::UntrustedAnchor)?;
-        if self
-            .leaves
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != self.leaves.len()
-            || self.leaves.len() as u64 != self.vouch.size
-            || merkle::root(&self.leaves)? != self.vouch.root
+        let replayed = replay(&self.entries)?;
+        if replayed.leaves.len() as u64 != self.vouch.size
+            || replayed.live.len() as u64 != self.vouch.live_size
+            || merkle::root(&replayed.leaves)? != self.vouch.root
+            || merkle::root(&replayed.live)? != self.vouch.live_root
         {
             return Err(Error::Malformed("vouch leaves"));
         }
@@ -308,7 +451,7 @@ impl SignedVouch {
     ///
     /// An OpenSSL error.
     pub fn covers(&self, claim: &Claim) -> Result<bool> {
-        Ok(self.leaves.contains(&claim.leaf()?))
+        Ok(self.live.contains(&claim.leaf()?))
     }
 
     /// The proof that it covers `claim`, by the anchor with `key`; `None`
@@ -319,7 +462,7 @@ impl SignedVouch {
     /// An OpenSSL error.
     pub fn proof(&self, claim: &Claim, key: &VerifyingKey) -> Result<Option<Proof>> {
         let leaf = claim.leaf()?;
-        let Some(index) = self.leaves.iter().position(|l| *l == leaf) else {
+        let Some(index) = self.live.iter().position(|l| *l == leaf) else {
             return Ok(None);
         };
         Ok(Some(Proof {
@@ -327,7 +470,7 @@ impl SignedVouch {
             vouch: b64::encode(&self.vouch.to_bytes()),
             signature: b64::encode(&self.signature),
             index: index as u64,
-            path: merkle::path(&self.leaves, index)?
+            path: merkle::path(&self.live, index)?
                 .iter()
                 .map(|h| b64::encode(h))
                 .collect(),
@@ -367,10 +510,19 @@ impl SignedVouch {
             return Ok(None);
         }
         let leaf = claim.leaf()?;
-        let prefix = &self.leaves[..prefix.unwrap_or(0)];
-        let Some(index) = prefix.iter().position(|l| *l == leaf) else {
+        let n = prefix.unwrap_or(0);
+        // Live within the prefix: its last appearance there, and no
+        // tombstone for it inside the prefix.
+        let Some(index) = self.leaves[..n].iter().rposition(|l| *l == leaf) else {
             return Ok(None);
         };
+        if self.entries[..n]
+            .iter()
+            .any(|e| matches!(e, LogEntry::Tombstone { target, .. } if *target == index as u64))
+        {
+            return Ok(None);
+        }
+        let prefix = &self.leaves[..n];
         Ok(Some(HeadProof::new(
             *anchor,
             index as u64,
@@ -382,16 +534,21 @@ impl SignedVouch {
         )))
     }
 
-    /// Encode: `IPSV ‖ 1 ‖ vouch ‖ signature ‖ n(u64) ‖ leaves(32·n)`.
+    /// Encode: `IPSV ‖ 1 ‖ 2 ‖ vouch ‖ signature ‖ n(u64) ‖ [entry]`, an
+    /// entry `1 ‖ leaf(32)` for a claim or `2 ‖ target(u64) ‖ time(u64)`
+    /// for a tombstone.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(SIGNED_VOUCH_MAGIC);
-        w.u8(1)
+        w.u8(2)
             .bytes(&self.vouch.to_bytes())
             .bytes(&self.signature)
-            .u64(self.leaves.len() as u64);
-        for l in &self.leaves {
-            w.fixed(l);
+            .u64(self.entries.len() as u64);
+        for e in &self.entries {
+            match e {
+                LogEntry::Claim(h) => w.u8(1).fixed(h),
+                LogEntry::Tombstone { target, time } => w.u8(2).u64(*target).u64(*time),
+            };
         }
         w.finish()
     }
@@ -403,7 +560,7 @@ impl SignedVouch {
     /// [`Error::Malformed`].
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, SIGNED_VOUCH_MAGIC, "signed vouch")?;
-        if r.u8()? != 1 {
+        if r.u8()? != 2 {
             return Err(Error::Malformed("signed vouch version"));
         }
         let vouch = Vouch::from_bytes(r.bytes()?)?;
@@ -412,25 +569,40 @@ impl SignedVouch {
         if n != vouch.size || n > 1 << 20 {
             return Err(Error::Malformed("vouch leaves"));
         }
-        let leaves = (0..n).map(|_| r.fixed()).collect::<Result<_, _>>()?;
+        let mut entries = Vec::new();
+        for _ in 0..n {
+            entries.push(match r.u8()? {
+                1 => LogEntry::Claim(r.fixed()?),
+                2 => LogEntry::Tombstone {
+                    target: r.u64()?,
+                    time: r.u64()?,
+                },
+                _ => return Err(Error::Malformed("vouch entry")),
+            });
+        }
         r.finish()?;
+        let replayed = replay(&entries)?;
         Ok(Self {
             vouch,
             signature,
-            leaves,
+            entries,
+            leaves: replayed.leaves,
+            live: replayed.live,
+            retired: replayed.retired,
         })
     }
 }
 
 /// The next claim log for an anchor that vouches for `leaves`, given its
-/// `previous` vouch: the previous log kept, in its order, with the new
-/// leaves appended; or a fresh log, in the caller's order, when the
-/// previous one cannot be extended (a claim dropped, or no usable
-/// previous log).  Deduplicated, so no claim is in a log twice.
+/// `previous` vouch: the previous log kept whole, a tombstone stamped
+/// `time` for each live claim no longer wanted, then each wanted claim
+/// not live yet, in the caller's order.  Without a previous log, the
+/// wanted claims, deduplicated.
 fn continue_log(
     leaves: impl IntoIterator<Item = Hash>,
     previous: Option<&SignedVouch>,
-) -> Vec<Hash> {
+    time: u64,
+) -> Vec<LogEntry> {
     let mut wanted: Vec<Hash> = Vec::new();
     for l in leaves {
         if !wanted.contains(&l) {
@@ -438,19 +610,28 @@ fn continue_log(
         }
     }
     let Some(previous) = previous else {
-        return wanted;
+        return wanted.into_iter().map(LogEntry::Claim).collect();
     };
-    let old = previous.leaves();
-    let kept: Vec<Hash> = old.iter().copied().filter(|l| wanted.contains(l)).collect();
-    if kept.len() != old.len() {
-        // A claim was dropped: the log restarts, so no old prefix stays
-        // valid.  New claims never cause a restart — they append.
-        return wanted;
+    let mut log = previous.entries.clone();
+    // Live claims with their index: the last appearance of each, untombstoned.
+    let mut live: Vec<(u64, Hash)> = Vec::new();
+    for (i, e) in previous.entries.iter().enumerate() {
+        match e {
+            LogEntry::Claim(h) => live.push((i as u64, *h)),
+            LogEntry::Tombstone { target, .. } => live.retain(|(t, _)| t != target),
+        }
     }
-    let mut log = kept;
-    for l in wanted {
-        if !log.contains(&l) {
-            log.push(l);
+    for (target, h) in &live {
+        if !wanted.contains(h) {
+            log.push(LogEntry::Tombstone {
+                target: *target,
+                time,
+            });
+        }
+    }
+    for w in wanted {
+        if !live.iter().any(|(_, h)| *h == w) {
+            log.push(LogEntry::Claim(w));
         }
     }
     log
@@ -745,12 +926,14 @@ impl Proof {
             .iter()
             .map(|h| b64::decode(h).ok()?.try_into().ok())
             .collect::<Option<_>>()?;
+        // Signature proofs are inclusion in the live tree: a claim the
+        // anchor dropped stops proving with the next vouch.
         merkle::verify(
             &claim.leaf().ok()?,
             self.index,
-            vouch.size,
+            vouch.live_size,
             &path,
-            &vouch.root,
+            &vouch.live_root,
         )
         .ok()?
         .then_some((*key.thumbprint(), vouch))
@@ -919,8 +1102,13 @@ impl HeadProof {
 
     /// Check it for `claim` against the pinned `heads`, returning the
     /// anchor whose head proved it.  Only the anchor's pin is consulted:
-    /// there is no signature to verify.
-    fn check(&self, claim: &Claim, heads: &[HeadPin]) -> Option<Thumbprint> {
+    /// there is no signature to verify.  A claim among `retired` — the
+    /// claims the host learned the pinned logs retired — proves nothing:
+    /// it is still in every later tree, but no longer vouched for.
+    fn check(&self, claim: &Claim, heads: &[HeadPin], retired: &[Hash]) -> Option<Thumbprint> {
+        if claim.leaf().is_ok_and(|l| retired.contains(&l)) {
+            return None;
+        }
         heads
             .iter()
             .find_map(|h| h.check(claim, self).ok().filter(|b| *b).map(|_| h.anchor))
@@ -1292,11 +1480,12 @@ impl Delegation {
         policy: &Policy,
         at: u64,
     ) -> Result<VerifiedDelegation> {
-        self.verify_at_with_heads(anchors, &[], policy, at)
+        self.verify_at_with_heads(anchors, &[], &[], policy, at)
     }
 
     /// [`verify_at`](Self::verify_at) with the client's pinned vouch
-    /// heads (§4.9): a head proof that checks against one of them is
+    /// heads (§4.9) and the claims it learned their logs retired: a head
+    /// proof that checks against one of them, for a claim not retired, is
     /// accepted with no signature, and wins over a signature proof.  The
     /// claim's validity is still checked, and the successions still lead
     /// to signature proofs — a head proof needs none.
@@ -1308,12 +1497,16 @@ impl Delegation {
         &self,
         anchors: &[Thumbprint],
         heads: &[HeadPin],
+        retired: &[Hash],
         policy: &Policy,
         at: u64,
     ) -> Result<VerifiedDelegation> {
         let claim = self.claim()?;
         let head_proofs = self.head_proofs();
-        if let Some(anchor) = head_proofs.iter().find_map(|p| p.check(&claim, heads)) {
+        if let Some(anchor) = head_proofs
+            .iter()
+            .find_map(|p| p.check(&claim, heads, retired))
+        {
             if !claim.valid_at(at) {
                 return Err(Error::Expired);
             }
@@ -1623,7 +1816,7 @@ mod tests {
         let mut d = Delegation::new(&claims[0]);
         d.add_head_proofs([hp]);
         let v = d
-            .verify_at_with_heads(&[], &[head1], &Policy::default(), NOW + 5)
+            .verify_at_with_heads(&[], &[head1], &[], &Policy::default(), NOW + 5)
             .unwrap();
         assert_eq!(v.head_anchor, Some(head1.anchor));
         assert_eq!(v.vouched_until, u64::MAX, "a head proof never expires");
@@ -1644,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_claim_restarts_the_log() {
+    fn dropping_a_claim_appends_a_tombstone() {
         let anchor = key();
         let thp = *anchor.public().thumbprint();
         let servers: Vec<_> = (0..3).map(|_| key()).collect();
@@ -1663,19 +1856,127 @@ mod tests {
             SignedVouch::issue(&anchor, "R", leaves(&[0, 1, 2]), NOW, NOW + 100, None).unwrap();
         let v2 = SignedVouch::issue(&anchor, "R", leaves(&[0, 2]), NOW + 1, NOW + 101, Some(&v1))
             .unwrap();
-        // Claim 1 dropped: the log restarts, so no prefix of the old one
-        // stays valid (a pinned head must not prove a dropped claim).
-        assert_eq!(v2.leaves().len(), 2);
+        v2.verify(anchor.public(), &Policy::default()).unwrap();
+        // Claim 1 dropped: the log grows by a tombstone, so the old head is
+        // still a prefix of the new one…
+        assert_eq!(v2.leaves().len(), 4);
+        assert_eq!(&v2.leaves()[..3], v1.leaves());
+        assert_eq!(
+            v2.entries()[3],
+            LogEntry::Tombstone {
+                target: 1,
+                time: NOW + 1
+            }
+        );
+        assert_eq!(v2.live(), &leaves(&[0, 2])[..]);
+        assert_eq!(v2.retired(), &leaves(&[1])[..]);
+        // …but the dropped claim no longer proves: not by signature (the
+        // live tree lacks it), not by the new head, and not by the old head
+        // for a host that learned the tombstone.
+        assert!(v2.proof(&claims[1], anchor.public()).unwrap().is_none());
+        assert!(!v2.covers(&claims[1]).unwrap());
         let head1 = (v1.vouch().size, v1.vouch().root);
-        for c in &claims {
-            assert!(
-                v2.head_proof(c, &thp, head1).unwrap().is_none(),
-                "no head proof from a restarted log against the old head"
-            );
-        }
-        // The new log's own head works.
         let head2 = (v2.vouch().size, v2.vouch().root);
-        assert!(v2.head_proof(&claims[0], &thp, head2).unwrap().is_some());
+        assert!(v2.head_proof(&claims[1], &thp, head2).unwrap().is_none());
+        let old = v2.head_proof(&claims[1], &thp, head1).unwrap().unwrap();
+        let pin1 = HeadPin {
+            anchor: thp,
+            size: head1.0,
+            root: head1.1,
+        };
+        let mut dropped = Delegation::new(&claims[1]);
+        dropped.head_proofs = vec![old.to_json()];
+        dropped
+            .verify_at_with_heads(&[], &[pin1], &[], &Policy::default(), NOW + 2)
+            .unwrap();
+        assert!(
+            dropped
+                .verify_at_with_heads(&[], &[pin1], v2.retired(), &Policy::default(), NOW + 2)
+                .is_err(),
+            "a retired claim proves nothing by an old head"
+        );
+        // The kept claims prove by the old head and the new.
+        assert!(v2.head_proof(&claims[0], &thp, head1).unwrap().is_some());
+        assert!(v2.head_proof(&claims[2], &thp, head2).unwrap().is_some());
+        // A host pinning either head learns what that prefix retired.
+        assert_eq!(v2.retired_at(head1.0, &head1.1).unwrap(), Some(Vec::new()));
+        assert_eq!(
+            v2.retired_at(head2.0, &head2.1).unwrap(),
+            Some(leaves(&[1]))
+        );
+        assert_eq!(v2.retired_at(head2.0, &head1.1).unwrap(), None);
+        assert_eq!(v2.retired_at(head2.0 + 1, &head2.1).unwrap(), None);
+        // Vouching for it again appends it again, live once more.
+        let v3 = SignedVouch::issue(
+            &anchor,
+            "R",
+            leaves(&[0, 1, 2]),
+            NOW + 2,
+            NOW + 102,
+            Some(&v2),
+        )
+        .unwrap();
+        v3.verify(anchor.public(), &Policy::default()).unwrap();
+        assert_eq!(v3.leaves().len(), 5);
+        assert!(v3.covers(&claims[1]).unwrap() && v3.retired().is_empty());
+    }
+
+    #[test]
+    fn claim_logs_follow_the_tombstone_rules() {
+        let anchor = key();
+        let sign = |entries: Vec<LogEntry>| {
+            // A vouch over any entries, signed honestly over what they make.
+            let replayed = replay(&entries);
+            replayed.map(|r| {
+                let vouch = Vouch {
+                    realm: "R".into(),
+                    anchor: *anchor.public().thumbprint(),
+                    iat: NOW,
+                    exp: NOW + 100,
+                    size: r.leaves.len() as u64,
+                    root: merkle::root(&r.leaves).unwrap(),
+                    live_size: r.live.len() as u64,
+                    live_root: merkle::root(&r.live).unwrap_or([0; 32]),
+                };
+                let signature = anchor
+                    .sign_with_context(&vouch.to_bytes(), VOUCH_CONTEXT)
+                    .unwrap();
+                SignedVouch {
+                    vouch,
+                    signature,
+                    entries,
+                    leaves: r.leaves,
+                    live: r.live,
+                    retired: r.retired,
+                }
+            })
+        };
+        let t = |target| LogEntry::Tombstone { target, time: NOW };
+        let c = |n: u8| LogEntry::Claim([n; 32]);
+        // A tombstone for a later index, for a tombstone, twice; a claim
+        // appended while live: none replays.
+        for bad in [
+            vec![t(1), c(1)],
+            vec![c(1), t(0), t(1)],
+            vec![c(1), t(0), t(0)],
+            vec![c(1), c(1)],
+        ] {
+            assert!(sign(bad.clone()).is_err(), "{bad:?}");
+        }
+        // A good log survives the wire with its entries.
+        let good = sign(vec![c(1), c(2), t(0), c(1)]).unwrap();
+        good.verify(anchor.public(), &Policy::default()).unwrap();
+        let parsed = SignedVouch::from_bytes(&good.to_bytes()).unwrap();
+        assert_eq!(parsed, good);
+        assert_eq!(parsed.live(), &[[2; 32], [1; 32]]);
+        // A tampered entry no longer makes the signed trees.
+        let mut tampered = good.clone();
+        tampered.entries[1] = c(3);
+        assert!(
+            tampered
+                .verify(anchor.public(), &Policy::default())
+                .is_err()
+        );
     }
 
     // PoC port (adversary poc_log_prefix): the production caller passes
@@ -1970,7 +2271,7 @@ mod tests {
         // Leaves that do not make the signed tree.
         let mut sv =
             SignedVouch::issue(&anchor, "R", [[1; 32], [2; 32]], NOW, NOW + 100, None).unwrap();
-        sv.leaves[1] = [3; 32];
+        sv.entries[1] = LogEntry::Claim([3; 32]);
         assert!(sv.verify(anchor.public(), &Policy::default()).is_err());
     }
 }
