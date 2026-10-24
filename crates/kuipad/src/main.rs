@@ -153,7 +153,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
         &cfg.server,
     )?);
     eprintln!(
-        "kuipad: transparency log {} at /ipa/ku/log ({} leaves)",
+        "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
         ledger.id(),
         ledger.size()
     );

@@ -3537,7 +3537,7 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     }));
     let _ = rustls_native_ossl::default_provider().install_default();
     let http = reqwest::blocking::Client::new();
-    let base = format!("{url}/ipa/ku/log/{}", ledger.id());
+    let base = format!("{url}/ipa/ku/tlog/{}", ledger.id());
     let get = |path: &str| http.get(format!("{base}/{path}")).send().unwrap();
     let json = |path: &str| -> serde_json::Value {
         serde_json::from_slice(&get(path).bytes().unwrap()).unwrap()
@@ -3589,7 +3589,7 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     assert_eq!(get("consistency?from=2&size=9").status(), 404);
     let other = kuipa_enroll::tlog::LogId::of(REALM, "elsewhere").unwrap();
     let status = http
-        .get(format!("{url}/ipa/ku/log/{other}/head"))
+        .get(format!("{url}/ipa/ku/tlog/{other}/head"))
         .send()
         .unwrap()
         .status();
