@@ -566,7 +566,8 @@ pq_up() {{ export KUIPA_ENDPOINTS="$KUIPA_PG_ENDPOINTS"; }}
 pq_bootstrap() {{
     local d="$KUIPA_PLAYGROUND/bootstrap"
     kuipa realm-info $PQ_SERVERS --krb5-dir "$d" || return
-    sed -i "s|kdc = [^ ]*:88|kdc = $PQ_KDC_SOCKET|; s|master_kdc = [^ ]*:88|master_kdc = $PQ_KDC_SOCKET|" "$d/krb5.conf"
+    sed "s|kdc = [^ ]*:88|kdc = $PQ_KDC_SOCKET|; s|master_kdc = [^ ]*:88|master_kdc = $PQ_KDC_SOCKET|" "$d/krb5.conf" > "$d/krb5.conf.new" || return
+    mv "$d/krb5.conf.new" "$d/krb5.conf"
     KRB5_CONFIG="$d/krb5.conf" kinit -n -c "$d/armor.ccache" @{realm} || return
     echo "anonymous PKINIT armour obtained with the advertised anchors"
     echo {password} | KRB5_CONFIG="$d/krb5.conf" kinit -T "$d/armor.ccache" {admin} >/dev/null || return
