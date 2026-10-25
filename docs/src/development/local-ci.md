@@ -115,9 +115,11 @@ playground is still torn down and the report still written. The
 playground itself gets `KUIPA_PLAYGROUND_START_TIMEOUT` seconds (default
 120) to start.
 `contrib/ci/playground/report.py` renders them as one self-contained HTML
-file: a summary, an index of the steps and, per step, the command and its
-output, with the trace and the server log in collapsed panels (open for a
-failed step). It has no external assets and follows the light or dark
+file: a summary; an overview of the sections, each a link with its first
+sentence, its number of steps and time, and its failures, which is the
+table of contents on narrow screens; an index of the steps in a sidebar on
+wide ones; and, per step, the command and its output, with the trace and
+the server log in collapsed panels (open for a failed step). It has no external assets and follows the light or dark
 system theme. Each section also carries an animated terminal capture —
 one SVG per section, under `svg/` — built from what the session recorded:
 the commands typed with the prompt of the host the shell acted as, the

@@ -229,8 +229,10 @@ body { margin: 0; background: var(--bg); color: var(--ink);
   font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
 .wrap { max-width: 72rem; margin: 0 auto; padding: 2rem 1rem 4rem;
   display: grid; grid-template-columns: 15rem minmax(0, 1fr); gap: 2rem; }
+/* On narrow screens the overview at the top is the table of contents:
+   the sidebar would only repeat it after the whole page. */
 @media (max-width: 60rem) { .wrap { grid-template-columns: minmax(0, 1fr); }
-  nav { position: static; max-height: none; order: 2; } }
+  nav { display: none; } }
 h1 { font-size: 1.7rem; margin: 0 0 .2rem; letter-spacing: -.01em; }
 .sub { color: var(--muted); margin: 0 0 1rem; }
 .mono, pre, code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
@@ -254,6 +256,22 @@ nav .sec a { color: var(--ink); text-decoration: none; }
 nav .sec a:hover { color: var(--accent); }
 .dot { width: .55rem; height: .55rem; border-radius: 50%; flex: none; transform: translateY(-.05rem); }
 .dot.pass { background: var(--pass); } .dot.fail { background: var(--fail); }
+.overview { margin-bottom: 2rem; }
+.overview > h2 { font-size: 1.2rem; margin: 0 0 .6rem; }
+.overview ol { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem;
+  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); }
+.overview li a { display: flex; flex-direction: column; gap: .2rem; height: 100%;
+  background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--pass);
+  border-radius: .6rem; padding: .55rem .75rem; color: var(--ink); text-decoration: none; }
+.overview li.fail a { border-left-color: var(--fail); }
+.overview li a:hover { border-color: var(--accent); }
+.overview .head { display: flex; gap: .45rem; align-items: baseline; font-weight: 600; }
+.overview .gist { color: var(--muted); font-size: .82rem; line-height: 1.4; }
+.overview .meta { color: var(--muted); font-size: .76rem; margin-top: auto; }
+.overview li.fail .meta { color: var(--fail); font-weight: 600; }
+section.group > h2 a.top { float: right; font-size: .78rem; font-weight: 400;
+  color: var(--muted); text-decoration: none; }
+section.group > h2 a.top:hover { color: var(--accent); }
 section.group { margin-bottom: 2.2rem; }
 section.group > h2 { font-size: 1.2rem; margin: 0 0 .25rem; }
 section.group > p { color: var(--muted); margin: 0 0 .9rem; max-width: 52rem; }
@@ -334,6 +352,34 @@ CAPTURE_SCRIPT = """<script>
 </script>"""
 
 
+def gist(text, limit=150):
+    """A section's text to its first sentence, at most `limit` characters
+    (cut at a word, with an ellipsis, when the sentence is longer)."""
+    first = re.split(r"(?<=\.)\s", text.strip(), maxsplit=1)[0]
+    if len(first) <= limit:
+        return first
+    return first[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+
+
+def overview_html(sections):
+    """The sections at a glance: each a link with its gist and its steps."""
+    items = []
+    for i, sec in enumerate(sections, start=1):
+        steps = sec["steps"]
+        failed = sum(1 for s in steps if not s["passed"])
+        state = "fail" if failed else "pass"
+        count = f"{len(steps)} step{'s' if len(steps) != 1 else ''}"
+        meta = f"{failed} of {count} failed" if failed else count
+        meta += f" · {seconds(sum(s['ms'] for s in steps))}"
+        items.append(
+            f'<li class="{state}"><a href="#section-{i}">'
+            f'<span class="head"><span class="num">{i}</span>{esc(sec["title"])}</span>'
+            f'<span class="gist">{esc(gist(sec["text"]))}</span>'
+            f'<span class="meta">{esc(meta)}</span></a></li>'
+        )
+    return f'<section class="overview" id="overview"><h2>Sections</h2><ol>{"".join(items)}</ol></section>'
+
+
 def render_html(data, commit, captures):
     steps = data["steps"]
     session = data["session"]
@@ -362,7 +408,8 @@ def render_html(data, commit, captures):
         if capture:
             sections_with_captures.add(i)
         body.append(
-            f'<section class="group" id="section-{i}"><h2>{esc(sec["title"])}</h2>'
+            f'<section class="group" id="section-{i}"><h2>{esc(sec["title"])}'
+            f'<a class="top" href="#overview">↑ Sections</a></h2>'
             f'<p>{esc(sec["text"])}</p>'
             + (capture_html(i, capture) if capture else "")
             + "".join(render_step(s) for s in sec["steps"])
@@ -407,6 +454,7 @@ def render_html(data, commit, captures):
     <span class="verdict {'pass' if ok else 'fail'}">{esc(verdict)}</span>
     <dl>{facts_html}</dl>
   </div>
+  {overview_html(data["sections"])}
   <section class="group">
     <h2>Playground</h2>
     <p>An MIT KDC for each realm and two IPA servers, ipa1 and ipa2, running the daemon's
