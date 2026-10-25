@@ -295,7 +295,7 @@ fn leased_voucher_creates_a_host_that_ends(realm: &Realm, ipa: &Ipa, issuer: &Is
         None
     );
     // Removed once the lease passed, and only it.
-    assert!(ipa.directory.purge_leases(end).unwrap().is_empty());
+    assert_eq!(ipa.directory.purge_leases(end).unwrap(), [] as [String; 0]);
     assert_eq!(ipa.directory.purge_leases(end + 1).unwrap(), [runner]);
     assert!(!realm.has(&principal));
     assert!(realm.has(&format!("host/web1.voucher.test@{REALM}")));
