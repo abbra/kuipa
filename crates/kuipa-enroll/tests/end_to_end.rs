@@ -2542,7 +2542,7 @@ fn members_open_and_membership(c: &Shared) {
     r.dir.groups.borrow_mut().remove(BOB);
     assert!(open_as(r, sealed, BOB, bob_key).is_err());
     assert!(in_session(bob_key).is_err());
-    assert!(vault_op(r, adv, BOB, &VaultOp::List).unwrap().is_empty());
+    assert_eq!(vault_op(r, adv, BOB, &VaultOp::List).unwrap(), Vec::new());
     // His device goes at the next vault operation anyone makes, even a
     // read, and is logged as a removal.
     let shown = vault_reply(r, adv, ALICE, &VaultOp::Show { name: "db".into() });
@@ -2596,7 +2596,7 @@ fn members_open_and_membership(c: &Shared) {
         )
         .unwrap(),
     );
-    assert!(left.vault().members.users.is_empty());
+    assert_eq!(left.vault().members.users, Vec::<String>::new());
     assert_eq!(left.vault().devices.len(), 2, "her device went with her");
     assert!(open_as(r, sealed, CAROL, carol_key).is_err());
 }
@@ -3162,7 +3162,7 @@ fn device_keys_are_escrowed_for_their_holders_and_logged() {
     assert_eq!(fetched.receipts.len(), 1, "the fetch is logged too");
     // Bob fetches only his own: none.
     let bobs = vault_reply_at(&r, 0, adv, BOB, &VaultOp::RecoverCode).unwrap();
-    assert!(bobs.escrows.is_empty());
+    assert_eq!(bobs.escrows, Vec::new());
 }
 
 /// Alice's helpdesk vault for disks: Carol a member, Bob a depositor.
@@ -3336,7 +3336,7 @@ fn deposits_retire(d: &Disks) {
     };
     assert!(retire(CAROL).is_err(), "not hers, and not a manager");
     retire(BOB).unwrap();
-    assert!(d.listed(CAROL).is_empty());
+    assert_eq!(d.listed(CAROL), Vec::new());
     let leave = VaultOp::Unshare {
         name: "alice/disks".into(),
         managers: vault::Members::default(),
