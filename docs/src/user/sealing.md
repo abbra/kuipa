@@ -9,8 +9,9 @@
 > with the `device` and `ticket` factors, re-authentication sessions
 > (`--session-hours`), offline sessions (`--offline-hours`, where the realm
 > allows them), unlock limits (`--max-unlocks`), registered sealing
-> (`--sealing registered`, `kuipa seal retire`) and shared vaults
-> (`share`, `unshare`). Not yet: passkeys,
+> (`--sealing registered`, `kuipa seal retire`), shared vaults
+> (`share`, `unshare`) and approvals (`--approvals`, `request`,
+> `approve`). Not yet: passkeys,
 > the attested `hardware-*` levels, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
 > only the default `allow` is accepted). A vault policy asking for any of
@@ -298,6 +299,54 @@ kuipa seal file break-glass root-password.txt
   counter.
 * `--sealing registered` means sealing needs a server, and resealing
   (after you rotate the password) retires the old sealed copy everywhere.
+
+### A break-glass secret several people approve
+
+Some secrets should never open on one person's say-so. Give the vault
+approvers, and every release waits until enough of them, other than
+whoever asks, have agreed:
+
+```sh
+alice$ kuipa seal create root-pw --require device,ticket \
+                                 --approvals 2 --approver-group security-oncall
+alice$ kuipa seal file root-pw root-password.txt
+```
+
+When Alice needs it, she asks, saying why:
+
+```sh
+alice$ kuipa seal request root-pw root-password.txt.sealed --reason "INC-1234: db01 locked"
+```
+
+Two people on call look and approve, from their own logins:
+
+```sh
+bob$   kuipa seal pending
+bob$   kuipa seal approve alice/root-pw 3f0c…e9
+carol$ kuipa seal approve alice/root-pw 3f0c…e9
+```
+
+Then Alice opens it with the request:
+
+```sh
+alice$ kuipa seal open root-password.txt.sealed --out - --request 3f0c…e9
+```
+
+* Alice still needs her own device and ticket; approvals add a
+  condition, they never replace a factor. Her own approval does not
+  count, even if she is on call.
+* A request names one file and covers one release
+  (`--approval-uses` for more), for 24 hours (`--approval-hours`, at most
+  168). Any approver can `kuipa seal deny` it instead, which ends it.
+* Approvers count while they are still in the group and not locked.
+* Every request, approval, denial and release is in the servers'
+  transparency log (`kuipa tlog watch root-pw`).
+* Approvals stop one person from acting alone. They do not stop the
+  realm's administrators, who can reach the servers' share: keep the
+  device factor on.
+
+Such vaults cannot have offline sessions, which would open files without
+asking a server.
 
 ### When you leave, or your account is disabled
 

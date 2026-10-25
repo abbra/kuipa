@@ -68,6 +68,10 @@ struct MemoryDirectory {
     sign_policy: RefCell<kuipa_enroll::sign::SignPolicy>,
     /// Groups by principal, as `memberOf` would list them.
     groups: RefCell<HashMap<String, Vec<String>>>,
+    /// Release requests by vault and id (`DESIGN-approvals.md`).
+    releases: RefCell<HashMap<(VaultId, String), vault::ReleaseRequest>>,
+    /// Their uses, by vault, id and server.
+    release_uses: RefCell<HashMap<(VaultId, String, String), u64>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -324,6 +328,93 @@ impl Directory for MemoryDirectory {
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.disabled.borrow().contains(&principal.to_string()))
+    }
+
+    fn vaults_approved_by(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let wanted = vault::Members::matching_entries(principal, groups);
+        Ok(self
+            .vaults
+            .borrow()
+            .values()
+            .filter(|v| {
+                v.policy
+                    .approvals
+                    .as_ref()
+                    .is_some_and(|a| a.from.entries().iter().any(|e| wanted.contains(e)))
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn release_add(&self, request: &vault::ReleaseRequest) -> Result<(), DirectoryError> {
+        self.releases
+            .borrow_mut()
+            .insert((request.vault, request.id.clone()), request.clone());
+        Ok(())
+    }
+
+    fn releases(&self, id: &VaultId) -> Result<Vec<vault::ReleaseRequest>, DirectoryError> {
+        let uses = self.release_uses.borrow();
+        Ok(self
+            .releases
+            .borrow()
+            .values()
+            .filter(|r| r.vault == *id)
+            .cloned()
+            .map(|mut r| {
+                r.uses = uses
+                    .iter()
+                    .filter(|((v, rid, _), _)| v == id && *rid == r.id)
+                    .map(|(_, n)| n)
+                    .sum();
+                r
+            })
+            .collect())
+    }
+
+    fn release_mark(
+        &self,
+        id: &VaultId,
+        request: &str,
+        approval: &vault::Approval,
+        deny: bool,
+    ) -> Result<(), DirectoryError> {
+        let mut releases = self.releases.borrow_mut();
+        let r = releases
+            .get_mut(&(*id, request.to_owned()))
+            .ok_or("no such request")?;
+        if deny {
+            r.denied = Some(approval.clone());
+        } else {
+            r.approvals.push(approval.clone());
+        }
+        Ok(())
+    }
+
+    fn release_use(
+        &self,
+        id: &VaultId,
+        request: &str,
+        server: &str,
+        limit: u64,
+    ) -> Result<bool, DirectoryError> {
+        let mut uses = self.release_uses.borrow_mut();
+        let total: u64 = uses
+            .iter()
+            .filter(|((v, r, _), _)| v == id && r == request)
+            .map(|(_, n)| n)
+            .sum();
+        if total >= limit {
+            return Ok(false);
+        }
+        *uses
+            .entry((*id, request.to_owned(), server.to_owned()))
+            .or_default() += 1;
+        Ok(true)
     }
 
     fn vault_limits(&self) -> Result<vault::Limits, DirectoryError> {
@@ -1247,6 +1338,7 @@ impl VaultCase {
                 device: key.map(|k| k as &dyn vault::DeviceKey),
                 session: None,
                 ticket: Some(&mut ticket),
+                release: None,
             },
             |s, req| ask_server(&self.r, s, req),
         )
@@ -1371,6 +1463,7 @@ fn alice_opens_her_file(c: &VaultCase) {
             device: Some(device),
             session: None,
             ticket: None,
+            release: None,
         },
         |s, req| ask_server(&c.r, s, req),
     );
@@ -1450,6 +1543,7 @@ fn bobs_vault_cannot_release(c: &VaultCase) {
                 device: Some(device),
                 session: None,
                 ticket: Some(&mut |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb))),
+                release: None,
             },
             |s, req| {
                 seen.push(req.clone());
@@ -1724,6 +1818,7 @@ fn opened_file_logs_release(
                 device: Some(device),
                 session: None,
                 ticket: Some(&mut ticket),
+                release: None,
             },
             ask,
         )
@@ -2065,6 +2160,7 @@ fn vault_sessions_and_unlock_limits() {
                 device: Some(key),
                 session: Some(&session),
                 ticket: None,
+                release: None,
             },
             ask,
         )
@@ -2149,6 +2245,7 @@ fn open_as(
             device: Some(key as &dyn vault::DeviceKey),
             session: None,
             ticket: Some(&mut ticket),
+            release: None,
         },
         |s, req| ask_server(r, s, req),
     )
@@ -2299,16 +2396,14 @@ fn members_not_managers(c: &Shared) {
     }
 }
 
-fn members_open_and_membership(c: &Shared) {
-    let alices_device = c.alice_key.public().kid().to_string();
+/// Any member seals to every member's device; each opens with their own
+/// device and ticket, and only so.
+fn members_open_with_their_own_devices(c: &Shared) {
     let r = &c.r;
-    let adv = c.adv();
     let alice_key = &c.alice_key;
     let bob_key = &c.bob_key;
     let carol_key = &c.carol_key;
     let sealed = &c.sealed;
-    // Any member seals to every member's device; each opens with their
-    // own device and ticket, and only so.
     assert_eq!(sealed.devices().len(), 3);
     assert_eq!(sealed.principal().to_string(), ALICE, "P is the owner");
     for (who, key) in [(ALICE, &alice_key), (BOB, &bob_key), (CAROL, &carol_key)] {
@@ -2327,7 +2422,16 @@ fn members_open_and_membership(c: &Shared) {
         "Bob's device, Alice's ticket"
     );
     assert!(open_as(r, sealed, "eve@EXAMPLE.TEST", bob_key).is_err());
+}
 
+fn members_open_and_membership(c: &Shared) {
+    let alices_device = c.alice_key.public().kid().to_string();
+    let r = &c.r;
+    let adv = c.adv();
+    let alice_key = &c.alice_key;
+    let bob_key = &c.bob_key;
+    let carol_key = &c.carol_key;
+    let sealed = &c.sealed;
     // A session is the member's own, for their own device.
     let bob_device = bob_key.public().kid().to_string();
     let unlock = |device: &str| VaultOp::Unlock {
@@ -2343,6 +2447,7 @@ fn members_open_and_membership(c: &Shared) {
                 device: Some(key),
                 session: Some(&session),
                 ticket: None,
+                release: None,
             },
             |s, req| ask_server(r, s, req),
         )
@@ -2515,6 +2620,7 @@ fn openers_have_their_own_allowance(c: &Shared) {
                 device: Some(key as &dyn vault::DeviceKey),
                 session: None,
                 ticket: Some(&mut ticket),
+                release: None,
             },
             |s, req| {
                 let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
@@ -2535,6 +2641,7 @@ fn openers_have_their_own_allowance(c: &Shared) {
 fn shared_vaults_open_for_their_members_with_their_own_devices() {
     let c = shared_fixture();
     members_not_managers(&c);
+    members_open_with_their_own_devices(&c);
     members_open_and_membership(&c);
     openers_have_their_own_allowance(&c);
     managers_share_and_unshare(&c);
@@ -2713,6 +2820,205 @@ fn a_vaults_limits_are_its_owners_by_their_groups() {
         policy: with(true, false),
     };
     vault_op(&r, adv, BOB, &within).unwrap();
+}
+
+const DAVE: &str = "dave@EXAMPLE.TEST";
+
+/// Alice's break-glass vault, whose releases two of the on-call group
+/// approve, with two files sealed to it.  Bob, Carol, Dave and Alice
+/// herself are on call.
+struct BreakGlass {
+    r: Realm,
+    vault: VaultId,
+    key: ExchangeKeyPair,
+    password: SealedVaultFile,
+    recovery: SealedVaultFile,
+}
+
+impl BreakGlass {
+    fn new() -> Self {
+        let r = realm();
+        let adv = &r.verify(0);
+        for who in [ALICE, BOB, CAROL, DAVE] {
+            r.dir
+                .groups
+                .borrow_mut()
+                .insert(who.into(), vec!["oncall".into()]);
+        }
+        let policy = vault::Policy {
+            factors: Factors {
+                device: Some(Level::Any),
+                ticket: true,
+                passkey: false,
+            },
+            approvals: Some(vault::Approvals {
+                m: 2,
+                from: vault::Members {
+                    groups: vec!["oncall".into()],
+                    ..vault::Members::default()
+                },
+                window: None,
+                uses: None,
+            }),
+            ..vault::Policy::default()
+        };
+        // Offline sessions open without a server, hence without approvals.
+        let offline = vault::Policy {
+            sessions: vault::Sessions {
+                reauth: None,
+                offline: Some(600),
+                epoch: None,
+            },
+            ..policy.clone()
+        };
+        let create = |name: &str, policy| VaultOp::Create {
+            name: name.into(),
+            policy,
+        };
+        assert!(vault_op(&r, adv, ALICE, &create("bad", offline)).is_err());
+        vault_op(&r, adv, ALICE, &create("break-glass", policy)).unwrap();
+        let key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+        let added = vault_op(&r, adv, ALICE, &add_device_op("break-glass", &key)).unwrap();
+        let v = added[0]
+            .verify(REALM, &r.all_anchors(), &Policy::default())
+            .unwrap();
+        let advs = [r.verify(0), r.verify(1)];
+        let seal = |text: &[u8]| {
+            let f = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], text).unwrap();
+            SealedVaultFile::from_bytes(&f.to_bytes()).unwrap()
+        };
+        Self {
+            vault: v.vault().id,
+            password: seal(b"root password"),
+            recovery: seal(b"recovery key"),
+            r,
+            key,
+        }
+    }
+
+    /// Open `file` as Alice, with her device and ticket, naming request `id`.
+    fn open(&self, file: &SealedVaultFile, id: Option<&str>) -> Result<SecretBuf, Error> {
+        let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb));
+        file.open(
+            Unlock {
+                device: Some(&self.key as &dyn vault::DeviceKey),
+                session: None,
+                ticket: Some(&mut ticket),
+                release: id.map(|i| vault::ReleaseRequest::id_bytes(i).unwrap()),
+            },
+            |s, req| ask_server(&self.r, s, req),
+        )
+    }
+
+    /// The request op for `file`, as `name` names the vault.
+    fn request_op(name: &str, file: &SealedVaultFile) -> VaultOp {
+        VaultOp::Request {
+            name: name.into(),
+            bindings: file
+                .bindings()
+                .unwrap()
+                .iter()
+                .map(vault::binding_hex)
+                .collect(),
+            reason: "INC-1: the database is down".into(),
+        }
+    }
+
+    /// Alice asks for the release of `file`; the request's id.
+    fn request(&self, file: &SealedVaultFile) -> String {
+        let reply = vault_reply(
+            &self.r,
+            &self.r.verify(0),
+            ALICE,
+            &Self::request_op("break-glass", file),
+        );
+        reply.requests[0].id.clone()
+    }
+
+    /// `who` approves, or with `deny` denies, request `id`.
+    fn decide(&self, who: &str, id: &str, deny: bool) -> Result<Vec<Descriptor>, ()> {
+        let (name, id) = ("alice/break-glass".to_owned(), id.to_owned());
+        let op = if deny {
+            VaultOp::Deny { name, id }
+        } else {
+            VaultOp::Approve { name, id }
+        };
+        vault_op(&self.r, &self.r.verify(0), who, &op)
+    }
+}
+
+/// Approvals count once each, never the requester's, and an approved
+/// request covers one release of the files it names.
+fn approvals_count_others_once(c: &BreakGlass) {
+    let (password, recovery) = (&c.password, &c.recovery);
+    // Without a request, the factors are not enough.
+    assert!(c.open(password, None).is_err());
+    let id = c.request(password);
+    assert!(c.open(password, Some(&id)).is_err(), "no approvals yet");
+    // Alice is on call, but her own approval does not count; Eve is not.
+    assert!(c.decide(ALICE, &id, false).is_err());
+    assert!(c.decide("eve@EXAMPLE.TEST", &id, false).is_err());
+    c.decide(BOB, &id, false).unwrap();
+    assert!(c.decide(BOB, &id, false).is_err(), "once each");
+    assert!(c.open(password, Some(&id)).is_err(), "one of two");
+    c.decide(CAROL, &id, false).unwrap();
+    assert_eq!(
+        c.open(password, Some(&id)).unwrap().as_ref(),
+        b"root password"
+    );
+    assert!(c.open(password, Some(&id)).is_err(), "used up");
+    assert!(c.open(recovery, Some(&id)).is_err(), "another file");
+    // Dave approves for the vault without being its member: he sees the
+    // request pending.
+    let pending = vault_reply(&c.r, &c.r.verify(0), DAVE, &VaultOp::Pending { name: None });
+    assert_eq!(pending.requests.len(), 1);
+    assert_eq!(pending.requests[0].approvals.len(), 2);
+}
+
+/// Approvers count while they are on call and not locked.
+fn approvers_count_while_admitted(c: &BreakGlass) {
+    let id = c.request(&c.recovery);
+    c.decide(BOB, &id, false).unwrap();
+    c.decide(CAROL, &id, false).unwrap();
+    c.r.dir.groups.borrow_mut().remove(CAROL);
+    assert!(c.open(&c.recovery, Some(&id)).is_err(), "Carol left");
+    c.r.dir.disabled.borrow_mut().insert(BOB.into());
+    c.decide(DAVE, &id, false).unwrap();
+    assert!(c.open(&c.recovery, Some(&id)).is_err(), "Bob is locked");
+    c.r.dir.disabled.borrow_mut().remove(BOB);
+    assert_eq!(
+        c.open(&c.recovery, Some(&id)).unwrap().as_ref(),
+        b"recovery key"
+    );
+}
+
+/// A denial, or the end of its window, ends a request; and only those with
+/// a part in the vault ask.
+fn requests_end(c: &BreakGlass) {
+    let id = c.request(&c.recovery);
+    c.decide(BOB, &id, true).unwrap();
+    assert!(c.decide(DAVE, &id, false).is_err());
+    assert!(c.open(&c.recovery, Some(&id)).is_err(), "denied");
+    let id = c.request(&c.recovery);
+    c.decide(BOB, &id, false).unwrap();
+    c.decide(DAVE, &id, false).unwrap();
+    c.r.dir
+        .releases
+        .borrow_mut()
+        .get_mut(&(c.vault, id.clone()))
+        .unwrap()
+        .not_after = 1;
+    assert!(c.open(&c.recovery, Some(&id)).is_err(), "expired");
+    let by_bob = BreakGlass::request_op("alice/break-glass", &c.recovery);
+    assert!(vault_op(&c.r, &c.r.verify(0), BOB, &by_bob).is_err());
+}
+
+#[test]
+fn releases_wait_for_approvals_from_others() {
+    let c = BreakGlass::new();
+    approvals_count_others_once(&c);
+    approvers_count_while_admitted(&c);
+    requests_end(&c);
 }
 
 /// Run a vault operation as `caller` against server `i`.
@@ -2946,6 +3252,7 @@ fn registered_sealing_opens_only_registered_files() {
                 device: Some(&device),
                 session: None,
                 ticket: None,
+                release: None,
             },
             ask,
         )

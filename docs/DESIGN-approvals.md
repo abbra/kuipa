@@ -14,9 +14,9 @@ holding the factors.
 
 | piece | status |
 |---|---|
-| the `approvals` policy field, release requests, approvals, denials | designed |
-| the release check and the request in `IPEQ` | designed |
-| `kuipa seal request`, `pending`, `approve`, `deny` | designed |
+| the `approvals` policy field, release requests, approvals, denials | implemented |
+| the release check and the request in `IPEQ` | implemented |
+| `kuipa seal request`, `pending`, `approve`, `deny`, `open --request` | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 
 ## 1. Policy
 
@@ -56,17 +56,22 @@ request = { vault, requester, bindings: [H(ct)] of the file's server
 ```
 
 The server checks that the requester may open the vault at all (a role,
-DESIGN.md §7.6.12, and not locked), stores the request as a child entry
+DESIGN.md §7.6.12), stores the request as a child entry
 `cn=<request id>,cn=<vault id>,cn=vaults,cn=kuipa,cn=etc,<suffix>`
-(`ipaKURelease`; the id is 16 random bytes), logs it, and answers with the
-id. A request names one file by its bindings: an approval is for that
+(class `ipaKURelease`, the request as JSON in `ipaKUReleaseRequest`; the
+id is 16 random bytes in hex), logs it, and answers with the request in
+the vault reply (`IPVR` version 3 carries release requests). A request names one file by its bindings: an approval is for that
 file, not for the vault. A request for several files names all their
 bindings.
 
 The approvers learn of it out of band (an on-call page, a ticket) or by
 asking: `kuipa seal pending` lists the open requests of every vault whose
-`approvals.from` admits the caller, with the requester, the reason and the
-file's bindings.
+`approvals.from` admits the caller, and of the vaults they have a part in,
+with the requester, the reason and the approvals so far. To find the
+first kind, a vault entry keeps its approvers beside its policy, as
+`kind:name` values in `ipaKUVaultApprover`; the server names them in one
+spelling each when it sets the policy, as it does a shared vault's
+members.
 
 ## 3. Approving and denying
 
@@ -78,9 +83,9 @@ checks that:
 * the approver is admitted by `approvals.from` now and is not locked;
 * the approver is not the requester.
 
-It then adds one value `<approver> <time>` to the request's
-`ipaKUReleaseApproval` (or sets `ipaKUReleaseDenied`), and logs the
-event. Values are added, never replaced, so 389-ds replication merges
+It then logs the event and adds one value `<approver> <time>` to the
+request's `ipaKUReleaseApproval` (or to `ipaKUReleaseDenied`). An
+approver approves a request once. Values are added, never replaced, so 389-ds replication merges
 approvals made on different servers as it merges unlock counts (DESIGN.md
 §7.6.7). One denial ends the request on every server once replicated.
 
@@ -112,14 +117,15 @@ opener of §7.6.12), the server also requires:
 6. the request's uses, summed over the servers (per-server values, as
    unlock counts), are fewer than `uses`.
 
-It counts one use, logs the release with the request id in its digest
-input, and answers as usual. Like `max_unlocks`, `uses` can be exceeded
-by the releases other servers make within one replication delay; every
-other check is exact.
+It counts one use in `ipaKUReleaseUses` (one `<server> <count>` value per
+server), logs the release as any other, and answers as usual. Like
+`max_unlocks`, `uses` can be exceeded by the releases other servers make
+within one replication delay; every other check is exact.
 
 An approval made on one server counts on another once it has
-replicated. `kuipa seal open` therefore sends the request to the server
-that stored the most recent approval first, then to the others.
+replicated. `kuipa seal open --request ID` tries the file's servers in
+turn, as every open does, so a server that has not seen the approvals yet
+refuses and the next one answers.
 
 ## 5. The log
 
@@ -131,10 +137,10 @@ Three vault actions join DESIGN-tlog.md §6, all of kind 4 (releases):
 | `approve` | request id ‖ approver |
 | `deny` | request id ‖ approver |
 
-The release itself is logged as today, with the request id added to
-what its digest covers. `kuipa tlog watch` lists requests, approvals and
-denials, and flags a release of an approvals vault that names no
-approved request.
+The release itself is logged as today, by the file's binding: together
+with the request's event, whose digest covers the same bindings, it shows
+which approved request a release used. `kuipa tlog watch` lists requests,
+approvals and denials.
 
 ## 6. What it protects, and what not
 

@@ -177,6 +177,7 @@ request:
 | vault shared or unshared (DESIGN.md §7.6.12) | 3 | vault id | `IPLV`: share or unshare, `H` of the managers and members after the change |
 | device added or removed | 2 | vault id | `IPLV`: action, the device's id |
 | session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |
+| release requested, approved, denied (DESIGN-approvals.md) | 4 | vault id | `IPLV`: action, `H` of the request, or of `id ‖ " " ‖ approver` |
 | server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` (its KEM's suite hash, DESIGN.md §4.1.1) |
 | Keys fetch | 6 | the caller's principal | the `IPKG` fetch |
 

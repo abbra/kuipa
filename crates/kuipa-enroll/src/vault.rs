@@ -47,8 +47,9 @@ pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault session";
 
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
-/// Version 2 adds the receipts of the events an operation logged.
-const REPLY_VERSION: u8 = 2;
+/// Version 2 adds the receipts of the events an operation logged, 3 the
+/// release requests.
+const REPLY_VERSION: u8 = 3;
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
 const SESSION_MAGIC: [u8; 4] = *b"IPST";
@@ -249,6 +250,78 @@ pub struct Policy {
     /// Sealing mode.
     #[serde(default)]
     pub sealing: Sealing,
+    /// Approvals a release needs (`DESIGN-approvals.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Approvals>,
+}
+
+/// How long a release request waits for approvals and is then usable,
+/// unless the policy says.
+pub const DEFAULT_APPROVAL_WINDOW: u64 = 86_400;
+
+/// The longest approval window a policy may set.
+pub const MAX_APPROVAL_WINDOW: u64 = 7 * 86_400;
+
+/// The longest reason a release request may give, in bytes.
+pub const MAX_REASON: usize = 512;
+
+/// A vault's approvals (`DESIGN-approvals.md` §1): `m` people of `from`,
+/// other than the requester, approve a release before a server answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approvals {
+    /// Approvals needed.
+    pub m: u32,
+    /// Who may approve, named as a shared vault's members are.
+    pub from: Members,
+    /// How long a request may wait for approvals and then be used, in
+    /// seconds (default [`DEFAULT_APPROVAL_WINDOW`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+    /// Releases one approved request covers (default 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses: Option<u64>,
+}
+
+impl Approvals {
+    /// The approval window, in seconds.
+    #[must_use]
+    pub fn window(&self) -> u64 {
+        self.window.unwrap_or(DEFAULT_APPROVAL_WINDOW)
+    }
+
+    /// The releases a request covers.
+    #[must_use]
+    pub fn uses(&self) -> u64 {
+        self.uses.unwrap_or(1)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.m == 0 {
+            return Err(Policy::refuse("approvals of none"));
+        }
+        if self.from.is_empty() {
+            return Err(Policy::refuse("approvals from no one"));
+        }
+        let only_users = self.from.groups.is_empty()
+            && self.from.hosts.is_empty()
+            && self.from.services.is_empty();
+        if only_users && self.from.users.len() < usize::try_from(self.m).unwrap_or(usize::MAX) {
+            return Err(Policy::refuse(format!(
+                "{} approvals from {} users",
+                self.m,
+                self.from.users.len()
+            )));
+        }
+        if !(1..=MAX_APPROVAL_WINDOW).contains(&self.window()) {
+            return Err(Policy::refuse(
+                "an approval window of no length or over 7 days",
+            ));
+        }
+        if self.uses() == 0 {
+            return Err(Policy::refuse("approved requests that cover no release"));
+        }
+        Ok(())
+    }
 }
 
 impl Policy {
@@ -291,6 +364,14 @@ impl Policy {
             && list.is_empty()
         {
             return Err(Self::refuse("ticket delegation via an empty list"));
+        }
+        if let Some(approvals) = &self.approvals {
+            approvals.validate()?;
+            if self.sessions.offline.is_some() {
+                return Err(Self::refuse(
+                    "offline sessions open files without a server, hence without approvals",
+                ));
+            }
         }
         Ok(())
     }
@@ -1339,6 +1420,82 @@ impl VerifiedDescriptor {
     }
 }
 
+/// One approval or denial of a release request: who, and when.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approval {
+    /// The approver.
+    pub approver: String,
+    /// When (Unix seconds).
+    pub at: u64,
+}
+
+/// A request for the release of a file of a vault with approvals
+/// (`DESIGN-approvals.md` §2), as the directory keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    /// The id: 16 random bytes, hex.
+    pub id: String,
+    /// The vault.
+    pub vault: VaultId,
+    /// Who asked, and alone may use it.
+    pub requester: String,
+    /// The binding hashes `H(ct)` (hex) of the file or files it is for.
+    pub bindings: Vec<String>,
+    /// Why, for the approvers.
+    pub reason: String,
+    /// When it was made.
+    pub created: u64,
+    /// No approval or release after this time.
+    pub not_after: u64,
+    /// The approvals so far, kept by the directory.
+    #[serde(default)]
+    pub approvals: Vec<Approval>,
+    /// The denial that ended it, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<Approval>,
+    /// Releases made with it so far, summed over the servers.
+    #[serde(default)]
+    pub uses: u64,
+}
+
+impl ReleaseRequest {
+    /// Whether approvals and releases may still be made with it at `now`.
+    #[must_use]
+    pub fn is_open(&self, now: u64) -> bool {
+        self.denied.is_none() && now <= self.not_after
+    }
+
+    /// What the transparency log digests for the request: everything but
+    /// what the directory adds later.
+    #[must_use]
+    pub fn log_bytes(&self) -> Vec<u8> {
+        let core = Self {
+            approvals: Vec::new(),
+            denied: None,
+            uses: 0,
+            ..self.clone()
+        };
+        serde_json::to_vec(&core).unwrap_or_default()
+    }
+
+    /// The id as the 16 bytes a recovery request carries.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for an id that is not 32 hex digits.
+    pub fn id_bytes(id: &str) -> Result<[u8; 16]> {
+        let mut out = [0u8; 16];
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::Malformed("release request id"));
+        }
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&id[2 * i..2 * i + 2], 16)
+                .map_err(|_| Error::Malformed("release request id"))?;
+        }
+        Ok(out)
+    }
+}
+
 /// What a user asks of their vaults, sent as the operation data of a
 /// `POST /ipa/ku/vault/{kid}` exchange authenticated by their ticket.
 /// Every `name` is a vault reference: `NAME` for the caller's own vault,
@@ -1426,6 +1583,37 @@ pub enum VaultOp {
         #[serde(default)]
         members: Members,
     },
+    /// Ask for the release of the file whose bindings these are, from a
+    /// vault with approvals (`DESIGN-approvals.md` §2).
+    Request {
+        /// The vault.
+        name: String,
+        /// The file's binding hashes (hex).
+        bindings: Vec<String>,
+        /// Why, for the approvers.
+        reason: String,
+    },
+    /// The open release requests of the vault, or of every vault whose
+    /// approvers or members include the caller.
+    Pending {
+        /// The vault, if just one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Approve a release request.
+    Approve {
+        /// The vault.
+        name: String,
+        /// The request.
+        id: String,
+    },
+    /// Deny a release request: it ends on every server.
+    Deny {
+        /// The vault.
+        name: String,
+        /// The request.
+        id: String,
+    },
     /// Start a session for one of the vault's devices: re-authentication,
     /// or with `offline`, the release of the vault's session keys.
     Unlock {
@@ -1468,11 +1656,14 @@ pub struct Reply {
     pub released: Option<ReleasedKeys>,
     /// Receipts for the events the operation logged (`DESIGN-tlog.md`).
     pub receipts: Vec<Receipt>,
+    /// Release requests the operation made, changed or listed.
+    pub requests: Vec<ReleaseRequest>,
 }
 
 impl Reply {
-    /// Encode: `IPVR` version 2, `n(u64) [descriptor] session released
-    /// m(u8) [receipt]` (session and released empty without one).
+    /// Encode: `IPVR` version 3, `n(u64) [descriptor] session released
+    /// m(u8) [receipt] requests` (session and released empty without one,
+    /// requests a JSON list).
     ///
     /// # Panics
     ///
@@ -1502,6 +1693,7 @@ impl Reply {
         for receipt in &self.receipts {
             w.bytes(&receipt.to_bytes());
         }
+        w.bytes(&serde_json::to_vec(&self.requests).unwrap_or_default());
         w.finish()
     }
 
@@ -1528,12 +1720,15 @@ impl Reply {
         let receipts = (0..r.u8()?)
             .map(|_| Receipt::from_bytes(r.bytes()?))
             .collect::<Result<_>>()?;
+        let requests =
+            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("release requests"))?;
         r.finish()?;
         Ok(Self {
             descriptors,
             session,
             released,
             receipts,
+            requests,
         })
     }
 }
@@ -1890,6 +2085,8 @@ pub struct Unlock<'a> {
     /// A GSS-API token for `ipa-ku@<server>` bound to the request's
     /// [`EscrowRequest::ticket_binding`], when the vault needs a ticket.
     pub ticket: Option<TicketSource<'a>>,
+    /// The approved release request, for a vault with approvals.
+    pub release: Option<[u8; 16]>,
 }
 
 impl SealedVaultFile {
@@ -2020,6 +2217,9 @@ impl SealedVaultFile {
             );
             if let Some(session) = unlock.session {
                 request = request.with_session(session.to_bytes());
+            }
+            if let Some(id) = unlock.release {
+                request = request.with_release(id);
             }
             if let Some(ticket) = unlock.ticket.as_mut() {
                 let Some(token) = ticket(&slot.server, &request.ticket_binding()?) else {

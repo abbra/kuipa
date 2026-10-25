@@ -40,6 +40,7 @@ source tree.
 | [Check what the realm vouched for](#check-what-the-realm-vouched-for) | auditors, realm admins | works |
 | [Seal your own files](#seal-your-own-files) | every user | partly |
 | [Share a vault with a team or a fleet](#share-a-vault-with-a-team-or-a-fleet) | teams, fleet owners | works |
+| [Require several people to approve a break-glass release](#require-several-people-to-approve-a-break-glass-release) | security teams | works |
 | [See who touched your vault](#see-who-touched-your-vault) | every user | works |
 | [Work offline for a while](#work-offline-for-a-while) | every user | works where the realm allows it |
 | [Sign files and commits under your login](#sign-files-and-commits-under-your-login) | developers, release engineers, CI | works |
@@ -47,7 +48,6 @@ source tree.
 | [Log in offline without a crackable password cache](#log-in-offline-without-a-crackable-password-cache) | laptop users | planned |
 | [Recover a vault when every device is lost](#recover-a-vault-when-every-device-is-lost) | every user, helpdesk | planned |
 | [Tie secrets to a TPM, passkey or attested hardware](#tie-secrets-to-a-tpm-passkey-or-attested-hardware) | users, fleet owners | planned |
-| [Require several people to approve a break-glass release](#require-several-people-to-approve-a-break-glass-release) | security teams | planned |
 | [Give CI runners short-lived identities](#give-ci-runners-short-lived-identities) | platform teams | planned |
 | [Anonymous tokens: surveys, reports, access](#anonymous-tokens-surveys-reports-access) | everyone | research |
 
@@ -239,6 +239,19 @@ their opens on every machine.
 
 **Status:** works. See [Sealing your own files](user/sealing.md#share-a-secret-with-your-team).
 
+### Require several people to approve a break-glass release
+
+**Why.** Emergency access to a team's or a person's sealed secrets
+should not rest on one person holding the factors.
+
+**What kuipa does.** A vault's policy names approvers and how many must
+agree. Whoever asks gets nothing until enough others have approved that
+request, and each request, approval and denial is in the transparency
+log.
+
+**Status:** works. See [Sealing your own files](user/sealing.md#a-break-glass-secret-several-people-approve)
+and [release approvals](reference/design.md#kuipa-release-approvals-m-of-n-before-a-break-glass-release).
+
 ### Sign files and commits under your login
 
 **Why.** Signing usually means guarding a private key on every laptop
@@ -293,19 +306,6 @@ or a security key cannot.
 **What kuipa would do.** Passkeys as a vault factor, a TPM factor for
 sealed keytabs and machine vaults, and checked hardware attestation, so
 a policy can demand keys that cannot leave the hardware.
-
-### Require several people to approve a break-glass release
-
-**Why.** Emergency access to someone's files, or to a sealed service
-secret, should not rest on one administrator.
-
-**What kuipa would do.** M-of-N approvals before a server releases its
-share, with each approval in the transparency log. *Needs* the
-transparency log, which works today.
-
-**Design:** a vault policy names approvers and how many must agree; the
-requester asks, they approve, and the release counts them. See
-[release approvals](reference/design.md#kuipa-release-approvals-m-of-n-before-a-break-glass-release).
 
 ### Give CI runners short-lived identities
 

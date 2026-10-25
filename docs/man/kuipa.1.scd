@@ -250,6 +250,12 @@ flags:
 
 Replace a vault's policy; the same flags as *seal create*.
 
+*--approvals* _M_ with *--approver-user* _USER_ and *--approver-group*
+_GROUP_ (each repeatable) makes every release wait for _M_ approvals
+from them, other than the requester's (*seal request*, *seal approve*);
+*--approval-hours* _H_ (default 24, at most 168) and *--approval-uses*
+_N_ (default 1) bound what one request covers.
+
 ## seal device add _VAULT_ [_flags_]
 
 Register this host's device key in a vault, making it (under a
@@ -284,6 +290,9 @@ with *-* the command refuses a terminal unless *--force*.
 *--passphrase-file* _FILE_
 	Read the device key's passphrase from this file.
 
+*--request* _ID_
+	The approved release request, for a vault with approvals.
+
 ## seal reseal _VAULT_ _SEALED_...
 
 Open sealed files and seal them again to the vault's current devices.
@@ -309,6 +318,21 @@ End the vault's session on this host.
 Describe a vault.  *seal list* describes all your vaults and those
 shared with you; *seal revoke VAULT* revokes it: no file sealed to it
 opens any more.
+
+## seal request _VAULT_ _SEALED_ --reason _TEXT_
+
+For a vault with approvals: ask its approvers to approve the release of
+_SEALED_, saying why.  Prints the request's id.
+
+## seal pending [_VAULT_]
+
+List the open release requests of _VAULT_, or of every vault you approve
+for or have a part in, with their approvals so far.
+
+## seal approve _VAULT_ _ID_, seal deny _VAULT_ _ID_
+
+Approve or deny a release request, as one of the vault's approvers.  Your
+own requests are not yours to approve.  One denial ends a request.
 
 ## seal share _VAULT_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]
 

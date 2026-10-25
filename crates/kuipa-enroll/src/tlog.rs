@@ -799,6 +799,12 @@ pub enum VaultAction {
     Share = 9,
     /// Managers or members were removed.
     Unshare = 10,
+    /// A release was requested (`DESIGN-approvals.md`).
+    Request = 11,
+    /// A release request was approved.
+    Approve = 12,
+    /// A release request was denied.
+    Deny = 13,
 }
 
 impl VaultAction {
@@ -810,7 +816,12 @@ impl VaultAction {
                 Kind::VAULT_POLICY
             }
             Self::AddDevice | Self::RemoveDevice => Kind::VAULT_DEVICE,
-            Self::Session | Self::OfflineSession | Self::Release => Kind::ESCROW_RELEASE,
+            Self::Session
+            | Self::OfflineSession
+            | Self::Release
+            | Self::Request
+            | Self::Approve
+            | Self::Deny => Kind::ESCROW_RELEASE,
         }
     }
 
@@ -826,6 +837,9 @@ impl VaultAction {
             8 => Self::Release,
             9 => Self::Share,
             10 => Self::Unshare,
+            11 => Self::Request,
+            12 => Self::Approve,
+            13 => Self::Deny,
             _ => return Err(Error::Malformed("vault event action")),
         })
     }
@@ -1425,6 +1439,7 @@ mod tests {
             (VaultAction::Create, Kind::VAULT_POLICY),
             (VaultAction::RemoveDevice, Kind::VAULT_DEVICE),
             (VaultAction::Unshare, Kind::VAULT_POLICY),
+            (VaultAction::Approve, Kind::ESCROW_RELEASE),
             (VaultAction::Release, Kind::ESCROW_RELEASE),
         ] {
             assert_eq!(action.kind(), kind);

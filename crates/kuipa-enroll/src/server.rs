@@ -27,8 +27,8 @@ use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
-    DEFAULT_EPOCH, Descriptor, Limits, Members, Recovered, ReleasedKeys, Reply, Role, SessionFor,
-    SessionKey, SessionToken, State, Vault, VaultAnswer, VaultOp,
+    Approval, DEFAULT_EPOCH, Descriptor, Limits, Members, Recovered, ReleaseRequest, ReleasedKeys,
+    Reply, Role, SessionFor, SessionKey, SessionToken, State, Vault, VaultAnswer, VaultOp,
 };
 use crate::voucher::Voucher;
 
@@ -298,6 +298,79 @@ pub trait Directory {
         Ok(Vec::new())
     }
 
+    /// The vaults whose approvals admit `principal`, a member of `groups`
+    /// (`DESIGN-approvals.md` §2): those whose policy's `approvals.from`
+    /// holds any of [`Members::matching_entries`].
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn vaults_approved_by(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let _ = (principal, groups);
+        Ok(Vec::new())
+    }
+
+    /// Store a new release request.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default approvals are not supported.
+    fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
+        let _ = request;
+        Err("approvals are not supported by this directory".into())
+    }
+
+    /// The release requests of vault `id`, with their approvals, denial and
+    /// uses summed over the servers.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn releases(&self, id: &escrow::VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+        let _ = id;
+        Ok(Vec::new())
+    }
+
+    /// Add `approval` to request `request` of vault `id`, or with `deny`
+    /// record it as the request's denial.  Values are only ever added, so
+    /// replicas merge them.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default approvals are not supported.
+    fn release_mark(
+        &self,
+        id: &escrow::VaultId,
+        request: &str,
+        approval: &Approval,
+        deny: bool,
+    ) -> Result<(), DirectoryError> {
+        let _ = (id, request, approval, deny);
+        Err("approvals are not supported by this directory".into())
+    }
+
+    /// Count one use of request `request` of vault `id` by `server`, unless
+    /// its uses, summed over all servers, have reached `limit`: then count
+    /// nothing and answer `false` (as [`vault_unlock`](Self::vault_unlock)).
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default approvals are not supported.
+    fn release_use(
+        &self,
+        id: &escrow::VaultId,
+        request: &str,
+        server: &str,
+        limit: u64,
+    ) -> Result<bool, DirectoryError> {
+        let _ = (id, request, server, limit);
+        Err("approvals are not supported by this directory".into())
+    }
+
     /// Count one release of vault `id` by `server` (§7.6.7), unless the
     /// vault's releases, summed over all servers, have reached `limit`:
     /// then count nothing and answer `false`.
@@ -551,6 +624,37 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         groups: &[String],
     ) -> Result<Vec<Vault>, DirectoryError> {
         (**self).vaults_shared_with(principal, groups)
+    }
+    fn vaults_approved_by(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        (**self).vaults_approved_by(principal, groups)
+    }
+    fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
+        (**self).release_add(request)
+    }
+    fn releases(&self, id: &escrow::VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+        (**self).releases(id)
+    }
+    fn release_mark(
+        &self,
+        id: &escrow::VaultId,
+        request: &str,
+        approval: &Approval,
+        deny: bool,
+    ) -> Result<(), DirectoryError> {
+        (**self).release_mark(id, request, approval, deny)
+    }
+    fn release_use(
+        &self,
+        id: &escrow::VaultId,
+        request: &str,
+        server: &str,
+        limit: u64,
+    ) -> Result<bool, DirectoryError> {
+        (**self).release_use(id, request, server, limit)
     }
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         (**self).principal_locked(principal)
@@ -1425,7 +1529,17 @@ impl EnrollServer {
         // sealed for offline sessions from now on: a new epoch starts.
         let rotate = matches!(op, VaultOp::RemoveDevice { .. } | VaultOp::Unshare { .. });
         let mut receipts = Vec::new();
+        let mut requests = Vec::new();
         let (mut vaults, session, released) = match op {
+            op @ (VaultOp::Request { .. }
+            | VaultOp::Pending { .. }
+            | VaultOp::Approve { .. }
+            | VaultOp::Deny { .. }) => {
+                let (found, logged) = self.release_op(&caller, op, now, directory)?;
+                requests = found;
+                receipts.extend(logged);
+                (Vec::new(), None, None)
+            }
             VaultOp::Unlock {
                 name,
                 device,
@@ -1497,6 +1611,7 @@ impl EnrollServer {
             session,
             released,
             receipts,
+            requests,
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
     }
@@ -1810,23 +1925,300 @@ impl EnrollServer {
         reference: &str,
         directory: &dyn Directory,
     ) -> Result<(Vault, Role), Refusal> {
+        let vault = self.find_vault(caller, reference, directory)?;
+        let groups = groups_for(&vault, caller, directory)?;
+        // A vault the caller has no part in is not told apart from none.
+        let role = vault
+            .role(caller, &groups)
+            .ok_or_else(|| missing_vault(caller, reference))?;
+        Ok((vault, role))
+    }
+
+    /// The vault `reference` names for `caller`, whatever the caller's part
+    /// in it.
+    fn find_vault(
+        &self,
+        caller: &Principal,
+        reference: &str,
+        directory: &dyn Directory,
+    ) -> Result<Vault, Refusal> {
         let (owner, name) = crate::vault::split_ref(reference);
         let owner: Principal = match owner {
             None => caller.clone(),
             Some(o) if o.contains('@') => o.parse()?,
             Some(o) => format!("{o}@{}", self.info.realm).parse()?,
         };
-        let missing = || Refusal::because(format!("no vault {reference:?} for {caller}"));
-        let vault = directory
+        directory
             .vaults_of(&owner)
             .map_err(Refusal)?
             .into_iter()
             .find(|v| v.name == name)
-            .ok_or_else(missing)?;
-        let groups = groups_for(&vault, caller, directory)?;
-        // A vault the caller has no part in is not told apart from none.
-        let role = vault.role(caller, &groups).ok_or_else(missing)?;
-        Ok((vault, role))
+            .ok_or_else(|| missing_vault(caller, reference))
+    }
+
+    /// The vault `reference` names, for someone who approves its releases
+    /// or has a part in it; and whether they approve.
+    fn vault_for_release(
+        &self,
+        caller: &Principal,
+        reference: &str,
+        directory: &dyn Directory,
+    ) -> Result<(Vault, bool), Refusal> {
+        let vault = self.find_vault(caller, reference, directory)?;
+        let approves = approves(&vault, caller, directory)?;
+        if approves
+            || vault
+                .role(caller, &groups_for(&vault, caller, directory)?)
+                .is_some()
+        {
+            Ok((vault, approves))
+        } else {
+            Err(missing_vault(caller, reference))
+        }
+    }
+
+    /// Answer the operations on release requests (`DESIGN-approvals.md`):
+    /// make one, list the open ones, approve or deny one.  Each change is
+    /// logged before it is stored.
+    fn release_op(
+        &self,
+        caller: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
+        match op {
+            VaultOp::Request {
+                name,
+                bindings,
+                reason,
+            } => self.make_request(caller, &name, bindings, reason, now, directory),
+            VaultOp::Pending { name } => Ok((
+                self.pending_requests(caller, name.as_deref(), now, directory)?,
+                Vec::new(),
+            )),
+            VaultOp::Approve { name, id } => {
+                self.mark_request(caller, &name, &id, false, now, directory)
+            }
+            VaultOp::Deny { name, id } => {
+                self.mark_request(caller, &name, &id, true, now, directory)
+            }
+            _ => unreachable!("only release-request operations"),
+        }
+    }
+
+    /// `request`: ask for the release of the files whose `bindings` these
+    /// are, for `reason`.
+    fn make_request(
+        &self,
+        caller: &Principal,
+        name: &str,
+        bindings: Vec<String>,
+        reason: String,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
+        let mut receipts = Vec::new();
+        let (vault, _) = self.resolve_vault(caller, name, directory)?;
+        let approvals = vault
+            .policy
+            .approvals
+            .as_ref()
+            .ok_or_else(|| Refusal::because("the vault needs no approvals"))?;
+        if vault.state != State::Enabled {
+            return Err(Refusal::because("the vault is revoked"));
+        }
+        let valid = |h: &String| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+        if bindings.is_empty() || bindings.len() > 64 || !bindings.iter().all(valid) {
+            return Err(Refusal::because("malformed binding hashes"));
+        }
+        if reason.len() > crate::vault::MAX_REASON {
+            return Err(Refusal::because("the reason is too long"));
+        }
+        let mut id = [0u8; 16];
+        native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
+        let request = ReleaseRequest {
+            id: hex(&id),
+            vault: vault.id,
+            requester: caller.to_string(),
+            bindings,
+            reason,
+            created: now,
+            not_after: now.saturating_add(approvals.window()),
+            approvals: Vec::new(),
+            denied: None,
+            uses: 0,
+        };
+        let digest = self.log_digest(&[&request.log_bytes()])?;
+        receipts.extend(self.record_vault(&vault.id, VaultAction::Request, None, digest)?);
+        directory.release_add(&request).map_err(Refusal)?;
+        eprintln!(
+            "kuipad: {caller} asked for release {} of vault {}",
+            request.id, vault.id
+        );
+        Ok((vec![request], receipts))
+    }
+
+    /// `pending`: the open requests of vault `name`, or of every vault the
+    /// caller approves for or has a part in.
+    fn pending_requests(
+        &self,
+        caller: &Principal,
+        name: Option<&str>,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Vec<ReleaseRequest>, Refusal> {
+        let vaults = if let Some(name) = name {
+            vec![self.vault_for_release(caller, name, directory)?.0]
+        } else {
+            let mut all = list_vaults(caller, directory)?;
+            let groups = directory.principal_groups(caller).unwrap_or_default();
+            for v in directory
+                .vaults_approved_by(caller, &groups)
+                .map_err(Refusal)?
+            {
+                if !all.iter().any(|a| a.id == v.id) && approves(&v, caller, directory)? {
+                    all.push(v);
+                }
+            }
+            all
+        };
+        let mut open = Vec::new();
+        for v in vaults.iter().filter(|v| v.policy.approvals.is_some()) {
+            open.extend(
+                directory
+                    .releases(&v.id)
+                    .map_err(Refusal)?
+                    .into_iter()
+                    .filter(|r| r.is_open(now)),
+            );
+        }
+        Ok(open)
+    }
+
+    /// `approve` (or with `deny`, `deny`) request `id` of vault `name`.
+    fn mark_request(
+        &self,
+        caller: &Principal,
+        name: &str,
+        id: &str,
+        deny: bool,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
+        let mut receipts = Vec::new();
+        let (vault, approves) = self.vault_for_release(caller, name, directory)?;
+        if !approves {
+            return Err(Refusal::because(format!(
+                "{caller} does not approve releases of the vault"
+            )));
+        }
+        if directory.principal_locked(caller).map_err(Refusal)? {
+            return Err(Refusal::because(format!("{caller} is locked or gone")));
+        }
+        let mut request = directory
+            .releases(&vault.id)
+            .map_err(Refusal)?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| Refusal::because(format!("no release request {id}")))?;
+        let me = caller.to_string();
+        if !request.is_open(now) {
+            return Err(Refusal::because("the request was denied or has expired"));
+        }
+        if request.requester == me {
+            return Err(Refusal::because("no one approves their own request"));
+        }
+        if !deny && request.approvals.iter().any(|a| a.approver == me) {
+            return Err(Refusal::because("already approved"));
+        }
+        let approval = Approval {
+            approver: me.clone(),
+            at: now,
+        };
+        let action = if deny {
+            VaultAction::Deny
+        } else {
+            VaultAction::Approve
+        };
+        let digest = self.log_digest(&[request.id.as_bytes(), b" ", me.as_bytes()])?;
+        receipts.extend(self.record_vault(&vault.id, action, None, digest)?);
+        directory
+            .release_mark(&vault.id, &request.id, &approval, deny)
+            .map_err(Refusal)?;
+        eprintln!(
+            "kuipad: {caller} {} release {} of vault {}",
+            if deny { "denied" } else { "approved" },
+            request.id,
+            vault.id
+        );
+        if deny {
+            request.denied = Some(approval);
+        } else {
+            request.approvals.push(approval);
+        }
+        Ok((vec![request], receipts))
+    }
+
+    /// The tree hash of `parts`, as a log event's digest.
+    fn log_digest(&self, parts: &[&[u8]]) -> Result<merkle::Hash, Refusal> {
+        let alg = self.tree_hash();
+        Ok(merkle::Hash::from_slice(&tang_pqc::primitives::digest(
+            alg.openssl_name(),
+            parts,
+        )?)?)
+    }
+
+    /// For a vault with approvals: check that `request` names an approved
+    /// release request of `who`'s for the file whose binding is `binding`
+    /// (`DESIGN-approvals.md` §4), and count one use of it.
+    fn check_release(
+        &self,
+        vault: &Vault,
+        request: &EscrowRequest,
+        who: &Principal,
+        binding: &str,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(), Refusal> {
+        let Some(approvals) = &vault.policy.approvals else {
+            return Ok(());
+        };
+        let id = request
+            .release()
+            .map(|id| hex(id))
+            .ok_or_else(|| Refusal::because("the vault needs an approved release request"))?;
+        let release = directory
+            .releases(&vault.id)
+            .map_err(Refusal)?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| Refusal::because(format!("no release request {id}")))?;
+        if release.requester != who.to_string() {
+            return Err(Refusal::because("the release request is someone else's"));
+        }
+        if !release.bindings.iter().any(|b| b == binding) {
+            return Err(Refusal::because("the release request is for other files"));
+        }
+        if !release.is_open(now) {
+            return Err(Refusal::because(
+                "the release request was denied or has expired",
+            ));
+        }
+        let counted = approvals_counted(approvals, &release, directory)?;
+        if counted < u64::from(approvals.m) {
+            return Err(Refusal::because(format!(
+                "{counted} of {} approvals so far",
+                approvals.m
+            )));
+        }
+        if !directory
+            .release_use(&vault.id, &release.id, &self.info.server, approvals.uses())
+            .map_err(Refusal)?
+        {
+            return Err(Refusal::because("the release request is used up"));
+        }
+        Ok(())
     }
 
     /// Add `managers` and `members` to `vault`, within `limits`.
@@ -1908,6 +2300,8 @@ impl EnrollServer {
             return Err(Refusal::because("too many vaults"));
         }
         limits.apply(&mut policy, now)?;
+        // The caller was checked to be of this realm.
+        normalize_approvers(&mut policy, caller.realm())?;
         let mut id = [0u8; 16];
         native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
         let vault = Vault {
@@ -1938,7 +2332,11 @@ impl EnrollServer {
     ) -> Result<Vec<Vault>, Refusal> {
         let vault = match op {
             VaultOp::List => return list_vaults(caller, directory),
-            VaultOp::Unlock { .. } => unreachable!("sessions are started by vault_op"),
+            VaultOp::Unlock { .. }
+            | VaultOp::Request { .. }
+            | VaultOp::Pending { .. }
+            | VaultOp::Approve { .. }
+            | VaultOp::Deny { .. } => unreachable!("answered by vault_op"),
             VaultOp::Create { name, policy } => {
                 return Self::create_vault(caller, name, policy, now, directory, record);
             }
@@ -1954,6 +2352,7 @@ impl EnrollServer {
                 let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
                 need(role, Role::Manager, "change its policy")?;
                 limits_for(&vault.owner, directory)?.apply(&mut policy, now)?;
+                normalize_approvers(&mut policy, &self.info.realm)?;
                 vault.policy = policy;
                 vault
             }
@@ -2331,16 +2730,17 @@ impl EnrollServer {
                 return Err(Refusal::because("the device's level is too low"));
             }
         }
-        if vault.policy.sealing == crate::vault::Sealing::Registered {
-            let hash = crate::vault::binding_hex(&BindingHash::from_slice(
-                &opened.ciphertext_hash().map_err(Error::from)?,
-            )?);
-            if !vault.bindings.contains(&hash) {
-                return Err(Refusal::because(
-                    "the file's binding is not registered (retired or never registered)",
-                ));
-            }
+        let binding = crate::vault::binding_hex(&BindingHash::from_slice(
+            &opened.ciphertext_hash().map_err(Error::from)?,
+        )?);
+        if vault.policy.sealing == crate::vault::Sealing::Registered
+            && !vault.bindings.contains(&binding)
+        {
+            return Err(Refusal::because(
+                "the file's binding is not registered (retired or never registered)",
+            ));
         }
+        self.check_release(&vault, request, &who, &binding, now, directory)?;
         if !directory
             .vault_unlock(request.vault(), &self.info.server, vault.policy.max_unlocks)
             .map_err(Refusal)?
@@ -2378,7 +2778,13 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
             },
             Some(device.clone()),
         ),
-        VaultOp::Show { .. } | VaultOp::List | VaultOp::Register { .. } => return None,
+        VaultOp::Show { .. }
+        | VaultOp::List
+        | VaultOp::Register { .. }
+        | VaultOp::Request { .. }
+        | VaultOp::Pending { .. }
+        | VaultOp::Approve { .. }
+        | VaultOp::Deny { .. } => return None,
     })
 }
 
@@ -2421,6 +2827,75 @@ fn limits_for(owner: &str, directory: &dyn Directory) -> Result<Limits, Refusal>
     let owner: Principal = owner.parse()?;
     let groups = directory.principal_groups(&owner).map_err(Refusal)?;
     Ok(realm.for_groups(&groups))
+}
+
+/// The refusal for a vault that does not exist or that `caller` has no
+/// part in: the two are not told apart.
+fn missing_vault(caller: &Principal, reference: &str) -> Refusal {
+    Refusal::because(format!("no vault {reference:?} for {caller}"))
+}
+
+/// Name `policy`'s approvers in one spelling each, as members are named,
+/// so a directory can search for them.
+fn normalize_approvers(policy: &mut crate::vault::Policy, realm: &str) -> Result<(), Refusal> {
+    if let Some(approvals) = &mut policy.approvals {
+        approvals.from = approvals.from.normalized(realm)?;
+    }
+    Ok(())
+}
+
+/// Lower-case hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Whether `vault`'s approvals admit `principal` as an approver.
+fn approves(
+    vault: &Vault,
+    principal: &Principal,
+    directory: &dyn Directory,
+) -> Result<bool, Refusal> {
+    let Some(approvals) = &vault.policy.approvals else {
+        return Ok(false);
+    };
+    let groups = if approvals.from.groups.is_empty() {
+        Vec::new()
+    } else {
+        directory.principal_groups(principal).map_err(Refusal)?
+    };
+    Ok(approvals.from.admits(principal, &groups))
+}
+
+/// The approvals of `release` that count (`DESIGN-approvals.md` §3): one
+/// per approver, not the requester's, from approvers still admitted and
+/// not locked.
+fn approvals_counted(
+    approvals: &crate::vault::Approvals,
+    release: &ReleaseRequest,
+    directory: &dyn Directory,
+) -> Result<u64, Refusal> {
+    let mut counted: Vec<&str> = Vec::new();
+    for a in &release.approvals {
+        if a.approver == release.requester || counted.contains(&a.approver.as_str()) {
+            continue;
+        }
+        let approver: Principal = a.approver.parse()?;
+        let groups = if approvals.from.groups.is_empty() {
+            Vec::new()
+        } else {
+            directory.principal_groups(&approver).map_err(Refusal)?
+        };
+        if approvals.from.admits(&approver, &groups)
+            && !directory.principal_locked(&approver).map_err(Refusal)?
+        {
+            counted.push(&a.approver);
+        }
+    }
+    Ok(counted.len() as u64)
 }
 
 /// Refuse unless `role` is at least `least`, to do `what`.
