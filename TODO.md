@@ -143,8 +143,8 @@ design first.
       deposits in a helpdesk vault) and deposits of LUKS and backup
       recovery keys: designed in `docs/DESIGN-recovery.md`; needs the
       approvals.
-- [ ] M-of-N approvals for break-glass releases, recorded in the
-      transparency log: designed in `docs/DESIGN-approvals.md`.
+- [x] M-of-N approvals for break-glass releases, recorded in the
+      transparency log (`docs/DESIGN-approvals.md`).
 - [ ] Short-lived CI runner identities (voucher leases, `ticket.leased`)
       and pipeline secrets in shared vaults: designed in
       `docs/DESIGN-ci.md`.
@@ -166,7 +166,10 @@ design first.
       the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
       `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
       `ipaKUVaultUnlocks`, `ipaKUVaultSessionKey`, `ipaKUVaultBinding`,
-      `ipaKUVaultManager`, `ipaKUVaultMember` (indexed for equality),
+      `ipaKUVaultManager`, `ipaKUVaultMember`, `ipaKUVaultApprover`
+      (indexed for equality), the `ipaKURelease` class for release
+      requests under a vault (`ipaKUReleaseRequest`,
+      `ipaKUReleaseApproval`, `ipaKUReleaseDenied`, `ipaKUReleaseUses`),
       `ipaKUServerEscrowKey` on
       `cn=masters` entries,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,

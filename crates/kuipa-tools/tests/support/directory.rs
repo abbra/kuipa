@@ -12,7 +12,7 @@ use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_inp
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::realm::TrustedRealm;
 use kuipa_enroll::server::{Accepted, Directory, DirectoryError, Staged};
-use kuipa_enroll::vault::Vault;
+use kuipa_enroll::vault::{Approval, ReleaseRequest, Vault};
 use kuipa_gssapi::{AcceptStep, GssServerCred};
 
 use super::kdc::Realm;
@@ -58,6 +58,10 @@ pub struct KdcDirectory {
     /// User groups by principal, as `memberOf` lists them (host groups
     /// come from `hostgroups`).
     pub groups: Mutex<HashMap<String, Vec<String>>>,
+    /// Release requests by vault and id (`DESIGN-approvals.md`).
+    pub releases: Mutex<HashMap<(VaultId, String), ReleaseRequest>>,
+    /// Their uses, by vault, id and server.
+    release_uses: Mutex<HashMap<(VaultId, String, String), u64>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -96,6 +100,8 @@ impl KdcDirectory {
             limits: Mutex::new(kuipa_enroll::vault::Limits::default()),
             sign_policy: Mutex::new(kuipa_enroll::sign::SignPolicy::default()),
             groups: Mutex::new(HashMap::new()),
+            releases: Mutex::new(HashMap::new()),
+            release_uses: Mutex::new(HashMap::new()),
             creds,
         }
     }
@@ -490,6 +496,96 @@ impl Directory for KdcDirectory {
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.locked.lock().unwrap().contains(&principal.to_string()))
+    }
+
+    fn vaults_approved_by(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let wanted = kuipa_enroll::vault::Members::matching_entries(principal, groups);
+        Ok(self
+            .vaults
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| {
+                v.policy
+                    .approvals
+                    .as_ref()
+                    .is_some_and(|a| a.from.entries().iter().any(|e| wanted.contains(e)))
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
+        self.releases
+            .lock()
+            .unwrap()
+            .insert((request.vault, request.id.clone()), request.clone());
+        Ok(())
+    }
+
+    fn releases(&self, id: &VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+        let uses = self.release_uses.lock().unwrap();
+        Ok(self
+            .releases
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.vault == *id)
+            .cloned()
+            .map(|mut r| {
+                r.uses = uses
+                    .iter()
+                    .filter(|((v, rid, _), _)| v == id && *rid == r.id)
+                    .map(|(_, n)| n)
+                    .sum();
+                r
+            })
+            .collect())
+    }
+
+    fn release_mark(
+        &self,
+        id: &VaultId,
+        request: &str,
+        approval: &Approval,
+        deny: bool,
+    ) -> Result<(), DirectoryError> {
+        let mut releases = self.releases.lock().unwrap();
+        let r = releases
+            .get_mut(&(*id, request.to_owned()))
+            .ok_or("no such request")?;
+        if deny {
+            r.denied = Some(approval.clone());
+        } else {
+            r.approvals.push(approval.clone());
+        }
+        Ok(())
+    }
+
+    fn release_use(
+        &self,
+        id: &VaultId,
+        request: &str,
+        server: &str,
+        limit: u64,
+    ) -> Result<bool, DirectoryError> {
+        let mut uses = self.release_uses.lock().unwrap();
+        let total: u64 = uses
+            .iter()
+            .filter(|((v, r, _), _)| v == id && r == request)
+            .map(|(_, n)| n)
+            .sum();
+        if total >= limit {
+            return Ok(false);
+        }
+        *uses
+            .entry((*id, request.to_owned(), server.to_owned()))
+            .or_default() += 1;
+        Ok(true)
     }
 
     fn add_trust_invitation(&self, hash: &[u8; 48], not_after: u64) -> Result<(), DirectoryError> {

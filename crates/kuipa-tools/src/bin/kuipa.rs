@@ -436,6 +436,40 @@ enum SealAction {
         /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
+        /// The approved release request (`kuipa seal request`), for a vault
+        /// with approvals.
+        #[arg(long, value_name = "ID")]
+        request: Option<String>,
+    },
+    /// Ask the vault's approvers to approve the release of a sealed file.
+    Request {
+        /// The vault.
+        vault: String,
+        /// The sealed file.
+        sealed: String,
+        /// Why, for the approvers.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+    },
+    /// List open release requests: of the vault, or of every vault you
+    /// approve for or have a part in.
+    Pending {
+        /// The vault.
+        vault: Option<String>,
+    },
+    /// Approve a release request.
+    Approve {
+        /// The vault.
+        vault: String,
+        /// The request's id (see `kuipa seal pending`).
+        id: String,
+    },
+    /// Deny a release request: it ends on every server.
+    Deny {
+        /// The vault.
+        vault: String,
+        /// The request's id.
+        id: String,
     },
     /// Open sealed files and seal them again to the vault's current
     /// devices.
@@ -589,9 +623,45 @@ struct PolicyInput {
     /// retire` makes old copies unopenable (default: `offline`).
     #[arg(long, value_name = "offline|registered")]
     sealing: Option<String>,
+    /// Releases need this many approvals (`kuipa seal approve`) from the
+    /// approvers, besides the factors.
+    #[arg(long, value_name = "M")]
+    approvals: Option<u32>,
+    /// A user who may approve; repeatable.
+    #[arg(long = "approver-user", value_name = "USER", requires = "approvals")]
+    approver_users: Vec<String>,
+    /// A group whose members may approve; repeatable.
+    #[arg(long = "approver-group", value_name = "GROUP", requires = "approvals")]
+    approver_groups: Vec<String>,
+    /// How many hours a release request may wait and then be used
+    /// (default 24, at most 168).
+    #[arg(long, value_name = "HOURS", requires = "approvals")]
+    approval_hours: Option<u64>,
+    /// How many releases one approved request covers (default 1).
+    #[arg(long, value_name = "N", requires = "approvals")]
+    approval_uses: Option<u64>,
 }
 
 impl PolicyInput {
+    fn approvals(&self) -> Result<Option<kuipa_enroll::vault::Approvals>, Error> {
+        let Some(m) = self.approvals else {
+            return Ok(None);
+        };
+        Ok(Some(kuipa_enroll::vault::Approvals {
+            m,
+            from: kuipa_enroll::vault::Members {
+                users: self.approver_users.clone(),
+                groups: self.approver_groups.clone(),
+                ..kuipa_enroll::vault::Members::default()
+            },
+            window: self
+                .approval_hours
+                .map(|h| h.checked_mul(3600).ok_or("--approval-hours is too large"))
+                .transpose()?,
+            uses: self.approval_uses,
+        }))
+    }
+
     fn policy(&self) -> Result<kuipa_enroll::vault::Policy, Error> {
         use kuipa_enroll::vault::{Factors, Level, Policy, TicketDelegation};
         let mut factors = Factors::default();
@@ -636,6 +706,7 @@ impl PolicyInput {
             ticket_delegation,
             not_after,
             sealing,
+            approvals: self.approvals()?,
             max_unlocks: self.max_unlocks,
             sessions: kuipa_enroll::vault::Sessions {
                 reauth: self
@@ -2111,13 +2182,15 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             out,
             force,
             passphrase_file,
+            request,
         } => {
             let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
             let bytes = std::fs::read(sealed)?;
             let pass = kuipa_tools::seal::Seal::needs_secret(&bytes)
                 .then(|| passphrase(passphrase_file.as_deref(), false))
                 .transpose()?;
-            let plain = seal.open(&bytes, pass.as_ref().map(AsRef::as_ref))?;
+            let plain =
+                seal.open_with(&bytes, pass.as_ref().map(AsRef::as_ref), request.as_deref())?;
             target.write(plain.as_ref())?;
             Ok(serde_json::json!({
                 "sealed": sealed,
@@ -2153,13 +2226,47 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             }
             Ok(serde_json::json!({ "vault": vault, "retired": sealed }))
         }
+        SealAction::Request {
+            vault,
+            sealed,
+            reason,
+        } => seal.request(vault, &std::fs::read(sealed)?, reason),
+        SealAction::Pending { vault } => seal.pending(vault.as_deref()),
+        SealAction::Approve { vault, id } => seal.decide(vault, id, false),
+        SealAction::Deny { vault, id } => seal.decide(vault, id, true),
         SealAction::Show { vault } => seal.show(vault),
         SealAction::List => seal.list(),
         SealAction::Revoke { vault } => seal.revoke(vault),
     }
 }
 
+/// `kuipa seal request`, `pending`, `approve` and `deny`.
+fn render_requests(requests: &[Value]) {
+    if requests.is_empty() {
+        println!("No open release requests.");
+    }
+    for r in requests {
+        println!(
+            "Release request {} of vault {}, by {}:",
+            get(r, "id").as_str().unwrap_or("?"),
+            get(r, "vault").as_str().unwrap_or("?"),
+            get(r, "requester").as_str().unwrap_or("?"),
+        );
+        let mut rows = Rows::default();
+        rows.field("reason", get(r, "reason"));
+        rows.field("approved by", get(r, "approvals"));
+        rows.field("denied by", get(r, "denied_by"));
+        rows.until("open until", get(r, "not_after"));
+        rows.field("releases so far", get(r, "uses"));
+        rows.print();
+    }
+}
+
 fn render_seal(value: &Value) {
+    if let Some(requests) = get(value, "requests").as_array() {
+        render_requests(requests);
+        return;
+    }
     if let Some(until) = get(value, "session_until").as_u64() {
         let until = kuipa_tools::text::date(until).unwrap_or_else(|| until.to_string());
         if get(value, "offline").as_bool().unwrap_or(false) {

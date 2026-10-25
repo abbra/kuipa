@@ -37,7 +37,7 @@ use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_inp
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
-use kuipa_enroll::vault::{Device, Limits, Members, State, Vault};
+use kuipa_enroll::vault::{Approval, Device, Limits, Members, ReleaseRequest, State, Vault};
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
 use native_ossl::util::SecretBuf;
@@ -77,6 +77,18 @@ const VAULT_BINDING_ATTR: &str = "ipaKUVaultBinding";
 /// `service:HTTP/ci.example.test@REALM`): its managers, and its members.
 const VAULT_MANAGER_ATTR: &str = "ipaKUVaultManager";
 const VAULT_MEMBER_ATTR: &str = "ipaKUVaultMember";
+/// Who approves a vault's releases (`DESIGN-approvals.md`), as its
+/// policy's `approvals.from`, one `kind:name` value each: kept beside the
+/// policy so approvers can be searched for.
+const VAULT_APPROVER_ATTR: &str = "ipaKUVaultApprover";
+/// Release requests, child entries of their vault: the request (JSON),
+/// one `<approver> <time>` value per approval, the denial as one, and
+/// per-server use counts `<server> <count>` (as unlock counts, §7.6.7).
+const RELEASE_CLASS: &str = "ipaKURelease";
+const RELEASE_REQUEST_ATTR: &str = "ipaKUReleaseRequest";
+const RELEASE_APPROVAL_ATTR: &str = "ipaKUReleaseApproval";
+const RELEASE_DENIED_ATTR: &str = "ipaKUReleaseDenied";
+const RELEASE_USES_ATTR: &str = "ipaKUReleaseUses";
 /// Every attribute a vault is read from.
 const VAULT_ATTRS: &[&str] = &[
     VAULT_OWNER_ATTR,
@@ -378,6 +390,53 @@ impl LdapDirectory {
                 Some((server.to_owned(), n.parse().ok()?))
             })
             .collect()
+    }
+
+    /// The `kind:name` values of who approves `vault`'s releases.
+    fn approvers(vault: &Vault) -> Vec<String> {
+        vault
+            .policy
+            .approvals
+            .as_ref()
+            .map(|a| a.from.entries())
+            .unwrap_or_default()
+    }
+
+    fn release_dn(&self, vault: &VaultId, id: &str) -> String {
+        format!("cn={id},{}", self.vault_dn(vault))
+    }
+
+    /// A release request from its entry.
+    fn release_from(entry: &kuipa_ldap::SearchEntry) -> Result<ReleaseRequest, DirectoryError> {
+        let values = |attr: &str| {
+            entry
+                .attrs
+                .get(&attr.to_lowercase())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let approval = |v: &String| {
+            let (approver, at) = v.rsplit_once(' ')?;
+            Some(Approval {
+                approver: approver.to_owned(),
+                at: at.parse().ok()?,
+            })
+        };
+        let core = values(RELEASE_REQUEST_ATTR)
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("release entry {} has no request", entry.dn))?;
+        let mut request: ReleaseRequest = serde_json::from_str(&core)?;
+        request.approvals = values(RELEASE_APPROVAL_ATTR)
+            .iter()
+            .filter_map(approval)
+            .collect();
+        request.denied = values(RELEASE_DENIED_ATTR).iter().find_map(approval);
+        request.uses = values(RELEASE_USES_ATTR)
+            .iter()
+            .filter_map(|v| v.rsplit_once(' ')?.1.parse::<u64>().ok())
+            .sum();
+        Ok(request)
     }
 
     fn vault_attrs(vault: &Vault) -> Result<VaultAttrs, DirectoryError> {
@@ -873,6 +932,7 @@ impl Directory for LdapDirectory {
     fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
         let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
         let (managers, members) = (vault.managers.entries(), vault.members.entries());
+        let approvers = Self::approvers(vault);
         let id = vault.id.to_string();
         self.service_conn()?.add_s(
             &self.vault_dn(&vault.id),
@@ -892,6 +952,10 @@ impl Directory for LdapDirectory {
                 (
                     VAULT_MEMBER_ATTR,
                     members.iter().map(String::as_bytes).collect(),
+                ),
+                (
+                    VAULT_APPROVER_ATTR,
+                    approvers.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     VAULT_DEVICE_ATTR,
@@ -933,6 +997,7 @@ impl Directory for LdapDirectory {
     fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
         let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
         let (managers, members) = (vault.managers.entries(), vault.members.entries());
+        let approvers = Self::approvers(vault);
         self.service_conn()?.modify_s(
             &self.vault_dn(&vault.id),
             &[
@@ -946,6 +1011,11 @@ impl Directory for LdapDirectory {
                     ModOp::Replace,
                     VAULT_MEMBER_ATTR,
                     members.iter().map(String::as_bytes).collect(),
+                ),
+                (
+                    ModOp::Replace,
+                    VAULT_APPROVER_ATTR,
+                    approvers.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     ModOp::Replace,
@@ -1001,6 +1071,132 @@ impl Directory for LdapDirectory {
             return Ok(Vec::new());
         }
         self.vaults_matching(&format!("(|{any})"))
+    }
+
+    fn vaults_approved_by(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let any = Members::matching_entries(principal, groups).iter().fold(
+            String::new(),
+            |mut any, e| {
+                use std::fmt::Write as _;
+                let _ = write!(any, "({VAULT_APPROVER_ATTR}={})", filter_escape(e));
+                any
+            },
+        );
+        if any.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.vaults_matching(&format!("(|{any})"))
+    }
+
+    fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
+        // What the directory adds later is kept in attributes of its own.
+        let core = serde_json::to_string(&ReleaseRequest {
+            approvals: Vec::new(),
+            denied: None,
+            uses: 0,
+            ..request.clone()
+        })?;
+        self.service_conn()?.add_s(
+            &self.release_dn(&request.vault, &request.id),
+            &[
+                (
+                    "objectClass",
+                    vec![b"top".as_slice(), RELEASE_CLASS.as_bytes()],
+                ),
+                ("cn", vec![request.id.as_bytes()]),
+                (RELEASE_REQUEST_ATTR, vec![core.as_bytes()]),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn releases(&self, id: &VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+        let entries = match self.service_conn()?.search(
+            &self.vault_dn(id),
+            Scope::OneLevel,
+            &format!("(objectClass={RELEASE_CLASS})"),
+            &[
+                RELEASE_REQUEST_ATTR,
+                RELEASE_APPROVAL_ATTR,
+                RELEASE_DENIED_ATTR,
+                RELEASE_USES_ATTR,
+            ],
+        ) {
+            Ok(e) => e,
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        entries.iter().map(Self::release_from).collect()
+    }
+
+    fn release_mark(
+        &self,
+        id: &VaultId,
+        request: &str,
+        approval: &Approval,
+        deny: bool,
+    ) -> Result<(), DirectoryError> {
+        let value = format!("{} {}", approval.approver, approval.at);
+        let attr = if deny {
+            RELEASE_DENIED_ATTR
+        } else {
+            RELEASE_APPROVAL_ATTR
+        };
+        // Added, never replaced: replicas merge what different servers add.
+        self.service_conn()?.modify_s(
+            &self.release_dn(id, request),
+            &[(ModOp::Add, attr, vec![value.as_bytes()])],
+        )?;
+        Ok(())
+    }
+
+    fn release_use(
+        &self,
+        id: &VaultId,
+        request: &str,
+        server: &str,
+        limit: u64,
+    ) -> Result<bool, DirectoryError> {
+        let mut svc = self.service_conn()?;
+        let dn = self.release_dn(id, request);
+        let entries = svc.search(
+            &dn,
+            Scope::Base,
+            &format!("(objectClass={RELEASE_CLASS})"),
+            &[RELEASE_USES_ATTR],
+        )?;
+        let entry = entries.first().ok_or("no such release request")?;
+        let counts: Vec<(String, u64)> = entry
+            .attrs
+            .get(&RELEASE_USES_ATTR.to_lowercase())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| {
+                let (s, n) = v.rsplit_once(' ')?;
+                Some((s.to_owned(), n.parse().ok()?))
+            })
+            .collect();
+        if counts.iter().map(|(_, n)| n).sum::<u64>() >= limit {
+            return Ok(false);
+        }
+        // As for unlock counts: each server replaces only its own value.
+        let own = counts.iter().find(|(s, _)| s == server).map(|(_, n)| *n);
+        let new = format!("{server} {}", own.unwrap_or(0) + 1);
+        let mut mods = Vec::new();
+        let old = own.map(|n| format!("{server} {n}"));
+        if let Some(old) = &old {
+            mods.push((ModOp::Delete, RELEASE_USES_ATTR, vec![old.as_bytes()]));
+        }
+        mods.push((ModOp::Add, RELEASE_USES_ATTR, vec![new.as_bytes()]));
+        svc.modify_s(&dn, &mods)?;
+        Ok(true)
     }
 
     fn vault_unlock(

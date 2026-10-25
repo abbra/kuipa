@@ -314,11 +314,12 @@ pub struct Seal<'a> {
 }
 
 /// What `op_with_session` answers: the verified descriptors, the session
-/// token and the keys released to the device.
+/// token, the keys released to the device and the release requests.
 type OpAnswer = (
     Vec<VerifiedDescriptor>,
     Option<SessionToken>,
     Option<ReleasedKeys>,
+    Vec<kuipa_enroll::vault::ReleaseRequest>,
 );
 
 impl<'a> Seal<'a> {
@@ -391,7 +392,7 @@ impl<'a> Seal<'a> {
                 .write(&self.user.vault(&reference, &public.realm)?, &d.to_bytes())?;
             verified.push(v);
         }
-        Ok((verified, reply.session, reply.released))
+        Ok((verified, reply.session, reply.released, reply.requests))
     }
 
     /// `kuipa seal unlock`: start a re-authentication session for this
@@ -404,7 +405,7 @@ impl<'a> Seal<'a> {
     /// directory, or any other error.
     pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
         let key = self.user.device(passphrase)?;
-        let (vaults, session, released) = self.op_with_session(&VaultOp::Unlock {
+        let (vaults, session, released, _) = self.op_with_session(&VaultOp::Unlock {
             name: name.into(),
             device: key.public().kid().to_string(),
             offline,
@@ -1015,6 +1016,65 @@ impl<'a> Seal<'a> {
         Ok(describe_all(&v))
     }
 
+    /// `kuipa seal request`: ask the approvers of vault `name` to approve
+    /// the release of `sealed`, for `reason`.
+    ///
+    /// # Errors
+    ///
+    /// A file of another kind, a vault without approvals, a refusal.
+    pub fn request(&self, name: &str, sealed: &[u8], reason: &str) -> Result<Value, Error> {
+        let file = SealedVaultFile::from_bytes(sealed)?;
+        let bindings = file
+            .bindings()?
+            .iter()
+            .map(kuipa_enroll::vault::binding_hex)
+            .collect();
+        let requests = self
+            .op_with_session(&VaultOp::Request {
+                name: name.into(),
+                bindings,
+                reason: reason.into(),
+            })?
+            .3;
+        Ok(describe_requests(name, &requests))
+    }
+
+    /// `kuipa seal pending`: the open release requests of vault `name`, or
+    /// of every vault the user approves for or has a part in.
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn pending(&self, name: Option<&str>) -> Result<Value, Error> {
+        let requests = self
+            .op_with_session(&VaultOp::Pending {
+                name: name.map(str::to_owned),
+            })?
+            .3;
+        Ok(describe_requests(name.unwrap_or(""), &requests))
+    }
+
+    /// `kuipa seal approve` (or with `deny`, `kuipa seal deny`): approve or
+    /// deny release request `id` of vault `name`.
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn decide(&self, name: &str, id: &str, deny: bool) -> Result<Value, Error> {
+        let op = if deny {
+            VaultOp::Deny {
+                name: name.into(),
+                id: id.into(),
+            }
+        } else {
+            VaultOp::Approve {
+                name: name.into(),
+                id: id.into(),
+            }
+        };
+        Ok(describe_requests(name, &self.op_with_session(&op)?.3))
+    }
+
     /// `kuipa seal revoke`.
     ///
     /// # Errors
@@ -1108,6 +1168,24 @@ impl<'a> Seal<'a> {
     /// No device key or a wrong passphrase, [`Outcome::RetryLater`] when no
     /// server would open it, or a malformed file.
     pub fn open(&self, sealed: &[u8], passphrase: Option<&[u8]>) -> Result<SecretBuf, Error> {
+        self.open_with(sealed, passphrase, None)
+    }
+
+    /// `kuipa seal open --request ID`: as [`open`](Self::open), naming the
+    /// approved release request `release` for a vault with approvals.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](Self::open), and a malformed request id.
+    pub fn open_with(
+        &self,
+        sealed: &[u8],
+        passphrase: Option<&[u8]>,
+        release: Option<&str>,
+    ) -> Result<SecretBuf, Error> {
+        let release = release
+            .map(kuipa_enroll::vault::ReleaseRequest::id_bytes)
+            .transpose()?;
         if sealed.starts_with(b"IPUS") {
             // Sealed for offline sessions: opened here, without a server.
             let file = SessionSealedFile::from_bytes(sealed)?;
@@ -1163,6 +1241,7 @@ impl<'a> Seal<'a> {
                 device,
                 session: session.as_ref().map(|l| &l.token),
                 ticket,
+                release,
             },
             |server, request| {
                 tracing::debug!(
@@ -1236,6 +1315,25 @@ pub fn describe(v: &VerifiedDescriptor) -> Value {
         "unlocks": vault.unlocks,
         "signed_by": v.server(),
         "signed_at": v.iat(),
+    })
+}
+
+/// The JSON form of release requests, for `--json` and the renderer.
+fn describe_requests(vault: &str, requests: &[kuipa_enroll::vault::ReleaseRequest]) -> Value {
+    json!({
+        "vault": vault,
+        "requests": requests.iter().map(|r| json!({
+            "id": r.id,
+            "vault": r.vault.to_string(),
+            "requester": r.requester,
+            "reason": r.reason,
+            "bindings": r.bindings,
+            "created": r.created,
+            "not_after": r.not_after,
+            "approvals": r.approvals.iter().map(|a| a.approver.clone()).collect::<Vec<_>>(),
+            "denied_by": r.denied.as_ref().map(|d| d.approver.clone()),
+            "uses": r.uses,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -1318,6 +1416,9 @@ fn describe_event(
                 .is_ok_and(|d| d != *event.digest)
                 .then_some("managers or members the stored descriptor does not show"),
         ),
+        A::Request => ("request", None),
+        A::Approve => ("approve", None),
+        A::Deny => ("deny", None),
         A::Revoke => (
             "revoke",
             (!expected.revoked).then_some("the stored descriptor shows the vault enabled"),

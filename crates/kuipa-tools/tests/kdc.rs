@@ -952,6 +952,65 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
     assert!(seal.open(&note, Some(b"correct horse")).is_ok());
 }
 
+fn break_glass(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    // ── A break-glass vault: two others approve each release
+    // (DESIGN-approvals.md) ──
+    realm.add_user("carol@EXAMPLE.TEST", "Carol123");
+    let carol_cc = realm.dir.join("carol.ccache");
+    realm.kinit("carol@EXAMPLE.TEST", "Carol123", &carol_cc, None, None);
+    let carol_cc = format!("FILE:{}", carol_cc.display());
+    let glass = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        approvals: Some(vault::Approvals {
+            m: 2,
+            from: vault::Members {
+                users: vec!["bob".into(), "carol".into()],
+                ..vault::Members::default()
+            },
+            window: None,
+            uses: None,
+        }),
+        ..vault::Policy::default()
+    };
+    seal.create("glass", glass).unwrap();
+    seal.add_device("glass", b"correct horse").unwrap();
+    let sealed = seal.seal("glass", b"root password").unwrap();
+    let pass: &[u8] = b"correct horse";
+    assert!(seal.open(&sealed, Some(pass)).is_err(), "no request");
+    let asked = seal.request("glass", &sealed, "INC-7: locked out").unwrap();
+    let id = asked["requests"][0]["id"].as_str().unwrap().to_owned();
+    // Bob and Carol approve from their own tickets; neither is a member.
+    let bob_home = UserPaths::new(realm.dir.join("bob-approver"));
+    let carol_home = UserPaths::new(realm.dir.join("carol-home"));
+    let bob = Seal::new(a, &bob_home, Some(&alice.bob_cc));
+    let carol = Seal::new(a, &carol_home, Some(&carol_cc));
+    let pending = bob.pending(None).unwrap();
+    assert_eq!(pending["requests"][0]["id"], id.as_str(), "{pending}");
+    bob.decide("alice/glass", &id, false).unwrap();
+    assert!(
+        seal.open_with(&sealed, Some(pass), Some(&id)).is_err(),
+        "one of two"
+    );
+    carol.decide("alice/glass", &id, false).unwrap();
+    assert_eq!(
+        seal.open_with(&sealed, Some(pass), Some(&id))
+            .unwrap()
+            .as_ref(),
+        b"root password"
+    );
+    assert!(
+        seal.open_with(&sealed, Some(pass), Some(&id)).is_err(),
+        "used up"
+    );
+}
+
 fn token_device(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
@@ -1393,6 +1452,7 @@ fn against_a_real_kdc() {
     offline_session(&world, &alice);
     registered_sealing(&world, &alice);
     shared_vault(&world, &alice);
+    break_glass(&world, &alice);
     token_device(&world, &alice);
     unprotect_host(&world);
     admin_ticket(&world);

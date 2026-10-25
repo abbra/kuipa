@@ -634,7 +634,11 @@ pub struct EscrowRequest {
     device: Option<tang_pqc::Thumbprint>,
     session: Vec<u8>,
     ticket: Vec<u8>,
+    release: Option<[u8; 16]>,
 }
+
+/// `IPEQ` version 2 adds the release request id (`DESIGN-approvals.md` §4).
+const REQUEST_VERSION_RELEASE: u8 = 2;
 
 impl EscrowRequest {
     /// A request for a user vault, answered to `device` if given.
@@ -654,7 +658,21 @@ impl EscrowRequest {
             device,
             session: Vec::new(),
             ticket: Vec::new(),
+            release: None,
         }
+    }
+
+    /// The same request naming an approved release request.
+    #[must_use]
+    pub fn with_release(mut self, id: [u8; 16]) -> Self {
+        self.release = Some(id);
+        self
+    }
+
+    /// The approved release request it names, if any.
+    #[must_use]
+    pub fn release(&self) -> Option<&[u8; 16]> {
+        self.release.as_ref()
     }
 
     /// The same request carrying a re-authentication session token.
@@ -738,15 +756,22 @@ impl EscrowRequest {
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        Writer::new(REQUEST_MAGIC)
-            .str(&self.principal.to_string())
+        // Version 1 without a release request, as every client sent it.
+        let mut w = match self.release {
+            None => Writer::new(REQUEST_MAGIC),
+            Some(_) => Writer::with_version(REQUEST_MAGIC, REQUEST_VERSION_RELEASE),
+        };
+        w.str(&self.principal.to_string())
             .fixed(self.vault.as_bytes())
             .fixed(&self.commitment)
             .bytes(&self.request.to_bytes())
             .bytes(self.device.as_ref().map_or(&[][..], |d| d.as_bytes()))
             .bytes(&self.session)
-            .bytes(&self.ticket)
-            .finish()
+            .bytes(&self.ticket);
+        if let Some(id) = &self.release {
+            w.fixed(id);
+        }
+        w.finish()
     }
 
     /// Decode.
@@ -755,7 +780,17 @@ impl EscrowRequest {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, REQUEST_MAGIC, "escrow request")?;
+        let versioned = bytes.get(4) == Some(&REQUEST_VERSION_RELEASE);
+        let mut r = if versioned {
+            Reader::with_version(
+                bytes,
+                REQUEST_MAGIC,
+                REQUEST_VERSION_RELEASE,
+                "escrow request",
+            )?
+        } else {
+            Reader::new(bytes, REQUEST_MAGIC, "escrow request")?
+        };
         let principal = r.str()?.parse()?;
         let vault = VaultId::from_bytes(r.fixed()?);
         let commitment = r.fixed()?;
@@ -768,6 +803,7 @@ impl EscrowRequest {
         };
         let session = r.bytes()?.to_vec();
         let ticket = r.bytes()?.to_vec();
+        let release = if versioned { Some(r.fixed()?) } else { None };
         r.finish()?;
         Ok(Self {
             principal,
@@ -777,6 +813,7 @@ impl EscrowRequest {
             device,
             session,
             ticket,
+            release,
         })
     }
 }
