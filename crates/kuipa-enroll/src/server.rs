@@ -3302,6 +3302,16 @@ impl EnrollServer {
         if directory.principal_locked(&who).map_err(Refusal)? {
             return Err(Refusal::because(format!("{who} is locked or gone")));
         }
+        if vault.policy.ticket_leased
+            && directory
+                .principal_lease(&who)
+                .map_err(Refusal)?
+                .is_none_or(|end| now >= end)
+        {
+            return Err(Refusal::because(format!(
+                "{who} is not a host whose lease is running"
+            )));
+        }
         if !admit(&who) {
             return Err(Refusal::because(format!("{who} opens too often")));
         }

@@ -262,6 +262,11 @@ flags:
 *--ticket-via* _SERVICE_
 	Accept delegated tickets only through these services.
 
+*--ticket-leased*
+	Open only for a host whose lease is running: CI runners joined
+	with *kuipa-voucher request --lease-hours*. Needs the *ticket*
+	factor.
+
 ## seal policy --require _FACTORS_ _VAULT_ [_policy-flags_]
 
 Replace a vault's policy; the same flags as *seal create*.

@@ -817,6 +817,10 @@ struct PolicyInput {
     /// Accept delegated tickets only through these services.
     #[arg(long, value_name = "SERVICE")]
     ticket_via: Vec<String>,
+    /// Open only for a host whose lease is running: CI runners joined
+    /// with `kuipa-voucher request --lease-hours`.
+    #[arg(long)]
+    ticket_leased: bool,
     /// How many times, in all, the servers may open files of the vault.
     #[arg(long, value_name = "N")]
     max_unlocks: Option<u64>,
@@ -915,6 +919,7 @@ impl PolicyInput {
         Ok(Policy {
             factors,
             ticket_delegation,
+            ticket_leased: self.ticket_leased,
             not_after,
             sealing,
             approvals: self.approvals()?,
@@ -2695,6 +2700,9 @@ fn render_seal(value: &Value) {
                 get(get(policy, "sessions"), "reauth"),
             );
             rows.field("delegated tickets", get(policy, "ticket_delegation"));
+            if get(policy, "ticket_leased") == &Value::Bool(true) {
+                rows.field("tickets", &Value::from("of leased hosts only"));
+            }
             let devices: Vec<Value> = list(get(v, "devices"))
                 .into_iter()
                 .map(|d| {
