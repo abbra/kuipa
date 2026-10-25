@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Benchmark fixtures for kuipa: deterministic keytabs, realms, and real CA certificates"
+# Fixtures only: nothing outside this workspace's benches should build on them.
+publish = false
+description = "Benchmark fixtures for kuipa: synthetic keytabs, realms, and real CA certificates"
 keywords = ["benchmark", "freeipa", "kerberos", "post-quantum"]
 categories = ["development-tools::testing"]
 
