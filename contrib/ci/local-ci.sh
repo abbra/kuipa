@@ -275,7 +275,7 @@ skip_job() {
 
 ALL_JOBS=(build fmt lint-workflows deps clippy doc test kdc-test playground-test)
 # Opt-in jobs: not part of 'all' (need an extra toolchain).
-EXTRA_JOBS=(msrv)
+EXTRA_JOBS=(msrv bench)
 
 # Job dependencies — mirrors the 'needs:' fields in .github/workflows/ci.yml.
 # Value is a space-separated list of prerequisite job names.
@@ -286,6 +286,7 @@ declare -A JOB_DEPS=(
     [test]="build"
     [kdc-test]="build"
     [playground-test]="build"
+    [bench]="build"
 )
 
 # ── Utilities ───────────────────────────────────────────────────────────────
@@ -505,8 +506,22 @@ job_msrv() {
 
     # Language features newer than the MSRV (clippy only checks library
     # APIs): build everything with the oldest supported compiler.
-    echo "Building with Rust $MSRV…"
+    echo "Building with Rust ${MSRV}…"
     rustup run "$MSRV" cargo build --workspace --all-targets
+}
+
+# ── Benchmarks ──────────────────────────────────────────────────────────────
+#
+# Criterion targets live in the crates whose code they measure
+# (kuipa-enroll, ml-dsa-blind); kuipa-perf supplies the fixtures and owns the
+# certificate-cost target.  CI runs a smoke pass: a few samples per benchmark,
+# enough to catch a regression or a fixture that no longer verifies.  Use
+# scripts/bench.sh for a full run that stores comparable results.
+job_bench() {
+    require_cargo || return 1
+
+    echo "Running the benchmark smoke pass (profile smoke)…"
+    KUIPA_BENCH_PROFILE=smoke scripts/bench.sh --quick --no-save
 }
 
 # ── Interactive playground ──────────────────────────────────────────────────
@@ -742,6 +757,7 @@ dispatch_job() {
         kdc-test)       run_job kdc-test       job_kdc_test ;;
         playground-test) run_job playground-test job_playground_test ;;
         msrv)           run_job msrv           job_msrv ;;
+        bench)          run_job bench          job_bench ;;
         *)
             echo "Unknown job: $1" >&2
             echo "Run '$0 --list' for available jobs." >&2
