@@ -45,6 +45,13 @@ that it is irreducible (Rabin's test). Seeds (32 bytes), the salt and
 SHA-512 commitments already suit λ = 256, so only the field, the number
 of trees and the mask lengths change.
 
+Both fields are implemented here (`gf128.rs`, `gf256.rs`), not taken
+from OpenSSL. OpenSSL has no public API for GF(2ᵐ) arithmetic that fits:
+GHASH (`CRYPTO_gcm128_*`, GMAC) multiplies only by `H = AES_K(0)`, in
+GCM's bit-reflected order, and the binary-field `BN_GF2m_*` functions
+are not constant-time and are compiled out of Fedora's and RHEL's
+OpenSSL, which is built with `no-ec2m`.
+
 **Research prototype. Not reviewed.**
 
 ## 2. The protocol
