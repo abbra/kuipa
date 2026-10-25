@@ -1,9 +1,12 @@
 //! The client and server halves of the enrollment flows: advertisement
 //! serve/verify, OTP and Kerberos joins, rekey.
 //!
-//! Each round-trip bench measures the whole exchange a host pays for: seal a
+//! Each round-trip bench measures kuipa's side of the exchange: seal a
 //! request, encode/decode it, have the server answer through the directory,
-//! open the response.
+//! open the response.  The directory is in memory, and its Kerberos checks
+//! are a byte comparison: no GSS acceptor, keytab lookup, LDAP or KDC is in
+//! the loop, so the Kerberos round trips are lower bounds on what a real
+//! enrollment costs.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use kuipa_enroll::join::{AuthType, Operation, Prepared, Request, Response};
@@ -131,8 +134,9 @@ fn join_otp(c: &mut Criterion) {
     g.finish();
 }
 
-/// A Kerberos-authenticated join, end to end: the directory does acceptor
-/// work per request.
+/// A Kerberos-authenticated join, end to end on kuipa's side.  The
+/// directory's "acceptor" compares the fake token's channel binding; real
+/// `gss_accept_sec_context` work is not measured.
 fn join_gss(c: &mut Criterion) {
     let p = profile();
     let r = realm(&p);
@@ -179,7 +183,8 @@ fn join_wire(c: &mut Criterion) {
     g.finish();
 }
 
-/// A host rekeying itself, end to end.
+/// A host rekeying itself, end to end on kuipa's side (the directory's
+/// Kerberos check is faked, as for [`join_gss`]).
 fn rekey(c: &mut Criterion) {
     let p = profile();
     let r = realm(&p);
