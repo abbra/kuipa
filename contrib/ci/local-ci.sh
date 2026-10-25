@@ -515,8 +515,9 @@ job_msrv() {
 # Criterion targets live in the crates whose code they measure
 # (kuipa-enroll, ml-dsa-blind); kuipa-perf supplies the fixtures and owns the
 # certificate-cost target.  CI runs a smoke pass: a few samples per benchmark,
-# enough to catch a regression or a fixture that no longer verifies.  Use
-# scripts/bench.sh for a full run that stores comparable results.
+# enough to catch a fixture that no longer verifies, but with no baseline to
+# catch a timing regression.  Use scripts/bench.sh for a full run that stores
+# comparable results.
 job_bench() {
     require_cargo || return 1
 

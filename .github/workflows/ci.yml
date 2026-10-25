@@ -9,6 +9,11 @@ on:
   pull_request:
     branches: [main]
 
+# No job writes to the repository: artifacts and caches use the runtime
+# token, not this one.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # System packages required to build the workspace and to run JavaScript-based
@@ -290,7 +295,9 @@ jobs:
 
   # ── Benchmarks ─────────────────────────────────────────────────────────────
   # The smoke profile in quick mode: every criterion target runs, so a fixture
-  # that no longer verifies or a flow that regressed hard fails the job.  The
+  # that no longer verifies, or a run that measures nothing, fails the job.
+  # It keeps no baseline and compares nothing: timing regressions are found
+  # with scripts/bench.sh compare, not here.  The
   # benches build in release, which the debug artifact cache does not cover —
   # only the registry cache helps here, and the release build of the workspace
   # is most of the job.  A quick smoke pass measures in ~13 minutes on a fast
