@@ -298,6 +298,10 @@ secret, should not rest on one administrator.
 share, with each approval in the transparency log. *Needs* the
 transparency log, which works today.
 
+**Design:** a vault policy names approvers and how many must agree; the
+requester asks, they approve, and the release counts them. See
+[release approvals](reference/design.md#kuipa-release-approvals-m-of-n-before-a-break-glass-release).
+
 ### Give CI runners short-lived identities
 
 **Why.** CI runners are created and destroyed constantly, and often hold
