@@ -1024,6 +1024,35 @@ pub fn enroll_bundle(
     Ok(json!({ "enrollment": summary(&enrollment), "pending": pending }))
 }
 
+/// An initiator credential from `keytab`, for its default client principal,
+/// or without one from this host's live keytab, for the host's principal.
+/// The credential comes from GSS-API (`client_keytab` in the credential
+/// store): this process does not read the keytab, so gssproxy can hold it.
+pub(crate) fn keytab_cred(
+    paths: &Paths,
+    keytab: Option<&std::path::Path>,
+) -> Result<GssClientCred, Error> {
+    let state = State::load(paths)?;
+    let path = keytab.map_or_else(|| live_keytab(paths, &state), std::path::Path::to_path_buf);
+    let cred = GssClientCred::from_client_keytab(
+        path.to_str().ok_or("non-UTF-8 keytab path")?,
+        None,
+        None,
+    )?;
+    let principal: Principal = cred
+        .principal_name()
+        .ok_or_else(|| format!("{}: no principal to act as", path.display()))?
+        .parse()?;
+    if principal.realm() != state.realm {
+        return Err(format!("{principal} is not of this host's realm {}", state.realm).into());
+    }
+    let host = Principal::host(&state.fqdn, &state.realm);
+    if keytab.is_none() && principal != host {
+        return Err(format!("the host keytab acts as {principal}, not as {host}").into());
+    }
+    Ok(cred)
+}
+
 fn live_keytab(paths: &Paths, state: &State) -> std::path::PathBuf {
     match state.holder {
         Holder::None => paths.keytab(),

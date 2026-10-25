@@ -43,6 +43,9 @@
 //!                                            what it belongs to and where
 //!                                            it appears
 //! kuipa status | check [--server S]         is this host healthy?
+//! kuipa escrow luks|file                   deposit recovery keys, as the
+//!                                            host or a service's keytab, into
+//!                                            a vault it cannot open
 //! kuipa seal …                              a user's own and shared vaults:
 //!                                            create, share, devices, seal
 //!                                            and open files
@@ -268,6 +271,12 @@ enum Command {
     Seal {
         #[command(subcommand)]
         action: SealAction,
+    },
+    /// Deposit recovery keys into a vault the depositor cannot open, with a
+    /// ticket from the host's keytab or a service's (run as root).
+    Escrow {
+        #[command(subcommand)]
+        action: EscrowAction,
     },
     /// Fetch a named secret from the realm's servers, authenticated by
     /// this host's keytab.
@@ -533,6 +542,85 @@ enum SealAction {
         /// The vault.
         vault: String,
     },
+}
+
+/// `kuipa escrow` subcommands: the host, or the principal of a keytab on
+/// it, deposits, and cannot read back.
+#[derive(Subcommand)]
+enum EscrowAction {
+    /// Deposit a LUKS volume's recovery key, read from standard input as
+    /// `systemd-cryptenroll --recovery-key DEVICE` prints it, in place of
+    /// this host's earlier deposit for that volume.
+    Luks {
+        /// The LUKS volume.
+        device: String,
+        /// The vault this host is a depositor of (`OWNER/NAME`).
+        #[arg(long, value_name = "VAULT")]
+        vault: String,
+        /// Read the recovery key from this file instead.
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<String>,
+        /// The volume's UUID (default: what `cryptsetup luksUUID` says).
+        #[arg(long, value_name = "UUID")]
+        uuid: Option<String>,
+        /// Deposit as the principal of this keytab (a service's or a
+        /// user's) rather than as the host.
+        #[arg(long, value_name = "FILE")]
+        keytab: Option<String>,
+    },
+    /// Deposit any small secret, such as a backup repository's password,
+    /// as this host's secret NAME.
+    File {
+        /// What it is, among this host's deposits.
+        name: String,
+        /// The file.
+        file: String,
+        /// The vault this host is a depositor of (`OWNER/NAME`).
+        #[arg(long, value_name = "VAULT")]
+        vault: String,
+        /// Deposit as the principal of this keytab (a service's or a
+        /// user's) rather than as the host.
+        #[arg(long, value_name = "FILE")]
+        keytab: Option<String>,
+    },
+}
+
+/// `kuipa escrow …`.
+fn run_escrow(paths: &Paths, action: &EscrowAction) -> Result<Value, Error> {
+    match action {
+        EscrowAction::Luks {
+            device,
+            vault,
+            key_file,
+            uuid,
+            keytab,
+        } => {
+            let input = if let Some(path) = key_file {
+                SecretBuf::new(std::fs::read(path)?)
+            } else {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+                SecretBuf::new(buf)
+            };
+            let by = kuipa_tools::escrow::Depositor {
+                paths,
+                keytab: keytab.as_deref().map(std::path::Path::new),
+            };
+            kuipa_tools::escrow::escrow_luks(&by, vault, device, input.as_ref(), uuid.as_deref())
+        }
+        EscrowAction::File {
+            name,
+            file,
+            vault,
+            keytab,
+        } => {
+            let by = kuipa_tools::escrow::Depositor {
+                paths,
+                keytab: keytab.as_deref().map(std::path::Path::new),
+            };
+            kuipa_tools::escrow::escrow_file(&by, vault, name, &std::fs::read(file)?)
+        }
+    }
 }
 
 /// `kuipa seal deposit` subcommands.
@@ -860,6 +948,7 @@ impl Command {
             Command::Check { .. } => "check",
             Command::Leave => "leave",
             Command::Seal { .. } => "seal",
+            Command::Escrow { .. } => "escrow",
             Command::Keys { .. } => "keys",
             Command::Tlog { .. } => "tlog",
             Command::Sign { .. } => "sign",
@@ -2602,6 +2691,7 @@ fn main() -> ExitCode {
     tracing::debug!("kuipa {}", args.command);
     let result = match &cli.command {
         Command::Seal { action } => run_seal(&paths, action),
+        Command::Escrow { action } => run_escrow(&paths, action),
         Command::Keys { action } => run_keys(&paths, action),
         Command::Tlog { action } => run_tlog(&paths, action),
         Command::Sign { action } => run_sign(&paths, action),
@@ -2613,7 +2703,7 @@ fn main() -> ExitCode {
                 // Standard output carries a secret; nothing else goes there.
             } else if cli.json {
                 println!("{value}");
-            } else if args.command == "seal" {
+            } else if args.command == "seal" || args.command == "escrow" {
                 render_seal(&value);
             } else {
                 render(&args.command, &args, &value, &paths);

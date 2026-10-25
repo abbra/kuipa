@@ -202,6 +202,22 @@ keys.  The value is written to standard output, or to *FILE*.  For
 or *aes-256-wrap*.  A host outside the realm's server list, or without
 the CA role for the wrapped CA keys, is refused.
 
+## escrow luks _DEVICE_ --vault _VAULT_ [--key-file _FILE_] [--uuid _UUID_] [--keytab _FILE_]
+
+As root: deposit the LUKS volume's recovery key, read from standard
+input as *systemd-cryptenroll --recovery-key* _DEVICE_ prints it, into a
+vault this host is a depositor of, in place of its earlier deposit for
+that volume.  The UUID is *cryptsetup luksUUID*'s unless given.  The
+host authenticates with its keytab and cannot read the key back; with
+*--keytab* _FILE_, the principal of that keytab (a service's or a
+user's) deposits instead.
+
+## escrow file _NAME_ _FILE_ --vault _VAULT_ [--keytab _FILE_]
+
+As root: deposit a small secret, such as a backup repository's password,
+as this host's secret _NAME_, or with *--keytab* as that keytab's
+principal's.
+
 # VAULT COMMANDS
 
 *kuipa seal* seals a user's own files to a vault of hers, or to one

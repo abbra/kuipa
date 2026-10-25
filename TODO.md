@@ -144,7 +144,9 @@ design first.
   - [x] Recovery codes (`kuipa seal recovery-code`, `recover code`,
         `recover finish`).
   - [x] Depositors and deposits (`kuipa seal deposit put|list|fetch|retire`).
-  - [ ] `kuipa escrow luks`, `kuipa escrow file` for hosts.
+  - [x] `kuipa escrow luks`, `kuipa escrow file` for hosts, and services
+        or users by their keytabs; **not yet run** against a real LUKS
+        volume.
   - [ ] Device-key deposits in a helpdesk vault, and their delivery.
 - [x] M-of-N approvals for break-glass releases, recorded in the
       transparency log (`docs/DESIGN-approvals.md`).

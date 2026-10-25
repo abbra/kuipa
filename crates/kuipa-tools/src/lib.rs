@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod dns;
+pub mod escrow;
 pub mod flows;
 pub mod mirror;
 pub mod net;

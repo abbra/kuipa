@@ -1134,6 +1134,90 @@ fn deposits(world: &Scenario, alice: &Alice) {
     );
 }
 
+fn escrows(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    // Hosts deposit too, with their own keytab (DESIGN-recovery.md §5):
+    // web1's LUKS recovery key, as systemd-cryptenroll prints it.
+    let host = kuipa_tools::escrow::Depositor {
+        paths: a,
+        keytab: None,
+    };
+    let key = "fejrltbu-bjitujnh-dfhrrbrk-hgbtdbgg-cbbitcrk-kclhkdgb-gbbhgjvb-ldbbrleb";
+    let uuid = "0b9c7f1e-6d2a-4c55-9a51-3e1f6b2d8c70";
+    let printed = format!("A secret recovery key has been generated:\n    {key}\n");
+    assert!(
+        kuipa_tools::escrow::escrow_luks(
+            &host,
+            "alice/drop",
+            "/dev/vda2",
+            printed.as_bytes(),
+            Some(uuid)
+        )
+        .is_err(),
+        "web1 is no depositor yet"
+    );
+    let web1 = vault::Members {
+        hosts: vec!["web1.example.test".into()],
+        ..vault::Members::default()
+    };
+    seal.share(
+        "drop",
+        [vault::Members::default(), vault::Members::default(), web1],
+    )
+    .unwrap();
+    let made = kuipa_tools::escrow::escrow_luks(
+        &host,
+        "alice/drop",
+        "/dev/vda2",
+        printed.as_bytes(),
+        Some(uuid),
+    )
+    .unwrap();
+    let luks = made["deposits"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        made["deposits"][0]["depositor"], "host/web1.example.test@EXAMPLE.TEST",
+        "{made}"
+    );
+    kuipa_tools::escrow::escrow_file(&host, "alice/drop", "borg", b"borg passphrase").unwrap();
+    // And so does any service whose keytab is on the host, as itself.
+    let backup = "backup/web1.example.test@EXAMPLE.TEST";
+    let keytab = realm.dir.join("backup.keytab");
+    std::fs::write(&keytab, realm.new_keys(backup)).unwrap();
+    let service = kuipa_tools::escrow::Depositor {
+        paths: a,
+        keytab: Some(&keytab),
+    };
+    let restic = b"restic for the backup service";
+    assert!(
+        kuipa_tools::escrow::escrow_file(&service, "alice/drop", "restic", restic).is_err(),
+        "the service is no depositor yet"
+    );
+    let services = vault::Members {
+        services: vec!["backup/web1.example.test".into()],
+        ..vault::Members::default()
+    };
+    seal.share(
+        "drop",
+        [
+            vault::Members::default(),
+            vault::Members::default(),
+            services,
+        ],
+    )
+    .unwrap();
+    let made = kuipa_tools::escrow::escrow_file(&service, "alice/drop", "restic", restic).unwrap();
+    assert_eq!(made["deposits"][0]["depositor"], backup, "{made}");
+    let listed = seal.deposits("drop").unwrap();
+    assert_eq!(listed["deposits"].as_array().unwrap().len(), 4, "{listed}");
+    let sealed = seal.deposit_file("drop", &luks).unwrap();
+    assert_eq!(
+        seal.open(&sealed, Some(b"correct horse")).unwrap().as_ref(),
+        key.as_bytes()
+    );
+}
+
 fn token_device(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
@@ -1578,6 +1662,7 @@ fn against_a_real_kdc() {
     break_glass(&world, &alice);
     lost_laptop(&world, &alice);
     deposits(&world, &alice);
+    escrows(&world, &alice);
     token_device(&world, &alice);
     unprotect_host(&world);
     admin_ticket(&world);
