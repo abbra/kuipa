@@ -4,8 +4,6 @@
 //! so anonymous PKINIT works.  Adapted from kurbu5-pkinit's
 //! `tests/system/pkinit/setup.py`.
 
-#![allow(clippy::struct_field_names, clippy::too_many_lines)]
-
 use std::fs;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -17,7 +15,8 @@ use super::certs::{KdcChain, kdc_chain};
 
 /// A running test realm.  Stops the KDC and removes its files on drop.
 pub struct Realm {
-    pub realm: String,
+    /// The realm's name, such as `EXAMPLE.TEST`.
+    pub name: String,
     pub dir: PathBuf,
     pub socket: PathBuf,
     pub krb5_conf: PathBuf,
@@ -37,6 +36,71 @@ fn have(tool: &str) -> bool {
 
 fn pem(der: &[u8]) -> Vec<u8> {
     synta_certificate::der_to_pem("CERTIFICATE", der)
+}
+
+/// The realm's `krb5.conf` and `kdc.conf`, and its ACL, with the KDC on
+/// `socket` and its PKINIT anchors in `ca_pem`; returns the two configs.
+fn write_configs(realm: &str, dir: &Path, socket: &Path, ca_pem: &Path) -> (PathBuf, PathBuf) {
+    let domain = realm.to_lowercase();
+    let krb5_conf = dir.join("krb5.conf");
+    fs::write(
+        &krb5_conf,
+        format!(
+            "[libdefaults]\n\
+             \x20 default_realm = {realm}\n\
+             \x20 rdns = false\n\
+             \x20 dns_canonicalize_hostname = false\n\
+             \x20 dns_lookup_kdc = false\n\
+             \x20 no_addresses = true\n\
+             [realms]\n\
+             \x20 {realm} = {{\n\
+             \x20   kdc = {sock}\n\
+             \x20   pkinit_anchors = FILE:{ca}\n\
+             \x20 }}\n\
+             [domain_realm]\n\
+             \x20 .{domain} = {realm}\n\
+             \x20 {domain} = {realm}\n",
+            sock = socket.display(),
+            ca = ca_pem.display(),
+        ),
+    )
+    .unwrap();
+    let kdc_conf = dir.join("kdc.conf");
+    fs::write(
+        &kdc_conf,
+        format!(
+            "[kdcdefaults]\n\
+             \x20 kdc_listen = {sock}\n\
+             \x20 kdc_tcp_listen = \"\"\n\
+             [dbmodules]\n\
+             \x20 db = {{\n\
+             \x20   db_library = db2\n\
+             \x20   database_name = {d}/db\n\
+             \x20 }}\n\
+             [realms]\n\
+             \x20 {realm} = {{\n\
+             \x20   database_module = db\n\
+             \x20   acl_file = {d}/acl\n\
+             \x20   key_stash_file = {d}/stash\n\
+             \x20   kdc_listen = {sock}\n\
+             \x20   kdc_tcp_listen = \"\"\n\
+             \x20   max_life = 1h\n\
+             \x20   supported_enctypes = aes256-cts-hmac-sha384-192:normal aes128-cts-hmac-sha256-128:normal\n\
+             \x20   default_principal_flags = +preauth\n\
+             \x20   pkinit_identity = FILE:{d}/kdc.pem,{d}/kdc-key.pem\n\
+             \x20   pkinit_anchors = FILE:{ca}\n\
+             \x20   pkinit_eku_checking = none\n\
+             \x20 }}\n\
+             [logging]\n\
+             \x20 kdc = FILE:{d}/kdc.log\n",
+            sock = socket.display(),
+            d = dir.display(),
+            ca = ca_pem.display(),
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("acl"), format!("*/admin@{realm} *\n")).unwrap();
+    (krb5_conf, kdc_conf)
 }
 
 impl Realm {
@@ -64,68 +128,10 @@ impl Realm {
         fs::write(&ca_pem, pem(&chain.ca_der)).unwrap();
         fs::write(dir.join("kdc.pem"), pem(&chain.kdc_der)).unwrap();
         fs::write(dir.join("kdc-key.pem"), &chain.kdc_key_pem).unwrap();
-        let domain = realm.to_lowercase();
-        let krb5_conf = dir.join("krb5.conf");
-        fs::write(
-            &krb5_conf,
-            format!(
-                "[libdefaults]\n\
-                 \x20 default_realm = {realm}\n\
-                 \x20 rdns = false\n\
-                 \x20 dns_canonicalize_hostname = false\n\
-                 \x20 dns_lookup_kdc = false\n\
-                 \x20 no_addresses = true\n\
-                 [realms]\n\
-                 \x20 {realm} = {{\n\
-                 \x20   kdc = {sock}\n\
-                 \x20   pkinit_anchors = FILE:{ca}\n\
-                 \x20 }}\n\
-                 [domain_realm]\n\
-                 \x20 .{domain} = {realm}\n\
-                 \x20 {domain} = {realm}\n",
-                sock = socket.display(),
-                ca = ca_pem.display(),
-            ),
-        )
-        .unwrap();
-        let kdc_conf = dir.join("kdc.conf");
-        fs::write(
-            &kdc_conf,
-            format!(
-                "[kdcdefaults]\n\
-                 \x20 kdc_listen = {sock}\n\
-                 \x20 kdc_tcp_listen = \"\"\n\
-                 [dbmodules]\n\
-                 \x20 db = {{\n\
-                 \x20   db_library = db2\n\
-                 \x20   database_name = {d}/db\n\
-                 \x20 }}\n\
-                 [realms]\n\
-                 \x20 {realm} = {{\n\
-                 \x20   database_module = db\n\
-                 \x20   acl_file = {d}/acl\n\
-                 \x20   key_stash_file = {d}/stash\n\
-                 \x20   kdc_listen = {sock}\n\
-                 \x20   kdc_tcp_listen = \"\"\n\
-                 \x20   max_life = 1h\n\
-                 \x20   supported_enctypes = aes256-cts-hmac-sha384-192:normal aes128-cts-hmac-sha256-128:normal\n\
-                 \x20   default_principal_flags = +preauth\n\
-                 \x20   pkinit_identity = FILE:{d}/kdc.pem,{d}/kdc-key.pem\n\
-                 \x20   pkinit_anchors = FILE:{ca}\n\
-                 \x20   pkinit_eku_checking = none\n\
-                 \x20 }}\n\
-                 [logging]\n\
-                 \x20 kdc = FILE:{d}/kdc.log\n",
-                sock = socket.display(),
-                d = dir.display(),
-                ca = ca_pem.display(),
-            ),
-        )
-        .unwrap();
-        fs::write(dir.join("acl"), format!("*/admin@{realm} *\n")).unwrap();
+        let (krb5_conf, kdc_conf) = write_configs(realm, &dir, &socket, &ca_pem);
 
         let mut me = Self {
-            realm: realm.into(),
+            name: realm.into(),
             dir,
             socket,
             krb5_conf,
@@ -198,13 +204,13 @@ impl Realm {
 
     /// Run a `kadmin.local` query.
     pub fn kadmin(&self, query: &[&str]) -> String {
-        self.run("kadmin.local", &["-r", &self.realm, "-q", &query.join(" ")])
+        self.run("kadmin.local", &["-r", &self.name, "-q", &query.join(" ")])
     }
 
     /// Does `principal` exist?
     pub fn has(&self, principal: &str) -> bool {
         let out = Command::new("kadmin.local")
-            .args(["-r", &self.realm, "-q", &format!("getprinc {principal}")])
+            .args(["-r", &self.name, "-q", &format!("getprinc {principal}")])
             .envs(self.env())
             .output()
             .unwrap();
@@ -236,8 +242,8 @@ impl Realm {
     /// FreeIPA's `trust-add --trust_secret` does (DESIGN §17.4).
     pub fn cross_realm(&self, partner: &str, secret: &str) {
         for principal in [
-            format!("krbtgt/{partner}@{}", self.realm),
-            format!("krbtgt/{}@{partner}", self.realm),
+            format!("krbtgt/{partner}@{}", self.name),
+            format!("krbtgt/{}@{partner}", self.name),
         ] {
             self.kadmin(&["addprinc", "-pw", secret, &principal]);
         }
@@ -286,7 +292,7 @@ impl Realm {
             .arg("-n")
             .arg("-c")
             .arg(ccache)
-            .arg(format!("@{}", self.realm))
+            .arg(format!("@{}", self.name))
             .output()
             .unwrap();
         if out.status.success() {

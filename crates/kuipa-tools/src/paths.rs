@@ -352,7 +352,10 @@ impl State {
     /// # Errors
     ///
     /// I/O errors.
-    #[allow(clippy::missing_panics_doc)] // serialising plain data cannot fail
+    ///
+    /// # Panics
+    ///
+    /// Never: the state holds only strings and plain JSON types.
     pub fn store(&self, paths: &Paths) -> Result<(), Error> {
         write_file(
             &paths.state(),
@@ -998,12 +1001,17 @@ mod tests {
         Hash::from_slice(&[byte; 32]).unwrap()
     }
 
-    #[test]
-    #[allow(clippy::too_many_lines)] // one pin-file grammar, one test
-    fn anchors_file_with_expiry() {
-        let dir = std::env::temp_dir().join(format!("kuipa-paths-{}", std::process::id()));
+    /// A scratch directory for one test, and the anchors file in it.
+    fn scratch_anchors(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kuipa-paths-{tag}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pq-anchors");
+        (dir, path)
+    }
+
+    #[test]
+    fn anchors_file_with_expiry() {
+        let (dir, path) = scratch_anchors("expiry");
         let (a, b, c) = (
             tang_pqc::Thumbprint::from_bytes([1; 32]),
             tang_pqc::Thumbprint::from_bytes([2; 32]),
@@ -1054,6 +1062,14 @@ mod tests {
             "expired pin left out"
         );
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_anchor_lines_are_refused() {
+        let (dir, path) = scratch_anchors("malformed");
+        let a = tang_pqc::Thumbprint::from_bytes([1; 32]);
+        let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
         let root = |n: u8| tang_pqc::Thumbprint::from_bytes([n; 32]);
         for bad in [
             format!("{a} soon\n"),
@@ -1096,6 +1112,15 @@ mod tests {
         assert!(read_anchor_pins(&path).is_err());
         fs::write(&path, format!("{a} 5 {}\n{a} 6 {}\n", root(9), root(9))).unwrap();
         assert!(read_anchor_pins(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn written_pins_read_back() {
+        let (dir, path) = scratch_anchors("written");
+        let a = tang_pqc::Thumbprint::from_bytes([1; 32]);
+        let b = tang_pqc::Thumbprint::from_bytes([2; 32]);
+        let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
         // Written lists carry no expiry and read back unchanged.
         write_anchors_to(&path, "test", &[a, b]).unwrap();
         assert_eq!(read_anchors_from(&path).unwrap(), vec![a, b]);

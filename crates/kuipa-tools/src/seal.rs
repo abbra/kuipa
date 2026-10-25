@@ -313,6 +313,14 @@ pub struct Seal<'a> {
     ccache: Option<&'a str>,
 }
 
+/// What `op_with_session` answers: the verified descriptors, the session
+/// token and the keys released to the device.
+type OpAnswer = (
+    Vec<VerifiedDescriptor>,
+    Option<SessionToken>,
+    Option<ReleasedKeys>,
+);
+
 impl<'a> Seal<'a> {
     /// Use the host's realm files under `host`, the user's directory, and
     /// the ticket in `ccache` (else the default ccache, `KRB5CCNAME`).
@@ -338,18 +346,7 @@ impl<'a> Seal<'a> {
         Ok(self.op_with_session(op)?.0)
     }
 
-    #[allow(clippy::type_complexity)]
-    fn op_with_session(
-        &self,
-        op: &VaultOp,
-    ) -> Result<
-        (
-            Vec<VerifiedDescriptor>,
-            Option<SessionToken>,
-            Option<ReleasedKeys>,
-        ),
-        Error,
-    > {
+    fn op_with_session(&self, op: &VaultOp) -> Result<OpAnswer, Error> {
         let public = self.public()?;
         // This host's pins, windows and freezes included (§1.4, §2): a
         // vault descriptor is fetched through a verified advertisement,
@@ -363,11 +360,13 @@ impl<'a> Seal<'a> {
         let (reply, _) = flows::exchange_with(
             &Deployment::servers(&public.servers),
             &trust,
-            &public.realm,
-            &anchors,
-            &heads,
-            &retired,
-            &frozen,
+            flows::Pins {
+                realm: &public.realm,
+                anchors: &anchors,
+                heads: &heads,
+                retired: &retired,
+                frozen: &frozen,
+            },
             known,
             Operation::Vault,
             |adv| {
@@ -684,11 +683,13 @@ impl<'a> Seal<'a> {
             let (answer, _) = flows::exchange_with(
                 &deployment,
                 &trust,
-                &public.realm,
-                &anchors,
-                &heads,
-                &retired,
-                &frozen,
+                flows::Pins {
+                    realm: &public.realm,
+                    anchors: &anchors,
+                    heads: &heads,
+                    retired: &retired,
+                    frozen: &frozen,
+                },
                 known,
                 Operation::Tlog,
                 |adv| {
@@ -808,11 +809,13 @@ impl<'a> Seal<'a> {
             let Ok((endpoint, v, _)) = flows::verified(
                 server,
                 &trust,
-                &public.realm,
-                &anchors,
-                &heads,
-                &retired,
-                &frozen,
+                flows::Pins {
+                    realm: &public.realm,
+                    anchors: &anchors,
+                    heads: &heads,
+                    retired: &retired,
+                    frozen: &frozen,
+                },
                 known,
             ) else {
                 continue;

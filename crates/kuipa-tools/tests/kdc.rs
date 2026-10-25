@@ -40,7 +40,9 @@ use kuipad::keystore::KeyStore;
 use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
-use tang_pqc::{ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, unix_seconds};
+use tang_pqc::{
+    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, Thumbprint, unix_seconds,
+};
 
 const REALM: &str = "EXAMPLE.TEST";
 const SERVER: &str = "ipa1.example.test";
@@ -177,47 +179,53 @@ fn kvnos(path: &Path) -> Vec<u32> {
     v
 }
 
-#[test]
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
-fn against_a_real_kdc() {
-    let Some(realm) = Realm::start(REALM, "kdc") else {
-        return;
-    };
-    let realm = Arc::new(realm);
-    let admin_ccache = realm.dir.join("admin.ccache");
-    // The daemon listens on a fixed local port chosen before any thread
-    // starts, so KUIPA_ENDPOINTS can map the server's FQDN to it.
-    let listeners = [(); 2].map(|()| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
-    let urls = listeners
-        .each_ref()
-        .map(|l| format!("http://{}", l.local_addr().unwrap()));
-    let mut env = realm.env();
-    env.push(("KRB5CCNAME", format!("FILE:{}", admin_ccache.display())));
-    env.push((
-        "KUIPA_ENDPOINTS",
-        format!("{SERVER}={},{SERVER2}={}", urls[0], urls[1]),
-    ));
-    // The KDC for the armoured exchanges kuipa makes itself.
-    env.push(("KUIPA_KDC", realm.socket.display().to_string()));
-    // Vault sessions live in a runtime directory of their own.
-    env.push((
-        "KUIPA_RUNTIME_DIR",
-        realm.dir.join("run-user").display().to_string(),
-    ));
-    // A software token (kryoptic) for a PKCS#11 device, when installed.
-    let token_conf = realm.dir.join("kryoptic.conf");
-    std::fs::write(
-        &token_conf,
-        format!(
-            "[[slots]]\nslot = 42\ndbtype = \"sqlite\"\ndbargs = \"{}\"\n",
-            realm.dir.join("token.sql").display()
-        ),
-    )
-    .unwrap();
-    env.push(("KRYOPTIC_CONF", token_conf.display().to_string()));
-    set_env(&env);
-    realm.add_user(ADMIN, "Admin123");
+/// The state the scenario's sections share: the realm and its directory,
+/// the two IPA servers and the anchors they vouch for, and web1's root.
+struct Scenario {
+    realm: Arc<Realm>,
+    directory: Arc<KdcDirectory>,
+    ipa: Vec<Arc<EnrollServer>>,
+    own_anchors: Vec<Thumbprint>,
+    urls: [String; 2],
+    admin_ccache: std::path::PathBuf,
+    web1: Paths,
+    servers: Deployment,
+    anchors: [Thumbprint; 1],
+}
 
+/// The files a keytab and a file protection left behind, for the checks
+/// that follow.
+#[derive(Clone)]
+struct Copies {
+    http: std::path::PathBuf,
+    http_keys: Vec<u8>,
+    service: String,
+    as_keytab: Target,
+    secret: std::path::PathBuf,
+    as_file: Target,
+    copy: std::path::PathBuf,
+    stale: std::path::PathBuf,
+}
+
+/// Alice's login and her personal vault, for the sections that use them.
+struct Alice {
+    cc: String,
+    home: UserPaths,
+    bob_cc: String,
+    sealed: Vec<u8>,
+}
+
+/// An enrollment string for `anchor`, with the one-time `secret` if any.
+fn enrollment_string(anchor: Thumbprint, secret: Option<&[u8]>) -> EnrollmentString {
+    EnrollmentString::new(
+        REALM,
+        anchor,
+        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        secret.map(Secret::new),
+    )
+}
+
+fn check_channel_bindings(realm: &Realm) {
     // ── GSS-API channel bindings, as the daemon and the client use them ──
     let svc = realm.dir.join("kuipa.keytab");
     std::fs::write(&svc, realm.new_keys(&format!("ipa-ku/{SERVER}@{REALM}"))).unwrap();
@@ -263,7 +271,112 @@ fn against_a_real_kdc() {
             assert!(kuipa_gssapi::accept_bound(&elsewhere, &t, &[3; 32], b"in", 32).is_err());
         }
     }
+}
 
+/// Start one IPA server of the realm, listening on `listener` and peering
+/// with `other`, reachable at `other_url`; returns it and its anchor.
+fn start_ipa_server(
+    realm: &Arc<Realm>,
+    directory: &Arc<KdcDirectory>,
+    fqdn: &str,
+    other: &str,
+    other_url: &str,
+    listener: std::net::TcpListener,
+) -> (Arc<EnrollServer>, Thumbprint) {
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let delegation = Delegation::issue(
+        &anchor,
+        REALM,
+        fqdn,
+        signing.public(),
+        now() - 60,
+        now() + 30 * 86400,
+    )
+    .unwrap();
+    let keys = ServerKeys {
+        signing,
+        join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+        escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
+        trust: Vec::new(),
+        vouchers: Vec::new(),
+        retired: Vec::new(),
+    };
+    let info = RealmInfo {
+        realm: REALM.into(),
+        domain: "example.test".into(),
+        basedn: "dc=example,dc=test".into(),
+        server: fqdn.into(),
+        servers: [SERVER, SERVER2].map(String::from).to_vec(),
+        ca_certs: vec![realm.chain.ca_der.clone()],
+        pkinit_anchors: vec![realm.chain.ca_der.clone()],
+        anchors: vec![*anchor.public().thumbprint()],
+        heads: Vec::new(),
+        trusts: Vec::new(),
+    };
+    let own_anchor = *anchor.public().thumbprint();
+    let key_dir = realm.dir.join(format!("keys-{fqdn}"));
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let alg = kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg());
+    let ledger = Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, fqdn, alg).unwrap());
+    let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
+    let settings = Settings {
+        me: fqdn.into(),
+        realm: REALM.into(),
+        peers: vec![other.into()],
+        discover: false,
+        endpoints: [(other.to_owned(), other_url.to_owned())].into(),
+        interval: Duration::from_millis(500),
+        ca_certs: vec![realm.chain.ca_der.clone()],
+        vouch_interval: Duration::ZERO,
+    };
+    let initiator = Arc::new(KeytabInitiator::new(
+        realm
+            .dir
+            .join(format!("kuipa-{fqdn}.keytab"))
+            .display()
+            .to_string(),
+        format!("ipa-ku/{fqdn}@{REALM}"),
+    ));
+    let peers = Peers::new(
+        settings,
+        Some(anchor),
+        server.clone(),
+        directory.clone(),
+        initiator,
+        KeyStore::new(key_dir),
+    )
+    .unwrap();
+    spawn(
+        listener,
+        Arc::new(App {
+            server: server.clone(),
+            directory: directory.clone(),
+            peers: Some(peers),
+            // Generous: a refusal in this test is the policy's, never
+            // the rate limit's.
+            limiter: kuipad::limit::Limiter::new(kuipad::limit::Limits {
+                per_host: kuipad::limit::Rate {
+                    burst: 1000.0,
+                    per_minute: 1000.0,
+                },
+                ..kuipad::limit::Limits::default()
+            }),
+            tang: None,
+            keys: None,
+            ledger: Some(ledger),
+        }),
+    );
+    (server, own_anchor)
+}
+
+/// Start both IPA servers of the realm, each with its own anchor; returns
+/// their directory, the servers and their anchors.
+fn start_ipa_servers(
+    realm: &Arc<Realm>,
+    listeners: [std::net::TcpListener; 2],
+    urls: &[String; 2],
+) -> (Arc<KdcDirectory>, Vec<Arc<EnrollServer>>, Vec<Thumbprint>) {
     // ── Two IPA servers, each with its own anchor, realm info with the real CA ──
     let names = [SERVER, SERVER2];
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &names, &[ADMIN]));
@@ -278,95 +391,17 @@ fn against_a_real_kdc() {
     let mut ipa = Vec::new();
     for (i, listener) in listeners.into_iter().enumerate() {
         let (fqdn, other) = (names[i], names[1 - i]);
-        let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-        let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-        let delegation = Delegation::issue(
-            &anchor,
-            REALM,
-            fqdn,
-            signing.public(),
-            now() - 60,
-            now() + 30 * 86400,
-        )
-        .unwrap();
-        let keys = ServerKeys {
-            signing,
-            join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-            escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-            trust: Vec::new(),
-            vouchers: Vec::new(),
-            retired: Vec::new(),
-        };
-        let info = RealmInfo {
-            realm: REALM.into(),
-            domain: "example.test".into(),
-            basedn: "dc=example,dc=test".into(),
-            server: fqdn.into(),
-            servers: names.map(String::from).to_vec(),
-            ca_certs: vec![realm.chain.ca_der.clone()],
-            pkinit_anchors: vec![realm.chain.ca_der.clone()],
-            anchors: vec![*anchor.public().thumbprint()],
-            heads: Vec::new(),
-            trusts: Vec::new(),
-        };
-        own_anchors.push(*anchor.public().thumbprint());
-        let key_dir = realm.dir.join(format!("keys-{fqdn}"));
-        std::fs::create_dir_all(&key_dir).unwrap();
-        let alg = kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg());
-        let ledger =
-            Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, fqdn, alg).unwrap());
-        let server =
-            Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
-        let settings = Settings {
-            me: fqdn.into(),
-            realm: REALM.into(),
-            peers: vec![other.into()],
-            discover: false,
-            endpoints: [(other.to_owned(), urls[1 - i].clone())].into(),
-            interval: Duration::from_millis(500),
-            ca_certs: vec![realm.chain.ca_der.clone()],
-            vouch_interval: Duration::ZERO,
-        };
-        let initiator = Arc::new(KeytabInitiator::new(
-            realm
-                .dir
-                .join(format!("kuipa-{fqdn}.keytab"))
-                .display()
-                .to_string(),
-            format!("ipa-ku/{fqdn}@{REALM}"),
-        ));
-        let peers = Peers::new(
-            settings,
-            Some(anchor),
-            server.clone(),
-            directory.clone(),
-            initiator,
-            KeyStore::new(key_dir),
-        )
-        .unwrap();
-        spawn(
-            listener,
-            Arc::new(App {
-                server: server.clone(),
-                directory: directory.clone(),
-                peers: Some(peers),
-                // Generous: a refusal in this test is the policy's, never
-                // the rate limit's.
-                limiter: kuipad::limit::Limiter::new(kuipad::limit::Limits {
-                    per_host: kuipad::limit::Rate {
-                        burst: 1000.0,
-                        per_minute: 1000.0,
-                    },
-                    ..kuipad::limit::Limits::default()
-                }),
-                tang: None,
-                keys: None,
-                ledger: Some(ledger),
-            }),
-        );
+        let (server, own_anchor) =
+            start_ipa_server(realm, &directory, fqdn, other, &urls[1 - i], listener);
+        own_anchors.push(own_anchor);
         ipa.push(server);
     }
+    (directory, ipa, own_anchors)
+}
 
+fn await_anchor_exchange(world: &Scenario) {
+    let ipa = &world.ipa;
+    let own_anchors = &world.own_anchors;
     // ── Anchor exchange: Kerberos-authenticated syncs, then cosignatures ──
     wait_for(
         "both servers trust both anchors and both vouch for both claims",
@@ -377,7 +412,7 @@ fn against_a_real_kdc() {
     );
     for (i, s) in ipa.iter().enumerate() {
         assert_eq!(s.anchors()[0], own_anchors[i], "own anchor first");
-        for a in &own_anchors {
+        for a in own_anchors {
             s.delegation()
                 .verify_at(&[*a], &Policy::default(), now())
                 .unwrap();
@@ -391,58 +426,63 @@ fn against_a_real_kdc() {
         let first = ipa[0].epoch_head();
         first.is_some() && ipa.iter().all(|s| s.epoch_head() == first)
     });
-    let servers = Deployment::servers(&[SERVER.to_owned()]);
-    // Clients pin ipa1's anchor only.
-    let anchors = [own_anchors[0]];
-    let string = |secret: Option<&[u8]>| {
-        EnrollmentString::new(
-            REALM,
-            anchors[0],
-            tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
-            secret.map(Secret::new),
-        )
-    };
+}
 
+fn enroll_web1_with_otp(world: &Scenario) -> Vec<u32> {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let servers = &world.servers;
+    let anchors = &world.anchors;
     // ── OTP enrollment, then key rotation authenticated by the host keys ──
     // The OTP is also the host's temporary Kerberos key (FreeIPA's host-add
     // sets it): the host gets a ticket with it and rekeys itself.
     realm.add_user(&format!("host/web1.example.test@{REALM}"), "Secret123");
-    let a = root(&realm, "web1");
-    let mut s = string(Some(b"Secret123"));
+    let mut s = enrollment_string(anchors[0], Some(b"Secret123"));
     let otp = s.take_secret().unwrap();
     flows::enroll_online(
-        &a,
+        a,
         s.realm(),
         &[*s.anchor()],
         &[],
         &[],
-        &Auth::Otp(otp),
-        "web1.example.test",
-        &servers,
+        flows::Host {
+            fqdn: "web1.example.test",
+            auth: &Auth::Otp(otp),
+        },
+        servers,
     )
     .unwrap();
     let first = kvnos(&a.keytab());
     assert_eq!(first.len(), 1);
-    let rotated = flows::rotate_keys(&a, None).unwrap();
+    let rotated = flows::rotate_keys(a, None).unwrap();
     assert_eq!(
         kvnos(&a.keytab()),
         vec![first[0], first[0] + 1],
         "new kvno plus the previous one: {rotated}"
     );
-    let check = flows::check(&a, None).unwrap();
+    let check = flows::check(a, None).unwrap();
     assert_eq!(check["ok"], true, "{check}");
+    first
+}
 
+fn protect_keytab(world: &Scenario, first: &[u32]) {
+    let a = &world.web1;
     // ── Keytab protection: rekey with escrow registration, unseal, undo ──
-    flows::protect(&a, &Target::Host).unwrap();
+    flows::protect(a, &Target::Host).unwrap();
     assert!(
         std::fs::symlink_metadata(a.keytab())
             .unwrap()
             .file_type()
             .is_symlink()
     );
-    assert_eq!(flows::unseal(&a).unwrap().kvno(), Some(first[0] + 2));
-    assert_eq!(flows::check(&a, None).unwrap()["ok"], true);
+    assert_eq!(flows::unseal(a).unwrap().kvno(), Some(first[0] + 2));
+    assert_eq!(flows::check(a, None).unwrap()["ok"], true);
+}
 
+fn protect_other_keytab_and_file(world: &Scenario) -> Copies {
+    let realm = &world.realm;
+    let directory = &world.directory;
+    let a = &world.web1;
     // ── Another keytab and any file, sealed for their own principals and
     //    registered outside a rekey, with those principals' keys (§7.5) ──
     let service = format!("HTTP/web1.example.test@{REALM}");
@@ -450,7 +490,7 @@ fn against_a_real_kdc() {
     let http_keys = realm.new_keys(&service);
     std::fs::write(&http, &http_keys).unwrap();
     let as_keytab = Target::Keytab(http.clone());
-    let protected = flows::protect(&a, &as_keytab).unwrap();
+    let protected = flows::protect(a, &as_keytab).unwrap();
     assert_eq!(protected["principal"], service.as_str(), "{protected}");
     assert!(
         std::fs::symlink_metadata(&http)
@@ -467,7 +507,7 @@ fn against_a_real_kdc() {
         path: secret.clone(),
         keytab: None,
     };
-    flows::protect(&a, &as_file).unwrap();
+    flows::protect(a, &as_file).unwrap();
     let host = format!("host/web1.example.test@{REALM}");
     let file_bindings = || directory.escrow_files.lock().unwrap()[&host].clone();
     assert_eq!(file_bindings().len(), 2);
@@ -480,39 +520,72 @@ fn against_a_real_kdc() {
     // again, which retires the previous seal's bindings.
     let first_seal = std::fs::read(paths::sealed_for(&secret)).unwrap();
     std::fs::write(&secret, b"token=second\n").unwrap();
-    let resealed = flows::protect(&a, &as_file).unwrap();
+    let resealed = flows::protect(a, &as_file).unwrap();
     assert_eq!(resealed["resealed"], true);
     assert_eq!(file_bindings().len(), 2, "the old seal's bindings retired");
     let stale = realm.dir.join("stale.sealed");
     std::fs::write(&stale, &first_seal).unwrap();
-    assert!(
-        flows::unseal_file(&a, &stale).is_err(),
-        "retired seal opens"
-    );
+    assert!(flows::unseal_file(a, &stale).is_err(), "retired seal opens");
+    Copies {
+        http,
+        http_keys,
+        service,
+        as_keytab,
+        secret,
+        as_file,
+        copy,
+        stale,
+    }
+}
 
+fn restore_copies_at_boot(world: &Scenario, copies: &Copies) {
+    let a = &world.web1;
+    let Copies {
+        http,
+        http_keys,
+        copy,
+        secret,
+        ..
+    } = copies.clone();
     // At boot every copy comes back through a server, as the host keytab
     // does; a host rekey replaces only the host's keytab bindings.
-    flows::rotate_keys(&a, None).unwrap();
+    flows::rotate_keys(a, None).unwrap();
     for p in [a.run_keytab(), a.run_copy(&http), copy.clone()] {
         std::fs::remove_file(p).unwrap();
     }
-    let all = flows::unseal_all(&a).unwrap();
+    let all = flows::unseal_all(a).unwrap();
     assert_eq!(all["written"].as_array().unwrap().len(), 3, "{all}");
     assert_eq!(std::fs::read(&http).unwrap(), http_keys);
     assert_eq!(std::fs::read(&secret).unwrap(), b"token=second\n");
-    let check = flows::check(&a, None).unwrap();
+    let check = flows::check(a, None).unwrap();
     assert_eq!(check["ok"], true, "{check}");
     assert_eq!(
-        flows::status(&a).unwrap()["protected"]
+        flows::status(a).unwrap()["protected"]
             .as_array()
             .unwrap()
             .len(),
         2
     );
+}
 
+fn undo_copies(world: &Scenario, copies: &Copies) {
+    let directory = &world.directory;
+    let a = &world.web1;
+    let Copies {
+        http,
+        http_keys,
+        secret,
+        as_file,
+        as_keytab,
+        service,
+        stale,
+        ..
+    } = copies.clone();
+    let host = format!("host/web1.example.test@{REALM}");
+    let file_bindings = || directory.escrow_files.lock().unwrap()[&host].clone();
     // Undo: plain again, and the bindings retired.
     let sealed_secret = std::fs::read(paths::sealed_for(&secret)).unwrap();
-    let undone = flows::unprotect(&a, &as_file).unwrap();
+    let undone = flows::unprotect(a, &as_file).unwrap();
     assert_eq!(undone["retired"], true, "{undone}");
     assert!(
         !std::fs::symlink_metadata(&secret)
@@ -526,11 +599,8 @@ fn against_a_real_kdc() {
         Vec::<kuipa_enroll::escrow::BindingHash>::new()
     );
     std::fs::write(&stale, &sealed_secret).unwrap();
-    assert!(
-        flows::unseal_file(&a, &stale).is_err(),
-        "retired seal opens"
-    );
-    let undone = flows::unprotect(&a, &as_keytab).unwrap();
+    assert!(flows::unseal_file(a, &stale).is_err(), "retired seal opens");
+    let undone = flows::unprotect(a, &as_keytab).unwrap();
     assert_eq!(undone["retired"], true, "{undone}");
     assert_eq!(std::fs::read(&http).unwrap(), http_keys);
     assert_eq!(
@@ -538,7 +608,11 @@ fn against_a_real_kdc() {
         Vec::<kuipa_enroll::escrow::BindingHash>::new()
     );
     assert!(!paths::sealed_for(&http).exists());
+}
 
+fn personal_vault(world: &Scenario) -> Alice {
+    let realm = &world.realm;
+    let a = &world.web1;
     // ── A user's own vault, with her ticket and a passphrase device (§7.6) ──
     // Alice is not root: she reads the host's public realm.json, anchors
     // and CA, and keeps everything of hers in her own directory.
@@ -547,7 +621,7 @@ fn against_a_real_kdc() {
     realm.kinit("alice@EXAMPLE.TEST", "Alice123", &alice_cc, None, None);
     let alice_cc = format!("FILE:{}", alice_cc.display());
     let home = UserPaths::new(realm.dir.join("alice-home"));
-    let seal = Seal::new(&a, &home, Some(&alice_cc));
+    let seal = Seal::new(a, &home, Some(&alice_cc));
     let policy = vault::Policy {
         factors: vault::Factors {
             device: Some(vault::Level::Any),
@@ -588,9 +662,21 @@ fn against_a_real_kdc() {
     let bob_cc = realm.dir.join("bob.ccache");
     realm.kinit("bob@EXAMPLE.TEST", "Bob12345", &bob_cc, None, None);
     let bob_cc = format!("FILE:{}", bob_cc.display());
-    let as_bob = Seal::new(&a, &home, Some(&bob_cc));
+    let as_bob = Seal::new(a, &home, Some(&bob_cc));
     assert!(as_bob.open(&sealed, Some(b"correct horse")).is_err());
+    Alice {
+        cc: alice_cc,
+        home,
+        bob_cc,
+        sealed,
+    }
+}
 
+fn tlog_watch(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let alice_cc = alice.cc.as_str();
     // ── Her vault's transparency logs (DESIGN-tlog.md §7) ──
     // The first watch sets the baseline: history listed, nothing flagged.
     let first = seal.watch("personal").unwrap();
@@ -612,7 +698,7 @@ fn against_a_real_kdc() {
     // A device added elsewhere — her laptop, or someone holding her
     // ticket — is not in this host's descriptor: flagged.
     let laptop = UserPaths::new(realm.dir.join("alice-laptop"));
-    Seal::new(&a, &laptop, Some(&alice_cc))
+    Seal::new(a, &laptop, Some(alice_cc))
         .add_device("personal", b"battery staple")
         .unwrap();
     let flagged = seal.watch("personal").unwrap();
@@ -627,7 +713,7 @@ fn against_a_real_kdc() {
     // A server whose key changed category (a crypto policy change) keeps
     // a new log under a new id: reported as such, read from its start, not
     // a fork.
-    let state_path = home_dir_of(&realm).join("vaults/personal.tlog");
+    let state_path = home_dir_of(realm).join("vaults/personal.tlog");
     let mut watched: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
     for w in watched.as_object_mut().unwrap().values_mut() {
@@ -639,6 +725,15 @@ fn against_a_real_kdc() {
     assert!(!moved["relogged"].as_array().unwrap().is_empty(), "{moved}");
     assert!(moved["baseline"].as_array().unwrap().is_empty(), "{moved}");
     assert!(!moved["events"].as_array().unwrap().is_empty(), "{moved}");
+}
+
+fn tlog_diverged(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let as_bob = Seal::new(a, &alice.home, Some(&alice.bob_cc));
+    let sealed = &alice.sealed;
+    let state_path = home_dir_of(realm).join("vaults/personal.tlog");
     // A log that does not extend what was seen is reported as forked.
     let mut watched: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
@@ -659,8 +754,13 @@ fn against_a_real_kdc() {
     let listed = seal.list().unwrap();
     assert_eq!(listed["vaults"].as_array().unwrap().len(), 1);
     seal.revoke("personal").unwrap();
-    assert!(seal.open(&sealed, Some(b"correct horse")).is_err());
+    assert!(seal.open(sealed, Some(b"correct horse")).is_err());
+}
 
+fn daily_session(world: &Scenario, alice: &Alice) {
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let as_bob = Seal::new(a, &alice.home, Some(&alice.bob_cc));
     // A session: one passphrase and ticket, then files open without either;
     // the servers count every release against the limit.
     let daily = vault::Policy {
@@ -701,7 +801,12 @@ fn against_a_real_kdc() {
         seal.open(&note, Some(b"correct horse")).is_err(),
         "the fifth unlock is over the limit"
     );
+}
 
+fn offline_session(world: &Scenario, alice: &Alice) {
+    let directory = &world.directory;
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
     // An offline session, once the realm allows them: files sealed with
     // --session open from the released key and the device, on this host.
     directory.limits.lock().unwrap().offline_sessions = true;
@@ -731,7 +836,11 @@ fn against_a_real_kdc() {
     assert_eq!(seal.open(&pass, None).unwrap().as_ref(), b"boarding pass");
     seal.lock("travel").unwrap();
     assert!(seal.open(&pass, None).is_err(), "locked");
+}
 
+fn registered_sealing(world: &Scenario, alice: &Alice) {
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
     // Registered sealing: a reseal or a retire makes old copies unopenable.
     let kept = vault::Policy {
         factors: vault::Factors {
@@ -763,7 +872,13 @@ fn against_a_real_kdc() {
         seal.open(&second, Some(b"correct horse")).is_err(),
         "retired"
     );
+}
 
+fn shared_vault(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let bob_cc = alice.bob_cc.as_str();
     // ── A vault shared with a teammate (§7.6.12) ──
     // Bob names it alice/team, registers his own device from his own
     // directory, and opens with his device and his ticket.
@@ -790,7 +905,7 @@ fn against_a_real_kdc() {
         "{shared}"
     );
     let bob_home = UserPaths::new(realm.dir.join("bob-home"));
-    let bob = Seal::new(&a, &bob_home, Some(&bob_cc));
+    let bob = Seal::new(a, &bob_home, Some(bob_cc));
     assert!(bob.show("team").is_err(), "a bare name is Bob's own");
     bob.add_device("alice/team", b"bob's phrase").unwrap();
     let listed = bob.list().unwrap();
@@ -835,12 +950,17 @@ fn against_a_real_kdc() {
     );
     assert!(bob.open(&note, Some(b"bob's phrase")).is_err());
     assert!(seal.open(&note, Some(b"correct horse")).is_ok());
+}
 
+fn token_device(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let alice_cc = alice.cc.as_str();
     // A device on a token: an ML-KEM key that never leaves it, used through
     // pkcs11-provider; the PIN takes the passphrase's place.
     if let Some(module) = token_with_ml_kem_key() {
         let home = UserPaths::new(realm.dir.join("alice-token-home"));
-        let seal = Seal::new(&a, &home, Some(&alice_cc));
+        let seal = Seal::new(a, &home, Some(alice_cc));
         let policy = vault::Policy {
             factors: vault::Factors {
                 device: Some(vault::Level::Any),
@@ -868,30 +988,47 @@ fn against_a_real_kdc() {
             b"on the token"
         );
     }
+}
 
-    flows::unprotect(&a, &Target::Host).unwrap();
+fn unprotect_host(world: &Scenario) {
+    let a = &world.web1;
+    flows::unprotect(a, &Target::Host).unwrap();
     assert!(!a.sealed().exists());
-    flows::rotate_keys(&a, None).unwrap();
+    flows::rotate_keys(a, None).unwrap();
+}
 
+fn admin_ticket(world: &Scenario) {
+    let realm = &world.realm;
+    let servers = &world.servers;
+    let anchors = &world.anchors;
+    let admin_ccache = &world.admin_ccache;
     // ── An administrator's existing ticket ──
-    realm.kinit(ADMIN, "Admin123", &admin_ccache, None, None);
-    let b = root(&realm, "web2");
+    realm.kinit(ADMIN, "Admin123", admin_ccache, None, None);
+    let b = root(realm, "web2");
     flows::enroll_online(
         &b,
         REALM,
-        &anchors,
+        anchors,
         &[],
         &[],
-        &Auth::Ccache,
-        "web2.example.test",
-        &servers,
+        flows::Host {
+            fqdn: "web2.example.test",
+            auth: &Auth::Ccache,
+        },
+        servers,
     )
     .unwrap();
     assert_eq!(kvnos(&b.keytab()).len(), 1);
+}
 
+fn bootstrap_2fa(world: &Scenario) -> std::path::PathBuf {
+    let realm = &world.realm;
+    let servers = &world.servers;
+    let anchors = &world.anchors;
+    let admin_ccache = &world.admin_ccache;
     // ── 2FA bootstrap: the advertisement's PKINIT anchors give FAST armour ──
     let boot = realm.dir.join("bootstrap");
-    flows::realm_info(REALM, &anchors, &[], &servers, &boot).unwrap();
+    flows::realm_info(REALM, anchors, &[], servers, &boot).unwrap();
     // The generated krb5.conf names KDCs by FQDN; this KDC is on a socket.
     let conf = std::fs::read_to_string(boot.join("krb5.conf"))
         .unwrap()
@@ -918,7 +1055,7 @@ fn against_a_real_kdc() {
     realm.kinit(
         ADMIN,
         "Admin123",
-        &admin_ccache,
+        admin_ccache,
         Some(&armor),
         Some(&conf_path),
     );
@@ -935,9 +1072,15 @@ fn against_a_real_kdc() {
         )
         .is_err()
     );
+    conf_path
+}
 
+fn password_enrollment(world: &Scenario) {
+    let realm = &world.realm;
+    let servers = &world.servers;
+    let anchors = &world.anchors;
     // ── A user's password: an armoured kinit on the host, then Kerberos ──
-    let g = root(&realm, "web6");
+    let g = root(realm, "web6");
     let password = |p: &[u8]| Auth::Password {
         principal: "admin".into(),
         password: Secret::new(p),
@@ -945,12 +1088,14 @@ fn against_a_real_kdc() {
     let err = flows::enroll_online(
         &g,
         REALM,
-        &anchors,
+        anchors,
         &[],
         &[],
-        &password(b"guess"),
-        "web6.example.test",
-        &servers,
+        flows::Host {
+            fqdn: "web6.example.test",
+            auth: &password(b"guess"),
+        },
+        servers,
     )
     .unwrap_err();
     assert!(
@@ -960,23 +1105,30 @@ fn against_a_real_kdc() {
     flows::enroll_online(
         &g,
         REALM,
-        &anchors,
+        anchors,
         &[],
         &[],
-        &password(b"Admin123"),
-        "web6.example.test",
-        &servers,
+        flows::Host {
+            fqdn: "web6.example.test",
+            auth: &password(b"Admin123"),
+        },
+        servers,
     )
     .unwrap();
     assert_eq!(kvnos(&g.keytab()).len(), 1);
+}
 
+fn collection_through_kuipa(world: &Scenario, conf_path: &Path) {
+    let realm = &world.realm;
+    let servers = &world.servers;
+    let anchors = &world.anchors;
     // ── Collection through kuipa: nobody brought a password ──
     let collected = Scripted {
         answer: b"Admin123",
         asked: std::cell::RefCell::new(Vec::new()),
     };
     kuipa_gssapi::ticket(
-        &conf_path,
+        conf_path,
         ADMIN,
         None,
         &format!("ipa-ku/{SERVER}@{REALM}"),
@@ -994,7 +1146,7 @@ fn against_a_real_kdc() {
         asked: std::cell::RefCell::new(Vec::new()),
     };
     kuipa_gssapi::ticket(
-        &conf_path,
+        conf_path,
         ADMIN,
         Some(b"Admin123"),
         &format!("ipa-ku/{SERVER}@{REALM}"),
@@ -1012,7 +1164,7 @@ fn against_a_real_kdc() {
     assert!(
         matches!(
             kuipa_gssapi::ticket(
-                &conf_path,
+                conf_path,
                 ADMIN,
                 None,
                 &format!("ipa-ku/{SERVER}@{REALM}"),
@@ -1024,30 +1176,36 @@ fn against_a_real_kdc() {
         "an uncollectable factor must be named"
     );
 
-    let c = root(&realm, "web3");
+    let c = root(realm, "web3");
     flows::enroll_online(
         &c,
         REALM,
-        &anchors,
+        anchors,
         &[],
         &[],
-        &Auth::Ccache,
-        "web3.example.test",
-        &servers,
+        flows::Host {
+            fqdn: "web3.example.test",
+            auth: &Auth::Ccache,
+        },
+        servers,
     )
     .unwrap();
+}
 
+fn offline_enrollment(world: &Scenario) {
+    let realm = &world.realm;
+    let anchors = &world.anchors;
     // ── Offline: prepare, stage (admin ticket), open the bundle, first contact ──
-    let d = root(&realm, "web4");
+    let d = root(realm, "web4");
     flows::prepare(&d, false, "web4.example.test").unwrap();
     let recipient =
         tang_pqc::ExchangeKey::from_jwk_json(&std::fs::read(d.recipient_public()).unwrap())
             .unwrap();
     let endpoint = Endpoint::new(SERVER, &Trust::FirstContact).unwrap();
     let adv = VerifiedRealm::verify(
-        &endpoint.advertisement(&anchors).unwrap(),
+        &endpoint.advertisement(anchors).unwrap(),
         REALM,
-        &anchors,
+        anchors,
         &Policy::default(),
         SystemTime::now(),
     )
@@ -1087,7 +1245,7 @@ fn against_a_real_kdc() {
     flows::enroll_bundle(
         &d,
         &bundle.to_bytes(),
-        Some(&string(None)),
+        Some(&enrollment_string(anchors[0], None)),
         false,
         Some("web4.example.test"),
     )
@@ -1096,10 +1254,15 @@ fn against_a_real_kdc() {
     let completed = flows::complete(&d).unwrap();
     assert!(!d.pending().exists(), "{completed}");
     assert_eq!(kvnos(&d.keytab()), vec![staged[0], staged[0] + 1]);
+}
 
+fn realm_wide_strings(world: &Scenario) {
+    let realm = &world.realm;
+    let anchors = &world.anchors;
+    let own_anchors = &world.own_anchors;
     // ── Realm-wide strings: ipa1's anchor, enrollment through ipa2 alone ──
-    let e = root(&realm, "web5");
-    let mut s5 = string(Some(b"Secret123"));
+    let e = root(realm, "web5");
+    let mut s5 = enrollment_string(anchors[0], Some(b"Secret123"));
     let otp = s5.take_secret().unwrap();
     let result = flows::enroll_online(
         &e,
@@ -1107,8 +1270,10 @@ fn against_a_real_kdc() {
         &[*s5.anchor()],
         &[],
         &[],
-        &Auth::LdapOtp(otp),
-        "web5.example.test",
+        flows::Host {
+            fqdn: "web5.example.test",
+            auth: &Auth::LdapOtp(otp),
+        },
         &Deployment::servers(&[SERVER2.to_owned()]),
     )
     .unwrap();
@@ -1119,7 +1284,13 @@ fn against_a_real_kdc() {
         [own_anchors[1], own_anchors[0]],
         "issuer's anchor first"
     );
+}
 
+fn refused_syncs(world: &Scenario) {
+    let realm = &world.realm;
+    let ipa = &world.ipa;
+    let own_anchors = &world.own_anchors;
+    let urls = &world.urls;
     // ── Syncs that do not authenticate their sender are refused ──
     let post = |sync: &PeerSync| {
         reqwest::blocking::Client::new()
@@ -1154,6 +1325,83 @@ fn against_a_real_kdc() {
         ..forged.clone()
     };
     assert_eq!(post(&garbage), 403, "no valid token");
+}
+
+#[test]
+fn against_a_real_kdc() {
+    let Some(realm) = Realm::start(REALM, "kdc") else {
+        return;
+    };
+    let realm = Arc::new(realm);
+    let admin_ccache = realm.dir.join("admin.ccache");
+    // The daemon listens on a fixed local port chosen before any thread
+    // starts, so KUIPA_ENDPOINTS can map the server's FQDN to it.
+    let listeners = [(); 2].map(|()| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let urls = listeners
+        .each_ref()
+        .map(|l| format!("http://{}", l.local_addr().unwrap()));
+    let mut env = realm.env();
+    env.push(("KRB5CCNAME", format!("FILE:{}", admin_ccache.display())));
+    env.push((
+        "KUIPA_ENDPOINTS",
+        format!("{SERVER}={},{SERVER2}={}", urls[0], urls[1]),
+    ));
+    // The KDC for the armoured exchanges kuipa makes itself.
+    env.push(("KUIPA_KDC", realm.socket.display().to_string()));
+    // Vault sessions live in a runtime directory of their own.
+    env.push((
+        "KUIPA_RUNTIME_DIR",
+        realm.dir.join("run-user").display().to_string(),
+    ));
+    // A software token (kryoptic) for a PKCS#11 device, when installed.
+    let token_conf = realm.dir.join("kryoptic.conf");
+    std::fs::write(
+        &token_conf,
+        format!(
+            "[[slots]]\nslot = 42\ndbtype = \"sqlite\"\ndbargs = \"{}\"\n",
+            realm.dir.join("token.sql").display()
+        ),
+    )
+    .unwrap();
+    env.push(("KRYOPTIC_CONF", token_conf.display().to_string()));
+    set_env(&env);
+    realm.add_user(ADMIN, "Admin123");
+
+    check_channel_bindings(&realm);
+    let (directory, ipa, own_anchors) = start_ipa_servers(&realm, listeners, &urls);
+    let world = Scenario {
+        web1: root(&realm, "web1"),
+        servers: Deployment::servers(&[SERVER.to_owned()]),
+        anchors: [own_anchors[0]],
+        realm,
+        directory,
+        ipa,
+        own_anchors,
+        urls,
+        admin_ccache,
+    };
+    await_anchor_exchange(&world);
+    let first = enroll_web1_with_otp(&world);
+    protect_keytab(&world, &first);
+    let copies = protect_other_keytab_and_file(&world);
+    restore_copies_at_boot(&world, &copies);
+    undo_copies(&world, &copies);
+    let alice = personal_vault(&world);
+    tlog_watch(&world, &alice);
+    tlog_diverged(&world, &alice);
+    daily_session(&world, &alice);
+    offline_session(&world, &alice);
+    registered_sealing(&world, &alice);
+    shared_vault(&world, &alice);
+    token_device(&world, &alice);
+    unprotect_host(&world);
+    admin_ticket(&world);
+    let conf_path = bootstrap_2fa(&world);
+    password_enrollment(&world);
+    collection_through_kuipa(&world, &conf_path);
+    offline_enrollment(&world);
+    realm_wide_strings(&world);
+    refused_syncs(&world);
 }
 
 /// Alice's data directory in the test realm.

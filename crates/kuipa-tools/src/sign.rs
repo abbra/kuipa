@@ -95,11 +95,13 @@ pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Ve
     let (bundles, _) = flows::exchange_with(
         &Deployment::servers(&public.servers),
         &trust,
-        &public.realm,
-        &anchors,
-        &heads,
-        &retired,
-        &frozen,
+        flows::Pins {
+            realm: &public.realm,
+            anchors: &anchors,
+            heads: &heads,
+            retired: &retired,
+            frozen: &frozen,
+        },
         known,
         Operation::Sign,
         |adv| {

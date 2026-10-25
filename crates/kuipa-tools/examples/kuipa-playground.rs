@@ -77,7 +77,6 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-#[allow(clippy::too_many_lines)]
 fn run(args: &[String]) -> Result<(), Error> {
     let env_file = PathBuf::from(option(args, "--env-file").ok_or("--env-file is required")?);
     let hosts: usize = option(args, "--hosts").map_or(Ok(5), |h| h.parse())?;
@@ -104,49 +103,124 @@ fn run(args: &[String]) -> Result<(), Error> {
     let (trusted_anchor, trusted_directory, trusted_url) = start_trusted(&trusted, &rt)?;
 
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &SERVERS, &[ADMIN]));
-    // Write the initial `cn=masters` state and watch for changes from
-    // `kuipa-playground masters` (the promotion story of §18): a thread
-    // applies them to the directory and acknowledges them.
-    {
-        let initial = serde_json::to_string_pretty(&serde_json::json!({
-            "masters": SERVERS,
-            "ca": [SERVERS[0]],
-        }))?;
-        std::fs::write(dir.join("masters.json"), &initial)?;
-        let watch = directory.clone();
-        let path = dir.join("masters.json");
-        let ack = dir.join("masters.ack");
-        std::thread::spawn(move || {
-            let mut last = String::new();
-            loop {
-                let applied = std::fs::read_to_string(&path)
-                    .ok()
-                    .filter(|text| *text != last)
-                    .and_then(|text| {
-                        serde_json::from_str::<serde_json::Value>(&text)
-                            .ok()
-                            .map(|state| (text, state))
-                    })
-                    .and_then(|(text, state)| {
-                        let names = |key: &str| -> Vec<String> {
-                            state[key]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|v| v.as_str().map(str::to_owned))
-                                .collect()
-                        };
-                        *watch.masters.lock().unwrap() = names("masters");
-                        *watch.ca_masters.lock().unwrap() = names("ca");
-                        std::fs::write(&ack, &text).is_ok().then_some(text)
-                    });
-                if let Some(text) = applied {
-                    last = text;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
+    publish_masters(&dir, &directory)?;
+    configure_policy(&directory);
+    seed_secrets(&directory);
+    let Started {
+        anchor,
+        mut endpoints,
+        servers,
+    } = start_servers(&realm, &directory, &rt)?;
+    endpoints.push(format!("{TRUSTED_SERVER}={trusted_url}"));
+
+    // B.TEST invites EXAMPLE.TEST, and ipa1 establishes the trust: both
+    // KDCs get the cross-realm keys from the derived secret, and every
+    // EXAMPLE.TEST server publishes B.TEST from the directory (§17.4).
+    let invitation = Invitation::new(TRUSTED_REALM, trusted_anchor)?;
+    trusted_directory.add_trust_invitation(&invitation.secret_hash()?, now() + 3600)?;
+    let shared: Arc<dyn Directory + Send + Sync> = directory.clone();
+    let trusted_endpoints =
+        std::collections::BTreeMap::from([(TRUSTED_SERVER.to_owned(), trusted_url)]);
+    rt.block_on(kuipad::trust::establish(
+        &servers[0],
+        &invitation,
+        &[TRUSTED_SERVER.to_owned()],
+        &trusted_endpoints,
+        &*shared,
+    ))?;
+    for server in &servers {
+        rt.block_on(kuipad::trust::refresh(
+            server,
+            &shared,
+            &[],
+            &trusted_endpoints,
+        ));
     }
+    println!("trust established: {REALM} trusts {TRUSTED_REALM} and the other way round");
+    // Enrollment strings pin ipa1's anchor; every server carries its
+    // signature after the exchange.
+    std::fs::write(dir.join("anchor"), anchor.to_string())?;
+
+    write_enrollment_strings(&dir, &realm, &directory, anchor, hosts)?;
+    // DNS for both realms, as FreeIPA publishes it: `kuipa enroll` finds
+    // the servers without `--server`.
+    let srv = |servers: &[&str]| -> Vec<support::dns::Record> {
+        servers
+            .iter()
+            .map(|s| (0, 100, 389, (*s).to_owned()))
+            .collect()
+    };
+    let dns = support::dns::serve(
+        [
+            (format!("_ldap._tcp.{DOMAIN}"), srv(&SERVERS)),
+            (
+                format!("_ldap._tcp.{TRUSTED_DOMAIN}"),
+                srv(&[TRUSTED_SERVER]),
+            ),
+        ]
+        .into(),
+        false,
+    );
+    let env = shell_settings(&realm, &trusted, &anchor, &endpoints.join(","), dns)?;
+    std::fs::write(&env_file, env)?;
+    println!("playground realm {REALM} ready in {}", dir.display());
+
+    wait_for_shutdown(&rt)?;
+    drop(rt);
+    drop(directory);
+    drop(realm);
+    drop(trusted);
+    Ok(())
+}
+
+/// Write the initial `cn=masters` state, and watch for changes from
+/// `kuipa-playground masters` (the promotion story of §18): a thread
+/// applies them to the directory and acknowledges them.
+fn publish_masters(dir: &Path, directory: &Arc<KdcDirectory>) -> Result<(), Error> {
+    let initial = serde_json::to_string_pretty(&serde_json::json!({
+        "masters": SERVERS,
+        "ca": [SERVERS[0]],
+    }))?;
+    std::fs::write(dir.join("masters.json"), &initial)?;
+    let watch = directory.clone();
+    let path = dir.join("masters.json");
+    let ack = dir.join("masters.ack");
+    std::thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            let applied = std::fs::read_to_string(&path)
+                .ok()
+                .filter(|text| *text != last)
+                .and_then(|text| {
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .map(|state| (text, state))
+                })
+                .and_then(|(text, state)| {
+                    let names = |key: &str| -> Vec<String> {
+                        state[key]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    };
+                    *watch.masters.lock().unwrap() = names("masters");
+                    *watch.ca_masters.lock().unwrap() = names("ca");
+                    std::fs::write(&ack, &text).is_ok().then_some(text)
+                });
+            if let Some(text) = applied {
+                last = text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    Ok(())
+}
+
+/// The playground realm's policy: offline vault sessions, and the release
+/// group's signing, with the administrator in it.
+fn configure_policy(directory: &KdcDirectory) {
     // The playground realm's administrators allow offline vault sessions.
     directory.limits.lock().unwrap().offline_sessions = true;
     // And let the release group sign blobs (DESIGN-sign.md); the
@@ -170,6 +244,11 @@ fn run(args: &[String]) -> Result<(), Error> {
         .lock()
         .unwrap()
         .insert(ADMIN.into(), vec!["release".into()]);
+}
+
+/// The secrets the directory serves: ipa1 is the CA and renewal master,
+/// holding the material a promoting replica would fetch.
+fn seed_secrets(directory: &KdcDirectory) {
     // The secrets transport (§18): ipa1 is the CA and renewal master, as
     // in a fresh IPA deployment, and holds the material a promoting
     // replica would fetch (the DM password hash, the RA agent key, a
@@ -214,41 +293,17 @@ fn run(args: &[String]) -> Result<(), Error> {
                 .to_vec(),
         );
     }
-    let Started {
-        anchor,
-        mut endpoints,
-        servers,
-    } = start_servers(&realm, &directory, &rt)?;
-    endpoints.push(format!("{TRUSTED_SERVER}={trusted_url}"));
+}
 
-    // B.TEST invites EXAMPLE.TEST, and ipa1 establishes the trust: both
-    // KDCs get the cross-realm keys from the derived secret, and every
-    // EXAMPLE.TEST server publishes B.TEST from the directory (§17.4).
-    let invitation = Invitation::new(TRUSTED_REALM, trusted_anchor)?;
-    trusted_directory.add_trust_invitation(&invitation.secret_hash()?, now() + 3600)?;
-    let shared: Arc<dyn Directory + Send + Sync> = directory.clone();
-    let trusted_endpoints =
-        std::collections::BTreeMap::from([(TRUSTED_SERVER.to_owned(), trusted_url)]);
-    rt.block_on(kuipad::trust::establish(
-        &servers[0],
-        &invitation,
-        &[TRUSTED_SERVER.to_owned()],
-        &trusted_endpoints,
-        &*shared,
-    ))?;
-    for server in &servers {
-        rt.block_on(kuipad::trust::refresh(
-            server,
-            &shared,
-            &[],
-            &trusted_endpoints,
-        ));
-    }
-    println!("trust established: {REALM} trusts {TRUSTED_REALM} and the other way round");
-    // Enrollment strings pin ipa1's anchor; every server carries its
-    // signature after the exchange.
-    std::fs::write(dir.join("anchor"), anchor.to_string())?;
-
+/// The OTP enrollment strings for `hosts` hosts, and the realm's plain one,
+/// as `ipa host-add --random` would print them.
+fn write_enrollment_strings(
+    dir: &Path,
+    realm: &Realm,
+    directory: &KdcDirectory,
+    anchor: Thumbprint,
+    hosts: usize,
+) -> Result<(), Error> {
     // OTP enrollment strings, as `ipa host-add --random` would print them;
     // as host-add does, the OTP is also the host's temporary Kerberos key.
     let enroll_dir = dir.join("enroll");
@@ -271,30 +326,11 @@ fn run(args: &[String]) -> Result<(), Error> {
     // Without a secret: for the password and ticket paths, and bundles.
     let plain = EnrollmentString::new(REALM, anchor, now() + 86_400, None);
     std::fs::write(enroll_dir.join("realm"), plain.encode().as_ref())?;
+    Ok(())
+}
 
-    // DNS for both realms, as FreeIPA publishes it: `kuipa enroll` finds
-    // the servers without `--server`.
-    let srv = |servers: &[&str]| -> Vec<support::dns::Record> {
-        servers
-            .iter()
-            .map(|s| (0, 100, 389, (*s).to_owned()))
-            .collect()
-    };
-    let dns = support::dns::serve(
-        [
-            (format!("_ldap._tcp.{DOMAIN}"), srv(&SERVERS)),
-            (
-                format!("_ldap._tcp.{TRUSTED_DOMAIN}"),
-                srv(&[TRUSTED_SERVER]),
-            ),
-        ]
-        .into(),
-        false,
-    );
-    let env = shell_settings(&realm, &trusted, &anchor, &endpoints.join(","), dns)?;
-    std::fs::write(&env_file, env)?;
-    println!("playground realm {REALM} ready in {}", dir.display());
-
+/// Block until the process is interrupted or terminated.
+fn wait_for_shutdown(rt: &tokio::runtime::Runtime) -> Result<(), Error> {
     rt.block_on(async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
@@ -302,10 +338,6 @@ fn run(args: &[String]) -> Result<(), Error> {
             _ = term.recv() => Ok(()),
         }
     })?;
-    drop(rt);
-    drop(directory);
-    drop(realm);
-    drop(trusted);
     Ok(())
 }
 
@@ -559,7 +591,6 @@ struct Started {
 
 /// The playground shell's settings: the realm's environment, the server
 /// endpoints, and helper functions.
-#[allow(clippy::too_many_lines)] // nearly all of it is the shell template
 fn shell_settings(
     realm: &Realm,
     trusted: &Realm,
@@ -595,7 +626,27 @@ export PQ_TRUSTED_KDC_SOCKET={trusted_socket}
 # The realm's enrollment string without a secret: realm-info, ticket and
 # password joins and bundles find it without anything typed.
 export KUIPA_ENROLLMENT_FILE="$KUIPA_PLAYGROUND/enroll/realm"
-# pq_host NAME: act as host NAME.{DOMAIN} (its own KUIPA_ROOT).
+"#,
+        ccache = shell_quote(&format!("FILE:{}", dir.join("admin.ccache").display())),
+        dir = shell_quote(&dir.display().to_string()),
+        endpoints = shell_quote(endpoints),
+        servers = shell_quote(&server_args),
+        anchor = shell_quote(&anchor.to_string()),
+        socket = shell_quote(&realm.socket.display().to_string()),
+        trusted_realm = TRUSTED_REALM,
+        trusted_socket = shell_quote(&trusted.socket.display().to_string()),
+        dns = dns,
+    )?;
+    shell_functions(&mut env)?;
+    Ok(env)
+}
+
+/// The playground shell's functions: the `pq_*` helpers for hosts, enrollment
+/// and bootstrap.
+fn shell_functions(env: &mut String) -> Result<(), Error> {
+    write!(
+        env,
+        r#"# pq_host NAME: act as host NAME.{DOMAIN} (its own KUIPA_ROOT).
 pq_host() {{
     export PQ_HOST="$1.{DOMAIN}"
     export KUIPA_ROOT="$KUIPA_PLAYGROUND/hosts/$1"
@@ -620,9 +671,9 @@ pq_bootstrap() {{
     kuipa realm-info $PQ_SERVERS --krb5-dir "$d" || return
     sed "s|kdc = [^ ]*:88|kdc = $PQ_KDC_SOCKET|; s|master_kdc = [^ ]*:88|master_kdc = $PQ_KDC_SOCKET|" "$d/krb5.conf" > "$d/krb5.conf.new" || return
     mv "$d/krb5.conf.new" "$d/krb5.conf"
-    KRB5_CONFIG="$d/krb5.conf" kinit -n -c "$d/armor.ccache" @{realm} || return
+    KRB5_CONFIG="$d/krb5.conf" kinit -n -c "$d/armor.ccache" @{REALM} || return
     echo "anonymous PKINIT armour obtained with the advertised anchors"
-    echo {password} | KRB5_CONFIG="$d/krb5.conf" kinit -T "$d/armor.ccache" {admin} >/dev/null || return
+    echo {ADMIN_PASSWORD} | KRB5_CONFIG="$d/krb5.conf" kinit -T "$d/armor.ccache" {ADMIN} >/dev/null || return
     echo "admin ticket obtained through the armoured exchange"
     klist
 }}
@@ -631,61 +682,89 @@ pq_bootstrap() {{
 pq_password() {{
     local name="$1"; shift
     pq_host "$name"
-    echo {password} | kuipa enroll $PQ_SERVERS --hostname "$PQ_HOST" --principal {admin} "$@"
+    echo {ADMIN_PASSWORD} | kuipa enroll $PQ_SERVERS --hostname "$PQ_HOST" --principal {ADMIN} "$@"
 }}
 # pq_offline NAME: prepare NAME, stage it with an admin ticket (what
 # `ipa host-add --pq-stage` does), and enroll it offline from the bundle.
 pq_offline() {{
     pq_host "$1"
     kuipa prepare --hostname "$PQ_HOST" || return
-    echo {password} | kinit {admin} >/dev/null || return
+    echo {ADMIN_PASSWORD} | kinit {ADMIN} >/dev/null || return
     kuipa-playground stage --host "$PQ_HOST" --out "$KUIPA_ROOT/bundle" \
         --recipient "$KUIPA_ROOT/var/lib/ipa-client/ku/recipient.pub.jwk" || return
     kuipa enroll --bundle "$KUIPA_ROOT/bundle" --hostname "$PQ_HOST" \
         --enrollment-file "$KUIPA_PLAYGROUND/enroll/realm"
 }}
-# pq_trust: install the realms this host's realm trusts ({trusted_realm}):
-# their anchors, PKINIT chain and KDCs, verified through {realm}.
+"#,
+    )?;
+    shell_trust_functions(env)
+}
+
+/// The `pq_*` helpers for trust and the administrator's login.
+fn shell_trust_functions(env: &mut String) -> Result<(), Error> {
+    write!(
+        env,
+        r#"# pq_trust: install the realms this host's realm trusts ({TRUSTED_REALM}):
+# their anchors, PKINIT chain and KDCs, verified through {REALM}.
 # pq_admin_kinit: log in as the administrator, with a kuipa data directory
 # of their own, for `kuipa seal`.
 pq_admin_kinit() {{
-    echo {password} | kinit {admin} >/dev/null || return
+    echo {ADMIN_PASSWORD} | kinit {ADMIN} >/dev/null || return
     export KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin"
     # Sessions stay inside the playground, not in the real runtime directory.
     export KUIPA_RUNTIME_DIR="$KUIPA_PLAYGROUND/run-user/admin"
     klist
 }}
 pq_trust() {{ kuipa trusted-realms "$@"; }}
-# pq_trusted_kinit [USER]: log in a user of {trusted_realm} on this host
-# (default {trusted_user}; a bare name is taken as USER@{trusted_realm}):
-# anonymous PKINIT armour from {trusted_realm}'s KDC with the chain kuipa
+"#,
+    )?;
+    shell_login_functions(env)
+}
+
+/// The `pq_*` helpers for logins in the trusted realm.
+fn shell_login_functions(env: &mut String) -> Result<(), Error> {
+    write!(
+        env,
+        r#"# pq_trusted_kinit [USER]: log in a user of {TRUSTED_REALM} on this host
+# (default {TRUSTED_USER}; a bare name is taken as USER@{TRUSTED_REALM}):
+# anonymous PKINIT armour from {TRUSTED_REALM}'s KDC with the chain kuipa
 # installed, then an armoured kinit.  The ticket and the configuration (the
 # realm's, plus the installed snippet with that KDC's socket instead of its
 # FQDN) stay in $KUIPA_ROOT/trusted-login; use them with pq_trusted.
 pq_trusted_kinit() {{
-    local principal="${{1:-{trusted_user}}}"
-    case "$principal" in *@*) ;; *) principal="$principal@{trusted_realm}" ;; esac
+    local principal="${{1:-{TRUSTED_USER}}}"
+    case "$principal" in *@*) ;; *) principal="$principal@{TRUSTED_REALM}" ;; esac
     local snippet="$KUIPA_ROOT/etc/krb5.conf.d/kuipa_trust_{trusted_file}"
-    [ -f "$snippet" ] || {{ echo "no {trusted_realm} configuration on this host: run pq_trust"; return 1; }}
+    [ -f "$snippet" ] || {{ echo "no {TRUSTED_REALM} configuration on this host: run pq_trust"; return 1; }}
     local d="$KUIPA_ROOT/trusted-login"
     mkdir -p "$d"
     sed "s|kdc = [^ ]*:88|kdc = $PQ_TRUSTED_KDC_SOCKET|; s|master_kdc = [^ ]*:88|master_kdc = $PQ_TRUSTED_KDC_SOCKET|" "$snippet" > "$d/krb5.conf"
     local conf="$KRB5_CONFIG:$d/krb5.conf"
     printf '%s\n' "$conf" > "$d/config"
-    KRB5_CONFIG="$conf" kinit -n -c "$d/armor.ccache" @{trusted_realm} || return
-    echo "anonymous PKINIT armour from {trusted_realm}'s KDC, with the PKINIT chain kuipa installed"
-    echo {password} | KRB5_CONFIG="$conf" kinit -T "$d/armor.ccache" -c "$d/user.ccache" "$principal" >/dev/null || return
+    KRB5_CONFIG="$conf" kinit -n -c "$d/armor.ccache" @{TRUSTED_REALM} || return
+    echo "anonymous PKINIT armour from {TRUSTED_REALM}'s KDC, with the PKINIT chain kuipa installed"
+    echo {ADMIN_PASSWORD} | KRB5_CONFIG="$conf" kinit -T "$d/armor.ccache" -c "$d/user.ccache" "$principal" >/dev/null || return
     echo "$principal logged in through the armoured exchange; try: pq_trusted kvno host/$PQ_HOST"
 }}
 # pq_trusted CMD...: run CMD as the user pq_trusted_kinit logged in, e.g.
 # `pq_trusted klist` or `pq_trusted kvno host/$PQ_HOST` (a ticket for this
-# {realm} host, over the cross-realm trust).
+# {REALM} host, over the cross-realm trust).
 pq_trusted() {{
     local d="$KUIPA_ROOT/trusted-login"
     [ -f "$d/user.ccache" ] || {{ echo "nobody logged in: run pq_trusted_kinit"; return 1; }}
     KRB5_CONFIG="$(cat "$d/config")" KRB5CCNAME="FILE:$d/user.ccache" "$@"
 }}
-# pq_enroll NAME [kuipa enroll options]: enroll NAME with its OTP string.
+"#,
+        trusted_file = TRUSTED_REALM.replace('.', "_"),
+    )?;
+    shell_enroll_functions(env)
+}
+
+/// The `pq_*` helpers for enrolling and promoting hosts, and vouchers.
+fn shell_enroll_functions(env: &mut String) -> Result<(), Error> {
+    write!(
+        env,
+        r#"# pq_enroll NAME [kuipa enroll options]: enroll NAME with its OTP string.
 pq_enroll() {{
     local name="$1"; shift
     pq_host "$name"
@@ -744,22 +823,8 @@ pq_voucher() {{
         --voucher-file "$v/$name.voucher" "${{key[@]}}" "$@"
 }}
 "#,
-        ccache = shell_quote(&format!("FILE:{}", dir.join("admin.ccache").display())),
-        dir = shell_quote(&dir.display().to_string()),
-        endpoints = shell_quote(endpoints),
-        servers = shell_quote(&server_args),
-        anchor = shell_quote(&anchor.to_string()),
-        socket = shell_quote(&realm.socket.display().to_string()),
-        trusted_realm = TRUSTED_REALM,
-        trusted_user = TRUSTED_USER,
-        trusted_file = TRUSTED_REALM.replace('.', "_"),
-        trusted_socket = shell_quote(&trusted.socket.display().to_string()),
-        dns = dns,
-        realm = REALM,
-        admin = ADMIN,
-        password = ADMIN_PASSWORD,
     )?;
-    Ok(env)
+    Ok(())
 }
 
 /// `ipa host-add --pq-stage`, the administrator side of §8.3.

@@ -1034,7 +1034,60 @@ struct Pins {
     frozen: Vec<Thumbprint>,
 }
 
-#[allow(clippy::too_many_lines)] // one command dispatch, one function
+/// `kuipa enroll` against a server: the authentication comes from the
+/// options and the enrollment string.
+fn enroll_online_from_args(args: &Args, paths: &Paths) -> Result<Value, Error> {
+    let deployment = args.deployment()?;
+    let principal = args.option("principal");
+    let ccache = args.flag("use-ccache");
+    let (pins, secrets) = args.pins(paths, principal.is_some() && !ccache)?;
+    let mut string = secrets.string;
+    let voucher = args.option("voucher-file");
+    let auth = match (principal, ccache, secrets.password) {
+        _ if voucher.is_some() => Auth::Voucher {
+            voucher: Secret::new(&std::fs::read(voucher.unwrap_or_default())?),
+            ephemeral: args
+                .option("ephemeral-key")
+                .map(|f| std::fs::read(f).map(|k| Secret::new(&k)))
+                .transpose()?,
+        },
+        (_, true, _) => Auth::Ccache,
+        (Some(p), false, Some(password)) => Auth::Password {
+            principal: p.to_owned(),
+            password,
+        },
+        _ => {
+            let otp = string
+                .as_mut()
+                .ok_or("an OTP comes in an enrollment string, not with --realm")?
+                .take_secret()
+                .ok_or("the enrollment string has no OTP")?;
+            // Never chosen automatically: a fake KDC could
+            // otherwise force the weaker check (§5.3).
+            if args.flag("ldap-otp") {
+                Auth::LdapOtp(otp)
+            } else {
+                Auth::Otp(otp)
+            }
+        }
+    };
+    let fqdn = args
+        .option("hostname")
+        .map_or_else(flows::hostname, |h| Ok(h.to_owned()))?;
+    flows::enroll_online(
+        paths,
+        &pins.realm,
+        &pins.anchors,
+        &pins.heads,
+        &pins.frozen,
+        flows::Host {
+            fqdn: &fqdn,
+            auth: &auth,
+        },
+        &deployment,
+    )
+}
+
 fn run(args: &Args) -> Result<Value, Error> {
     let paths = Paths::from_env();
     match args.command.as_str() {
@@ -1055,53 +1108,7 @@ fn run(args: &Args) -> Result<Value, Error> {
                     args.option("hostname"),
                 )
             } else {
-                let deployment = args.deployment()?;
-                let principal = args.option("principal");
-                let ccache = args.flag("use-ccache");
-                let (pins, secrets) = args.pins(&paths, principal.is_some() && !ccache)?;
-                let mut string = secrets.string;
-                let voucher = args.option("voucher-file");
-                let auth = match (principal, ccache, secrets.password) {
-                    _ if voucher.is_some() => Auth::Voucher {
-                        voucher: Secret::new(&std::fs::read(voucher.unwrap_or_default())?),
-                        ephemeral: args
-                            .option("ephemeral-key")
-                            .map(|f| std::fs::read(f).map(|k| Secret::new(&k)))
-                            .transpose()?,
-                    },
-                    (_, true, _) => Auth::Ccache,
-                    (Some(p), false, Some(password)) => Auth::Password {
-                        principal: p.to_owned(),
-                        password,
-                    },
-                    _ => {
-                        let otp = string
-                            .as_mut()
-                            .ok_or("an OTP comes in an enrollment string, not with --realm")?
-                            .take_secret()
-                            .ok_or("the enrollment string has no OTP")?;
-                        // Never chosen automatically: a fake KDC could
-                        // otherwise force the weaker check (§5.3).
-                        if args.flag("ldap-otp") {
-                            Auth::LdapOtp(otp)
-                        } else {
-                            Auth::Otp(otp)
-                        }
-                    }
-                };
-                let fqdn = args
-                    .option("hostname")
-                    .map_or_else(flows::hostname, |h| Ok(h.to_owned()))?;
-                flows::enroll_online(
-                    &paths,
-                    &pins.realm,
-                    &pins.anchors,
-                    &pins.heads,
-                    &pins.frozen,
-                    &auth,
-                    &fqdn,
-                    &deployment,
-                )
+                enroll_online_from_args(args, &paths)
             }
         }
         "voucher-key" => {
