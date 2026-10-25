@@ -39,6 +39,7 @@
 - [Configuration](reference/configuration.md)
 - [Files and environment](reference/files.md)
 - [Design](reference/design.md)
+- [Benchmarks](reference/benchmarks.md)
 
 # Development
 
