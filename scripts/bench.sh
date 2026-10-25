@@ -46,6 +46,7 @@ COMPARE_PREV=""
 RESULTS_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/kuipa-bench"
 OUTPUT_FILE=""
 CRITERION_DIR="$REPO_ROOT/target/criterion"
+RUN_STARTED=$(date +%s)
 COMPARE_DIR1=""
 COMPARE_DIR2=""
 
@@ -107,18 +108,23 @@ fi
 
 # Flatten criterion's per-benchmark estimates into one JSON array, keyed by
 # full benchmark id, so comparison works after criterion's directory is gone.
+# Only files written since $RUN_STARTED belong to this run: criterion keeps
+# `new/` from earlier runs, and a --targets subset must not report them.
 collect_results() {
-    python3 - "$CRITERION_DIR" <<'PY'
+    python3 - "$CRITERION_DIR" "$RUN_STARTED" <<'PY'
 import json, os, sys
 
-root = sys.argv[1]
+root, started = sys.argv[1], float(sys.argv[2])
 out = []
 for base, _dirs, files in os.walk(root):
     if os.path.basename(base) != "new" or "estimates.json" not in files:
         continue
+    estimates = os.path.join(base, "estimates.json")
+    if os.path.getmtime(estimates) < started:
+        continue
     with open(os.path.join(base, "benchmark.json"), encoding="utf-8") as fh:
         info = json.load(fh)
-    with open(os.path.join(base, "estimates.json"), encoding="utf-8") as fh:
+    with open(estimates, encoding="utf-8") as fh:
         e = json.load(fh)
     ms = 1e6
     entry = {
