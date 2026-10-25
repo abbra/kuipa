@@ -1613,8 +1613,11 @@ impl Delegation {
     }
 
     /// The JSON value embedded in advertisements and bundles.
+    ///
+    /// # Panics
+    ///
+    /// Never: the value holds only strings and plain JSON types.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)] // serialising plain strings cannot fail
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).expect("serialisable")
     }

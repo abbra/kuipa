@@ -1404,6 +1404,17 @@ pub struct SessionToken {
     signature: Box<[u8]>,
 }
 
+/// The vault, holder and device a session must be for.
+#[derive(Clone, Copy)]
+pub struct SessionFor<'a> {
+    /// The vault the session opens.
+    pub vault: &'a VaultId,
+    /// The holder whose device presents the session.
+    pub holder: &'a str,
+    /// That device.
+    pub device: &'a Thumbprint,
+}
+
 impl fmt::Debug for SessionToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionToken")
@@ -1454,25 +1465,24 @@ impl SessionToken {
     }
 
     /// Check the signature and its delegation against `anchors` of
-    /// `realm`, and that the session is for `vault`, `holder` and `device`
-    /// and lasts past `now`.
+    /// `realm`, and that the session is for `expected` and lasts past `now`.
     ///
     /// # Errors
     ///
     /// [`Error::Expired`], [`Error::Mismatch`], [`Error::UntrustedAnchor`],
     /// [`Error::WrongRealm`] or a crypto error.
-    #[allow(clippy::too_many_arguments)]
     pub fn check(
         &self,
         realm: &str,
         anchors: &[Thumbprint],
         policy: &CryptoPolicy,
-        vault: &VaultId,
-        holder: &str,
-        device: &Thumbprint,
+        expected: SessionFor<'_>,
         now: u64,
     ) -> Result<()> {
-        if &self.vault != vault || self.holder != holder || &self.device != device {
+        if &self.vault != expected.vault
+            || self.holder != expected.holder
+            || &self.device != expected.device
+        {
             return Err(Error::Mismatch("session"));
         }
         if now > self.not_after {

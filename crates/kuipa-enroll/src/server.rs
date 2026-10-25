@@ -27,8 +27,8 @@ use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
-    DEFAULT_EPOCH, Descriptor, Limits, Members, Recovered, ReleasedKeys, Reply, Role, SessionKey,
-    SessionToken, State, Vault, VaultAnswer, VaultOp,
+    DEFAULT_EPOCH, Descriptor, Limits, Members, Recovered, ReleasedKeys, Reply, Role, SessionFor,
+    SessionKey, SessionToken, State, Vault, VaultAnswer, VaultOp,
 };
 use crate::voucher::Voucher;
 
@@ -2200,9 +2200,11 @@ impl EnrollServer {
                     &self.info.realm,
                     &self.anchors(),
                     &self.policy,
-                    request.vault(),
-                    holder,
-                    &device.thumbprint()?,
+                    SessionFor {
+                        vault: request.vault(),
+                        holder,
+                        device: &device.thumbprint()?,
+                    },
                     now,
                 )
                 .map_err(|e| Refusal::because(format!("session: {e}")))?;
