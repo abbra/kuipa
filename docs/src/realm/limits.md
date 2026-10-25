@@ -35,7 +35,8 @@ live on `cn=vault-limits,cn=kuipa,cn=etc,<suffix>`, attribute
 | `max_lifetime` | 400 days (seconds) | the longest a vault may live |
 | `max_unlocks` | none | the largest unlock limit a vault may set |
 | `max_vaults` | 16 | vaults per user |
-| `max_devices` | 8 | devices per vault |
+| `max_devices` | 8 | devices per vault and holder: each member of a shared vault registers up to this many |
+| `max_members` | 64 | managers and members of a shared vault, together; `0` keeps every vault to its owner |
 | `max_reauth` | 12 hours (seconds) | the longest re-authentication session |
 | `offline_sessions` | `false` | whether vaults may allow offline sessions at all |
 | `without_device` | `true` | whether a vault may do without the device factor |

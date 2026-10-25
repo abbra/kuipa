@@ -795,6 +795,10 @@ pub enum VaultAction {
     OfflineSession = 7,
     /// A server share of a sealed file was released.
     Release = 8,
+    /// Managers or members were added.
+    Share = 9,
+    /// Managers or members were removed.
+    Unshare = 10,
 }
 
 impl VaultAction {
@@ -802,7 +806,9 @@ impl VaultAction {
     #[must_use]
     pub const fn kind(self) -> Kind {
         match self {
-            Self::Create | Self::SetPolicy | Self::Revoke => Kind::VAULT_POLICY,
+            Self::Create | Self::SetPolicy | Self::Revoke | Self::Share | Self::Unshare => {
+                Kind::VAULT_POLICY
+            }
             Self::AddDevice | Self::RemoveDevice => Kind::VAULT_DEVICE,
             Self::Session | Self::OfflineSession | Self::Release => Kind::ESCROW_RELEASE,
         }
@@ -818,6 +824,8 @@ impl VaultAction {
             6 => Self::Session,
             7 => Self::OfflineSession,
             8 => Self::Release,
+            9 => Self::Share,
+            10 => Self::Unshare,
             _ => return Err(Error::Malformed("vault event action")),
         })
     }
@@ -1416,6 +1424,7 @@ mod tests {
         for (action, kind) in [
             (VaultAction::Create, Kind::VAULT_POLICY),
             (VaultAction::RemoveDevice, Kind::VAULT_DEVICE),
+            (VaultAction::Unshare, Kind::VAULT_POLICY),
             (VaultAction::Release, Kind::ESCROW_RELEASE),
         ] {
             assert_eq!(action.kind(), kind);

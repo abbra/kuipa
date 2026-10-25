@@ -125,10 +125,10 @@ impl DeviceType {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TicketDelegation {
-    /// Any ticket naming the owner.
+    /// Any ticket naming the opener.
     #[default]
     Allow,
-    /// Only tickets the owner obtained with their own credentials.
+    /// Only tickets the opener obtained with their own credentials.
     Refuse,
     /// Delegated tickets whose every transited service is listed.
     Via(Vec<String>),
@@ -154,7 +154,8 @@ pub struct Factors {
     /// A registered device of at least this level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<Level>,
-    /// The owner's Kerberos ticket.
+    /// The opener's Kerberos ticket: the owner's, or in a shared vault a
+    /// manager's or member's.
     #[serde(default)]
     pub ticket: bool,
     /// A passkey assertion from one of the owner's IPA passkeys.
@@ -266,8 +267,13 @@ pub struct Limits {
     pub max_unlocks: Option<u64>,
     /// Vaults per user.
     pub max_vaults: usize,
-    /// Devices per vault.
+    /// Devices per vault and holder: each member of a shared vault
+    /// registers up to this many.
     pub max_devices: usize,
+    /// Entries in a vault's managers and members together (§7.6.12);
+    /// 0 keeps every vault to its owner.
+    #[serde(default = "default_max_members")]
+    pub max_members: usize,
     /// The longest re-authentication session, in seconds.
     pub max_reauth: u64,
     /// Whether offline sessions are allowed at all.
@@ -279,6 +285,10 @@ pub struct Limits {
     pub descriptor_age: u64,
 }
 
+const fn default_max_members() -> usize {
+    64
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -286,6 +296,7 @@ impl Default for Limits {
             max_unlocks: None,
             max_vaults: 16,
             max_devices: 8,
+            max_members: default_max_members(),
             max_reauth: 12 * 3600,
             offline_sessions: false,
             without_device: true,
@@ -352,6 +363,11 @@ pub struct Device {
     pub key: String,
     /// When it was registered.
     pub added: u64,
+    /// The principal who registered it, and who alone opens with it;
+    /// absent on devices registered before shared vaults, which are the
+    /// owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
 }
 
 impl Device {
@@ -367,7 +383,15 @@ impl Device {
             alg: key.alg().id(),
             key: b64::encode(key.as_bytes()),
             added,
+            holder: None,
         }
+    }
+
+    /// The same device, held by `holder`.
+    #[must_use]
+    pub fn held_by(mut self, holder: &str) -> Self {
+        self.holder = Some(holder.to_owned());
+        self
     }
 
     /// The public key, checked against the id.
@@ -415,6 +439,13 @@ pub struct Vault {
     pub name: String,
     /// The policy.
     pub policy: Policy,
+    /// Who manages the vault besides its owner: its policy, members and
+    /// state (§7.6.12).
+    #[serde(default, skip_serializing_if = "Members::is_empty")]
+    pub managers: Members,
+    /// Who opens and seals with it besides its owner and managers.
+    #[serde(default, skip_serializing_if = "Members::is_empty")]
+    pub members: Members,
     /// Registered devices.
     #[serde(default)]
     pub devices: Vec<Device>,
@@ -432,6 +463,31 @@ pub struct Vault {
     /// a file sealed and not yet retired; left out of descriptors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<String>,
+}
+
+/// Who shares a vault: users, user and host groups (by the directory's
+/// `memberOf`), hosts and services, as the signing policy names signers.
+pub type Members = crate::sign::Signers;
+
+/// What a principal may do with a vault (§7.6.12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    /// Open and seal, and register and remove its own devices.
+    Member,
+    /// Also change the policy, the managers and members, and revoke.
+    Manager,
+    /// The vault's owner: a manager, and the `P` its files are sealed to.
+    Owner,
+}
+
+/// Split a vault reference, `NAME` (the caller's own) or `OWNER/NAME`
+/// (one shared with the caller), at its last `/`.
+#[must_use]
+pub fn split_ref(reference: &str) -> (Option<&str>, &str) {
+    match reference.rsplit_once('/') {
+        Some((owner, name)) => (Some(owner), name),
+        None => (None, reference),
+    }
 }
 
 /// The most bindings a vault keeps registered.
@@ -906,6 +962,40 @@ fn open_device_share(
 }
 
 impl Vault {
+    /// What `principal`, a member of `groups`, may do with this vault, if
+    /// anything.
+    #[must_use]
+    pub fn role(&self, principal: &Principal, groups: &[String]) -> Option<Role> {
+        if principal.to_string() == self.owner {
+            Some(Role::Owner)
+        } else if self.managers.admits(principal, groups) {
+            Some(Role::Manager)
+        } else if self.members.admits(principal, groups) {
+            Some(Role::Member)
+        } else {
+            None
+        }
+    }
+
+    /// Whether anyone besides the owner shares it.
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        !self.managers.is_empty() || !self.members.is_empty()
+    }
+
+    /// Who shares it, as the transparency log digests it after a share or
+    /// an unshare.
+    #[must_use]
+    pub fn sharing_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&(&self.managers, &self.members)).unwrap_or_default()
+    }
+
+    /// Who holds `device`: its holder, else the owner.
+    #[must_use]
+    pub fn holder<'a>(&'a self, device: &'a Device) -> &'a str {
+        device.holder.as_deref().unwrap_or(&self.owner)
+    }
+
     /// The registered device `id`, if any.
     #[must_use]
     pub fn device(&self, id: &Thumbprint) -> Option<&Device> {
@@ -1099,8 +1189,10 @@ impl VerifiedDescriptor {
     }
 }
 
-/// What an owner asks of their vaults, sent as the operation data of a
+/// What a user asks of their vaults, sent as the operation data of a
 /// `POST /ipa/ku/vault/{kid}` exchange authenticated by their ticket.
+/// Every `name` is a vault reference: `NAME` for the caller's own vault,
+/// `OWNER/NAME` for one shared with them ([`split_ref`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum VaultOp {
@@ -1149,7 +1241,7 @@ pub enum VaultOp {
         /// The vault.
         name: String,
     },
-    /// Describe every vault of the owner.
+    /// Describe every vault of the caller, and those shared with them.
     List,
     /// With `sealing = registered`: register the bindings of a newly sealed
     /// file, and retire those of files it replaces or that are given up.
@@ -1160,6 +1252,29 @@ pub enum VaultOp {
         add: Vec<String>,
         /// Binding hashes (hex) to retire.
         retire: Vec<String>,
+    },
+    /// Add managers or members (§7.6.12); managers only.
+    Share {
+        /// The vault.
+        name: String,
+        /// New managers.
+        #[serde(default)]
+        managers: Members,
+        /// New members.
+        #[serde(default)]
+        members: Members,
+    },
+    /// Remove managers or members, and the devices they hold; managers
+    /// only, but anyone may leave.
+    Unshare {
+        /// The vault.
+        name: String,
+        /// Managers to remove.
+        #[serde(default)]
+        managers: Members,
+        /// Members to remove.
+        #[serde(default)]
+        members: Members,
     },
     /// Start a session for one of the vault's devices: re-authentication,
     /// or with `offline`, the release of the vault's session keys.
@@ -1273,14 +1388,15 @@ impl Reply {
     }
 }
 
-/// A re-authentication session (§7.6.6): for `device` of `owner`'s vault,
+/// A re-authentication session (§7.6.6): for `device` of a vault and its
+/// `holder` (the owner, or the member of a shared vault who registered it),
 /// until `not_after`, signed by a server under its delegation so any
 /// server can check it.  It stands in for the ticket and passkey factors;
 /// the answer is still encrypted to the device.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionToken {
     vault: VaultId,
-    owner: String,
+    holder: String,
     device: Thumbprint,
     not_after: u64,
     delegation: Box<[u8]>,
@@ -1307,13 +1423,13 @@ impl SessionToken {
         signing: &SigningKey,
         delegation: &Delegation,
         vault: VaultId,
-        owner: &str,
+        holder: &str,
         device: Thumbprint,
         not_after: u64,
     ) -> Result<Self> {
         let mut t = Self {
             vault,
-            owner: owner.to_owned(),
+            holder: holder.to_owned(),
             device,
             not_after,
             delegation: delegation.to_json().into_bytes().into(),
@@ -1329,7 +1445,7 @@ impl SessionToken {
     fn signed_part(&self) -> Vec<u8> {
         Writer::new(SESSION_MAGIC)
             .fixed(self.vault.as_bytes())
-            .str(&self.owner)
+            .str(&self.holder)
             .fixed(self.device.as_bytes())
             .u64(self.not_after)
             .bytes(&self.delegation)
@@ -1338,7 +1454,7 @@ impl SessionToken {
     }
 
     /// Check the signature and its delegation against `anchors` of
-    /// `realm`, and that the session is for `vault`, `owner` and `device`
+    /// `realm`, and that the session is for `vault`, `holder` and `device`
     /// and lasts past `now`.
     ///
     /// # Errors
@@ -1352,11 +1468,11 @@ impl SessionToken {
         anchors: &[Thumbprint],
         policy: &CryptoPolicy,
         vault: &VaultId,
-        owner: &str,
+        holder: &str,
         device: &Thumbprint,
         now: u64,
     ) -> Result<()> {
-        if &self.vault != vault || self.owner != owner || &self.device != device {
+        if &self.vault != vault || self.holder != holder || &self.device != device {
             return Err(Error::Mismatch("session"));
         }
         if now > self.not_after {
@@ -1408,7 +1524,7 @@ impl SessionToken {
         let mut r = Reader::new(signed, SESSION_MAGIC, "vault session")?;
         let t = Self {
             vault: VaultId::from_bytes(r.fixed()?),
-            owner: r.str()?.to_owned(),
+            holder: r.str()?.to_owned(),
             device: Thumbprint::from_bytes(r.fixed()?),
             not_after: r.u64()?,
             delegation: r.bytes()?.into(),

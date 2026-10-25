@@ -94,18 +94,11 @@ impl UserPaths {
         self.dir.join("vaults")
     }
 
-    fn vault(&self, name: &str) -> Result<PathBuf, Error> {
-        if name.is_empty()
-            || name.starts_with('.')
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        {
-            return Err(
-                format!("{name:?} is not a vault name: letters, digits, '.', '_' and '-'").into(),
-            );
-        }
-        Ok(self.vaults().join(format!("{name}.vault")))
+    /// The stored descriptor of the vault `reference` names in `realm`.
+    fn vault(&self, reference: &str, realm: &str) -> Result<PathBuf, Error> {
+        Ok(self
+            .vaults()
+            .join(format!("{}.vault", local_name(reference, realm)?)))
     }
 
     fn servers(&self) -> PathBuf {
@@ -250,6 +243,50 @@ impl HostDevice {
     }
 }
 
+/// The file name, without extension, of what the user keeps of the vault
+/// `reference` names: `NAME` for their own vault, `NAME@OWNER` (the
+/// owner's principal, `/` written `+`) for `OWNER/NAME`, one shared with
+/// them.
+fn local_name(reference: &str, realm: &str) -> Result<String, Error> {
+    let (owner, name) = kuipa_enroll::vault::split_ref(reference);
+    if name.is_empty()
+        || name.starts_with('.')
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(
+            format!("{name:?} is not a vault name: letters, digits, '.', '_' and '-'").into(),
+        );
+    }
+    let Some(owner) = owner else {
+        return Ok(name.to_owned());
+    };
+    let owner = if owner.contains('@') {
+        owner.replace('/', "+")
+    } else {
+        format!("{}@{realm}", owner.replace('/', "+"))
+    };
+    if owner.starts_with(['.', '@'])
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-@+".contains(&b))
+    {
+        return Err(format!("{owner:?} is not a vault owner").into());
+    }
+    Ok(format!("{name}@{owner}"))
+}
+
+/// The reference `me` uses for `vault`: its name if `me` owns it (or is
+/// not known), else `OWNER/NAME`.
+fn reference_for(vault: &kuipa_enroll::vault::Vault, me: Option<&str>) -> String {
+    if me.is_none_or(|me| me == vault.owner) {
+        vault.name.clone()
+    } else {
+        format!("{}/{}", vault.owner, vault.name)
+    }
+}
+
 /// The vault a sealed file (either format) belongs to.
 fn vault_of(sealed: &[u8]) -> Option<kuipa_enroll::escrow::VaultId> {
     if sealed.starts_with(b"IPUS") {
@@ -321,6 +358,7 @@ impl<'a> Seal<'a> {
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
+        let me = cred.principal_name();
         let extra = op.to_bytes();
         let (reply, _) = flows::exchange_with(
             &Deployment::servers(&public.servers),
@@ -349,8 +387,9 @@ impl<'a> Seal<'a> {
         let mut verified = Vec::with_capacity(reply.descriptors.len());
         for d in reply.descriptors {
             let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::from_system()?)?;
+            let reference = reference_for(v.vault(), me.as_deref());
             self.user
-                .write(&self.user.vault(&v.vault().name)?, &d.to_bytes())?;
+                .write(&self.user.vault(&reference, &public.realm)?, &d.to_bytes())?;
             verified.push(v);
         }
         Ok((verified, reply.session, reply.released))
@@ -515,10 +554,14 @@ impl<'a> Seal<'a> {
         let expected = Expected {
             devices: vault.devices.iter().map(|d| d.id.clone()).collect(),
             policy: serde_json::to_vec(&vault.policy)?,
+            sharing: vault.sharing_bytes(),
             revoked: vault.state == kuipa_enroll::vault::State::Revoked,
         };
         let public = self.public()?;
-        let state_path = self.user.vaults().join(format!("{name}.tlog"));
+        let state_path = self
+            .user
+            .vaults()
+            .join(format!("{}.tlog", local_name(name, &self.public()?.realm)?));
         let mut state: BTreeMap<String, Watched> = match fs::read(&state_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| format!("{}: {e}", state_path.display()))?,
@@ -717,10 +760,10 @@ impl<'a> Seal<'a> {
 
     /// The stored descriptor of vault `name`, verified.
     fn stored(&self, name: &str) -> Result<Option<VerifiedDescriptor>, Error> {
-        let Ok(bytes) = fs::read(self.user.vault(name)?) else {
+        let public = self.public()?;
+        let Ok(bytes) = fs::read(self.user.vault(name, &public.realm)?) else {
             return Ok(None);
         };
-        let public = self.public()?;
         let anchors = paths::read_anchors(self.host)?;
         Ok(Some(Descriptor::from_bytes(&bytes)?.verify(
             &public.realm,
@@ -825,7 +868,10 @@ impl<'a> Seal<'a> {
     ///
     /// A refusal or any other error.
     pub fn create(&self, name: &str, policy: Policy) -> Result<Value, Error> {
-        self.user.vault(name)?;
+        if name.contains('/') {
+            return Err(format!("{name:?}: a vault is created as one's own, by its name").into());
+        }
+        local_name(name, "")?;
         let v = self.op(&VaultOp::Create {
             name: name.into(),
             policy,
@@ -923,6 +969,45 @@ impl<'a> Seal<'a> {
         let v = self.op(&VaultOp::RemoveDevice {
             name: name.into(),
             id: id.into(),
+        })?;
+        Ok(describe_all(&v))
+    }
+
+    /// `kuipa seal share`: add `managers` and `members` to vault `name`.
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn share(
+        &self,
+        name: &str,
+        managers: kuipa_enroll::vault::Members,
+        members: kuipa_enroll::vault::Members,
+    ) -> Result<Value, Error> {
+        let v = self.op(&VaultOp::Share {
+            name: name.into(),
+            managers,
+            members,
+        })?;
+        Ok(describe_all(&v))
+    }
+
+    /// `kuipa seal unshare`: remove `managers` and `members` from vault
+    /// `name`, with the devices they hold.
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn unshare(
+        &self,
+        name: &str,
+        managers: kuipa_enroll::vault::Members,
+        members: kuipa_enroll::vault::Members,
+    ) -> Result<Value, Error> {
+        let v = self.op(&VaultOp::Unshare {
+            name: name.into(),
+            managers,
+            members,
         })?;
         Ok(describe_all(&v))
     }
@@ -1102,7 +1187,7 @@ impl<'a> Seal<'a> {
     }
 
     /// `kuipa seal reseal`: open each file and seal it again to the
-    /// vault's current devices.
+    /// vault's current devices, every member's.
     ///
     /// # Errors
     ///
@@ -1114,6 +1199,9 @@ impl<'a> Seal<'a> {
         passphrase: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
         let plain = self.open(sealed, passphrase)?;
+        // The devices registered now, not those of the stored descriptor:
+        // a reseal is what gives a new device or member the file.
+        self.op(&VaultOp::Show { name: name.into() })?;
         let again = self.seal(name, plain.as_ref())?;
         if self
             .stored(name)?
@@ -1136,8 +1224,11 @@ pub fn describe(v: &VerifiedDescriptor) -> Value {
         "owner": vault.owner,
         "state": vault.state,
         "policy": vault.policy,
+        "managers": vault.managers.entries(),
+        "members": vault.members.entries(),
         "devices": vault.devices.iter().map(|d| json!({
             "id": d.id, "label": d.label, "type": d.kind, "level": d.level,
+            "holder": vault.holder(d),
         })).collect::<Vec<_>>(),
         "unlocks": vault.unlocks,
         "signed_by": v.server(),
@@ -1182,6 +1273,8 @@ struct Expected {
     devices: BTreeSet<String>,
     /// The policy's JSON, digested with each log's hash to compare.
     policy: Vec<u8>,
+    /// Who shares the vault, digested the same way.
+    sharing: Vec<u8>,
     revoked: bool,
 }
 
@@ -1211,6 +1304,16 @@ fn describe_event(
             primitives::digest(event.digest.alg().openssl_name(), &[&expected.policy])
                 .is_ok_and(|d| d != *event.digest)
                 .then_some("a policy the stored descriptor does not show"),
+        ),
+        A::Share | A::Unshare => (
+            if event.action == A::Share {
+                "share"
+            } else {
+                "unshare"
+            },
+            primitives::digest(event.digest.alg().openssl_name(), &[&expected.sharing])
+                .is_ok_and(|d| d != *event.digest)
+                .then_some("managers or members the stored descriptor does not show"),
         ),
         A::Revoke => (
             "revoke",

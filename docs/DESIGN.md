@@ -1345,7 +1345,9 @@ A sealed file must not open:
   stolen laptop) without the factors its vault's policy names;
 * for **another user of the host** who can read the sealed file;
 * once the owner is **disabled or deleted**, or the vault or the device is
-  **revoked**, on any host, from then on.
+  **revoked**, on any host, from then on;
+* in a shared vault (§7.6.12), for a member once they are **removed** from
+  it or from the group that made them one, or disabled.
 
 Out of scope: **root on the running host** while a file is open or a
 session is unlocked (root can read process memory and the kernel keyring),
@@ -1356,7 +1358,8 @@ never what a client does with it afterwards.
 
 A **vault** is an entry in a central container,
 `cn=<vault id>,cn=vaults,cn=kuipa,cn=etc,<suffix>`, owned by one user
-(`ipaKUVaultOwner`). The vault id is 16 random bytes in hex, chosen by the
+(`ipaKUVaultOwner`) and shared with others when its owner chooses
+(§7.6.12). The vault id is 16 random bytes in hex, chosen by the
 server at creation. The entry holds:
 
 | attribute | content |
@@ -1364,6 +1367,7 @@ server at creation. The entry holds:
 | `ipaKUVaultOwner` | the owner's principal |
 | `ipaKUVaultName` | the owner's label (unique per owner) |
 | `ipaKUVaultPolicy` | JSON, below |
+| `ipaKUVaultManager`, `ipaKUVaultMember` | shared vaults only: one `kind:name` value per manager or member (§7.6.12) |
 | `ipaKUVaultDevice` | one value per registered device key, below |
 | `ipaKUVaultSessionKey` | offline sessions only: the current epoch's session key, sealed to each server's escrow key (§7.6.6) |
 | `ipaKUVaultState` | `enabled` or `revoked` |
@@ -1402,8 +1406,13 @@ registered in the vault:
 ipaKUVaultDevice = { "id": thumbprint(dpk), "label", "dpk": <ML-KEM public key>,
                      "level": "any" | "hardware-wrapped" | "hardware-bound",
                      "type": "file" | "passkey" | "pkcs11" | "pkcs11-wrapped",
-                     "attestation": <summary>, "added": <time> }
+                     "attestation": <summary>, "added": <time>,
+                     "holder": <principal> }
 ```
+
+`holder` is the principal who registered the device and who alone opens
+with it: the owner, or in a shared vault a manager or member (§7.6.12).
+Devices registered before shared vaults have none and are the owner's.
 
 | type | where the decapsulation key is | highest level |
 |---|---|---|
@@ -1652,7 +1661,11 @@ kuipa seal open F.sealed --out F|- [--force] [--passphrase-file F]
 kuipa seal unlock VAULT [--offline] | lock VAULT              sessions
 kuipa seal reseal VAULT F.sealed…                             new devices, new epoch
 kuipa seal list | show VAULT | revoke VAULT
+kuipa seal share | unshare VAULT [--manager] --user U --group G …       §7.6.12
 ```
+
+`VAULT` is the vault's name for its owner, `OWNER/NAME` for anyone it is
+shared with.
 
 `open --out -` follows `kuipa-unseal`'s rules (§10.5): standard output
 only when it is not a terminal, unless `--force`.
@@ -1691,7 +1704,95 @@ only when it is not a terminal, unless `--force`.
 * FreeIPA: schema and ACIs for the container, `vault-limits`, and a
   framework front end for administrators (list, revoke, set limits).
 
-#### 7.6.12 Decisions
+#### 7.6.12 Shared vaults (implemented)
+
+A team's database password or a fleet's API key belongs to no one person.
+A **shared vault** is a user vault whose owner names others who may use
+it. Nothing about the sealed file changes: `P` in every file, binding and
+commitment is still the owner's principal and names the vault, so a
+shared vault's files are `IPUF` and `IPUS` files like any other.
+
+**Roles.** A principal's role in a vault is the first that applies:
+
+| role | who | may |
+|---|---|---|
+| owner | `ipaKUVaultOwner` | everything a manager may; the vault counts against the owner's `max_vaults` |
+| manager | named in `ipaKUVaultManager` | change the policy, share and unshare, revoke, remove anyone's device |
+| member | named in `ipaKUVaultMember` | show, seal (and register bindings), open, start sessions, register and remove their own devices, leave |
+
+Managers and members are named as signers are in the signing policy
+(DESIGN-sign.md): users, groups, hosts and services, a group by the
+directory's `memberOf` (user groups for users, host groups for hosts), so
+managing an IPA group manages who opens the vault. The server stores each
+as one `kind:name` value (`user:bob@REALM`, `group:dba`,
+`host:web1.example.test`, `service:HTTP/ci.example.test@REALM`): users
+and services as full principals of the realm, host names in lower case,
+one spelling each, so that "vaults shared with me" is an equality search
+on both attributes for the caller's own value and each of their groups.
+A host group makes a **fleet vault**: each host runs `kuipa seal` as root
+with its host ticket and keeps its own device key in its own kuipa
+directory.
+
+**Devices are their holders'.** Each member registers their own device
+keys (at most `max_devices` each), recorded with them as `holder`. A file
+is sealed to every registered device, every member's, as before. The
+server answers an unlock only to a device held by the opener:
+
+* with a session token, the opener is the token's holder, and the token
+  (§7.6.6) names the device's holder where it named the owner;
+* with the ticket factor, the opener is the ticket's client, and a named
+  device must be theirs: Bob's ticket does not open with Alice's device,
+  nor Alice's with Bob's;
+* otherwise (device factor alone), the opener is the device's holder.
+
+Then the opener must have a role in the vault **now** (their groups looked
+up at this release, only when the vault names a group) and must not be
+locked (`nsAccountLock`). The owner's lock stops the owner, not the
+team: a shared vault outlives its creator's account, kept by its managers
+or revoked by the realm's administrators. Every other check of §7.6.5 is
+unchanged.
+
+**References.** A vault is named `NAME` by its owner and `OWNER/NAME` by
+everyone else (`alice/db`, `alice@EXAMPLE.TEST/db`; split at the last `/`,
+since a host owner's principal has one). Vault names never contain `/`. A
+vault the caller has no part in is refused exactly as one that does not
+exist. `list` answers the caller's own vaults and those shared with them.
+The client keeps a shared vault's descriptor apart from any vault of its
+own, as `vaults/NAME@OWNER.vault` (`/` in the owner written `+`).
+
+**Joining and leaving.** The vault operations `share` and `unshare` add
+and remove managers and members; a member may `unshare` themselves, and
+only themselves (by name; one who is a member by group leaves the group).
+`unshare` drops the devices of everyone it leaves without a role, and
+removing a device or a member starts a new offline-session epoch at once,
+so files sealed for offline sessions from then on do not open from keys
+released before. A file opens for a new member's device only once it is
+sealed or resealed after the device was registered: `kuipa seal reseal`
+by any member fetches the current devices first. A removed member keeps
+whatever was released to them before (§7.6.1): the secret inside should
+change.
+
+**Limits and logs.** `max_members` (default 64) bounds the entries in
+`managers` and `members` together; 0 keeps every vault to its owner. A
+`share` or `unshare` is logged as a vault policy leaf (kind 3) whose
+digest is that of who shares the vault after the change
+(DESIGN-tlog.md §6); `kuipa tlog watch` flags one that the stored
+descriptor does not show.
+
+What membership does not give: a member sees the vault's descriptor,
+hence its members, devices and policy. Releases are counted per vault
+(`max_unlocks`), not per member, and are rate limited (§5.1) by `P`, so a
+team shares its owner's per-principal allowance; a busy shared vault may
+need a higher `rate_limit.per_host`. A change of membership in IPA (a user
+leaving a group) takes effect at the next release, but leaves that user's
+devices registered until an `unshare` or a manager removes them.
+
+```
+kuipa seal share VAULT [--manager] [--user U…] [--group G…] [--host FQDN…] [--service S…]
+kuipa seal unshare VAULT [--manager] [--user U…] [--group G…] [--host FQDN…] [--service S…]
+```
+
+#### 7.6.13 Decisions
 
 Settled with the design: the threat model of §7.6.1; factors configurable
 per vault, any non-empty combination besides the server share; offline
@@ -1711,7 +1812,12 @@ and a key wrapper; ahdapa's relying-party code copied into kuipa; one
 recovery path for user and machine vaults; the command named `kuipa seal`
 (the server object stays a vault, distinct from `ipa vault-*`);
 offline-session keys sealed per server in the vault entry; descriptors
-older than 30 days (a realm limit) refused for sealing.
+older than 30 days (a realm limit) refused for sealing. For shared vaults
+(§7.6.12): owner, managers and members, named as the signing policy names
+signers and resolved through `memberOf` at every release; devices held by
+the member who registered them and answered to only for that member;
+`OWNER/NAME` references; the files' `P` still the owner's; a new
+offline-session epoch on every removal.
 
 ## 8. Offline enrollment
 
@@ -2727,7 +2833,7 @@ a static table is the smallest surface to audit.
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
-| user vaults, unified recovery (§7.6): vault model and descriptor, devices (passphrase files, PKCS#11 tokens), the ticket factor, sessions, offline sessions, unlock counts, registered sealing, machine vaults for host and service escrow, `kuipa seal` | implemented, tested against a real KDC; **not yet**: passkeys, attestation for the `hardware-*` levels, PAC delegation info for `ticket.delegation`; the LDAP side **not yet run against FreeIPA** |
+| user vaults, unified recovery (§7.6): vault model and descriptor, devices (passphrase files, PKCS#11 tokens), the ticket factor, sessions, offline sessions, unlock counts, registered sealing, shared vaults (§7.6.12), machine vaults for host and service escrow, `kuipa seal` | implemented, tested against a real KDC; **not yet**: passkeys, attestation for the `hardware-*` levels, PAC delegation info for `ticket.delegation`; the LDAP side **not yet run against FreeIPA** |
 | gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change merged as gssapi/gssproxy#135, **awaiting an upstream release** |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 

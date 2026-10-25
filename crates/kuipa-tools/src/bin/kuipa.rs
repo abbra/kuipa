@@ -43,8 +43,9 @@
 //!                                            what it belongs to and where
 //!                                            it appears
 //! kuipa status | check [--server S]         is this host healthy?
-//! kuipa seal …                              a user's own vaults: create,
-//!                                            devices, seal and open files
+//! kuipa seal …                              a user's own and shared vaults:
+//!                                            create, share, devices, seal
+//!                                            and open files
 //!                                            (runs as the user, with their
 //!                                            ticket)
 //! kuipa leave                               remove kuipa state
@@ -359,10 +360,11 @@ enum KeysAction {
     },
 }
 
-/// `kuipa seal` subcommands.
+/// `kuipa seal` subcommands.  A vault is named by its name when it is the
+/// user's own, and as `OWNER/NAME` when it is shared with them.
 #[derive(Subcommand)]
 enum SealAction {
-    /// Create a vault.
+    /// Create a vault, owned by you.
     Create {
         /// The vault's name.
         vault: String,
@@ -375,6 +377,30 @@ enum SealAction {
         vault: String,
         #[command(flatten)]
         policy: PolicyInput,
+    },
+    /// Share a vault: its members open and seal files and register their
+    /// own devices; its managers also change its policy, members and
+    /// state.  Managers only.
+    Share {
+        /// The vault.
+        vault: String,
+        #[command(flatten)]
+        who: MembersInput,
+        /// Make them managers rather than members.
+        #[arg(long)]
+        manager: bool,
+    },
+    /// Stop sharing a vault with managers or members, and drop the
+    /// devices they hold.  Managers only, but a member may remove
+    /// themselves.
+    Unshare {
+        /// The vault.
+        vault: String,
+        #[command(flatten)]
+        who: MembersInput,
+        /// Remove them as managers rather than members.
+        #[arg(long)]
+        manager: bool,
     },
     /// Register or remove this host's device key.
     Device {
@@ -453,13 +479,47 @@ enum SealAction {
         /// The vault.
         vault: String,
     },
-    /// Describe all your vaults.
+    /// Describe all your vaults and those shared with you.
     List,
     /// Revoke a vault: no file sealed to it opens any more.
     Revoke {
         /// The vault.
         vault: String,
     },
+}
+
+/// Who `kuipa seal share` and `unshare` name.
+#[derive(clap::Args)]
+struct MembersInput {
+    /// A user (`bob` or `bob@REALM`); repeatable.
+    #[arg(long = "user", value_name = "USER")]
+    users: Vec<String>,
+    /// A user group or host group, by name; repeatable.
+    #[arg(long = "group", value_name = "GROUP")]
+    groups: Vec<String>,
+    /// A host, by FQDN; repeatable.
+    #[arg(long = "host", value_name = "FQDN")]
+    hosts: Vec<String>,
+    /// A service (`HTTP/ci.example.test`); repeatable.
+    #[arg(long = "service", value_name = "SERVICE")]
+    services: Vec<String>,
+}
+
+impl MembersInput {
+    /// The set named, as managers or as members.
+    fn split(&self, manager: bool) -> (kuipa_enroll::vault::Members, kuipa_enroll::vault::Members) {
+        let set = kuipa_enroll::vault::Members {
+            users: self.users.clone(),
+            groups: self.groups.clone(),
+            hosts: self.hosts.clone(),
+            services: self.services.clone(),
+        };
+        if manager {
+            (set, kuipa_enroll::vault::Members::default())
+        } else {
+            (kuipa_enroll::vault::Members::default(), set)
+        }
+    }
 }
 
 /// `kuipa seal device` subcommands.
@@ -1973,6 +2033,32 @@ fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
     Ok(serde_json::json!({ "quiet": true }))
 }
 
+/// `kuipa seal device …`.
+fn run_seal_device(
+    seal: &kuipa_tools::seal::Seal<'_>,
+    user: &kuipa_tools::seal::UserPaths,
+    action: &DeviceAction,
+) -> Result<Value, Error> {
+    match action {
+        DeviceAction::Add {
+            vault,
+            passphrase_file,
+            pkcs11,
+            module,
+        } => {
+            if let Some(uri) = pkcs11 {
+                let pin = passphrase(passphrase_file.as_deref(), false)?;
+                seal.add_token_device(vault, std::path::Path::new(module), uri, pin.as_ref())
+            } else {
+                let first = !user.device_key().exists() && !user.token_device().exists();
+                let pass = passphrase(passphrase_file.as_deref(), first)?;
+                seal.add_device(vault, pass.as_ref())
+            }
+        }
+        DeviceAction::Remove { vault, id } => seal.remove_device(vault, id),
+    }
+}
+
 /// `kuipa seal …`: as the user, with their ticket.
 fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
     let user = kuipa_tools::seal::UserPaths::from_env()?;
@@ -1980,24 +2066,23 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
     match action {
         SealAction::Create { vault, policy } => seal.create(vault, policy.policy()?),
         SealAction::Policy { vault, policy } => seal.set_policy(vault, policy.policy()?),
-        SealAction::Device { action } => match action {
-            DeviceAction::Add {
-                vault,
-                passphrase_file,
-                pkcs11,
-                module,
-            } => {
-                if let Some(uri) = pkcs11 {
-                    let pin = passphrase(passphrase_file.as_deref(), false)?;
-                    seal.add_token_device(vault, std::path::Path::new(module), uri, pin.as_ref())
-                } else {
-                    let first = !user.device_key().exists() && !user.token_device().exists();
-                    let pass = passphrase(passphrase_file.as_deref(), first)?;
-                    seal.add_device(vault, pass.as_ref())
-                }
-            }
-            DeviceAction::Remove { vault, id } => seal.remove_device(vault, id),
-        },
+        SealAction::Share {
+            vault,
+            who,
+            manager,
+        } => {
+            let (managers, members) = who.split(*manager);
+            seal.share(vault, managers, members)
+        }
+        SealAction::Unshare {
+            vault,
+            who,
+            manager,
+        } => {
+            let (managers, members) = who.split(*manager);
+            seal.unshare(vault, managers, members)
+        }
+        SealAction::Device { action } => run_seal_device(&seal, &user, action),
         SealAction::File {
             vault,
             file,
@@ -2102,6 +2187,11 @@ fn render_seal(value: &Value) {
             if get(factors, "ticket").as_bool().unwrap_or(false) {
                 needs.push("your Kerberos ticket".to_owned());
             }
+            for who in ["managers", "members"] {
+                if !list(get(v, who)).is_empty() {
+                    rows.field(who, get(v, who));
+                }
+            }
             rows.row("opening needs", needs.join(" and "));
             rows.until("expires", get(policy, "not_after"));
             rows.field("unlocks so far", get(v, "unlocks"));
@@ -2115,8 +2205,9 @@ fn render_seal(value: &Value) {
                 .into_iter()
                 .map(|d| {
                     Value::String(format!(
-                        "{} ({}, {}): {}",
+                        "{} ({}, {}, {}): {}",
                         get(d, "label").as_str().unwrap_or("?"),
+                        get(d, "holder").as_str().unwrap_or("?"),
                         get(d, "type").as_str().unwrap_or("?"),
                         get(d, "level").as_str().unwrap_or("?"),
                         get(d, "id").as_str().unwrap_or("?"),
