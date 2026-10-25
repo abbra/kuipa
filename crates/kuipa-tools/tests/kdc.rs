@@ -350,7 +350,15 @@ fn against_a_real_kdc() {
                 server: server.clone(),
                 directory: directory.clone(),
                 peers: Some(peers),
-                limiter: kuipad::limit::Limiter::default(),
+                // Generous: a refusal in this test is the policy's, never
+                // the rate limit's.
+                limiter: kuipad::limit::Limiter::new(kuipad::limit::Limits {
+                    per_host: kuipad::limit::Rate {
+                        burst: 1000.0,
+                        per_minute: 1000.0,
+                    },
+                    ..kuipad::limit::Limits::default()
+                }),
                 tang: None,
                 keys: None,
                 ledger: Some(ledger),
