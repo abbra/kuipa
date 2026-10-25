@@ -1749,12 +1749,18 @@ fn opened_file_logs_release(
     }
 }
 
-#[test]
-fn vault_events_are_logged_with_receipts() {
+/// A realm whose first server keeps its log in `ledger`.
+fn logged_realm() -> (Realm, Arc<MemoryLedger>) {
     let mut r = realm();
     let ledger = Arc::new(MemoryLedger::new(SERVERS[0]));
     let first = r.servers.remove(0).with_ledger(ledger.clone());
     r.servers.insert(0, first);
+    (r, ledger)
+}
+
+#[test]
+fn vault_events_are_logged_with_receipts() {
+    let (mut r, ledger) = logged_realm();
     let advs = [r.verify(0), r.verify(1)];
     let adv = &advs[0];
     let anchors = r.all_anchors();
@@ -2151,7 +2157,8 @@ fn open_as(
 /// The shared vault test's fixture: Alice's vault, shared with the dba group
 /// and with Carol, and the file she sealed to its members.
 fn shared_fixture() -> Shared {
-    let r = realm();
+    // Server 0 keeps a log, so removals are seen to be logged.
+    let (r, _) = logged_realm();
     let advs = [r.verify(0), r.verify(1)];
     let anchors = r.all_anchors();
     let alice_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
@@ -2350,10 +2357,28 @@ fn members_open_and_membership(c: &Shared) {
     assert!(open_as(r, sealed, BOB, bob_key).is_err());
     assert!(in_session(bob_key).is_err());
     assert!(vault_op(r, adv, BOB, &VaultOp::List).unwrap().is_empty());
+    // His device goes at the next vault operation anyone makes, even a
+    // read, and is logged as a removal.
+    let shown = vault_reply(r, adv, ALICE, &VaultOp::Show { name: "db".into() });
+    let v = verified_descriptor(&c.anchors, &shown.descriptors);
+    let holders: Vec<_> = v
+        .vault()
+        .devices
+        .iter()
+        .map(|d| v.vault().holder(d))
+        .collect();
+    assert_eq!(holders, [ALICE, CAROL]);
+    assert_eq!(shown.receipts.len(), 1, "one device removal logged");
     r.dir
         .groups
         .borrow_mut()
         .insert(BOB.into(), vec!["dba".into()]);
+    assert!(
+        open_as(r, sealed, BOB, bob_key).is_err(),
+        "no device any more"
+    );
+    // Back in the group, he registers it again; the file has its slot.
+    vault_op(r, adv, BOB, &add_device_op("alice/db", bob_key)).unwrap();
     assert!(open_as(r, sealed, BOB, bob_key).is_ok());
     // A disabled member is refused; the others are not.
     r.dir.disabled.borrow_mut().insert(BOB.into());

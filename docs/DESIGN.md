@@ -1763,8 +1763,11 @@ own, as `vaults/NAME@OWNER.vault` (`/` in the owner written `+`).
 **Joining and leaving.** The vault operations `share` and `unshare` add
 and remove managers and members; a member may `unshare` themselves, and
 only themselves (by name; one who is a member by group leaves the group).
-`unshare` drops the devices of everyone it leaves without a role, and
-removing a device or a member starts a new offline-session epoch at once,
+Every vault operation (a `show` or `list` too) drops the devices of
+holders with no role any more, unshared or out of the group in IPA, each
+logged as a device removal (a locked holder keeps theirs: a lock can be
+lifted, and every release checks it). Removing a device or a member starts
+a new offline-session epoch at once,
 so files sealed for offline sessions from then on do not open from keys
 released before. A file opens for a new member's device only once it is
 sealed or resealed after the device was registered: `kuipa seal reseal`
@@ -1791,8 +1794,8 @@ opens do not use up the owner's.
 What membership does not give: a member sees the vault's descriptor,
 hence its members, devices and policy. Releases are counted per vault
 (`max_unlocks`), not per member. A change of membership in IPA (a user
-leaving a group) takes effect at the next release, but leaves that user's
-devices registered until an `unshare` or a manager removes them.
+leaving a group) refuses that user's opens from the next release on; their
+devices go at the next vault operation anyone makes.
 
 ```
 kuipa seal share VAULT [--manager] [--user U…] [--group G…] [--host FQDN…] [--service S…]
