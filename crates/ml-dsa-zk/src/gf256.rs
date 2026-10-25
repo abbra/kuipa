@@ -5,11 +5,19 @@
 
 use std::ops::{Add, AddAssign, Mul};
 
+use crate::gf128::halves;
+
 /// An element of GF(2²⁵⁶).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Gf256(pub [u128; 2]);
 
 impl Gf256 {
+    /// Addition: XOR.
+    #[must_use]
+    fn xor(self, other: Self) -> Self {
+        Self([self.0[0] ^ other.0[0], self.0[1] ^ other.0[1]])
+    }
+
     /// 0.
     pub const ZERO: Self = Self([0, 0]);
     /// 1.
@@ -60,19 +68,16 @@ impl Gf256 {
 }
 
 // Addition in characteristic 2 is XOR.
-#[allow(clippy::suspicious_arithmetic_impl)]
 impl Add for Gf256 {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        Self([self.0[0] ^ other.0[0], self.0[1] ^ other.0[1]])
+        self.xor(other)
     }
 }
 
-#[allow(clippy::suspicious_op_assign_impl)]
 impl AddAssign for Gf256 {
     fn add_assign(&mut self, other: Self) {
-        self.0[0] ^= other.0[0];
-        self.0[1] ^= other.0[1];
+        *self = self.xor(other);
     }
 }
 
@@ -88,10 +93,9 @@ fn clmul64(a: u64, b: u64) -> u128 {
 }
 
 /// 128×128 → 256 carry-less multiplication by Karatsuba, as `(lo, hi)`.
-#[allow(clippy::cast_possible_truncation)] // splitting into halves
 fn clmul128(a: u128, b: u128) -> (u128, u128) {
-    let (a0, a1) = (a as u64, (a >> 64) as u64);
-    let (b0, b1) = (b as u64, (b >> 64) as u64);
+    let (a0, a1) = halves(a);
+    let (b0, b1) = halves(b);
     let z0 = clmul64(a0, b0);
     let z2 = clmul64(a1, b1);
     let z1 = clmul64(a0 ^ a1, b0 ^ b1) ^ z0 ^ z2;
@@ -207,7 +211,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::many_single_char_names)] // Rabin's test's names
     fn the_modulus_is_irreducible() {
         // Rabin's test for degree 256, whose only prime factor is 2:
         // x^(2²⁵⁶) ≡ x, and gcd(x^(2¹²⁸) − x, f) = 1.
@@ -222,9 +225,10 @@ mod tests {
         }
         assert_eq!(p, x);
         let f: Poly = [0x425, 0, 0, 0, 1];
-        let [l, h] = half.0;
-        #[allow(clippy::cast_possible_truncation)] // splitting into limbs
-        let g: Poly = [l as u64, (l >> 64) as u64, h as u64, (h >> 64) as u64, 0];
+        let [lo, hi] = half.0;
+        let (lo0, lo1) = halves(lo);
+        let (hi0, hi1) = halves(hi);
+        let g: Poly = [lo0, lo1, hi0, hi1, 0];
         assert_eq!(degree(&gcd(f, g)), Some(0));
     }
 }

@@ -9,6 +9,12 @@ use std::ops::{Add, AddAssign, Mul};
 pub struct Gf(pub u128);
 
 impl Gf {
+    /// Addition: XOR.
+    #[must_use]
+    fn xor(self, other: Self) -> Self {
+        Self(self.0 ^ other.0)
+    }
+
     /// 0.
     pub const ZERO: Self = Self(0);
     /// 1.
@@ -40,19 +46,24 @@ impl Gf {
 }
 
 // Addition in characteristic 2 is XOR.
-#[allow(clippy::suspicious_arithmetic_impl)]
 impl Add for Gf {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        Self(self.0 ^ other.0)
+        self.xor(other)
     }
 }
 
-#[allow(clippy::suspicious_op_assign_impl)]
 impl AddAssign for Gf {
     fn add_assign(&mut self, other: Self) {
-        self.0 ^= other.0;
+        *self = self.xor(other);
     }
+}
+
+/// The low and high 64-bit halves of `x`.
+pub(crate) fn halves(x: u128) -> (u64, u64) {
+    let lo = u64::try_from(x & u128::from(u64::MAX)).expect("masked to 64 bits");
+    let hi = u64::try_from(x >> 64).expect("shifted to 64 bits");
+    (lo, hi)
 }
 
 /// 64×64 → 128 carry-less multiplication, branch-free.
@@ -68,10 +79,9 @@ fn clmul64(a: u64, b: u64) -> u128 {
 
 impl Mul for Gf {
     type Output = Self;
-    #[allow(clippy::cast_possible_truncation)] // splitting into halves
     fn mul(self, other: Self) -> Self {
-        let (a0, a1) = (self.0 as u64, (self.0 >> 64) as u64);
-        let (b0, b1) = (other.0 as u64, (other.0 >> 64) as u64);
+        let (a0, a1) = halves(self.0);
+        let (b0, b1) = halves(other.0);
         // Karatsuba: the 256-bit product as (hi, lo).
         let z0 = clmul64(a0, b0);
         let z2 = clmul64(a1, b1);
