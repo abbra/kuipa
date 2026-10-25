@@ -134,6 +134,10 @@ pub struct LdapDirectory {
     initiator: std::sync::Mutex<()>,
 }
 
+/// A vault's attributes as the directory stores them: its name, the
+/// policy, the session keys and the devices, each as JSON.
+type VaultAttrs = (String, Vec<String>, &'static str, Vec<String>);
+
 impl LdapDirectory {
     /// Acquire the daemon's acceptor credential.
     ///
@@ -376,10 +380,7 @@ impl LdapDirectory {
             .collect()
     }
 
-    #[allow(clippy::type_complexity)]
-    fn vault_attrs(
-        vault: &Vault,
-    ) -> Result<(String, Vec<String>, &'static str, Vec<String>), DirectoryError> {
+    fn vault_attrs(vault: &Vault) -> Result<VaultAttrs, DirectoryError> {
         let policy = serde_json::to_string(&vault.policy)?;
         let keys = vault
             .session_keys
