@@ -288,6 +288,30 @@ jobs:
           REPORT_URL: ${{ steps.report.outputs.artifact-url }}
         run: echo "**[Download the playground report]($REPORT_URL)**" >> "$GITHUB_STEP_SUMMARY"
 
+  # ── Benchmarks ─────────────────────────────────────────────────────────────
+  # The smoke profile in quick mode: every criterion target runs, so a fixture
+  # that no longer verifies or a flow that regressed hard fails the job.  The
+  # benches build in release, which the debug artifact cache does not cover —
+  # only the registry cache helps here.
+  bench:
+    name: Benchmarks
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Install native dependencies
+        run: dnf install -y $DNF_PACKAGES
+      - uses: actions/checkout@v7
+      - name: Restore cargo registry cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-v1-
+      - name: Run the benchmark smoke pass
+        run: ./contrib/ci/local-ci.sh --no-deps bench
+
   # ── MSRV ───────────────────────────────────────────────────────────────────
   # Builds with the oldest supported Rust (rust-version in Cargo.toml), which
   # catches language features clippy's incompatible_msrv lint cannot.

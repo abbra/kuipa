@@ -16,7 +16,7 @@ printing `✓` for what it found and `○` for what is missing:
 | `rustfmt`, `clippy` | the `fmt` and `clippy` jobs |
 | OpenSSL ≥ 3.5, krb5 and OpenLDAP development files, libclang | building (Fedora: `openssl-devel krb5-devel openldap-devel clang-devel`; bindgen needs libclang for native-ossl-sys) |
 | `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` (MIT krb5 1.22 or later), MIT `pkinit.so` | `kdc-test`, `playground-test` and `interactive` (Fedora: `krb5-server krb5-workstation krb5-pkinit`; macOS: `brew install krb5`, whose keg `bin`/`sbin` the script puts first on `PATH`) |
-| `python3` | `playground-test`, to render its report |
+| `python3` | `playground-test`, to render its report, and `bench`/`scripts/bench.sh`, to collect and compare results |
 | `rustup` with the MSRV toolchain | `msrv` (`rustup toolchain install 1.89`) |
 | `valgrind` | `--valgrind` only |
 | `actionlint` (or `yamllint` as a fallback) | `lint-workflows`; skipped with a warning if neither is installed |
@@ -59,6 +59,7 @@ KUIPA_KRB5_VENDOR=heimdal ./contrib/ci/local-ci.sh build clippy test
 | `kdc-test` | `cargo test -p kuipa-tools --test kdc --test trust --test voucher` with `KUIPA_REQUIRE_KDC=1`, so missing KDC tools fail the job instead of skipping the tests; `SKIP` (not `FAIL`) under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
 | `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report/` (see below); `SKIP` under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
 | `msrv` (opt-in) | `cargo build --workspace --all-targets` with the `rust-version` toolchain | |
+| `bench` (opt-in) | the criterion targets in quick mode under the `smoke` profile (`scripts/bench.sh --quick --no-save`): a fixture that no longer verifies panics, so this job doubles as a protocol self-check (see [Benchmarks](../reference/benchmarks.md)) | `build` |
 
 Dependencies are run on demand: `local-ci.sh clippy` builds first. Inside
 CI, `--no-deps` turns that off because the workflow's `needs:` already
