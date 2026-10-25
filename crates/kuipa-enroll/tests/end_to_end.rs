@@ -53,6 +53,8 @@ struct MemoryDirectory {
     escrow: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     escrow_files: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     disabled: RefCell<HashSet<String>>,
+    /// When each leased principal's lease ends.
+    leases: RefCell<HashMap<String, u64>>,
     staged: RefCell<HashMap<String, Staged>>,
     vaults: RefCell<HashMap<VaultId, Vault>>,
     unlocks: RefCell<HashMap<(VaultId, String), u64>>,
@@ -334,6 +336,10 @@ impl Directory for MemoryDirectory {
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.disabled.borrow().contains(&principal.to_string()))
+    }
+
+    fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
+        Ok(self.leases.borrow().get(&principal.to_string()).copied())
     }
 
     fn vaults_approved_by(
@@ -1555,6 +1561,21 @@ fn delegated_tickets(c: &VaultCase) {
     assert!(c.open(via, Some(device)).is_ok());
     let elsewhere = "alice@EXAMPLE.TEST via host/vm2.example.test@EXAMPLE.TEST";
     assert!(c.open(elsewhere, Some(device)).is_err());
+    // Only a principal whose lease is running, with ticket.leased.
+    set_policy(
+        c,
+        vault::Policy {
+            ticket_leased: true,
+            ..policy.clone()
+        },
+    );
+    assert!(c.open(ALICE, Some(device)).is_err(), "not leased");
+    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    c.r.dir.leases.borrow_mut().insert(ALICE.into(), now + 3600);
+    assert!(c.open(ALICE, Some(device)).is_ok());
+    c.r.dir.leases.borrow_mut().insert(ALICE.into(), now - 1);
+    assert!(c.open(ALICE, Some(device)).is_err(), "the lease ended");
+    c.r.dir.leases.borrow_mut().clear();
     // A level the device does not have.
     set_policy(
         c,

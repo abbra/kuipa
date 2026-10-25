@@ -239,6 +239,10 @@ pub struct Policy {
     /// Which delegated tickets satisfy `factors.ticket`.
     #[serde(default)]
     pub ticket_delegation: TicketDelegation,
+    /// Only a host whose lease is still running opens (`DESIGN-ci.md` §2):
+    /// for runners that join with leased vouchers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ticket_leased: bool,
     /// No unlock after this time (Unix seconds); the server fills it in
     /// from the realm limits when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +370,11 @@ impl Policy {
             && list.is_empty()
         {
             return Err(Self::refuse("ticket delegation via an empty list"));
+        }
+        if self.ticket_leased && !f.ticket {
+            return Err(Self::refuse(
+                "ticket.leased needs the ticket factor: the lease is the ticket's host's",
+            ));
         }
         if let Some(approvals) = &self.approvals {
             approvals.validate()?;
@@ -2599,6 +2608,16 @@ mod tests {
         assert!(any.meets(&Factors::default()), "nothing asked");
         assert_eq!(bound.to_string(), "device=hardware-bound,ticket");
         assert_eq!(Factors::default().to_string(), "none");
+    }
+
+    #[test]
+    fn ticket_leased_needs_the_ticket_factor() {
+        let leased = |f| Policy {
+            ticket_leased: true,
+            ..policy(f)
+        };
+        assert!(leased(factors(None, true)).validate().is_ok());
+        assert!(leased(factors(Some(Level::Any), false)).validate().is_err());
     }
 
     #[test]
