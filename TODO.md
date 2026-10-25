@@ -151,9 +151,8 @@ design first.
         (`kuipa seal recover helpdesk|deliver|fetch`).
 - [x] M-of-N approvals for break-glass releases, recorded in the
       transparency log (`docs/DESIGN-approvals.md`).
-- [ ] Short-lived CI runner identities (voucher leases, `ticket.leased`)
-      and pipeline secrets in shared vaults: designed in
-      `docs/DESIGN-ci.md`.
+- [x] Short-lived CI runner identities (voucher leases, `ticket.leased`)
+      and pipeline secrets in shared vaults (`docs/DESIGN-ci.md`).
 - [ ] Recipes in the book: Ansible vault passwords, `systemd-creds` and
       container secrets, `tang-pqc` file encryption, `realm-info` for
       unenrolled machines.
@@ -182,7 +181,10 @@ design first.
       on a `cn=recovery,cn=kuipa,cn=etc` entry,
       `ipaKUServerEscrowKey` on
       `cn=masters` entries,
-      `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
+      `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKULease` on host entries
+      (written by the daemon, which may delete only entries carrying it),
+      `ipaKUVouchers` on a `cn=vouchers,cn=kuipa,cn=etc` entry,
+      `ipaKUTrustInvitation`,
       `ipaKUTrustedRealm`) and
       the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs for the daemon's identity
       (including adding hosts and host-group members for vouchers, and

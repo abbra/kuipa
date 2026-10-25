@@ -291,6 +291,25 @@ ipa host-del web-17.example.test --updatedns
   locked entry (`nsAccountLock`) as disabled. Until FreeIPA's
   `host-disable` sets the lock, delete the host to retire its files.
 
+For instances that should not outlive a job or a day, such as CI
+runners, give the voucher a lease instead, and nothing needs to remember
+to clean up:
+
+```sh
+kuipa-voucher request --public "$JWK" --realm EXAMPLE.TEST \
+    --fqdn runner-17.example.test --hostgroup ci-runners --lease-hours 4 \
+    --binding "$BINDING" --state st.json > req
+```
+
+The KDC issues the host no ticket after the 4 hours, and kuipad removes
+the entry an hour later. The realm caps leases at 7 days unless
+`ipaKUVouchers` on `cn=vouchers,cn=kuipa,cn=etc` sets another
+`max_lease` (seconds). A shared vault created with `--ticket-leased`
+opens only for hosts whose lease is running: pipeline secrets sealed to
+it are worth nothing to a long-lived host added to the runners' group by
+mistake, or to a keytab copied off a runner after its lease
+([CI runners](../reference/design.md#kuipa-for-ci-runners-leased-identities-and-pipeline-secrets)).
+
 ### Bind identities to the instance's virtual TPM
 
 **planned**

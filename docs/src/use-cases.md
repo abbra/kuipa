@@ -35,6 +35,7 @@ source tree.
 | [Keep keytabs useless in backups and snapshots](#keep-keytabs-useless-in-backups-and-snapshots) | host admins | works |
 | [Seal any file to a host](#seal-any-file-to-a-host) | host admins | works |
 | [Unlock encrypted disks with a post-quantum Tang](#unlock-encrypted-disks-with-a-post-quantum-tang) | host admins | works, not yet tested with real Clevis and LUKS |
+| [Give CI runners short-lived identities](#give-ci-runners-short-lived-identities) | platform teams | works |
 | [Accept users of a trusted realm](#accept-users-of-a-trusted-realm) | realm admins | works |
 | [Move secrets between IPA replicas](#move-secrets-between-ipa-replicas) | realm admins | works |
 | [Check what the realm vouched for](#check-what-the-realm-vouched-for) | auditors, realm admins | works |
@@ -48,7 +49,6 @@ source tree.
 | [Have independent witnesses watch the logs](#have-independent-witnesses-watch-the-logs) | auditors, partner sites | works |
 | [Log in offline without a crackable password cache](#log-in-offline-without-a-crackable-password-cache) | laptop users | planned |
 | [Tie secrets to a TPM, passkey or attested hardware](#tie-secrets-to-a-tpm-passkey-or-attested-hardware) | users, fleet owners | planned |
-| [Give CI runners short-lived identities](#give-ci-runners-short-lived-identities) | platform teams | planned |
 | [Anonymous tokens: surveys, reports, access](#anonymous-tokens-surveys-reports-access) | everyone | research |
 
 Every use case follows the host's system crypto policy. Under a CNSA 2.0
@@ -137,6 +137,20 @@ network, but Tang's key exchange is classical.
 **Status:** works as a command and over HTTP. It is **not yet tested
 under real Clevis, with LUKS2, or in an initramfs**. See
 [Keys and rotation](realm/keys.md#tang).
+
+### Give CI runners short-lived identities
+
+**Why.** CI runners are created and destroyed constantly, and often hold
+long-lived secrets pasted into the CI system.
+
+**What kuipa does.** The CI controller requests a voucher with a lease
+(`kuipa-voucher request --lease-hours 4`) for each runner it starts. The
+KDC issues the runner no ticket after the lease, and the realm removes
+the host an hour later. Pipeline secrets are files sealed to a shared
+vault of the runners' host group with `--ticket-leased`: they open with
+a runner's ticket only while its lease runs, so a copied keytab is worth
+at most the rest of the lease. See
+[CI runners](reference/design.md#kuipa-for-ci-runners-leased-identities-and-pipeline-secrets).
 
 ## Realms
 
@@ -308,19 +322,6 @@ or a security key cannot.
 **What kuipa would do.** Passkeys as a vault factor, a TPM factor for
 sealed keytabs and machine vaults, and checked hardware attestation, so
 a policy can demand keys that cannot leave the hardware.
-
-### Give CI runners short-lived identities
-
-**Why.** CI runners are created and destroyed constantly, and often hold
-long-lived secrets.
-
-**What kuipa would do.** Join runners with vouchers (which work today),
-give them identities that expire on their own, and seal pipeline secrets
-to them.
-
-**Design:** a voucher carries a lease, the realm removes the host when it
-ends, and a shared vault opens only for leased runners. See
-[CI runners](reference/design.md#kuipa-for-ci-runners-leased-identities-and-pipeline-secrets).
 
 ### Anonymous tokens: surveys, reports, access
 
