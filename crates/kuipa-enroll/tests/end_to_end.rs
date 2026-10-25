@@ -301,6 +301,27 @@ impl Directory for MemoryDirectory {
             .collect())
     }
 
+    fn vaults_shared_with(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let wanted = vault::Members::matching_entries(principal, groups);
+        Ok(self
+            .vaults
+            .borrow()
+            .values()
+            .filter(|v| {
+                v.managers
+                    .entries()
+                    .iter()
+                    .chain(&v.members.entries())
+                    .any(|e| wanted.contains(e))
+            })
+            .cloned()
+            .collect())
+    }
+
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.disabled.borrow().contains(&principal.to_string()))
     }
@@ -1896,6 +1917,389 @@ fn vault_sessions_and_unlock_limits() {
         .seal(&gss_token(ALICE, &cb), &[], &op.to_bytes())
         .unwrap();
     assert!(r.send(0, Operation::Vault, &request).is_err());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn shared_vaults_open_for_their_members_with_their_own_devices() {
+    const CAROL: &str = "carol@EXAMPLE.TEST";
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let adv = &advs[0];
+    let anchors = r.all_anchors();
+    let alice_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let bob_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let carol_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let add = |name: &str, key: &ExchangeKeyPair| VaultOp::AddDevice {
+        name: name.into(),
+        label: "laptop".into(),
+        kind: DeviceType::File,
+        alg: key.public().alg().id(),
+        key: tang_pqc::b64::encode(key.public().as_bytes()),
+    };
+    let users = |names: &[&str]| vault::Members {
+        users: names.iter().map(|&n| n.to_owned()).collect(),
+        ..vault::Members::default()
+    };
+    let group = |g: &str| vault::Members {
+        groups: vec![g.to_owned()],
+        ..vault::Members::default()
+    };
+    let share = |name: &str, managers: vault::Members, members: vault::Members| VaultOp::Share {
+        name: name.into(),
+        managers,
+        members,
+    };
+    let unshare =
+        |name: &str, managers: vault::Members, members: vault::Members| VaultOp::Unshare {
+            name: name.into(),
+            managers,
+            members,
+        };
+    let verified = |d: &[Descriptor]| d[0].verify(REALM, &anchors, &Policy::default()).unwrap();
+    r.dir
+        .groups
+        .borrow_mut()
+        .insert(BOB.into(), vec!["dba".into()]);
+
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Create {
+            name: "db".into(),
+            policy: vault::Policy {
+                factors: Factors {
+                    device: Some(Level::Any),
+                    ticket: true,
+                    passkey: false,
+                },
+                sessions: vault::Sessions {
+                    reauth: Some(600),
+                    offline: None,
+                    epoch: None,
+                },
+                ..vault::Policy::default()
+            },
+        },
+    )
+    .unwrap();
+    vault_op(&r, adv, ALICE, &add("db", &alice_key)).unwrap();
+    // A slash names an owner: no vault is created under one.
+    let slashed = VaultOp::Create {
+        name: "a/b".into(),
+        policy: vault::Policy::default(),
+    };
+    assert!(vault_op(&r, adv, ALICE, &slashed).is_err());
+
+    // Before it is shared, Bob cannot see it, by either spelling.
+    for name in ["alice/db", "alice@EXAMPLE.TEST/db", "db"] {
+        assert!(vault_op(&r, adv, BOB, &VaultOp::Show { name: name.into() }).is_err());
+    }
+    assert!(vault_op(&r, adv, BOB, &share("alice/db", users(&[BOB]), users(&[]))).is_err());
+
+    // Alice shares it with the dba group and with Carol by name.
+    let shared = vault_op(
+        &r,
+        adv,
+        ALICE,
+        &share("db", vault::Members::default(), {
+            let mut m = group("dba");
+            m.users.push("carol".into());
+            m
+        }),
+    )
+    .unwrap();
+    let v = verified(&shared);
+    assert_eq!(v.vault().members.users, [CAROL], "normalized to the realm");
+    assert_eq!(v.vault().members.groups, ["dba"]);
+
+    // Bob sees it in his list and registers his own device in it.
+    let listed = vault_op(&r, adv, BOB, &VaultOp::List).unwrap();
+    assert_eq!(listed.len(), 1);
+    vault_op(&r, adv, BOB, &add("alice/db", &bob_key)).unwrap();
+    let v = verified(&vault_op(&r, adv, CAROL, &add("alice@EXAMPLE.TEST/db", &carol_key)).unwrap());
+    let holders: Vec<_> = v
+        .vault()
+        .devices
+        .iter()
+        .map(|d| v.vault().holder(d).to_owned())
+        .collect();
+    assert_eq!(holders, [ALICE, BOB, CAROL]);
+    // Members are not managers: no policy, sharing, revoking or other
+    // members' devices.
+    let alices_device = alice_key.public().kid().to_string();
+    for op in [
+        VaultOp::SetPolicy {
+            name: "alice/db".into(),
+            policy: v.vault().policy.clone(),
+        },
+        share("alice/db", vault::Members::default(), users(&["eve"])),
+        unshare("alice/db", vault::Members::default(), users(&["carol"])),
+        VaultOp::Revoke {
+            name: "alice/db".into(),
+        },
+        VaultOp::RemoveDevice {
+            name: "alice/db".into(),
+            id: alices_device.clone(),
+        },
+    ] {
+        assert!(vault_op(&r, adv, BOB, &op).is_err(), "{op:?}");
+    }
+
+    // Any member seals to every member's device; each opens with their
+    // own device and ticket, and only so.
+    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"db=hunter2\n").unwrap();
+    let sealed = SealedVaultFile::from_bytes(&sealed.to_bytes()).unwrap();
+    assert_eq!(sealed.devices().len(), 3);
+    assert_eq!(sealed.principal().to_string(), ALICE, "P is the owner");
+    let ask = |s: &str, req: &EscrowRequest| {
+        let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+        r.servers[usize::from(s == "ipa2.example.test")]
+            .recover(&req, &r.dir)
+            .ok()
+            .map(|a| a.to_bytes())
+    };
+    let open_as = |who: &'static str, key: &ExchangeKeyPair| {
+        let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(who, cb));
+        sealed.open(
+            Unlock {
+                device: Some(key as &dyn vault::DeviceKey),
+                session: None,
+                ticket: Some(&mut ticket),
+            },
+            ask,
+        )
+    };
+    for (who, key) in [(ALICE, &alice_key), (BOB, &bob_key), (CAROL, &carol_key)] {
+        assert_eq!(
+            open_as(who, key).unwrap().as_ref(),
+            b"db=hunter2\n",
+            "{who}"
+        );
+    }
+    assert!(
+        open_as(BOB, &alice_key).is_err(),
+        "Alice's device, Bob's ticket"
+    );
+    assert!(
+        open_as(ALICE, &bob_key).is_err(),
+        "Bob's device, Alice's ticket"
+    );
+    assert!(open_as("eve@EXAMPLE.TEST", &bob_key).is_err());
+
+    // A session is the member's own, for their own device.
+    let bob_device = bob_key.public().kid().to_string();
+    let unlock = |device: &str| VaultOp::Unlock {
+        name: "alice/db".into(),
+        device: device.into(),
+        offline: false,
+    };
+    let reply = vault_reply(&r, adv, BOB, &unlock(&bob_device));
+    let session = reply.session.unwrap();
+    let in_session = |key: &ExchangeKeyPair| {
+        sealed.open(
+            Unlock {
+                device: Some(key),
+                session: Some(&session),
+                ticket: None,
+            },
+            ask,
+        )
+    };
+    assert!(in_session(&bob_key).is_ok());
+    assert!(in_session(&alice_key).is_err());
+    assert!(vault_op(&r, adv, BOB, &unlock(&alices_device)).is_err());
+
+    // Membership is the directory's: out of the group, Bob opens nothing,
+    // in or out of his session; back in, he does again.
+    r.dir.groups.borrow_mut().remove(BOB);
+    assert!(open_as(BOB, &bob_key).is_err());
+    assert!(in_session(&bob_key).is_err());
+    assert!(vault_op(&r, adv, BOB, &VaultOp::List).unwrap().is_empty());
+    r.dir
+        .groups
+        .borrow_mut()
+        .insert(BOB.into(), vec!["dba".into()]);
+    assert!(open_as(BOB, &bob_key).is_ok());
+    // A disabled member is refused; the others are not.
+    r.dir.disabled.borrow_mut().insert(BOB.into());
+    assert!(open_as(BOB, &bob_key).is_err());
+    assert!(open_as(CAROL, &carol_key).is_ok());
+    r.dir.disabled.borrow_mut().remove(BOB);
+
+    // Carol may leave, but not remove anyone else.
+    assert!(
+        vault_op(
+            &r,
+            adv,
+            CAROL,
+            &unshare("alice/db", vault::Members::default(), group("dba"))
+        )
+        .is_err()
+    );
+    let left = verified(
+        &vault_op(
+            &r,
+            adv,
+            CAROL,
+            &unshare("alice/db", vault::Members::default(), users(&["carol"])),
+        )
+        .unwrap(),
+    );
+    assert!(left.vault().members.users.is_empty());
+    assert_eq!(left.vault().devices.len(), 2, "her device went with her");
+    assert!(open_as(CAROL, &carol_key).is_err());
+
+    // Bob made a manager can share and unshare; dropping the group drops
+    // his membership but not his management, so his device stays.
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &share("db", users(&["bob"]), vault::Members::default()),
+    )
+    .unwrap();
+    vault_op(
+        &r,
+        adv,
+        BOB,
+        &share("alice/db", vault::Members::default(), users(&["carol"])),
+    )
+    .unwrap();
+    let v = verified(
+        &vault_op(
+            &r,
+            adv,
+            BOB,
+            &unshare("alice/db", vault::Members::default(), group("dba")),
+        )
+        .unwrap(),
+    );
+    assert_eq!(v.vault().managers.users, [BOB]);
+    assert_eq!(v.vault().members.users, [CAROL]);
+    assert_eq!(v.vault().devices.len(), 2);
+    assert!(open_as(BOB, &bob_key).is_ok());
+    // Removed as manager, his device goes, and with it his files.
+    let v = verified(
+        &vault_op(
+            &r,
+            adv,
+            ALICE,
+            &unshare("db", users(&["bob"]), vault::Members::default()),
+        )
+        .unwrap(),
+    );
+    assert!(v.vault().managers.is_empty());
+    assert_eq!(v.vault().devices.len(), 1);
+    assert!(open_as(BOB, &bob_key).is_err());
+    assert!(open_as(ALICE, &alice_key).is_ok());
+
+    // The realm caps who may share a vault; 0 keeps vaults to their owners.
+    r.dir.limits.borrow_mut().max_members = 1;
+    assert!(
+        vault_op(
+            &r,
+            adv,
+            ALICE,
+            &share("db", vault::Members::default(), users(&["dave"]))
+        )
+        .is_err()
+    );
+    r.dir.limits.borrow_mut().max_members = 0;
+    let lonely = VaultOp::Create {
+        name: "lonely".into(),
+        policy: v.vault().policy.clone(),
+    };
+    vault_op(&r, adv, ALICE, &lonely).unwrap();
+    assert!(
+        vault_op(
+            &r,
+            adv,
+            ALICE,
+            &share("lonely", vault::Members::default(), users(&["bob"]))
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn removing_a_member_starts_a_new_offline_epoch() {
+    let r = realm();
+    let adv = &r.verify(0);
+    let anchors = r.all_anchors();
+    r.dir.limits.borrow_mut().offline_sessions = true;
+    let key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let epochs = |d: &[Descriptor]| {
+        d[0].verify(REALM, &anchors, &Policy::default())
+            .unwrap()
+            .vault()
+            .session_keys
+            .len()
+    };
+    let created = vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Create {
+            name: "travel".into(),
+            policy: vault::Policy {
+                factors: Factors {
+                    device: Some(Level::Any),
+                    ticket: true,
+                    passkey: false,
+                },
+                sessions: vault::Sessions {
+                    reauth: None,
+                    offline: Some(3600),
+                    epoch: None,
+                },
+                ..vault::Policy::default()
+            },
+        },
+    )
+    .unwrap();
+    let members = vault::Members {
+        users: vec!["bob".into()],
+        ..vault::Members::default()
+    };
+    let shared = vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Share {
+            name: "travel".into(),
+            managers: vault::Members::default(),
+            members: members.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(epochs(&shared), epochs(&created), "sharing keeps the epoch");
+    vault_op(
+        &r,
+        adv,
+        BOB,
+        &VaultOp::AddDevice {
+            name: "alice/travel".into(),
+            label: "bob".into(),
+            kind: DeviceType::File,
+            alg: key.public().alg().id(),
+            key: tang_pqc::b64::encode(key.public().as_bytes()),
+        },
+    )
+    .unwrap();
+    let removed = vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Unshare {
+            name: "travel".into(),
+            managers: vault::Members::default(),
+            members,
+        },
+    )
+    .unwrap();
+    assert_eq!(epochs(&removed), epochs(&created) + 1);
 }
 
 /// Run a vault operation as `caller` against server `i`.

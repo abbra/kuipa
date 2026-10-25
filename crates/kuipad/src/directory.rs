@@ -37,7 +37,7 @@ use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_inp
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
-use kuipa_enroll::vault::{Device, Limits, State, Vault};
+use kuipa_enroll::vault::{Device, Limits, Members, State, Vault};
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
 use native_ossl::util::SecretBuf;
@@ -72,6 +72,24 @@ const VAULT_UNLOCKS_ATTR: &str = "ipaKUVaultUnlocks";
 const VAULT_SESSION_KEY_ATTR: &str = "ipaKUVaultSessionKey";
 /// Registered bindings of a vault's files, hex `H(ct)` (§7.6.2).
 const VAULT_BINDING_ATTR: &str = "ipaKUVaultBinding";
+/// Who shares a vault (§7.6.12), one `kind:name` value each
+/// (`user:bob@REALM`, `group:dba`, `host:web1.example.test`,
+/// `service:HTTP/ci.example.test@REALM`): its managers, and its members.
+const VAULT_MANAGER_ATTR: &str = "ipaKUVaultManager";
+const VAULT_MEMBER_ATTR: &str = "ipaKUVaultMember";
+/// Every attribute a vault is read from.
+const VAULT_ATTRS: &[&str] = &[
+    VAULT_OWNER_ATTR,
+    VAULT_NAME_ATTR,
+    VAULT_POLICY_ATTR,
+    VAULT_MANAGER_ATTR,
+    VAULT_MEMBER_ATTR,
+    VAULT_DEVICE_ATTR,
+    VAULT_STATE_ATTR,
+    VAULT_UNLOCKS_ATTR,
+    VAULT_SESSION_KEY_ATTR,
+    VAULT_BINDING_ATTR,
+];
 /// A server's current escrow key on its `cn=masters` entry, `<KEM id>
 /// <base64url key>` (§7.6.6).
 const SERVER_ESCROW_KEY_ATTR: &str = "ipaKUServerEscrowKey";
@@ -286,6 +304,16 @@ impl LdapDirectory {
             .flatten()
             .map(|d| serde_json::from_str::<Device>(d))
             .collect::<Result<_, _>>()?;
+        let members = |attr: &str| {
+            Members::from_entries(
+                entry
+                    .attrs
+                    .get(&attr.to_lowercase())
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            )
+        };
         let state = match one(VAULT_STATE_ATTR)?.as_str() {
             "enabled" => State::Enabled,
             _ => State::Revoked,
@@ -295,6 +323,8 @@ impl LdapDirectory {
             owner: one(VAULT_OWNER_ATTR)?,
             name: one(VAULT_NAME_ATTR)?,
             policy: serde_json::from_str(&one(VAULT_POLICY_ATTR)?)?,
+            managers: members(VAULT_MANAGER_ATTR),
+            members: members(VAULT_MEMBER_ATTR),
             devices,
             state,
             unlocks: Self::unlock_counts(entry).iter().map(|(_, n)| n).sum(),
@@ -311,6 +341,25 @@ impl LdapDirectory {
                 .cloned()
                 .unwrap_or_default(),
         })
+    }
+
+    /// The vaults in the container that match `filter`.
+    fn vaults_matching(&self, filter: &str) -> Result<Vec<Vault>, DirectoryError> {
+        let filter = format!("(&(objectClass={VAULT_CLASS}){filter})");
+        let entries = match self.service_conn()?.search(
+            &self.vaults_dn(),
+            Scope::OneLevel,
+            &filter,
+            VAULT_ATTRS,
+        ) {
+            Ok(e) => e,
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        entries.iter().map(Self::vault_from).collect()
     }
 
     /// The per-server release counts on a vault entry.
@@ -822,6 +871,7 @@ impl Directory for LdapDirectory {
 
     fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
         let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
+        let (managers, members) = (vault.managers.entries(), vault.members.entries());
         let id = vault.id.to_string();
         self.service_conn()?.add_s(
             &self.vault_dn(&vault.id),
@@ -834,6 +884,14 @@ impl Directory for LdapDirectory {
                 (VAULT_OWNER_ATTR, vec![vault.owner.as_bytes()]),
                 (VAULT_NAME_ATTR, vec![vault.name.as_bytes()]),
                 (VAULT_POLICY_ATTR, vec![policy.as_bytes()]),
+                (
+                    VAULT_MANAGER_ATTR,
+                    managers.iter().map(String::as_bytes).collect(),
+                ),
+                (
+                    VAULT_MEMBER_ATTR,
+                    members.iter().map(String::as_bytes).collect(),
+                ),
                 (
                     VAULT_DEVICE_ATTR,
                     devices.iter().map(String::as_bytes).collect(),
@@ -860,16 +918,7 @@ impl Directory for LdapDirectory {
             &self.vault_dn(id),
             Scope::Base,
             &format!("(objectClass={VAULT_CLASS})"),
-            &[
-                VAULT_OWNER_ATTR,
-                VAULT_NAME_ATTR,
-                VAULT_POLICY_ATTR,
-                VAULT_DEVICE_ATTR,
-                VAULT_STATE_ATTR,
-                VAULT_UNLOCKS_ATTR,
-                VAULT_SESSION_KEY_ATTR,
-                VAULT_BINDING_ATTR,
-            ],
+            VAULT_ATTRS,
         ) {
             Ok(entries) => entries.first().map(Self::vault_from).transpose(),
             Err(kuipa_ldap::LdapError::Protocol {
@@ -882,10 +931,21 @@ impl Directory for LdapDirectory {
 
     fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
         let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
+        let (managers, members) = (vault.managers.entries(), vault.members.entries());
         self.service_conn()?.modify_s(
             &self.vault_dn(&vault.id),
             &[
                 (ModOp::Replace, VAULT_POLICY_ATTR, vec![policy.as_bytes()]),
+                (
+                    ModOp::Replace,
+                    VAULT_MANAGER_ATTR,
+                    managers.iter().map(String::as_bytes).collect(),
+                ),
+                (
+                    ModOp::Replace,
+                    VAULT_MEMBER_ATTR,
+                    members.iter().map(String::as_bytes).collect(),
+                ),
                 (
                     ModOp::Replace,
                     VAULT_DEVICE_ATTR,
@@ -915,33 +975,31 @@ impl Directory for LdapDirectory {
     }
 
     fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
-        let filter = format!(
-            "(&(objectClass={VAULT_CLASS})({VAULT_OWNER_ATTR}={}))",
+        self.vaults_matching(&format!(
+            "({VAULT_OWNER_ATTR}={})",
             filter_escape(&owner.to_string())
-        );
-        let entries = match self.service_conn()?.search(
-            &self.vaults_dn(),
-            Scope::OneLevel,
-            &filter,
-            &[
-                VAULT_OWNER_ATTR,
-                VAULT_NAME_ATTR,
-                VAULT_POLICY_ATTR,
-                VAULT_DEVICE_ATTR,
-                VAULT_STATE_ATTR,
-                VAULT_UNLOCKS_ATTR,
-                VAULT_SESSION_KEY_ATTR,
-                VAULT_BINDING_ATTR,
-            ],
-        ) {
-            Ok(e) => e,
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        entries.iter().map(Self::vault_from).collect()
+        ))
+    }
+
+    fn vaults_shared_with(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let any: String = Members::matching_entries(principal, groups)
+            .iter()
+            .flat_map(|e| {
+                let e = filter_escape(e);
+                [
+                    format!("({VAULT_MANAGER_ATTR}={e})"),
+                    format!("({VAULT_MEMBER_ATTR}={e})"),
+                ]
+            })
+            .collect();
+        if any.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.vaults_matching(&format!("(|{any})"))
     }
 
     fn vault_unlock(

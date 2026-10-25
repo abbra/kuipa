@@ -39,12 +39,12 @@ source tree.
 | [Move secrets between IPA replicas](#move-secrets-between-ipa-replicas) | realm admins | works |
 | [Check what the realm vouched for](#check-what-the-realm-vouched-for) | auditors, realm admins | works |
 | [Seal your own files](#seal-your-own-files) | every user | partly |
+| [Share a vault with a team or a fleet](#share-a-vault-with-a-team-or-a-fleet) | teams, fleet owners | works |
 | [See who touched your vault](#see-who-touched-your-vault) | every user | works |
 | [Work offline for a while](#work-offline-for-a-while) | every user | works where the realm allows it |
 | [Sign files and commits under your login](#sign-files-and-commits-under-your-login) | developers, release engineers, CI | works |
 | [Have independent witnesses watch the logs](#have-independent-witnesses-watch-the-logs) | auditors, partner sites | works |
 | [Log in offline without a crackable password cache](#log-in-offline-without-a-crackable-password-cache) | laptop users | planned |
-| [Share a vault with a team or a fleet](#share-a-vault-with-a-team-or-a-fleet) | teams, fleet owners | planned |
 | [Recover a vault when every device is lost](#recover-a-vault-when-every-device-is-lost) | every user, helpdesk | planned |
 | [Tie secrets to a TPM, passkey or attested hardware](#tie-secrets-to-a-tpm-passkey-or-attested-hardware) | users, fleet owners | planned |
 | [Require several people to approve a break-glass release](#require-several-people-to-approve-a-break-glass-release) | security teams | planned |
@@ -226,6 +226,19 @@ lets your device open your files offline until a time the realm sets.
 **Status:** works where the realm allows it. See
 [Sealing your own files](user/sealing.md#work-offline-for-a-while-if-your-administrators-allow-it).
 
+### Share a vault with a team or a fleet
+
+**Why.** Teams and host groups need shared secrets, such as a database
+password or a fleet's API key, without a password everyone copies.
+
+**What kuipa does.** A vault's owner shares it with users, IPA groups,
+hosts or host groups, as members or as managers. Each member opens with
+their own device and login, under the vault's one policy. Membership is
+checked at every open, so removing someone from the group in IPA stops
+their opens on every machine.
+
+**Status:** works. See [Sealing your own files](user/sealing.md#share-a-secret-with-your-team).
+
 ### Sign files and commits under your login
 
 **Why.** Signing usually means guarding a private key on every laptop
@@ -257,15 +270,6 @@ laptop: the realm signs an offline grant for one user, one machine and a
 time window. The password check moves into the laptop's TPM, which
 limits guesses and works only on that machine and only within the
 window. The disk holds nothing to guess against.
-
-### Share a vault with a team or a fleet
-
-**Why.** A vault has one owner today. Teams and host groups need shared
-secrets, such as a database password or a fleet's API key, without a
-password everyone copies.
-
-**What kuipa would do.** Vaults with several owners, or a host group,
-under one policy, with members added and removed in the realm.
 
 ### Recover a vault when every device is lost
 

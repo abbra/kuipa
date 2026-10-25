@@ -8,8 +8,9 @@
 > `any` until attestation is checked), `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
 > with the `device` and `ticket` factors, re-authentication sessions
 > (`--session-hours`), offline sessions (`--offline-hours`, where the realm
-> allows them), unlock limits (`--max-unlocks`) and registered sealing
-> (`--sealing registered`, `kuipa seal retire`). Not yet: passkeys,
+> allows them), unlock limits (`--max-unlocks`), registered sealing
+> (`--sealing registered`, `kuipa seal retire`) and shared vaults
+> (`share`, `unshare`). Not yet: passkeys,
 > the attested `hardware-*` levels, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
 > only the default `allow` is accepted). A vault policy asking for any of
@@ -29,7 +30,8 @@ keeps the data with you.
 
 * A **vault** is a set of rules on the IPA servers, owned by you: which
   factors opening a file needs, until when, how many times. You create
-  vaults yourself, within limits your administrators set.
+  vaults yourself, within limits your administrators set, and can share
+  one with other users, a group or a host group.
 * A **device** is a key that belongs to you and lives on one machine or
   token: a passphrase-protected key file, a key wrapped by a passkey, or a
   key on a smart card or token. You register each device in the vault.
@@ -233,6 +235,49 @@ session is unlocked, the key is on your machine, and the servers can no
 longer enforce when it ends or count your opens. They are for convenience
 on a machine you trust, not for your most sensitive files.
 
+### Share a secret with your team
+
+A database password the whole team needs belongs in a vault you share,
+not in a chat message. Share it with the IPA group, and make a colleague
+a manager so the vault does not depend on you alone:
+
+```sh
+alice$ kuipa seal create db --require device,ticket
+alice$ kuipa seal share db --group dba
+alice$ kuipa seal share db --manager --user carol
+```
+
+Others name your vault `alice/db`. Each member registers their own device
+from their own machine, and `kuipa seal list` shows it among theirs:
+
+```sh
+bob$ kuipa seal device add alice/db --passphrase
+bob$ kuipa seal file alice/db db-password.txt
+bob$ kuipa seal open db-password.txt.sealed --out -
+```
+
+* Every file is sealed to every member's devices. Each member opens with
+  their own device and their own ticket: Bob's ticket does not open with
+  Alice's device.
+* Membership is checked at every open. Someone who leaves the `dba` group
+  in IPA opens nothing more; `kuipa seal unshare db --group dba` (or
+  `--user bob`) also removes their devices. A member can leave with
+  `kuipa seal unshare alice/db --user bob`.
+* A file sealed before a member registered their device does not open for
+  them until someone resealed it: `kuipa seal reseal alice/db *.sealed`.
+* What a removed member already opened stays opened: change the secret
+  itself, then reseal.
+
+Managers change the policy, share and unshare, and revoke. Members open,
+seal, start sessions and manage their own devices. The vault stays yours
+(it counts against your vault limit) but keeps working for the team if
+your account is disabled.
+
+For a fleet, share with a host group (`--group webservers`) or hosts
+(`--host web1.example.test`): each host runs `kuipa seal` as root, with
+its host ticket (`kinit -k`) and its own device key in its kuipa
+directory (`KUIPA_USER_DIR`).
+
 ### A break-glass secret that opens only a few times
 
 An emergency root password or a recovery key should open rarely, with
@@ -256,7 +301,9 @@ kuipa seal file break-glass root-password.txt
 ### When you leave, or your account is disabled
 
 Disabling your IPA account, or revoking a vault, stops every future open on
-every machine at once. Nothing has to be found and deleted first.
+every machine at once. Nothing has to be found and deleted first. Vaults
+you share keep opening for their other members; their managers, or your
+administrators, can revoke them.
 
 What this cannot undo: a file you already opened, or an offline session
 already unlocked, has its plaintext or key on that machine.
@@ -276,9 +323,9 @@ already unlocked, has its plaintext or key on that machine.
 
 ## What it does not do
 
-* **Share files with someone else.** A vault has one owner. To give a
-  colleague a secret, use `ipa vault-*` or your organisation's secret
-  store.
+* **Keep a secret from a vault's own members.** Everyone you share a
+  vault with can open every file sealed to it, and sees its members,
+  devices and policy.
 * **Open files with no network.** Every open needs a server, except during
   an offline session.
 * **Run unattended out of the box.** A job that opens files while
@@ -296,7 +343,8 @@ Users manage their own vaults; administrators set the limits and can step
 in:
 
 * **Realm limits**: the longest expiry, the largest `--max-unlocks`, vaults
-  per user, devices per vault, the longest sessions, which factor
+  per user, devices per member of a vault, how many managers and members
+  a shared vault may have, the longest sessions, which factor
   combinations are allowed (for example: never `ticket` alone), and whether
   offline sessions are allowed at all (off by default).
 * **Revoke** a user's vault or one of its devices; disabling the user stops

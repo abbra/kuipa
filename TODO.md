@@ -61,6 +61,13 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         pkcs11-provider (no attestation yet: registered at `any`).
   - [ ] 9b. Passkeys (libfido2 FFI, relying-party verifier from ahdapa).
   - [x] Registered sealing (`sealing = registered`).
+  - [x] Shared vaults (§7.6.12): managers and members by user, group,
+        host or service, devices held by members, `OWNER/NAME`
+        references, `kuipa seal share`/`unshare`.
+  - [ ] Shared vaults, remaining: prune the devices of members who left
+        a group in IPA (today they stay registered, refused at every
+        open, until an `unshare`); rate-limit releases per opener rather
+        than by the owner's `P`, which a team now shares.
   - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
 - [x] Secrets transport (§18): the `keys` operation in `kuipa-enroll`
@@ -132,7 +139,6 @@ design first.
       operation arms a host while online with a signed offline grant (one
       user, one host, a window) and a per-user TPM-sealed object; needs the
       TPM factor.
-- [ ] Shared and group vaults (several owners, or a host group).
 - [ ] Recovery slots held by a helpdesk group, also escrowing LUKS and
       backup recovery keys.
 - [ ] M-of-N approvals for break-glass releases, recorded in the
@@ -156,7 +162,9 @@ design first.
 - [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
       the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
       `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
-      `ipaKUVaultUnlocks`, `ipaKUVaultSessionKey`, `ipaKUVaultBinding`, `ipaKUServerEscrowKey` on
+      `ipaKUVaultUnlocks`, `ipaKUVaultSessionKey`, `ipaKUVaultBinding`,
+      `ipaKUVaultManager`, `ipaKUVaultMember` (indexed for equality),
+      `ipaKUServerEscrowKey` on
       `cn=masters` entries,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
       `ipaKUTrustedRealm`) and

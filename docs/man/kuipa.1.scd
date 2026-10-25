@@ -204,10 +204,14 @@ the CA role for the wrapped CA keys, is refused.
 
 # VAULT COMMANDS
 
-*kuipa seal* seals a user's own files to a vault of hers. It runs as
-the user, with her Kerberos ticket, and needs no root. The device key
-lives in the user's data directory (see *ENVIRONMENT*); vault sessions
-live in tmpfs under the runtime directory.
+*kuipa seal* seals a user's own files to a vault of hers, or to one
+shared with her. It runs as the user, with her Kerberos ticket, and
+needs no root. The device key lives in the user's data directory (see
+*ENVIRONMENT*); vault sessions live in tmpfs under the runtime
+directory.
+
+__VAULT__ is a vault's name for its owner, and *OWNER/NAME* (for
+example *alice/db*) for everyone it is shared with.
 
 ## seal create --require _FACTORS_ _VAULT_ [_policy-flags_]
 
@@ -302,8 +306,24 @@ End the vault's session on this host.
 
 ## seal show _VAULT_
 
-Describe a vault.  *seal list* describes all your vaults;
-*seal revoke VAULT* revokes it: no file sealed to it opens any more.
+Describe a vault.  *seal list* describes all your vaults and those
+shared with you; *seal revoke VAULT* revokes it: no file sealed to it
+opens any more.
+
+## seal share _VAULT_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]
+
+Share a vault, as its owner or a manager.  Members open and seal its
+files, start sessions, and register and remove their own devices;
+with *--manager*, they also change its policy, share and unshare it,
+and revoke it.  Groups are IPA user groups or host groups; membership
+is checked at every open.  Each option may be repeated.
+
+## seal unshare _VAULT_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]
+
+Stop sharing a vault with those named (as managers with *--manager*),
+and remove the devices of everyone left without a part in it.  A member
+may remove themselves.  Files sealed to the vault stop opening for them
+at once; reseal and change the secret if they may have opened it.
 
 ## tlog watch _VAULT_
 

@@ -460,6 +460,35 @@ impl Directory for KdcDirectory {
             .collect())
     }
 
+    fn vaults_shared_with(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let wanted = kuipa_enroll::vault::Members::matching_entries(principal, groups);
+        let vaults: Vec<Vault> = self
+            .vaults
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| {
+                v.managers
+                    .entries()
+                    .iter()
+                    .chain(&v.members.entries())
+                    .any(|e| wanted.contains(e))
+            })
+            .cloned()
+            .collect();
+        Ok(vaults
+            .into_iter()
+            .map(|mut v| {
+                v.unlocks = self.total(&v.id);
+                v
+            })
+            .collect())
+    }
+
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.locked.lock().unwrap().contains(&principal.to_string()))
     }

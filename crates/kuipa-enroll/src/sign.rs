@@ -662,6 +662,138 @@ pub struct Signers {
     pub services: Vec<String>,
 }
 
+impl Signers {
+    /// Whether `principal`, a member of `groups`, is one of these.
+    #[must_use]
+    pub fn admits(&self, principal: &Principal, groups: &[String]) -> bool {
+        let name = principal.to_string();
+        let named = match principal.components() {
+            [user] => self.users.iter().any(|u| u == user || *u == name),
+            [service, host] if service == "host" => {
+                self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+            }
+            [_, _] => {
+                let service = principal.components().join("/");
+                self.services.iter().any(|s| *s == service || *s == name)
+            }
+            _ => false,
+        };
+        named || groups.iter().any(|g| self.groups.contains(g))
+    }
+
+    /// Whether there is no one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty()
+            && self.groups.is_empty()
+            && self.hosts.is_empty()
+            && self.services.is_empty()
+    }
+
+    /// One `kind:name` value per entry (`user:alice@REALM`, `group:dba`,
+    /// `host:web1.example.test`, `service:HTTP/ci.example.test@REALM`), as
+    /// a directory stores and searches them.
+    #[must_use]
+    pub fn entries(&self) -> Vec<String> {
+        let tagged = |kind: &str, names: &[String]| {
+            names
+                .iter()
+                .map(|n| format!("{kind}:{n}"))
+                .collect::<Vec<_>>()
+        };
+        [
+            tagged("user", &self.users),
+            tagged("group", &self.groups),
+            tagged("host", &self.hosts),
+            tagged("service", &self.services),
+        ]
+        .concat()
+    }
+
+    /// The set of [`entries`](Self::entries) values; others are skipped.
+    #[must_use]
+    pub fn from_entries<'a>(entries: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut set = Self::default();
+        for e in entries {
+            let list = match e.split_once(':') {
+                Some(("user", n)) => (&mut set.users, n),
+                Some(("group", n)) => (&mut set.groups, n),
+                Some(("host", n)) => (&mut set.hosts, n),
+                Some(("service", n)) => (&mut set.services, n),
+                _ => continue,
+            };
+            list.0.push(list.1.to_owned());
+        }
+        set
+    }
+
+    /// The `kind:name` values that would admit `principal`, a member of
+    /// `groups`, written as [`normalized`](Self::normalized) writes them:
+    /// what to search a directory for.
+    #[must_use]
+    pub fn matching_entries(principal: &Principal, groups: &[String]) -> Vec<String> {
+        let mut out = match principal.components() {
+            [_] => vec![format!("user:{principal}")],
+            [service, host] if service == "host" => {
+                vec![format!("host:{}", host.to_ascii_lowercase())]
+            }
+            [_, _] => vec![format!("service:{principal}")],
+            _ => Vec::new(),
+        };
+        out.extend(groups.iter().map(|g| format!("group:{g}")));
+        out
+    }
+
+    /// The same set with every user and service a full principal of
+    /// `realm`, host names in lower case, sorted and without duplicates:
+    /// one spelling per entry, so it can be searched for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Policy`] for an empty name, a user with a `/`, a service
+    /// without one, or a principal of another realm.
+    pub fn normalized(&self, realm: &str) -> Result<Self> {
+        let full = |name: &str, service: bool| -> Result<String> {
+            let (base, at) = match name.rsplit_once('@') {
+                Some((b, r)) if r == realm => (b, r),
+                Some(_) => return Err(Error::Policy(format!("{name} is not of realm {realm}"))),
+                None => (name, realm),
+            };
+            if base.is_empty() || base.contains('/') != service {
+                return Err(Error::Policy(format!(
+                    "{name:?} is not a {}",
+                    if service { "service" } else { "user" }
+                )));
+            }
+            Ok(format!("{base}@{at}"))
+        };
+        let tidy = |mut v: Vec<String>| {
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        if self.groups.iter().chain(&self.hosts).any(String::is_empty) {
+            return Err(Error::Policy("an empty group or host name".into()));
+        }
+        Ok(Self {
+            users: tidy(
+                self.users
+                    .iter()
+                    .map(|u| full(u, false))
+                    .collect::<Result<_>>()?,
+            ),
+            groups: tidy(self.groups.clone()),
+            hosts: tidy(self.hosts.iter().map(|h| h.to_ascii_lowercase()).collect()),
+            services: tidy(
+                self.services
+                    .iter()
+                    .map(|s| full(s, true))
+                    .collect::<Result<_>>()?,
+            ),
+        })
+    }
+}
+
 /// The realm's signing policy: who may sign for which purpose.  No
 /// purpose, no signing.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,23 +814,11 @@ impl SignPolicy {
             .purposes
             .get(purpose)
             .ok_or_else(|| Error::Policy(format!("no signing purpose {purpose:?}")))?;
-        let name = principal.to_string();
-        let allowed = match principal.components() {
-            [user] => signers.users.iter().any(|u| u == user || *u == name),
-            [service, host] if service == "host" => {
-                signers.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
-            }
-            [_, _] => {
-                let service = principal.components().join("/");
-                signers.services.iter().any(|s| *s == service || *s == name)
-            }
-            _ => false,
-        } || groups.iter().any(|g| signers.groups.contains(g));
-        if allowed {
+        if signers.admits(principal, groups) {
             Ok(())
         } else {
             Err(Error::Policy(format!(
-                "{name} may not sign for {purpose:?}"
+                "{principal} may not sign for {purpose:?}"
             )))
         }
     }
@@ -915,6 +1035,63 @@ mod tests {
         let mut short = request(1).to_bytes().unwrap();
         short.truncate(short.len() - 1);
         assert!(Request::from_bytes(&short).is_err());
+    }
+
+    #[test]
+    fn a_set_has_one_spelling_per_entry_and_searches_as_it_admits() {
+        let set = Signers {
+            users: vec!["bob".into(), "bob@EXAMPLE.TEST".into()],
+            groups: vec!["dba".into()],
+            hosts: vec!["Web1.Example.Test".into()],
+            services: vec!["HTTP/ci.example.test".into()],
+        }
+        .normalized(REALM)
+        .unwrap();
+        assert_eq!(set.users, ["bob@EXAMPLE.TEST"]);
+        assert_eq!(set.hosts, ["web1.example.test"]);
+        assert_eq!(set.services, ["HTTP/ci.example.test@EXAMPLE.TEST"]);
+        let entries = set.entries();
+        assert_eq!(
+            Signers::from_entries(entries.iter().map(String::as_str)),
+            set
+        );
+        let p = |s: &str| s.parse::<Principal>().unwrap();
+        for (who, groups) in [
+            ("bob@EXAMPLE.TEST", vec![]),
+            ("carol@EXAMPLE.TEST", vec!["dba".to_owned()]),
+            ("host/web1.example.test@EXAMPLE.TEST", vec![]),
+            ("HTTP/ci.example.test@EXAMPLE.TEST", vec![]),
+        ] {
+            let who = p(who);
+            assert!(set.admits(&who, &groups), "{who}");
+            assert!(
+                Signers::matching_entries(&who, &groups)
+                    .iter()
+                    .any(|e| entries.contains(e)),
+                "{who}"
+            );
+        }
+        assert!(!set.admits(&p("eve@EXAMPLE.TEST"), &[]));
+        for bad in [
+            Signers {
+                users: vec!["bob@OTHER.TEST".into()],
+                ..Signers::default()
+            },
+            Signers {
+                users: vec!["bob/admin".into()],
+                ..Signers::default()
+            },
+            Signers {
+                services: vec!["ci".into()],
+                ..Signers::default()
+            },
+            Signers {
+                groups: vec![String::new()],
+                ..Signers::default()
+            },
+        ] {
+            assert!(bad.normalized(REALM).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

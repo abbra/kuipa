@@ -27,8 +27,8 @@ use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
-    DEFAULT_EPOCH, Descriptor, Limits, Recovered, ReleasedKeys, Reply, SessionKey, SessionToken,
-    State, Vault, VaultAnswer, VaultOp,
+    DEFAULT_EPOCH, Descriptor, Limits, Members, Recovered, ReleasedKeys, Reply, Role, SessionKey,
+    SessionToken, State, Vault, VaultAnswer, VaultOp,
 };
 use crate::voucher::Voucher;
 
@@ -282,6 +282,22 @@ pub trait Directory {
         Ok(Vec::new())
     }
 
+    /// The vaults shared with `principal`, a member of `groups`: those
+    /// whose managers or members hold any of
+    /// [`Members::matching_entries`](crate::vault::Members::matching_entries).
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn vaults_shared_with(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        let _ = (principal, groups);
+        Ok(Vec::new())
+    }
+
     /// Count one release of vault `id` by `server` (§7.6.7), unless the
     /// vault's releases, summed over all servers, have reached `limit`:
     /// then count nothing and answer `false`.
@@ -528,6 +544,13 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
         (**self).vaults_of(owner)
+    }
+    fn vaults_shared_with(
+        &self,
+        principal: &Principal,
+        groups: &[String],
+    ) -> Result<Vec<Vault>, DirectoryError> {
+        (**self).vaults_shared_with(principal, groups)
     }
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         (**self).principal_locked(principal)
@@ -884,13 +907,20 @@ impl EnrollServer {
             _ => device,
         };
         let digest = match action {
-            VaultAction::Create | VaultAction::SetPolicy => {
-                let policy = serde_json::to_vec(&vault.policy)
-                    .map_err(|e| Refusal::because(e.to_string()))?;
+            VaultAction::Create
+            | VaultAction::SetPolicy
+            | VaultAction::Share
+            | VaultAction::Unshare => {
+                // A policy, or who shares the vault after the change.
+                let what = match action {
+                    VaultAction::Share | VaultAction::Unshare => vault.sharing_bytes(),
+                    _ => serde_json::to_vec(&vault.policy)
+                        .map_err(|e| Refusal::because(e.to_string()))?,
+                };
                 let alg = self.tree_hash();
                 merkle::Hash::from_slice(&tang_pqc::primitives::digest(
                     alg.openssl_name(),
-                    &[&policy],
+                    &[&what],
                 )?)?
             }
             _ => merkle::Hash::zero(self.tree_hash()),
@@ -1368,9 +1398,9 @@ impl EnrollServer {
         Ok(request.respond(ss, t, Some(&binding), &params.acknowledgement())?)
     }
 
-    /// Answer an owner's vault operation (§7.6): authenticate the owner
-    /// by their ticket, apply the realm limits, store, and answer with
-    /// signed descriptors.
+    /// Answer a vault operation (§7.6): authenticate the caller by their
+    /// ticket, check their role in the vault, apply the realm limits,
+    /// store, and answer with signed descriptors.
     fn vault_op(
         &self,
         request: &Request,
@@ -1383,14 +1413,17 @@ impl EnrollServer {
         let accepted = directory
             .accept_user(body.authenticator.as_ref(), &cb)
             .map_err(Refusal)?;
-        let owner: Principal = accepted.principal.parse()?;
-        if owner.realm() != self.info.realm {
+        let caller: Principal = accepted.principal.parse()?;
+        if caller.realm() != self.info.realm {
             return Err(Refusal::because("wrong realm"));
         }
         let op = VaultOp::from_bytes(&body.extra)?;
         let now = unix_seconds(SystemTime::now());
         let delegation = self.delegation();
         let mut event = vault_event(&op);
+        // Whoever loses a device or their membership must not open files
+        // sealed for offline sessions from now on: a new epoch starts.
+        let rotate = matches!(op, VaultOp::RemoveDevice { .. } | VaultOp::Unshare { .. });
         let mut receipts = Vec::new();
         let (mut vaults, session, released) = match op {
             VaultOp::Unlock {
@@ -1399,7 +1432,7 @@ impl EnrollServer {
                 offline,
             } => {
                 let (vault, token, released) =
-                    self.start_session(&owner, &name, &device, offline, now, directory)?;
+                    self.start_session(&caller, &name, &device, offline, now, directory)?;
                 // Nothing is released before the answer, which waits for
                 // the record.
                 if let Some((action, device)) = event.take() {
@@ -1417,14 +1450,14 @@ impl EnrollServer {
                     Ok(())
                 };
                 (
-                    Self::apply_vault_op(&owner, op, now, directory, &mut record)?,
+                    self.apply_vault_op(&caller, op, now, directory, &mut record)?,
                     None,
                     None,
                 )
             }
         };
         for v in &mut vaults {
-            if self.maintain_epochs(v, now, directory)? {
+            if self.maintain_epochs(v, now, rotate, directory)? {
                 directory.vault_update(v).map_err(Refusal)?;
             }
         }
@@ -1651,6 +1684,7 @@ impl EnrollServer {
         &self,
         vault: &mut Vault,
         now: u64,
+        rotate: bool,
         directory: &dyn Directory,
     ) -> Result<bool, Refusal> {
         if vault.state != State::Enabled || vault.policy.sessions.offline.is_none() {
@@ -1664,10 +1698,11 @@ impl EnrollServer {
             }
         }
         let length = vault.policy.sessions.epoch.unwrap_or(DEFAULT_EPOCH);
-        let due = vault
-            .session_keys
-            .last()
-            .is_none_or(|k| now >= k.started.saturating_add(length));
+        let due = rotate
+            || vault
+                .session_keys
+                .last()
+                .is_none_or(|k| now >= k.started.saturating_add(length));
         if due {
             let epoch = vault.session_keys.last().map_or(1, |k| k.epoch + 1);
             vault
@@ -1679,24 +1714,20 @@ impl EnrollServer {
         Ok(changed)
     }
 
-    /// Start a session for `device` of `owner`'s vault `name`, as long as
-    /// its policy allows (and no longer than the vault): a re-authentication
-    /// token, or offline the vault's session keys released to the device.
+    /// Start a session for `caller`'s `device` in the vault `name` refers
+    /// to, as long as its policy allows (and no longer than the vault): a
+    /// re-authentication token, or offline the vault's session keys
+    /// released to the device.
     fn start_session(
         &self,
-        owner: &Principal,
+        caller: &Principal,
         name: &str,
         device: &str,
         offline: bool,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vault, SessionToken, Option<ReleasedKeys>), Refusal> {
-        let mut vault = directory
-            .vaults_of(owner)
-            .map_err(Refusal)?
-            .into_iter()
-            .find(|v| v.name == name)
-            .ok_or_else(|| Refusal::because(format!("{owner} has no vault {name:?}")))?;
+        let (mut vault, _) = self.resolve_vault(caller, name, directory)?;
         if vault.state != State::Enabled {
             return Err(Refusal::because("the vault is revoked"));
         }
@@ -1712,7 +1743,7 @@ impl EnrollServer {
             sessions.reauth
         }
         .ok_or_else(|| Refusal::because("the vault's policy allows no such session"))?;
-        if offline && self.maintain_epochs(&mut vault, now, directory)? {
+        if offline && self.maintain_epochs(&mut vault, now, false, directory)? {
             directory.vault_update(&vault).map_err(Refusal)?;
         }
         let registered = vault
@@ -1720,6 +1751,9 @@ impl EnrollServer {
             .iter()
             .find(|d| d.id == device)
             .ok_or_else(|| Refusal::because("the device is not registered"))?;
+        if vault.holder(registered) != caller.to_string() {
+            return Err(Refusal::because("the device is another member's"));
+        }
         let device = registered.thumbprint()?;
         let released = if offline {
             if !directory
@@ -1745,71 +1779,201 @@ impl EnrollServer {
             &self.keys.signing,
             &self.delegation(),
             vault.id,
-            &vault.owner,
+            &caller.to_string(),
             device,
             not_after,
         )?;
         eprintln!(
-            "kuipad: {owner} started {} session for vault {} until {not_after}",
+            "kuipad: {caller} started {} session for vault {} until {not_after}",
             if offline { "an offline" } else { "a" },
             vault.id
         );
         Ok((vault, token, released))
     }
 
+    /// The vault `reference` names for `caller` (`NAME`, the caller's
+    /// own, or `OWNER/NAME`, one shared with them), with the caller's role.
+    fn resolve_vault(
+        &self,
+        caller: &Principal,
+        reference: &str,
+        directory: &dyn Directory,
+    ) -> Result<(Vault, Role), Refusal> {
+        let (owner, name) = crate::vault::split_ref(reference);
+        let owner: Principal = match owner {
+            None => caller.clone(),
+            Some(o) if o.contains('@') => o.parse()?,
+            Some(o) => format!("{o}@{}", self.info.realm).parse()?,
+        };
+        let missing = || Refusal::because(format!("no vault {reference:?} for {caller}"));
+        let vault = directory
+            .vaults_of(&owner)
+            .map_err(Refusal)?
+            .into_iter()
+            .find(|v| v.name == name)
+            .ok_or_else(missing)?;
+        let groups = groups_for(&vault, caller, directory)?;
+        // A vault the caller has no part in is not told apart from none.
+        let role = vault.role(caller, &groups).ok_or_else(missing)?;
+        Ok((vault, role))
+    }
+
+    /// Add `managers` and `members` to `vault`, within `limits`.
+    fn share(
+        &self,
+        vault: &mut Vault,
+        managers: &Members,
+        members: &Members,
+        limits: &Limits,
+    ) -> Result<(), Refusal> {
+        let realm = &self.info.realm;
+        let managers = managers.normalized(realm)?;
+        let members = members.normalized(realm)?;
+        if managers.is_empty() && members.is_empty() {
+            return Err(Refusal::because("no one to share with"));
+        }
+        vault.managers = union(&vault.managers, &managers).normalized(realm)?;
+        vault.members = union(&vault.members, &members).normalized(realm)?;
+        let size = vault.managers.entries().len() + vault.members.entries().len();
+        if size > limits.max_members {
+            return Err(Refusal::because(if limits.max_members == 0 {
+                "the realm does not allow shared vaults".to_owned()
+            } else {
+                format!(
+                    "the realm allows at most {} managers and members",
+                    limits.max_members
+                )
+            }));
+        }
+        Ok(())
+    }
+
+    /// Remove `managers` and `members` from `vault` for `caller`, whose
+    /// role is `role` (a member may remove only themselves), and the
+    /// devices of everyone left without a role.
+    fn unshare(
+        &self,
+        vault: &mut Vault,
+        caller: &Principal,
+        role: Role,
+        managers: &Members,
+        members: &Members,
+        directory: &dyn Directory,
+    ) -> Result<(), Refusal> {
+        let realm = &self.info.realm;
+        let managers = managers.normalized(realm)?;
+        let members = members.normalized(realm)?;
+        if role < Role::Manager {
+            let own = Members::matching_entries(caller, &[]);
+            if !managers.is_empty() || members.entries().iter().any(|e| !own.contains(e)) {
+                return Err(Refusal::because(
+                    "only the vault's managers may remove others",
+                ));
+            }
+        }
+        vault.managers = difference(&vault.managers, &managers);
+        vault.members = difference(&vault.members, &members);
+        let mut kept = Vec::with_capacity(vault.devices.len());
+        for d in std::mem::take(&mut vault.devices) {
+            let holder: Principal = vault.holder(&d).parse()?;
+            let groups = groups_for(vault, &holder, directory)?;
+            if vault.role(&holder, &groups).is_some() {
+                kept.push(d);
+            }
+        }
+        vault.devices = kept;
+        Ok(())
+    }
+
+    /// Create `caller`'s vault `name` under `policy`, within the realm's
+    /// limits.
+    fn create_vault(
+        caller: &Principal,
+        name: String,
+        mut policy: crate::vault::Policy,
+        now: u64,
+        directory: &dyn Directory,
+        record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
+    ) -> Result<Vec<Vault>, Refusal> {
+        let limits = directory.vault_limits().map_err(Refusal)?;
+        let mine = directory.vaults_of(caller).map_err(Refusal)?;
+        if name.is_empty() || name.contains('/') {
+            return Err(Refusal::because(format!("{name:?} is not a vault name")));
+        }
+        if mine.iter().any(|v| v.name == name) {
+            return Err(Refusal::because(format!("vault {name:?} exists")));
+        }
+        if mine.len() >= limits.max_vaults {
+            return Err(Refusal::because("too many vaults"));
+        }
+        limits.apply(&mut policy, now)?;
+        let mut id = [0u8; 16];
+        native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
+        let vault = Vault {
+            id: escrow::VaultId::from_bytes(id),
+            owner: caller.to_string(),
+            name,
+            policy,
+            managers: Members::default(),
+            members: Members::default(),
+            devices: Vec::new(),
+            state: State::Enabled,
+            unlocks: 0,
+            session_keys: Vec::new(),
+            bindings: Vec::new(),
+        };
+        record(&vault)?;
+        directory.vault_add(&vault).map_err(Refusal)?;
+        Ok(vec![vault])
+    }
+
     fn apply_vault_op(
-        owner: &Principal,
+        &self,
+        caller: &Principal,
         op: VaultOp,
         now: u64,
         directory: &dyn Directory,
         record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
     ) -> Result<Vec<Vault>, Refusal> {
         let limits = directory.vault_limits().map_err(Refusal)?;
-        let mine = directory.vaults_of(owner).map_err(Refusal)?;
-        let named = |name: &str| {
-            mine.iter()
-                .find(|v| v.name == name)
-                .cloned()
-                .ok_or_else(|| Refusal::because(format!("{owner} has no vault {name:?}")))
-        };
         let vault = match op {
-            VaultOp::List => return Ok(mine),
+            VaultOp::List => return list_vaults(caller, directory),
             VaultOp::Unlock { .. } => unreachable!("sessions are started by vault_op"),
+            VaultOp::Create { name, policy } => {
+                return Self::create_vault(caller, name, policy, now, directory, record);
+            }
+            VaultOp::Show { name } => {
+                return Ok(vec![self.resolve_vault(caller, &name, directory)?.0]);
+            }
             VaultOp::Register { name, add, retire } => {
-                let mut vault = named(&name)?;
+                let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
                 register_bindings(&mut vault, add, &retire)?;
                 vault
             }
-            VaultOp::Show { name } => return Ok(vec![named(&name)?]),
-            VaultOp::Create { name, mut policy } => {
-                if mine.iter().any(|v| v.name == name) {
-                    return Err(Refusal::because(format!("vault {name:?} exists")));
-                }
-                if mine.len() >= limits.max_vaults {
-                    return Err(Refusal::because("too many vaults"));
-                }
-                limits.apply(&mut policy, now)?;
-                let mut id = [0u8; 16];
-                native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
-                let vault = Vault {
-                    id: escrow::VaultId::from_bytes(id),
-                    owner: owner.to_string(),
-                    name,
-                    policy,
-                    devices: Vec::new(),
-                    state: State::Enabled,
-                    unlocks: 0,
-                    session_keys: Vec::new(),
-                    bindings: Vec::new(),
-                };
-                record(&vault)?;
-                directory.vault_add(&vault).map_err(Refusal)?;
-                return Ok(vec![vault]);
-            }
             VaultOp::SetPolicy { name, mut policy } => {
-                let mut vault = named(&name)?;
+                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                need(role, Role::Manager, "change its policy")?;
                 limits.apply(&mut policy, now)?;
                 vault.policy = policy;
+                vault
+            }
+            VaultOp::Share {
+                name,
+                managers,
+                members,
+            } => {
+                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                need(role, Role::Manager, "share it")?;
+                self.share(&mut vault, &managers, &members, &limits)?;
+                vault
+            }
+            VaultOp::Unshare {
+                name,
+                managers,
+                members,
+            } => {
+                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                self.unshare(&mut vault, caller, role, &managers, &members, directory)?;
                 vault
             }
             VaultOp::AddDevice {
@@ -1819,8 +1983,15 @@ impl EnrollServer {
                 alg,
                 key,
             } => {
-                let mut vault = named(&name)?;
-                if vault.devices.len() >= limits.max_devices {
+                let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
+                let me = caller.to_string();
+                if vault
+                    .devices
+                    .iter()
+                    .filter(|d| vault.holder(d) == me)
+                    .count()
+                    >= limits.max_devices
+                {
                     return Err(Refusal::because("too many devices"));
                 }
                 let public = tang_pqc::ExchangeKey::from_bytes(
@@ -1829,7 +2000,7 @@ impl EnrollServer {
                 )
                 .map_err(Error::from)?;
                 // No attestation is verified yet: every device is `any`.
-                let device = crate::vault::Device::new(&public, &label, kind, now);
+                let device = crate::vault::Device::new(&public, &label, kind, now).held_by(&me);
                 if vault.devices.iter().any(|d| d.id == device.id) {
                     return Err(Refusal::because("device already registered"));
                 }
@@ -1837,16 +2008,22 @@ impl EnrollServer {
                 vault
             }
             VaultOp::RemoveDevice { name, id } => {
-                let mut vault = named(&name)?;
-                let before = vault.devices.len();
-                vault.devices.retain(|d| d.id != id);
-                if vault.devices.len() == before {
-                    return Err(Refusal::because("no such device"));
+                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                let me = caller.to_string();
+                let device = vault
+                    .devices
+                    .iter()
+                    .find(|d| d.id == id)
+                    .ok_or_else(|| Refusal::because("no such device"))?;
+                if vault.holder(device) != me {
+                    need(role, Role::Manager, "remove another member's device")?;
                 }
+                vault.devices.retain(|d| d.id != id);
                 vault
             }
             VaultOp::Revoke { name } => {
-                let mut vault = named(&name)?;
+                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                need(role, Role::Manager, "revoke it")?;
                 vault.state = State::Revoked;
                 vault
             }
@@ -2001,6 +2178,65 @@ impl EnrollServer {
         Ok(Recovered::Plain(opened.respond().map_err(Error::from)?))
     }
 
+    /// Who opens `vault` with `request`: whose session or ticket it is,
+    /// checked, else whose `device`.
+    fn opener(
+        &self,
+        vault: &Vault,
+        request: &EscrowRequest,
+        device: Option<&crate::vault::Device>,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<String, Refusal> {
+        Ok(if !request.session().is_empty() {
+            // A session stands in for the ticket, for its holder's device.
+            if vault.policy.sessions.reauth.is_none() {
+                return Err(Refusal::because("the vault's policy allows no sessions"));
+            }
+            let device = device.ok_or_else(|| Refusal::because("a session needs its device"))?;
+            let holder = vault.holder(device);
+            SessionToken::from_bytes(request.session())?
+                .check(
+                    &self.info.realm,
+                    &self.anchors(),
+                    &self.policy,
+                    request.vault(),
+                    holder,
+                    &device.thumbprint()?,
+                    now,
+                )
+                .map_err(|e| Refusal::because(format!("session: {e}")))?;
+            holder.to_owned()
+        } else if vault.policy.factors.ticket {
+            if request.ticket().is_empty() {
+                return Err(Refusal::because("the vault needs the opener's ticket"));
+            }
+            let cb = request.ticket_binding()?;
+            let accepted = directory
+                .accept_user(request.ticket(), &cb)
+                .map_err(Refusal)?;
+            if !vault
+                .policy
+                .ticket_delegation
+                .accepts(accepted.transited.as_deref())
+            {
+                return Err(Refusal::because(match &accepted.transited {
+                    Some(t) => format!("a ticket delegated through {t:?} is not accepted"),
+                    None => "the ticket's delegation cannot be checked".to_owned(),
+                }));
+            }
+            if let Some(d) = device
+                && vault.holder(d) != accepted.principal
+            {
+                return Err(Refusal::because("the device is not the ticket holder's"));
+            }
+            accepted.principal
+        } else {
+            let device = device.ok_or_else(|| Refusal::because("the vault needs a device"))?;
+            vault.holder(device).to_owned()
+        })
+    }
+
     /// The vault half of [`recover`](Self::recover): check the vault and
     /// its owner, then the policy's factors, record the release, and
     /// answer to the device.  The recovery answer has no place for a
@@ -2015,15 +2251,12 @@ impl EnrollServer {
             .vault_get(request.vault())
             .map_err(Refusal)?
             .ok_or_else(|| Refusal::because(format!("unknown vault {}", request.vault())))?;
-        let owner = request.principal();
-        if vault.owner != owner.to_string() {
+        // `P` names the vault's owner, whoever opens it.
+        if vault.owner != request.principal().to_string() {
             return Err(Refusal::because("the vault has another owner"));
         }
         if vault.state != State::Enabled {
             return Err(Refusal::because("the vault is revoked"));
-        }
-        if directory.principal_locked(owner).map_err(Refusal)? {
-            return Err(Refusal::because("the owner is locked or gone"));
         }
         let now = unix_seconds(SystemTime::now());
         if vault.policy.not_after.is_some_and(|t| now > t) {
@@ -2033,49 +2266,6 @@ impl EnrollServer {
         if factors.passkey {
             return Err(Refusal::because("the passkey factor is not supported yet"));
         }
-        let in_session = !request.session().is_empty();
-        if in_session {
-            // A session stands in for the ticket: checked here, with the
-            // device it is bound to checked below.
-            if vault.policy.sessions.reauth.is_none() {
-                return Err(Refusal::because("the vault's policy allows no sessions"));
-            }
-            let device = request
-                .device()
-                .ok_or_else(|| Refusal::because("a session needs its device"))?;
-            SessionToken::from_bytes(request.session())?
-                .check(
-                    &self.info.realm,
-                    &self.anchors(),
-                    &self.policy,
-                    request.vault(),
-                    &vault.owner,
-                    device,
-                    now,
-                )
-                .map_err(|e| Refusal::because(format!("session: {e}")))?;
-        } else if factors.ticket {
-            if request.ticket().is_empty() {
-                return Err(Refusal::because("the vault needs the owner's ticket"));
-            }
-            let cb = request.ticket_binding()?;
-            let accepted = directory
-                .accept_user(request.ticket(), &cb)
-                .map_err(Refusal)?;
-            if accepted.principal != vault.owner {
-                return Err(Refusal::because("the ticket is not the owner's"));
-            }
-            if !vault
-                .policy
-                .ticket_delegation
-                .accepts(accepted.transited.as_deref())
-            {
-                return Err(Refusal::because(match &accepted.transited {
-                    Some(t) => format!("a ticket delegated through {t:?} is not accepted"),
-                    None => "the ticket's delegation cannot be checked".to_owned(),
-                }));
-            }
-        }
         let device = match request.device() {
             Some(id) => Some(
                 vault
@@ -2084,6 +2274,16 @@ impl EnrollServer {
             ),
             None => None,
         };
+        let who: Principal = self
+            .opener(&vault, request, device, now, directory)?
+            .parse()?;
+        let groups = groups_for(&vault, &who, directory)?;
+        if vault.role(&who, &groups).is_none() {
+            return Err(Refusal::because(format!("{who} has no part in the vault")));
+        }
+        if directory.principal_locked(&who).map_err(Refusal)? {
+            return Err(Refusal::because(format!("{who} is locked or gone")));
+        }
         if let Some(level) = factors.device {
             let device = device.ok_or_else(|| Refusal::because("the vault needs a device"))?;
             if device.level < level {
@@ -2125,6 +2325,8 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
         VaultOp::Revoke { .. } => (VaultAction::Revoke, None),
         VaultOp::AddDevice { .. } => (VaultAction::AddDevice, None),
         VaultOp::RemoveDevice { id, .. } => (VaultAction::RemoveDevice, Some(id.clone())),
+        VaultOp::Share { .. } => (VaultAction::Share, None),
+        VaultOp::Unshare { .. } => (VaultAction::Unshare, None),
         VaultOp::Unlock {
             device, offline, ..
         } => (
@@ -2137,6 +2339,69 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
         ),
         VaultOp::Show { .. } | VaultOp::List | VaultOp::Register { .. } => return None,
     })
+}
+
+/// Refuse unless `role` is at least `least`, to do `what`.
+fn need(role: Role, least: Role, what: &str) -> Result<(), Refusal> {
+    if role >= least {
+        Ok(())
+    } else {
+        Err(Refusal::because(format!(
+            "only the vault's managers may {what}"
+        )))
+    }
+}
+
+/// `caller`'s own vaults, and those shared with them.
+fn list_vaults(caller: &Principal, directory: &dyn Directory) -> Result<Vec<Vault>, Refusal> {
+    let mut all = directory.vaults_of(caller).map_err(Refusal)?;
+    // A directory without groups shares by name alone.
+    let groups = directory.principal_groups(caller).unwrap_or_default();
+    for v in directory
+        .vaults_shared_with(caller, &groups)
+        .map_err(Refusal)?
+    {
+        if v.role(caller, &groups).is_some() && !all.iter().any(|a| a.id == v.id) {
+            all.push(v);
+        }
+    }
+    Ok(all)
+}
+
+/// The groups of `principal` that matter to `vault`: none unless the vault
+/// names a group, so a vault without groups needs no directory lookup.
+fn groups_for(
+    vault: &Vault,
+    principal: &Principal,
+    directory: &dyn Directory,
+) -> Result<Vec<String>, Refusal> {
+    if vault.managers.groups.is_empty() && vault.members.groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    directory.principal_groups(principal).map_err(Refusal)
+}
+
+/// Everyone in `a` or `b` (normalized again by the caller).
+fn union(a: &Members, b: &Members) -> Members {
+    let join = |x: &[String], y: &[String]| [x, y].concat();
+    Members {
+        users: join(&a.users, &b.users),
+        groups: join(&a.groups, &b.groups),
+        hosts: join(&a.hosts, &b.hosts),
+        services: join(&a.services, &b.services),
+    }
+}
+
+/// Everyone in `a` and not in `b`.
+fn difference(a: &Members, b: &Members) -> Members {
+    let without =
+        |x: &[String], y: &[String]| x.iter().filter(|e| !y.contains(e)).cloned().collect();
+    Members {
+        users: without(&a.users, &b.users),
+        groups: without(&a.groups, &b.groups),
+        hosts: without(&a.hosts, &b.hosts),
+        services: without(&a.services, &b.services),
+    }
 }
 
 /// With registered sealing: retire `retire` and register `add` on `vault`.

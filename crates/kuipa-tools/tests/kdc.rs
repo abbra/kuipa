@@ -764,6 +764,78 @@ fn against_a_real_kdc() {
         "retired"
     );
 
+    // ── A vault shared with a teammate (§7.6.12) ──
+    // Bob names it alice/team, registers his own device from his own
+    // directory, and opens with his device and his ticket.
+    let team = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    seal.create("team", team).unwrap();
+    seal.add_device("team", b"correct horse").unwrap();
+    let before = seal.seal("team", b"before bob").unwrap();
+    let bob_only = vault::Members {
+        users: vec!["bob".into()],
+        ..vault::Members::default()
+    };
+    let shared = seal
+        .share("team", vault::Members::default(), bob_only.clone())
+        .unwrap();
+    assert_eq!(
+        shared["vaults"][0]["members"][0], "user:bob@EXAMPLE.TEST",
+        "{shared}"
+    );
+    let bob_home = UserPaths::new(realm.dir.join("bob-home"));
+    let bob = Seal::new(&a, &bob_home, Some(&bob_cc));
+    assert!(bob.show("team").is_err(), "a bare name is Bob's own");
+    bob.add_device("alice/team", b"bob's phrase").unwrap();
+    let listed = bob.list().unwrap();
+    assert_eq!(
+        listed["vaults"][0]["owner"], "alice@EXAMPLE.TEST",
+        "{listed}"
+    );
+    assert!(
+        realm
+            .dir
+            .join("bob-home/vaults/team@alice@EXAMPLE.TEST.vault")
+            .exists(),
+        "kept apart from any vault of his own"
+    );
+    let note = bob.seal("alice/team", b"from bob").unwrap();
+    assert_eq!(
+        bob.open(&note, Some(b"bob's phrase")).unwrap().as_ref(),
+        b"from bob"
+    );
+    assert_eq!(
+        seal.open(&note, Some(b"correct horse")).unwrap().as_ref(),
+        b"from bob"
+    );
+    // A file sealed before his device was registered has no share for it
+    // until Alice reseals it.
+    assert!(bob.open(&before, Some(b"bob's phrase")).is_err());
+    let before = seal
+        .reseal("team", &before, Some(b"correct horse"))
+        .unwrap();
+    assert_eq!(
+        bob.open(&before, Some(b"bob's phrase")).unwrap().as_ref(),
+        b"before bob"
+    );
+    // Unshared, his device goes and nothing opens for him.
+    let unshared = seal
+        .unshare("team", vault::Members::default(), bob_only)
+        .unwrap();
+    assert_eq!(
+        unshared["vaults"][0]["devices"].as_array().unwrap().len(),
+        1,
+        "{unshared}"
+    );
+    assert!(bob.open(&note, Some(b"bob's phrase")).is_err());
+    assert!(seal.open(&note, Some(b"correct horse")).is_ok());
+
     // A device on a token: an ML-KEM key that never leaves it, used through
     // pkcs11-provider; the PIN takes the passphrase's place.
     if let Some(module) = token_with_ml_kem_key() {
