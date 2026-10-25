@@ -1742,6 +1742,7 @@ shared vault's files are `IPUF` and `IPUS` files like any other.
 | owner | `ipaKUVaultOwner` | everything a manager may; the vault counts against the owner's `max_vaults` |
 | manager | named in `ipaKUVaultManager` | change the policy, share and unshare, revoke, remove anyone's device |
 | member | named in `ipaKUVaultMember` | show, seal (and register bindings), open, start sessions, register and remove their own devices, leave |
+| depositor | named in `ipaKUVaultDepositor` | show, seal to it and deposit (DESIGN-recovery.md §3), never open |
 
 Managers and members are named as signers are in the signing policy
 (DESIGN-sign.md): users, groups, hosts and services, a group by the

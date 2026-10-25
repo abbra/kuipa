@@ -392,6 +392,7 @@ type OpAnswer = (
     Option<ReleasedKeys>,
     Vec<kuipa_enroll::vault::ReleaseRequest>,
     Vec<kuipa_enroll::vault::DeviceEscrow>,
+    Vec<kuipa_enroll::vault::Deposit>,
 );
 
 impl<'a> Seal<'a> {
@@ -470,6 +471,7 @@ impl<'a> Seal<'a> {
             reply.released,
             reply.requests,
             reply.escrows,
+            reply.deposits,
         ))
     }
 
@@ -483,7 +485,7 @@ impl<'a> Seal<'a> {
     /// directory, or any other error.
     pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
         let key = self.user.device(passphrase)?;
-        let (vaults, session, released, _, _) = self.op_with_session(&VaultOp::Unlock {
+        let (vaults, session, released, _, _, _) = self.op_with_session(&VaultOp::Unlock {
             name: name.into(),
             device: key.public().kid().to_string(),
             offline,
@@ -1055,7 +1057,8 @@ impl<'a> Seal<'a> {
         Ok(describe_all(&v))
     }
 
-    /// `kuipa seal share`: add `managers` and `members` to vault `name`.
+    /// `kuipa seal share`: add `who` (managers, members, depositors) to
+    /// vault `name`.
     ///
     /// # Errors
     ///
@@ -1063,19 +1066,20 @@ impl<'a> Seal<'a> {
     pub fn share(
         &self,
         name: &str,
-        managers: kuipa_enroll::vault::Members,
-        members: kuipa_enroll::vault::Members,
+        who: [kuipa_enroll::vault::Members; 3],
     ) -> Result<Value, Error> {
+        let [managers, members, depositors] = who;
         let v = self.op(&VaultOp::Share {
             name: name.into(),
             managers,
             members,
+            depositors,
         })?;
         Ok(describe_all(&v))
     }
 
-    /// `kuipa seal unshare`: remove `managers` and `members` from vault
-    /// `name`, with the devices they hold.
+    /// `kuipa seal unshare`: remove `who` (managers, members, depositors)
+    /// from vault `name`, with the devices they hold.
     ///
     /// # Errors
     ///
@@ -1083,15 +1087,82 @@ impl<'a> Seal<'a> {
     pub fn unshare(
         &self,
         name: &str,
-        managers: kuipa_enroll::vault::Members,
-        members: kuipa_enroll::vault::Members,
+        who: [kuipa_enroll::vault::Members; 3],
     ) -> Result<Value, Error> {
+        let [managers, members, depositors] = who;
         let v = self.op(&VaultOp::Unshare {
             name: name.into(),
             managers,
             members,
+            depositors,
         })?;
         Ok(describe_all(&v))
+    }
+
+    /// `kuipa seal deposit put`: seal `contents` to vault `name` and leave
+    /// it with the servers as a deposit of `kind` for `subject`, in place of
+    /// any earlier one of the same kind and subject (`DESIGN-recovery.md`
+    /// §3).  A depositor seals without being able to open.
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn deposit(
+        &self,
+        name: &str,
+        contents: &[u8],
+        kind: kuipa_enroll::vault::DepositKind,
+        subject: std::collections::BTreeMap<String, String>,
+    ) -> Result<Value, Error> {
+        // The server registers a deposit's bindings itself.
+        let sealed = self.seal_file(name, contents)?;
+        let answer = self.op_with_session(&VaultOp::Deposit {
+            name: name.into(),
+            kind,
+            subject,
+            sealed: tang_pqc::b64::encode(&sealed.to_bytes()),
+        })?;
+        Ok(describe_deposits(name, &answer.5))
+    }
+
+    /// `kuipa seal deposit list`: vault `name`'s deposits (a depositor's
+    /// own, for a depositor).
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn deposits(&self, name: &str) -> Result<Value, Error> {
+        let answer = self.op_with_session(&VaultOp::Deposits { name: name.into() })?;
+        Ok(describe_deposits(name, &answer.5))
+    }
+
+    /// `kuipa seal deposit fetch`: deposit `id`'s sealed file, to open as
+    /// any other file of the vault.
+    ///
+    /// # Errors
+    ///
+    /// A depositor, no such deposit, a refusal.
+    pub fn deposit_file(&self, name: &str, id: &str) -> Result<Vec<u8>, Error> {
+        let answer = self.op_with_session(&VaultOp::FetchDeposit {
+            name: name.into(),
+            id: id.into(),
+        })?;
+        let deposit = answer.5.first().ok_or("the server sent no deposit")?;
+        Ok(tang_pqc::b64::decode(&deposit.sealed)?)
+    }
+
+    /// `kuipa seal deposit retire`: remove deposit `id`, a depositor's own
+    /// or, for a manager, any.
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn retire_deposit(&self, name: &str, id: &str) -> Result<Value, Error> {
+        self.op_with_session(&VaultOp::RetireDeposit {
+            name: name.into(),
+            id: id.into(),
+        })?;
+        Ok(json!({ "vault": name, "retired_deposit": id }))
     }
 
     /// `kuipa seal request`: ask the approvers of vault `name` to approve
@@ -1326,6 +1397,17 @@ impl<'a> Seal<'a> {
     /// A revoked vault, no device registered when the policy needs one, no
     /// server known, or any other error.
     pub fn seal(&self, name: &str, contents: &[u8]) -> Result<Vec<u8>, Error> {
+        let sealed = self.seal_file(name, contents)?;
+        if self.descriptor(name)?.vault().policy.sealing == kuipa_enroll::vault::Sealing::Registered
+        {
+            // Until registered, no server opens it.
+            self.register(name, &sealed.bindings()?, &[])?;
+        }
+        Ok(sealed.to_bytes())
+    }
+
+    /// Seal `contents` to vault `name`, without registering it.
+    fn seal_file(&self, name: &str, contents: &[u8]) -> Result<SealedVaultFile, Error> {
         let descriptor = self.descriptor(name)?;
         // The realm's descriptor age bounds the advertisements too.
         let mut servers = self.cached_servers(descriptor.max_age())?;
@@ -1333,12 +1415,7 @@ impl<'a> Seal<'a> {
             servers = self.refresh_servers()?;
         }
         let refs: Vec<_> = servers.iter().collect();
-        let sealed = SealedVaultFile::seal(&descriptor, &refs, contents)?;
-        if descriptor.vault().policy.sealing == kuipa_enroll::vault::Sealing::Registered {
-            // Until registered, no server opens it.
-            self.register(name, &sealed.bindings()?, &[])?;
-        }
-        Ok(sealed.to_bytes())
+        Ok(SealedVaultFile::seal(&descriptor, &refs, contents)?)
     }
 
     /// Register `add` and retire `retire` on vault `name` (registered
@@ -1521,6 +1598,7 @@ pub fn describe(v: &VerifiedDescriptor) -> Value {
         "policy": vault.policy,
         "managers": vault.managers.entries(),
         "members": vault.members.entries(),
+        "depositors": vault.depositors.entries(),
         "devices": vault.devices.iter().map(|d| json!({
             "id": d.id, "label": d.label, "type": d.kind, "level": d.level,
             "holder": vault.holder(d),
@@ -1528,6 +1606,20 @@ pub fn describe(v: &VerifiedDescriptor) -> Value {
         "unlocks": vault.unlocks,
         "signed_by": v.server(),
         "signed_at": v.iat(),
+    })
+}
+
+/// The JSON form of deposits, for `--json` and the renderer.
+fn describe_deposits(vault: &str, deposits: &[kuipa_enroll::vault::Deposit]) -> Value {
+    json!({
+        "vault": vault,
+        "deposits": deposits.iter().map(|d| json!({
+            "id": d.id,
+            "depositor": d.depositor,
+            "kind": d.kind,
+            "subject": d.subject,
+            "added": d.added,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -1634,6 +1726,8 @@ fn describe_event(
             "recover-code",
             Some("the device's escrowed key was fetched for recovery"),
         ),
+        A::Deposit => ("deposit", None),
+        A::RetireDeposit => ("retire-deposit", None),
         A::Request => ("request", None),
         A::Approve => ("approve", None),
         A::Deny => ("deny", None),

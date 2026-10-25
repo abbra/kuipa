@@ -27,9 +27,9 @@ use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
-    Approval, DEFAULT_EPOCH, Descriptor, DeviceEscrow, Limits, Members, Recovered, ReleaseRequest,
-    ReleasedKeys, Reply, Role, SessionFor, SessionKey, SessionToken, State, Vault, VaultAnswer,
-    VaultOp,
+    Approval, DEFAULT_EPOCH, Deposit, Descriptor, DeviceEscrow, Limits, Members, Recovered,
+    ReleaseRequest, ReleasedKeys, Reply, Role, SessionFor, SessionKey, SessionToken, State, Vault,
+    VaultAnswer, VaultOp,
 };
 use crate::voucher::Voucher;
 
@@ -397,6 +397,36 @@ pub trait Directory {
         Ok(Vec::new())
     }
 
+    /// Store a new deposit (`DESIGN-recovery.md` §3).
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default deposits are not supported.
+    fn deposit_add(&self, deposit: &Deposit) -> Result<(), DirectoryError> {
+        let _ = deposit;
+        Err("deposits are not supported by this directory".into())
+    }
+
+    /// The deposits of vault `id`, with their files.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn deposits(&self, id: &escrow::VaultId) -> Result<Vec<Deposit>, DirectoryError> {
+        let _ = id;
+        Ok(Vec::new())
+    }
+
+    /// Remove deposit `deposit` of vault `id`.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default deposits are not supported.
+    fn deposit_remove(&self, id: &escrow::VaultId, deposit: &str) -> Result<(), DirectoryError> {
+        let _ = (id, deposit);
+        Err("deposits are not supported by this directory".into())
+    }
+
     /// Count one release of vault `id` by `server` (§7.6.7), unless the
     /// vault's releases, summed over all servers, have reached `limit`:
     /// then count nothing and answer `false`.
@@ -670,6 +700,15 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn device_escrows(&self, principal: &Principal) -> Result<Vec<DeviceEscrow>, DirectoryError> {
         (**self).device_escrows(principal)
+    }
+    fn deposit_add(&self, deposit: &Deposit) -> Result<(), DirectoryError> {
+        (**self).deposit_add(deposit)
+    }
+    fn deposits(&self, id: &escrow::VaultId) -> Result<Vec<Deposit>, DirectoryError> {
+        (**self).deposits(id)
+    }
+    fn deposit_remove(&self, id: &escrow::VaultId, deposit: &str) -> Result<(), DirectoryError> {
+        (**self).deposit_remove(id, deposit)
     }
     fn releases(&self, id: &escrow::VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
         (**self).releases(id)
@@ -1565,22 +1604,20 @@ impl EnrollServer {
         // sealed for offline sessions from now on: a new epoch starts.
         let rotate = matches!(op, VaultOp::RemoveDevice { .. } | VaultOp::Unshare { .. });
         let mut receipts = Vec::new();
-        let mut requests = Vec::new();
-        let mut escrows = Vec::new();
+        // What the operations that concern no descriptor answer.
+        let mut side = Reply::default();
         let (mut vaults, session, released) = match op {
-            op @ (VaultOp::EscrowCode { .. } | VaultOp::RecoverCode) => {
-                let (found, logged) = self.escrow_op(&caller, op, now, directory)?;
-                escrows = found;
-                receipts.extend(logged);
-                (Vec::new(), None, None)
-            }
             op @ (VaultOp::Request { .. }
             | VaultOp::Pending { .. }
             | VaultOp::Approve { .. }
-            | VaultOp::Deny { .. }) => {
-                let (found, logged) = self.release_op(&caller, op, now, directory)?;
-                requests = found;
-                receipts.extend(logged);
+            | VaultOp::Deny { .. }
+            | VaultOp::EscrowCode { .. }
+            | VaultOp::RecoverCode
+            | VaultOp::Deposit { .. }
+            | VaultOp::Deposits { .. }
+            | VaultOp::FetchDeposit { .. }
+            | VaultOp::RetireDeposit { .. }) => {
+                side = self.side_op(&caller, op, now, directory)?;
                 (Vec::new(), None, None)
             }
             VaultOp::Unlock {
@@ -1649,13 +1686,13 @@ impl EnrollServer {
                 )?)
             })
             .collect::<Result<Vec<_>, Refusal>>()?;
+        receipts.append(&mut side.receipts);
         let reply = Reply {
             descriptors,
             session,
             released,
             receipts,
-            requests,
-            escrows,
+            ..side
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
     }
@@ -1897,7 +1934,8 @@ impl EnrollServer {
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vault, SessionToken, Option<ReleasedKeys>), Refusal> {
-        let (mut vault, _) = self.resolve_vault(caller, name, directory)?;
+        let (mut vault, role) = self.resolve_vault(caller, name, directory)?;
+        need_member(role)?;
         if vault.state != State::Enabled {
             return Err(Refusal::because("the vault is revoked"));
         }
@@ -2010,11 +2048,7 @@ impl EnrollServer {
     ) -> Result<(Vault, bool), Refusal> {
         let vault = self.find_vault(caller, reference, directory)?;
         let approves = approves(&vault, caller, directory)?;
-        if approves
-            || vault
-                .role(caller, &groups_for(&vault, caller, directory)?)
-                .is_some()
-        {
+        if approves || vault.opens(caller, &groups_for(&vault, caller, directory)?) {
             Ok((vault, approves))
         } else {
             Err(missing_vault(caller, reference))
@@ -2063,7 +2097,8 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
         let mut receipts = Vec::new();
-        let (vault, _) = self.resolve_vault(caller, name, directory)?;
+        let (vault, role) = self.resolve_vault(caller, name, directory)?;
+        need_member(role)?;
         let approvals = vault
             .policy
             .approvals
@@ -2279,6 +2314,208 @@ impl EnrollServer {
         }
     }
 
+    /// Answer the operations on release requests, device escrows and
+    /// deposits, which concern no descriptor.
+    fn side_op(
+        &self,
+        caller: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Reply, Refusal> {
+        Ok(match op {
+            op @ (VaultOp::Request { .. }
+            | VaultOp::Pending { .. }
+            | VaultOp::Approve { .. }
+            | VaultOp::Deny { .. }) => {
+                let (requests, receipts) = self.release_op(caller, op, now, directory)?;
+                Reply {
+                    receipts,
+                    requests,
+                    ..Reply::default()
+                }
+            }
+            op @ (VaultOp::EscrowCode { .. } | VaultOp::RecoverCode) => {
+                let (escrows, receipts) = self.escrow_op(caller, op, now, directory)?;
+                Reply {
+                    receipts,
+                    escrows,
+                    ..Reply::default()
+                }
+            }
+            op => {
+                let (deposits, receipts) = self.deposit_op(caller, op, now, directory)?;
+                Reply {
+                    receipts,
+                    deposits,
+                    ..Reply::default()
+                }
+            }
+        })
+    }
+
+    /// Answer the deposit operations (`DESIGN-recovery.md` §3): deposit,
+    /// list, fetch one, retire one.
+    fn deposit_op(
+        &self,
+        caller: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vec<Deposit>, Vec<Receipt>), Refusal> {
+        let me = caller.to_string();
+        match op {
+            op @ VaultOp::Deposit { .. } => self.make_deposit(caller, op, now, directory),
+            VaultOp::Deposits { name } => {
+                let (vault, role) = self.resolve_vault(caller, &name, directory)?;
+                let listed = directory
+                    .deposits(&vault.id)
+                    .map_err(Refusal)?
+                    .into_iter()
+                    .filter(|d| role >= Role::Member || d.depositor == me)
+                    .map(|mut d| {
+                        d.sealed.clear();
+                        d
+                    })
+                    .collect();
+                Ok((listed, Vec::new()))
+            }
+            VaultOp::FetchDeposit { name, id } => {
+                let (vault, role) = self.resolve_vault(caller, &name, directory)?;
+                need_member(role)?;
+                Ok((vec![find_deposit(&vault, &id, directory)?], Vec::new()))
+            }
+            VaultOp::RetireDeposit { name, id } => {
+                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                let deposit = find_deposit(&vault, &id, directory)?;
+                if deposit.depositor != me {
+                    need(role, Role::Manager, "retire another's deposit")?;
+                }
+                let receipts = self.retire_deposits(&mut vault, &[deposit], directory)?;
+                Ok((Vec::new(), receipts))
+            }
+            _ => unreachable!("only deposit operations"),
+        }
+    }
+
+    /// `deposit`: keep a file sealed to the vault, in place of the
+    /// depositor's earlier one of the same kind and subject.
+    fn make_deposit(
+        &self,
+        caller: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vec<Deposit>, Vec<Receipt>), Refusal> {
+        let VaultOp::Deposit {
+            name,
+            kind,
+            subject,
+            sealed,
+        } = op
+        else {
+            unreachable!("only deposit");
+        };
+        // Any role deposits, a depositor's included.
+        let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
+        if vault.state != State::Enabled {
+            return Err(Refusal::because("the vault is revoked"));
+        }
+        let bytes = tang_pqc::b64::decode(&sealed).map_err(Error::from)?;
+        if bytes.len() > crate::vault::MAX_DEPOSIT {
+            return Err(Refusal::because("the deposit is too large"));
+        }
+        let file = crate::vault::SealedVaultFile::from_bytes(&bytes)?;
+        if *file.vault() != vault.id || file.principal().to_string() != vault.owner {
+            return Err(Refusal::because("a file sealed to another vault"));
+        }
+        if subject.len() > 8
+            || subject
+                .iter()
+                .any(|(k, v)| k.is_empty() || k.len() > 64 || v.len() > 256)
+        {
+            return Err(Refusal::because("a malformed deposit subject"));
+        }
+        let me = caller.to_string();
+        let existing = directory.deposits(&vault.id).map_err(Refusal)?;
+        let (replaced, others): (Vec<Deposit>, Vec<Deposit>) = existing
+            .into_iter()
+            .filter(|d| d.depositor == me)
+            .partition(|d| d.kind == kind && d.subject == subject);
+        if others.len() >= limits_for(&vault.owner, directory)?.max_deposits {
+            return Err(Refusal::because("too many deposits"));
+        }
+        let mut id = [0u8; 16];
+        native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
+        let deposit = Deposit {
+            id: hex(&id),
+            vault: vault.id,
+            depositor: me,
+            kind,
+            subject,
+            added: now,
+            sealed,
+        };
+        let digest = self.log_digest(&[&bytes])?;
+        let mut receipts = self
+            .record_vault(&vault.id, VaultAction::Deposit, None, digest)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        if vault.policy.sealing == crate::vault::Sealing::Registered {
+            let add = file
+                .bindings()?
+                .iter()
+                .map(crate::vault::binding_hex)
+                .collect();
+            register_bindings(&mut vault, add, &[])?;
+            directory.vault_update(&vault).map_err(Refusal)?;
+        }
+        directory.deposit_add(&deposit).map_err(Refusal)?;
+        receipts.extend(self.retire_deposits(&mut vault, &replaced, directory)?);
+        eprintln!(
+            "kuipad: {caller} deposited {} in vault {}",
+            deposit.id, vault.id
+        );
+        let mut listed = deposit;
+        listed.sealed.clear();
+        Ok((vec![listed], receipts))
+    }
+
+    /// Remove `deposits` of `vault`, and with registered sealing retire
+    /// their files' bindings, so no copy of them opens any more.
+    fn retire_deposits(
+        &self,
+        vault: &mut Vault,
+        deposits: &[Deposit],
+        directory: &dyn Directory,
+    ) -> Result<Vec<Receipt>, Refusal> {
+        let mut receipts = Vec::new();
+        let mut retired = Vec::new();
+        for d in deposits {
+            let digest = self.log_digest(&[d.id.as_bytes()])?;
+            receipts.extend(self.record_vault(
+                &vault.id,
+                VaultAction::RetireDeposit,
+                None,
+                digest,
+            )?);
+            directory
+                .deposit_remove(&vault.id, &d.id)
+                .map_err(Refusal)?;
+            let file = tang_pqc::b64::decode(&d.sealed)
+                .ok()
+                .and_then(|b| crate::vault::SealedVaultFile::from_bytes(&b).ok());
+            if let Some(file) = file {
+                retired.extend(file.bindings()?.iter().map(crate::vault::binding_hex));
+            }
+        }
+        if vault.policy.sealing == crate::vault::Sealing::Registered && !retired.is_empty() {
+            register_bindings(vault, Vec::new(), &retired)?;
+            directory.vault_update(vault).map_err(Refusal)?;
+        }
+        Ok(receipts)
+    }
+
     /// The tree hash of `parts`, as a log event's digest.
     fn log_digest(&self, parts: &[&[u8]]) -> Result<merkle::Hash, Refusal> {
         let alg = self.tree_hash();
@@ -2340,29 +2577,27 @@ impl EnrollServer {
         Ok(())
     }
 
-    /// Add `managers` and `members` to `vault`, within `limits`.
-    fn share(
-        &self,
-        vault: &mut Vault,
-        managers: &Members,
-        members: &Members,
-        limits: &Limits,
-    ) -> Result<(), Refusal> {
+    /// Add `who` (managers, members, depositors) to `vault`, within
+    /// `limits`.
+    fn share(&self, vault: &mut Vault, who: [&Members; 3], limits: &Limits) -> Result<(), Refusal> {
         let realm = &self.info.realm;
-        let managers = managers.normalized(realm)?;
-        let members = members.normalized(realm)?;
-        if managers.is_empty() && members.is_empty() {
+        let [managers, members, depositors] = who.map(|m| m.normalized(realm));
+        let (managers, members, depositors) = (managers?, members?, depositors?);
+        if managers.is_empty() && members.is_empty() && depositors.is_empty() {
             return Err(Refusal::because("no one to share with"));
         }
         vault.managers = union(&vault.managers, &managers).normalized(realm)?;
         vault.members = union(&vault.members, &members).normalized(realm)?;
-        let size = vault.managers.entries().len() + vault.members.entries().len();
+        vault.depositors = union(&vault.depositors, &depositors).normalized(realm)?;
+        let size = vault.managers.entries().len()
+            + vault.members.entries().len()
+            + vault.depositors.entries().len();
         if size > limits.max_members {
             return Err(Refusal::because(if limits.max_members == 0 {
                 "the realm does not allow shared vaults".to_owned()
             } else {
                 format!(
-                    "the realm allows at most {} managers and members",
+                    "the realm allows at most {} managers, members and depositors",
                     limits.max_members
                 )
             }));
@@ -2370,23 +2605,29 @@ impl EnrollServer {
         Ok(())
     }
 
-    /// Remove `managers` and `members` from `vault` for `caller`, whose
-    /// role is `role` (a member may remove only themselves); their devices
-    /// go after the operation ([`prune_departed`]).
+    /// Remove `who` (managers, members, depositors) from `vault` for
+    /// `caller`, whose role is `role` (anyone else may remove only
+    /// themselves); their devices go after the operation
+    /// ([`prune_departed`]).
     fn unshare(
         &self,
         vault: &mut Vault,
         caller: &Principal,
         role: Role,
-        managers: &Members,
-        members: &Members,
+        who: [&Members; 3],
     ) -> Result<(), Refusal> {
         let realm = &self.info.realm;
-        let managers = managers.normalized(realm)?;
-        let members = members.normalized(realm)?;
+        let [managers, members, depositors] = who.map(|m| m.normalized(realm));
+        let (managers, members, depositors) = (managers?, members?, depositors?);
         if role < Role::Manager {
             let own = Members::matching_entries(caller, &[]);
-            if !managers.is_empty() || members.entries().iter().any(|e| !own.contains(e)) {
+            if !managers.is_empty()
+                || members
+                    .entries()
+                    .iter()
+                    .chain(&depositors.entries())
+                    .any(|e| !own.contains(e))
+            {
                 return Err(Refusal::because(
                     "only the vault's managers may remove others",
                 ));
@@ -2394,6 +2635,7 @@ impl EnrollServer {
         }
         vault.managers = difference(&vault.managers, &managers);
         vault.members = difference(&vault.members, &members);
+        vault.depositors = difference(&vault.depositors, &depositors);
         Ok(())
     }
 
@@ -2430,6 +2672,7 @@ impl EnrollServer {
             policy,
             managers: Members::default(),
             members: Members::default(),
+            depositors: Members::default(),
             devices: Vec::new(),
             state: State::Enabled,
             unlocks: 0,
@@ -2460,7 +2703,8 @@ impl EnrollServer {
         else {
             unreachable!("only add-device");
         };
-        let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
+        let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+        need_member(role)?;
         let me = caller.to_string();
         if vault
             .devices
@@ -2501,7 +2745,11 @@ impl EnrollServer {
             | VaultOp::Approve { .. }
             | VaultOp::Deny { .. }
             | VaultOp::EscrowCode { .. }
-            | VaultOp::RecoverCode => unreachable!("answered by vault_op"),
+            | VaultOp::RecoverCode
+            | VaultOp::Deposit { .. }
+            | VaultOp::Deposits { .. }
+            | VaultOp::FetchDeposit { .. }
+            | VaultOp::RetireDeposit { .. } => unreachable!("answered by vault_op"),
             VaultOp::Create { name, policy } => {
                 return Self::create_vault(caller, name, policy, now, directory, record);
             }
@@ -2509,7 +2757,8 @@ impl EnrollServer {
                 return Ok(vec![self.resolve_vault(caller, &name, directory)?.0]);
             }
             VaultOp::Register { name, add, retire } => {
-                let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
+                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                need_member(role)?;
                 register_bindings(&mut vault, add, &retire)?;
                 vault
             }
@@ -2525,20 +2774,22 @@ impl EnrollServer {
                 name,
                 managers,
                 members,
+                depositors,
             } => {
                 let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
                 need(role, Role::Manager, "share it")?;
                 let limits = limits_for(&vault.owner, directory)?;
-                self.share(&mut vault, &managers, &members, &limits)?;
+                self.share(&mut vault, [&managers, &members, &depositors], &limits)?;
                 vault
             }
             VaultOp::Unshare {
                 name,
                 managers,
                 members,
+                depositors,
             } => {
                 let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
-                self.unshare(&mut vault, caller, role, &managers, &members)?;
+                self.unshare(&mut vault, caller, role, [&managers, &members, &depositors])?;
                 vault
             }
             op @ VaultOp::AddDevice { .. } => self.add_device(caller, op, now, directory)?,
@@ -2850,7 +3101,7 @@ impl EnrollServer {
             .opener(&vault, request, device, now, directory)?
             .parse()?;
         let groups = groups_for(&vault, &who, directory)?;
-        if vault.role(&who, &groups).is_none() {
+        if !vault.opens(&who, &groups) {
             return Err(Refusal::because(format!("{who} has no part in the vault")));
         }
         if directory.principal_locked(&who).map_err(Refusal)? {
@@ -2921,7 +3172,11 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
         | VaultOp::Approve { .. }
         | VaultOp::Deny { .. }
         | VaultOp::EscrowCode { .. }
-        | VaultOp::RecoverCode => return None,
+        | VaultOp::RecoverCode
+        | VaultOp::Deposit { .. }
+        | VaultOp::Deposits { .. }
+        | VaultOp::FetchDeposit { .. }
+        | VaultOp::RetireDeposit { .. } => return None,
     })
 }
 
@@ -2939,7 +3194,7 @@ fn prune_departed(vault: &mut Vault, directory: &dyn Directory) -> Result<Vec<St
         } else {
             let principal: Principal = holder.parse()?;
             let groups = groups_for(vault, &principal, directory)?;
-            let stays = vault.role(&principal, &groups).is_some();
+            let stays = vault.opens(&principal, &groups);
             roles.insert(holder, stays);
             stays
         };
@@ -3033,6 +3288,25 @@ fn approvals_counted(
         }
     }
     Ok(counted.len() as u64)
+}
+
+/// Deposit `id` of `vault`, with its file.
+fn find_deposit(vault: &Vault, id: &str, directory: &dyn Directory) -> Result<Deposit, Refusal> {
+    directory
+        .deposits(&vault.id)
+        .map_err(Refusal)?
+        .into_iter()
+        .find(|d| d.id == id)
+        .ok_or_else(|| Refusal::because(format!("no deposit {id}")))
+}
+
+/// Refuse a depositor what only those who open may do.
+fn need_member(role: Role) -> Result<(), Refusal> {
+    if role >= Role::Member {
+        Ok(())
+    } else {
+        Err(Refusal::because("a depositor does not open the vault"))
+    }
 }
 
 /// Refuse unless `role` is at least `least`, to do `what`.

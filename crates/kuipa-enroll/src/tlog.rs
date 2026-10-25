@@ -810,6 +810,10 @@ pub enum VaultAction {
     EscrowCode = 14,
     /// The device's escrowed key was fetched for recovery.
     RecoverCode = 15,
+    /// A file was deposited (`DESIGN-recovery.md` §3).
+    Deposit = 16,
+    /// A deposit was removed.
+    RetireDeposit = 17,
 }
 
 impl VaultAction {
@@ -817,9 +821,13 @@ impl VaultAction {
     #[must_use]
     pub const fn kind(self) -> Kind {
         match self {
-            Self::Create | Self::SetPolicy | Self::Revoke | Self::Share | Self::Unshare => {
-                Kind::VAULT_POLICY
-            }
+            Self::Create
+            | Self::SetPolicy
+            | Self::Revoke
+            | Self::Share
+            | Self::Unshare
+            | Self::Deposit
+            | Self::RetireDeposit => Kind::VAULT_POLICY,
             Self::AddDevice | Self::RemoveDevice | Self::EscrowCode | Self::RecoverCode => {
                 Kind::VAULT_DEVICE
             }
@@ -849,6 +857,8 @@ impl VaultAction {
             13 => Self::Deny,
             14 => Self::EscrowCode,
             15 => Self::RecoverCode,
+            16 => Self::Deposit,
+            17 => Self::RetireDeposit,
             _ => return Err(Error::Malformed("vault event action")),
         })
     }
@@ -1450,6 +1460,7 @@ mod tests {
             (VaultAction::Unshare, Kind::VAULT_POLICY),
             (VaultAction::Approve, Kind::ESCROW_RELEASE),
             (VaultAction::RecoverCode, Kind::VAULT_DEVICE),
+            (VaultAction::Deposit, Kind::VAULT_POLICY),
             (VaultAction::Release, Kind::ESCROW_RELEASE),
         ] {
             assert_eq!(action.kind(), kind);

@@ -319,6 +319,21 @@ Describe a vault.  *seal list* describes all your vaults and those
 shared with you; *seal revoke VAULT* revokes it: no file sealed to it
 opens any more.
 
+## seal deposit put _VAULT_ _FILE_ [--name _NAME_]
+
+Seal _FILE_ to the vault and leave it with the servers as a deposit, in
+place of your earlier deposit of the same name.  Depositors (*seal share
+--depositor*) do this without being able to open the vault.
+
+## seal deposit list _VAULT_, seal deposit fetch _VAULT_ _ID_ --out _FILE_
+
+List the vault's deposits (a depositor sees their own), or, as a member,
+fetch one's sealed file to open with *seal open*.
+
+## seal deposit retire _VAULT_ _ID_
+
+Remove a deposit: your own, or any as a manager.
+
 ## seal recovery-code
 
 Escrow this host's device key under a new recovery code, which is
@@ -358,7 +373,8 @@ own requests are not yours to approve.  One denial ends a request.
 Share a vault, as its owner or a manager.  Members open and seal its
 files, start sessions, and register and remove their own devices;
 with *--manager*, they also change its policy, share and unshare it,
-and revoke it.  Groups are IPA user groups or host groups; membership
+and revoke it; with *--depositor*, they only seal to it and deposit,
+and never open it.  Groups are IPA user groups or host groups; membership
 is checked at every open.  Each option may be repeated.
 
 ## seal unshare _VAULT_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]

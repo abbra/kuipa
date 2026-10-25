@@ -174,7 +174,8 @@ request:
 | event | kind | subject | body |
 |---|---|---|---|
 | vault created, policy set, revoked | 3 | vault id | `IPLV`: action, `H` of the policy (zeros for revoke) |
-| vault shared or unshared (DESIGN.md §7.6.12) | 3 | vault id | `IPLV`: share or unshare, `H` of the managers and members after the change |
+| vault shared or unshared (DESIGN.md §7.6.12) | 3 | vault id | `IPLV`: share or unshare, `H` of the managers, members and depositors after the change (depositors left out when there are none) |
+| file deposited, deposit retired (DESIGN-recovery.md §3) | 3 | vault id | `IPLV`: action, `H` of the sealed file, or of the deposit's id |
 | device added or removed | 2 | vault id | `IPLV`: action, the device's id |
 | device key escrowed under a recovery code, or fetched (DESIGN-recovery.md) | 2 | vault id of each vault where the holder holds the device | `IPLV`: action, the device's id |
 | session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |

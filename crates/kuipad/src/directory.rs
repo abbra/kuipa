@@ -38,7 +38,7 @@ use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
 use kuipa_enroll::vault::{
-    Approval, Device, DeviceEscrow, Limits, Members, ReleaseRequest, State, Vault,
+    Approval, Deposit, Device, DeviceEscrow, Limits, Members, ReleaseRequest, State, Vault,
 };
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
@@ -79,6 +79,11 @@ const VAULT_BINDING_ATTR: &str = "ipaKUVaultBinding";
 /// `service:HTTP/ci.example.test@REALM`): its managers, and its members.
 const VAULT_MANAGER_ATTR: &str = "ipaKUVaultManager";
 const VAULT_MEMBER_ATTR: &str = "ipaKUVaultMember";
+/// Who deposits to a vault without opening it (`DESIGN-recovery.md` §3).
+const VAULT_DEPOSITOR_ATTR: &str = "ipaKUVaultDepositor";
+/// Deposits, child entries of their vault, each kept whole as JSON.
+const DEPOSIT_CLASS: &str = "ipaKUDeposit";
+const DEPOSIT_ATTR: &str = "ipaKUDepositData";
 /// Who approves a vault's releases (`DESIGN-approvals.md`), as its
 /// policy's `approvals.from`, one `kind:name` value each: kept beside the
 /// policy so approvers can be searched for.
@@ -101,6 +106,7 @@ const VAULT_ATTRS: &[&str] = &[
     VAULT_POLICY_ATTR,
     VAULT_MANAGER_ATTR,
     VAULT_MEMBER_ATTR,
+    VAULT_DEPOSITOR_ATTR,
     VAULT_DEVICE_ATTR,
     VAULT_STATE_ATTR,
     VAULT_UNLOCKS_ATTR,
@@ -346,6 +352,7 @@ impl LdapDirectory {
             policy: serde_json::from_str(&one(VAULT_POLICY_ATTR)?)?,
             managers: members(VAULT_MANAGER_ATTR),
             members: members(VAULT_MEMBER_ATTR),
+            depositors: members(VAULT_DEPOSITOR_ATTR),
             devices,
             state,
             unlocks: Self::unlock_counts(entry).iter().map(|(_, n)| n).sum(),
@@ -938,6 +945,7 @@ impl Directory for LdapDirectory {
         let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
         let (managers, members) = (vault.managers.entries(), vault.members.entries());
         let approvers = Self::approvers(vault);
+        let depositors = vault.depositors.entries();
         let id = vault.id.to_string();
         self.service_conn()?.add_s(
             &self.vault_dn(&vault.id),
@@ -957,6 +965,10 @@ impl Directory for LdapDirectory {
                 (
                     VAULT_MEMBER_ATTR,
                     members.iter().map(String::as_bytes).collect(),
+                ),
+                (
+                    VAULT_DEPOSITOR_ATTR,
+                    depositors.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     VAULT_APPROVER_ATTR,
@@ -1003,6 +1015,7 @@ impl Directory for LdapDirectory {
         let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
         let (managers, members) = (vault.managers.entries(), vault.members.entries());
         let approvers = Self::approvers(vault);
+        let depositors = vault.depositors.entries();
         self.service_conn()?.modify_s(
             &self.vault_dn(&vault.id),
             &[
@@ -1016,6 +1029,11 @@ impl Directory for LdapDirectory {
                     ModOp::Replace,
                     VAULT_MEMBER_ATTR,
                     members.iter().map(String::as_bytes).collect(),
+                ),
+                (
+                    ModOp::Replace,
+                    VAULT_DEPOSITOR_ATTR,
+                    depositors.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     ModOp::Replace,
@@ -1069,6 +1087,7 @@ impl Directory for LdapDirectory {
                 [
                     format!("({VAULT_MANAGER_ATTR}={e})"),
                     format!("({VAULT_MEMBER_ATTR}={e})"),
+                    format!("({VAULT_DEPOSITOR_ATTR}={e})"),
                 ]
             })
             .collect();
@@ -1076,6 +1095,49 @@ impl Directory for LdapDirectory {
             return Ok(Vec::new());
         }
         self.vaults_matching(&format!("(|{any})"))
+    }
+
+    fn deposit_add(&self, deposit: &Deposit) -> Result<(), DirectoryError> {
+        let data = serde_json::to_string(deposit)?;
+        self.service_conn()?.add_s(
+            &format!("cn={},{}", deposit.id, self.vault_dn(&deposit.vault)),
+            &[
+                (
+                    "objectClass",
+                    vec![b"top".as_slice(), DEPOSIT_CLASS.as_bytes()],
+                ),
+                ("cn", vec![deposit.id.as_bytes()]),
+                (DEPOSIT_ATTR, vec![data.as_bytes()]),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn deposits(&self, id: &VaultId) -> Result<Vec<Deposit>, DirectoryError> {
+        let entries = match self.service_conn()?.search(
+            &self.vault_dn(id),
+            Scope::OneLevel,
+            &format!("(objectClass={DEPOSIT_CLASS})"),
+            &[DEPOSIT_ATTR],
+        ) {
+            Ok(e) => e,
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        entries
+            .iter()
+            .filter_map(|e| e.attrs.get(&DEPOSIT_ATTR.to_lowercase())?.first().cloned())
+            .map(|v| Ok(serde_json::from_str(&v)?))
+            .collect()
+    }
+
+    fn deposit_remove(&self, id: &VaultId, deposit: &str) -> Result<(), DirectoryError> {
+        self.service_conn()?
+            .delete_s(&format!("cn={deposit},{}", self.vault_dn(id)))?;
+        Ok(())
     }
 
     fn device_escrow_set(

@@ -18,7 +18,7 @@ the most managed:
 | piece | status |
 |---|---|
 | recovery codes (`kuipa seal recovery-code`, `recover code`, `recover finish`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
-| depositors, deposits, `kuipa seal deposit` | designed |
+| depositors, deposits, `kuipa seal deposit put`, `list`, `fetch`, `retire` | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | device-key deposits and delivery (`kuipa seal recover`) | designed; needs DESIGN-approvals.md |
 | `kuipa escrow luks`, `kuipa escrow file` | designed |
 
@@ -88,27 +88,41 @@ A shared vault (DESIGN.md §7.6.12) gains a fourth role, below member:
 
 | role | may |
 |---|---|
-| depositor (`depositors`, named as members are) | show the vault (to seal to it), deposit, list and retire their own deposits |
+| depositor (`depositors`, named as members are, in `ipaKUVaultDepositor`) | show the vault (to seal to it), deposit, list and retire their own deposits, leave |
 
-A depositor never opens: they hold no device in the vault, and a release
-refuses an opener who is only a depositor. A **deposit** is a file sealed
-to the vault (`IPUF`) that the server keeps for the members, since its
-depositor may be gone by the time anyone needs it:
+A depositor never opens: they register no device, start no session, ask
+for no release, fetch no deposit, and a release refuses an opener who is
+only a depositor. `kuipa seal share VAULT --depositor --group G` makes
+them one; managers, members and depositors count together against
+`max_members`. A **deposit** is a file sealed to the vault (`IPUF`) that
+the server keeps for the members, since its depositor may be gone by the
+time anyone needs it:
 
 ```text
 cn=<deposit id>,cn=<vault id>,cn=vaults,cn=kuipa,cn=etc,<suffix>
-  ipaKUDeposit: { "depositor", "kind": "device" | "luks" | "file",
-                  "subject": <what it is for>, "added", "sealed": <IPUF, ≤ 16 KiB> }
+  objectClass ipaKUDeposit
+  ipaKUDepositData: { "id", "vault", "depositor", "kind": "device" | "luks" | "file",
+                      "subject": <what it is for>, "added", "sealed": <IPUF, ≤ 16 KiB> }
 ```
 
-`subject` is structured by kind: `{"user", "device"}` for a device key,
-`{"host", "uuid"}` for a LUKS volume, `{"host", "name"}` for a file. The
-vault operations are `deposit` (which, with `sealing = registered`, also
-registers the file's bindings), `deposits` (members see all, depositors
-their own) and `retire-deposit` (a depositor's own, or any for a
-manager). A new deposit with the same depositor, kind and subject retires
-the previous one. The realm limits gain `max_deposits` per depositor and
-vault (default 32).
+`subject` says what the deposit is for among its depositor's deposits of
+that kind, as string pairs (at most 8): `{"device"}` for a device key,
+`{"uuid"}` for a LUKS volume, `{"name"}` for a file; the depositor (a
+user, or a host's principal) is the deposit's own field. The vault
+operations are:
+
+| operation | who | does |
+|---|---|---|
+| `deposit` | any role | checks the file is sealed to this vault, keeps it, and with `sealing = registered` registers its bindings; a deposit with the same depositor, kind and subject replaces the earlier one, whose bindings are retired |
+| `deposits` | any role | lists deposits without their files: all of them for members, their own for a depositor |
+| `fetch-deposit` | members | one deposit with its file, which opens as any file of the vault, under its policy |
+| `retire-deposit` | a deposit's depositor, or a manager | removes it and retires its bindings |
+
+Deposits and retirements are logged (`deposit` with `H` of the file,
+`retire-deposit` with `H` of its id, kind 3). The realm limits gain
+`max_deposits` per depositor and vault (default 32). On the command
+line they are `kuipa seal deposit put VAULT FILE [--name N]`, `list`,
+`fetch VAULT ID --out F.sealed` and `retire VAULT ID`.
 
 The vault's own policy decides how deposits open, as for any file. For a
 helpdesk it would be:

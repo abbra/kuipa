@@ -22,7 +22,7 @@ use kuipa_enroll::server::{
 use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, SignedHead, VaultAction, VaultEvent};
 use kuipa_enroll::vault::{
     self, Descriptor, DeviceType, Factors, Level, Recovered, SealedVaultFile, TicketDelegation,
-    Unlock, Vault, VaultOp,
+    Unlock, Vault, VaultOp, VerifiedDescriptor,
 };
 use kuipa_enroll::{EnrollServer, Error};
 use native_ossl::util::SecretBuf;
@@ -74,6 +74,8 @@ struct MemoryDirectory {
     release_uses: RefCell<HashMap<(VaultId, String, String), u64>>,
     /// Device keys kept under recovery codes, by holder.
     escrows: RefCell<HashMap<String, Vec<vault::DeviceEscrow>>>,
+    /// Deposits by vault and id (`DESIGN-recovery.md` §3).
+    deposits: RefCell<HashMap<(VaultId, String), vault::Deposit>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -350,6 +352,30 @@ impl Directory for MemoryDirectory {
             })
             .cloned()
             .collect())
+    }
+
+    fn deposit_add(&self, deposit: &vault::Deposit) -> Result<(), DirectoryError> {
+        self.deposits
+            .borrow_mut()
+            .insert((deposit.vault, deposit.id.clone()), deposit.clone());
+        Ok(())
+    }
+
+    fn deposits(&self, id: &VaultId) -> Result<Vec<vault::Deposit>, DirectoryError> {
+        Ok(self
+            .deposits
+            .borrow()
+            .values()
+            .filter(|d| d.vault == *id)
+            .cloned()
+            .collect())
+    }
+
+    fn deposit_remove(&self, id: &VaultId, deposit: &str) -> Result<(), DirectoryError> {
+        self.deposits
+            .borrow_mut()
+            .remove(&(*id, deposit.to_owned()));
+        Ok(())
     }
 
     fn device_escrow_set(
@@ -2238,6 +2264,7 @@ fn share_op(name: &str, managers: vault::Members, members: vault::Members) -> Va
         name: name.into(),
         managers,
         members,
+        depositors: vault::Members::default(),
     }
 }
 
@@ -2247,6 +2274,7 @@ fn unshare_op(name: &str, managers: vault::Members, members: vault::Members) -> 
         name: name.into(),
         managers,
         members,
+        depositors: vault::Members::default(),
     }
 }
 
@@ -2722,6 +2750,7 @@ fn removing_a_member_starts_a_new_offline_epoch() {
             name: "travel".into(),
             managers: vault::Members::default(),
             members: members.clone(),
+            depositors: vault::Members::default(),
         },
     )
     .unwrap();
@@ -2747,6 +2776,7 @@ fn removing_a_member_starts_a_new_offline_epoch() {
             name: "travel".into(),
             managers: vault::Members::default(),
             members,
+            depositors: vault::Members::default(),
         },
     )
     .unwrap();
@@ -2833,6 +2863,7 @@ fn a_vaults_limits_are_its_owners_by_their_groups() {
                 ..vault::Members::default()
             },
             members: vault::Members::default(),
+            depositors: vault::Members::default(),
         },
     )
     .unwrap();
@@ -3105,6 +3136,196 @@ fn device_keys_are_escrowed_for_their_holders_and_logged() {
     // Bob fetches only his own: none.
     let bobs = vault_reply_at(&r, 0, adv, BOB, &VaultOp::RecoverCode).unwrap();
     assert!(bobs.escrows.is_empty());
+}
+
+/// Alice's helpdesk vault for disks: Carol a member, Bob a depositor.
+struct Disks {
+    r: Realm,
+    carol_key: ExchangeKeyPair,
+    other: VerifiedDescriptor,
+}
+
+impl Disks {
+    fn new() -> Self {
+        let (r, _) = logged_realm();
+        let adv = &r.verify(0);
+        let policy = vault::Policy {
+            factors: Factors {
+                device: Some(Level::Any),
+                ticket: true,
+                passkey: false,
+            },
+            sealing: vault::Sealing::Registered,
+            ..vault::Policy::default()
+        };
+        for name in ["disks", "other"] {
+            let op = VaultOp::Create {
+                name: name.into(),
+                policy: policy.clone(),
+            };
+            vault_op(&r, adv, ALICE, &op).unwrap();
+        }
+        let alice_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+        vault_op(&r, adv, ALICE, &add_device_op("disks", &alice_key)).unwrap();
+        let other = vault_op(&r, adv, ALICE, &add_device_op("other", &alice_key)).unwrap();
+        let other = other[0]
+            .verify(REALM, &r.all_anchors(), &Policy::default())
+            .unwrap();
+        let shared = VaultOp::Share {
+            name: "disks".into(),
+            managers: vault::Members::default(),
+            members: member_users(&["carol"]),
+            depositors: member_users(&["bob"]),
+        };
+        vault_op(&r, adv, ALICE, &shared).unwrap();
+        let carol_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+        vault_op(&r, adv, CAROL, &add_device_op("alice/disks", &carol_key)).unwrap();
+        Self {
+            r,
+            carol_key,
+            other,
+        }
+    }
+
+    /// `who`'s view of the vault, to seal with.
+    fn descriptor(&self, who: &str) -> VerifiedDescriptor {
+        let shown = vault_op(
+            &self.r,
+            &self.r.verify(0),
+            who,
+            &VaultOp::Show {
+                name: "alice/disks".into(),
+            },
+        )
+        .unwrap();
+        shown[0]
+            .verify(REALM, &self.r.all_anchors(), &Policy::default())
+            .unwrap()
+    }
+
+    fn seal(&self, d: &VerifiedDescriptor, text: &[u8]) -> SealedVaultFile {
+        let advs = [self.r.verify(0), self.r.verify(1)];
+        SealedVaultFile::seal(d, &[&advs[0], &advs[1]], text).unwrap()
+    }
+
+    fn op(&self, who: &str, op: &VaultOp) -> Result<vault::Reply, ()> {
+        vault_reply_at(&self.r, 0, &self.r.verify(0), who, op)
+    }
+
+    /// Bob deposits `file` as the LUKS key of volume `uuid`.
+    fn deposit(&self, file: &SealedVaultFile, uuid: &str) -> Result<vault::Reply, ()> {
+        self.op(
+            BOB,
+            &VaultOp::Deposit {
+                name: "alice/disks".into(),
+                kind: vault::DepositKind::Luks,
+                subject: [("uuid".to_owned(), uuid.to_owned())].into(),
+                sealed: tang_pqc::b64::encode(&file.to_bytes()),
+            },
+        )
+    }
+
+    /// The deposits `who` lists.
+    fn listed(&self, who: &str) -> Vec<vault::Deposit> {
+        let name = "alice/disks".into();
+        self.op(who, &VaultOp::Deposits { name }).unwrap().deposits
+    }
+
+    /// Deposit `id`'s file, as Carol fetches it.
+    fn fetched(&self, id: &str) -> SealedVaultFile {
+        let fetch = VaultOp::FetchDeposit {
+            name: "alice/disks".into(),
+            id: id.into(),
+        };
+        let reply = self.op(CAROL, &fetch).unwrap();
+        SealedVaultFile::from_bytes(&tang_pqc::b64::decode(&reply.deposits[0].sealed).unwrap())
+            .unwrap()
+    }
+}
+
+/// Bob deposits and never opens; Carol finds the deposit and opens it.
+fn depositors_deposit_members_open(d: &Disks) {
+    let bobs = d.descriptor(BOB);
+    let key = d.seal(&bobs, b"luks recovery key");
+    let made = d.deposit(&key, "1234").unwrap();
+    assert_eq!(made.receipts.len(), 1, "logged");
+    let id = made.deposits[0].id.clone();
+    assert!(made.deposits[0].sealed.is_empty(), "not sent back");
+    // Bob may not open: no device, no registering, no fetching.
+    let bob_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    assert!(d.op(BOB, &add_device_op("alice/disks", &bob_key)).is_err());
+    let fetch = VaultOp::FetchDeposit {
+        name: "alice/disks".into(),
+        id: id.clone(),
+    };
+    assert!(d.op(BOB, &fetch).is_err());
+    assert!(open_as(&d.r, &key, BOB, &bob_key).is_err());
+    assert_eq!(d.listed(BOB).len(), 1);
+    // Carol, a member, opens the deposited file: the deposit registered it.
+    let fetched = d.fetched(&id);
+    assert_eq!(
+        open_as(&d.r, &fetched, CAROL, &d.carol_key)
+            .unwrap()
+            .as_ref(),
+        b"luks recovery key"
+    );
+}
+
+/// A deposit of the same kind and subject replaces the last, whose file
+/// stops opening; others count against the limit; files sealed to other
+/// vaults are refused.
+fn deposits_replace_and_are_limited(d: &Disks) {
+    let bobs = d.descriptor(BOB);
+    let old = d.fetched(&d.listed(CAROL)[0].id);
+    let new = d.seal(&bobs, b"new recovery key");
+    d.deposit(&new, "1234").unwrap();
+    let listed = d.listed(CAROL);
+    assert_eq!(listed.len(), 1, "replaced");
+    assert!(open_as(&d.r, &old, CAROL, &d.carol_key).is_err(), "retired");
+    let fresh = d.fetched(&listed[0].id);
+    assert_eq!(
+        open_as(&d.r, &fresh, CAROL, &d.carol_key).unwrap().as_ref(),
+        b"new recovery key"
+    );
+    let elsewhere = d.seal(&d.other, b"x");
+    assert!(
+        d.deposit(&elsewhere, "5678").is_err(),
+        "another vault's file"
+    );
+    d.r.dir.limits.borrow_mut().max_deposits = 1;
+    assert!(d.deposit(&new, "5678").is_err(), "one deposit each");
+    d.r.dir.limits.borrow_mut().max_deposits = 32;
+}
+
+/// Bob retires his own deposits, Carol nobody's; Bob may leave.
+fn deposits_retire(d: &Disks) {
+    let id = d.listed(BOB)[0].id.clone();
+    let retire = |who: &str| {
+        let op = VaultOp::RetireDeposit {
+            name: "alice/disks".into(),
+            id: id.clone(),
+        };
+        d.op(who, &op)
+    };
+    assert!(retire(CAROL).is_err(), "not hers, and not a manager");
+    retire(BOB).unwrap();
+    assert!(d.listed(CAROL).is_empty());
+    let leave = VaultOp::Unshare {
+        name: "alice/disks".into(),
+        managers: vault::Members::default(),
+        members: vault::Members::default(),
+        depositors: member_users(&["bob"]),
+    };
+    d.op(BOB, &leave).unwrap();
+    assert!(d.deposit(&d.seal(&d.descriptor(CAROL), b"x"), "9").is_err());
+}
+
+#[test]
+fn depositors_deposit_and_never_open() {
+    let d = Disks::new();
+    depositors_deposit_members_open(&d);
+    deposits_replace_and_are_limited(&d);
+    deposits_retire(&d);
 }
 
 /// Run a vault operation as `caller` against server `i`.

@@ -64,6 +64,8 @@ pub struct KdcDirectory {
     release_uses: Mutex<HashMap<(VaultId, String, String), u64>>,
     /// Device keys kept under recovery codes, by holder.
     pub escrows: Mutex<HashMap<String, Vec<kuipa_enroll::vault::DeviceEscrow>>>,
+    /// Deposits by vault and id (`DESIGN-recovery.md` §3).
+    pub deposits: Mutex<HashMap<(VaultId, String), kuipa_enroll::vault::Deposit>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -105,6 +107,7 @@ impl KdcDirectory {
             releases: Mutex::new(HashMap::new()),
             release_uses: Mutex::new(HashMap::new()),
             escrows: Mutex::new(HashMap::new()),
+            deposits: Mutex::new(HashMap::new()),
             creds,
         }
     }
@@ -520,6 +523,33 @@ impl Directory for KdcDirectory {
             })
             .cloned()
             .collect())
+    }
+
+    fn deposit_add(&self, deposit: &kuipa_enroll::vault::Deposit) -> Result<(), DirectoryError> {
+        self.deposits
+            .lock()
+            .unwrap()
+            .insert((deposit.vault, deposit.id.clone()), deposit.clone());
+        Ok(())
+    }
+
+    fn deposits(&self, id: &VaultId) -> Result<Vec<kuipa_enroll::vault::Deposit>, DirectoryError> {
+        Ok(self
+            .deposits
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|d| d.vault == *id)
+            .cloned()
+            .collect())
+    }
+
+    fn deposit_remove(&self, id: &VaultId, deposit: &str) -> Result<(), DirectoryError> {
+        self.deposits
+            .lock()
+            .unwrap()
+            .remove(&(*id, deposit.to_owned()));
+        Ok(())
     }
 
     fn device_escrow_set(
