@@ -139,8 +139,10 @@ design first.
       operation arms a host while online with a signed offline grant (one
       user, one host, a window) and a per-user TPM-sealed object; needs the
       TPM factor.
-- [ ] Recovery slots held by a helpdesk group, also escrowing LUKS and
-      backup recovery keys.
+- [ ] Recovery after losing every device (recovery codes, device-key
+      deposits in a helpdesk vault) and deposits of LUKS and backup
+      recovery keys: designed in `docs/DESIGN-recovery.md`; needs the
+      approvals.
 - [ ] M-of-N approvals for break-glass releases, recorded in the
       transparency log: designed in `docs/DESIGN-approvals.md`.
 - [ ] Short-lived CI runner identities: leases on top of vouchers, and

@@ -280,6 +280,11 @@ your files are gone.
 only under policy and recorded in the transparency log. The same slot
 can escrow LUKS and backup recovery keys.
 
+**Design:** a recovery code you print, or your device key deposited in a
+helpdesk vault and handed back under several people's approval; hosts
+deposit their LUKS and backup keys the same way. See
+[recovery](reference/design.md#kuipa-recovery-lost-devices-luks-and-backup-keys).
+
 ### Tie secrets to a TPM, passkey or attested hardware
 
 **Why.** A device key on disk can be copied. One inside a TPM, a passkey

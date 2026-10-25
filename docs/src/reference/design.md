@@ -15,3 +15,7 @@
 ---
 
 {{#include ../../DESIGN-approvals.md}}
+
+---
+
+{{#include ../../DESIGN-recovery.md}}
