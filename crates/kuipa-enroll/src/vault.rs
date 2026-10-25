@@ -2679,7 +2679,7 @@ mod tests {
         // No group: the realm's, and the result names no groups.
         let plain = of(&["staff"]);
         assert_eq!((plain.max_vaults, plain.max_unlocks), (2, Some(10)));
-        assert!(plain.groups.is_empty());
+        assert_eq!(plain.groups, Vec::new());
         // One group: its fields, the realm's for the rest; null lifts a cap.
         let ops = of(&["ops"]);
         assert_eq!((ops.max_vaults, ops.max_unlocks), (50, None));
