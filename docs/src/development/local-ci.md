@@ -93,6 +93,12 @@ session uses the playground's helpers the way a person would, with
 
 * an OTP join, `status`, a rekey and `check`;
 * `protect`, `kuipa-unseal` and `unprotect`;
+* a user's vaults: devices, sealing, the transparency log and witnesses,
+  sessions, offline sessions;
+* realm limits, a vault shared with bob, a break-glass vault bob and
+  carol approve, bob's lost device recovered with a code, and carol's
+  deposits;
+* signing files and a git commit;
 * failover to ipa2;
 * password, ticket, offline and voucher joins;
 * the trusted realm B.TEST, with a ticket across the trust;
@@ -198,6 +204,7 @@ live in one shell; nothing touches the real system.
 | `pq_trusted_kinit [USER]` | log in a `B.TEST` user on the current host (default `alice@B.TEST`; a bare name means `USER@B.TEST`): anonymous PKINIT armour from B's KDC with the installed chain, then an armoured `kinit`; refuses before `pq_trust`. The ticket and the configuration (the realm's plus the installed snippet, B's KDC pointed at its socket) stay in `$KUIPA_ROOT/trusted-login` |
 | `pq_trusted CMD…` | run `CMD` with that user's ticket and configuration, e.g. `pq_trusted klist` or `pq_trusted kvno host/$PQ_HOST` (a ticket for this `EXAMPLE.TEST` host over the trust) |
 | `pq_admin_kinit` | log in as the administrator with a kuipa data directory and runtime directory of their own, for `kuipa seal` |
+| `pq_as USER CMD…` | run `CMD` as `bob` or `carol` (password `Secret123`), each with a ticket and a kuipa data directory of their own, for shared vaults, approvals and deposits: `pq_as bob kuipa seal list` |
 | `pq_down SERVER` / `pq_up` | make a server unreachable from this shell, and back (for failover) |
 | `pq_log [N]` | the servers' log |
 
