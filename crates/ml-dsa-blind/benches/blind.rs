@@ -34,8 +34,10 @@ fn message(len: usize) -> Vec<u8> {
     rng.bytes(len)
 }
 
-/// Deterministic keys per parameter set: the blind signer's identity is fixed
-/// for the whole bench, so the measured work is the protocol, not keygen.
+/// One key per parameter set, generated outside the timed loops so the
+/// measured work is the protocol, not keygen.  Keys are fresh each run;
+/// ML-DSA's cost does not depend on which key signs, and signing is hedged
+/// (randomized) anyway, so a fixed key would not make runs any more alike.
 fn keys(ps: ParameterSet) -> (SigningKey, VerifyingKey) {
     let key = SigningKey::generate(ps).expect("generate");
     let public = key.verifying_key().clone();
@@ -169,7 +171,7 @@ fn encode(c: &mut Criterion) {
         let req_bytes = req.as_bytes().to_vec();
         g.throughput(Throughput::Bytes(sig.to_bytes().len() as u64));
         g.bench_function(format!("request/parse-{}", label(ps)), |b| {
-            b.iter(|| BlindRequest::from_bytes(black_box(&req_bytes)).is_ok());
+            b.iter(|| BlindRequest::from_bytes(black_box(&req_bytes)).expect("parse"));
         });
         g.bench_function(format!("signature/encode-{}", label(ps)), |b| {
             b.iter(|| black_box(&sig).to_bytes().len());
@@ -184,8 +186,9 @@ fn encode(c: &mut Criterion) {
     g.finish();
 }
 
-/// Context construction: domain separation strings are copied and truncated
-/// to `MAX_LEN`, which every sign/verify path repeats.
+/// Context construction: domain separation strings are copied and checked
+/// against `MAX_LEN`, which every sign/verify path repeats.  A context over
+/// `MAX_LEN` is refused, not truncated; `new-refused` times that refusal.
 fn context(c: &mut Criterion) {
     let mut g = c.benchmark_group("context");
     let mut rng = SplitMix64::new(0xc0fe);
@@ -193,11 +196,11 @@ fn context(c: &mut Criterion) {
     let long = rng.bytes(1024);
     g.throughput(Throughput::Bytes(short.len() as u64));
     g.bench_function("new-32", |b| {
-        b.iter(|| Context::new(black_box(short.clone())).is_ok());
+        b.iter(|| Context::new(black_box(short.clone())).expect("context"));
     });
     g.throughput(Throughput::Bytes(long.len() as u64));
-    g.bench_function("new-truncated", |b| {
-        b.iter(|| Context::new(black_box(long.clone())).is_ok());
+    g.bench_function("new-refused", |b| {
+        b.iter(|| Context::new(black_box(long.clone())).expect_err("over MAX_LEN"));
     });
     g.finish();
 }
