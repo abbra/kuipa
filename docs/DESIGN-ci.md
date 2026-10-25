@@ -14,23 +14,25 @@ vaults, §7.6.12). This design adds the two missing pieces:
 
 | piece | status |
 |---|---|
-| the voucher `lease`, leased host entries, their removal | designed |
-| the `ticket.leased` policy option | designed |
+| the voucher `lease`, leased host entries, their removal | implemented |
+| the `ticket.leased` policy option | implemented |
+| `ticket.delegation = refuse` for runner vaults | needs the PAC's S4U delegation info (TODO.md, vaults 5); until then it refuses every ticket |
 | runner setup: voucher join, protected keytab in gssproxy | works today (DESIGN.md §7.4, §9) |
 
 ## 1. Leases
 
-The voucher message (DESIGN.md §9) gains a lease, in a new version:
+The voucher message (DESIGN.md §9) carries a lease:
 
 ```text
-m = "IPVN" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
+m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
 ```
 
-`lease` is the host's lifetime in seconds from its join, 0 for none
-(an `IPVM` voucher is a voucher with no lease). The provisioner chooses
-it (`kuipa-voucher request --lease 4h`); the issuer still sees only `μ`.
-The realm caps it: `max_lease` in the realm's voucher settings, default 7
-days.
+`lease` is the host's lifetime in seconds from its join, 0 for none.
+No vouchers were deployed before leases, so the field is part of the one
+voucher format rather than a new version. The provisioner chooses it
+(`kuipa-voucher request --lease-hours 4`); the issuer still sees only
+`μ`. The realm caps it at the join: `max_lease` (seconds) in
+`ipaKUVouchers`, JSON on `cn=vouchers,cn=kuipa,cn=etc`, default 7 days.
 
 When the server joins a host by a voucher with a lease, the directory
 also sets, as the daemon:
@@ -46,6 +48,7 @@ server, in its maintenance loop, deletes the host entries whose
 finish logging), with their escrow bindings and host-group membership;
 the deletion is logged. The daemon deletes only entries carrying
 `ipaKULease`, which only it sets, so its ACI can be limited to them.
+kuipad checks every five minutes.
 
 ## 2. Pipeline secrets
 
