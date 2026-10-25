@@ -213,7 +213,7 @@ impl GssServerCred {
             length: svc_cstr.to_bytes().len(),
             // SAFETY: gss_import_name treats input_name_buffer as read-only per
             // RFC 2744 §2; *const → *mut cast is safe for C APIs with that contract.
-            #[allow(clippy::as_ptr_cast_mut)]
+            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
             value: svc_cstr.as_ptr() as *mut _,
         };
         let mut svc_name: ffi::GssNameT = ptr::null_mut();
@@ -533,7 +533,7 @@ impl GssServerCred {
     }
 }
 
-/// The principal name of credential `cred`, as `gss_inquire_cred` and
+/// The principal name of credential `raw`, as `gss_inquire_cred` and
 /// `gss_display_name` give it.
 fn cred_principal_name(cred: ffi::GssCredIdT) -> Option<String> {
     let mut minor: ffi::OmUint32 = 0;
@@ -1245,7 +1245,7 @@ impl GssClientCred {
         let principal_buf = ffi::GssBufferDesc {
             length: principal_cstr.to_bytes().len(),
             // SAFETY: gss_import_name treats the buffer as read-only.
-            #[allow(clippy::as_ptr_cast_mut)]
+            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
             value: principal_cstr.as_ptr() as *mut _,
         };
         let mut user_name: ffi::GssNameT = ptr::null_mut();
@@ -2069,7 +2069,7 @@ impl GssClientContext {
         let svc_buf = ffi::GssBufferDesc {
             length: svc_cstr.to_bytes().len(),
             // SAFETY: gss_import_name treats the buffer as read-only.
-            #[allow(clippy::as_ptr_cast_mut)]
+            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
             value: svc_cstr.as_ptr() as *mut _,
         };
         let mut target_name: ffi::GssNameT = ptr::null_mut();
@@ -2165,7 +2165,7 @@ impl GssClientContext {
                 input_storage = ffi::GssBufferDesc {
                     length: data.len(),
                     // SAFETY: gss_init_sec_context treats input_token as read-only.
-                    #[allow(clippy::as_ptr_cast_mut)]
+                    #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
                     value: data.as_ptr() as *mut _,
                 };
                 &raw const input_storage
@@ -2184,7 +2184,7 @@ impl GssClientContext {
                     application_data: ffi::GssBufferDesc {
                         length: data.len(),
                         // SAFETY: application_data is treated as read-only.
-                        #[allow(clippy::as_ptr_cast_mut)]
+                        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
                         value: data.as_ptr() as *mut _,
                     },
                 };
@@ -2364,7 +2364,7 @@ impl GssServerContext {
             length: input_token.len(),
             // SAFETY: gss_accept_sec_context treats input_token_buffer as read-only
             // per RFC 2744 §2; *const → *mut cast is safe for C APIs with that contract.
-            #[allow(clippy::as_ptr_cast_mut)]
+            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
             value: input_token.as_ptr() as *mut _,
         };
         let mut output_buf = ffi::gss_c_no_buffer();
@@ -2387,7 +2387,7 @@ impl GssServerContext {
                         length: data.len(),
                         // SAFETY: gss_accept_sec_context treats application_data as
                         // read-only; *const → *mut cast is safe per RFC 2744 §2.
-                        #[allow(clippy::as_ptr_cast_mut)]
+                        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
                         value: data.as_ptr() as *mut _,
                     },
                 };
@@ -2599,7 +2599,7 @@ fn impersonate_with_server_cred_mit(
     let principal_oid = ffi::gss_krb5_nt_principal_name();
     let principal_buf = ffi::GssBufferDesc {
         length: principal_cstr.to_bytes().len(),
-        #[allow(clippy::as_ptr_cast_mut)]
+        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
         value: principal_cstr.as_ptr() as *mut _,
     };
     let mut user_name: ffi::GssNameT = ptr::null_mut();
@@ -2705,7 +2705,7 @@ fn pseudo_random(raw: ffi::GssCtxIdT, input: &[u8], len: usize) -> Result<Vec<u8
     let in_buf = ffi::GssBufferDesc {
         length: input.len(),
         // SAFETY: gss_pseudo_random treats prf_in as read-only.
-        #[allow(clippy::as_ptr_cast_mut)]
+        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
         value: input.as_ptr() as *mut _,
     };
     let mut out_buf = ffi::gss_c_no_buffer();

@@ -257,21 +257,17 @@ impl Context {
     /// `out`.  `password` is the long-term key, if the caller brought one;
     /// otherwise the front end is asked before the exchange starts, because
     /// Heimdal's step API never prompts for the password itself.
-    // One argument per thing libkrb5's own step API takes: the principal,
-    // the password, the service, its realm, the armour, the output cache,
-    // the front end.
     #[cfg(heimdal_kerberos)]
-    #[allow(clippy::too_many_arguments)]
     fn exchange(
         &self,
         client: &Principal<'_>,
         password: Option<&CStr>,
-        service: &CStr,
-        realm: &str,
+        target: Target<'_>,
         armour: &Ccache<'_>,
         out: &Ccache<'_>,
         answers: &Answers<'_>,
     ) -> Result<(), GssError> {
+        let Target { service, realm } = target;
         let opt = self.options()?;
         // The realm's defaults for an init-creds exchange: `kinit` applies
         // them, and `krb5_init_creds_init` does not when options are given.
@@ -359,6 +355,14 @@ impl Drop for Options<'_> {
 
 /// One step-by-step AS exchange of Heimdal's libkrb5: the handle, plus what
 /// keeps the prompter's data alive while libkrb5 may call it.
+/// The service an armoured exchange gets a ticket for, and that service's realm.
+#[cfg(heimdal_kerberos)]
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    service: &'a CStr,
+    realm: &'a str,
+}
+
 #[cfg(heimdal_kerberos)]
 struct Step<'a, 'b> {
     ctx: &'a Context,
@@ -1020,8 +1024,10 @@ pub fn ticket(
         ctx.exchange(
             &client,
             password.as_deref(),
-            &service,
-            realm,
+            Target {
+                service: &service,
+                realm,
+            },
             &armour,
             &out,
             &answers,

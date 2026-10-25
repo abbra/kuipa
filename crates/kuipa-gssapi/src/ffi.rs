@@ -130,7 +130,7 @@ static GSS_MECH_KRB5_OID_BYTES: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0
 pub fn gss_mech_krb5() -> GssOidDesc {
     GssOidDesc {
         length: 9,
-        #[allow(clippy::as_ptr_cast_mut)]
+        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
         elements: GSS_MECH_KRB5_OID_BYTES.as_ptr() as *mut c_void,
     }
 }
@@ -150,7 +150,7 @@ static GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES: [u8; 10] =
 pub fn gss_c_nt_hostbased_service() -> GssOidDesc {
     GssOidDesc {
         length: 6,
-        #[allow(clippy::as_ptr_cast_mut)]
+        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
         elements: GSS_C_NT_HOSTBASED_SERVICE_OID_BYTES.as_ptr() as *mut c_void,
     }
 }
@@ -159,7 +159,7 @@ pub fn gss_c_nt_hostbased_service() -> GssOidDesc {
 pub fn gss_krb5_nt_principal_name() -> GssOidDesc {
     GssOidDesc {
         length: 10,
-        #[allow(clippy::as_ptr_cast_mut)]
+        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
         elements: GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES.as_ptr() as *mut c_void,
     }
 }
