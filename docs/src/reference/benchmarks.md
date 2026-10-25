@@ -17,9 +17,12 @@ with the code it benches:
 | `blind` | `ml-dsa-blind` | Blinded request, blind signing, finalization, verification, round trip, wire encode, context construction, per parameter set |
 | `certs` | `kuipa-perf` | CA keygen, self-signing, chain construction — RSA-2048, EC P-256 and ML-DSA-65 |
 
-`kuipa-perf` is the fixture crate: it synthesizes deterministic realms,
-keytabs, certificates and anchors, and is a *dev-dependency* of the crates
-above rather than a bench owner itself. Its fixtures verify as they are built —
+`kuipa-perf` is the fixture crate: it synthesizes realms, keytabs,
+certificates and anchors, and is a *dev-dependency* of the crates above rather
+than a bench owner itself (it is not published). Synthetic data — keytab keys,
+claims, filler leaves — comes from a fixed-seed generator; every private key,
+CA keys included, comes from OpenSSL, so no fixture key can be re-derived from
+the source. Its fixtures verify as they are built —
 a realm that fails to verify panics during setup, so a broken fixture can never
 produce a number.
 
@@ -79,8 +82,10 @@ Comparison reads the stored files, so a baseline survives `cargo clean`.
 
 `local-ci.sh bench` (opt-in, like `msrv`) runs the smoke profile in quick mode
 and fails if any benchmark panics — which is the fixture crate's verification
-assertion firing, so the job doubles as a protocol self-check. The workflow
-job runs on every PR.
+assertion firing, so the job doubles as a protocol self-check — or if the run
+collected no results at all. The workflow job runs on every PR. It keeps no
+baseline and compares nothing, so it does not catch timing regressions: use
+`scripts/bench.sh compare` against a saved run for that.
 
 ## Reading the numbers
 
@@ -88,7 +93,15 @@ job runs on every PR.
   loops, except in `certs`, which measures them on purpose.
 - Throughput annotations are criterion's: `Bytes` for payload-shaped work
   (MB/s), `Elements` for count-shaped work.
-- `join/otp` and `join/gss` measure the whole client-side round trip against
-  an in-memory directory; the directory's own work (Kerberos checks simulated
-  with a fixed binding) is included, because that is what the client waits on.
+- `join/otp`, `join/gss` and `rekey/gss` measure kuipa's side of the round
+  trip against an in-memory directory. The directory's Kerberos check is a
+  byte comparison of a fake token, not `gss_accept_sec_context` and a keytab
+  lookup, so the Kerberos round trips are lower bounds on a real enrollment.
   LDAP and a real KDC are not in the loop — see the local CI docs for those.
+- `realm/verify` checks the advertisement's signatures and metadata. The CA
+  certificates it carries are decoded, not parsed as X.509: kuipa hands them
+  to kinit and TLS as they are. `cert/parse` measures the X.509 parse.
+- `escrow/unseal` models every server but the last being unreachable: one
+  recovery request per slot on the client, one server-side recovery.
+- `trust/compute` gives each attested peer its own anchor and proof, so it
+  pays one ML-DSA verification per attested delegation.

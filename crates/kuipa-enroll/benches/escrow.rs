@@ -79,8 +79,11 @@ fn seal(c: &mut Criterion) {
     });
 }
 
-/// Recovering a sealed keytab.  Recovery answers only from the *last*
-/// server, so every slot is tried first: the honest worst case.
+/// Recovering a sealed keytab when every server but the last is
+/// unreachable: the client builds a recovery request (one encapsulation)
+/// for every slot, and only the last server answers, opening its request,
+/// checking the commitment and asking the directory.  Server-side work is
+/// therefore paid once per iteration, client-side work once per slot.
 fn unseal(c: &mut Criterion) {
     let p = profile();
     sweep(c, "escrow/unseal", &fan_out(&p), |g, servers| {
