@@ -19,3 +19,23 @@ tang-pqc.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.8"
+kuipa-perf.workspace = true
+
+[[bench]]
+name = "crypto"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "anchors"
+harness = false
+
+[[bench]]
+name = "escrow"
+harness = false
