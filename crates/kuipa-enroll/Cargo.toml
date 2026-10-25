@@ -12,6 +12,9 @@ categories = ["cryptography"]
 agirru-crdt.workspace = true
 # MTC trees; its OpenSSL backend is native-ossl (and brings PKCS#11 support).
 synta-mtc = { version = "0.5.1", default-features = false, features = ["std", "derive", "openssl"] }
+# Parsing the CA certificates an advertisement carries.
+synta = { version = "0.5.1", default-features = false, features = ["std"] }
+synta-certificate = { version = "0.5.1", default-features = false, features = ["std", "derive"] }
 native-ossl.workspace = true
 serde.workspace = true
 serde_json.workspace = true
