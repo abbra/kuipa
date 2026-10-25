@@ -2143,6 +2143,40 @@ impl EnrollServer {
         request: &EscrowRequest,
         directory: &dyn Directory,
     ) -> Result<Recovered, Refusal> {
+        self.recover_admitted(request, directory, &|_| true)
+    }
+
+    /// Whether `request` is for a machine vault (§7.6.8), whose principal
+    /// is the one that opens it: told from the request alone, before
+    /// anything is decapsulated.
+    #[must_use]
+    pub fn is_machine_request(&self, request: &EscrowRequest) -> bool {
+        self.keys
+            .escrow_key(request.recovery().kid())
+            .and_then(|key| {
+                request
+                    .vault()
+                    .machine_kind(request.principal(), key.public().alg())
+                    .ok()
+            })
+            .is_some_and(|kind| kind.is_some())
+    }
+
+    /// As [`recover`](Self::recover), with `admit` asked once the opener of
+    /// a user vault is known, before anything is counted or released: a
+    /// rate limit per opener, so the members of a shared vault do not
+    /// share its owner's allowance (§7.6.12).
+    ///
+    /// # Errors
+    ///
+    /// As for [`recover`](Self::recover), and a refusal when `admit`
+    /// refuses.
+    pub fn recover_admitted(
+        &self,
+        request: &EscrowRequest,
+        directory: &dyn Directory,
+        admit: &dyn Fn(&Principal) -> bool,
+    ) -> Result<Recovered, Refusal> {
         let recovery = request.recovery();
         let key = self
             .keys
@@ -2164,7 +2198,7 @@ impl EnrollServer {
             .vault()
             .machine_kind(request.principal(), key.public().alg())?
         else {
-            return self.recover_vault(request, opened, directory);
+            return self.recover_vault(request, opened, directory, admit);
         };
         let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
         if !directory
@@ -2248,6 +2282,7 @@ impl EnrollServer {
         request: &EscrowRequest,
         opened: tang_pqc::OpenedRequest<'_>,
         directory: &dyn Directory,
+        admit: &dyn Fn(&Principal) -> bool,
     ) -> Result<Recovered, Refusal> {
         let vault = directory
             .vault_get(request.vault())
@@ -2285,6 +2320,9 @@ impl EnrollServer {
         }
         if directory.principal_locked(&who).map_err(Refusal)? {
             return Err(Refusal::because(format!("{who} is locked or gone")));
+        }
+        if !admit(&who) {
+            return Err(Refusal::because(format!("{who} opens too often")));
         }
         if let Some(level) = factors.device {
             let device = device.ok_or_else(|| Refusal::because("the vault needs a device"))?;

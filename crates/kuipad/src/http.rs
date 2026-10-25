@@ -643,19 +643,36 @@ async fn recover<D: Directory + Send + Sync + 'static>(
         Err(e) => return refused("recover", &e),
     };
     let what = format!("recover {}", request.principal());
-    if let Err(status) = admit(&app, &what, &request.principal().to_string(), &headers) {
+    // A machine vault is opened by its principal, limited before anything
+    // is decapsulated.  A user vault's `P` is its owner, whoever opens it:
+    // only the source is limited first, and the opener once known, so a
+    // shared vault's members each have their own allowance (§7.6.12).
+    let machine = app.server.is_machine_request(&request);
+    let principal = request.principal().to_string();
+    let host = machine.then_some(principal.as_str());
+    if let Err(status) = admit_for(&app, &what, host, &headers) {
         return status.into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
+        let limited = std::cell::Cell::new(false);
+        let admit = |opener: &kuipa_enroll::keytab::Principal| {
+            let ok = app.limiter.check(&opener.to_string(), None).is_ok();
+            limited.set(!ok);
+            ok
+        };
         app.server
-            .recover(&request, &app.directory)
+            .recover_admitted(&request, &app.directory, &admit)
             .map(|r| r.to_bytes())
-            .map_err(|e| e.to_string())
+            .map_err(|e| (e.to_string(), limited.get()))
     })
     .await;
     match result {
         Ok(Ok(body)) => binary(body, "application/vnd.ipa-ku.rec-rsp"),
-        Ok(Err(reason)) => refused(&what, &reason),
+        Ok(Err((reason, true))) => {
+            eprintln!("kuipad: {what}: rate limited ({reason})");
+            StatusCode::TOO_MANY_REQUESTS.into_response()
+        }
+        Ok(Err((reason, false))) => refused(&what, &reason),
         Err(e) => refused(&what, &e),
     }
 }

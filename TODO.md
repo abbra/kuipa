@@ -63,11 +63,11 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] Registered sealing (`sealing = registered`).
   - [x] Shared vaults (§7.6.12): managers and members by user, group,
         host or service, devices held by members, `OWNER/NAME`
-        references, `kuipa seal share`/`unshare`.
+        references, `kuipa seal share`/`unshare`; user-vault releases
+        rate-limited per opener.
   - [ ] Shared vaults, remaining: prune the devices of members who left
         a group in IPA (today they stay registered, refused at every
-        open, until an `unshare`); rate-limit releases per opener rather
-        than by the owner's `P`, which a team now shares.
+        open, until an `unshare`).
   - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
 - [x] Secrets transport (§18): the `keys` operation in `kuipa-enroll`

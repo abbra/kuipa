@@ -7,7 +7,7 @@ token buckets:
 
 | bucket | default | keyed by |
 |---|---|---|
-| per host | a burst of 10, then 2 a minute | the host's name for joins, rekeys and staging; the principal for unseal requests |
+| per host | a burst of 10, then 2 a minute | the host's name for joins, rekeys and staging; the principal for unsealing a host's or service's keytab or file; for opening a user's vault file, whoever opens it (checked once the server knows who, so each member of a shared vault has their own allowance) |
 | per address | a burst of 60, then 30 a minute | the client's address, from httpd's `X-Forwarded-For` |
 
 Registrations and users' vault operations use only the per-address bucket:

@@ -1779,11 +1779,18 @@ digest is that of who shares the vault after the change
 (DESIGN-tlog.md §6); `kuipa tlog watch` flags one that the stored
 descriptor does not show.
 
+**Rate limits.** A machine vault's release is limited (§5.1) by its
+principal before anything is decapsulated, as before. A user vault's `P`
+is its owner whoever opens it, so its releases are limited by source
+first and then by the **opener**, once the server knows who that is and
+before anything is counted or released (`EnrollServer::recover_admitted`;
+kuipad answers `429` as for any other limit). Each member of a shared
+vault has their own `rate_limit.per_host` allowance, and one member's
+opens do not use up the owner's.
+
 What membership does not give: a member sees the vault's descriptor,
 hence its members, devices and policy. Releases are counted per vault
-(`max_unlocks`), not per member, and are rate limited (§5.1) by `P`, so a
-team shares its owner's per-principal allowance; a busy shared vault may
-need a higher `rate_limit.per_host`. A change of membership in IPA (a user
+(`max_unlocks`), not per member. A change of membership in IPA (a user
 leaving a group) takes effect at the next release, but leaves that user's
 devices registered until an `unshare` or a manager removes them.
 
