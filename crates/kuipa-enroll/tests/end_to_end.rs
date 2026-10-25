@@ -33,7 +33,7 @@ use tang_pqc::{
 
 const REALM: &str = "EXAMPLE.TEST";
 const HOST: &str = "web1.example.test";
-const CA: &[u8] = b"IPA CA certificate (DER)";
+const CA: &[u8] = include_bytes!("data/ipa-ca.der");
 
 fn now() -> u64 {
     unix_seconds(SystemTime::now())

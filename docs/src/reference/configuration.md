@@ -12,8 +12,8 @@
 | `principal` | required | the daemon's principal, `ipa-ku/<server>@REALM` |
 | `service` | required | its GSS-API service name, `ipa-ku@<server>` |
 | `keytab` | required | its keytab |
-| `ca_file` | required | the IPA CA chain (PEM) |
-| `pkinit_anchors_file` | `/var/lib/ipa-client/pki/kdc-ca-bundle.pem` | the PKINIT anchors hosts need for armoured `kinit` |
+| `ca_file` | required | the IPA CA chain (PEM): CA certificates only, Merkle Tree CAs included |
+| `pkinit_anchors_file` | `/var/lib/ipa-client/pki/kdc-ca-bundle.pem` | the PKINIT anchors hosts need for armoured `kinit`: CA certificates only |
 | `key_dir` | `/var/lib/ipa/ku` | the key directory |
 | `listen` | `unix:/run/ipa/kuipad.sock` | where to listen when not socket-activated (`unix:/path` or `host:port`) |
 | `peers` | `[]` | servers to exchange anchors with, besides the IPA servers in LDAP |

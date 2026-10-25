@@ -55,9 +55,11 @@ pub struct RealmInfo {
     pub server: String,
     /// The realm's servers (KDCs), for a bootstrap `krb5.conf`.
     pub servers: Vec<String>,
-    /// The IPA CA chain (DER).
+    /// The IPA CA chain (DER), each a CA certificate
+    /// ([`check_ca`](crate::certs::check_ca)).
     pub ca_certs: Vec<Vec<u8>>,
-    /// The PKINIT trust anchors (DER) clients need for anonymous PKINIT.
+    /// The PKINIT trust anchors (DER) clients need for anonymous PKINIT,
+    /// each a CA certificate.
     pub pkinit_anchors: Vec<Vec<u8>>,
     /// Current realm anchors.
     pub anchors: Vec<Thumbprint>,
@@ -240,10 +242,12 @@ impl RealmInfo {
         .expect("serialisable")
     }
 
-    /// Check the names and trusted realms: every name must be safe for
-    /// generated configuration ([`is_safe_name`]), and every trusted realm
-    /// clearly separate — not this realm, not listed twice, with servers,
-    /// and with anchors of its own, none of them this realm's.
+    /// Check the names, certificates and trusted realms: every name must be
+    /// safe for generated configuration ([`is_safe_name`]), every CA
+    /// certificate and PKINIT anchor a CA certificate
+    /// ([`certs::check_ca`](crate::certs::check_ca)), and every trusted
+    /// realm clearly separate — not this realm, not listed twice, with
+    /// servers, and with anchors of its own, none of them this realm's.
     ///
     /// # Errors
     ///
@@ -254,6 +258,9 @@ impl RealmInfo {
             .chain(&self.servers);
         if !names.into_iter().all(|n| is_safe_name(n)) {
             return Err(Error::Malformed("realm info names"));
+        }
+        for cert in self.ca_certs.iter().chain(&self.pkinit_anchors) {
+            crate::certs::check_ca(cert)?;
         }
         for (i, t) in self.trusts.iter().enumerate() {
             t.validate_for(&self.realm, &self.anchors)?;
@@ -897,7 +904,7 @@ pub(crate) mod tests {
             now() + 86400,
         )
         .unwrap();
-        let ca = b"not really a certificate".to_vec();
+        let ca = include_bytes!("../tests/data/ipa-ca.der").to_vec();
         let info = RealmInfo {
             realm: "EXAMPLE.TEST".into(),
             domain: "example.test".into(),
@@ -905,7 +912,7 @@ pub(crate) mod tests {
             server: server.into(),
             servers: vec![server.into()],
             ca_certs: vec![ca.clone()],
-            pkinit_anchors: vec![b"pkinit anchor".to_vec()],
+            pkinit_anchors: vec![include_bytes!("../tests/data/pkinit-ca.der").to_vec()],
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
@@ -1172,7 +1179,10 @@ pub(crate) mod tests {
         assert!(conf.contains("default_realm = EXAMPLE.TEST"));
         assert!(conf.contains("        kdc = ipa1.example.test:88\n"));
         assert!(conf.contains("pkinit_anchors = FILE:/tmp/anchors.pem"));
-        assert_eq!(v.info().pkinit_anchors, vec![b"pkinit anchor".to_vec()]);
+        assert_eq!(
+            v.info().pkinit_anchors,
+            vec![include_bytes!("../tests/data/pkinit-ca.der").to_vec()]
+        );
 
         assert!(matches!(
             VerifiedRealm::verify(
@@ -1228,6 +1238,40 @@ pub(crate) mod tests {
             ),
             Err(Error::Mismatch(_))
         ));
+    }
+
+    #[test]
+    fn advertised_certificates_must_be_ca_certificates() {
+        // What a host would write into ca.crt or its PKINIT anchors: a
+        // blob that is no certificate, and an end-entity certificate.
+        let leaf = synta_certificate::pem_to_der(include_bytes!("../tests/data/mtc-demo-leaf.pem"));
+        for bad in [b"IPA CA (DER)".to_vec(), leaf[0].clone()] {
+            for pkinit in [false, true] {
+                let mut t = test_realm("ipa1.example.test");
+                if pkinit {
+                    t.info.pkinit_anchors.push(bad.clone());
+                } else {
+                    t.info.ca_certs.push(bad.clone());
+                }
+                let anchors = [*t.anchor.public().thumbprint()];
+                assert!(matches!(
+                    VerifiedRealm::verify(
+                        &t.signed(),
+                        "EXAMPLE.TEST",
+                        &anchors,
+                        &Policy::default(),
+                        SystemTime::now()
+                    ),
+                    Err(Error::Malformed(_))
+                ));
+            }
+        }
+
+        // A Merkle Tree CA is one, though it is unsigned.
+        let mut t = test_realm("ipa1.example.test");
+        let mtc = synta_certificate::pem_to_der(include_bytes!("../tests/data/mtc-demo-ca.pem"));
+        t.info.ca_certs.push(mtc[0].clone());
+        assert!(verified(&t).info().ca_certs.contains(&mtc[0]));
     }
 
     #[test]

@@ -27,7 +27,8 @@ use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, unix_seconds};
 
 const REALM: &str = "EXAMPLE.TEST";
 const HOST: &str = "web1.example.test";
-const CA: &[u8] = b"IPA CA (DER)";
+const CA: &[u8] = include_bytes!("data/ipa-ca.der");
+const PKINIT: &[u8] = include_bytes!("data/pkinit-ca.der");
 
 #[derive(Default)]
 struct Dir {
@@ -198,7 +199,7 @@ fn server_keys(anchor: &SigningKey, fqdn: &str) -> (ServerKeys, RealmInfo, Deleg
             server: fqdn.into(),
             servers: vec!["ipa1.example.test".into(), "ipa2.example.test".into()],
             ca_certs: vec![CA.to_vec()],
-            pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+            pkinit_anchors: vec![PKINIT.to_vec()],
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
@@ -1263,7 +1264,7 @@ fn offline_enrollment_from_a_bundle() {
         },
         keytab: Dir::default().keys(HOST),
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads: vec![None],
         epoch_seq: 0,
@@ -1433,7 +1434,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     )));
     let anchors =
         synta_certificate::pem_to_der(&std::fs::read(dir.join("pkinit-anchors.pem")).unwrap());
-    assert_eq!(anchors, vec![b"PKINIT anchor (DER)".to_vec()]);
+    assert_eq!(anchors, vec![PKINIT.to_vec()]);
 
     // A wrong OTP is refused; the right one enrolls.
     let err = flows::enroll_online(
@@ -1971,7 +1972,7 @@ fn trusted_realms_pins_and_uses_the_partners_heads() {
         server: "trustB1.example.test".into(),
         servers: vec!["trustB1.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![b_pin],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -2022,7 +2023,7 @@ fn trust_info_of(anchor: &SigningKey) -> RealmInfo {
         server: "trustA1.example.test".into(),
         servers: vec!["trustA1.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -2229,7 +2230,7 @@ fn mirror_info_of(anchor: &SigningKey) -> RealmInfo {
         server: "mirror1.example.test".into(),
         servers: vec!["mirror1.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -2431,7 +2432,7 @@ fn info_of(anchor: &SigningKey) -> RealmInfo {
         server: "frozen1.example.test".into(),
         servers: vec!["frozen1.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -2519,7 +2520,7 @@ fn claim_log_info_of(anchor: &SigningKey) -> RealmInfo {
         server: "claimlog1.example.test".into(),
         servers: vec!["claimlog1.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -2788,7 +2789,7 @@ fn window_info_of(anchor: &SigningKey) -> RealmInfo {
         server: "window1.example.test".into(),
         servers: vec!["window1.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -2929,7 +2930,7 @@ fn audit_info_of(anchor: &SigningKey) -> RealmInfo {
         server: "audit1.example.test".into(),
         servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -2959,7 +2960,7 @@ fn info_named(server: &str, anchors: &[tang_pqc::Thumbprint]) -> RealmInfo {
         server: server.into(),
         servers: vec![server.into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: anchors.to_vec(),
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -3225,7 +3226,7 @@ fn a_forged_partner_head_is_not_pinned() {
         server: "forgeB1.example.test".into(),
         servers: vec!["forgeB1.example.test".into()],
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![b_pin],
         heads: Vec::new(),
         trusts: Vec::new(),
@@ -3716,7 +3717,7 @@ fn bundle_enroll(
         },
         keytab: Dir::default().keys(HOST),
         ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![b"PKINIT anchor (DER)".to_vec()],
+        pkinit_anchors: vec![PKINIT.to_vec()],
         anchors: vec![*anchor.public().thumbprint()],
         heads,
         epoch_seq: 0,

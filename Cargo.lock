@@ -1014,6 +1014,8 @@ dependencies = [
  "native-ossl",
  "serde",
  "serde_json",
+ "synta",
+ "synta-certificate",
  "synta-mtc",
  "tang-pqc",
 ]
