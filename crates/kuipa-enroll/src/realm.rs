@@ -251,7 +251,8 @@ impl RealmInfo {
     ///
     /// # Errors
     ///
-    /// [`Error::Malformed`].
+    /// [`Error::Malformed`] for names and trusted realms, [`Error::NotCa`]
+    /// for certificates.
     pub fn validate(&self) -> Result<()> {
         let names = [&self.realm, &self.domain, &self.server]
             .into_iter()
@@ -259,8 +260,17 @@ impl RealmInfo {
         if !names.into_iter().all(|n| is_safe_name(n)) {
             return Err(Error::Malformed("realm info names"));
         }
-        for cert in self.ca_certs.iter().chain(&self.pkinit_anchors) {
-            crate::certs::check_ca(cert)?;
+        for (list, certs) in [
+            ("CA certificate", &self.ca_certs),
+            ("PKINIT anchor", &self.pkinit_anchors),
+        ] {
+            for (i, cert) in certs.iter().enumerate() {
+                crate::certs::check_ca(cert).map_err(|what| Error::NotCa {
+                    list,
+                    entry: i + 1,
+                    what,
+                })?;
+            }
         }
         for (i, t) in self.trusts.iter().enumerate() {
             t.validate_for(&self.realm, &self.anchors)?;
@@ -1262,7 +1272,7 @@ pub(crate) mod tests {
                         &Policy::default(),
                         SystemTime::now()
                     ),
-                    Err(Error::Malformed(_))
+                    Err(Error::NotCa { entry: 2, .. })
                 ));
             }
         }

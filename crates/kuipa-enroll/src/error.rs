@@ -38,6 +38,17 @@ pub enum Error {
     Deployment(String),
     /// A vault policy or operation is refused (§7.6).
     Policy(String),
+    /// An advertised CA certificate or PKINIT anchor is not a certificate a
+    /// host may install as a CA: which list, which entry (from 1), and
+    /// what it is instead ([`check_ca`](crate::certs::check_ca)).
+    NotCa {
+        /// `"CA certificate"` or `"PKINIT anchor"`.
+        list: &'static str,
+        /// The entry's place in its list, from 1.
+        entry: usize,
+        /// What it is instead.
+        what: crate::certs::NotCa,
+    },
 }
 
 impl fmt::Display for Error {
@@ -56,6 +67,7 @@ impl fmt::Display for Error {
             Self::Insecure(what) => write!(f, "{what} requires an explicit opt-in"),
             Self::PeerSync(what) => write!(f, "peer sync refused: {what}"),
             Self::Deployment(why) | Self::Policy(why) => f.write_str(why),
+            Self::NotCa { list, entry, what } => write!(f, "{list} {entry} is {what}"),
         }
     }
 }
