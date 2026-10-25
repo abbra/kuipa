@@ -1147,6 +1147,8 @@ fn bindings_open_only_under_what_they_commit_to() {
         req.vault(),
         &VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap()
     );
+    // Opened by its own principal: rate limited by it before decapsulation.
+    assert!(r.servers[0].is_machine_request(req));
 
     // Eve's own principal and machine vault, where the binding is registered.
     let eves = renamed(
@@ -2477,11 +2479,39 @@ fn realm_caps_sharing(c: &Shared) {
     );
 }
 
+/// Releases of a user vault are limited by opener, not by `P`: a member
+/// out of allowance does not stop the owner.
+fn openers_have_their_own_allowance(c: &Shared) {
+    let r = &c.r;
+    let open = |who: &'static str, key: &ExchangeKeyPair| {
+        let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(who, cb));
+        c.sealed.open(
+            Unlock {
+                device: Some(key as &dyn vault::DeviceKey),
+                session: None,
+                ticket: Some(&mut ticket),
+            },
+            |s, req| {
+                let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+                let server = &r.servers[usize::from(s == "ipa2.example.test")];
+                assert!(!server.is_machine_request(&req), "P names the owner");
+                server
+                    .recover_admitted(&req, &r.dir, &|opener| opener.to_string() != BOB)
+                    .ok()
+                    .map(|a| a.to_bytes())
+            },
+        )
+    };
+    assert!(open(BOB, &c.bob_key).is_err());
+    assert!(open(ALICE, &c.alice_key).is_ok());
+}
+
 #[test]
 fn shared_vaults_open_for_their_members_with_their_own_devices() {
     let c = shared_fixture();
     members_not_managers(&c);
     members_open_and_membership(&c);
+    openers_have_their_own_allowance(&c);
     managers_share_and_unshare(&c);
     realm_caps_sharing(&c);
 }
