@@ -407,8 +407,11 @@ impl SignedAdvertisement {
     }
 
     /// Serialise as JWS General JSON.
+    ///
+    /// # Panics
+    ///
+    /// Never: the document holds only strings and plain JSON types.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)] // serialising plain strings cannot fail
     pub fn to_json(&self) -> String {
         serde_json::to_string(&self.jws).expect("JWS serialisation cannot fail")
     }
