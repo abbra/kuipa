@@ -1324,9 +1324,10 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         .ok()
         .map(|b| Keytab::from_mit(&b))
         .transpose()?;
-    let cred = GssClientCred::from_keytab_initiate(
+    let cred = GssClientCred::from_client_keytab(
         keytab_path.to_str().ok_or("non-UTF-8 keytab path")?,
-        &principal.to_string(),
+        Some(&principal.to_string()),
+        None,
     )?;
 
     let (sealer, registrations) = if holder == Holder::None {
@@ -1642,9 +1643,10 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm);
-    let cred = GssClientCred::from_keytab_initiate(
+    let cred = GssClientCred::from_client_keytab(
         paths.keytab().to_str().ok_or("non-UTF-8 keytab path")?,
-        &principal.to_string(),
+        Some(&principal.to_string()),
+        None,
     )?;
     let extra = fetch.to_bytes()?;
     let (answer, _) = exchange_with(
@@ -1746,9 +1748,10 @@ fn register(
     let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
-    let cred = GssClientCred::from_keytab_initiate(
+    let cred = GssClientCred::from_client_keytab(
         keytab.to_str().ok_or("non-UTF-8 keytab path")?,
-        &params.principal.to_string(),
+        Some(&params.principal.to_string()),
+        None,
     )?;
     let extra = params.to_bytes()?;
     tracing::debug!(
@@ -2137,7 +2140,9 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         .to_str()
         .ok_or("non-UTF-8 keytab path")
         .map_err(Error::from)
-        .and_then(|p| GssClientCred::from_keytab_initiate(p, &principal).map_err(Error::from));
+        .and_then(|p| {
+            GssClientCred::from_client_keytab(p, Some(&principal), None).map_err(Error::from)
+        });
     if let Err(e) = &kinit {
         problems.push(format!(
             "cannot get a ticket with the host keys ({e}): run `kuipa rotate-keys` or re-enroll"

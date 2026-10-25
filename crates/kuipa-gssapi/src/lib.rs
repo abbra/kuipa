@@ -784,68 +784,126 @@ impl GssClientCred {
         Ok(GssClientCred { raw: cred_handle })
     }
 
-    /// Acquire an initiator credential from the keytab at `keytab_file`.
+    /// Acquire an initiator credential from the client keytab `keytab_file`,
+    /// for `principal` or else the keytab's default client principal (its
+    /// first entry's), which [`Self::principal_name`] then names.  Its
+    /// tickets go into the ccache `ccache`, or a private in-process one.
     ///
-    /// Under MIT Kerberos this passes `desired_name = NULL` so the library
-    /// selects from the keytab whichever credential can obtain a service ticket
-    /// for the requested target, using `gss_acquire_cred_from()` (RFC 5587)
-    /// with `GSS_C_INITIATE`.  The keytab is consulted lazily: no TGT is
-    /// acquired until the credential is first used.
+    /// Under MIT Kerberos this is `gss_acquire_cred_from()` (RFC 5587) with
+    /// `{"client_keytab": path, "ccache": name}` and `GSS_C_INITIATE`: the
+    /// library gets a TGT from the keytab when the credential is first used,
+    /// and again when it nears its end, and this process never opens the
+    /// keytab itself, so with gssproxy active (`GSS_USE_PROXY`) gssproxy reads
+    /// it and the process needs no access to the file.  Naming the ccache
+    /// keeps a ticket of someone else's in the default ccache from being
+    /// taken for the keytab's principal; a long-running process should name
+    /// one it reuses, since every private ccache stays in memory.
     ///
-    /// Heimdal has no credential store and no lazy keytab initiator, so this
-    /// reads the *first* entry of the keytab, obtains a TGT for that principal
-    /// now, stores it in a private in-process ccache, and imports that ccache
-    /// as an INITIATE credential.  Which principal that is therefore depends on
-    /// the keytab's entry order, and concurrent calls share one ccache name —
-    /// pass an explicit principal with
-    /// [`Self::from_keytab_initiate_named`] when the choice matters.
+    /// Heimdal has no credential store: there the keytab must be readable,
+    /// and the principal's TGT is obtained now into the ccache.
     ///
     /// # Errors
     ///
-    /// - [`GssError::NulInKeytabPath`] — `keytab_file` contains a NUL byte.
-    /// - [`GssError::KeytabNotReadable`] — keytab file cannot be opened.
+    /// - [`GssError::NulInKeytabPath`], [`GssError::NulInUserPrincipal`],
+    ///   [`GssError::NulInCcacheName`] — an argument contains a NUL byte.
+    /// - [`GssError::ImportName`] — `principal` is not a principal name.
     /// - [`GssError::Krb5`] — Heimdal could not read the keytab or obtain the
     ///   TGT.
-    /// - [`GssError::AcquireCred`] — credential acquisition failed (keytab
-    ///   missing, no usable credential, or Kerberos library error).
-    pub fn from_keytab(keytab_file: &str) -> Result<Self, GssError> {
+    /// - [`GssError::AcquireCred`] — credential acquisition failed.
+    pub fn from_client_keytab(
+        keytab_file: &str,
+        principal: Option<&str>,
+        ccache: Option<&str>,
+    ) -> Result<Self, GssError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let kt_cstr = CString::new(keytab_file).map_err(|_| GssError::NulInKeytabPath)?;
-
-        std::fs::File::open(keytab_file).map_err(|e| GssError::KeytabNotReadable {
-            path: keytab_file.to_owned(),
-            source: e,
-        })?;
-
+        let principal = principal
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| GssError::NulInUserPrincipal)?;
+        let ccache = match ccache {
+            Some(name) => CString::new(name).map_err(|_| GssError::NulInCcacheName)?,
+            None => CString::new(format!(
+                "MEMORY:kuipa-client-keytab-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .expect("no NUL in a generated name"),
+        };
         #[cfg(mit_kerberos)]
-        return Self::from_keytab_mit(&kt_cstr);
+        return Self::from_store_mit(
+            &[(c"client_keytab", &kt_cstr), (c"ccache", &ccache)],
+            principal.as_deref(),
+        );
         #[cfg(heimdal_kerberos)]
-        return Self::from_keytab_heimdal(&kt_cstr);
+        {
+            let principal = match principal {
+                Some(p) => p,
+                None => keytab_first_principal(&kt_cstr)?,
+            };
+            tgt_into_ccache(&kt_cstr, &principal, &ccache)?;
+            Ok(GssClientCred {
+                raw: acquire_initiator_from_ccache(&ccache)?,
+            })
+        }
     }
 
+    /// An initiator credential from the credential store `store`, as
+    /// `(key, value)` pairs, for the Kerberos principal `name` or, without
+    /// one, whichever the store's default is.
     #[cfg(mit_kerberos)]
-    fn from_keytab_mit(kt_cstr: &CStr) -> Result<Self, GssError> {
+    fn from_store_mit(store: &[(&CStr, &CStr)], name: Option<&CStr>) -> Result<Self, GssError> {
         let mut minor: ffi::OmUint32 = 0;
-        let key_keytab = c"keytab";
-        let mut element = ffi::GssKeyValueElementDesc {
-            key: key_keytab.as_ptr(),
-            value: kt_cstr.as_ptr(),
-        };
+        let mut desired: ffi::GssNameT = ptr::null_mut();
+        if let Some(name) = name {
+            let buf = ffi::GssBufferDesc {
+                length: name.to_bytes().len(),
+                value: name.as_ptr() as *mut std::ffi::c_void,
+            };
+            let oid = ffi::gss_krb5_nt_principal_name();
+            // SAFETY: buf wraps a live CStr, oid is a well-formed OID
+            // descriptor, desired is a valid output pointer.
+            let major = unsafe {
+                ffi::gss_import_name(
+                    &raw mut minor,
+                    &raw const buf,
+                    &raw const oid,
+                    &raw mut desired,
+                )
+            };
+            if major != ffi::GSS_S_COMPLETE {
+                let detail = format_gss_status(major, minor);
+                return Err(GssError::ImportName {
+                    detail,
+                    major,
+                    minor,
+                });
+            }
+        }
+        let mut elements: Vec<ffi::GssKeyValueElementDesc> = store
+            .iter()
+            .map(|(key, value)| ffi::GssKeyValueElementDesc {
+                key: key.as_ptr(),
+                value: value.as_ptr(),
+            })
+            .collect();
         let cred_store = ffi::GssKeyValueSetDesc {
-            count: 1,
-            elements: &raw mut element,
+            count: u32::try_from(elements.len()).expect("a few store elements"),
+            elements: elements.as_mut_ptr(),
         };
 
         let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
         let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
         let mut time_rec: ffi::OmUint32 = 0;
 
-        // SAFETY: all arguments are valid; desired_name=NULL lets the library
-        // choose the credential; output pointers are valid locals.
+        // SAFETY: all arguments are valid; desired is a name imported above
+        // or NULL, which lets the library choose; output pointers are valid
+        // locals.
         let major = unsafe {
             ffi::gss_acquire_cred_from(
                 &raw mut minor,
-                ptr::null_mut(), // desired_name = NULL
-                0,               // GSS_C_INDEFINITE
+                desired,
+                0, // GSS_C_INDEFINITE
                 ffi::GSS_C_NO_OID_SET,
                 ffi::GSS_C_INITIATE,
                 &raw const cred_store,
@@ -856,6 +914,10 @@ impl GssClientCred {
         };
 
         let error_minor = minor;
+        if !desired.is_null() {
+            // SAFETY: desired was imported above and is released once.
+            unsafe { ffi::gss_release_name(&raw mut minor, &raw mut desired) };
+        }
 
         // SAFETY: actual_mechs is non-null when set by gss_acquire_cred_from.
         unsafe {
@@ -870,7 +932,7 @@ impl GssClientCred {
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
             let detail = format_gss_status(major, error_minor);
-            tracing::warn!(keytab = %kt_cstr.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (keytab) failed");
+            tracing::warn!(store = ?store, major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (keytab) failed");
             return Err(GssError::AcquireCred {
                 detail,
                 major,
@@ -878,24 +940,6 @@ impl GssClientCred {
             });
         }
 
-        Ok(GssClientCred { raw: cred_handle })
-    }
-
-    /// The Heimdal path: name the principal from the keytab's first entry, get
-    /// its TGT into a private in-process ccache, and import that ccache.
-    #[cfg(heimdal_kerberos)]
-    fn from_keytab_heimdal(kt_cstr: &CStr) -> Result<Self, GssError> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let ccache_name = CString::new(format!(
-            "MEMORY:kuipa-keytab-initiator-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
-        .expect("no NUL in a generated name");
-
-        let principal = keytab_first_principal(kt_cstr)?;
-        tgt_into_ccache(kt_cstr, &principal, &ccache_name)?;
-        let cred_handle = acquire_initiator_from_ccache(&ccache_name)?;
         Ok(GssClientCred { raw: cred_handle })
     }
 
@@ -1124,85 +1168,10 @@ impl GssClientCred {
         }
     }
 
-    /// Acquire an initiator credential by getting a TGT from `keytab_file` for
-    /// `principal` (equivalent to `kinit -k -t keytab principal`).
-    ///
-    /// Uses `krb5_get_init_creds_keytab` to obtain a TGT, stores it in the
-    /// in-process ccache `MEMORY:kuipa-initiator`, then acquires a GSSAPI
-    /// initiator credential from that ccache.  The resulting credential can be
-    /// passed to [`GssClientCred::impersonate`] for S4U2Self LDAP binds.
-    ///
-    /// **Single-use ccache constraint**: this function writes to a fixed in-process
-    /// `MEMORY:kuipa-initiator` ccache.  Calling it concurrently from multiple
-    /// threads will race on that ccache.  The intended usage pattern is a single
-    /// call at startup (inside a `spawn_blocking` task) followed by reuse of the
-    /// returned credential handle.  For per-call ccache isolation use
-    /// [`GssClientCred::from_keytab_initiate_named`] instead.
-    ///
-    /// The TGT is valid for the lifetime configured by the KDC (typically 24 h).
-    /// Restart ahdapa to renew it.
-    ///
-    /// # Errors
-    ///
-    /// - [`GssError::NulInKeytabPath`] — `keytab_file` contains a NUL byte.
-    /// - [`GssError::NulInUserPrincipal`] — `principal` contains a NUL byte.
-    /// - [`GssError::KeytabNotReadable`] — keytab file cannot be opened.
-    /// - [`GssError::Krb5`] — libkrb5 TGT acquisition failed.
-    /// - [`GssError::AcquireCred`] — GSSAPI credential acquisition from ccache failed.
-    pub fn from_keytab_initiate(keytab_file: &str, principal: &str) -> Result<Self, GssError> {
-        let kt_cstr = CString::new(keytab_file).map_err(|_| GssError::NulInKeytabPath)?;
-        let principal_cstr = CString::new(principal).map_err(|_| GssError::NulInUserPrincipal)?;
-
-        std::fs::File::open(keytab_file).map_err(|e| GssError::KeytabNotReadable {
-            path: keytab_file.to_owned(),
-            source: e,
-        })?;
-
-        tgt_into_ccache(&kt_cstr, &principal_cstr, DEFAULT_INITIATOR_CCACHE)?;
-        let cred_handle = acquire_initiator_from_ccache(DEFAULT_INITIATOR_CCACHE)?;
-
-        Ok(GssClientCred { raw: cred_handle })
-    }
-
-    /// Like [`from_keytab_initiate`][Self::from_keytab_initiate] but stores the
-    /// TGT into a caller-named ccache instead of the default
-    /// `MEMORY:kuipa-initiator`.
-    ///
-    /// This is useful when multiple proxy threads need isolated credential
-    /// stores (e.g. `MEMORY:kuipa-proxy-initiator`).
-    ///
-    /// # Errors
-    ///
-    /// - [`GssError::NulInKeytabPath`] — `keytab_file` contains a NUL byte.
-    /// - [`GssError::NulInCcacheName`] — `ccache_name` contains a NUL byte.
-    /// - [`GssError::NulInUserPrincipal`] — `principal` contains a NUL byte.
-    /// - [`GssError::KeytabNotReadable`] — keytab file cannot be opened.
-    /// - [`GssError::Krb5`] — libkrb5 TGT acquisition failed.
-    /// - [`GssError::AcquireCred`] — GSSAPI credential acquisition from ccache failed.
-    pub fn from_keytab_initiate_named(
-        keytab_file: &str,
-        principal: &str,
-        ccache_name: &str,
-    ) -> Result<Self, GssError> {
-        let kt_cstr = CString::new(keytab_file).map_err(|_| GssError::NulInKeytabPath)?;
-        let principal_cstr = CString::new(principal).map_err(|_| GssError::NulInUserPrincipal)?;
-        let ccache_cstr = CString::new(ccache_name).map_err(|_| GssError::NulInCcacheName)?;
-
-        std::fs::File::open(keytab_file).map_err(|e| GssError::KeytabNotReadable {
-            path: keytab_file.to_owned(),
-            source: e,
-        })?;
-
-        tgt_into_ccache(&kt_cstr, &principal_cstr, &ccache_cstr)?;
-        let cred_handle = acquire_initiator_from_ccache(&ccache_cstr)?;
-
-        Ok(GssClientCred { raw: cred_handle })
-    }
-
     /// Acquire a delegated credential that acts as `user_principal` (S4U2Self).
     ///
     /// `initiator` must be an initiator credential obtained from the HTTP service
-    /// keytab (e.g. via [`GssClientCred::from_keytab`]).  MIT Kerberos uses the
+    /// keytab (e.g. via [`GssClientCred::from_client_keytab`]).  MIT Kerberos uses the
     /// keytab to authenticate as the service and then issues a service-for-user
     /// (S4U2Self) ticket.
     ///
@@ -1626,22 +1595,18 @@ impl GssClientCred {
     }
 }
 
-/// The in-process ccache [`GssClientCred::from_keytab_initiate`] stores its TGT in.
-const DEFAULT_INITIATOR_CCACHE: &CStr = c"MEMORY:kuipa-initiator";
-
 /// Get a TGT from `kt` for `principal` and store it in the `MEMORY:` ccache
 /// named `ccache_name`.  Takes borrowed C strings so that either an owned
 /// [`CString`] or a static [`CStr`] name works on both vendors.
 ///
-/// Shared by [`GssClientCred::from_keytab_initiate`] and
-/// [`GssClientCred::from_keytab_initiate_named`], which differ only in the
-/// ccache name and in how they turn the stored TGT into a GSSAPI initiator
-/// credential.
+/// Heimdal's stand-in for MIT's `client_keytab`: it has no credential store
+/// (see [`GssClientCred::from_client_keytab`]).
 ///
 /// # Errors
 ///
 /// - [`GssError::Krb5`] — the context, principal, keytab, ccache, TGT or
 ///   store step failed.
+#[cfg(heimdal_kerberos)]
 fn tgt_into_ccache(kt: &CStr, principal: &CStr, ccache_name: &CStr) -> Result<(), GssError> {
     // SAFETY: each pointer is initialised before use; on error we clean up in
     // reverse-acquisition order (no double-free, no leak).
@@ -1863,69 +1828,6 @@ fn keytab_first_principal(kt: &CStr) -> Result<CString, GssError> {
         ffi::krb5_free_context(ctx);
         Ok(principal)
     }
-}
-
-#[cfg(mit_kerberos)]
-/// Acquire a Kerberos initiator credential from the `MEMORY:`/`FILE:` ccache
-/// named `ccache_name`, via MIT's `gss_acquire_cred_from` credential store.
-///
-/// # Errors
-///
-/// - [`GssError::AcquireCred`] — acquisition failed.
-fn acquire_initiator_from_ccache(ccache_name: &CStr) -> Result<ffi::GssCredIdT, GssError> {
-    let key_ccache = c"ccache";
-    let mut element = ffi::GssKeyValueElementDesc {
-        key: key_ccache.as_ptr(),
-        value: ccache_name.as_ptr(),
-    };
-    let cred_store = ffi::GssKeyValueSetDesc {
-        count: 1,
-        elements: &raw mut element,
-    };
-
-    let mut minor: ffi::OmUint32 = 0;
-    let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
-    let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
-    let mut time_rec: ffi::OmUint32 = 0;
-
-    // SAFETY: cred_store elements point to live C strings; output pointers are
-    // valid stack locals.
-    let major = unsafe {
-        ffi::gss_acquire_cred_from(
-            &raw mut minor,
-            ptr::null_mut(), // desired_name = GSS_C_NO_NAME
-            0,               // GSS_C_INDEFINITE
-            ffi::GSS_C_NO_OID_SET,
-            ffi::GSS_C_INITIATE,
-            &raw const cred_store,
-            &raw mut cred_handle,
-            &raw mut actual_mechs,
-            &raw mut time_rec,
-        )
-    };
-
-    let error_minor = minor;
-    // SAFETY: actual_mechs is non-null only when set by gss_acquire_cred_from.
-    unsafe {
-        if !actual_mechs.is_null() {
-            ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs);
-        }
-    }
-
-    if major != ffi::GSS_S_COMPLETE {
-        if !cred_handle.is_null() {
-            // SAFETY: set by gss_acquire_cred_from.
-            unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
-        }
-        let detail = format_gss_status(major, error_minor);
-        tracing::warn!(ccache = %ccache_name.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (initiator ccache) failed");
-        return Err(GssError::AcquireCred {
-            detail,
-            major,
-            minor: error_minor,
-        });
-    }
-    Ok(cred_handle)
 }
 
 #[cfg(heimdal_kerberos)]
@@ -2859,7 +2761,7 @@ mod tests {
 
     #[test]
     fn from_keytab_nul_in_path_returns_error() {
-        let err = GssClientCred::from_keytab("/tmp/\0bad.keytab").unwrap_err();
+        let err = GssClientCred::from_client_keytab("/tmp/\0bad.keytab", None, None).unwrap_err();
         assert!(matches!(err, GssError::NulInKeytabPath));
     }
 

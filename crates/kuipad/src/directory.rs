@@ -206,10 +206,12 @@ impl LdapDirectory {
             .initiator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cred = GssClientCred::from_keytab_initiate_named(
+        // One named ccache, reused: MIT keeps its TGT there and renews it
+        // from the keytab.
+        let cred = GssClientCred::from_client_keytab(
             &self.cfg.keytab,
-            &self.cfg.principal,
-            "MEMORY:kuipad-service",
+            Some(&self.cfg.principal),
+            Some("MEMORY:kuipad-service"),
         )?;
         let mut conn = self.connect()?;
         conn.bind_with_s4u_cred(&cred)?;
