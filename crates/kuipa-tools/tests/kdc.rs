@@ -361,7 +361,11 @@ fn start_ipa_server(
                     burst: 1000.0,
                     per_minute: 1000.0,
                 },
-                ..kuipad::limit::Limits::default()
+                // Every request comes from 127.0.0.1.
+                per_source: kuipad::limit::Rate {
+                    burst: 1000.0,
+                    per_minute: 1000.0,
+                },
             }),
             tang: None,
             keys: None,
@@ -1218,6 +1222,112 @@ fn escrows(world: &Scenario, alice: &Alice) {
     );
 }
 
+fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let directory = &world.directory;
+    let a = &world.web1;
+    // ── A lost device's key, back through the helpdesk (DESIGN-recovery.md
+    // §4): Carol's escrow vault takes users' device keys, and Bob approves
+    // each release from it. ──
+    let carol_cc = format!("FILE:{}", realm.dir.join("carol.ccache").display());
+    let carol_home = UserPaths::new(realm.dir.join("carol-helpdesk"));
+    let carol = Seal::new(a, &carol_home, Some(&carol_cc));
+    let escrow = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        approvals: Some(vault::Approvals {
+            m: 1,
+            from: vault::Members {
+                users: vec!["bob".into()],
+                ..vault::Members::default()
+            },
+            window: None,
+            uses: None,
+        }),
+        ..vault::Policy::default()
+    };
+    carol.create("escrow", escrow).unwrap();
+    carol.add_device("escrow", b"carol pass").unwrap();
+    let alice_only = vault::Members {
+        users: vec!["alice".into()],
+        ..vault::Members::default()
+    };
+    carol
+        .share(
+            "escrow",
+            [
+                vault::Members::default(),
+                vault::Members::default(),
+                alice_only,
+            ],
+        )
+        .unwrap();
+    *directory.recovery.lock().unwrap() = Some(vault::RecoverySettings {
+        device_vault: "carol/escrow".into(),
+        required: true,
+    });
+
+    // Alice's laptop registers its device: its key is deposited first.
+    let old_home = UserPaths::new(realm.dir.join("alice-old-desk"));
+    let old = Seal::new(a, &old_home, Some(&alice.cc));
+    let pins = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    old.create("pins", pins).unwrap();
+    old.add_device("pins", b"old pass").unwrap();
+    let note = old.seal("pins", b"door=4711").unwrap();
+    let deposits = carol.deposits("escrow").unwrap();
+    let deposit = deposits["deposits"][0]["id"].as_str().unwrap().to_owned();
+
+    // On a new one she registers a device and tells the helpdesk which.
+    let new_home = UserPaths::new(realm.dir.join("alice-new-desk"));
+    let new = Seal::new(a, &new_home, Some(&alice.cc));
+    new.add_device("pins", b"new pass").unwrap();
+    let shown = new.recover_helpdesk(b"new pass").unwrap();
+    let device = shown["helpdesk_device"].as_str().unwrap().to_owned();
+    // Carol asks for the deposit's release, Bob approves, Carol delivers.
+    let sealed = carol.deposit_file("escrow", &deposit).unwrap();
+    let asked = carol
+        .request("escrow", &sealed, "INC-9: alice lost her desk")
+        .unwrap();
+    let rq = asked["requests"][0]["id"].as_str().unwrap().to_owned();
+    let bob_home = UserPaths::new(realm.dir.join("bob-helpdesk"));
+    Seal::new(a, &bob_home, Some(&alice.bob_cc))
+        .decide("carol/escrow", &rq, false)
+        .unwrap();
+    let pass: &[u8] = b"carol pass";
+    carol
+        .deliver(
+            &deposit,
+            ("alice@EXAMPLE.TEST", &device),
+            Some(pass),
+            Some(&rq),
+        )
+        .unwrap();
+    // Alice fetches it on the new desk and opens her old note there.
+    new.recover_fetch(b"new pass").unwrap();
+    assert_eq!(
+        new.open(&note, Some(b"new pass")).unwrap().as_ref(),
+        b"door=4711"
+    );
+    let (_, again) = new
+        .recover_finish(b"new pass", std::slice::from_ref(&note), true)
+        .unwrap();
+    assert_eq!(
+        new.open(&again[0], Some(b"new pass")).unwrap().as_ref(),
+        b"door=4711"
+    );
+    *directory.recovery.lock().unwrap() = None;
+}
+
 fn token_device(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
@@ -1663,6 +1773,7 @@ fn against_a_real_kdc() {
     lost_laptop(&world, &alice);
     deposits(&world, &alice);
     escrows(&world, &alice);
+    helpdesk_recovery(&world, &alice);
     token_device(&world, &alice);
     unprotect_host(&world);
     admin_ticket(&world);

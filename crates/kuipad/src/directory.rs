@@ -38,7 +38,8 @@ use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
 use kuipa_enroll::vault::{
-    Approval, Deposit, Device, DeviceEscrow, Limits, Members, ReleaseRequest, State, Vault,
+    Approval, Deposit, Device, DeviceEscrow, Limits, Members, RecoverySettings, ReleaseRequest,
+    State, Vault,
 };
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
@@ -99,6 +100,9 @@ const RELEASE_USES_ATTR: &str = "ipaKUReleaseUses";
 /// Device keys kept for recovery on their holder's own entry, one JSON
 /// value per device (`DESIGN-recovery.md` §2).
 const DEVICE_ESCROW_ATTR: &str = "ipaKUDeviceEscrow";
+/// The realm's device-key recovery settings, JSON, on
+/// `cn=recovery,cn=kuipa,cn=etc` (`DESIGN-recovery.md` §4).
+const RECOVERY_ATTR: &str = "ipaKURecovery";
 /// Every attribute a vault is read from.
 const VAULT_ATTRS: &[&str] = &[
     VAULT_OWNER_ATTR,
@@ -911,6 +915,10 @@ impl Directory for LdapDirectory {
         Ok(self
             .realm_setting("vault-limits", VAULT_LIMITS_ATTR)?
             .unwrap_or_default())
+    }
+
+    fn recovery_settings(&self) -> Result<Option<RecoverySettings>, DirectoryError> {
+        self.realm_setting("recovery", RECOVERY_ATTR)
     }
 
     fn sign_policy(&self) -> Result<kuipa_enroll::sign::SignPolicy, DirectoryError> {

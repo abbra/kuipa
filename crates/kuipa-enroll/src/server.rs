@@ -28,8 +28,8 @@ use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEve
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
     Approval, DEFAULT_EPOCH, Deposit, Descriptor, DeviceEscrow, Limits, Members, Recovered,
-    ReleaseRequest, ReleasedKeys, Reply, Role, SessionFor, SessionKey, SessionToken, State, Vault,
-    VaultAnswer, VaultOp,
+    RecoverySettings, ReleaseRequest, ReleasedKeys, Reply, Role, SessionFor, SessionKey,
+    SessionToken, State, Vault, VaultAnswer, VaultOp,
 };
 use crate::voucher::Voucher;
 
@@ -397,6 +397,16 @@ pub trait Directory {
         Ok(Vec::new())
     }
 
+    /// The realm's device-key recovery settings (`DESIGN-recovery.md` §4),
+    /// if it has any.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn recovery_settings(&self) -> Result<Option<RecoverySettings>, DirectoryError> {
+        Ok(None)
+    }
+
     /// Store a new deposit (`DESIGN-recovery.md` §3).
     ///
     /// # Errors
@@ -703,6 +713,9 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn deposit_add(&self, deposit: &Deposit) -> Result<(), DirectoryError> {
         (**self).deposit_add(deposit)
+    }
+    fn recovery_settings(&self) -> Result<Option<RecoverySettings>, DirectoryError> {
+        (**self).recovery_settings()
     }
     fn deposits(&self, id: &escrow::VaultId) -> Result<Vec<Deposit>, DirectoryError> {
         (**self).deposits(id)
@@ -1616,7 +1629,10 @@ impl EnrollServer {
             | VaultOp::Deposit { .. }
             | VaultOp::Deposits { .. }
             | VaultOp::FetchDeposit { .. }
-            | VaultOp::RetireDeposit { .. }) => {
+            | VaultOp::RetireDeposit { .. }
+            | VaultOp::RecoverySettings
+            | VaultOp::DeviceKey { .. }
+            | VaultOp::Deliver { .. }) => {
                 side = self.side_op(&caller, op, now, directory)?;
                 (Vec::new(), None, None)
             }
@@ -2335,6 +2351,9 @@ impl EnrollServer {
                     ..Reply::default()
                 }
             }
+            op @ (VaultOp::RecoverySettings
+            | VaultOp::DeviceKey { .. }
+            | VaultOp::Deliver { .. }) => self.recovery_op(caller, op, now, directory)?,
             op @ (VaultOp::EscrowCode { .. } | VaultOp::RecoverCode) => {
                 let (escrows, receipts) = self.escrow_op(caller, op, now, directory)?;
                 Reply {
@@ -2351,6 +2370,94 @@ impl EnrollServer {
                     ..Reply::default()
                 }
             }
+        })
+    }
+
+    /// Answer the recovery operations (`DESIGN-recovery.md` §4): the
+    /// realm's settings, a user's device's public key, and a delivery to
+    /// it.  The last two are for members of the realm's device vault: the
+    /// helpdesk.
+    fn recovery_op(
+        &self,
+        caller: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Reply, Refusal> {
+        let settings = directory.recovery_settings().map_err(Refusal)?;
+        let (user, device) = match &op {
+            VaultOp::RecoverySettings => {
+                return Ok(Reply {
+                    recovery: settings,
+                    ..Reply::default()
+                });
+            }
+            VaultOp::DeviceKey { user, device } | VaultOp::Deliver { user, device, .. } => {
+                // A bare name is a user of this realm, as a vault's owner is.
+                let user: Principal = if user.contains('@') {
+                    user.parse()?
+                } else {
+                    format!("{user}@{}", self.info.realm).parse()?
+                };
+                (user, device.clone())
+            }
+            _ => unreachable!("only recovery operations"),
+        };
+        let settings =
+            settings.ok_or_else(|| Refusal::because("the realm has no device recovery"))?;
+        let helpdesk = self.find_vault(caller, &settings.device_vault, directory)?;
+        if !helpdesk.opens(caller, &groups_for(&helpdesk, caller, directory)?) {
+            return Err(Refusal::because(
+                "only the realm's helpdesk delivers device keys",
+            ));
+        }
+        let me = user.to_string();
+        let vaults: Vec<Vault> = list_vaults(&user, directory)?
+            .into_iter()
+            .filter(|v| {
+                v.devices
+                    .iter()
+                    .any(|d| d.id == device && v.holder(d) == me)
+            })
+            .collect();
+        let registered = vaults
+            .iter()
+            .flat_map(|v| v.devices.iter())
+            .find(|d| d.id == device)
+            .cloned()
+            .ok_or_else(|| Refusal::because(format!("{user} has registered no device {device}")))?;
+        let VaultOp::Deliver { blob, .. } = op else {
+            return Ok(Reply {
+                devices: vec![registered.held_by(&me)],
+                ..Reply::default()
+            });
+        };
+        let bytes = tang_pqc::b64::decode(&blob).map_err(Error::from)?;
+        if !bytes.starts_with(b"IPDD") || bytes.len() > crate::vault::MAX_ESCROW_BLOB {
+            return Err(Refusal::because("not a device delivery"));
+        }
+        let mut receipts = Vec::new();
+        for v in &vaults {
+            let zero = merkle::Hash::zero(self.tree_hash());
+            receipts.extend(self.record_vault(&v.id, VaultAction::Deliver, Some(&device), zero)?);
+        }
+        let escrow = DeviceEscrow {
+            device,
+            kind: "delivery".into(),
+            blob,
+            added: now,
+        };
+        directory
+            .device_escrow_set(&user, &escrow)
+            .map_err(Refusal)?;
+        eprintln!(
+            "kuipad: {caller} delivered a recovered key to {user}'s device {}",
+            escrow.device
+        );
+        Ok(Reply {
+            receipts,
+            escrows: vec![escrow],
+            ..Reply::default()
         })
     }
 
@@ -2722,11 +2829,53 @@ impl EnrollServer {
         .map_err(Error::from)?;
         // No attestation is verified yet: every device is `any`.
         let device = crate::vault::Device::new(&public, &label, kind, now).held_by(&me);
+        self.check_device_deposit(caller, &device, directory)?;
         if vault.devices.iter().any(|d| d.id == device.id) {
             return Err(Refusal::because("device already registered"));
         }
         vault.devices.push(device);
         Ok(vault)
+    }
+
+    /// With `required` recovery, refuse an extractable device whose key
+    /// its holder has not deposited in the realm's device vault
+    /// (`DESIGN-recovery.md` §4).  The deposit's existence is checked, not
+    /// its contents: a holder who deposits something else loses only their
+    /// own recovery.
+    fn check_device_deposit(
+        &self,
+        caller: &Principal,
+        device: &crate::vault::Device,
+        directory: &dyn Directory,
+    ) -> Result<(), Refusal> {
+        let Some(settings) = directory.recovery_settings().map_err(Refusal)? else {
+            return Ok(());
+        };
+        let extractable = matches!(
+            device.kind,
+            crate::vault::DeviceType::File | crate::vault::DeviceType::Pkcs11Wrapped
+        );
+        if !settings.required || !extractable {
+            return Ok(());
+        }
+        let helpdesk = self.find_vault(caller, &settings.device_vault, directory)?;
+        let me = caller.to_string();
+        let deposited = directory
+            .deposits(&helpdesk.id)
+            .map_err(Refusal)?
+            .iter()
+            .any(|d| {
+                d.kind == crate::vault::DepositKind::Device
+                    && d.depositor == me
+                    && d.subject.get("device") == Some(&device.id)
+            });
+        if deposited {
+            Ok(())
+        } else {
+            Err(Refusal::because(
+                "the realm requires the device's key deposited for recovery first",
+            ))
+        }
     }
 
     fn apply_vault_op(
@@ -2749,7 +2898,10 @@ impl EnrollServer {
             | VaultOp::Deposit { .. }
             | VaultOp::Deposits { .. }
             | VaultOp::FetchDeposit { .. }
-            | VaultOp::RetireDeposit { .. } => unreachable!("answered by vault_op"),
+            | VaultOp::RetireDeposit { .. }
+            | VaultOp::RecoverySettings
+            | VaultOp::DeviceKey { .. }
+            | VaultOp::Deliver { .. } => unreachable!("answered by vault_op"),
             VaultOp::Create { name, policy } => {
                 return Self::create_vault(caller, name, policy, now, directory, record);
             }
@@ -3176,7 +3328,10 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
         | VaultOp::Deposit { .. }
         | VaultOp::Deposits { .. }
         | VaultOp::FetchDeposit { .. }
-        | VaultOp::RetireDeposit { .. } => return None,
+        | VaultOp::RetireDeposit { .. }
+        | VaultOp::RecoverySettings
+        | VaultOp::DeviceKey { .. }
+        | VaultOp::Deliver { .. } => return None,
     })
 }
 

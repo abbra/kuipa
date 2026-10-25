@@ -147,7 +147,8 @@ design first.
   - [x] `kuipa escrow luks`, `kuipa escrow file` for hosts, and services
         or users by their keytabs; **not yet run** against a real LUKS
         volume.
-  - [ ] Device-key deposits in a helpdesk vault, and their delivery.
+  - [x] Device-key deposits in a helpdesk vault, and their delivery
+        (`kuipa seal recover helpdesk|deliver|fetch`).
 - [x] M-of-N approvals for break-glass releases, recorded in the
       transparency log (`docs/DESIGN-approvals.md`).
 - [ ] Short-lived CI runner identities (voucher leases, `ticket.leased`)
@@ -177,7 +178,8 @@ design first.
       `ipaKUReleaseApproval`, `ipaKUReleaseDenied`, `ipaKUReleaseUses`),
       `ipaKUDeviceEscrow` on user entries (written by the daemon),
       `ipaKUVaultDepositor` (indexed for equality), the `ipaKUDeposit`
-      class for deposits under a vault (`ipaKUDepositData`),
+      class for deposits under a vault (`ipaKUDepositData`), `ipaKURecovery`
+      on a `cn=recovery,cn=kuipa,cn=etc` entry,
       `ipaKUServerEscrowKey` on
       `cn=masters` entries,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,

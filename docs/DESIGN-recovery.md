@@ -19,7 +19,7 @@ the most managed:
 |---|---|
 | recovery codes (`kuipa seal recovery-code`, `recover code`, `recover finish`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | depositors, deposits, `kuipa seal deposit put`, `list`, `fetch`, `retire` | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
-| device-key deposits and delivery (`kuipa seal recover`) | designed; needs DESIGN-approvals.md |
+| device-key deposits and delivery (`kuipa seal recover helpdesk`, `deliver`, `fetch`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | `kuipa escrow luks`, `kuipa escrow file` | implemented, tested against a real KDC (a LUKS key as `systemd-cryptenroll` prints it); **not yet run** against a real LUKS volume |
 
 Device-key deposits do not apply to keys that never leave hardware (a
@@ -142,37 +142,48 @@ administrators cannot open it with the escrow keys alone.
 The realm names its device escrow vault in `cn=recovery,cn=kuipa,cn=etc`
 (`ipaKURecovery`: `{"device_vault": "OWNER/NAME", "required": false}`),
 and the realm's users are its depositors (for example the group
-`ipausers`).
+`ipausers`). Clients learn the setting with the vault operation
+`recovery-settings`.
 
-**Depositing.** When `kuipa seal device add` makes a device key, and
-whenever `kuipa seal recovery deposit` is run, the client seals the
-private JWK to the escrow vault as a deposit of kind `device` with
-subject `{user, device id}`. With `"required": true`, `add-device` refuses
-a device of an extractable type (`file`, and `pkcs11-wrapped` at
-creation) unless its holder has a device deposit with that id. The
-server can check that the deposit exists, not that it holds the right
-key: a user who deposits garbage only loses their own recovery.
+**Depositing.** When `kuipa seal device add` registers a key-file device,
+and the realm names a device vault, the client first seals the private
+JWK to that vault as a deposit of kind `device` with subject `{"device":
+id}`, unless the user already deposited that device; a token's key
+(`pkcs11`) never leaves the token and is not deposited. With `"required":
+true`, `add-device` refuses an extractable device (`file`,
+`pkcs11-wrapped`) unless its holder has a device deposit with that id,
+and a failed deposit stops the registration; otherwise it is only
+warned about. The server can check that the deposit exists, not that it
+holds the right key: a user who deposits garbage only loses their own
+recovery.
 
 **Recovering.**
 
 1. The user, on a new host with a ticket (after the helpdesk reset their
-   password if need be), makes and registers a new device key and runs
-   `kuipa seal recover --helpdesk OLD-DEVICE`, which prints the new
-   device's thumbprint for the helpdesk.
-2. A helpdesk member requests the release of the deposit:
-   `kuipa seal request helpdesk/device-escrow --deposit ID --reason
-   "INC-1234: alice, lost laptop"`. Two leads approve after checking the
-   user's identity their own way.
-3. The helpdesk member runs `kuipa seal recover deliver --deposit ID
-   --to-device NEW`: it opens the deposit (with their device, their
-   ticket and the approved request), encrypts the old key to the new
-   device's registered public key (ML-KEM, `IPDD`), and stores that with
-   the operation `deliver`, which the server keeps on the user's entry
-   until fetched and logs. The new device is looked up in the user's
-   vaults; the server refuses a delivery to a device the user did not
-   register.
-4. The user runs `kuipa seal recover --fetch`: the delivery opens only
-   with the new device's key. Then `recover finish` as in §2.
+   password if need be), registers a new device (`kuipa seal device add
+   VAULT`) and runs `kuipa seal recover helpdesk`, which prints the new
+   device's id for the helpdesk.
+2. A helpdesk member finds the deposit (`kuipa seal deposit list
+   helpdesk/device-escrow`: the one whose subject is the lost device),
+   fetches it and asks for its release: `kuipa seal request
+   helpdesk/device-escrow DEPOSIT.sealed --reason "INC-1234: alice, lost
+   laptop"`. The leads approve after checking the user's identity their
+   own way.
+3. The helpdesk member runs `kuipa seal recover deliver DEPOSIT --user
+   alice --device NEW --request RQ`: it opens the deposit (with their
+   device, their ticket and the approved request), looks up the new
+   device's public key (the operation `device-key`, which answers only
+   for a device the user registered), encrypts the old key to it
+   (`IPDD`: an ML-KEM encapsulation to the new device, the private JWK
+   under a key derived from it), and hands that to the operation
+   `deliver`. The server keeps it on the user's entry, as an
+   `ipaKUDeviceEscrow` value of kind `delivery`, and logs it (`deliver`,
+   kind 2) in every vault where the user holds the new device; `kuipa
+   tlog watch` always flags one. `device-key` and `deliver` answer only
+   members of the realm's device vault.
+4. The user runs `kuipa seal recover fetch`: the delivery opens only with
+   the new device's key, and the old key is kept as `recovered.key`.
+   Then `recover finish` as in §2.
 
 The helpdesk member holds the old key while delivering it. That is the
 price of not letting administrators recover alone. It is bounded:
