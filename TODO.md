@@ -145,8 +145,9 @@ design first.
       approvals.
 - [ ] M-of-N approvals for break-glass releases, recorded in the
       transparency log: designed in `docs/DESIGN-approvals.md`.
-- [ ] Short-lived CI runner identities: leases on top of vouchers, and
-      pipeline secrets sealed to them.
+- [ ] Short-lived CI runner identities (voucher leases, `ticket.leased`)
+      and pipeline secrets in shared vaults: designed in
+      `docs/DESIGN-ci.md`.
 - [ ] Recipes in the book: Ansible vault passwords, `systemd-creds` and
       container secrets, `tang-pqc` file encryption, `realm-info` for
       unenrolled machines.

@@ -316,6 +316,10 @@ long-lived secrets.
 give them identities that expire on their own, and seal pipeline secrets
 to them.
 
+**Design:** a voucher carries a lease, the realm removes the host when it
+ends, and a shared vault opens only for leased runners. See
+[CI runners](reference/design.md#kuipa-for-ci-runners-leased-identities-and-pipeline-secrets).
+
 ### Anonymous tokens: surveys, reports, access
 
 **Why.** Some things should be countable but not traceable: one vote per

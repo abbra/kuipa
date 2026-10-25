@@ -19,3 +19,7 @@
 ---
 
 {{#include ../../DESIGN-recovery.md}}
+
+---
+
+{{#include ../../DESIGN-ci.md}}
