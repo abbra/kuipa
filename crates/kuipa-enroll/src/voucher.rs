@@ -4,8 +4,12 @@
 //! publishes, on
 //!
 //! ```text
-//! m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ binding
+//! m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
 //! ```
+//!
+//! `lease` (`DESIGN-ci.md` §1) is how long the host the voucher creates
+//! lives from its join, in seconds, 0 for no lease; the realm caps it
+//! ([`VoucherSettings`]).
 //!
 //! made blind (`ml-dsa-blind`): the issuer signs `μ` and never sees `m`;
 //! the result is an ordinary signature on `salt ‖ m` with context
@@ -37,6 +41,26 @@ pub const SALT_LEN: usize = 32;
 
 const PREFIX: &str = "ipa-ku-voucher1:";
 const MESSAGE_MAGIC: [u8; 4] = *b"IPVM";
+
+/// The realm's voucher settings (`ipaKUVouchers` on
+/// `cn=vouchers,cn=kuipa,cn=etc`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VoucherSettings {
+    /// The longest lease, in seconds; [`DEFAULT_MAX_LEASE`] when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lease: Option<u64>,
+}
+
+impl VoucherSettings {
+    /// The longest lease a voucher may give its host.
+    #[must_use]
+    pub fn max_lease(&self) -> u64 {
+        self.max_lease.unwrap_or(DEFAULT_MAX_LEASE)
+    }
+}
+
+/// The longest lease when the realm sets none: 7 days.
+pub const DEFAULT_MAX_LEASE: u64 = 7 * 86_400;
 const VOUCHER_MAGIC: [u8; 4] = *b"IPVO";
 const BINDING_LABEL: &[u8] = b"ipa-ku-enroll/v1 voucher binding";
 
@@ -53,6 +77,8 @@ pub struct Claims {
     pub not_before: u64,
     /// Unix seconds.
     pub not_after: u64,
+    /// How long the host lives from its join, in seconds; 0 for no lease.
+    pub lease: u64,
     /// [`binding`] of the host's ephemeral key (32 or 48 bytes), or empty.
     pub binding: Vec<u8>,
 }
@@ -61,14 +87,9 @@ impl Claims {
     /// The signed message `m`.
     #[must_use]
     pub fn message(&self) -> Vec<u8> {
-        Writer::new(MESSAGE_MAGIC)
-            .str(&self.realm)
-            .str(&self.fqdn)
-            .str(&self.hostgroup)
-            .u64(self.not_before)
-            .u64(self.not_after)
-            .bytes(&self.binding)
-            .finish()
+        let mut w = Writer::new(MESSAGE_MAGIC);
+        self.put(&mut w);
+        w.finish()
     }
 
     fn put(&self, w: &mut Writer) {
@@ -77,6 +98,7 @@ impl Claims {
             .str(&self.hostgroup)
             .u64(self.not_before)
             .u64(self.not_after)
+            .u64(self.lease)
             .bytes(&self.binding);
     }
 
@@ -87,6 +109,7 @@ impl Claims {
             hostgroup: r.str()?.to_owned(),
             not_before: r.u64()?,
             not_after: r.u64()?,
+            lease: r.u64()?,
             binding: match r.bytes()? {
                 b if b.is_empty() || is_binding_len(b.len()) => b.to_vec(),
                 _ => return Err(Error::Malformed("voucher binding")),
@@ -221,7 +244,8 @@ impl Voucher {
     /// # Errors
     ///
     /// [`Error::Refused`] for a bad signature, another key, realm or host,
-    /// another ephemeral key, or outside its validity.
+    /// another ephemeral key, or outside its validity.  The lease is the
+    /// caller's to cap.
     pub fn verify(
         &self,
         key: &VerifyingKey,
@@ -279,6 +303,7 @@ mod tests {
             hostgroup: "webservers".into(),
             not_before: 100,
             not_after: 200,
+            lease: 0,
             binding,
         }
     }
@@ -364,5 +389,29 @@ mod tests {
                 .is_err()
         );
         assert!(Voucher::parse(b"ipa-ku-voucher1:AAAA").is_err());
+
+        // A lease is signed and kept through the text form.
+        let leased = |lease| {
+            let c = Claims {
+                lease,
+                ..claims(Vec::new())
+            };
+            Voucher::parse(voucher(&key, c).encode().as_ref()).unwrap()
+        };
+        let four_hours = leased(4 * 3600);
+        assert_eq!(four_hours.claims().lease, 4 * 3600);
+        assert!(
+            four_hours
+                .verify(k, "EXAMPLE.TEST", "web1.example.test", &ek, 150)
+                .is_ok()
+        );
+        let mut longer = four_hours.clone();
+        longer.claims.lease = DEFAULT_MAX_LEASE;
+        assert!(
+            longer
+                .verify(k, "EXAMPLE.TEST", "web1.example.test", &ek, 150)
+                .is_err(),
+            "the lease is signed"
+        );
     }
 }

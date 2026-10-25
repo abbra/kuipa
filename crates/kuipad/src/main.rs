@@ -192,19 +192,11 @@ async fn serve(cfg: Config) -> Result<(), Error> {
         store,
     )?;
     tokio::spawn(peers.clone().run());
-    {
-        let (server, directory) = (server.clone(), directory.clone());
-        let configured = cfg.trusted_realms()?;
-        let endpoints = cfg.peer_endpoints.clone();
-        let every = std::time::Duration::from_secs(cfg.peer_interval.max(5) * 10);
-        tokio::spawn(async move {
-            let directory: Arc<dyn kuipa_enroll::Directory + Send + Sync> = directory;
-            loop {
-                kuipad::trust::refresh(&server, &directory, &configured, &endpoints).await;
-                tokio::time::sleep(every).await;
-            }
-        });
-    }
+    spawn_maintenance(
+        &cfg,
+        &server,
+        &(directory.clone() as Arc<dyn kuipa_enroll::Directory + Send + Sync>),
+    )?;
     let tang = TangKeys::new(&cfg.key_dir).server()?.map(Arc::new);
     if tang.is_some() {
         eprintln!("kuipad: serving post-quantum Tang at /ipa/ku/tang");
@@ -220,6 +212,49 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     }));
 
     listen(app, &cfg.listen).await
+}
+
+/// Start the maintenance loops: refreshing the trusted realms, and
+/// removing hosts whose lease ended.
+///
+/// # Errors
+///
+/// A malformed trusted-realm configuration.
+fn spawn_maintenance(
+    cfg: &Config,
+    server: &Arc<EnrollServer>,
+    directory: &Arc<dyn kuipa_enroll::Directory + Send + Sync>,
+) -> Result<(), Error> {
+    let (server, trusts) = (server.clone(), directory.clone());
+    let configured = cfg.trusted_realms()?;
+    let endpoints = cfg.peer_endpoints.clone();
+    let every = std::time::Duration::from_secs(cfg.peer_interval.max(5) * 10);
+    tokio::spawn(async move {
+        loop {
+            kuipad::trust::refresh(&server, &trusts, &configured, &endpoints).await;
+            tokio::time::sleep(every).await;
+        }
+    });
+    tokio::spawn(purge_ended_leases(directory.clone()));
+    Ok(())
+}
+
+/// Remove leased hosts (DESIGN-ci.md §1) an hour after their lease, which
+/// lets a job that is still running finish logging; the KDC stopped
+/// issuing them tickets when it ended.  Every five minutes, forever.
+async fn purge_ended_leases(directory: Arc<dyn kuipa_enroll::Directory + Send + Sync>) {
+    loop {
+        let directory = directory.clone();
+        let purged = tokio::task::spawn_blocking(move || {
+            let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+            directory.purge_leases(now.saturating_sub(3600))
+        })
+        .await;
+        if let Ok(Err(e)) = purged {
+            eprintln!("kuipad: purging ended leases: {e}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+    }
 }
 
 /// Serve `app` on the socket-activated Unix socket, or else on `listen`

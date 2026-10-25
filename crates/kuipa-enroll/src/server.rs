@@ -407,6 +407,15 @@ pub trait Directory {
         Ok(None)
     }
 
+    /// The realm's voucher settings, if it has any.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn voucher_settings(&self) -> Result<Option<crate::voucher::VoucherSettings>, DirectoryError> {
+        Ok(None)
+    }
+
     /// Store a new deposit (`DESIGN-recovery.md` §3).
     ///
     /// # Errors
@@ -516,9 +525,32 @@ pub trait Directory {
         hostgroup: &str,
         salt: &[u8; 32],
         enctypes: &[Enctype],
+        lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {
-        let _ = (fqdn, hostgroup, salt, enctypes);
+        let _ = (fqdn, hostgroup, salt, enctypes, lease);
         Err("vouchers are not supported by this directory".into())
+    }
+
+    /// When the lease of `principal`'s host ends, if it is leased
+    /// (`DESIGN-ci.md` §1).
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
+        let _ = principal;
+        Ok(None)
+    }
+
+    /// Remove the leased hosts whose lease ended before `before`, and
+    /// answer their names.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn purge_leases(&self, before: u64) -> Result<Vec<String>, DirectoryError> {
+        let _ = before;
+        Ok(Vec::new())
     }
 
     /// Record a trust invitation (the hash of its secret), usable once
@@ -717,6 +749,9 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn recovery_settings(&self) -> Result<Option<RecoverySettings>, DirectoryError> {
         (**self).recovery_settings()
     }
+    fn voucher_settings(&self) -> Result<Option<crate::voucher::VoucherSettings>, DirectoryError> {
+        (**self).voucher_settings()
+    }
     fn deposits(&self, id: &escrow::VaultId) -> Result<Vec<Deposit>, DirectoryError> {
         (**self).deposits(id)
     }
@@ -771,8 +806,15 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         hostgroup: &str,
         salt: &[u8; 32],
         enctypes: &[Enctype],
+        lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {
-        (**self).join_with_voucher(fqdn, hostgroup, salt, enctypes)
+        (**self).join_with_voucher(fqdn, hostgroup, salt, enctypes, lease)
+    }
+    fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
+        (**self).principal_lease(principal)
+    }
+    fn purge_leases(&self, before: u64) -> Result<Vec<String>, DirectoryError> {
+        (**self).purge_leases(before)
     }
     fn add_trust_invitation(
         &self,
@@ -1470,8 +1512,9 @@ impl EnrollServer {
                 let ephemeral = crate::voucher::binding(request.ephemeral_key())?;
                 let now = unix_seconds(SystemTime::now());
                 let claims = voucher.verify(key, &self.info.realm, fqdn, &ephemeral, now)?;
+                let lease = voucher_lease(claims, now, directory)?;
                 let keytab = directory
-                    .join_with_voucher(fqdn, &claims.hostgroup, voucher.salt(), enctypes)
+                    .join_with_voucher(fqdn, &claims.hostgroup, voucher.salt(), enctypes, lease)
                     .map_err(Refusal)?;
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
@@ -3571,6 +3614,32 @@ pub fn parse_stage_result(
     ))
 }
 
+/// When the host a voucher creates at `now` loses its lease
+/// (`DESIGN-ci.md` §1): `None` for no lease.
+///
+/// # Errors
+///
+/// A refusal for a lease over the realm's longest.
+fn voucher_lease(
+    claims: &crate::voucher::Claims,
+    now: u64,
+    directory: &dyn Directory,
+) -> Result<Option<u64>, Refusal> {
+    if claims.lease == 0 {
+        return Ok(None);
+    }
+    let max = directory
+        .voucher_settings()
+        .map_err(Refusal)?
+        .unwrap_or_default()
+        .max_lease();
+    if claims.lease > max {
+        return Err(Refusal::because(format!(
+            "the lease is longer than the realm's {max} seconds"
+        )));
+    }
+    Ok(Some(now.saturating_add(claims.lease)))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

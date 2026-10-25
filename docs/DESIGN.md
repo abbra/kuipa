@@ -1985,10 +1985,13 @@ A voucher is an ML-DSA signature, with context `ipa-ku-enroll/v1 voucher`,
 on `salt ‖ m`:
 
 ```text
-m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ binding
+m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
 binding = H("ipa-ku-enroll/v1 voucher binding" ‖ ek_e)  or empty
           H: ek_e's KEM suite hash, SHA-256 (ML-KEM-768) or SHA-384 (ML-KEM-1024)
 ```
+
+`lease` is how long the host lives from its join, in seconds, or 0: a
+leased host gets no ticket after it and is removed (`DESIGN-ci.md` §1).
 
 The provisioner blinds `m` with `ml-dsa-blind` (`μ = SHAKE256(tr ‖ 0 ‖
 |ctx| ‖ ctx ‖ salt ‖ m)` with a fresh secret salt) and sends the issuer

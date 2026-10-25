@@ -103,6 +103,11 @@ const DEVICE_ESCROW_ATTR: &str = "ipaKUDeviceEscrow";
 /// The realm's device-key recovery settings, JSON, on
 /// `cn=recovery,cn=kuipa,cn=etc` (`DESIGN-recovery.md` §4).
 const RECOVERY_ATTR: &str = "ipaKURecovery";
+/// When a leased host's lease ends, Unix seconds, on its entry; set only
+/// by a voucher join with a lease (`DESIGN-ci.md` §1).
+const LEASE_ATTR: &str = "ipaKULease";
+/// The realm's voucher settings, JSON, on `cn=vouchers,cn=kuipa,cn=etc`.
+const VOUCHERS_ATTR: &str = "ipaKUVouchers";
 /// Every attribute a vault is read from.
 const VAULT_ATTRS: &[&str] = &[
     VAULT_OWNER_ATTR,
@@ -921,6 +926,60 @@ impl Directory for LdapDirectory {
         self.realm_setting("recovery", RECOVERY_ATTR)
     }
 
+    fn voucher_settings(
+        &self,
+    ) -> Result<Option<kuipa_enroll::voucher::VoucherSettings>, DirectoryError> {
+        self.realm_setting("vouchers", VOUCHERS_ATTR)
+    }
+
+    fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
+        let Some(entry) =
+            self.principal_entry(&mut self.service_conn()?, principal, &[LEASE_ATTR])?
+        else {
+            return Ok(None);
+        };
+        Ok(entry
+            .attrs
+            .get(&LEASE_ATTR.to_lowercase())
+            .and_then(|v| v.first())
+            .and_then(|v| v.parse().ok()))
+    }
+
+    fn purge_leases(&self, before: u64) -> Result<Vec<String>, DirectoryError> {
+        let mut conn = self.service_conn()?;
+        let base = format!("cn=computers,cn=accounts,{}", self.cfg.basedn);
+        let leased = conn.search(
+            &base,
+            Scope::OneLevel,
+            &format!("({LEASE_ATTR}=*)"),
+            &["fqdn", LEASE_ATTR],
+        )?;
+        let mut gone = Vec::new();
+        for entry in leased {
+            let end: Option<u64> = entry
+                .attrs
+                .get(&LEASE_ATTR.to_lowercase())
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse().ok());
+            if end.is_some_and(|end| end < before) {
+                // The entry carries its keys and escrow bindings; the
+                // directory's referential integrity drops its group
+                // memberships.  Only entries with a lease, which only the
+                // daemon sets, are removed.
+                conn.delete_s(&entry.dn)?;
+                let fqdn = entry
+                    .attrs
+                    .get("fqdn")
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_else(|| entry.dn.clone());
+                eprintln!("kuipad: the lease of {fqdn} ended: host removed");
+                gone.push(fqdn);
+            }
+        }
+        Ok(gone)
+    }
+
     fn sign_policy(&self) -> Result<kuipa_enroll::sign::SignPolicy, DirectoryError> {
         // No policy entry: no purpose, so nobody signs.
         Ok(self
@@ -1429,8 +1488,19 @@ impl Directory for LdapDirectory {
         hostgroup: &str,
         salt: &[u8; 32],
         enctypes: &[Enctype],
+        lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {
         let mut conn = self.service_conn()?;
+        // The KDC issues a leased host no ticket after its lease.
+        let lease = lease
+            .map(|end| -> Result<(String, String), DirectoryError> {
+                let expiration =
+                    synta::GeneralizedTime::from_unix(i64::try_from(end).unwrap_or(i64::MAX))
+                        .ok_or("the lease ends out of range")?
+                        .to_string();
+                Ok((expiration, end.to_string()))
+            })
+            .transpose()?;
         let spent = hex(salt);
         let base = format!("cn=computers,cn=accounts,{}", self.cfg.basedn);
         let filter = format!("({VOUCHER_SPENT_ATTR}={})", filter_escape(&spent));
@@ -1471,7 +1541,15 @@ impl Directory for LdapDirectory {
                 ("managedBy", vec![dn.as_bytes()]),
                 ("ipaUniqueID", vec![b"autogenerate".as_slice()]),
                 (VOUCHER_SPENT_ATTR, vec![spent.as_bytes()]),
-            ],
+            ]
+            .into_iter()
+            .chain(lease.iter().flat_map(|(expiration, end)| {
+                [
+                    ("krbPrincipalExpiration", vec![expiration.as_bytes()]),
+                    (LEASE_ATTR, vec![end.as_bytes()]),
+                ]
+            }))
+            .collect::<Vec<_>>(),
         )?;
         if !hostgroup.is_empty() {
             conn.modify_s(
@@ -1483,7 +1561,12 @@ impl Directory for LdapDirectory {
                 &[(ModOp::Add, "member", vec![dn.as_bytes()])],
             )?;
         }
-        eprintln!("kuipad: voucher created host {fqdn}");
+        match &lease {
+            Some((expiration, _)) => {
+                eprintln!("kuipad: voucher created host {fqdn}, leased until {expiration}");
+            }
+            None => eprintln!("kuipad: voucher created host {fqdn}"),
+        }
         self.new_keys(&mut conn, &principal, enctypes)
     }
 

@@ -98,6 +98,10 @@ enum Command {
         /// Days the voucher is valid from now.
         #[arg(long, value_name = "N", default_value = "7")]
         days: String,
+        /// The host lives this many hours from its join, and the realm
+        /// then removes it (`DESIGN-ci.md` §1): for CI runners.
+        #[arg(long, value_name = "HOURS")]
+        lease_hours: Option<u64>,
         /// Binding from `kuipa voucher-key`, base64.  Base64url may
         /// start with `-`, so hyphen-leading values are allowed.
         #[arg(long, value_name = "BASE64", allow_hyphen_values = true)]
@@ -156,10 +160,16 @@ fn run(command: Command) -> Result<(), Error> {
             fqdn,
             hostgroup,
             days,
+            lease_hours,
             binding,
             state,
         } => {
             let days: u64 = days.parse()?;
+            let lease = match lease_hours {
+                Some(0) => return Err("--lease-hours must be at least 1".into()),
+                Some(h) => h.checked_mul(3600).ok_or("--lease-hours is too large")?,
+                None => 0,
+            };
             let binding = match binding {
                 Some(b) => Some(b64::decode(&b)?)
                     .filter(|b| kuipa_enroll::voucher::is_binding_len(b.len()))
@@ -177,6 +187,7 @@ fn run(command: Command) -> Result<(), Error> {
                 hostgroup: hostgroup.unwrap_or_default(),
                 not_before: now.saturating_sub(300),
                 not_after: validity,
+                lease,
                 binding,
             };
             let request = voucher::request(&std::fs::read(&public)?, &claims, Path::new(&state))?;
@@ -198,6 +209,7 @@ fn run(command: Command) -> Result<(), Error> {
                     "hostgroup": c.hostgroup,
                     "not_before": c.not_before,
                     "not_after": c.not_after,
+                    "lease": c.lease,
                     "bound": c.is_bound(),
                 })
             );

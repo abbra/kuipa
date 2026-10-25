@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::voucher::{Claims, Voucher};
+use kuipa_enroll::{Directory as _, EnrollServer};
 use kuipa_tools::flows::{self, Auth};
 use kuipa_tools::paths::Paths;
 use kuipa_tools::voucher;
@@ -43,6 +43,7 @@ fn claims(fqdn: &str, binding: Vec<u8>) -> Claims {
         hostgroup: "webservers".into(),
         not_before: now() - 60,
         not_after: now() + 3600,
+        lease: 0,
         binding,
     }
 }
@@ -57,12 +58,12 @@ struct Issuer {
 }
 
 impl Issuer {
-    /// A voucher key, and a quota of three signatures.
+    /// A voucher key, and a quota of five signatures.
     fn new(dir: &Path) -> Self {
         let key = dir.join("issuer.pem");
         let quota = dir.join("quota.json");
         let public = voucher::keygen(&key, SignatureAlg::MlDsa65).unwrap();
-        voucher::set_quota(&quota, 3).unwrap();
+        voucher::set_quota(&quota, 5).unwrap();
         Self {
             dir: dir.to_owned(),
             key,
@@ -261,8 +262,61 @@ fn voucher_under_unknown_key_is_refused(ipa: &Ipa, issuer: &Issuer) {
     assert!(ipa.enroll("web3.voucher.test", &web3, None).is_err());
 }
 
-/// The quota of three is used up: a fourth signature is refused.
-fn quota_of_three_is_used_up(issuer: &Issuer) {
+/// A leased voucher's host stops getting tickets when its lease ends, and
+/// is removed after; a lease over the realm's longest is refused.
+fn leased_voucher_creates_a_host_that_ends(realm: &Realm, ipa: &Ipa, issuer: &Issuer) {
+    let runner = "runner1.voucher.test";
+    let leased = Claims {
+        lease: 2 * 3600,
+        ..claims(runner, Vec::new())
+    };
+    let before = now();
+    ipa.enroll(runner, &issuer.issue(&leased, "runner1"), None)
+        .unwrap();
+    let principal = format!("host/{runner}@{REALM}");
+    let end = ipa
+        .directory
+        .principal_lease(&principal.parse().unwrap())
+        .unwrap()
+        .expect("the host is leased");
+    assert!((before + 2 * 3600..=now() + 2 * 3600).contains(&end));
+    // The KDC stops its tickets then.
+    let getprinc = realm.kadmin(&["getprinc", &principal]);
+    let expiration = getprinc
+        .lines()
+        .find(|l| l.starts_with("Expiration date:"))
+        .unwrap();
+    assert!(!expiration.contains("[never]"), "{expiration}");
+    // An unleased host has no lease.
+    assert_eq!(
+        ipa.directory
+            .principal_lease(&format!("host/web1.voucher.test@{REALM}").parse().unwrap())
+            .unwrap(),
+        None
+    );
+    // Removed once the lease passed, and only it.
+    assert!(ipa.directory.purge_leases(end).unwrap().is_empty());
+    assert_eq!(ipa.directory.purge_leases(end + 1).unwrap(), [runner]);
+    assert!(!realm.has(&principal));
+    assert!(realm.has(&format!("host/web1.voucher.test@{REALM}")));
+
+    let too_long = Claims {
+        lease: kuipa_enroll::voucher::DEFAULT_MAX_LEASE + 1,
+        ..claims("runner2.voucher.test", Vec::new())
+    };
+    assert!(
+        ipa.enroll(
+            "runner2.voucher.test",
+            &issuer.issue(&too_long, "runner2"),
+            None
+        )
+        .is_err()
+    );
+    assert!(!realm.has(&format!("host/runner2.voucher.test@{REALM}")));
+}
+
+/// The quota of five is used up: a sixth signature is refused.
+fn quota_is_used_up(issuer: &Issuer) {
     let state = issuer.dir.join("web4.state");
     let request = voucher::request(
         issuer.public.as_bytes(),
@@ -286,5 +340,6 @@ fn vouchers_against_a_real_kdc() {
     bearer_voucher_creates_one_host(&realm, &ipa, &issuer);
     bound_voucher_needs_its_ephemeral_key(&realm, &ipa, &issuer);
     voucher_under_unknown_key_is_refused(&ipa, &issuer);
-    quota_of_three_is_used_up(&issuer);
+    leased_voucher_creates_a_host_that_ends(&realm, &ipa, &issuer);
+    quota_is_used_up(&issuer);
 }
