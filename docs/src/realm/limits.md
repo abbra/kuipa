@@ -41,11 +41,24 @@ live on `cn=vault-limits,cn=kuipa,cn=etc,<suffix>`, attribute
 | `offline_sessions` | `false` | whether vaults may allow offline sessions at all |
 | `without_device` | `true` | whether a vault may do without the device factor |
 | `descriptor_age` | 30 days (seconds) | how long a client may seal offline with a vault's description |
+| `factors` | none | factor sets a policy must meet one of, e.g. `[{"device": "any"}]` |
 
 Offline sessions hand a key to the user's machine for a while, after which
 the servers can no longer enforce limits on it. They stay off until you
 set `"offline_sessions": true`. Setting `"without_device": false` forbids
 vaults that rely on a ticket alone, which a stolen password would open.
+
+`factors` says more precisely what a vault must ask for. A vault's policy
+must include all the factors of one of the listed sets, and a device at
+the set's level or higher. For example, to require either a device key
+that never leaves its token, or a ticket and a passkey together:
+
+```json
+"factors": [
+  { "device": "hardware-bound" },
+  { "ticket": true, "passkey": true }
+]
+```
 
 ## Revoking
 

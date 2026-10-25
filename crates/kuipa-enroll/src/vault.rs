@@ -163,6 +163,45 @@ pub struct Factors {
     pub passkey: bool,
 }
 
+impl Factors {
+    /// Whether these factors include all of `least`'s: its device factor at
+    /// its level or above, its ticket, its passkey.
+    #[must_use]
+    pub fn meets(&self, least: &Self) -> bool {
+        least
+            .device
+            .is_none_or(|l| self.device.is_some_and(|d| d >= l))
+            && (self.ticket || !least.ticket)
+            && (self.passkey || !least.passkey)
+    }
+}
+
+/// As `kuipa seal create --require` takes them: `device=any,ticket`.
+impl fmt::Display for Factors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+        if let Some(level) = self.device {
+            parts.push(format!(
+                "device={}",
+                serde_json::to_value(level)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default()
+            ));
+        }
+        if self.ticket {
+            parts.push("ticket".to_owned());
+        }
+        if self.passkey {
+            parts.push("passkey".to_owned());
+        }
+        if parts.is_empty() {
+            parts.push("none".to_owned());
+        }
+        f.write_str(&parts.join(","))
+    }
+}
+
 /// How bindings of the vault's files are authorised.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -283,6 +322,10 @@ pub struct Limits {
     pub without_device: bool,
     /// How old a descriptor may be when a client seals with it, in seconds.
     pub descriptor_age: u64,
+    /// The factors a policy needs at least: it must meet one of these
+    /// sets ([`Factors::meets`]).  Empty: any non-empty combination.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub factors: Vec<Factors>,
 }
 
 const fn default_max_members() -> usize {
@@ -301,6 +344,7 @@ impl Default for Limits {
             offline_sessions: false,
             without_device: true,
             descriptor_age: 30 * 86_400,
+            factors: Vec::new(),
         }
     }
 }
@@ -340,6 +384,13 @@ impl Limits {
         }
         if policy.factors.device.is_none() && !self.without_device {
             return Err(Policy::refuse("the realm requires the device factor"));
+        }
+        if !self.factors.is_empty() && !self.factors.iter().any(|f| policy.factors.meets(f)) {
+            let sets: Vec<String> = self.factors.iter().map(Factors::to_string).collect();
+            return Err(Policy::refuse(format!(
+                "the realm requires the factors of one of: {}",
+                sets.join("; ")
+            )));
         }
         Ok(())
     }
@@ -1976,5 +2027,62 @@ impl SealedVaultFile {
             devices,
             ciphertext,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn factors(device: Option<Level>, ticket: bool) -> Factors {
+        Factors {
+            device,
+            ticket,
+            passkey: false,
+        }
+    }
+
+    fn policy(f: Factors) -> Policy {
+        Policy {
+            factors: f,
+            ..Policy::default()
+        }
+    }
+
+    #[test]
+    fn factor_sets_are_met_by_their_supersets() {
+        let any = factors(Some(Level::Any), false);
+        let bound = factors(Some(Level::HardwareBound), true);
+        assert!(bound.meets(&any), "a stronger device and more factors");
+        assert!(!any.meets(&bound));
+        assert!(!factors(None, true).meets(&any), "no device at all");
+        assert!(any.meets(&Factors::default()), "nothing asked");
+        assert_eq!(bound.to_string(), "device=hardware-bound,ticket");
+        assert_eq!(Factors::default().to_string(), "none");
+    }
+
+    #[test]
+    fn a_policy_must_meet_one_of_the_realm_factor_sets() {
+        let limits = Limits {
+            factors: vec![
+                factors(Some(Level::Any), false),
+                Factors {
+                    device: None,
+                    ticket: true,
+                    passkey: true,
+                },
+            ],
+            ..Limits::default()
+        };
+        limits
+            .apply(&mut policy(factors(Some(Level::Any), true)), NOW)
+            .unwrap();
+        let err = limits
+            .apply(&mut policy(factors(None, true)), NOW)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("device=any; ticket,passkey"), "{err}");
     }
 }

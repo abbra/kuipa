@@ -1399,6 +1399,12 @@ opts the realm in), and the factor shapes allowed (for example: `ticket`
 alone not allowed). Users create and change their own vaults (self-service)
 within these limits; the server refuses a policy outside them.
 
+The factor shapes (implemented) are `factors`, a list of factor sets in
+the policy's own form (`[{"device": "any"}, {"ticket": true, "passkey":
+true}]`): a policy must include all of one set's factors, a device at
+its level or above. Empty, any non-empty combination will do, as it did
+before; `without_device: false` is the same as `[{"device": "any"}]`.
+
 A **device** is an ML-KEM key pair of the owner; its public half is
 registered in the vault:
 
