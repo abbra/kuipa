@@ -3,7 +3,9 @@
 //! KDC-backed directory, each with its own anchor, pre-made OTP enrollment
 //! strings (pinning ipa1's anchor) and an administrator.  A second realm,
 //! `B.TEST`, with its own KDC, CA, server and user, is advertised as trusted
-//! (§17).  Started by
+//! (§17).  Three more servers ipa1's anchor delegates advertise CA chains of
+//! their own — a PEM blob, a KDC certificate as a PKINIT anchor, a Merkle
+//! Tree CA — for host `app1` to enroll through ([`chains`]).  Started by
 //! `contrib/ci/local-ci.sh interactive`, which drops you into a shell inside
 //! it.
 //!
@@ -57,6 +59,13 @@ const TRUSTED_REALM: &str = "B.TEST";
 const TRUSTED_DOMAIN: &str = "b.test";
 const TRUSTED_SERVER: &str = "ipa1.b.test";
 const TRUSTED_USER: &str = "alice@B.TEST";
+/// Servers outside the realm's exchange that advertise CA chains of their
+/// own, for the "CA chains" session section ([`chains`]).
+const CHAIN_SERVERS: [&str; 3] = [
+    "ipa-pem.example.test",
+    "ipa-kdccert.example.test",
+    "ipa-mtc.example.test",
+];
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -109,6 +118,7 @@ fn run(args: &[String]) -> Result<(), Error> {
     let (trusted_anchor, trusted_directory, trusted_url) = start_trusted(&trusted, &rt)?;
 
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &SERVERS, &[ADMIN]));
+    let chain_directory = Arc::new(KdcDirectory::new(realm.clone(), &CHAIN_SERVERS, &[ADMIN]));
     publish_masters(&dir, &directory)?;
     watch_recovery(&dir, &directory);
     configure_policy(&directory);
@@ -117,7 +127,7 @@ fn run(args: &[String]) -> Result<(), Error> {
         anchor,
         mut endpoints,
         servers,
-    } = start_servers(&realm, &directory, &rt)?;
+    } = start_servers(&realm, &directory, &chain_directory, &rt)?;
     endpoints.push(format!("{TRUSTED_SERVER}={trusted_url}"));
 
     // B.TEST invites EXAMPLE.TEST, and ipa1 establishes the trust: both
@@ -148,7 +158,7 @@ fn run(args: &[String]) -> Result<(), Error> {
     // signature after the exchange.
     std::fs::write(dir.join("anchor"), anchor.to_string())?;
 
-    write_enrollment_strings(&dir, &realm, &directory, anchor, hosts)?;
+    write_enrollment_strings(&dir, &realm, &directory, &chain_directory, anchor, hosts)?;
     // DNS for both realms, as FreeIPA publishes it: `kuipa enroll` finds
     // the servers without `--server`.
     let srv = |servers: &[&str]| -> Vec<support::dns::Record> {
@@ -392,6 +402,7 @@ fn write_enrollment_strings(
     dir: &Path,
     realm: &Realm,
     directory: &KdcDirectory,
+    chain_directory: &KdcDirectory,
     anchor: Thumbprint,
     hosts: usize,
 ) -> Result<(), Error> {
@@ -413,6 +424,20 @@ fn write_enrollment_strings(
         realm.add_user(&format!("host/{fqdn}@{REALM}"), &otp);
         otps.insert(fqdn, otp.into_bytes());
     }
+    drop(otps);
+    // app1 enrolls through the chain servers (start_chain_servers), which
+    // answer from their own directory.
+    let mut otps = chain_directory.otps.lock().unwrap();
+    let otp = random_otp()?;
+    let string = EnrollmentString::new(
+        REALM,
+        anchor,
+        now() + 86_400,
+        Some(Secret::new(otp.as_bytes())),
+    );
+    std::fs::write(enroll_dir.join("app1"), string.encode().as_ref())?;
+    realm.add_user(&format!("host/app1.{DOMAIN}@{REALM}"), &otp);
+    otps.insert(format!("app1.{DOMAIN}"), otp.into_bytes());
     drop(otps);
     // Without a secret: for the password and ticket paths, and bundles.
     let plain = EnrollmentString::new(REALM, anchor, now() + 86_400, None);
@@ -499,12 +524,15 @@ fn session_limiter() -> kuipad::limit::Limiter {
 
 /// Start every server on `rt`, each with its own anchor, and wait for the
 /// anchor exchange.
-fn start_servers(
-    realm: &Arc<Realm>,
-    directory: &Arc<KdcDirectory>,
-    rt: &tokio::runtime::Runtime,
-) -> Result<Started, Error> {
-    let dir = &realm.dir;
+/// A listener for each of [`SERVERS`], their URLs, and their
+/// `KUIPA_ENDPOINTS` entries.
+struct Listening {
+    listeners: Vec<tokio::net::TcpListener>,
+    urls: Vec<String>,
+    endpoints: Vec<String>,
+}
+
+fn listen(rt: &tokio::runtime::Runtime) -> Result<Listening, Error> {
     let mut listeners = Vec::new();
     let mut urls = Vec::new();
     for _ in SERVERS {
@@ -512,11 +540,30 @@ fn start_servers(
         urls.push(format!("http://{}", listener.local_addr()?));
         listeners.push(listener);
     }
-    let endpoints: Vec<String> = SERVERS
+    let endpoints = SERVERS
         .iter()
         .zip(&urls)
         .map(|(s, u)| format!("{s}={u}"))
         .collect();
+    Ok(Listening {
+        listeners,
+        urls,
+        endpoints,
+    })
+}
+
+fn start_servers(
+    realm: &Arc<Realm>,
+    directory: &Arc<KdcDirectory>,
+    chain_directory: &Arc<KdcDirectory>,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Started, Error> {
+    let dir = &realm.dir;
+    let Listening {
+        listeners,
+        urls,
+        mut endpoints,
+    } = listen(rt)?;
 
     let (voucher_key, witness) = (start_issuer(dir)?, start_witness(dir)?);
 
@@ -573,6 +620,9 @@ fn start_servers(
             ca_certs: vec![realm.chain.ca_der.clone()],
             vouch_interval: Duration::ZERO,
         };
+        if i == 0 {
+            endpoints.extend(start_chain_servers(&anchor, realm, chain_directory, rt)?);
+        }
         let tang = start_tang(dir, server, &key_dir, &urls[i])?;
         let initiator = Arc::new(KeytabInitiator::new(
             dir.join(format!("kuipa-{server}.keytab"))
@@ -607,6 +657,116 @@ fn start_servers(
         endpoints,
         servers,
     })
+}
+
+/// A server [`start_chain_servers`] runs, and the chain it advertises.
+struct Chain {
+    server: &'static str,
+    ca_certs: Vec<Vec<u8>>,
+    pkinit_anchors: Vec<Vec<u8>>,
+}
+
+/// The CA chains [`start_chain_servers`] advertise, from the realm's CA
+/// (DER) and KDC certificate.
+fn chains(ca: &[u8], kdc: &[u8]) -> [Chain; 3] {
+    let mtc_ca =
+        synta_certificate::pem_to_der(include_bytes!("../tests/data/mtc-demo-ca.pem")).remove(0);
+    [
+        // The CA certificate pasted as PEM where DER belongs: no certificate.
+        Chain {
+            server: CHAIN_SERVERS[0],
+            ca_certs: vec![
+                ca.to_vec(),
+                synta_certificate::der_to_pem("CERTIFICATE", ca),
+            ],
+            pkinit_anchors: vec![ca.to_vec()],
+        },
+        // The KDC's own certificate as a PKINIT anchor: an end entity.
+        Chain {
+            server: CHAIN_SERVERS[1],
+            ca_certs: vec![ca.to_vec()],
+            pkinit_anchors: vec![ca.to_vec(), kdc.to_vec()],
+        },
+        // A sound chain that includes a Merkle Tree CA (the IETF demo's,
+        // unsigned): a CA by its critical Merkle Tree CA extension.
+        Chain {
+            server: CHAIN_SERVERS[2],
+            ca_certs: vec![ca.to_vec(), mtc_ca],
+            pkinit_anchors: vec![ca.to_vec()],
+        },
+    ]
+}
+
+/// Servers that `anchor` (ipa1's) delegates, outside the anchor exchange,
+/// each advertising a CA chain of its own ([`chains`]): what the "CA chains"
+/// session section enrolls `app1` through.  A client verifies them as it
+/// would any server of the realm, so what it refuses there is the chain,
+/// not the server.  They answer from `directory`, their own over the realm's
+/// KDC (their principals and acceptor keys; `app1`'s OTP), so the realm's
+/// own servers and their list stay as they are.  Returns their
+/// `KUIPA_ENDPOINTS` entries.
+fn start_chain_servers(
+    anchor: &SigningKey,
+    realm: &Arc<Realm>,
+    directory: &Arc<KdcDirectory>,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Vec<String>, Error> {
+    let mut endpoints = Vec::new();
+    for Chain {
+        server,
+        ca_certs,
+        pkinit_anchors,
+    } in chains(&realm.chain.ca_der, &realm.chain.kdc_der)
+    {
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
+        endpoints.push(format!("{server}=http://{}", listener.local_addr()?));
+        let signing = SigningKey::generate(SignatureAlg::MlDsa65)?;
+        let delegation = Delegation::issue(
+            anchor,
+            REALM,
+            server,
+            signing.public(),
+            now() - 60,
+            now() + 90 * 86400,
+        )?;
+        let keys = ServerKeys {
+            signing,
+            join: vec![ExchangeKeyPair::generate_preferred()?],
+            escrow: vec![ExchangeKeyPair::generate_preferred()?],
+            trust: Vec::new(),
+            vouchers: Vec::new(),
+            retired: Vec::new(),
+        };
+        let info = RealmInfo {
+            realm: REALM.into(),
+            domain: DOMAIN.into(),
+            basedn: "dc=example,dc=test".into(),
+            server: server.into(),
+            servers: vec![server.into()],
+            ca_certs,
+            pkinit_anchors,
+            anchors: vec![*anchor.public().thumbprint()],
+            heads: Vec::new(),
+            trusts: Vec::new(),
+        };
+        let enroll = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
+        enroll.publish(
+            delegation,
+            vec![*anchor.public().thumbprint()],
+            std::collections::HashMap::new(),
+        );
+        let app = Arc::new(App {
+            server: enroll,
+            directory: directory.clone(),
+            peers: None,
+            limiter: kuipad::limit::Limiter::default(),
+            tang: None,
+            keys: None,
+            ledger: None,
+        });
+        rt.spawn(async move { axum::serve(listener, router(app)).await });
+    }
+    Ok(endpoints)
 }
 
 /// A transparency-log witness (DESIGN-tlog.md §4) in
