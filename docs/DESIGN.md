@@ -1392,7 +1392,7 @@ access alone never opens a file. That is what makes a user vault stronger
 than host escrow (§7.5), whose files open without a human.
 
 **Realm limits** (`cn=vault-limits,cn=kuipa,cn=etc`, set by administrators,
-later per group): the furthest `not_after`, the largest `max_unlocks`,
+for the realm and per group): the furthest `not_after`, the largest `max_unlocks`,
 vaults per user, devices per vault, the longest sessions, whether offline
 sessions are allowed at all (by default they are not: an administrator
 opts the realm in), and the factor shapes allowed (for example: `ticket`
@@ -1404,6 +1404,23 @@ the policy's own form (`[{"device": "any"}, {"ticket": true, "passkey":
 true}]`): a policy must include all of one set's factors, a device at
 its level or above. Empty, any non-empty combination will do, as it did
 before; `without_device: false` is the same as `[{"device": "any"}]`.
+
+Per-group limits (implemented) are `groups`, entries naming a user or
+host group, a `priority`, and any of the other fields. A vault's limits
+are its **owner's**, whoever changes it (a manager of a shared vault
+gets the owner's, not their own): of the groups the owner is a member
+of (`memberOf`), the entry with the lowest priority applies, ties going
+to the group whose name sorts first, and its fields replace the realm's;
+the fields it leaves out are the realm's. Exactly one entry applies, as
+FreeIPA chooses one password policy, rather than a merge: a merge of
+several groups' fields would make it hard to tell what a user may do,
+and could hand a group's lax factors to a member of a strict one. A
+group's `"max_unlocks": null` lifts the realm's cap. The owner's groups
+are read only when the realm has group entries. Limits apply when a
+policy is set, a device registered, a vault shared, a session started
+and a descriptor signed; a vault already outside new limits keeps its
+policy until it is next changed, but no longer gets an offline session
+its owner's limits forbid.
 
 A **device** is an ML-KEM key pair of the owner; its public half is
 registered in the vault:

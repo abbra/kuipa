@@ -326,6 +326,73 @@ pub struct Limits {
     /// sets ([`Factors::meets`]).  Empty: any non-empty combination.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub factors: Vec<Factors>,
+    /// Limits for the members of groups, in place of these where they
+    /// say otherwise ([`Limits::for_groups`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupLimits>,
+}
+
+/// Limits for the members of one user group or host group: each field
+/// set here replaces the realm's, the others are the realm's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupLimits {
+    /// The group, by name.
+    pub group: String,
+    /// Of the groups a vault's owner is in, the one with the lowest
+    /// priority applies (ties go to the group named first in byte order),
+    /// as FreeIPA's password policies are chosen.
+    pub priority: u32,
+    /// What this group's members get instead of the realm's limits.
+    #[serde(flatten)]
+    pub set: LimitOverrides,
+}
+
+/// The fields of [`Limits`] a group can replace; `None` keeps the realm's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitOverrides {
+    /// [`Limits::max_lifetime`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime: Option<u64>,
+    /// [`Limits::max_unlocks`]; `null` lifts the realm's cap.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub max_unlocks: Option<Option<u64>>,
+    /// [`Limits::max_vaults`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vaults: Option<usize>,
+    /// [`Limits::max_devices`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_devices: Option<usize>,
+    /// [`Limits::max_members`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_members: Option<usize>,
+    /// [`Limits::max_reauth`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_reauth: Option<u64>,
+    /// [`Limits::offline_sessions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_sessions: Option<bool>,
+    /// [`Limits::without_device`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub without_device: Option<bool>,
+    /// [`Limits::descriptor_age`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor_age: Option<u64>,
+    /// [`Limits::factors`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factors: Option<Vec<Factors>>,
+}
+
+/// A field that is present, `null` included: `Some` of what it holds.
+fn present<'de, D, T>(d: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 const fn default_max_members() -> usize {
@@ -345,11 +412,43 @@ impl Default for Limits {
             without_device: true,
             descriptor_age: 30 * 86_400,
             factors: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
 
 impl Limits {
+    /// The limits for a vault whose owner is a member of `groups`: those
+    /// of the matching group with the lowest priority over the realm's,
+    /// or the realm's.  The result names no groups.
+    #[must_use]
+    pub fn for_groups(&self, groups: &[String]) -> Self {
+        let mut out = Self {
+            groups: Vec::new(),
+            ..self.clone()
+        };
+        let Some(chosen) = self
+            .groups
+            .iter()
+            .filter(|g| groups.contains(&g.group))
+            .min_by(|a, b| (a.priority, &a.group).cmp(&(b.priority, &b.group)))
+        else {
+            return out;
+        };
+        let o = chosen.set.clone();
+        out.max_lifetime = o.max_lifetime.unwrap_or(out.max_lifetime);
+        out.max_unlocks = o.max_unlocks.unwrap_or(out.max_unlocks);
+        out.max_vaults = o.max_vaults.unwrap_or(out.max_vaults);
+        out.max_devices = o.max_devices.unwrap_or(out.max_devices);
+        out.max_members = o.max_members.unwrap_or(out.max_members);
+        out.max_reauth = o.max_reauth.unwrap_or(out.max_reauth);
+        out.offline_sessions = o.offline_sessions.unwrap_or(out.offline_sessions);
+        out.without_device = o.without_device.unwrap_or(out.without_device);
+        out.descriptor_age = o.descriptor_age.unwrap_or(out.descriptor_age);
+        out.factors = o.factors.unwrap_or(out.factors);
+        out
+    }
+
     /// Check `policy` (made valid) against these limits at `now`, filling
     /// in `not_after` when absent.
     ///
@@ -2084,5 +2183,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("device=any; ticket,passkey"), "{err}");
+    }
+
+    #[test]
+    fn the_owners_group_with_the_lowest_priority_sets_the_limits() {
+        let limits: Limits = serde_json::from_value(serde_json::json!({
+            "max_lifetime": 86_400, "max_unlocks": 10, "max_vaults": 2,
+            "max_devices": 8, "max_reauth": 3600, "without_device": true,
+            "descriptor_age": 86_400,
+            "groups": [
+                { "group": "ops", "priority": 20, "max_vaults": 50,
+                  "max_unlocks": null, "offline_sessions": true },
+                { "group": "contractors", "priority": 10, "max_vaults": 1,
+                  "factors": [{ "device": "hardware-bound" }] },
+                { "group": "auditors", "priority": 10, "max_vaults": 3 },
+            ],
+        }))
+        .unwrap();
+        let of = |groups: &[&str]| {
+            limits.for_groups(&groups.iter().map(|&g| g.to_owned()).collect::<Vec<_>>())
+        };
+        // No group: the realm's, and the result names no groups.
+        let plain = of(&["staff"]);
+        assert_eq!((plain.max_vaults, plain.max_unlocks), (2, Some(10)));
+        assert!(plain.groups.is_empty());
+        // One group: its fields, the realm's for the rest; null lifts a cap.
+        let ops = of(&["ops"]);
+        assert_eq!((ops.max_vaults, ops.max_unlocks), (50, None));
+        assert!(ops.offline_sessions);
+        assert_eq!(ops.max_lifetime, 86_400);
+        // Several: the lowest priority wins whole, ties by name.
+        let both = of(&["ops", "contractors"]);
+        assert_eq!(both.max_vaults, 1);
+        assert!(!both.offline_sessions, "nothing merged from ops");
+        assert_eq!(both.factors, [factors(Some(Level::HardwareBound), false)]);
+        assert_eq!(of(&["contractors", "auditors"]).max_vaults, 3);
+        // What a realm stores reads back the same.
+        let again: Limits = serde_json::from_slice(&serde_json::to_vec(&limits).unwrap()).unwrap();
+        assert_eq!(again, limits);
     }
 }
