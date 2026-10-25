@@ -462,6 +462,19 @@ section "Voucher enrollment" \
     "web6 has no host entry and no OTP: it enrolls with a voucher the issuer signed blindly, bound to the host's ephemeral key."
 step 0 "Enroll web6 with a bound voucher" 'pq_voucher web6 --bound'
 
+section "CI runners with leases" \
+    "carol, a CI administrator, keeps the deploy token in a vault of the ci-runners host group that opens with a ticket alone, and only for a host whose lease is running. The autoscaler's voucher gives runner1 a 4-hour lease: the KDC issues it no ticket after that, and the realm removes it an hour later."
+step 0 "carol makes the pipeline vault and seals the deploy token to it" \
+    'pq_as carol kuipa seal create deploy --require ticket --ticket-leased --sealing registered && pq_as carol kuipa seal share deploy --group ci-runners && echo "token=deploy-secret" > "$KUIPA_PLAYGROUND/deploy.txt" && pq_as carol kuipa seal file deploy "$KUIPA_PLAYGROUND/deploy.txt"' \
+    "members: group:ci-runners"
+step 0 "runner1 joins with a leased voucher" \
+    'pq_voucher runner1 --hostgroup ci-runners --lease-hours 4' '"lease":14400'
+step 0 "A job on runner1 opens the token with the runner's own ticket" \
+    'job() { KRB5CCNAME="FILE:$KUIPA_ROOT/job.ccache" KUIPA_USER_DIR="$KUIPA_ROOT/job" "$@"; } && job kinit -k -t "$KUIPA_ROOT/etc/krb5.keytab" "host/$PQ_HOST" && job klist && job kuipa seal open "$KUIPA_PLAYGROUND/deploy.txt.sealed" --out - | cat' \
+    "token=deploy-secret"
+step 75 "runner2, in the same group without a lease, does not open it" \
+    'pq_voucher runner2 --hostgroup ci-runners >/dev/null && job kinit -k -t "$KUIPA_ROOT/etc/krb5.keytab" "host/$PQ_HOST" && job kuipa seal open "$KUIPA_PLAYGROUND/deploy.txt.sealed" --out -'
+
 section "Auditing the claim logs" \
     "kuipa-audit reads the realm's public claim logs: what an anchor's tree covers, and whether the servers agree on their heads."
 step 0 "web1's pinned heads, against the realm" \

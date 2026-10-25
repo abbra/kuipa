@@ -281,9 +281,11 @@ fn publish_masters(dir: &Path, directory: &Arc<KdcDirectory>) -> Result<(), Erro
 /// The playground realm's policy: offline vault sessions, and the release
 /// group's signing, with the administrator in it.
 fn configure_policy(directory: &KdcDirectory) {
-    // The playground realm's limits: every vault needs a device, and only
+    // The playground realm's limits: every vault needs a device, only
     // the travellers group, the administrator's, may have offline
-    // sessions (DESIGN.md §7.6.2).
+    // sessions, and the CI administrators, carol, may make vaults that
+    // open with a ticket alone, for runners (DESIGN.md §7.6.2,
+    // DESIGN-ci.md §2).
     {
         let mut limits = directory.limits.lock().unwrap();
         limits.factors = vec![kuipa_enroll::vault::Factors {
@@ -291,14 +293,28 @@ fn configure_policy(directory: &KdcDirectory) {
             ..kuipa_enroll::vault::Factors::default()
         }];
         limits.offline_sessions = false;
-        limits.groups = vec![kuipa_enroll::vault::GroupLimits {
-            group: "travellers".into(),
-            priority: 10,
-            set: kuipa_enroll::vault::LimitOverrides {
-                offline_sessions: Some(true),
-                ..kuipa_enroll::vault::LimitOverrides::default()
+        limits.groups = vec![
+            kuipa_enroll::vault::GroupLimits {
+                group: "travellers".into(),
+                priority: 10,
+                set: kuipa_enroll::vault::LimitOverrides {
+                    offline_sessions: Some(true),
+                    ..kuipa_enroll::vault::LimitOverrides::default()
+                },
             },
-        }];
+            kuipa_enroll::vault::GroupLimits {
+                group: "ci-admins".into(),
+                priority: 20,
+                set: kuipa_enroll::vault::LimitOverrides {
+                    without_device: Some(true),
+                    factors: Some(vec![kuipa_enroll::vault::Factors {
+                        ticket: true,
+                        ..kuipa_enroll::vault::Factors::default()
+                    }]),
+                    ..kuipa_enroll::vault::LimitOverrides::default()
+                },
+            },
+        ];
     }
     // And let the release group sign blobs (DESIGN-sign.md); the
     // administrator is in it.
@@ -316,11 +332,9 @@ fn configure_policy(directory: &KdcDirectory) {
             ..kuipa_enroll::sign::Signers::default()
         },
     );
-    directory
-        .groups
-        .lock()
-        .unwrap()
-        .insert(ADMIN.into(), vec!["release".into(), "travellers".into()]);
+    let mut groups = directory.groups.lock().unwrap();
+    groups.insert(ADMIN.into(), vec!["release".into(), "travellers".into()]);
+    groups.insert(USERS[1].into(), vec!["ci-admins".into()]);
 }
 
 /// The secrets the directory serves: ipa1 is the CA and renewal master,
@@ -900,24 +914,32 @@ pq_promote() {{
     done
     echo "promotion material fetched into $d"
 }}
-# pq_voucher NAME [--bound] [kuipa enroll options]: enroll a new host NAME
-# with a voucher in host group webservers: blind it, have the issuer
-# ($KUIPA_PLAYGROUND/voucher, quota 100) sign it, unblind it, enroll.
-# With --bound, the voucher works only with the host's ephemeral key.
+# pq_voucher NAME [--bound] [--hostgroup G] [--lease-hours N] [kuipa enroll
+# options]: enroll a new host NAME with a voucher in host group G
+# (webservers): blind it, have the issuer ($KUIPA_PLAYGROUND/voucher,
+# quota 100) sign it, unblind it, enroll.  With --bound, the voucher works
+# only with the host's ephemeral key; with --lease-hours, the host lives
+# that long.
 pq_voucher() {{
     local name="$1"; shift
     pq_host "$name"
     local v="$KUIPA_PLAYGROUND/voucher" eph="$KUIPA_ROOT/voucher-ephemeral.jwk"
-    local bind=() key=()
-    if [ "$1" = --bound ]; then
-        shift
-        rm -f "$eph"
-        local b
-        b=$(kuipa voucher-key --out "$eph" --json | sed 's/.*"binding":"\([^"]*\)".*/\1/')
-        bind=("--binding=$b") key=("--ephemeral-key=$eph")
-    fi
+    local bind=() key=() lease=() group=webservers
+    while :; do
+        case "${{1-}}" in
+            --bound)
+                shift
+                rm -f "$eph"
+                local b
+                b=$(kuipa voucher-key --out "$eph" --json | sed 's/.*"binding":"\([^"]*\)".*/\1/')
+                bind=("--binding=$b") key=("--ephemeral-key=$eph") ;;
+            --hostgroup) group="$2"; shift 2 ;;
+            --lease-hours) lease=("--lease-hours=$2"); shift 2 ;;
+            *) break ;;
+        esac
+    done
     kuipa-voucher request --public "$v/issuer.jwk" --realm {REALM} --fqdn "$PQ_HOST" \
-        --hostgroup webservers "${{bind[@]}}" --state "$v/$name.state" \
+        --hostgroup "$group" "${{bind[@]}}" "${{lease[@]}}" --state "$v/$name.state" \
         | kuipa-voucher sign --key "$v/issuer.pem" --quota "$v/quota.json" \
         | kuipa-voucher finish --state "$v/$name.state" > "$v/$name.voucher" || return
     kuipa-voucher show < "$v/$name.voucher"
