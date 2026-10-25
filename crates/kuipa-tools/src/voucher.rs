@@ -186,6 +186,7 @@ pub struct State {
     hostgroup: String,
     not_before: u64,
     not_after: u64,
+    lease: u64,
     binding: String,
     salt: String,
 }
@@ -202,6 +203,7 @@ impl State {
             hostgroup: self.hostgroup.clone(),
             not_before: self.not_before,
             not_after: self.not_after,
+            lease: self.lease,
             binding,
         })
     }
@@ -224,6 +226,7 @@ pub fn request(public: &[u8], claims: &Claims, state: &Path) -> Result<String, E
         hostgroup: claims.hostgroup.clone(),
         not_before: claims.not_before,
         not_after: claims.not_after,
+        lease: claims.lease,
         binding: b64::encode(&claims.binding),
         salt: b64::encode(pending.salt()),
     };
@@ -294,6 +297,7 @@ mod tests {
             hostgroup: String::new(),
             not_before: 0,
             not_after: 1,
+            lease: 0,
             binding: Vec::new(),
         };
         let request = request(public.as_bytes(), &claims, &dir.join("state.json")).unwrap();

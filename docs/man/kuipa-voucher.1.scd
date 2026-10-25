@@ -63,6 +63,12 @@ Blind a voucher for one host; print the request for *sign*.
 *--days* _N_
 	Days the voucher is valid from now (default 7).
 
+*--lease-hours* _N_
+	The host lives _N_ hours from its join: the KDC issues it no
+	ticket after that, and the realm removes it an hour later. The
+	realm caps the lease (*max_lease* in *ipaKUVouchers*, default 7
+	days) and refuses a longer one at the join. For CI runners.
+
 *--binding* _BASE64_
 	Binding from *kuipa voucher-key*, base64; the voucher then
 	works only with that host's ephemeral key.

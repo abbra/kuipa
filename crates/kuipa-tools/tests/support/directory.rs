@@ -30,6 +30,8 @@ pub struct KdcDirectory {
     pub servers: Vec<String>,
     /// Spent voucher salts.
     pub spent: Mutex<HashSet<[u8; 32]>>,
+    /// When each leased host's lease ends (`DESIGN-ci.md` §1), by FQDN.
+    pub leases: Mutex<HashMap<String, u64>>,
     /// Host groups and their members, as voucher joins add them.
     pub hostgroups: Mutex<HashMap<String, Vec<String>>>,
     /// Trust invitations (secret hash → not after).
@@ -93,6 +95,7 @@ impl KdcDirectory {
             staged: Mutex::new(HashSet::new()),
             servers: servers.iter().map(|s| (*s).to_owned()).collect(),
             spent: Mutex::new(HashSet::new()),
+            leases: Mutex::new(HashMap::new()),
             hostgroups: Mutex::new(HashMap::new()),
             invitations: Mutex::new(HashMap::new()),
             trusts: Mutex::new(Vec::new()),
@@ -202,6 +205,7 @@ impl Directory for KdcDirectory {
         hostgroup: &str,
         salt: &[u8; 32],
         _: &[Enctype],
+        lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {
         if self.realm.has(&format!("host/{fqdn}@{}", self.realm.name)) {
             return Err("the host exists".into());
@@ -217,7 +221,46 @@ impl Directory for KdcDirectory {
                 .or_default()
                 .push(fqdn.to_owned());
         }
-        self.keys(fqdn)
+        let keytab = self.keys(fqdn)?;
+        if let Some(end) = lease {
+            // As krbPrincipalExpiration does: no ticket after the lease.
+            self.realm.kadmin(&[
+                "modprinc",
+                "-expire",
+                &format!("\"{}\"", kuipa_tools::text::date(end).unwrap()),
+                &format!("host/{fqdn}@{}", self.realm.name),
+            ]);
+            self.leases.lock().unwrap().insert(fqdn.to_owned(), end);
+        }
+        Ok(keytab)
+    }
+
+    fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
+        Ok(match principal.components() {
+            [service, fqdn] if service == "host" => self.leases.lock().unwrap().get(fqdn).copied(),
+            _ => None,
+        })
+    }
+
+    fn purge_leases(&self, before: u64) -> Result<Vec<String>, DirectoryError> {
+        let mut leases = self.leases.lock().unwrap();
+        let gone: Vec<String> = leases
+            .iter()
+            .filter(|(_, end)| **end < before)
+            .map(|(fqdn, _)| fqdn.clone())
+            .collect();
+        for fqdn in &gone {
+            leases.remove(fqdn);
+            self.realm.kadmin(&[
+                "delprinc",
+                "-force",
+                &format!("host/{fqdn}@{}", self.realm.name),
+            ]);
+            for members in self.hostgroups.lock().unwrap().values_mut() {
+                members.retain(|m| m != fqdn);
+            }
+        }
+        Ok(gone)
     }
 
     fn join_with_gss(
