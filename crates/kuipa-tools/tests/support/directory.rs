@@ -66,6 +66,8 @@ pub struct KdcDirectory {
     pub escrows: Mutex<HashMap<String, Vec<kuipa_enroll::vault::DeviceEscrow>>>,
     /// Deposits by vault and id (`DESIGN-recovery.md` §3).
     pub deposits: Mutex<HashMap<(VaultId, String), kuipa_enroll::vault::Deposit>>,
+    /// The realm's device-key recovery settings (`DESIGN-recovery.md` §4).
+    pub recovery: Mutex<Option<kuipa_enroll::vault::RecoverySettings>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -108,6 +110,7 @@ impl KdcDirectory {
             release_uses: Mutex::new(HashMap::new()),
             escrows: Mutex::new(HashMap::new()),
             deposits: Mutex::new(HashMap::new()),
+            recovery: Mutex::new(None),
             creds,
         }
     }
@@ -523,6 +526,12 @@ impl Directory for KdcDirectory {
             })
             .cloned()
             .collect())
+    }
+
+    fn recovery_settings(
+        &self,
+    ) -> Result<Option<kuipa_enroll::vault::RecoverySettings>, DirectoryError> {
+        Ok(self.recovery.lock().unwrap().clone())
     }
 
     fn deposit_add(&self, deposit: &kuipa_enroll::vault::Deposit) -> Result<(), DirectoryError> {

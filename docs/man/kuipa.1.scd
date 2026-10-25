@@ -362,6 +362,19 @@ On a new host, after losing every device: fetch your escrowed keys, open
 the one the code opens, and keep it beside this host's device key.
 Files sealed to the lost device open again here.
 
+## seal recover helpdesk, seal recover fetch
+
+On a new host whose device is registered: print that device's id for the
+helpdesk (*helpdesk*), and once they have delivered a lost device's key
+to it, fetch it and keep it beside this host's device key (*fetch*).
+
+## seal recover deliver _DEPOSIT_ --user _USER_ --device _ID_ [--request _ID_]
+
+As the helpdesk, a member of the realm's device vault: open the device
+deposit _DEPOSIT_ (with the approved release request, for a vault with
+approvals) and deliver the key it holds to _USER_'s device _ID_,
+encrypted to it.
+
 ## seal recover finish _SEALED_... [--retire-old]
 
 Register this host's device wherever the recovered one is, and reseal

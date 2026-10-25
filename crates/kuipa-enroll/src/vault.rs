@@ -48,13 +48,15 @@ pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault session";
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
 /// Version 2 adds the receipts of the events an operation logged, 3 the
-/// release requests, 4 device escrows, 5 deposits.
-const REPLY_VERSION: u8 = 5;
+/// release requests, 4 device escrows, 5 deposits, 6 devices and the
+/// realm's recovery settings.
+const REPLY_VERSION: u8 = 6;
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
 const SESSION_MAGIC: [u8; 4] = *b"IPST";
 const SESSION_FILE_MAGIC: [u8; 4] = *b"IPUS";
 const EPOCH_KEYS_MAGIC: [u8; 4] = *b"IPEK";
+const DELIVERY_MAGIC: [u8; 4] = *b"IPDD";
 
 /// How long an offline-session epoch lasts unless the policy says.
 pub const DEFAULT_EPOCH: u64 = 30 * 86_400;
@@ -1567,6 +1569,61 @@ pub struct Deposit {
     pub sealed: String,
 }
 
+/// The realm's device-key recovery (`DESIGN-recovery.md` §4), on
+/// `cn=recovery,cn=kuipa,cn=etc` (`ipaKURecovery`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverySettings {
+    /// The helpdesk vault device keys are deposited to, `OWNER/NAME`.
+    pub device_vault: String,
+    /// Whether an extractable device is registered only once its key is
+    /// deposited there.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// A recovered device key on its way to its holder's new device
+/// (`DESIGN-recovery.md` §4): `IPDD ct sealed`, the key's private JWK
+/// sealed under a key from an ML-KEM encapsulation to the new device.
+///
+/// # Errors
+///
+/// A crypto error.
+pub fn seal_delivery(to: &ExchangeKey, key: &ExchangeKeyPair) -> Result<Vec<u8>> {
+    let (ct, secret) = to.encapsulate()?;
+    let k = delivery_key(secret.as_ref(), to.kid(), &ct)?;
+    let sealed = primitives::seal(k.as_ref(), key.to_jwk()?.as_ref())?;
+    Ok(Writer::new(DELIVERY_MAGIC)
+        .bytes(&ct)
+        .bytes(&sealed)
+        .finish())
+}
+
+/// The key a delivery holds, opened with the device it was sealed to.
+///
+/// # Errors
+///
+/// [`Error::Malformed`], or [`Error::BadResponse`] for another device's.
+pub fn open_delivery(bytes: &[u8], device: &dyn DeviceKey) -> Result<ExchangeKeyPair> {
+    let mut r = Reader::new(bytes, DELIVERY_MAGIC, "device delivery")?;
+    let ct = r.bytes()?.to_vec();
+    let sealed = r.bytes()?.to_vec();
+    r.finish()?;
+    let secret = device.decapsulate(&ct)?;
+    let k = delivery_key(secret.as_ref(), &device.id(), &ct)?;
+    let jwk = primitives::open(k.as_ref(), &sealed).map_err(|_| Error::BadResponse)?;
+    ExchangeKeyPair::from_jwk(jwk.as_ref()).map_err(Into::into)
+}
+
+fn delivery_key(secret: &[u8], to: &Thumbprint, ct: &[u8]) -> Result<SecretBuf> {
+    let hash = suite(ct)?;
+    Ok(DOMAIN.derive_key(
+        hash,
+        &[secret],
+        "device delivery",
+        &[to.as_bytes(), &primitives::digest(hash, &[ct])?],
+    )?)
+}
+
 /// The largest escrowed device key a server keeps, in bytes.
 pub const MAX_ESCROW_BLOB: usize = 16 * 1024;
 
@@ -1751,6 +1808,27 @@ pub enum VaultOp {
         /// The deposit.
         id: String,
     },
+    /// The realm's recovery settings.
+    RecoverySettings,
+    /// The public key of `user`'s device `device`, to deliver to; members
+    /// of the realm's device vault only.
+    DeviceKey {
+        /// Whose.
+        user: String,
+        /// The device's id.
+        device: String,
+    },
+    /// Keep `blob`, a recovered key sealed to `user`'s device `device`
+    /// (`IPDD`), on `user`'s entry until they fetch it; members of the
+    /// realm's device vault only.
+    Deliver {
+        /// Whose.
+        user: String,
+        /// The device it is sealed to.
+        device: String,
+        /// The delivery, base64url.
+        blob: String,
+    },
     /// Start a session for one of the vault's devices: re-authentication,
     /// or with `offline`, the release of the vault's session keys.
     Unlock {
@@ -1799,12 +1877,16 @@ pub struct Reply {
     pub escrows: Vec<DeviceEscrow>,
     /// Deposits the operation made, listed or fetched.
     pub deposits: Vec<Deposit>,
+    /// Devices the operation looked up.
+    pub devices: Vec<Device>,
+    /// The realm's recovery settings, when asked for.
+    pub recovery: Option<RecoverySettings>,
 }
 
 impl Reply {
-    /// Encode: `IPVR` version 5, `n(u64) [descriptor] session released
-    /// m(u8) [receipt] requests escrows deposits` (session and released
-    /// empty without one, the rest JSON lists).
+    /// Encode: `IPVR` version 6, `n(u64) [descriptor] session released
+    /// m(u8) [receipt] requests escrows deposits devices recovery`
+    /// (session and released empty without one, the rest JSON).
     ///
     /// # Panics
     ///
@@ -1837,6 +1919,8 @@ impl Reply {
         w.bytes(&serde_json::to_vec(&self.requests).unwrap_or_default());
         w.bytes(&serde_json::to_vec(&self.escrows).unwrap_or_default());
         w.bytes(&serde_json::to_vec(&self.deposits).unwrap_or_default());
+        w.bytes(&serde_json::to_vec(&self.devices).unwrap_or_default());
+        w.bytes(&serde_json::to_vec(&self.recovery).unwrap_or_default());
         w.finish()
     }
 
@@ -1869,6 +1953,10 @@ impl Reply {
             serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("device escrows"))?;
         let deposits =
             serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("deposits"))?;
+        let devices =
+            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("devices"))?;
+        let recovery = serde_json::from_slice(r.bytes()?)
+            .map_err(|_| Error::Malformed("recovery settings"))?;
         r.finish()?;
         Ok(Self {
             descriptors,
@@ -1878,6 +1966,8 @@ impl Reply {
             requests,
             escrows,
             deposits,
+            devices,
+            recovery,
         })
     }
 }
@@ -2532,6 +2622,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("device=any; ticket,passkey"), "{err}");
+    }
+
+    #[test]
+    fn a_delivery_opens_only_with_the_device_it_was_sealed_to() {
+        let old = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+        let new = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+        let other = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+        let blob = seal_delivery(new.public(), &old).unwrap();
+        assert!(blob.starts_with(b"IPDD"));
+        let back = open_delivery(&blob, &new).unwrap();
+        assert_eq!(back.public().kid(), old.public().kid());
+        assert!(open_delivery(&blob, &other).is_err());
+        let mut cut = blob.clone();
+        cut.truncate(blob.len() - 1);
+        assert!(open_delivery(&cut, &new).is_err());
     }
 
     #[test]

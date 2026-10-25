@@ -231,6 +231,32 @@ file still sealed only to the old device stops opening once it is retired.
 Every escrow and every fetch of it is in your vaults' transparency logs, so
 `kuipa tlog watch` shows if someone with your password tried.
 
+### No code? The helpdesk can bring your device back
+
+If your realm keeps device keys for recovery, `kuipa seal device add`
+deposits each new device's key in a helpdesk vault, sealed so that only
+the helpdesk opens it, and only under its policy (usually several people
+approving). Your realm may require it. If you lose every device and have
+no code:
+
+```sh
+new$ kuipa seal device add notes                # a device for the new laptop
+new$ kuipa seal recover helpdesk                # prints its id: give it to the helpdesk
+```
+
+The helpdesk checks it is you, gets the release of your old device's key
+approved, and delivers it to your new device, encrypted to it. Then:
+
+```sh
+new$ kuipa seal recover fetch                   # the old key, on the new laptop
+new$ kuipa seal recover finish ~/secrets/*.sealed --retire-old
+```
+
+Only your new device opens what the helpdesk delivered, and the
+delivery is in your vaults' logs. The helpdesk member who delivered it
+held your old key for a moment, after the others approved: that is why
+`recover finish --retire-old` retires it.
+
 ### Stay signed in for a working day
 
 Typing a passphrase or touching a key for every open gets tiring. If the

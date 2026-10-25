@@ -31,8 +31,8 @@ use kuipa_enroll::join::{AuthType, Operation, Prepared};
 use kuipa_enroll::keytab::Enctype;
 use kuipa_enroll::realm::{Deployment, VerifiedRealm};
 use kuipa_enroll::vault::{
-    Descriptor, DeviceKey, DeviceType, Policy, ReleasedKeys, SealedVaultFile, SessionSealedFile,
-    SessionToken, TicketSource, Unlock, VaultOp, VerifiedDescriptor,
+    Descriptor, DeviceKey, DeviceType, Policy, SealedVaultFile, SessionSealedFile, SessionToken,
+    TicketSource, Unlock, VaultOp, VerifiedDescriptor,
 };
 use kuipa_gssapi::GssClientCred;
 use native_ossl::digest::DigestAlg;
@@ -393,16 +393,12 @@ enum Credential<'a> {
     Keytab(Option<&'a Path>),
 }
 
-/// What `op_with_session` answers: the verified descriptors, the session
-/// token, the keys released to the device and the release requests.
-type OpAnswer = (
-    Vec<VerifiedDescriptor>,
-    Option<SessionToken>,
-    Option<ReleasedKeys>,
-    Vec<kuipa_enroll::vault::ReleaseRequest>,
-    Vec<kuipa_enroll::vault::DeviceEscrow>,
-    Vec<kuipa_enroll::vault::Deposit>,
-);
+/// What `op_with_session` answers: the descriptors, verified, and the rest
+/// of the server's reply (its own descriptors moved out).
+struct OpAnswer {
+    vaults: Vec<VerifiedDescriptor>,
+    reply: kuipa_enroll::vault::Reply,
+}
 
 impl<'a> Seal<'a> {
     /// Use the host's realm files under `host`, the user's directory, and
@@ -443,7 +439,7 @@ impl<'a> Seal<'a> {
     /// Run `op` against the realm, authenticated by the user's ticket, and
     /// keep the descriptors it answers with.
     fn op(&self, op: &VaultOp) -> Result<Vec<VerifiedDescriptor>, Error> {
-        Ok(self.op_with_session(op)?.0)
+        Ok(self.op_with_session(op)?.vaults)
     }
 
     fn op_with_session(&self, op: &VaultOp) -> Result<OpAnswer, Error> {
@@ -483,22 +479,19 @@ impl<'a> Seal<'a> {
             },
             |pending, response, adv| Ok(pending.finish_vault(response, adv)?),
         )?;
+        let mut reply = reply;
         let mut verified = Vec::with_capacity(reply.descriptors.len());
-        for d in reply.descriptors {
+        for d in std::mem::take(&mut reply.descriptors) {
             let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::from_system()?)?;
             let reference = reference_for(v.vault(), me.as_deref());
             self.user
                 .write(&self.user.vault(&reference, &public.realm)?, &d.to_bytes())?;
             verified.push(v);
         }
-        Ok((
-            verified,
-            reply.session,
-            reply.released,
-            reply.requests,
-            reply.escrows,
-            reply.deposits,
-        ))
+        Ok(OpAnswer {
+            vaults: verified,
+            reply,
+        })
     }
 
     /// `kuipa seal unlock`: start a re-authentication session for this
@@ -511,11 +504,12 @@ impl<'a> Seal<'a> {
     /// directory, or any other error.
     pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
         let key = self.user.device(passphrase)?;
-        let (vaults, session, released, _, _, _) = self.op_with_session(&VaultOp::Unlock {
+        let OpAnswer { vaults, reply } = self.op_with_session(&VaultOp::Unlock {
             name: name.into(),
             device: key.public().kid().to_string(),
             offline,
         })?;
+        let (session, released) = (reply.session, reply.released);
         let session = session.ok_or("the server started no session")?;
         let epochs = match (offline, released) {
             (false, _) => Vec::new(),
@@ -1022,6 +1016,9 @@ impl<'a> Seal<'a> {
             write_device_key(self.user, &key, passphrase)?;
             (HostDevice::File(key), DeviceType::File)
         };
+        if let HostDevice::File(k) = &key {
+            self.deposit_device_key(k)?;
+        }
         let public = self.public()?;
         let v = self.op(&VaultOp::AddDevice {
             name: name.into(),
@@ -1148,7 +1145,7 @@ impl<'a> Seal<'a> {
             subject,
             sealed: tang_pqc::b64::encode(&sealed.to_bytes()),
         })?;
-        Ok(describe_deposits(name, &answer.5))
+        Ok(describe_deposits(name, &answer.reply.deposits))
     }
 
     /// `kuipa seal deposit list`: vault `name`'s deposits (a depositor's
@@ -1159,7 +1156,7 @@ impl<'a> Seal<'a> {
     /// A refusal or any other error.
     pub fn deposits(&self, name: &str) -> Result<Value, Error> {
         let answer = self.op_with_session(&VaultOp::Deposits { name: name.into() })?;
-        Ok(describe_deposits(name, &answer.5))
+        Ok(describe_deposits(name, &answer.reply.deposits))
     }
 
     /// `kuipa seal deposit fetch`: deposit `id`'s sealed file, to open as
@@ -1173,7 +1170,11 @@ impl<'a> Seal<'a> {
             name: name.into(),
             id: id.into(),
         })?;
-        let deposit = answer.5.first().ok_or("the server sent no deposit")?;
+        let deposit = answer
+            .reply
+            .deposits
+            .first()
+            .ok_or("the server sent no deposit")?;
         Ok(tang_pqc::b64::decode(&deposit.sealed)?)
     }
 
@@ -1210,7 +1211,8 @@ impl<'a> Seal<'a> {
                 bindings,
                 reason: reason.into(),
             })?
-            .3;
+            .reply
+            .requests;
         Ok(describe_requests(name, &requests))
     }
 
@@ -1225,7 +1227,8 @@ impl<'a> Seal<'a> {
             .op_with_session(&VaultOp::Pending {
                 name: name.map(str::to_owned),
             })?
-            .3;
+            .reply
+            .requests;
         Ok(describe_requests(name.unwrap_or(""), &requests))
     }
 
@@ -1247,7 +1250,10 @@ impl<'a> Seal<'a> {
                 id: id.into(),
             }
         };
-        Ok(describe_requests(name, &self.op_with_session(&op)?.3))
+        Ok(describe_requests(
+            name,
+            &self.op_with_session(&op)?.reply.requests,
+        ))
     }
 
     /// `kuipa seal recovery-code`: escrow this host's device key under a
@@ -1293,7 +1299,7 @@ impl<'a> Seal<'a> {
             read_device_key(self.user, passphrase)?;
         }
         let secret = recovery_secret(code)?;
-        let escrows = self.op_with_session(&VaultOp::RecoverCode)?.4;
+        let escrows = self.op_with_session(&VaultOp::RecoverCode)?.reply.escrows;
         let key = escrows
             .iter()
             .find_map(|e| {
@@ -1383,6 +1389,142 @@ impl<'a> Seal<'a> {
             }),
             resealed,
         ))
+    }
+
+    /// The realm's device-key recovery settings, if it has any.
+    fn recovery(&self) -> Result<Option<kuipa_enroll::vault::RecoverySettings>, Error> {
+        Ok(self
+            .op_with_session(&VaultOp::RecoverySettings)?
+            .reply
+            .recovery)
+    }
+
+    /// Where the realm keeps device keys for recovery, deposit `key` there
+    /// (`DESIGN-recovery.md` §4), unless the user already has.  A failure
+    /// stops the registration only where the realm requires the deposit.
+    fn deposit_device_key(&self, key: &ExchangeKeyPair) -> Result<(), Error> {
+        let Some(settings) = self.recovery()? else {
+            return Ok(());
+        };
+        match self.deposit_device_key_to(&settings.device_vault, key) {
+            Err(e) if !settings.required => {
+                tracing::warn!("the device key was not deposited for recovery: {e}");
+                Ok(())
+            }
+            done => done,
+        }
+    }
+
+    fn deposit_device_key_to(&self, vault: &str, key: &ExchangeKeyPair) -> Result<(), Error> {
+        let id = key.public().kid().to_string();
+        let mine = self
+            .op_with_session(&VaultOp::Deposits { name: vault.into() })?
+            .reply
+            .deposits;
+        if mine.iter().any(|d| {
+            d.kind == kuipa_enroll::vault::DepositKind::Device
+                && d.subject.get("device") == Some(&id)
+        }) {
+            return Ok(());
+        }
+        let subject = std::collections::BTreeMap::from([("device".to_owned(), id)]);
+        self.deposit(
+            vault,
+            key.to_jwk()?.as_ref(),
+            kuipa_enroll::vault::DepositKind::Device,
+            subject,
+        )?;
+        Ok(())
+    }
+
+    /// `kuipa seal recover helpdesk`: this host's device, which the
+    /// helpdesk delivers a lost device's key to.
+    ///
+    /// # Errors
+    ///
+    /// No device key here, or a wrong passphrase.
+    pub fn recover_helpdesk(&self, passphrase: &[u8]) -> Result<Value, Error> {
+        let key = self.user.device(passphrase)?;
+        Ok(json!({ "helpdesk_device": key.public().kid().to_string() }))
+    }
+
+    /// `kuipa seal recover deliver`: as the helpdesk, open deposit `id` of
+    /// the realm's device vault (with this host's device under `passphrase`
+    /// and, for a vault with approvals, the approved request `release`) and
+    /// deliver the key it holds to `user`'s device `device`, encrypted to
+    /// that device's registered public key.
+    ///
+    /// # Errors
+    ///
+    /// No device recovery in the realm, not a device deposit, a refusal
+    /// (not the helpdesk, no such device of the user's), or any other
+    /// error.
+    pub fn deliver(
+        &self,
+        id: &str,
+        to: (&str, &str),
+        passphrase: Option<&[u8]>,
+        release: Option<&str>,
+    ) -> Result<Value, Error> {
+        let (user, device) = to;
+        let settings = self.recovery()?.ok_or("the realm has no device recovery")?;
+        let sealed = self.deposit_file(&settings.device_vault, id)?;
+        let jwk = self.open_with(&sealed, passphrase, release)?;
+        let old = ExchangeKeyPair::from_jwk(jwk.as_ref())?;
+        let found = self
+            .op_with_session(&VaultOp::DeviceKey {
+                user: user.into(),
+                device: device.into(),
+            })?
+            .reply
+            .devices;
+        let new = found
+            .first()
+            .ok_or("the server named no such device")?
+            .public()?;
+        if new.kid().to_string() != device {
+            return Err("the server named another device".into());
+        }
+        let blob = kuipa_enroll::vault::seal_delivery(&new, &old)?;
+        self.op_with_session(&VaultOp::Deliver {
+            user: user.into(),
+            device: device.into(),
+            blob: tang_pqc::b64::encode(&blob),
+        })?;
+        Ok(json!({
+            "delivered": old.public().kid().to_string(),
+            "user": user,
+            "to_device": device,
+        }))
+    }
+
+    /// `kuipa seal recover fetch`: the key the helpdesk delivered to this
+    /// host's device, kept here as the recovered key, under `passphrase`.
+    ///
+    /// # Errors
+    ///
+    /// No delivery for this device, a wrong passphrase, a recovered key
+    /// already here, a refusal.
+    pub fn recover_fetch(&self, passphrase: &[u8]) -> Result<Value, Error> {
+        if self.user.recovered_key().exists() {
+            return Err(
+                "a recovered key is already here: `kuipa seal recover finish` first".into(),
+            );
+        }
+        let device = self.user.device(passphrase)?;
+        let mine = device.public().kid().to_string();
+        let escrows = self.op_with_session(&VaultOp::RecoverCode)?.reply.escrows;
+        let key = escrows
+            .iter()
+            .filter(|e| e.kind == "delivery" && e.device == mine)
+            .find_map(|e| {
+                let blob = tang_pqc::b64::decode(&e.blob).ok()?;
+                kuipa_enroll::vault::open_delivery(&blob, device.as_device()).ok()
+            })
+            .ok_or("nothing was delivered to this host's device")?;
+        self.user
+            .write(&self.user.recovered_key(), &protect_key(&key, passphrase)?)?;
+        Ok(json!({ "recovered": key.public().kid().to_string() }))
     }
 
     /// `kuipa seal revoke`.
@@ -1754,6 +1896,10 @@ fn describe_event(
         ),
         A::Deposit => ("deposit", None),
         A::RetireDeposit => ("retire-deposit", None),
+        A::Deliver => (
+            "deliver",
+            Some("a recovered key was delivered to the device"),
+        ),
         A::Request => ("request", None),
         A::Approve => ("approve", None),
         A::Deny => ("deny", None),

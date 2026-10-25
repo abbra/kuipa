@@ -76,6 +76,8 @@ struct MemoryDirectory {
     escrows: RefCell<HashMap<String, Vec<vault::DeviceEscrow>>>,
     /// Deposits by vault and id (`DESIGN-recovery.md` §3).
     deposits: RefCell<HashMap<(VaultId, String), vault::Deposit>>,
+    /// The realm's device-key recovery settings (§4).
+    recovery: RefCell<Option<vault::RecoverySettings>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -352,6 +354,10 @@ impl Directory for MemoryDirectory {
             })
             .cloned()
             .collect())
+    }
+
+    fn recovery_settings(&self) -> Result<Option<vault::RecoverySettings>, DirectoryError> {
+        Ok(self.recovery.borrow().clone())
     }
 
     fn deposit_add(&self, deposit: &vault::Deposit) -> Result<(), DirectoryError> {
@@ -3326,6 +3332,121 @@ fn depositors_deposit_and_never_open() {
     depositors_deposit_members_open(&d);
     deposits_replace_and_are_limited(&d);
     deposits_retire(&d);
+}
+
+/// Carol's escrow vault, which the realm names for device keys and whose
+/// depositor Alice is, with deposits required; Alice's vault `notes`.
+fn helpdesk_realm() -> Realm {
+    let (r, _) = logged_realm();
+    let adv = &r.verify(0);
+    let policy = vault::Policy {
+        factors: Factors {
+            device: Some(Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    for (who, name) in [(CAROL, "escrow"), (ALICE, "notes")] {
+        let create = VaultOp::Create {
+            name: name.into(),
+            policy: policy.clone(),
+        };
+        vault_op(&r, adv, who, &create).unwrap();
+    }
+    let carol_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    vault_op(&r, adv, CAROL, &add_device_op("escrow", &carol_key)).unwrap();
+    let shared = VaultOp::Share {
+        name: "escrow".into(),
+        managers: vault::Members::default(),
+        members: vault::Members::default(),
+        depositors: member_users(&["alice"]),
+    };
+    vault_op(&r, adv, CAROL, &shared).unwrap();
+    *r.dir.recovery.borrow_mut() = Some(vault::RecoverySettings {
+        device_vault: "carol/escrow".into(),
+        required: true,
+    });
+    r
+}
+
+/// Alice's device is registered only once its key is deposited.
+fn device_keys_are_deposited_first(r: &Realm, laptop: &ExchangeKeyPair) {
+    let adv = &r.verify(0);
+    let op = |who: &str, op: &VaultOp| vault_reply_at(r, 0, adv, who, op);
+    let settings = op(BOB, &VaultOp::RecoverySettings).unwrap().recovery;
+    assert_eq!(settings.unwrap().device_vault, "carol/escrow");
+    assert!(
+        op(ALICE, &add_device_op("notes", laptop)).is_err(),
+        "not deposited"
+    );
+    let escrow = op(
+        ALICE,
+        &VaultOp::Show {
+            name: "carol/escrow".into(),
+        },
+    )
+    .unwrap();
+    let escrow = escrow.descriptors[0]
+        .verify(REALM, &r.all_anchors(), &Policy::default())
+        .unwrap();
+    let advs = [r.verify(0), r.verify(1)];
+    let jwk = laptop.to_jwk().unwrap();
+    let sealed = SealedVaultFile::seal(&escrow, &[&advs[0], &advs[1]], jwk.as_ref()).unwrap();
+    let deposit = VaultOp::Deposit {
+        name: "carol/escrow".into(),
+        kind: vault::DepositKind::Device,
+        subject: [("device".to_owned(), laptop.public().kid().to_string())].into(),
+        sealed: tang_pqc::b64::encode(&sealed.to_bytes()),
+    };
+    op(ALICE, &deposit).unwrap();
+    op(ALICE, &add_device_op("notes", laptop)).unwrap();
+}
+
+/// Only the helpdesk looks up a user's device and delivers to it, and
+/// only to a device the user registered; only that device opens it.
+fn the_helpdesk_delivers(r: &Realm, laptop: &ExchangeKeyPair) {
+    let adv = &r.verify(0);
+    let op = |who: &str, op: &VaultOp| vault_reply_at(r, 0, adv, who, op);
+    let id = laptop.public().kid().to_string();
+    let key_of = |who: &str, device: &str| {
+        let lookup = VaultOp::DeviceKey {
+            user: ALICE.into(),
+            device: device.into(),
+        };
+        op(who, &lookup)
+    };
+    assert!(key_of(BOB, &id).is_err(), "not the helpdesk");
+    assert!(key_of(CAROL, "no-such-device").is_err());
+    let found = key_of(CAROL, &id).unwrap().devices;
+    assert_eq!(found[0].public().unwrap().kid(), laptop.public().kid());
+    let lost = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let blob = vault::seal_delivery(laptop.public(), &lost).unwrap();
+    let deliver = |who: &str, blob: &[u8]| {
+        let delivery = VaultOp::Deliver {
+            user: ALICE.into(),
+            device: id.clone(),
+            blob: tang_pqc::b64::encode(blob),
+        };
+        op(who, &delivery)
+    };
+    assert!(deliver(BOB, &blob).is_err(), "not the helpdesk");
+    assert!(deliver(CAROL, b"not a delivery").is_err());
+    let delivered = deliver(CAROL, &blob).unwrap();
+    assert_eq!(delivered.receipts.len(), 1, "logged in Alice's vault");
+    let escrows = op(ALICE, &VaultOp::RecoverCode).unwrap().escrows;
+    let delivery = escrows.iter().find(|e| e.kind == "delivery").unwrap();
+    let opened =
+        vault::open_delivery(&tang_pqc::b64::decode(&delivery.blob).unwrap(), laptop).unwrap();
+    assert_eq!(opened.public().kid(), lost.public().kid());
+}
+
+#[test]
+fn the_helpdesk_delivers_deposited_device_keys() {
+    let r = helpdesk_realm();
+    let laptop = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    device_keys_are_deposited_first(&r, &laptop);
+    the_helpdesk_delivers(&r, &laptop);
 }
 
 /// Run a vault operation as `caller` against server `i`.

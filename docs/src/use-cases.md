@@ -41,12 +41,12 @@ source tree.
 | [Seal your own files](#seal-your-own-files) | every user | partly |
 | [Share a vault with a team or a fleet](#share-a-vault-with-a-team-or-a-fleet) | teams, fleet owners | works |
 | [Require several people to approve a break-glass release](#require-several-people-to-approve-a-break-glass-release) | security teams | works |
+| [Recover a vault when every device is lost](#recover-a-vault-when-every-device-is-lost) | every user, helpdesk | works |
 | [See who touched your vault](#see-who-touched-your-vault) | every user | works |
 | [Work offline for a while](#work-offline-for-a-while) | every user | works where the realm allows it |
 | [Sign files and commits under your login](#sign-files-and-commits-under-your-login) | developers, release engineers, CI | works |
 | [Have independent witnesses watch the logs](#have-independent-witnesses-watch-the-logs) | auditors, partner sites | works |
 | [Log in offline without a crackable password cache](#log-in-offline-without-a-crackable-password-cache) | laptop users | planned |
-| [Recover a vault when every device is lost](#recover-a-vault-when-every-device-is-lost) | every user, helpdesk | partly: recovery codes |
 | [Tie secrets to a TPM, passkey or attested hardware](#tie-secrets-to-a-tpm-passkey-or-attested-hardware) | users, fleet owners | planned |
 | [Give CI runners short-lived identities](#give-ci-runners-short-lived-identities) | platform teams | planned |
 | [Anonymous tokens: surveys, reports, access](#anonymous-tokens-surveys-reports-access) | everyone | research |
@@ -252,6 +252,22 @@ log.
 **Status:** works. See [Sealing your own files](user/sealing.md#a-break-glass-secret-several-people-approve)
 and [release approvals](reference/design.md#kuipa-release-approvals-m-of-n-before-a-break-glass-release).
 
+### Recover a vault when every device is lost
+
+**Why.** If a vault requires your device and you lose all your devices,
+your files are gone.
+
+**What kuipa does.** A recovery code you print brings your device key
+back on a new machine. Without one, the helpdesk delivers it from a vault
+it was deposited in when you registered the device, under several
+people's approval and recorded in the transparency log. Hosts and
+services deposit their LUKS and backup keys into a helpdesk vault the
+same way, and cannot read them back.
+
+**Status:** works. See [Sealing your own files](user/sealing.md#keep-a-recovery-code-in-case-it-was-your-only-device),
+[Protecting keytabs and files](host/protect.md#deposit-recovery-keys-with-the-helpdesk)
+and [recovery](reference/design.md#kuipa-recovery-lost-devices-luks-and-backup-keys).
+
 ### Sign files and commits under your login
 
 **Why.** Signing usually means guarding a private key on every laptop
@@ -283,23 +299,6 @@ laptop: the realm signs an offline grant for one user, one machine and a
 time window. The password check moves into the laptop's TPM, which
 limits guesses and works only on that machine and only within the
 window. The disk holds nothing to guess against.
-
-### Recover a vault when every device is lost
-
-**Why.** If a vault requires your device and you lose all your devices,
-your files are gone.
-
-**What kuipa would do.** A recovery slot held by a helpdesk group, used
-only under policy and recorded in the transparency log. The same slot
-can escrow LUKS and backup recovery keys.
-
-**Status:** partly. A recovery code you print brings your device key back
-on a new machine ([Sealing your own files](user/sealing.md#keep-a-recovery-code-in-case-it-was-your-only-device)),
-and hosts and services deposit their LUKS and backup keys into a
-helpdesk vault they cannot open ([Protecting keytabs and files](host/protect.md#deposit-recovery-keys-with-the-helpdesk)).
-Still designed only: your device key deposited in a helpdesk vault and
-handed back under several people's approval. See
-[recovery](reference/design.md#kuipa-recovery-lost-devices-luks-and-backup-keys).
 
 ### Tie secrets to a TPM, passkey or attested hardware
 

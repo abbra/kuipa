@@ -676,6 +676,38 @@ enum RecoverAction {
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
     },
+    /// Print this host's device, for the helpdesk to deliver a lost
+    /// device's key to (register it in a vault first).
+    Helpdesk {
+        /// Read the device passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// As the helpdesk: open a device deposit of the realm's device vault
+    /// and deliver the key to the user's new device.
+    Deliver {
+        /// The deposit's id (`kuipa seal deposit list`).
+        deposit: String,
+        /// Whose key it is.
+        #[arg(long, value_name = "USER")]
+        user: String,
+        /// The user's new device (`kuipa seal recover helpdesk` printed it).
+        #[arg(long, value_name = "ID")]
+        device: String,
+        /// The approved release request, for a vault with approvals.
+        #[arg(long, value_name = "ID")]
+        request: Option<String>,
+        /// Read this host's device passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Fetch the key the helpdesk delivered to this host's device, and keep
+    /// it beside this host's own.
+    Fetch {
+        /// Read the device passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
     /// Register this host's device wherever the recovered one is, and
     /// reseal the files to it; with --retire-old, also retire the
     /// recovered device.
@@ -2368,6 +2400,27 @@ fn run_recover(
             let pass = passphrase(passphrase_file.as_deref(), first)?;
             seal.recover_code(code, pass.as_ref())
         }
+        RecoverAction::Helpdesk { passphrase_file } => {
+            seal.recover_helpdesk(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        }
+        RecoverAction::Deliver {
+            deposit,
+            user,
+            device,
+            request,
+            passphrase_file,
+        } => {
+            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            seal.deliver(
+                deposit,
+                (user, device),
+                Some(pass.as_ref()),
+                request.as_deref(),
+            )
+        }
+        RecoverAction::Fetch { passphrase_file } => {
+            seal.recover_fetch(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        }
         RecoverAction::Finish {
             sealed,
             retire_old,
@@ -2534,6 +2587,16 @@ fn render_recovery(value: &Value) -> bool {
         println!();
         println!(
             "Write it down and keep it away from this host. It is shown only now; with it and your password, `kuipa seal recover code` brings this device's key back on another host."
+        );
+    } else if let Some(device) = get(value, "helpdesk_device").as_str() {
+        println!(
+            "This host's device is {device}. Give it to the helpdesk, with the id of the lost device; once they have delivered its key, run `kuipa seal recover fetch`."
+        );
+    } else if let Some(old) = get(value, "delivered").as_str() {
+        println!(
+            "Device {old}'s key is delivered to {}'s device {}: only that device opens it.",
+            get(value, "user").as_str().unwrap_or("?"),
+            get(value, "to_device").as_str().unwrap_or("?")
         );
     } else if let Some(device) = get(value, "recovered").as_str() {
         println!(

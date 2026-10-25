@@ -814,6 +814,9 @@ pub enum VaultAction {
     Deposit = 16,
     /// A deposit was removed.
     RetireDeposit = 17,
+    /// A recovered key was delivered to the device (`DESIGN-recovery.md`
+    /// §4).
+    Deliver = 18,
 }
 
 impl VaultAction {
@@ -828,9 +831,11 @@ impl VaultAction {
             | Self::Unshare
             | Self::Deposit
             | Self::RetireDeposit => Kind::VAULT_POLICY,
-            Self::AddDevice | Self::RemoveDevice | Self::EscrowCode | Self::RecoverCode => {
-                Kind::VAULT_DEVICE
-            }
+            Self::AddDevice
+            | Self::RemoveDevice
+            | Self::EscrowCode
+            | Self::RecoverCode
+            | Self::Deliver => Kind::VAULT_DEVICE,
             Self::Session
             | Self::OfflineSession
             | Self::Release
@@ -859,6 +864,7 @@ impl VaultAction {
             15 => Self::RecoverCode,
             16 => Self::Deposit,
             17 => Self::RetireDeposit,
+            18 => Self::Deliver,
             _ => return Err(Error::Malformed("vault event action")),
         })
     }
