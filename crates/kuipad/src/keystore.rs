@@ -39,17 +39,24 @@ fn read_private(path: PathBuf) -> Result<native_ossl::util::SecretBuf, Error> {
     Ok(native_ossl::util::SecretBuf::new(fs::read(path)?))
 }
 
-/// Which keys [`KeyStore::rotate`] replaces, one flag per
-/// `rotate-keys` option.
+/// Which retired keys [`KeyStore::rotate`] replaces: the join, escrow and
+/// trust keys, whose old ones are kept for what they answered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct Rotation {
+pub struct Retire {
     /// Retire the join keys and create a new one.
     pub join: bool,
     /// Retire the escrow keys and create a new one.
     pub escrow: bool,
     /// Retire the trust keys and create a new one.
     pub trust: bool,
+}
+
+/// Which keys [`KeyStore::rotate`] replaces, one flag per
+/// `rotate-keys` option.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rotation {
+    /// The join, escrow and trust keys to retire.
+    pub retire: Retire,
     /// Replace the signing key.  The old one is not kept: it only signs
     /// advertisements and bundles, and the next claim names the new one.
     pub signing: bool,
@@ -247,9 +254,9 @@ impl KeyStore {
         let mut changes = Changes::default();
         let current = self.names()?;
         for (role, wanted) in [
-            ("join", which.join),
-            ("escrow", which.escrow),
-            ("trust", which.trust),
+            ("join", which.retire.join),
+            ("escrow", which.retire.escrow),
+            ("trust", which.retire.trust),
         ] {
             if !wanted {
                 continue;
@@ -548,9 +555,11 @@ mod tests {
 
         let changes = store
             .rotate(Rotation {
-                join: true,
+                retire: Retire {
+                    join: true,
+                    ..Retire::default()
+                },
                 signing: true,
-                ..Rotation::default()
             })
             .unwrap();
         assert_eq!(changes.created.len(), 2, "{changes:?}");
@@ -568,7 +577,10 @@ mod tests {
         // Escrow keys are kept longer than join keys.
         store
             .rotate(Rotation {
-                escrow: true,
+                retire: Retire {
+                    escrow: true,
+                    ..Retire::default()
+                },
                 ..Rotation::default()
             })
             .unwrap();
