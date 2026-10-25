@@ -29,29 +29,18 @@ pub struct Ca {
     pub kind: CaKind,
 }
 
-/// A deterministic 32-byte ML-DSA seed derived from `label`.
-fn seed(label: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32);
-    for i in 0..4u64 {
-        out.extend_from_slice(
-            &crate::prng::SplitMix64::hash(label.as_bytes())
-                .wrapping_add(i)
-                .to_le_bytes(),
-        );
-    }
-    out
-}
-
 /// A positive, deterministic serial derived from `label`.
 fn serial(label: &str) -> synta::Integer {
-    synta::Integer::from_u64(u64::from_le_bytes(seed(label)[..8].try_into().unwrap()) | 1)
+    synta::Integer::from_u64(crate::prng::SplitMix64::hash(label.as_bytes()) | 1)
 }
 
 /// Generate a private key of `kind`.
 ///
-/// ML-DSA takes a fixed seed so fixture certificates are identical run to
-/// run; RSA and EC keygen draws from the provider and cannot be seeded, but
-/// their output sizes are fixed, which is what the benches measure.
+/// Every key, of every kind, draws from the provider: a fixture CA's
+/// private key must not be derivable from the source.  Each call is a new
+/// key, so a [`chain`] is that many distinct CAs.  Certificate sizes are
+/// fixed by the key type and parameter set, which is what keeps runs
+/// comparable.
 ///
 /// # Errors
 ///
@@ -74,17 +63,7 @@ pub fn key(kind: CaKind) -> Result<Pkey<Private>, native_ossl::error::ErrorStack
             ctx.set_params(&params)?;
             ctx.generate()
         }
-        CaKind::MlDsa65 => {
-            let params = native_ossl::params::ParamBuilder::new()?
-                .set(
-                    native_ossl::typed_params::ml_dsa::SEED,
-                    seed("kuipa-bench-ca").as_slice(),
-                )?
-                .build()?;
-            let mut ctx = KeygenCtx::new(c"ML-DSA-65")?;
-            ctx.set_params(&params)?;
-            ctx.generate()
-        }
+        CaKind::MlDsa65 => KeygenCtx::new(c"ML-DSA-65")?.generate(),
     }
 }
 
@@ -155,8 +134,8 @@ pub fn generate(kind: CaKind, cn: &str) -> Result<Ca, String> {
     })
 }
 
-/// `count` CA certificates of `kind`, for an advertisement that carries
-/// several roots.
+/// `count` CA certificates of `kind`, each on its own key, for an
+/// advertisement that carries several roots.
 ///
 /// # Errors
 ///
@@ -169,7 +148,16 @@ pub fn chain(kind: CaKind, count: usize) -> Result<Vec<Vec<u8>>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaKind, generate};
+    use super::{CaKind, generate, key};
+
+    #[test]
+    fn every_ca_key_is_fresh() {
+        for kind in [CaKind::Rsa2048, CaKind::EcP256, CaKind::MlDsa65] {
+            let a = key(kind).unwrap().public_key_to_der().unwrap();
+            let b = key(kind).unwrap().public_key_to_der().unwrap();
+            assert_ne!(a, b, "{} keys repeat", kind.name());
+        }
+    }
 
     #[test]
     fn ec_ca_is_a_der_sequence() {

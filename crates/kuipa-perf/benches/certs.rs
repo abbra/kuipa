@@ -2,9 +2,9 @@
 //! certificates it pins, per kind, including the post-quantum CA that
 //! `pqproduction` uses.
 //!
-//! Key generation is nondeterministic for RSA and EC (OpenSSL draws its own
-//! randomness) and deterministic for ML-DSA-65 from a fixed seed, so sizes
-//! are stable and timings comparable across runs.
+//! Key generation draws from OpenSSL for every kind, so no two runs share a
+//! key; certificate sizes are fixed by the key type and parameter set, so
+//! timings stay comparable across runs.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use kuipa_perf::CaKind;
