@@ -13,7 +13,7 @@ The same flow, with many more steps, runs scripted in
 `./contrib/ci/local-ci.sh playground-test`, which writes a report to
 `kuipa-playground-report/`: every step's output and trace, plus an
 animated terminal capture of each section of the session. This page
-follows that session's sixteen sections; the traced steps below quote
+follows that session's seventeen sections; the traced steps below quote
 it, so what you read here is what CI saw, minus the playground's
 throwaway paths and thumbprints.
 
@@ -446,7 +446,41 @@ print as JSON — `kuipa-voucher show` output, machine-readable, so its
 same summary again. Vouchers are for fleets; see
 [Cloud virtual machines](cloud.md).
 
-## 11. Auditing the claim logs: `kuipa-audit`
+## 11. CA chains: what a host installs, and what it refuses
+
+A host writes the CA certificates and PKINIT anchors that the verified
+advertisement carries into `ca.crt`, its PKINIT anchors and `krb5.conf`.
+Their trust comes from the advertisement's signature, but each entry must
+still be a CA certificate before anything is written: one DER certificate
+with basic constraints `cA` (and `keyCertSign`, if it has a key usage), or a
+Merkle Tree CA, recognised by its critical Merkle Tree CA extension.
+
+The playground runs three servers outside the anchor exchange, each delegated
+by ipa1's anchor, so they verify like any server of the realm, and each
+advertising a chain of its own. app1 tries them in turn:
+
+- **ipa-pem** carries its CA certificate as PEM text where DER belongs — a
+  configuration mistake that is easy to make. The enrollment stops with
+  `CA certificate 2 is not a DER certificate`, and app1 has nothing installed:
+  the chain is checked when the advertisement is, before the join.
+- **ipa-kdccert** offers the KDC's own certificate among its PKINIT anchors.
+  It is an end entity, so: `PKINIT anchor 2 is an end-entity certificate, not
+  a CA`.
+- **ipa-mtc** adds the IETF demo's Merkle Tree CA to the realm's CA. It is
+  unsigned (RFC 9925) and has no key usage that signs certificates, but its
+  extension makes it a CA: `kuipa realm-info` installs both certificates, and
+  app1 enrolls through it.
+
+app1's `kuipa check` then lists all three as the realm's servers: ipa-mtc's
+advertisement verifies, and the other two are reported with what is wrong
+with their chains, so a broken chain on any server shows up in the health
+check rather than in a failed `kinit`.
+
+A server checks its own `ca_file` and `pkinit_anchors_file` the same way, so
+kuipad refuses to start from either rather than advertise what every host
+would refuse.
+
+## 12. Auditing the claim logs: `kuipa-audit`
 
 `kuipa-audit coverage` reads the realm's public claim logs and checks
 what the pinned heads cover: for each anchor, the pinned head (`2
@@ -471,7 +505,7 @@ leaf count     2
 An auditor deciding whether to trust a log reasons in calendar time;
 see [Auditing and mirroring](../realm/audit.md).
 
-## 12. A keyless mirror: `kuipa-mirror`
+## 13. A keyless mirror: `kuipa-mirror`
 
 `kuipa-mirror` syncs the public endpoints of one server and serves them
 read-only. The claim-log answer above came from the mirror, not ipa1:
@@ -480,7 +514,7 @@ the mirror. When the origin is unreachable past a vouch's expiry, the
 mirror's head proofs stop verifying for new verifications — the
 clients' own clocks decide, and the mirror cannot lie about it.
 
-## 13. The trusted realm: `pq_trust`, `pq_trusted_kinit`, `pq_trusted`
+## 14. The trusted realm: `pq_trust`, `pq_trusted_kinit`, `pq_trusted`
 
 web1 installs the realm its realm trusts, `B.TEST`, verified through
 EXAMPLE.TEST's advertisement:
@@ -512,14 +546,14 @@ The ticket and the configuration stay in `$KUIPA_ROOT/trusted-login`;
 path: her TGT, the cross-realm ticket, and the service ticket from
 EXAMPLE.TEST's KDC.
 
-## 14. Post-quantum Tang: `tang-pqc`
+## 15. Post-quantum Tang: `tang-pqc`
 
 ipa1 also serves post-quantum Tang: a secret encrypted with the
 tang-pqc pin (`echo "a secret" | tang-pqc encrypt "$(pq_tang)"`) is
 recovered with ipa1's help — `tang-pqc decrypt` prints `a secret`
 back. The same escrow machinery as the keytab, on a public pin.
 
-## 15. Replica promotion: `kuipa keys fetch`
+## 16. Replica promotion: `kuipa keys fetch`
 
 web7 imitates a promoting replica: it fetches the material promotion
 delivers — the DM password hash, the RA agent key, the CA subsystem
@@ -540,7 +574,7 @@ An unknown nickname is refused; the wrapped CA keys need the CA role
 before `pq_promote` fetches the whole set. A removed server
 (`ipa-server-del`) is refused again.
 
-## 16. Failure is reported: `kuipa check` with both servers down
+## 17. Failure is reported: `kuipa check` with both servers down
 
 ```
     ipa1.example.test: server unreachable: error sending request for url (http://127.0.0.1:9/ipa/ku/adv?anchor=…&head=…)

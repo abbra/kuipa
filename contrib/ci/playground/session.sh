@@ -475,6 +475,28 @@ step 0 "A job on runner1 opens the token with the runner's own ticket" \
 step 75 "runner2, in the same group without a lease, does not open it" \
     'pq_voucher runner2 --hostgroup ci-runners >/dev/null && job kinit -k -t "$KUIPA_ROOT/etc/krb5.keytab" "host/$PQ_HOST" && job kuipa seal open "$KUIPA_PLAYGROUND/deploy.txt.sealed" --out -'
 
+section "CA chains" \
+    "A host installs the CA certificates and PKINIT anchors the verified advertisement carries, so each must be a CA certificate before anything is written. Three servers ipa1's anchor delegates advertise chains of their own, and app1 tries each: a chain with a certificate that is not one, or an end entity among the anchors, is refused; one that includes a Merkle Tree CA is installed."
+step fail "ipa-pem advertises its CA certificate as PEM text, where DER belongs" \
+    'pq_host app1; kuipa enroll --server ipa-pem.example.test --hostname "$PQ_HOST" --enrollment-file "$KUIPA_PLAYGROUND/enroll/app1"' \
+    "CA certificate 2 is not a DER certificate"
+step 0 "Nothing was installed: the chain is checked before the join" \
+    '[ -z "$(ls -A "$KUIPA_ROOT")" ] && echo "app1 has nothing installed"' \
+    "app1 has nothing installed"
+step fail "ipa-kdccert offers the KDC's own certificate as a PKINIT anchor" \
+    'kuipa enroll --server ipa-kdccert.example.test --hostname "$PQ_HOST" --enrollment-file "$KUIPA_PLAYGROUND/enroll/app1"' \
+    "PKINIT anchor 2 is an end-entity certificate, not a CA"
+step 0 "ipa-mtc's chain includes a Merkle Tree CA, unsigned: installed as advertised" \
+    'kuipa realm-info --server ipa-mtc.example.test --krb5-dir "$KUIPA_ROOT/bootstrap" && echo "$(grep -c "BEGIN CERTIFICATE" "$KUIPA_ROOT/bootstrap/ca.crt") CA certificates installed"' \
+    "2 CA certificates installed"
+step 0 "app1 enrolls through ipa-mtc" \
+    'kuipa enroll --server ipa-mtc.example.test --hostname "$PQ_HOST" --enrollment-file "$KUIPA_PLAYGROUND/enroll/app1"' \
+    "principal: host/app1.example.test@EXAMPLE.TEST"
+step 1 "app1's health check keeps refusing the servers with broken chains" 'kuipa check' \
+    "ipa-mtc.example.test: advertisement verified" \
+    "ipa-pem.example.test: advertisement: CA certificate 2 is not a DER certificate" \
+    "ipa-kdccert.example.test: advertisement: PKINIT anchor 2 is an end-entity certificate, not a CA"
+
 section "Auditing the claim logs" \
     "kuipa-audit reads the realm's public claim logs: what an anchor's tree covers, and whether the servers agree on their heads."
 step 0 "web1's pinned heads, against the realm" \
