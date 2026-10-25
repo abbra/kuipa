@@ -537,8 +537,8 @@ Start a throwaway kuipa realm and drop you into a shell inside it:
   * two IPA servers, ipa1 and ipa2.example.test, running the daemon's HTTP
     router over a directory backed by that KDC (GSS-API for real, keys from
     the KDC; only the LDAP side is simulated);
-  * OTP enrollment strings for web1..webN.example.test and an administrator,
-    admin@EXAMPLE.TEST (password Secret123);
+  * OTP enrollment strings for web1..webN.example.test, an administrator,
+    admin@EXAMPLE.TEST (password Secret123), and the users bob and carol;
   * the kuipa, kuipa-unseal, kuipa-voucher, tang-pqc and kuipa-playground binaries on PATH, and
     shell helpers (pq_host, pq_enroll, pq_down/pq_up, pq_bootstrap, pq_log).
 
@@ -650,6 +650,7 @@ run_interactive_playground() {
     echo "  servers:      ipa1.example.test, ipa2.example.test  (pq_log shows their log)"
     echo "  anchor:       $PQ_ANCHOR"
     echo "  admin:        admin@EXAMPLE.TEST, password Secret123"
+    echo "  users:        bob, carol (the same password; pq_as USER CMD runs as them)"
     echo "  hosts:        web1..web$hosts.example.test; OTP strings in \$KUIPA_PLAYGROUND/enroll/"
     echo "  current host: web1 (pq_host NAME switches; each host has its own KUIPA_ROOT)"
     echo
@@ -663,6 +664,8 @@ run_interactive_playground() {
     echo "        --use-ccache                      # armoured kinit, ticket join"
     echo "    pq_offline web5                       # prepare, stage, open the bundle"
     echo "    kuipa complete                       # first contact: rekey the staged keys"
+    echo "    pq_admin_kinit; kuipa seal create team --require device,ticket"
+    echo "    kuipa seal share team --user bob; pq_as bob kuipa seal list"
     echo
     echo "  Exit this shell (exit or Ctrl-D) to tear the playground down."
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"

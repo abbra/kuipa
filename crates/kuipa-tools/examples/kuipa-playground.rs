@@ -50,6 +50,9 @@ const DOMAIN: &str = "example.test";
 const SERVERS: [&str; 2] = ["ipa1.example.test", "ipa2.example.test"];
 const ADMIN: &str = "admin@EXAMPLE.TEST";
 const ADMIN_PASSWORD: &str = "Secret123";
+/// The realm's other users, for shared vaults, approvals and deposits
+/// (`pq_as`); their password is the administrator's.
+const USERS: [&str; 2] = ["bob@EXAMPLE.TEST", "carol@EXAMPLE.TEST"];
 const TRUSTED_REALM: &str = "B.TEST";
 const TRUSTED_DOMAIN: &str = "b.test";
 const TRUSTED_SERVER: &str = "ipa1.b.test";
@@ -93,6 +96,9 @@ fn run(args: &[String]) -> Result<(), Error> {
         }
     }
     realm.add_user(ADMIN, ADMIN_PASSWORD);
+    for user in USERS {
+        realm.add_user(user, ADMIN_PASSWORD);
+    }
     let dir = realm.dir.clone();
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -221,8 +227,25 @@ fn publish_masters(dir: &Path, directory: &Arc<KdcDirectory>) -> Result<(), Erro
 /// The playground realm's policy: offline vault sessions, and the release
 /// group's signing, with the administrator in it.
 fn configure_policy(directory: &KdcDirectory) {
-    // The playground realm's administrators allow offline vault sessions.
-    directory.limits.lock().unwrap().offline_sessions = true;
+    // The playground realm's limits: every vault needs a device, and only
+    // the travellers group, the administrator's, may have offline
+    // sessions (DESIGN.md §7.6.2).
+    {
+        let mut limits = directory.limits.lock().unwrap();
+        limits.factors = vec![kuipa_enroll::vault::Factors {
+            device: Some(kuipa_enroll::vault::Level::Any),
+            ..kuipa_enroll::vault::Factors::default()
+        }];
+        limits.offline_sessions = false;
+        limits.groups = vec![kuipa_enroll::vault::GroupLimits {
+            group: "travellers".into(),
+            priority: 10,
+            set: kuipa_enroll::vault::LimitOverrides {
+                offline_sessions: Some(true),
+                ..kuipa_enroll::vault::LimitOverrides::default()
+            },
+        }];
+    }
     // And let the release group sign blobs (DESIGN-sign.md); the
     // administrator is in it.
     directory.sign_policy.lock().unwrap().purposes.insert(
@@ -243,7 +266,7 @@ fn configure_policy(directory: &KdcDirectory) {
         .groups
         .lock()
         .unwrap()
-        .insert(ADMIN.into(), vec!["release".into()]);
+        .insert(ADMIN.into(), vec!["release".into(), "travellers".into()]);
 }
 
 /// The secrets the directory serves: ipa1 is the CA and renewal master,
@@ -714,6 +737,18 @@ pq_admin_kinit() {{
     # Sessions stay inside the playground, not in the real runtime directory.
     export KUIPA_RUNTIME_DIR="$KUIPA_PLAYGROUND/run-user/admin"
     klist
+}}
+# pq_as USER CMD...: run CMD as USER of this realm (bob or carol), with a
+# ticket and a kuipa data directory of their own; logs them in the first
+# time.
+pq_as() {{
+    local user="$1"
+    shift
+    local cc="$KUIPA_PLAYGROUND/users/$user.ccache"
+    mkdir -p "$KUIPA_PLAYGROUND/users"
+    [ -f "$cc" ] || echo {ADMIN_PASSWORD} | KRB5CCNAME="FILE:$cc" kinit "$user@{REALM}" >/dev/null || return
+    KRB5CCNAME="FILE:$cc" KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/$user" \
+        KUIPA_RUNTIME_DIR="$KUIPA_PLAYGROUND/run-user/$user" "$@"
 }}
 pq_trust() {{ kuipa trusted-realms "$@"; }}
 "#,

@@ -289,6 +289,93 @@ step 0 "Revoke the vault" 'kuipa seal revoke personal' "revoked"
 step 75 "No server opens a file of a revoked vault" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
 
+section "Realm limits" \
+    "The realm sets what users may choose. Here every vault needs a device, and only the travellers group may have offline sessions: the administrator, who made the offline vault above, is a traveller; bob is not."
+step fail "A vault without the device factor is refused (the server log says why)" \
+    'kuipa seal create weak --require ticket' "refused the request"
+step fail "bob is no traveller: no offline sessions for him" \
+    'pq_as bob kuipa seal create trip --require device,ticket --offline-hours 2' \
+    "refused the request"
+
+section "Sharing a vault with a team" \
+    "The administrator shares a vault with bob. bob names it admin/team, registers a device of his own, and opens with his own device and ticket."
+step 0 "Create the team vault and share it with bob" \
+    'kuipa seal create team --require device,ticket && kuipa seal device add team --passphrase-file "$KUIPA_PLAYGROUND/pass" && kuipa seal share team --user bob' \
+    "members: user:bob@EXAMPLE.TEST"
+step 0 "bob finds it among his vaults, under its owner" \
+    'pq_as bob kuipa seal list' "Vault team (admin@EXAMPLE.TEST)"
+step 0 "bob registers his own device in it" \
+    'echo "bob staple" > "$KUIPA_PLAYGROUND/bob-pass" && pq_as bob kuipa seal device add admin/team --passphrase-file "$KUIPA_PLAYGROUND/bob-pass"' \
+    "bob@EXAMPLE.TEST"
+step 0 "bob seals a file to it" \
+    'echo "db=hunter2" > "$KUIPA_PLAYGROUND/team.txt" && pq_as bob kuipa seal file admin/team "$KUIPA_PLAYGROUND/team.txt"'
+step 0 "The administrator opens it with their own device" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/team.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" | cat' \
+    "db=hunter2"
+step 0 "And bob with his" \
+    'pq_as bob kuipa seal open "$KUIPA_PLAYGROUND/team.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | cat' \
+    "db=hunter2"
+
+section "Break-glass approvals" \
+    "Every release of this vault waits for two approvals, from bob and carol. The administrator asks, saying why; bob and carol approve with their own tickets; then the administrator opens that one file, once."
+step 0 "Create the vault and seal the root password to it" \
+    'kuipa seal create root-pw --require device,ticket --approvals 2 --approver-user bob --approver-user carol && kuipa seal device add root-pw --passphrase-file "$KUIPA_PLAYGROUND/pass" && echo "root=correct-battery" > "$KUIPA_PLAYGROUND/root.txt" && kuipa seal file root-pw "$KUIPA_PLAYGROUND/root.txt"'
+step 75 "Without approvals, the device and the ticket are not enough" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/root.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
+step 0 "Ask for its release" \
+    'rq=$(kuipa --json seal request root-pw "$KUIPA_PLAYGROUND/root.txt.sealed" --reason "INC-1: db01 is locked") && echo "$rq" && rq_id=$(sed -n "s/.*\"id\":\"\([0-9a-f]\{32\}\)\".*/\1/p" <<<"$rq") && test -n "$rq_id"' \
+    "INC-1: db01 is locked"
+step 0 "bob sees it pending, and approves" \
+    'pq_as bob kuipa seal pending && pq_as bob kuipa seal approve admin/root-pw "$rq_id"' \
+    "INC-1: db01 is locked" "approved by: bob@EXAMPLE.TEST"
+step 75 "One approval of two does not open it" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/root.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" --request "$rq_id"'
+step 0 "carol approves too" \
+    'pq_as carol kuipa seal approve admin/root-pw "$rq_id"' \
+    "approved by: bob@EXAMPLE.TEST, carol@EXAMPLE.TEST"
+step 0 "Now it opens" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/root.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" --request "$rq_id" | cat' \
+    "root=correct-battery"
+step 75 "Once: the request is used up" \
+    'kuipa seal open "$KUIPA_PLAYGROUND/root.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" --request "$rq_id"'
+
+section "Recovering a lost device" \
+    "bob escrows his device key under a recovery code he writes down. His laptop is lost: on a new one the code brings the key back and his files open again; finishing reseals them to the new laptop's device and retires the old one."
+step 0 "bob makes a recovery code for his device" \
+    'rc=$(pq_as bob kuipa --json seal recovery-code --passphrase-file "$KUIPA_PLAYGROUND/bob-pass") && code=$(sed -n "s/.*\"recovery_code\":\"\([A-Z2-7-]*\)\".*/\1/p" <<<"$rc") && test -n "$code" && printf "%s\n" "$code" > "$KUIPA_PLAYGROUND/bob-code" && echo "recovery code: $code"' \
+    "recovery code: "
+step 0 "On a new laptop, the code brings the old device key back" \
+    'pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-new" kuipa seal recover code --code-file "$KUIPA_PLAYGROUND/bob-code" --passphrase-file "$KUIPA_PLAYGROUND/bob-pass"' \
+    "is recovered on this host"
+step 0 "bob's file opens there" \
+    'pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-new" kuipa seal open "$KUIPA_PLAYGROUND/team.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | cat' \
+    "db=hunter2"
+step 0 "Finish: reseal to the new laptop's device, retire the old one" \
+    'cp "$KUIPA_PLAYGROUND/team.txt.sealed" "$KUIPA_PLAYGROUND/bob-team.sealed" && pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-new" kuipa seal recover finish "$KUIPA_PLAYGROUND/bob-team.sealed" --retire-old --passphrase-file "$KUIPA_PLAYGROUND/bob-pass"' \
+    "is retired"
+step 75 "The lost laptop's key opens nothing any more" \
+    'pq_as bob kuipa seal open "$KUIPA_PLAYGROUND/bob-team.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass"'
+step 0 "The new laptop opens the resealed file" \
+    'pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-new" kuipa seal open "$KUIPA_PLAYGROUND/bob-team.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | cat' \
+    "db=hunter2"
+
+section "Deposits" \
+    "carol is a depositor of the administrator's drop vault: she seals a backup password to it and leaves it with the servers, and cannot read it back. The administrator lists, fetches and opens it."
+step 0 "Create the drop vault, with carol as a depositor" \
+    'kuipa seal create drop --require device,ticket --sealing registered && kuipa seal device add drop --passphrase-file "$KUIPA_PLAYGROUND/pass" && kuipa seal share drop --depositor --user carol' \
+    "depositors: user:carol@EXAMPLE.TEST"
+step 0 "carol deposits a backup password" \
+    'echo "restic=s3cret" > "$KUIPA_PLAYGROUND/restic.txt" && pq_as carol kuipa seal deposit put admin/drop "$KUIPA_PLAYGROUND/restic.txt" --name restic' \
+    "name=restic" "by carol@EXAMPLE.TEST"
+step 0 "The administrator lists the vault's deposits" \
+    'dep=$(kuipa --json seal deposit list drop) && echo "$dep" && did=$(sed -n "s/.*\"id\":\"\([0-9a-f]\{32\}\)\".*/\1/p" <<<"$dep") && test -n "$did"' \
+    '"depositor":"carol@EXAMPLE.TEST"'
+step fail "carol, a depositor, cannot fetch it back" \
+    'pq_as carol kuipa seal deposit fetch admin/drop "$did" --out "$KUIPA_PLAYGROUND/carol.sealed"'
+step 0 "The administrator fetches and opens it" \
+    'kuipa seal deposit fetch drop "$did" --out "$KUIPA_PLAYGROUND/restic.sealed" && kuipa seal open "$KUIPA_PLAYGROUND/restic.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" | cat' \
+    "restic=s3cret"
+
 section "Signing under your ticket" \
     "The realm states that the administrator, by their ticket, signed a release: kuipa sign asks a server, which checks the signing policy (the release group may sign blobs), logs the statement in its transparency log, and signs it.  Anyone with the realm's anchors verifies it offline."
 step 0 "Sign two files in one statement" \
