@@ -61,7 +61,7 @@ target_package() {
 }
 
 usage() {
-    grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \?//' | head -26
+    grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \?//' | head -27
     exit 0
 }
 
@@ -124,7 +124,10 @@ for base, _dirs, files in os.walk(root):
     entry = {
         "id": info["full_id"],
         "group": info["group_id"],
-        "function": info["function_id"],
+        # Criterion leaves function_id null for benchmarks that are not
+        # created through bench_with_input; the tail of full_id is it.
+        "function": info.get("function_id")
+        or info["full_id"].removeprefix(info["group_id"] + "/"),
         "mean_ms": e["mean"]["point_estimate"] / ms,
         "mean_ci_ms": [
             e["mean"]["confidence_interval"]["lower_bound"] / ms,
@@ -143,7 +146,7 @@ for base, _dirs, files in os.walk(root):
         with open(sample, encoding="utf-8") as fh:
             raw = json.load(fh)
         # sample.json holds parallel `iters`/`times` (ns) lists.
-        entry["samples"] = [[t / ms, i] for i, t in zip(raw["iters"], raw["times"])[:20]]
+        entry["samples"] = [[t / ms, i] for i, t in list(zip(raw["iters"], raw["times"]))[:20]]
         entry["sample_count"] = len(raw["times"])
     out.append(entry)
 
@@ -174,7 +177,7 @@ save_results() {
     KUIPA_FLAGS="${CRITERION_ARGS[*]:-}" \
         python3 - "$git_commit" "$git_dirty" "$PROFILE" "$TARGETS" "$results_json" \
         >"$results_dir/params.json" <<'PY'
-import datetime, json, os, sys
+import datetime, json, os, platform, sys
 
 commit, dirty, profile, targets, results = sys.argv[1:6]
 fixture = json.loads(os.environ.get("KUIPA_FIXTURE", "{}"))
@@ -189,9 +192,9 @@ print(json.dumps({
     "criterion_flags": flags,
     "release": True,
     "platform": {
-        "system": platform_system := __import__("platform").system(),
-        "machine": __import__("platform").machine(),
-        "processor": __import__("platform").processor(),
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "python": platform.python_version(),
     },
     "benchmark_count": len(json.load(open(results, encoding="utf-8"))),
 }, indent=2))
