@@ -1011,6 +1011,57 @@ fn break_glass(world: &Scenario, alice: &Alice) {
     );
 }
 
+fn lost_laptop(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    // ── A lost laptop, back with a recovery code (DESIGN-recovery.md §2) ──
+    let laptop = UserPaths::new(realm.dir.join("alice-lost-laptop"));
+    let on_laptop = Seal::new(a, &laptop, Some(&alice.cc));
+    let notes = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..vault::Policy::default()
+    };
+    on_laptop.create("notes", notes).unwrap();
+    on_laptop.add_device("notes", b"laptop pass").unwrap();
+    let note = on_laptop.seal("notes", b"pin=1234").unwrap();
+    let shown = on_laptop.recovery_code(b"laptop pass").unwrap();
+    let code = shown["recovery_code"].as_str().unwrap().to_owned();
+
+    // The laptop is gone; on a new one, the code brings its key back.
+    let fresh = UserPaths::new(realm.dir.join("alice-new-laptop"));
+    let on_new = Seal::new(a, &fresh, Some(&alice.cc));
+    let pass: &[u8] = b"new pass";
+    assert!(
+        on_new
+            .recover_code("AAAAAAAAAAAAAAAAAAAAAAAAAA", pass)
+            .is_err(),
+        "another code"
+    );
+    on_new.recover_code(&code, pass).unwrap();
+    assert_eq!(
+        on_new.open(&note, Some(pass)).unwrap().as_ref(),
+        b"pin=1234"
+    );
+    // Finishing reseals to the new laptop's own device and retires the old.
+    let (done, again) = on_new
+        .recover_finish(pass, std::slice::from_ref(&note), true)
+        .unwrap();
+    assert_eq!(done["resealed"], 1, "{done}");
+    assert!(!fresh.recovered_key().exists());
+    assert_eq!(
+        on_new.open(&again[0], Some(pass)).unwrap().as_ref(),
+        b"pin=1234"
+    );
+    // Whoever has the old laptop opens nothing, old file or new.
+    let old_pass: &[u8] = b"laptop pass";
+    assert!(on_laptop.open(&again[0], Some(old_pass)).is_err());
+    assert!(on_laptop.open(&note, Some(old_pass)).is_err());
+}
+
 fn token_device(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
@@ -1453,6 +1504,7 @@ fn against_a_real_kdc() {
     registered_sealing(&world, &alice);
     shared_vault(&world, &alice);
     break_glass(&world, &alice);
+    lost_laptop(&world, &alice);
     token_device(&world, &alice);
     unprotect_host(&world);
     admin_ticket(&world);

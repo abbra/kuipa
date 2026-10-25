@@ -319,6 +319,25 @@ Describe a vault.  *seal list* describes all your vaults and those
 shared with you; *seal revoke VAULT* revokes it: no file sealed to it
 opens any more.
 
+## seal recovery-code
+
+Escrow this host's device key under a new recovery code, which is
+printed once: write it down.  The servers keep the key encrypted under
+the code, on your own entry; every escrow is in your vaults' logs.
+
+## seal recover code [--code-file _FILE_]
+
+On a new host, after losing every device: fetch your escrowed keys, open
+the one the code opens, and keep it beside this host's device key.
+Files sealed to the lost device open again here.
+
+## seal recover finish _SEALED_... [--retire-old]
+
+Register this host's device wherever the recovered one is, and reseal
+_SEALED_ to it.  With *--retire-old*, also remove the recovered device
+from your vaults and forget it here: run it once every file is resealed,
+since files sealed only to the old device then stop opening.
+
 ## seal request _VAULT_ _SEALED_ --reason _TEXT_
 
 For a vault with approvals: ask its approvers to approve the release of

@@ -805,6 +805,11 @@ pub enum VaultAction {
     Approve = 12,
     /// A release request was denied.
     Deny = 13,
+    /// The device's key was escrowed under a recovery code
+    /// (`DESIGN-recovery.md`).
+    EscrowCode = 14,
+    /// The device's escrowed key was fetched for recovery.
+    RecoverCode = 15,
 }
 
 impl VaultAction {
@@ -815,7 +820,9 @@ impl VaultAction {
             Self::Create | Self::SetPolicy | Self::Revoke | Self::Share | Self::Unshare => {
                 Kind::VAULT_POLICY
             }
-            Self::AddDevice | Self::RemoveDevice => Kind::VAULT_DEVICE,
+            Self::AddDevice | Self::RemoveDevice | Self::EscrowCode | Self::RecoverCode => {
+                Kind::VAULT_DEVICE
+            }
             Self::Session
             | Self::OfflineSession
             | Self::Release
@@ -840,6 +847,8 @@ impl VaultAction {
             11 => Self::Request,
             12 => Self::Approve,
             13 => Self::Deny,
+            14 => Self::EscrowCode,
+            15 => Self::RecoverCode,
             _ => return Err(Error::Malformed("vault event action")),
         })
     }
@@ -1440,6 +1449,7 @@ mod tests {
             (VaultAction::RemoveDevice, Kind::VAULT_DEVICE),
             (VaultAction::Unshare, Kind::VAULT_POLICY),
             (VaultAction::Approve, Kind::ESCROW_RELEASE),
+            (VaultAction::RecoverCode, Kind::VAULT_DEVICE),
             (VaultAction::Release, Kind::ESCROW_RELEASE),
         ] {
             assert_eq!(action.kind(), kind);

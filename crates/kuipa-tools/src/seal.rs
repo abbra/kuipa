@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tang_pqc::primitives;
 use tang_pqc::wire::{Reader, Writer};
-use tang_pqc::{ExchangeKeyPair, KemAlg, SignedAdvertisement, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, KemAlg, SignedAdvertisement, Thumbprint, unix_seconds};
 
 use crate::flows::{self, Outcome};
 use crate::net::Endpoint;
@@ -88,6 +88,33 @@ impl UserPaths {
     #[must_use]
     pub fn device_key(&self) -> PathBuf {
         self.dir.join("device.key")
+    }
+
+    /// A lost host's device key, recovered here until `kuipa seal recover
+    /// finish --retire-old` (`DESIGN-recovery.md` §2).
+    #[must_use]
+    pub fn recovered_key(&self) -> PathBuf {
+        self.dir.join("recovered.key")
+    }
+
+    /// The recovered key under `secret`, if there is one.
+    fn recovered(&self, secret: &[u8]) -> Result<Option<ExchangeKeyPair>, Error> {
+        match fs::read(self.recovered_key()) {
+            Ok(bytes) => Ok(Some(unprotect_key(&bytes, secret)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The device to open a file with device slots `ids`: the recovered
+    /// key when the file has a slot for it, else this host's device.
+    fn device_for(&self, ids: &[Thumbprint], secret: &[u8]) -> Result<HostDevice, Error> {
+        if let Some(old) = self.recovered(secret)?
+            && ids.contains(old.public().kid())
+        {
+            return Ok(HostDevice::File(old));
+        }
+        self.device(secret)
     }
 
     fn vaults(&self) -> PathBuf {
@@ -164,24 +191,28 @@ fn passphrase_key(passphrase: &[u8], salt: &[u8], iterations: u64) -> Result<Sec
     Ok(key)
 }
 
-/// Write `key` to `path` under `passphrase`:
-/// `IPDK kdf(1) iterations(u64) salt(16) GCM_{PBKDF2(passphrase, salt)}(private JWK)`.
+/// `key` under `secret` (a passphrase or a recovery code):
+/// `IPDK kdf(1) iterations(u64) salt(16) GCM_{PBKDF2(secret, salt)}(private JWK)`.
+fn protect_key(key: &ExchangeKeyPair, secret: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut salt = [0u8; 16];
+    Rand::fill(&mut salt)?;
+    let sealing = passphrase_key(secret, &salt, PBKDF2_ITERATIONS)?;
+    let sealed = primitives::seal(sealing.as_ref(), key.to_jwk()?.as_ref())?;
+    Ok(Writer::new(DEVICE_KEY_MAGIC)
+        .u8(KDF_PBKDF2_SHA512)
+        .u64(PBKDF2_ITERATIONS)
+        .fixed(&salt)
+        .bytes(&sealed)
+        .finish())
+}
+
+/// Write `key` to the device key file under `passphrase`.
 fn write_device_key(
     user: &UserPaths,
     key: &ExchangeKeyPair,
     passphrase: &[u8],
 ) -> Result<(), Error> {
-    let mut salt = [0u8; 16];
-    Rand::fill(&mut salt)?;
-    let sealing = passphrase_key(passphrase, &salt, PBKDF2_ITERATIONS)?;
-    let sealed = primitives::seal(sealing.as_ref(), key.to_jwk()?.as_ref())?;
-    let bytes = Writer::new(DEVICE_KEY_MAGIC)
-        .u8(KDF_PBKDF2_SHA512)
-        .u64(PBKDF2_ITERATIONS)
-        .fixed(&salt)
-        .bytes(&sealed)
-        .finish();
-    user.write(&user.device_key(), &bytes)
+    user.write(&user.device_key(), &protect_key(key, passphrase)?)
 }
 
 /// Read the device key under `passphrase`.
@@ -192,7 +223,12 @@ fn write_device_key(
 pub fn read_device_key(user: &UserPaths, passphrase: &[u8]) -> Result<ExchangeKeyPair, Error> {
     let bytes = fs::read(user.device_key())
         .map_err(|_| "this host has no device key: run `kuipa seal device add VAULT` first")?;
-    let mut r = Reader::new(&bytes, DEVICE_KEY_MAGIC, "device key")?;
+    unprotect_key(&bytes, passphrase)
+}
+
+/// The key `protect_key` protected under `secret`.
+fn unprotect_key(bytes: &[u8], secret: &[u8]) -> Result<ExchangeKeyPair, Error> {
+    let mut r = Reader::new(bytes, DEVICE_KEY_MAGIC, "device key")?;
     if r.u8()? != KDF_PBKDF2_SHA512 {
         return Err("device key: unknown key derivation".into());
     }
@@ -200,9 +236,44 @@ pub fn read_device_key(user: &UserPaths, passphrase: &[u8]) -> Result<ExchangeKe
     let salt: [u8; 16] = r.fixed()?;
     let sealed = r.bytes()?.to_vec();
     r.finish()?;
-    let sealing = passphrase_key(passphrase, &salt, iterations)?;
+    let sealing = passphrase_key(secret, &salt, iterations)?;
     let jwk = primitives::open(sealing.as_ref(), &sealed).map_err(|_| "wrong passphrase")?;
     Ok(ExchangeKeyPair::from_jwk(jwk.as_ref())?)
+}
+
+/// The base32 alphabet of RFC 4648.
+const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// A new recovery code: 128 random bits as 26 base32 characters, in
+/// groups of four for writing down (`DESIGN-recovery.md` §2).
+fn new_recovery_code() -> Result<String, Error> {
+    let mut bits = [0u8; 16];
+    Rand::fill(&mut bits)?;
+    let n = u128::from_be_bytes(bits);
+    // 26 characters carry 130 bits: the first holds the top 3.
+    let chars: Vec<u8> = (0..26)
+        .rev()
+        .map(|i| BASE32[usize::try_from((n >> (5 * i)) & 31).unwrap_or(0)])
+        .collect();
+    Ok(chars
+        .chunks(4)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join("-"))
+}
+
+/// The secret a recovery code stands for: its 26 characters, upper case,
+/// without the dashes and spaces it was written down with.
+fn recovery_secret(code: &str) -> Result<SecretBuf, Error> {
+    let bare: Vec<u8> = code
+        .bytes()
+        .filter(|b| !b"- \t".contains(b))
+        .map(|b| b.to_ascii_uppercase())
+        .collect();
+    if bare.len() != 26 || !bare.iter().all(|b| BASE32.contains(b)) {
+        return Err("a recovery code is 26 letters and digits 2-7".into());
+    }
+    Ok(SecretBuf::new(bare))
 }
 
 /// A live session on this host: the server's token, the unwrapped device
@@ -320,6 +391,7 @@ type OpAnswer = (
     Option<SessionToken>,
     Option<ReleasedKeys>,
     Vec<kuipa_enroll::vault::ReleaseRequest>,
+    Vec<kuipa_enroll::vault::DeviceEscrow>,
 );
 
 impl<'a> Seal<'a> {
@@ -392,7 +464,13 @@ impl<'a> Seal<'a> {
                 .write(&self.user.vault(&reference, &public.realm)?, &d.to_bytes())?;
             verified.push(v);
         }
-        Ok((verified, reply.session, reply.released, reply.requests))
+        Ok((
+            verified,
+            reply.session,
+            reply.released,
+            reply.requests,
+            reply.escrows,
+        ))
     }
 
     /// `kuipa seal unlock`: start a re-authentication session for this
@@ -405,7 +483,7 @@ impl<'a> Seal<'a> {
     /// directory, or any other error.
     pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
         let key = self.user.device(passphrase)?;
-        let (vaults, session, released, _) = self.op_with_session(&VaultOp::Unlock {
+        let (vaults, session, released, _, _) = self.op_with_session(&VaultOp::Unlock {
             name: name.into(),
             device: key.public().kid().to_string(),
             offline,
@@ -1075,6 +1153,141 @@ impl<'a> Seal<'a> {
         Ok(describe_requests(name, &self.op_with_session(&op)?.3))
     }
 
+    /// `kuipa seal recovery-code`: escrow this host's device key under a
+    /// new recovery code, which only the answer shows (`DESIGN-recovery.md`
+    /// §2).  The device must be registered in one of the user's vaults.
+    ///
+    /// # Errors
+    ///
+    /// A token device (its key never leaves the token), a wrong
+    /// passphrase, a refusal.
+    pub fn recovery_code(&self, passphrase: &[u8]) -> Result<Value, Error> {
+        if self.user.token().is_some() {
+            return Err("a token's key never leaves the token: it has no recovery code".into());
+        }
+        let key = read_device_key(self.user, passphrase)?;
+        let code = new_recovery_code()?;
+        let blob = protect_key(&key, recovery_secret(&code)?.as_ref())?;
+        let device = key.public().kid().to_string();
+        self.op_with_session(&VaultOp::EscrowCode {
+            device: device.clone(),
+            blob: tang_pqc::b64::encode(&blob),
+        })?;
+        Ok(json!({ "device": device, "recovery_code": code }))
+    }
+
+    /// `kuipa seal recover code`: fetch the user's escrowed device keys,
+    /// open the one `code` protects, and keep it on this host as the
+    /// recovered key, under `passphrase` (this host's device passphrase,
+    /// if it has a device key).
+    ///
+    /// # Errors
+    ///
+    /// No escrow the code opens, a wrong passphrase for this host's device,
+    /// a recovered key already here, a refusal.
+    pub fn recover_code(&self, code: &str, passphrase: &[u8]) -> Result<Value, Error> {
+        if self.user.recovered_key().exists() {
+            return Err(
+                "a recovered key is already here: `kuipa seal recover finish` first".into(),
+            );
+        }
+        if self.user.device_key().exists() {
+            // One passphrase for both keys of this host.
+            read_device_key(self.user, passphrase)?;
+        }
+        let secret = recovery_secret(code)?;
+        let escrows = self.op_with_session(&VaultOp::RecoverCode)?.4;
+        let key = escrows
+            .iter()
+            .find_map(|e| {
+                let blob = tang_pqc::b64::decode(&e.blob).ok()?;
+                unprotect_key(&blob, secret.as_ref()).ok()
+            })
+            .ok_or("the code opens none of your escrowed device keys")?;
+        self.user
+            .write(&self.user.recovered_key(), &protect_key(&key, passphrase)?)?;
+        Ok(json!({ "recovered": key.public().kid().to_string() }))
+    }
+
+    /// `kuipa seal recover finish`: register this host's device (made now
+    /// under `passphrase` if there is none) in every vault where the
+    /// recovered device is the user's, and reseal `sealed` to it.  With
+    /// `retire_old`, also remove the recovered device from those vaults and
+    /// forget it here: files not resealed then no longer open.  Answers the
+    /// resealed files, in order.
+    ///
+    /// # Errors
+    ///
+    /// Nothing recovered here, a file of a vault the recovered device is
+    /// not in, a wrong passphrase, a refusal.
+    pub fn recover_finish(
+        &self,
+        passphrase: &[u8],
+        sealed: &[Vec<u8>],
+        retire_old: bool,
+    ) -> Result<(Value, Vec<Vec<u8>>), Error> {
+        let old = self
+            .user
+            .recovered(passphrase)?
+            .ok_or("nothing recovered here: run `kuipa seal recover code` first")?;
+        let old_id = old.public().kid().to_string();
+        let me = self
+            .cred()?
+            .principal_name()
+            .ok_or("cannot tell whose ticket this is")?;
+        let held: Vec<(String, kuipa_enroll::escrow::VaultId)> = self
+            .op(&VaultOp::List)?
+            .iter()
+            .filter_map(|d| {
+                let v = d.vault();
+                v.devices
+                    .iter()
+                    .any(|x| x.id == old_id && v.holder(x) == me)
+                    .then(|| (reference_for(v, Some(&me)), v.id))
+            })
+            .collect();
+        if !self.user.device_key().exists() && self.user.token().is_none() {
+            write_device_key(
+                self.user,
+                &ExchangeKeyPair::generate(KemAlg::MlKem768)?,
+                passphrase,
+            )?;
+        }
+        let new_id = self.user.device(passphrase)?.public().kid().to_string();
+        for (name, _) in &held {
+            let current = self.op(&VaultOp::Show { name: name.clone() })?;
+            if !current
+                .iter()
+                .any(|d| d.vault().devices.iter().any(|x| x.id == new_id))
+            {
+                self.add_device(name, passphrase)?;
+            }
+        }
+        let mut resealed = Vec::with_capacity(sealed.len());
+        for file in sealed {
+            let id = vault_of(file).ok_or("not a sealed vault file")?;
+            let (name, _) = held.iter().find(|(_, v)| *v == id).ok_or_else(|| {
+                format!("a file of vault {id}, where the recovered device is not")
+            })?;
+            resealed.push(self.reseal(name, file, Some(passphrase))?);
+        }
+        if retire_old {
+            for (name, _) in &held {
+                self.remove_device(name, &old_id)?;
+            }
+            paths::remove(&self.user.recovered_key())?;
+        }
+        Ok((
+            json!({
+                "vaults": held.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "device": new_id,
+                "resealed": resealed.len(),
+                "retired": if retire_old { Some(old_id) } else { None },
+            }),
+            resealed,
+        ))
+    }
+
     /// `kuipa seal revoke`.
     ///
     /// # Errors
@@ -1218,7 +1431,7 @@ impl<'a> Seal<'a> {
             } else {
                 let passphrase = passphrase
                     .ok_or("the file needs this host's device key: give its passphrase or PIN")?;
-                unwrapped = self.user.device(passphrase)?;
+                unwrapped = self.user.device_for(&file.devices(), passphrase)?;
                 Some(unwrapped.as_device())
             };
         let trust = flows::ca_trust(self.host)?;
@@ -1416,6 +1629,11 @@ fn describe_event(
                 .is_ok_and(|d| d != *event.digest)
                 .then_some("managers or members the stored descriptor does not show"),
         ),
+        A::EscrowCode => ("escrow-code", unlisted.then_some("an unlisted device")),
+        A::RecoverCode => (
+            "recover-code",
+            Some("the device's escrowed key was fetched for recovery"),
+        ),
         A::Request => ("request", None),
         A::Approve => ("approve", None),
         A::Deny => ("deny", None),
@@ -1444,4 +1662,41 @@ fn describe_event(
         "unexpected": flag && why.is_some(),
         "why": why,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_codes_are_128_bits_written_in_groups() {
+        let code = new_recovery_code().unwrap();
+        // 26 characters in groups of four: 7 groups, the last of two.
+        assert_eq!(code.len(), 26 + 6, "{code}");
+        assert_eq!(code.split('-').count(), 7);
+        // The top character carries 3 bits only.
+        assert!(b"ABCDEFGH".contains(&code.as_bytes()[0]), "{code}");
+        assert_ne!(code, new_recovery_code().unwrap());
+        // Written down any way, it is the same secret.
+        let secret = recovery_secret(&code).unwrap();
+        let sloppy = code.to_lowercase().replace('-', " ");
+        assert_eq!(recovery_secret(&sloppy).unwrap().as_ref(), secret.as_ref());
+        // Too short, too long, or a character outside the alphabet.
+        let mut outside = code.clone();
+        outside.replace_range(0..1, "1");
+        for bad in [String::new(), "ABCD".into(), format!("{code}A"), outside] {
+            assert!(recovery_secret(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_key_under_a_code_opens_only_with_it() {
+        let key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+        let code = new_recovery_code().unwrap();
+        let blob = protect_key(&key, recovery_secret(&code).unwrap().as_ref()).unwrap();
+        let back = unprotect_key(&blob, recovery_secret(&code).unwrap().as_ref()).unwrap();
+        assert_eq!(back.public().kid(), key.public().kid());
+        let other = recovery_secret(&new_recovery_code().unwrap()).unwrap();
+        assert!(unprotect_key(&blob, other.as_ref()).is_err());
+    }
 }

@@ -139,10 +139,12 @@ design first.
       operation arms a host while online with a signed offline grant (one
       user, one host, a window) and a per-user TPM-sealed object; needs the
       TPM factor.
-- [ ] Recovery after losing every device (recovery codes, device-key
-      deposits in a helpdesk vault) and deposits of LUKS and backup
-      recovery keys: designed in `docs/DESIGN-recovery.md`; needs the
-      approvals.
+- [ ] Recovery after losing every device and deposits of LUKS and
+      backup recovery keys (`docs/DESIGN-recovery.md`):
+  - [x] Recovery codes (`kuipa seal recovery-code`, `recover code`,
+        `recover finish`).
+  - [ ] Depositors and deposits; `kuipa escrow luks`, `kuipa escrow file`.
+  - [ ] Device-key deposits in a helpdesk vault, and their delivery.
 - [x] M-of-N approvals for break-glass releases, recorded in the
       transparency log (`docs/DESIGN-approvals.md`).
 - [ ] Short-lived CI runner identities (voucher leases, `ticket.leased`)
@@ -170,6 +172,7 @@ design first.
       (indexed for equality), the `ipaKURelease` class for release
       requests under a vault (`ipaKUReleaseRequest`,
       `ipaKUReleaseApproval`, `ipaKUReleaseDenied`, `ipaKUReleaseUses`),
+      `ipaKUDeviceEscrow` on user entries (written by the daemon),
       `ipaKUServerEscrowKey` on
       `cn=masters` entries,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,

@@ -441,6 +441,19 @@ enum SealAction {
         #[arg(long, value_name = "ID")]
         request: Option<String>,
     },
+    /// Escrow this host's device key under a new recovery code, printed
+    /// once: write it down.  With it, a lost device's files can be opened
+    /// again (`kuipa seal recover`).
+    RecoveryCode {
+        /// Read the device key's passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Recover a lost device's key with its recovery code.
+    Recover {
+        #[command(subcommand)]
+        action: RecoverAction,
+    },
     /// Ask the vault's approvers to approve the release of a sealed file.
     Request {
         /// The vault.
@@ -519,6 +532,36 @@ enum SealAction {
     Revoke {
         /// The vault.
         vault: String,
+    },
+}
+
+/// `kuipa seal recover` subcommands.
+#[derive(Subcommand)]
+enum RecoverAction {
+    /// Fetch your escrowed device keys and keep the one the code opens on
+    /// this host, beside its own device key.
+    Code {
+        /// Read the recovery code from this file.
+        #[arg(long, value_name = "FILE")]
+        code_file: Option<String>,
+        /// Read this host's device passphrase (or the one to protect the
+        /// recovered key with) from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Register this host's device wherever the recovered one is, and
+    /// reseal the files to it; with --retire-old, also retire the
+    /// recovered device.
+    Finish {
+        /// Sealed files, rewritten in place.
+        sealed: Vec<String>,
+        /// Remove the recovered device from your vaults and forget it here:
+        /// files not resealed now stop opening.
+        #[arg(long)]
+        retire_old: bool,
+        /// Read the device passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
     },
 }
 
@@ -2111,6 +2154,75 @@ fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
     Ok(serde_json::json!({ "quiet": true }))
 }
 
+/// `kuipa seal open`.
+fn run_open(seal: &kuipa_tools::seal::Seal<'_>, action: &SealAction) -> Result<Value, Error> {
+    let SealAction::Open {
+        sealed,
+        out,
+        force,
+        passphrase_file,
+        request,
+    } = action
+    else {
+        unreachable!("only open");
+    };
+    let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
+    let bytes = std::fs::read(sealed)?;
+    let pass = kuipa_tools::seal::Seal::needs_secret(&bytes)
+        .then(|| passphrase(passphrase_file.as_deref(), false))
+        .transpose()?;
+    let plain = seal.open_with(&bytes, pass.as_ref().map(AsRef::as_ref), request.as_deref())?;
+    target.write(plain.as_ref())?;
+    Ok(serde_json::json!({
+        "sealed": sealed,
+        "written": out,
+        // Standard output holds the plaintext: print nothing else.
+        "quiet": matches!(target, kuipa_tools::output::Output::Stdout),
+    }))
+}
+
+/// `kuipa seal recover …`.
+fn run_recover(
+    seal: &kuipa_tools::seal::Seal<'_>,
+    user: &kuipa_tools::seal::UserPaths,
+    action: &RecoverAction,
+) -> Result<Value, Error> {
+    match action {
+        RecoverAction::Code {
+            code_file,
+            passphrase_file,
+        } => {
+            let code = match code_file {
+                Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
+                None if std::io::stdin().is_terminal() => prompt("recovery code", true)?,
+                None => {
+                    return Err("no recovery code: give --code-file or run on a terminal".into());
+                }
+            };
+            let code = std::str::from_utf8(code.as_ref()).map_err(|_| "not a recovery code")?;
+            let first = !user.device_key().exists();
+            let pass = passphrase(passphrase_file.as_deref(), first)?;
+            seal.recover_code(code, pass.as_ref())
+        }
+        RecoverAction::Finish {
+            sealed,
+            retire_old,
+            passphrase_file,
+        } => {
+            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            let files = sealed
+                .iter()
+                .map(std::fs::read)
+                .collect::<Result<Vec<_>, _>>()?;
+            let (value, again) = seal.recover_finish(pass.as_ref(), &files, *retire_old)?;
+            for (path, bytes) in sealed.iter().zip(again) {
+                paths::write_file(std::path::Path::new(path), &bytes, 0o600)?;
+            }
+            Ok(value)
+        }
+    }
+}
+
 /// `kuipa seal device …`.
 fn run_seal_device(
     seal: &kuipa_tools::seal::Seal<'_>,
@@ -2177,28 +2289,7 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             paths::write_file(std::path::Path::new(&out), &sealed, 0o600)?;
             Ok(serde_json::json!({ "vault": vault, "file": file, "sealed": out }))
         }
-        SealAction::Open {
-            sealed,
-            out,
-            force,
-            passphrase_file,
-            request,
-        } => {
-            let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
-            let bytes = std::fs::read(sealed)?;
-            let pass = kuipa_tools::seal::Seal::needs_secret(&bytes)
-                .then(|| passphrase(passphrase_file.as_deref(), false))
-                .transpose()?;
-            let plain =
-                seal.open_with(&bytes, pass.as_ref().map(AsRef::as_ref), request.as_deref())?;
-            target.write(plain.as_ref())?;
-            Ok(serde_json::json!({
-                "sealed": sealed,
-                "written": out,
-                // Standard output holds the plaintext: print nothing else.
-                "quiet": matches!(target, kuipa_tools::output::Output::Stdout),
-            }))
-        }
+        open @ SealAction::Open { .. } => run_open(&seal, open),
         SealAction::Reseal {
             vault,
             sealed,
@@ -2232,12 +2323,52 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             reason,
         } => seal.request(vault, &std::fs::read(sealed)?, reason),
         SealAction::Pending { vault } => seal.pending(vault.as_deref()),
+        SealAction::RecoveryCode { passphrase_file } => {
+            seal.recovery_code(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        }
+        SealAction::Recover { action } => run_recover(&seal, &user, action),
         SealAction::Approve { vault, id } => seal.decide(vault, id, false),
         SealAction::Deny { vault, id } => seal.decide(vault, id, true),
         SealAction::Show { vault } => seal.show(vault),
         SealAction::List => seal.list(),
         SealAction::Revoke { vault } => seal.revoke(vault),
     }
+}
+
+/// `kuipa seal recovery-code` and `recover`; whether `value` was one.
+fn render_recovery(value: &Value) -> bool {
+    if let Some(code) = get(value, "recovery_code").as_str() {
+        println!(
+            "Recovery code for device {}:",
+            get(value, "device").as_str().unwrap_or("?")
+        );
+        println!();
+        println!("    {code}");
+        println!();
+        println!(
+            "Write it down and keep it away from this host. It is shown only now; with it and your password, `kuipa seal recover code` brings this device's key back on another host."
+        );
+    } else if let Some(device) = get(value, "recovered").as_str() {
+        println!(
+            "Device {device} is recovered on this host. Run `kuipa seal recover finish FILE.sealed…` to reseal your files to this host's own device."
+        );
+    } else if get(value, "resealed").is_number() && get(value, "device").is_string() {
+        println!(
+            "This host's device {} is registered in {} vault(s), and {} file(s) are resealed to it.",
+            get(value, "device").as_str().unwrap_or("?"),
+            list(get(value, "vaults")).len(),
+            get(value, "resealed")
+        );
+        match get(value, "retired").as_str() {
+            Some(old) => println!("Device {old} is retired: it opens nothing any more."),
+            None => println!(
+                "The recovered device is still registered; once every file is resealed, run again with --retire-old."
+            ),
+        }
+    } else {
+        return false;
+    }
+    true
 }
 
 /// `kuipa seal request`, `pending`, `approve` and `deny`.
@@ -2265,6 +2396,9 @@ fn render_requests(requests: &[Value]) {
 fn render_seal(value: &Value) {
     if let Some(requests) = get(value, "requests").as_array() {
         render_requests(requests);
+        return;
+    }
+    if render_recovery(value) {
         return;
     }
     if let Some(until) = get(value, "session_until").as_u64() {

@@ -62,6 +62,8 @@ pub struct KdcDirectory {
     pub releases: Mutex<HashMap<(VaultId, String), ReleaseRequest>>,
     /// Their uses, by vault, id and server.
     release_uses: Mutex<HashMap<(VaultId, String, String), u64>>,
+    /// Device keys kept under recovery codes, by holder.
+    pub escrows: Mutex<HashMap<String, Vec<kuipa_enroll::vault::DeviceEscrow>>>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -102,6 +104,7 @@ impl KdcDirectory {
             groups: Mutex::new(HashMap::new()),
             releases: Mutex::new(HashMap::new()),
             release_uses: Mutex::new(HashMap::new()),
+            escrows: Mutex::new(HashMap::new()),
             creds,
         }
     }
@@ -517,6 +520,31 @@ impl Directory for KdcDirectory {
             })
             .cloned()
             .collect())
+    }
+
+    fn device_escrow_set(
+        &self,
+        principal: &Principal,
+        escrow: &kuipa_enroll::vault::DeviceEscrow,
+    ) -> Result<(), DirectoryError> {
+        let mut all = self.escrows.lock().unwrap();
+        let mine = all.entry(principal.to_string()).or_default();
+        mine.retain(|e| e.device != escrow.device);
+        mine.push(escrow.clone());
+        Ok(())
+    }
+
+    fn device_escrows(
+        &self,
+        principal: &Principal,
+    ) -> Result<Vec<kuipa_enroll::vault::DeviceEscrow>, DirectoryError> {
+        Ok(self
+            .escrows
+            .lock()
+            .unwrap()
+            .get(&principal.to_string())
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {

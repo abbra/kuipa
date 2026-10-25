@@ -37,7 +37,9 @@ use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_inp
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
-use kuipa_enroll::vault::{Approval, Device, Limits, Members, ReleaseRequest, State, Vault};
+use kuipa_enroll::vault::{
+    Approval, Device, DeviceEscrow, Limits, Members, ReleaseRequest, State, Vault,
+};
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
 use native_ossl::util::SecretBuf;
@@ -89,6 +91,9 @@ const RELEASE_REQUEST_ATTR: &str = "ipaKUReleaseRequest";
 const RELEASE_APPROVAL_ATTR: &str = "ipaKUReleaseApproval";
 const RELEASE_DENIED_ATTR: &str = "ipaKUReleaseDenied";
 const RELEASE_USES_ATTR: &str = "ipaKUReleaseUses";
+/// Device keys kept for recovery on their holder's own entry, one JSON
+/// value per device (`DESIGN-recovery.md` §2).
+const DEVICE_ESCROW_ATTR: &str = "ipaKUDeviceEscrow";
 /// Every attribute a vault is read from.
 const VAULT_ATTRS: &[&str] = &[
     VAULT_OWNER_ATTR,
@@ -1071,6 +1076,54 @@ impl Directory for LdapDirectory {
             return Ok(Vec::new());
         }
         self.vaults_matching(&format!("(|{any})"))
+    }
+
+    fn device_escrow_set(
+        &self,
+        principal: &Principal,
+        escrow: &DeviceEscrow,
+    ) -> Result<(), DirectoryError> {
+        let mut svc = self.service_conn()?;
+        let entry = self
+            .principal_entry(&mut svc, principal, &[DEVICE_ESCROW_ATTR])?
+            .ok_or_else(|| format!("no entry for {principal}"))?;
+        // The device's earlier escrow goes, the others stay.
+        let old: Vec<&String> = entry
+            .attrs
+            .get(&DEVICE_ESCROW_ATTR.to_lowercase())
+            .into_iter()
+            .flatten()
+            .filter(|v| {
+                serde_json::from_str::<DeviceEscrow>(v).is_ok_and(|e| e.device == escrow.device)
+            })
+            .collect();
+        let new = serde_json::to_string(escrow)?;
+        let mut mods = Vec::new();
+        if !old.is_empty() {
+            mods.push((
+                ModOp::Delete,
+                DEVICE_ESCROW_ATTR,
+                old.iter().map(|v| v.as_bytes()).collect(),
+            ));
+        }
+        mods.push((ModOp::Add, DEVICE_ESCROW_ATTR, vec![new.as_bytes()]));
+        svc.modify_s(&entry.dn, &mods)?;
+        Ok(())
+    }
+
+    fn device_escrows(&self, principal: &Principal) -> Result<Vec<DeviceEscrow>, DirectoryError> {
+        let Some(entry) =
+            self.principal_entry(&mut self.service_conn()?, principal, &[DEVICE_ESCROW_ATTR])?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(entry
+            .attrs
+            .get(&DEVICE_ESCROW_ATTR.to_lowercase())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| serde_json::from_str(v).ok())
+            .collect())
     }
 
     fn vaults_approved_by(
