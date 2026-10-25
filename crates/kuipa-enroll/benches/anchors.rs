@@ -5,7 +5,7 @@
 //! vouch covers, proofs a delegation carries — so they use the synthetic
 //! [`Ledger`] fixture rather than a realm, and sweep on ledger size.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use kuipa_enroll::anchors::{AnchorState, Entry, Trust};
 use kuipa_enroll::delegation::{Claim, Delegation, SignedVouch, VOUCH_VALIDITY};
 use kuipa_perf::ledger::ledger;
@@ -94,21 +94,26 @@ fn state(c: &mut Criterion) {
                 exp: now() + 30 * 86400,
             })
             .collect();
+        // The clone is setup: copying a state as big as the sweep would
+        // otherwise be most of what this measures.
         g.bench_function(format!("put/{claims}"), |b| {
-            b.iter(|| {
-                let mut s = l.state.clone();
-                for claim in &fresh {
-                    s.put(
-                        Entry::Claim(claim.clone()),
-                        black_box(kuipa_perf::REALM),
-                        black_box(&l.policy),
-                        black_box(now()),
-                        black_box(&l.clock),
-                    )
-                    .expect("put");
-                }
-                s.len()
-            });
+            b.iter_batched(
+                || l.state.clone(),
+                |mut s| {
+                    for claim in &fresh {
+                        s.put(
+                            Entry::Claim(claim.clone()),
+                            black_box(kuipa_perf::REALM),
+                            black_box(&l.policy),
+                            black_box(now()),
+                            black_box(&l.clock),
+                        )
+                        .expect("put");
+                    }
+                    s.len()
+                },
+                BatchSize::LargeInput,
+            );
         });
     });
 
@@ -125,18 +130,29 @@ fn state(c: &mut Criterion) {
     });
 }
 
-/// Computing trust over a ledger whose claim count grows.
+/// Computing trust over a ledger whose claim count grows, with the
+/// profile's `attested` peers presenting Kerberos-attested delegations.
+///
+/// Each attested peer has its own anchor and carries that anchor's proof,
+/// so `compute` verifies one ML-DSA proof per attested delegation, as a
+/// server does after a sync.  A peer without an anchor would be admitted
+/// with no verification at all.
 fn trust(c: &mut Criterion) {
     let p = profile();
     sweep(c, "trust/compute", &p.sweep(p.leaves), |g, claims| {
-        let l = ledger(claims, 1, claims);
+        let attested = p.attested.min(claims.saturating_sub(1));
+        let l = ledger(claims, attested + 1, claims);
         let own = l.own().clone();
-        let attested: Vec<Delegation> = l
-            .claims
-            .iter()
-            .skip(1)
-            .take(p.attested)
-            .map(Delegation::new)
+        let attested: Vec<Delegation> = (1..=attested)
+            .map(|i| {
+                let claim = &l.claims[i];
+                assert!(claim.anchor.is_some(), "attested peer {i} has no anchor");
+                let mut d = Delegation::new(claim);
+                d.add(l.vouch(i).proof(claim, l.key(i)).expect("proof"));
+                d.verify_at(&[*l.key(i).thumbprint()], &l.policy, now())
+                    .expect("attested delegation verifies");
+                d
+            })
             .collect();
         let members: BTreeSet<String> = l.members.clone();
         g.bench_function(format!("compute/{claims}"), |b| {
