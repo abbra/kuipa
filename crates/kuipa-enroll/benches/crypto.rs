@@ -235,17 +235,19 @@ fn symmetric(c: &mut Criterion) {
 fn vouchers(c: &mut Criterion) {
     // A bound voucher: the claims carry the digest of the host's ephemeral
     // KEM key, which `verify` compares against what the request proves.
+    // The validity window is an hour around `at`, as an issuer would set
+    // it, so `verify` checks a window that can actually close.
     let ephemeral = voucher_binding(&[3u8; 1184]).expect("binding");
+    let at = 1_700_000_000;
     let claims = Claims {
         realm: REALM.into(),
         fqdn: HOST.into(),
         hostgroup: "web".into(),
-        not_before: 0,
-        not_after: u64::MAX,
+        not_before: at - 60,
+        not_after: at + 3600,
         binding: ephemeral.clone(),
     };
     let message = claims.message();
-    let at = 1_700_000_000;
 
     let mut g = c.benchmark_group("voucher");
     for alg in SignatureAlg::ALL {
@@ -276,7 +278,7 @@ fn vouchers(c: &mut Criterion) {
         });
         g.throughput(Throughput::Bytes(encoded.len() as u64));
         g.bench_function(format!("parse/{label}"), |b| {
-            b.iter(|| Voucher::parse(black_box(encoded.as_ref())).is_ok());
+            b.iter(|| Voucher::parse(black_box(encoded.as_ref())).expect("parse"));
         });
     }
     g.finish();
@@ -300,14 +302,15 @@ fn certificates(c: &mut Criterion) {
     }
     g.finish();
 
-    // Parsing the CA bundle is what a client does before PKINIT; ML-DSA CAs
-    // are an order of magnitude larger than EC ones.
+    // Parsing a CA certificate is what kinit and the TLS stack do with the
+    // bundle an enrollment writes (kuipa itself carries the DER as-is);
+    // ML-DSA CAs are an order of magnitude larger than EC ones.
     let mut g = c.benchmark_group("cert/parse");
     for kind in kinds {
         let cas = chain(kind, 1).expect("CA chain");
         g.throughput(Throughput::Bytes(cas[0].len() as u64));
         g.bench_function(name(kind), |b| {
-            b.iter(|| X509::from_der(black_box(&cas[0])).is_ok());
+            b.iter(|| X509::from_der(black_box(&cas[0])).expect("parse"));
         });
     }
     g.finish();
