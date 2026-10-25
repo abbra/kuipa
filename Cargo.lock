@@ -1012,11 +1012,14 @@ dependencies = [
  "criterion",
  "kuipa-perf",
  "native-ossl",
+ "rustls",
+ "rustls-native-ossl",
  "serde",
  "serde_json",
  "synta",
  "synta-certificate",
  "synta-mtc",
+ "synta-x509-verification",
  "tang-pqc",
 ]
 
@@ -1977,6 +1980,16 @@ dependencies = [
  "synta-certificate",
  "synta-codegen",
  "synta-derive",
+]
+
+[[package]]
+name = "synta-x509-verification"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddb7667d5e6bc195666b6411e3e27d8a5ff0dcfd8d865e431ea3018b031eba08"
+dependencies = [
+ "synta",
+ "synta-certificate",
 ]
 
 [[package]]

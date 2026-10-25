@@ -27,8 +27,6 @@ use kuipa_enroll::delegation::{
 use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
 use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::server::Directory;
-use rustls::pki_types::CertificateDer;
-use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
 use tang_pqc::{Policy, SigningKey, Thumbprint, unix_seconds};
 use tokio::sync::{Notify, RwLock};
 
@@ -233,12 +231,7 @@ fn http_client(settings: &Settings) -> Result<reqwest::Client, Error> {
         let _ = rustls_native_ossl::default_provider().install_default();
     });
     let provider = Arc::new(rustls_native_ossl::default_provider());
-    let roots: Vec<_> = settings
-        .ca_certs
-        .iter()
-        .map(|c| CertificateDer::from(c.as_slice()))
-        .collect();
-    let verifier = OsslServerCertVerifier::builder(&roots)?.build();
+    let verifier = kuipa_enroll::tls::server_verifier(&settings.ca_certs)?;
     let tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .dangerous()

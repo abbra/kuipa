@@ -3,7 +3,8 @@
 //!
 //! The protocol does not rely on TLS (§10.3).  On first contact the client
 //! has no CA yet, so TLS only hides the host name from passive observers;
-//! after enrollment it verifies against the installed IPA CA.
+//! after enrollment it verifies against the installed IPA CA, which may be
+//! a Merkle Tree CA ([`kuipa_enroll::tls`]).
 //!
 //! Errors are classified for the failover rules of §4.6.
 
@@ -14,7 +15,6 @@ use reqwest::StatusCode;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
 use tang_pqc::b64;
 
 /// How to authenticate the server's TLS certificate.
@@ -23,7 +23,7 @@ pub enum Trust {
     /// First contact: any certificate (the protocol authenticates the
     /// server through the realm anchor instead).
     FirstContact,
-    /// The IPA CA chain (DER).
+    /// The IPA CA chain (DER), Merkle Tree CAs included.
     Ca(Vec<Vec<u8>>),
 }
 
@@ -124,13 +124,8 @@ fn tls_config(trust: &Trust) -> Result<rustls::ClientConfig, NetError> {
             builder.with_custom_certificate_verifier(Arc::new(FirstContact(provider)))
         }
         Trust::Ca(certs) => {
-            let roots: Vec<_> = certs
-                .iter()
-                .map(|c| CertificateDer::from(c.as_slice()))
-                .collect();
-            let verifier = OsslServerCertVerifier::builder(&roots)
-                .map_err(|e| NetError::Other(format!("IPA CA: {e}")))?
-                .build();
+            let verifier = kuipa_enroll::tls::server_verifier(certs)
+                .map_err(|e| NetError::Other(format!("IPA CA: {e}")))?;
             builder.with_custom_certificate_verifier(Arc::new(verifier))
         }
     };

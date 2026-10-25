@@ -32,6 +32,8 @@ pub mod realm;
 pub mod server;
 pub mod sign;
 pub mod tlog;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod trust;
 pub mod vault;
 pub mod voucher;
