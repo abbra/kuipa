@@ -292,12 +292,14 @@ jobs:
   # The smoke profile in quick mode: every criterion target runs, so a fixture
   # that no longer verifies or a flow that regressed hard fails the job.  The
   # benches build in release, which the debug artifact cache does not cover —
-  # only the registry cache helps here.
+  # only the registry cache helps here, and the release build of the workspace
+  # is most of the job.  A quick smoke pass measures in ~13 minutes on a fast
+  # laptop; the CI budget covers that plus a cold release build.
   bench:
     name: Benchmarks
     needs: [build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     container: quay.io/fedora/fedora:latest
     steps:
       - name: Install native dependencies
