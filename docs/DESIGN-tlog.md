@@ -176,6 +176,7 @@ request:
 | vault created, policy set, revoked | 3 | vault id | `IPLV`: action, `H` of the policy (zeros for revoke) |
 | vault shared or unshared (DESIGN.md §7.6.12) | 3 | vault id | `IPLV`: share or unshare, `H` of the managers and members after the change |
 | device added or removed | 2 | vault id | `IPLV`: action, the device's id |
+| device key escrowed under a recovery code, or fetched (DESIGN-recovery.md) | 2 | vault id of each vault where the holder holds the device | `IPLV`: action, the device's id |
 | session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |
 | release requested, approved, denied (DESIGN-approvals.md) | 4 | vault id | `IPLV`: action, `H` of the request, or of `id ‖ " " ‖ approver` |
 | server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` (its KEM's suite hash, DESIGN.md §4.1.1) |

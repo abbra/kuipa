@@ -196,6 +196,41 @@ If you suspect your password was compromised too, and a vault requires only
 `ticket`, revoke that vault: a ticket-only vault does not protect against
 someone who has your password and a copy of the file.
 
+### Keep a recovery code, in case it was your only device
+
+If a vault needs your device and you lose every device, the servers will
+not open your files for anyone, you included. A recovery code is your way
+back. Make one on each machine whose device key you would miss:
+
+```sh
+laptop$ kuipa seal recovery-code
+Recovery code for device …:
+
+    DKQ7-W2PM-…-4F
+```
+
+Write it down, away from the laptop: on paper, or in a password manager.
+It is shown once and kuipa never stores it. The servers keep your device
+key encrypted under it, which is useless to anyone without the code.
+
+When the laptop is gone, on the new one:
+
+```sh
+new$ kuipa seal recover code                       # asks for the code
+new$ kuipa seal open ~/secrets/token.sealed --out -     # opens again
+new$ kuipa seal recover finish ~/secrets/*.sealed --retire-old
+```
+
+`recover code` brings the old device key back onto the new laptop.
+`recover finish` registers the new laptop's own device in every vault where
+the old one was, and reseals the files you list to it. `--retire-old` then
+removes the old device from those vaults, so whoever has the lost laptop
+can open nothing. Leave `--retire-old` off until every file is resealed: a
+file still sealed only to the old device stops opening once it is retired.
+
+Every escrow and every fetch of it is in your vaults' transparency logs, so
+`kuipa tlog watch` shows if someone with your password tried.
+
 ### Stay signed in for a working day
 
 Typing a passphrase or touching a key for every open gets tiring. If the

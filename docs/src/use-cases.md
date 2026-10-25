@@ -46,7 +46,7 @@ source tree.
 | [Sign files and commits under your login](#sign-files-and-commits-under-your-login) | developers, release engineers, CI | works |
 | [Have independent witnesses watch the logs](#have-independent-witnesses-watch-the-logs) | auditors, partner sites | works |
 | [Log in offline without a crackable password cache](#log-in-offline-without-a-crackable-password-cache) | laptop users | planned |
-| [Recover a vault when every device is lost](#recover-a-vault-when-every-device-is-lost) | every user, helpdesk | planned |
+| [Recover a vault when every device is lost](#recover-a-vault-when-every-device-is-lost) | every user, helpdesk | partly: recovery codes |
 | [Tie secrets to a TPM, passkey or attested hardware](#tie-secrets-to-a-tpm-passkey-or-attested-hardware) | users, fleet owners | planned |
 | [Give CI runners short-lived identities](#give-ci-runners-short-lived-identities) | platform teams | planned |
 | [Anonymous tokens: surveys, reports, access](#anonymous-tokens-surveys-reports-access) | everyone | research |
@@ -293,9 +293,11 @@ your files are gone.
 only under policy and recorded in the transparency log. The same slot
 can escrow LUKS and backup recovery keys.
 
-**Design:** a recovery code you print, or your device key deposited in a
-helpdesk vault and handed back under several people's approval; hosts
-deposit their LUKS and backup keys the same way. See
+**Status:** partly. A recovery code you print brings your device key back
+on a new machine ([Sealing your own files](user/sealing.md#keep-a-recovery-code-in-case-it-was-your-only-device)).
+Still designed only: your device key deposited in a helpdesk vault and
+handed back under several people's approval, and hosts depositing their
+LUKS and backup keys the same way. See
 [recovery](reference/design.md#kuipa-recovery-lost-devices-luks-and-backup-keys).
 
 ### Tie secrets to a TPM, passkey or attested hardware

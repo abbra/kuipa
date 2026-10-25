@@ -17,7 +17,7 @@ the most managed:
 
 | piece | status |
 |---|---|
-| recovery codes (`kuipa seal recovery-code`, `recover --code`) | designed |
+| recovery codes (`kuipa seal recovery-code`, `recover code`, `recover finish`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | depositors, deposits, `kuipa seal deposit` | designed |
 | device-key deposits and delivery (`kuipa seal recover`) | designed; needs DESIGN-approvals.md |
 | `kuipa escrow luks`, `kuipa escrow file` | designed |
@@ -40,8 +40,8 @@ vault's policy: recovery restores a factor, it does not bypass one.
 
 ## 2. Recovery codes
 
-`kuipa seal recovery-code [--device ID]` makes a code for this host's
-device key:
+`kuipa seal recovery-code` makes a code for this host's device key (a
+file device: a token's key never leaves the token):
 
 ```text
 code  ←$ 128 bits, shown once as 26 base32 characters in groups of 4
@@ -50,16 +50,31 @@ blob  = IPDK(kdf, iterations, salt, GCM_K(private JWK))   (the device.key format
 ```
 
 The client stores the blob with the vault operation `escrow-code
-{device, blob}`, authenticated by the owner's ticket. The server keeps it
-on the owner's own entry, one `ipaKUDeviceEscrow` value per device
-(`{"device", "kind": "code", "blob", "added"}`), and logs the event. A
-new code for the same device replaces the old one.
+{device, blob}`, authenticated by the owner's ticket; the device must be
+one the caller holds in one of their vaults, and the blob at most 16 KiB.
+The server keeps it on the owner's own entry, one `ipaKUDeviceEscrow`
+value per device (`{"device", "kind": "code", "blob", "added"}`). A new
+code for the same device replaces the old one. The event is logged
+(`escrow-code`, kind 2, with the device's id) in every vault where the
+caller holds the device, so the vault's watchers see that its device can
+be recovered.
 
-On a new host, `kuipa seal recover --code` fetches the blobs with the
-operation `recover-code` (the owner's ticket; logged), asks for the code,
-opens the blob and installs the old key as a second device of this host,
-`recovered.key`. `kuipa seal recover finish` then reseals the files it is
-given and removes the old device from every vault of the user.
+On a new host, `kuipa seal recover code` fetches the blobs with the
+operation `recover-code` (the owner's ticket; logged as `recover-code` in
+those vaults, which `kuipa tlog watch` always flags), asks for the code,
+opens the blob it opens, and keeps the old key beside this host's own as
+`recovered.key`, under this host's device passphrase. `kuipa seal open`
+uses it for files that have a slot for it and none for this host's
+device.
+
+`kuipa seal recover finish FILE.sealed…` registers this host's device
+(made now if the host has none) in every vault where the recovered device
+is the user's, and reseals the files to it. Only with `--retire-old`
+does it also remove the recovered device from those vaults and forget it
+here. That is a separate flag because a file left out of the list,
+sealed only to the old device, would stop opening: the user retires the
+old device once everything is resealed, and until then the laptop that
+was lost still holds a key the vaults accept.
 
 The blob is readable by whoever reads the directory, which is why the
 code has the full 128 bits: no one guesses it, whatever the iteration

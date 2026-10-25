@@ -48,8 +48,8 @@ pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault session";
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
 /// Version 2 adds the receipts of the events an operation logged, 3 the
-/// release requests.
-const REPLY_VERSION: u8 = 3;
+/// release requests, 4 device escrows.
+const REPLY_VERSION: u8 = 4;
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
 const SESSION_MAGIC: [u8; 4] = *b"IPST";
@@ -1496,6 +1496,24 @@ impl ReleaseRequest {
     }
 }
 
+/// The largest escrowed device key a server keeps, in bytes.
+pub const MAX_ESCROW_BLOB: usize = 16 * 1024;
+
+/// A device key kept for recovery (`DESIGN-recovery.md` §2), on its
+/// holder's own entry: the private key under a key derived from a
+/// recovery code only the holder has, in the `device.key` format.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEscrow {
+    /// The device's id.
+    pub device: String,
+    /// How it is protected: `code`.
+    pub kind: String,
+    /// The protected key, base64url.
+    pub blob: String,
+    /// When it was escrowed.
+    pub added: u64,
+}
+
 /// What a user asks of their vaults, sent as the operation data of a
 /// `POST /ipa/ku/vault/{kid}` exchange authenticated by their ticket.
 /// Every `name` is a vault reference: `NAME` for the caller's own vault,
@@ -1614,6 +1632,16 @@ pub enum VaultOp {
         /// The request.
         id: String,
     },
+    /// Keep `blob`, device `device`'s key under a recovery code, on the
+    /// caller's entry, in place of any earlier one for that device.
+    EscrowCode {
+        /// The device's id; the caller must hold it in one of their vaults.
+        device: String,
+        /// The protected key, base64url.
+        blob: String,
+    },
+    /// The caller's device keys kept under recovery codes.
+    RecoverCode,
     /// Start a session for one of the vault's devices: re-authentication,
     /// or with `offline`, the release of the vault's session keys.
     Unlock {
@@ -1658,12 +1686,14 @@ pub struct Reply {
     pub receipts: Vec<Receipt>,
     /// Release requests the operation made, changed or listed.
     pub requests: Vec<ReleaseRequest>,
+    /// Device keys the operation escrowed or returned.
+    pub escrows: Vec<DeviceEscrow>,
 }
 
 impl Reply {
-    /// Encode: `IPVR` version 3, `n(u64) [descriptor] session released
-    /// m(u8) [receipt] requests` (session and released empty without one,
-    /// requests a JSON list).
+    /// Encode: `IPVR` version 4, `n(u64) [descriptor] session released
+    /// m(u8) [receipt] requests escrows` (session and released empty
+    /// without one, requests and escrows JSON lists).
     ///
     /// # Panics
     ///
@@ -1694,6 +1724,7 @@ impl Reply {
             w.bytes(&receipt.to_bytes());
         }
         w.bytes(&serde_json::to_vec(&self.requests).unwrap_or_default());
+        w.bytes(&serde_json::to_vec(&self.escrows).unwrap_or_default());
         w.finish()
     }
 
@@ -1722,6 +1753,8 @@ impl Reply {
             .collect::<Result<_>>()?;
         let requests =
             serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("release requests"))?;
+        let escrows =
+            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("device escrows"))?;
         r.finish()?;
         Ok(Self {
             descriptors,
@@ -1729,6 +1762,7 @@ impl Reply {
             released,
             receipts,
             requests,
+            escrows,
         })
     }
 }

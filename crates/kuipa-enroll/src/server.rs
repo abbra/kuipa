@@ -27,8 +27,9 @@ use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
-    Approval, DEFAULT_EPOCH, Descriptor, Limits, Members, Recovered, ReleaseRequest, ReleasedKeys,
-    Reply, Role, SessionFor, SessionKey, SessionToken, State, Vault, VaultAnswer, VaultOp,
+    Approval, DEFAULT_EPOCH, Descriptor, DeviceEscrow, Limits, Members, Recovered, ReleaseRequest,
+    ReleasedKeys, Reply, Role, SessionFor, SessionKey, SessionToken, State, Vault, VaultAnswer,
+    VaultOp,
 };
 use crate::voucher::Voucher;
 
@@ -371,6 +372,31 @@ pub trait Directory {
         Err("approvals are not supported by this directory".into())
     }
 
+    /// Keep `escrow` on `principal`'s own entry, in place of any earlier
+    /// escrow of the same device (`DESIGN-recovery.md` §2).
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default recovery codes are not supported.
+    fn device_escrow_set(
+        &self,
+        principal: &Principal,
+        escrow: &DeviceEscrow,
+    ) -> Result<(), DirectoryError> {
+        let _ = (principal, escrow);
+        Err("recovery codes are not supported by this directory".into())
+    }
+
+    /// The device keys kept on `principal`'s entry.
+    ///
+    /// # Errors
+    ///
+    /// Any failure.
+    fn device_escrows(&self, principal: &Principal) -> Result<Vec<DeviceEscrow>, DirectoryError> {
+        let _ = principal;
+        Ok(Vec::new())
+    }
+
     /// Count one release of vault `id` by `server` (§7.6.7), unless the
     /// vault's releases, summed over all servers, have reached `limit`:
     /// then count nothing and answer `false`.
@@ -634,6 +660,16 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
         (**self).release_add(request)
+    }
+    fn device_escrow_set(
+        &self,
+        principal: &Principal,
+        escrow: &DeviceEscrow,
+    ) -> Result<(), DirectoryError> {
+        (**self).device_escrow_set(principal, escrow)
+    }
+    fn device_escrows(&self, principal: &Principal) -> Result<Vec<DeviceEscrow>, DirectoryError> {
+        (**self).device_escrows(principal)
     }
     fn releases(&self, id: &escrow::VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
         (**self).releases(id)
@@ -1530,7 +1566,14 @@ impl EnrollServer {
         let rotate = matches!(op, VaultOp::RemoveDevice { .. } | VaultOp::Unshare { .. });
         let mut receipts = Vec::new();
         let mut requests = Vec::new();
+        let mut escrows = Vec::new();
         let (mut vaults, session, released) = match op {
+            op @ (VaultOp::EscrowCode { .. } | VaultOp::RecoverCode) => {
+                let (found, logged) = self.escrow_op(&caller, op, now, directory)?;
+                escrows = found;
+                receipts.extend(logged);
+                (Vec::new(), None, None)
+            }
             op @ (VaultOp::Request { .. }
             | VaultOp::Pending { .. }
             | VaultOp::Approve { .. }
@@ -1612,6 +1655,7 @@ impl EnrollServer {
             released,
             receipts,
             requests,
+            escrows,
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
     }
@@ -2160,6 +2204,81 @@ impl EnrollServer {
         Ok((vec![request], receipts))
     }
 
+    /// Answer `escrow-code` and `recover-code` (`DESIGN-recovery.md` §2):
+    /// keep or return the caller's device keys under recovery codes.  Each
+    /// is logged in every vault where the caller holds the device, so a
+    /// vault's watchers see that its device can be recovered, and when it
+    /// was fetched.
+    fn escrow_op(
+        &self,
+        caller: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vec<DeviceEscrow>, Vec<Receipt>), Refusal> {
+        let me = caller.to_string();
+        let vaults = list_vaults(caller, directory)?;
+        let held = |device: &str| -> Vec<escrow::VaultId> {
+            vaults
+                .iter()
+                .filter(|v| {
+                    v.devices
+                        .iter()
+                        .any(|d| d.id == device && v.holder(d) == me)
+                })
+                .map(|v| v.id)
+                .collect()
+        };
+        let mut receipts = Vec::new();
+        let mut log = |device: &str, action: VaultAction| -> Result<(), Refusal> {
+            for id in held(device) {
+                let zero = merkle::Hash::zero(self.tree_hash());
+                receipts.extend(self.record_vault(&id, action, Some(device), zero)?);
+            }
+            Ok(())
+        };
+        match op {
+            VaultOp::EscrowCode { device, blob } => {
+                if held(&device).is_empty() {
+                    return Err(Refusal::because(
+                        "register the device in a vault before escrowing it",
+                    ));
+                }
+                let bytes = tang_pqc::b64::decode(&blob).map_err(Error::from)?;
+                if bytes.is_empty() || bytes.len() > crate::vault::MAX_ESCROW_BLOB {
+                    return Err(Refusal::because(
+                        "an escrowed key of no or too great a size",
+                    ));
+                }
+                let escrow = DeviceEscrow {
+                    device,
+                    kind: "code".into(),
+                    blob,
+                    added: now,
+                };
+                log(&escrow.device, VaultAction::EscrowCode)?;
+                directory
+                    .device_escrow_set(caller, &escrow)
+                    .map_err(Refusal)?;
+                eprintln!("kuipad: {caller} escrowed device {}", escrow.device);
+                Ok((vec![escrow], receipts))
+            }
+            VaultOp::RecoverCode => {
+                let escrows = directory.device_escrows(caller).map_err(Refusal)?;
+                // Logged before anything is answered.
+                for e in &escrows {
+                    log(&e.device, VaultAction::RecoverCode)?;
+                }
+                eprintln!(
+                    "kuipad: {caller} fetched {} escrowed device key(s)",
+                    escrows.len()
+                );
+                Ok((escrows, receipts))
+            }
+            _ => unreachable!("only escrow operations"),
+        }
+    }
+
     /// The tree hash of `parts`, as a log event's digest.
     fn log_digest(&self, parts: &[&[u8]]) -> Result<merkle::Hash, Refusal> {
         let alg = self.tree_hash();
@@ -2322,6 +2441,50 @@ impl EnrollServer {
         Ok(vec![vault])
     }
 
+    /// `add-device`: register a device key of the caller's in a vault,
+    /// held by them.
+    fn add_device(
+        &self,
+        caller: &Principal,
+        op: VaultOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Vault, Refusal> {
+        let VaultOp::AddDevice {
+            name,
+            label,
+            kind,
+            alg,
+            key,
+        } = op
+        else {
+            unreachable!("only add-device");
+        };
+        let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
+        let me = caller.to_string();
+        if vault
+            .devices
+            .iter()
+            .filter(|d| vault.holder(d) == me)
+            .count()
+            >= limits_for(&vault.owner, directory)?.max_devices
+        {
+            return Err(Refusal::because("too many devices"));
+        }
+        let public = tang_pqc::ExchangeKey::from_bytes(
+            tang_pqc::KemAlg::from_id(alg).map_err(Error::from)?,
+            &tang_pqc::b64::decode(&key).map_err(Error::from)?,
+        )
+        .map_err(Error::from)?;
+        // No attestation is verified yet: every device is `any`.
+        let device = crate::vault::Device::new(&public, &label, kind, now).held_by(&me);
+        if vault.devices.iter().any(|d| d.id == device.id) {
+            return Err(Refusal::because("device already registered"));
+        }
+        vault.devices.push(device);
+        Ok(vault)
+    }
+
     fn apply_vault_op(
         &self,
         caller: &Principal,
@@ -2336,7 +2499,9 @@ impl EnrollServer {
             | VaultOp::Request { .. }
             | VaultOp::Pending { .. }
             | VaultOp::Approve { .. }
-            | VaultOp::Deny { .. } => unreachable!("answered by vault_op"),
+            | VaultOp::Deny { .. }
+            | VaultOp::EscrowCode { .. }
+            | VaultOp::RecoverCode => unreachable!("answered by vault_op"),
             VaultOp::Create { name, policy } => {
                 return Self::create_vault(caller, name, policy, now, directory, record);
             }
@@ -2376,37 +2541,7 @@ impl EnrollServer {
                 self.unshare(&mut vault, caller, role, &managers, &members)?;
                 vault
             }
-            VaultOp::AddDevice {
-                name,
-                label,
-                kind,
-                alg,
-                key,
-            } => {
-                let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
-                let me = caller.to_string();
-                if vault
-                    .devices
-                    .iter()
-                    .filter(|d| vault.holder(d) == me)
-                    .count()
-                    >= limits_for(&vault.owner, directory)?.max_devices
-                {
-                    return Err(Refusal::because("too many devices"));
-                }
-                let public = tang_pqc::ExchangeKey::from_bytes(
-                    tang_pqc::KemAlg::from_id(alg).map_err(Error::from)?,
-                    &tang_pqc::b64::decode(&key).map_err(Error::from)?,
-                )
-                .map_err(Error::from)?;
-                // No attestation is verified yet: every device is `any`.
-                let device = crate::vault::Device::new(&public, &label, kind, now).held_by(&me);
-                if vault.devices.iter().any(|d| d.id == device.id) {
-                    return Err(Refusal::because("device already registered"));
-                }
-                vault.devices.push(device);
-                vault
-            }
+            op @ VaultOp::AddDevice { .. } => self.add_device(caller, op, now, directory)?,
             VaultOp::RemoveDevice { name, id } => {
                 let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
                 let me = caller.to_string();
@@ -2784,7 +2919,9 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
         | VaultOp::Request { .. }
         | VaultOp::Pending { .. }
         | VaultOp::Approve { .. }
-        | VaultOp::Deny { .. } => return None,
+        | VaultOp::Deny { .. }
+        | VaultOp::EscrowCode { .. }
+        | VaultOp::RecoverCode => return None,
     })
 }
 

@@ -72,6 +72,8 @@ struct MemoryDirectory {
     releases: RefCell<HashMap<(VaultId, String), vault::ReleaseRequest>>,
     /// Their uses, by vault, id and server.
     release_uses: RefCell<HashMap<(VaultId, String, String), u64>>,
+    /// Device keys kept under recovery codes, by holder.
+    escrows: RefCell<HashMap<String, Vec<vault::DeviceEscrow>>>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -348,6 +350,30 @@ impl Directory for MemoryDirectory {
             })
             .cloned()
             .collect())
+    }
+
+    fn device_escrow_set(
+        &self,
+        principal: &Principal,
+        escrow: &vault::DeviceEscrow,
+    ) -> Result<(), DirectoryError> {
+        let mut all = self.escrows.borrow_mut();
+        let mine = all.entry(principal.to_string()).or_default();
+        mine.retain(|e| e.device != escrow.device);
+        mine.push(escrow.clone());
+        Ok(())
+    }
+
+    fn device_escrows(
+        &self,
+        principal: &Principal,
+    ) -> Result<Vec<vault::DeviceEscrow>, DirectoryError> {
+        Ok(self
+            .escrows
+            .borrow()
+            .get(&principal.to_string())
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn release_add(&self, request: &vault::ReleaseRequest) -> Result<(), DirectoryError> {
@@ -3019,6 +3045,66 @@ fn releases_wait_for_approvals_from_others() {
     approvals_count_others_once(&c);
     approvers_count_while_admitted(&c);
     requests_end(&c);
+}
+
+#[test]
+fn device_keys_are_escrowed_for_their_holders_and_logged() {
+    let (r, _) = logged_realm();
+    let adv = &r.verify(0);
+    let key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let device = key.public().kid().to_string();
+    let escrow = |who: &str, device: &str, blob: &[u8]| {
+        vault_reply_at(
+            &r,
+            0,
+            adv,
+            who,
+            &VaultOp::EscrowCode {
+                device: device.into(),
+                blob: tang_pqc::b64::encode(blob),
+            },
+        )
+    };
+    // Only a device the caller holds in a vault.
+    assert!(escrow(ALICE, &device, b"blob").is_err());
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Create {
+            name: "notes".into(),
+            policy: vault::Policy {
+                factors: Factors {
+                    device: Some(Level::Any),
+                    ticket: true,
+                    passkey: false,
+                },
+                ..vault::Policy::default()
+            },
+        },
+    )
+    .unwrap();
+    vault_op(&r, adv, ALICE, &add_device_op("notes", &key)).unwrap();
+    assert!(escrow(BOB, &device, b"blob").is_err(), "not Bob's device");
+    assert!(escrow(ALICE, &device, b"").is_err(), "empty");
+    let big = vec![7u8; vault::MAX_ESCROW_BLOB + 1];
+    assert!(escrow(ALICE, &device, &big).is_err(), "too large");
+
+    // Kept, replaced by the next, and logged in the vault of the device.
+    let first = escrow(ALICE, &device, b"first").unwrap();
+    assert_eq!(first.escrows.len(), 1);
+    assert_eq!(first.receipts.len(), 1, "logged");
+    escrow(ALICE, &device, b"second").unwrap();
+    let fetched = vault_reply_at(&r, 0, adv, ALICE, &VaultOp::RecoverCode).unwrap();
+    assert_eq!(fetched.escrows.len(), 1);
+    assert_eq!(
+        tang_pqc::b64::decode(&fetched.escrows[0].blob).unwrap(),
+        b"second"
+    );
+    assert_eq!(fetched.receipts.len(), 1, "the fetch is logged too");
+    // Bob fetches only his own: none.
+    let bobs = vault_reply_at(&r, 0, adv, BOB, &VaultOp::RecoverCode).unwrap();
+    assert!(bobs.escrows.is_empty());
 }
 
 /// Run a vault operation as `caller` against server `i`.
