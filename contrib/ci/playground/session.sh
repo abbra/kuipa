@@ -359,6 +359,31 @@ step 0 "The new laptop opens the resealed file" \
     'pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-new" kuipa seal open "$KUIPA_PLAYGROUND/bob-team.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | cat' \
     "db=hunter2"
 
+section "The helpdesk brings a device back" \
+    "carol runs the helpdesk vault the realm names for device keys; the administrator approves each release from it. bob's desk deposits its device key when he registers it. The desk is lost, bob has no recovery code: carol delivers the key to his new desk, encrypted to its device."
+step 0 "carol creates the helpdesk vault; the administrator approves its releases" \
+    'echo "carol staple" > "$KUIPA_PLAYGROUND/carol-pass" && pq_as carol kuipa seal create device-escrow --require device,ticket --approvals 1 --approver-user admin && pq_as carol kuipa seal device add device-escrow --passphrase-file "$KUIPA_PLAYGROUND/carol-pass" && pq_as carol kuipa seal share device-escrow --depositor --user bob' \
+    "depositors: user:bob@EXAMPLE.TEST"
+step 0 "The realm keeps device keys there" \
+    'kuipa-playground recovery --vault carol/device-escrow' "device keys are deposited in carol/device-escrow"
+step 0 "bob's desk registers a device: its key is deposited first" \
+    'desk() { pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-$1" "${@:2}"; } && desk desk kuipa seal create keys --require device,ticket && desk desk kuipa seal device add keys --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" && echo "vpn=bob-secret" > "$KUIPA_PLAYGROUND/keys.txt" && desk desk kuipa seal file keys "$KUIPA_PLAYGROUND/keys.txt" && old=$(desk desk kuipa --json seal recover helpdesk --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | python3 -c "import json,sys; print(json.load(sys.stdin)[\"helpdesk_device\"])") && pq_as carol kuipa seal deposit list device-escrow' \
+    "(device, device=" "by bob@EXAMPLE.TEST"
+step 0 "The desk is lost; on a new one bob registers a device and names it" \
+    'desk new-desk kuipa seal device add keys --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" && new=$(desk new-desk kuipa --json seal recover helpdesk --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | python3 -c "import json,sys; print(json.load(sys.stdin)[\"helpdesk_device\"])") && echo "new device: $new"' \
+    "new device: "
+step 0 "carol asks for the release of the old device's deposit" \
+    'did=$(pq_as carol kuipa --json seal deposit list device-escrow | python3 -c "import json,sys; print(next(d[\"id\"] for d in json.load(sys.stdin)[\"deposits\"] if d[\"subject\"].get(\"device\") == \"$old\"))") && pq_as carol kuipa seal deposit fetch device-escrow "$did" --out "$KUIPA_PLAYGROUND/old-key.sealed" && hq=$(pq_as carol kuipa --json seal request device-escrow "$KUIPA_PLAYGROUND/old-key.sealed" --reason "INC-2: bob lost his desk") && echo "$hq" && hq_id=$(python3 -c "import json,sys; print(json.load(sys.stdin)[\"requests\"][0][\"id\"])" <<<"$hq")' \
+    "INC-2: bob lost his desk"
+step 0 "The administrator approves, having checked it is bob" \
+    'kuipa seal approve carol/device-escrow "$hq_id"' "approved by: admin@EXAMPLE.TEST"
+step 0 "carol delivers the old key to bob's new device" \
+    'pq_as carol kuipa seal recover deliver "$did" --user bob --device "$new" --request "$hq_id" --passphrase-file "$KUIPA_PLAYGROUND/carol-pass"' \
+    "is delivered to bob's device"
+step 0 "bob fetches it on the new desk, and his file opens there" \
+    'desk new-desk kuipa seal recover fetch --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" && desk new-desk kuipa seal open "$KUIPA_PLAYGROUND/keys.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | cat' \
+    "is recovered on this host" "vpn=bob-secret"
+
 section "Deposits" \
     "carol is a depositor of the administrator's drop vault: she seals a backup password to it and leaves it with the servers, and cannot read it back. The administrator lists, fetches and opens it. Then web1, a depositor too, deposits its LUKS recovery key with its own keytab."
 step 0 "Create the drop vault, with carol as a depositor" \
