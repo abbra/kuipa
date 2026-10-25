@@ -49,38 +49,37 @@ const fn lane(x: usize, y: usize) -> usize {
 }
 
 /// Append Keccak-f\[1600\] of `state` to `c`; returns the new state.
-#[allow(clippy::needless_range_loop, clippy::many_single_char_names)] // FIPS 202's indices and names
-pub fn permutation(c: &mut Circuit, state: &[Wire; 1600]) -> [Wire; 1600] {
-    let mut a = *state;
-    for rc in ROUND_CONSTANTS {
+pub fn permutation(circuit: &mut Circuit, state: &[Wire; 1600]) -> [Wire; 1600] {
+    let mut lanes = *state;
+    for round_const in ROUND_CONSTANTS {
         // θ
         let mut col = [0u32; 320];
         for x in 0..5 {
             for z in 0..64 {
-                let mut w = a[lane(x, 0) + z];
+                let mut acc = lanes[lane(x, 0) + z];
                 for y in 1..5 {
-                    w = c.xor(w, a[lane(x, y) + z]);
+                    acc = circuit.xor(acc, lanes[lane(x, y) + z]);
                 }
-                col[64 * x + z] = w;
+                col[64 * x + z] = acc;
             }
         }
         for x in 0..5 {
             for z in 0..64 {
                 let left = col[64 * ((x + 4) % 5) + z];
                 let right = col[64 * ((x + 1) % 5) + (z + 63) % 64];
-                let d = c.xor(left, right);
+                let delta = circuit.xor(left, right);
                 for y in 0..5 {
-                    a[lane(x, y) + z] = c.xor(a[lane(x, y) + z], d);
+                    lanes[lane(x, y) + z] = circuit.xor(lanes[lane(x, y) + z], delta);
                 }
             }
         }
         // ρ and π: B[y, 2x+3y] = rot(A[x, y], r[x][y]).
-        let mut b = [0u32; 1600];
+        let mut rho_pi = [0u32; 1600];
         for x in 0..5 {
             for y in 0..5 {
-                let r = ROTATIONS[x][y] as usize;
+                let rot = ROTATIONS[x][y] as usize;
                 for z in 0..64 {
-                    b[lane(y, 2 * x + 3 * y) + (z + r) % 64] = a[lane(x, y) + z];
+                    rho_pi[lane(y, 2 * x + 3 * y) + (z + rot) % 64] = lanes[lane(x, y) + z];
                 }
             }
         }
@@ -88,25 +87,24 @@ pub fn permutation(c: &mut Circuit, state: &[Wire; 1600]) -> [Wire; 1600] {
         for x in 0..5 {
             for y in 0..5 {
                 for z in 0..64 {
-                    let n = c.not(b[lane(x + 1, y) + z]);
-                    let t = c.and(n, b[lane(x + 2, y) + z]);
-                    a[lane(x, y) + z] = c.xor(b[lane(x, y) + z], t);
+                    let inverted = circuit.not(rho_pi[lane(x + 1, y) + z]);
+                    let masked = circuit.and(inverted, rho_pi[lane(x + 2, y) + z]);
+                    lanes[lane(x, y) + z] = circuit.xor(rho_pi[lane(x, y) + z], masked);
                 }
             }
         }
         // ι
-        for z in 0..64 {
-            if (rc >> z) & 1 == 1 {
-                a[z] = c.not(a[z]);
+        for (z, wire) in lanes.iter_mut().enumerate().take(64) {
+            if (round_const >> z) & 1 == 1 {
+                *wire = circuit.not(*wire);
             }
         }
     }
-    a
+    lanes
 }
 
 /// Keccak-f\[1600\] in software, over lanes: for tests and witnesses.
 #[must_use]
-#[allow(clippy::many_single_char_names)] // FIPS 202's names
 pub fn permute(state: [u64; 25]) -> [u64; 25] {
     let mut a = state;
     for rc in ROUND_CONSTANTS {

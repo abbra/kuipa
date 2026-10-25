@@ -217,7 +217,6 @@ pub fn prove_at(level: Level, circuit: &Circuit, input: &[bool]) -> Result<(Proo
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the protocol's steps and names
 fn prove_in<F: Field>(
     level: Level,
     circuit: &Circuit,
@@ -227,10 +226,10 @@ fn prove_in<F: Field>(
     let (wires, outputs) = circuit.evaluate(input)?;
     let layout = Layout::of(level, circuit);
     let tau = layout.tau;
-    let mut w: Vec<bool> = input.to_vec();
-    for (i, g) in circuit.gates().iter().enumerate() {
-        if matches!(g, Gate::And(..)) {
-            w.push(wires[circuit.inputs() as usize + i]);
+    let mut witness: Vec<bool> = input.to_vec();
+    for (index, gate) in circuit.gates().iter().enumerate() {
+        if matches!(gate, Gate::And(..)) {
+            witness.push(wires[circuit.inputs() as usize + index]);
         }
     }
     let prg = Prg::new()?;
@@ -240,34 +239,12 @@ fn prove_in<F: Field>(
     Rand::fill_private(&mut master)?;
 
     // 1. The trees, their leaves' commitments, u and the columns.
-    let mut trees: Vec<Vec<Seed>> = Vec::with_capacity(tau);
-    let mut coms = Vec::with_capacity(tau * LEAVES * 64);
-    let mut us: Vec<Vec<u8>> = Vec::with_capacity(tau);
-    let mut columns = vec![vec![0u8; layout.lbytes]; tau * DEPTH];
-    let mut r = vec![0u8; layout.lbytes];
-    for i in 0..tau {
-        let mut nodes = vec![[0u8; 32]; 2 * LEAVES];
-        nodes[1] = node_seed(&master, i)?;
-        for n in 1..LEAVES {
-            let (a, b) = prg.children(&nodes[n])?;
-            nodes[2 * n] = a;
-            nodes[2 * n + 1] = b;
-        }
-        let mut u = vec![0u8; layout.lbytes];
-        for x in 0..LEAVES {
-            let seed = nodes[LEAVES + x];
-            coms.extend_from_slice(&commit(&salt, i, x, &seed)?);
-            prg.expand(&seed, &mut r)?;
-            xor_into(&mut u, &r);
-            for b in 0..DEPTH {
-                if (x >> b) & 1 == 1 {
-                    xor_into(&mut columns[DEPTH * i + b], &r);
-                }
-            }
-        }
-        us.push(u);
-        trees.push(nodes);
-    }
+    let Commitments {
+        trees,
+        coms,
+        us,
+        columns,
+    } = commit_trees(&prg, &master, &salt, &layout)?;
     let h_com = hash("ml-dsa-zk/v1 commitments", &[&salt, &coms])?;
     // The bits past L are never read; zero them, for one encoding.
     let tail = if layout.l.is_multiple_of(8) {
@@ -285,93 +262,38 @@ fn prove_in<F: Field>(
             c
         })
         .collect();
-    let u = &us[0];
+    let vole_u = &us[0];
 
     // 2. The VOLE check's hashes.
-    let mut t = transcript_start(level, circuit, &outputs, &salt, &h_com, &corrections)?;
-    let chi: F = gf_challenge(&mut t, "chi")?;
+    let mut transcript = transcript_start(level, circuit, &outputs, &salt, &h_com, &corrections)?;
+    let chi: F = gf_challenge(&mut transcript, "chi")?;
     let pw = powers(chi, layout.ell + layout.lambda);
-    let u_hash = vole_hash(u, &pw, &layout);
+    let u_hash = vole_hash(vole_u, &pw, &layout);
     let col_hashes: Vec<F> = columns.iter().map(|c| vole_hash(c, &pw, &layout)).collect();
     let h_v = column_digest(&col_hashes)?;
 
     // 3. The witness, masked.
-    let mut d = vec![0u8; layout.dbytes];
-    for (j, wj) in w.iter().enumerate() {
-        if *wj ^ bit(u, j) {
-            d[j / 8] |= 1 << (j % 8);
+    let mut masked = vec![0u8; layout.dbytes];
+    for (j, wj) in witness.iter().enumerate() {
+        if *wj ^ bit(vole_u, j) {
+            masked[j / 8] |= 1 << (j % 8);
         }
     }
-    t.absorb("u hash", &u_hash.to_vec())?;
-    t.absorb("column hashes", &h_v)?;
-    t.absorb("witness", &d)?;
-    let eta: F = gf_challenge(&mut t, "eta")?;
+    transcript.absorb("u hash", &u_hash.to_vec())?;
+    transcript.absorb("column hashes", &h_v)?;
+    transcript.absorb("witness", &masked)?;
+    let eta: F = gf_challenge(&mut transcript, "eta")?;
 
     // 4. QuickSilver over the MACs vⱼ.
-    let v: Vec<F> = rows(&columns, layout.l);
-    let mut macs: Vec<(bool, F)> = (0..circuit.inputs() as usize)
-        .map(|j| (w[j], v[j]))
-        .collect();
-    let mut next = circuit.inputs() as usize;
-    let (mut a0, mut a1) = (F::ZERO, F::ZERO);
-    let mut weight = eta;
-    for g in circuit.gates() {
-        let m = match *g {
-            Gate::Xor(a, b) => {
-                let (x, y) = (macs[a as usize], macs[b as usize]);
-                (x.0 ^ y.0, x.1 + y.1)
-            }
-            Gate::Not(a) => {
-                let x = macs[a as usize];
-                (!x.0, x.1)
-            }
-            Gate::And(a, b) => {
-                let (x, y) = (macs[a as usize], macs[b as usize]);
-                let c = (w[next], v[next]);
-                next += 1;
-                a0 += weight * (x.1 * y.1);
-                a1 += weight * (x.1.times_bit(y.0) + y.1.times_bit(x.0) + c.1);
-                weight = weight * eta;
-                c
-            }
-        };
-        macs.push(m);
-    }
-    for o in circuit.outputs() {
-        a1 += weight * macs[*o as usize].1;
-        weight = weight * eta;
-    }
-    let (mut mask_value, mut mask_mac) = (F::ZERO, F::ZERO);
-    for t_ in 0..layout.lambda {
-        let j = layout.ell + t_;
-        mask_value += F::x_pow(t_).times_bit(bit(u, j));
-        mask_mac += F::x_pow(t_) * v[j];
-    }
-    a0 += mask_mac;
-    a1 += mask_value;
+    let vole_v: Vec<F> = rows(&columns, layout.l);
+    let (a0, a1) = quicksilver_sums(circuit, &witness, &vole_v, vole_u, &layout, eta);
 
     // 5. Δ, and the openings.
-    t.absorb("a0", &a0.to_vec())?;
-    t.absorb("a1", &a1.to_vec())?;
+    transcript.absorb("a0", &a0.to_vec())?;
+    transcript.absorb("a1", &a1.to_vec())?;
     let mut delta = vec![0u8; tau];
-    t.challenge("delta", &mut delta)?;
-    let openings = trees
-        .iter()
-        .enumerate()
-        .map(|(i, nodes)| {
-            let hidden = usize::from(delta[i]);
-            let mut copath = [[0u8; 32]; DEPTH];
-            let mut n = LEAVES + hidden;
-            for slot in &mut copath {
-                *slot = nodes[n ^ 1];
-                n >>= 1;
-            }
-            Ok(Opening {
-                copath,
-                hidden: commit(&salt, i, hidden, &nodes[LEAVES + hidden])?,
-            })
-        })
-        .collect::<Result<_>>()?;
+    transcript.challenge("delta", &mut delta)?;
+    let openings = openings(&trees, &salt, &delta)?;
     Ok((
         Proof {
             level,
@@ -380,13 +302,135 @@ fn prove_in<F: Field>(
             corrections,
             u_hash: u_hash.to_vec(),
             h_v,
-            d,
+            d: masked,
             a0: a0.to_vec(),
             a1: a1.to_vec(),
             openings,
         },
         outputs,
     ))
+}
+
+/// The seed trees, the leaf commitments, the per-tree `u` vectors and the
+/// columns of the VOLE correlation, as [`prove_in`] needs them.
+struct Commitments {
+    trees: Vec<Vec<Seed>>,
+    coms: Vec<u8>,
+    us: Vec<Vec<u8>>,
+    columns: Vec<Vec<u8>>,
+}
+
+fn commit_trees(prg: &Prg, master: &Seed, salt: &[u8; 32], layout: &Layout) -> Result<Commitments> {
+    let tau = layout.tau;
+    let mut trees: Vec<Vec<Seed>> = Vec::with_capacity(tau);
+    let mut coms = Vec::with_capacity(tau * LEAVES * 64);
+    let mut us: Vec<Vec<u8>> = Vec::with_capacity(tau);
+    let mut columns = vec![vec![0u8; layout.lbytes]; tau * DEPTH];
+    let mut r = vec![0u8; layout.lbytes];
+    for i in 0..tau {
+        let mut nodes = vec![[0u8; 32]; 2 * LEAVES];
+        nodes[1] = node_seed(master, i)?;
+        for node in 1..LEAVES {
+            let (left, right) = prg.children(&nodes[node])?;
+            nodes[2 * node] = left;
+            nodes[2 * node + 1] = right;
+        }
+        let mut u = vec![0u8; layout.lbytes];
+        for leaf in 0..LEAVES {
+            let seed = nodes[LEAVES + leaf];
+            coms.extend_from_slice(&commit(salt, i, leaf, &seed)?);
+            prg.expand(&seed, &mut r)?;
+            xor_into(&mut u, &r);
+            for depth in 0..DEPTH {
+                if (leaf >> depth) & 1 == 1 {
+                    xor_into(&mut columns[DEPTH * i + depth], &r);
+                }
+            }
+        }
+        us.push(u);
+        trees.push(nodes);
+    }
+    Ok(Commitments {
+        trees,
+        coms,
+        us,
+        columns,
+    })
+}
+
+/// QuickSilver's two sums, `a0` and `a1`, over the gates and the outputs,
+/// with the mask's `λ` terms added in.
+fn quicksilver_sums<F: Field>(
+    circuit: &Circuit,
+    witness: &[bool],
+    vole_v: &[F],
+    vole_u: &[u8],
+    layout: &Layout,
+    eta: F,
+) -> (F, F) {
+    let mut macs: Vec<(bool, F)> = (0..circuit.inputs() as usize)
+        .map(|col| (witness[col], vole_v[col]))
+        .collect();
+    let mut next = circuit.inputs() as usize;
+    let (mut a0, mut a1) = (F::ZERO, F::ZERO);
+    let mut weight = eta;
+    for gate in circuit.gates() {
+        let mac = match *gate {
+            Gate::Xor(lhs, rhs) => {
+                let (x, y) = (macs[lhs as usize], macs[rhs as usize]);
+                (x.0 ^ y.0, x.1 + y.1)
+            }
+            Gate::Not(src) => {
+                let x = macs[src as usize];
+                (!x.0, x.1)
+            }
+            Gate::And(lhs, rhs) => {
+                let (x, y) = (macs[lhs as usize], macs[rhs as usize]);
+                let fresh = (witness[next], vole_v[next]);
+                next += 1;
+                a0 += weight * (x.1 * y.1);
+                a1 += weight * (x.1.times_bit(y.0) + y.1.times_bit(x.0) + fresh.1);
+                weight = weight * eta;
+                fresh
+            }
+        };
+        macs.push(mac);
+    }
+    for out in circuit.outputs() {
+        a1 += weight * macs[*out as usize].1;
+        weight = weight * eta;
+    }
+    let (mut mask_value, mut mask_mac) = (F::ZERO, F::ZERO);
+    for power in 0..layout.lambda {
+        let col = layout.ell + power;
+        mask_value += F::x_pow(power).times_bit(bit(vole_u, col));
+        mask_mac += F::x_pow(power) * vole_v[col];
+    }
+    a0 += mask_mac;
+    a1 += mask_value;
+    (a0, a1)
+}
+
+/// The openings: each tree's co-path to its hidden leaf, and that leaf's
+/// commitment.
+fn openings(trees: &[Vec<Seed>], salt: &[u8; 32], delta: &[u8]) -> Result<Vec<Opening>> {
+    trees
+        .iter()
+        .enumerate()
+        .map(|(i, nodes)| {
+            let hidden = usize::from(delta[i]);
+            let mut copath = [[0u8; 32]; DEPTH];
+            let mut node = LEAVES + hidden;
+            for slot in &mut copath {
+                *slot = nodes[node ^ 1];
+                node >>= 1;
+            }
+            Ok(Opening {
+                copath,
+                hidden: commit(salt, i, hidden, &nodes[LEAVES + hidden])?,
+            })
+        })
+        .collect()
 }
 
 /// Verify `proof` that some input makes `circuit`'s outputs `outputs`,
@@ -418,7 +462,6 @@ pub fn verify_at(minimum: Level, circuit: &Circuit, outputs: &[bool], proof: &Pr
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the protocol's steps and names
 fn verify_in<F: Field>(circuit: &Circuit, outputs: &[bool], proof: &Proof) -> Result<()> {
     circuit.check()?;
     let layout = Layout::of(proof.level, circuit);
@@ -435,12 +478,8 @@ fn verify_in<F: Field>(circuit: &Circuit, outputs: &[bool], proof: &Proof) -> Re
     {
         return Err(Error::Malformed("proof shape"));
     }
-    let (u_hash, a0, a1) = (
-        F::from_slice(&proof.u_hash),
-        F::from_slice(&proof.a0),
-        F::from_slice(&proof.a1),
-    );
-    let mut t = transcript_start(
+    let u_hash = F::from_slice(&proof.u_hash);
+    let mut transcript = transcript_start(
         proof.level,
         circuit,
         outputs,
@@ -448,60 +487,18 @@ fn verify_in<F: Field>(circuit: &Circuit, outputs: &[bool], proof: &Proof) -> Re
         &proof.h_com,
         &proof.corrections,
     )?;
-    let chi: F = gf_challenge(&mut t, "chi")?;
-    t.absorb("u hash", &proof.u_hash)?;
-    t.absorb("column hashes", &proof.h_v)?;
-    t.absorb("witness", &proof.d)?;
-    let eta: F = gf_challenge(&mut t, "eta")?;
-    t.absorb("a0", &proof.a0)?;
-    t.absorb("a1", &proof.a1)?;
+    let chi: F = gf_challenge(&mut transcript, "chi")?;
+    transcript.absorb("u hash", &proof.u_hash)?;
+    transcript.absorb("column hashes", &proof.h_v)?;
+    transcript.absorb("witness", &proof.d)?;
+    let eta: F = gf_challenge(&mut transcript, "eta")?;
+    transcript.absorb("a0", &proof.a0)?;
+    transcript.absorb("a1", &proof.a1)?;
     let mut delta_bytes = vec![0u8; tau];
-    t.challenge("delta", &mut delta_bytes)?;
+    transcript.challenge("delta", &mut delta_bytes)?;
     let delta = F::from_slice(&delta_bytes);
 
-    // The opened leaves, their commitments, and the columns of Q.
-    let prg = Prg::new()?;
-    let mut coms = Vec::with_capacity(tau * LEAVES * 64);
-    let mut columns = vec![vec![0u8; layout.lbytes]; tau * DEPTH];
-    let mut r = vec![0u8; layout.lbytes];
-    for (i, opening) in proof.openings.iter().enumerate() {
-        let hidden = usize::from(delta_bytes[i]);
-        let mut known: Vec<Option<Seed>> = vec![None; 2 * LEAVES];
-        let mut n = LEAVES + hidden;
-        for seed in &opening.copath {
-            known[n ^ 1] = Some(*seed);
-            n >>= 1;
-        }
-        for n in 1..LEAVES {
-            if let Some(seed) = known[n] {
-                let (a, b) = prg.children(&seed)?;
-                known[2 * n] = Some(a);
-                known[2 * n + 1] = Some(b);
-            }
-        }
-        for x in 0..LEAVES {
-            if x == hidden {
-                coms.extend_from_slice(&opening.hidden);
-                continue;
-            }
-            let seed = known[LEAVES + x].ok_or(Error::Invalid)?;
-            coms.extend_from_slice(&commit(&proof.salt, i, x, &seed)?);
-            prg.expand(&seed, &mut r)?;
-            let y = x ^ hidden;
-            for b in 0..DEPTH {
-                if (y >> b) & 1 == 1 {
-                    xor_into(&mut columns[DEPTH * i + b], &r);
-                }
-            }
-        }
-        if i > 0 {
-            for b in 0..DEPTH {
-                if (hidden >> b) & 1 == 1 {
-                    xor_into(&mut columns[DEPTH * i + b], &proof.corrections[i - 1]);
-                }
-            }
-        }
-    }
+    let (coms, columns) = opened_columns(proof, &layout, &delta_bytes)?;
     let h_com = hash("ml-dsa-zk/v1 commitments", &[&proof.salt, &coms])?;
     if h_com != proof.h_com {
         return Err(Error::Invalid);
@@ -519,38 +516,106 @@ fn verify_in<F: Field>(circuit: &Circuit, outputs: &[bool], proof: &Proof) -> Re
         return Err(Error::Invalid);
     }
 
-    // QuickSilver over the MACs Kⱼ = qⱼ + dⱼΔ.
-    let q: Vec<F> = rows(&columns, layout.l);
-    let k = |j: usize| q[j] + delta.times_bit(bit(&proof.d, j));
-    let mut macs: Vec<F> = (0..circuit.inputs() as usize).map(k).collect();
-    let mut next = circuit.inputs() as usize;
-    let mut lhs = F::ZERO;
-    let mut weight = eta;
-    for g in circuit.gates() {
-        let m = match *g {
-            Gate::Xor(a, b) => macs[a as usize] + macs[b as usize],
-            Gate::Not(a) => macs[a as usize] + delta,
-            Gate::And(a, b) => {
-                let c = k(next);
-                next += 1;
-                lhs += weight * (macs[a as usize] * macs[b as usize] + c * delta);
-                weight = weight * eta;
-                c
-            }
-        };
-        macs.push(m);
-    }
-    for (o, y) in circuit.outputs().iter().zip(outputs) {
-        lhs += weight * ((macs[*o as usize] + delta.times_bit(*y)) * delta);
-        weight = weight * eta;
-    }
-    for t_ in 0..layout.lambda {
-        lhs += F::x_pow(t_) * q[layout.ell + t_];
-    }
-    if lhs != a0 + a1 * delta {
+    if !quicksilver_holds(circuit, outputs, proof, &layout, &columns, eta, delta) {
         return Err(Error::Invalid);
     }
     Ok(())
+}
+
+/// The commitments of the opened leaves, and the columns of Q they fill
+/// in: every leaf but the hidden one, and the hidden leaf's share from the
+/// correction.
+fn opened_columns(
+    proof: &Proof,
+    layout: &Layout,
+    delta_bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    let prg = Prg::new()?;
+    let tau = layout.tau;
+    let mut coms = Vec::with_capacity(tau * LEAVES * 64);
+    let mut columns = vec![vec![0u8; layout.lbytes]; tau * DEPTH];
+    let mut r = vec![0u8; layout.lbytes];
+    for (i, opening) in proof.openings.iter().enumerate() {
+        let hidden = usize::from(delta_bytes[i]);
+        let mut known: Vec<Option<Seed>> = vec![None; 2 * LEAVES];
+        let mut node = LEAVES + hidden;
+        for seed in &opening.copath {
+            known[node ^ 1] = Some(*seed);
+            node >>= 1;
+        }
+        for node in 1..LEAVES {
+            if let Some(seed) = known[node] {
+                let (left, right) = prg.children(&seed)?;
+                known[2 * node] = Some(left);
+                known[2 * node + 1] = Some(right);
+            }
+        }
+        for leaf in 0..LEAVES {
+            if leaf == hidden {
+                coms.extend_from_slice(&opening.hidden);
+                continue;
+            }
+            let seed = known[LEAVES + leaf].ok_or(Error::Invalid)?;
+            coms.extend_from_slice(&commit(&proof.salt, i, leaf, &seed)?);
+            prg.expand(&seed, &mut r)?;
+            let shifted = leaf ^ hidden;
+            for depth in 0..DEPTH {
+                if (shifted >> depth) & 1 == 1 {
+                    xor_into(&mut columns[DEPTH * i + depth], &r);
+                }
+            }
+        }
+        if i > 0 {
+            for depth in 0..DEPTH {
+                if (hidden >> depth) & 1 == 1 {
+                    xor_into(&mut columns[DEPTH * i + depth], &proof.corrections[i - 1]);
+                }
+            }
+        }
+    }
+    Ok((coms, columns))
+}
+
+/// Whether the QuickSilver sum `a0 + a1·Δ` equals the MACs' sum the
+/// verifier computes from the columns of Q.
+fn quicksilver_holds<F: Field>(
+    circuit: &Circuit,
+    outputs: &[bool],
+    proof: &Proof,
+    layout: &Layout,
+    columns: &[Vec<u8>],
+    eta: F,
+    delta: F,
+) -> bool {
+    let (a0, a1) = (F::from_slice(&proof.a0), F::from_slice(&proof.a1));
+    let q_rows: Vec<F> = rows(columns, layout.l);
+    let mac_key = |col: usize| q_rows[col] + delta.times_bit(bit(&proof.d, col));
+    let mut macs: Vec<F> = (0..circuit.inputs() as usize).map(mac_key).collect();
+    let mut next = circuit.inputs() as usize;
+    let mut lhs = F::ZERO;
+    let mut weight = eta;
+    for gate in circuit.gates() {
+        let mac = match *gate {
+            Gate::Xor(a, b) => macs[a as usize] + macs[b as usize],
+            Gate::Not(src) => macs[src as usize] + delta,
+            Gate::And(a, b) => {
+                let fresh = mac_key(next);
+                next += 1;
+                lhs += weight * (macs[a as usize] * macs[b as usize] + fresh * delta);
+                weight = weight * eta;
+                fresh
+            }
+        };
+        macs.push(mac);
+    }
+    for (out, value) in circuit.outputs().iter().zip(outputs) {
+        lhs += weight * ((macs[*out as usize] + delta.times_bit(*value)) * delta);
+        weight = weight * eta;
+    }
+    for power in 0..layout.lambda {
+        lhs += F::x_pow(power) * q_rows[layout.ell + power];
+    }
+    lhs == a0 + a1 * delta
 }
 
 impl Proof {
