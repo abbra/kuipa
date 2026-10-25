@@ -23,7 +23,10 @@ use synta_mtc::builder::parse_mtc_ca_extension;
 use synta_mtc::crypto::MtcProof;
 use synta_mtc::types::constants::{is_mtc_ca_extension_oid, is_mtc_proof_oid};
 
-use crate::error::{Error, Result};
+/// Why a certificate is not one a host may install as a CA: what
+/// [`check_ca`] says, and [`Error::NotCa`](crate::error::Error::NotCa)
+/// reports for a list entry.
+pub type NotCa = &'static str;
 
 /// Require `der` to be one DER certificate that can act as a CA: basic
 /// constraints with `cA` set, or a Merkle Tree CA.  A key usage extension,
@@ -31,32 +34,35 @@ use crate::error::{Error, Result};
 ///
 /// # Errors
 ///
-/// [`Error::Malformed`]: not a certificate, trailing bytes, an extension
-/// that does not decode, a Merkle Tree CA extension that is not critical,
-/// a proof or unsigned signature that is not one, or not a CA.
-pub fn check_ca(der: &[u8]) -> Result<()> {
-    let malformed = || Error::Malformed("CA certificate");
+/// What the certificate is instead, to complete "… is": not a certificate,
+/// one followed by other bytes, one whose extensions, proof or unsigned
+/// signature are not what they claim, a Merkle Tree CA with a non-critical
+/// or malformed extension, or not a CA.
+///
+/// [`Error::NotCa`]: crate::error::Error::NotCa
+pub fn check_ca(der: &[u8]) -> Result<(), NotCa> {
     let mut decoder = synta::Decoder::new(der, synta::Encoding::Der);
-    let cert: Certificate<'_> = decoder.decode().map_err(|_| malformed())?;
+    let cert: Certificate<'_> = decoder.decode().map_err(|_| "not a DER certificate")?;
     if !decoder.is_empty() {
-        return Err(malformed());
+        return Err("a certificate followed by other bytes");
     }
     let alg = cert.signature_algorithm.algorithm.components();
     if cert.tbs_certificate.signature.algorithm.components() != alg {
-        return Err(malformed());
+        return Err("a certificate naming two signature algorithms");
     }
     let signature = &cert.signature_value;
     if is_mtc_proof_oid(alg) {
         MtcProof::decode_signature_value(signature.as_bytes(), signature.unused_bits())
-            .map_err(|_| Error::Malformed("MTC proof"))?;
+            .map_err(|_| "a Merkle Tree certificate whose proof does not decode")?;
     } else if alg == oids::ALG_UNSIGNED && !signature.as_bytes().is_empty() {
-        return Err(Error::Malformed("unsigned certificate"));
+        return Err("an unsigned certificate that carries a signature");
     }
 
+    let undecodable = "a certificate whose extensions do not decode";
     let extensions = match &cert.tbs_certificate.extensions {
         Some(raw) => {
             Extensions::from_der(raw.as_bytes())
-                .map_err(|_| malformed())?
+                .map_err(|_| undecodable)?
                 .0
         }
         None => Vec::new(),
@@ -68,17 +74,17 @@ pub fn check_ca(der: &[u8]) -> Result<()> {
         let id = ext.extn_id.components();
         let value = ext.extn_value.as_bytes();
         if id == oids::BASIC_CONSTRAINTS {
-            let bc = BasicConstraints::from_der(value).map_err(|_| malformed())?;
+            let bc = BasicConstraints::from_der(value).map_err(|_| undecodable)?;
             is_ca |= bc.c_a.is_some_and(|c| c.value());
         } else if id == oids::KEY_USAGE {
-            let ku = KeyUsage::from_der(value).map_err(|_| malformed())?;
+            let ku = KeyUsage::from_der(value).map_err(|_| undecodable)?;
             cert_sign = key_usage_bit(&ku, KEY_USAGE_KEY_CERT_SIGN);
         } else if is_mtc_ca_extension_oid(id) {
             // §5.5: the extension MUST be critical, so that a relying party
             // unaware of Merkle Tree CAs does not take this for a CA whose
             // key signs certificates.
             if !ext.critical.is_some_and(|c| c.value()) {
-                return Err(Error::Malformed("Merkle Tree CA extension"));
+                return Err("a Merkle Tree CA whose extension is not critical");
             }
             mtc_ca = true;
         }
@@ -89,11 +95,14 @@ pub fn check_ca(der: &[u8]) -> Result<()> {
         parse_mtc_ca_extension(der)
             .ok()
             .flatten()
-            .ok_or(Error::Malformed("Merkle Tree CA extension"))?;
+            .ok_or("a Merkle Tree CA whose extension does not decode")?;
         return Ok(());
     }
-    if !is_ca || !cert_sign {
-        return Err(Error::Malformed("not a CA certificate"));
+    if !is_ca {
+        return Err("an end-entity certificate, not a CA");
+    }
+    if !cert_sign {
+        return Err("a CA whose key usage does not allow signing certificates");
     }
     Ok(())
 }
@@ -101,7 +110,6 @@ pub fn check_ca(der: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::check_ca;
-    use crate::error::Error;
     use synta_certificate::{
         CertificateBuilder, CertificateSigner, KEY_USAGE_DIGITAL_SIGNATURE,
         KEY_USAGE_KEY_CERT_SIGN, NameBuilder, UnsignedCertificateSigner, encode_basic_constraints,
@@ -238,10 +246,10 @@ mod tests {
     #[test]
     fn demo_merkle_tree_certificate_is_an_end_entity() {
         let der = synta_certificate::pem_to_der(include_bytes!("../tests/data/mtc-demo-leaf.pem"));
-        assert!(matches!(
+        assert_eq!(
             check_ca(&der[0]),
-            Err(Error::Malformed("not a CA certificate"))
-        ));
+            Err("an end-entity certificate, not a CA")
+        );
     }
 
     #[test]
