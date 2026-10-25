@@ -228,8 +228,11 @@ impl ExchangeKey {
     }
 
     /// The public AKP JWK (`key_ops: ["deriveKey"]`).
+    ///
+    /// # Panics
+    ///
+    /// Never: the JWK holds only strings and plain JSON types.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)] // serialising plain strings cannot fail
     pub fn to_jwk_json(&self) -> String {
         serde_json::to_string(&self.to_jwk()).expect("JWK serialisation cannot fail")
     }
@@ -515,8 +518,11 @@ impl VerifyingKey {
     }
 
     /// The public AKP JWK (`key_ops: ["verify"]`).
+    ///
+    /// # Panics
+    ///
+    /// Never: the JWK holds only strings and plain JSON types.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)] // serialising plain strings cannot fail
     pub fn to_jwk_json(&self) -> String {
         serde_json::to_string(&self.to_jwk()).expect("JWK serialisation cannot fail")
     }

@@ -37,8 +37,11 @@ pub fn encode_into(data: &[u8], out: &mut [u8]) {
 }
 
 /// Encode.
+///
+/// # Panics
+///
+/// Never: the output is ASCII by construction.
 #[must_use]
-#[allow(clippy::missing_panics_doc)] // the alphabet is ASCII
 pub fn encode(data: &[u8]) -> String {
     let mut out = vec![0u8; encoded_len(data.len())];
     encode_into(data, &mut out);
