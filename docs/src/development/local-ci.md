@@ -100,7 +100,8 @@ session uses the playground's helpers the way a person would, with
   through the helpdesk, and carol's and web1's deposits;
 * signing files and a git commit;
 * failover to ipa2;
-* password, ticket, offline and voucher joins;
+* password, ticket, offline and voucher joins, and CI runners joined
+  with leased vouchers opening a pipeline secret;
 * the trusted realm B.TEST, with a ticket across the trust;
 * the post-quantum Tang pin;
 * a health check that must fail with both servers down.
