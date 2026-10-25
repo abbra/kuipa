@@ -25,6 +25,7 @@
 //! a statement evaluates (ML-DSA's own SHAKE), never as the proof's hash.
 
 pub mod circuit;
+mod clmul;
 pub mod field;
 pub mod gf128;
 pub mod gf256;

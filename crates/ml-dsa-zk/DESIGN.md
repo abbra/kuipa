@@ -125,12 +125,15 @@ This is the VOLEitH argument FAEST relies on; it is not re-proven here.
 The Keccak-f\[1600\] preimage statement ("I know a state whose image
 is this") has 38,400 AND gates.
 
-| statement | λ | witness bits | proof | prove | verify |
-|---|---|---|---|---|---|
-| Keccak-f\[1600\] preimage | 128 | 40,000 | 85,814 B | ~64 ms | ~36 ms |
-| Keccak-f\[1600\] preimage | 256 | 40,000 | 172,486 B | ~92 ms | ~90 ms |
+| statement | λ | witness bits | proof | prove | verify | prove, verify without `pmull` |
+|---|---|---|---|---|---|---|
+| Keccak-f\[1600\] preimage | 128 | 40,000 | 85,814 B | ~15 ms | ~13 ms | ~36 ms, ~36 ms |
+| Keccak-f\[1600\] preimage | 256 | 40,000 | 172,486 B | ~29 ms | ~27 ms | ~98 ms, ~97 ms |
 
-These are release builds on an Apple M-series laptop. The proof is about
+These are release builds on an Apple M-series laptop, with the CPU's
+carry-less multiply (`pmull`) and with the portable loop that
+architectures without a stable intrinsic for it use (`src/clmul.rs`).
+The proof is about
 `(τ−1)·L/8` bytes of corrections plus `ℓ/8` of witness: about two bytes
 per committed bit at λ = 128, four at λ = 256.
 
