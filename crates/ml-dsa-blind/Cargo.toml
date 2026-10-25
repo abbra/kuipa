@@ -17,6 +17,15 @@ native-ossl.workspace = true
 # `ML-DSA-MU` digest, whose parameters native-ossl does not expose yet.
 native-ossl-sys = "0.3.2"
 
+# Benchmark fixtures: deterministic synthesis lives in kuipa-perf, which is a
+# dev-dependency so the shipped crate stays free of it.
+criterion = "0.8"
+kuipa-perf.workspace = true
+
+[[bench]]
+name = "blind"
+harness = false
+
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
