@@ -360,7 +360,7 @@ step 0 "The new laptop opens the resealed file" \
     "db=hunter2"
 
 section "Deposits" \
-    "carol is a depositor of the administrator's drop vault: she seals a backup password to it and leaves it with the servers, and cannot read it back. The administrator lists, fetches and opens it."
+    "carol is a depositor of the administrator's drop vault: she seals a backup password to it and leaves it with the servers, and cannot read it back. The administrator lists, fetches and opens it. Then web1, a depositor too, deposits its LUKS recovery key with its own keytab."
 step 0 "Create the drop vault, with carol as a depositor" \
     'kuipa seal create drop --require device,ticket --sealing registered && kuipa seal device add drop --passphrase-file "$KUIPA_PLAYGROUND/pass" && kuipa seal share drop --depositor --user carol' \
     "depositors: user:carol@EXAMPLE.TEST"
@@ -375,6 +375,15 @@ step fail "carol, a depositor, cannot fetch it back" \
 step 0 "The administrator fetches and opens it" \
     'kuipa seal deposit fetch drop "$did" --out "$KUIPA_PLAYGROUND/restic.sealed" && kuipa seal open "$KUIPA_PLAYGROUND/restic.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" | cat' \
     "restic=s3cret"
+step 0 "web1 becomes a depositor too" \
+    'kuipa seal share drop --depositor --host web1.example.test' \
+    "host:web1.example.test"
+step 0 "web1 deposits its LUKS recovery key, with its own keytab" \
+    'printf "A secret recovery key has been generated for this volume:\n\n    fejrltbu-bjitujnh-dfhrrbrk-hgbtdbgg-cbbitcrk-kclhkdgb-gbbhgjvb-ldbbrleb\n" > "$KUIPA_PLAYGROUND/cryptenroll.txt" && kuipa escrow luks /dev/vda2 --vault admin/drop --uuid 0b9c7f1e-6d2a-4c55-9a51-3e1f6b2d8c70 < "$KUIPA_PLAYGROUND/cryptenroll.txt"' \
+    "luks" "by host/web1.example.test@EXAMPLE.TEST"
+step 0 "The helpdesk reads it back when the disk will not unlock" \
+    'lid=$(kuipa --json seal deposit list drop | tr "{" "\n" | grep "\"kind\":\"luks\"" | sed -n "s/.*\"id\":\"\([0-9a-f]\{32\}\)\".*/\1/p") && kuipa seal deposit fetch drop "$lid" --out "$KUIPA_PLAYGROUND/luks.sealed" && kuipa seal open "$KUIPA_PLAYGROUND/luks.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" | cat' \
+    "fejrltbu-bjitujnh"
 
 section "Signing under your ticket" \
     "The realm states that the administrator, by their ticket, signed a release: kuipa sign asks a server, which checks the signing policy (the release group may sign blobs), logs the statement in its transparency log, and signs it.  Anyone with the realm's anchors verifies it offline."
