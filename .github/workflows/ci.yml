@@ -303,7 +303,8 @@ jobs:
     container: quay.io/fedora/fedora:latest
     steps:
       - name: Install native dependencies
-        run: dnf install -y $DNF_PACKAGES
+        # bench.sh collects criterion's estimates with python3.
+        run: dnf install -y $DNF_PACKAGES python3
       - uses: actions/checkout@v7
       - name: Restore cargo registry cache
         uses: actions/cache@v6
