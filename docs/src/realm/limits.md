@@ -42,6 +42,7 @@ live on `cn=vault-limits,cn=kuipa,cn=etc,<suffix>`, attribute
 | `without_device` | `true` | whether a vault may do without the device factor |
 | `descriptor_age` | 30 days (seconds) | how long a client may seal offline with a vault's description |
 | `factors` | none | factor sets a policy must meet one of, e.g. `[{"device": "any"}]` |
+| `groups` | none | limits for members of groups, below |
 
 Offline sessions hand a key to the user's machine for a while, after which
 the servers can no longer enforce limits on it. They stay off until you
@@ -59,6 +60,35 @@ that never leaves its token, or a ticket and a passkey together:
   { "ticket": true, "passkey": true }
 ]
 ```
+
+### Limits for groups
+
+`groups` gives the members of IPA user groups or host groups other
+limits. Each entry names a `group`, a `priority`, and any of the fields
+above, which replace the realm's for that group; the fields it leaves
+out stay the realm's:
+
+```json
+"groups": [
+  { "group": "travellers", "priority": 10,
+    "offline_sessions": true, "max_vaults": 32 },
+  { "group": "contractors", "priority": 5,
+    "max_lifetime": 7776000, "factors": [{ "device": "hardware-bound" }] }
+]
+```
+
+Limits follow a vault's **owner**: a manager of someone else's shared
+vault works within the owner's limits, not their own. When the owner is
+in several of the listed groups, only the entry with the lowest priority
+applies, as FreeIPA picks one password policy; nothing is merged. Here a
+contractor who also travels gets the contractors' limits and no offline
+sessions. `"max_unlocks": null` in an entry lifts the realm's cap for
+that group.
+
+Limits are checked whenever a vault's policy is set, a device registered
+or the vault shared. A vault already outside tightened limits keeps its
+policy until it is next changed, but offline sessions its owner may no
+longer have are refused at once.
 
 ## Revoking
 

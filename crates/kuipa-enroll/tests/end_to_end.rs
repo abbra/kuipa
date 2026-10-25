@@ -2620,6 +2620,101 @@ fn removing_a_member_starts_a_new_offline_epoch() {
     assert_eq!(epochs(&removed), epochs(&created) + 1);
 }
 
+#[test]
+fn a_vaults_limits_are_its_owners_by_their_groups() {
+    let r = realm();
+    let adv = &r.verify(0);
+    // The realm: one vault each, and always a device.  Travellers: three
+    // vaults, and offline sessions.
+    *r.dir.limits.borrow_mut() = serde_json::from_value(serde_json::json!({
+        "max_lifetime": 400 * 86_400, "max_vaults": 1, "max_devices": 8,
+        "max_reauth": 3600, "without_device": true, "descriptor_age": 86_400,
+        "factors": [{ "device": "any" }],
+        "groups": [{ "group": "travellers", "priority": 10,
+                     "max_vaults": 3, "offline_sessions": true }],
+    }))
+    .unwrap();
+    r.dir
+        .groups
+        .borrow_mut()
+        .insert(BOB.into(), vec!["travellers".into()]);
+    let with = |device: bool, offline: bool| vault::Policy {
+        factors: Factors {
+            device: device.then_some(Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        sessions: vault::Sessions {
+            reauth: None,
+            offline: offline.then_some(3600),
+            epoch: None,
+        },
+        ..vault::Policy::default()
+    };
+    let create = |who: &str, name: &str, policy: vault::Policy| {
+        vault_op(
+            &r,
+            adv,
+            who,
+            &VaultOp::Create {
+                name: name.into(),
+                policy,
+            },
+        )
+    };
+
+    // Alice has the realm's limits.
+    create(ALICE, "a1", with(true, false)).unwrap();
+    assert!(create(ALICE, "a2", with(true, false)).is_err(), "one vault");
+    let offline = VaultOp::SetPolicy {
+        name: "a1".into(),
+        policy: with(true, true),
+    };
+    assert!(
+        vault_op(&r, adv, ALICE, &offline).is_err(),
+        "no offline sessions"
+    );
+
+    // Bob, a traveller, has his group's, and the realm's factor rule.
+    assert!(
+        create(BOB, "b0", with(false, false)).is_err(),
+        "ticket alone"
+    );
+    for name in ["b1", "b2", "b3"] {
+        create(BOB, name, with(true, true)).unwrap();
+    }
+    assert!(
+        create(BOB, "b4", with(true, false)).is_err(),
+        "three vaults"
+    );
+
+    // As a manager of Alice's vault, Bob still gets her limits, not his.
+    vault_op(
+        &r,
+        adv,
+        ALICE,
+        &VaultOp::Share {
+            name: "a1".into(),
+            managers: vault::Members {
+                users: vec!["bob".into()],
+                ..vault::Members::default()
+            },
+            members: vault::Members::default(),
+        },
+    )
+    .unwrap();
+    let offline = VaultOp::SetPolicy {
+        name: "alice/a1".into(),
+        policy: with(true, true),
+    };
+    assert!(vault_op(&r, adv, BOB, &offline).is_err());
+    let within = VaultOp::SetPolicy {
+        name: "alice/a1".into(),
+        policy: with(true, false),
+    };
+    vault_op(&r, adv, BOB, &within).unwrap();
+}
+
 /// Run a vault operation as `caller` against server `i`.
 fn vault_reply_at(
     r: &Realm,

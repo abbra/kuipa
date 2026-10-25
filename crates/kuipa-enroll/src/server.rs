@@ -1399,7 +1399,7 @@ impl EnrollServer {
     }
 
     /// Answer a vault operation (§7.6): authenticate the caller by their
-    /// ticket, check their role in the vault, apply the realm limits,
+    /// ticket, check their role in the vault, apply the owner's limits,
     /// store, and answer with signed descriptors.
     fn vault_op(
         &self,
@@ -1472,26 +1472,26 @@ impl EnrollServer {
                 directory.vault_update(v).map_err(Refusal)?;
             }
         }
-        let max_age = directory.vault_limits().map_err(Refusal)?.descriptor_age;
         let descriptors = vaults
             .iter()
             .map(|v| {
+                let max_age = limits_for(&v.owner, directory)?.descriptor_age;
                 // Descriptors carry each epoch's public key, never its slots.
                 let mut public = v.clone();
                 for k in &mut public.session_keys {
                     k.slots.clear();
                 }
                 public.bindings.clear();
-                Descriptor::sign(
+                Ok(Descriptor::sign(
                     &self.keys.signing,
                     &delegation,
                     &self.info.realm,
                     &public,
                     now,
                     max_age,
-                )
+                )?)
             })
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, Refusal>>()?;
         let reply = Reply {
             descriptors,
             session,
@@ -1744,7 +1744,7 @@ impl EnrollServer {
         }
         let sessions = &vault.policy.sessions;
         let length = if offline {
-            if !directory.vault_limits().map_err(Refusal)?.offline_sessions {
+            if !limits_for(&vault.owner, directory)?.offline_sessions {
                 return Err(Refusal::because(
                     "the realm does not allow offline sessions",
                 ));
@@ -1896,7 +1896,7 @@ impl EnrollServer {
         directory: &dyn Directory,
         record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
     ) -> Result<Vec<Vault>, Refusal> {
-        let limits = directory.vault_limits().map_err(Refusal)?;
+        let limits = limits_for(&caller.to_string(), directory)?;
         let mine = directory.vaults_of(caller).map_err(Refusal)?;
         if name.is_empty() || name.contains('/') {
             return Err(Refusal::because(format!("{name:?} is not a vault name")));
@@ -1936,7 +1936,6 @@ impl EnrollServer {
         directory: &dyn Directory,
         record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
     ) -> Result<Vec<Vault>, Refusal> {
-        let limits = directory.vault_limits().map_err(Refusal)?;
         let vault = match op {
             VaultOp::List => return list_vaults(caller, directory),
             VaultOp::Unlock { .. } => unreachable!("sessions are started by vault_op"),
@@ -1954,7 +1953,7 @@ impl EnrollServer {
             VaultOp::SetPolicy { name, mut policy } => {
                 let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
                 need(role, Role::Manager, "change its policy")?;
-                limits.apply(&mut policy, now)?;
+                limits_for(&vault.owner, directory)?.apply(&mut policy, now)?;
                 vault.policy = policy;
                 vault
             }
@@ -1965,6 +1964,7 @@ impl EnrollServer {
             } => {
                 let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
                 need(role, Role::Manager, "share it")?;
+                let limits = limits_for(&vault.owner, directory)?;
                 self.share(&mut vault, &managers, &members, &limits)?;
                 vault
             }
@@ -1991,7 +1991,7 @@ impl EnrollServer {
                     .iter()
                     .filter(|d| vault.holder(d) == me)
                     .count()
-                    >= limits.max_devices
+                    >= limits_for(&vault.owner, directory)?.max_devices
                 {
                     return Err(Refusal::because("too many devices"));
                 }
@@ -2408,6 +2408,19 @@ fn prune_departed(vault: &mut Vault, directory: &dyn Directory) -> Result<Vec<St
     }
     vault.devices = kept;
     Ok(gone)
+}
+
+/// The limits for vaults of `owner`: the realm's, with those of the group
+/// the realm gives them by (§7.6.2).  The owner's groups are looked up only
+/// when the realm sets limits for any.
+fn limits_for(owner: &str, directory: &dyn Directory) -> Result<Limits, Refusal> {
+    let realm = directory.vault_limits().map_err(Refusal)?;
+    if realm.groups.is_empty() {
+        return Ok(realm);
+    }
+    let owner: Principal = owner.parse()?;
+    let groups = directory.principal_groups(&owner).map_err(Refusal)?;
+    Ok(realm.for_groups(&groups))
 }
 
 /// Refuse unless `role` is at least `least`, to do `what`.

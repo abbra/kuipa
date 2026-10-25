@@ -343,7 +343,7 @@ already unlocked, has its plaintext or key on that machine.
 Users manage their own vaults; administrators set the limits and can step
 in:
 
-* **Realm limits**: the longest expiry, the largest `--max-unlocks`, vaults
+* **Realm limits**, for the whole realm or for members of a group: the longest expiry, the largest `--max-unlocks`, vaults
   per user, devices per member of a vault, how many managers and members
   a shared vault may have, the longest sessions, which factor
   combinations are allowed (for example: never `ticket` alone), and whether
