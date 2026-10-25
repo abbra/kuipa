@@ -1,10 +1,12 @@
 //! GF(2²⁵⁶), as `x²⁵⁶ + x¹⁰ + x⁵ + x² + 1` (FAEST-256's field): the
 //! field of the λ = 256 proofs ([`Level::L256`](crate::Level::L256)).
 //! Bit `i` of the pair of `u128`s, low half first, is the coefficient of
-//! `xⁱ`.  Multiplication is carry-less and branch-free.
+//! `xⁱ`.  Multiplication is carry-less and branch-free, on the CPU's
+//! carry-less multiply where it has one.
 
 use std::ops::{Add, AddAssign, Mul};
 
+use crate::clmul::clmul64;
 use crate::gf128::halves;
 
 /// An element of GF(2²⁵⁶).
@@ -79,17 +81,6 @@ impl AddAssign for Gf256 {
     fn add_assign(&mut self, other: Self) {
         *self = self.xor(other);
     }
-}
-
-/// 64×64 → 128 carry-less multiplication, branch-free.
-fn clmul64(a: u64, b: u64) -> u128 {
-    let a = u128::from(a);
-    let mut r = 0u128;
-    for i in 0..64 {
-        let mask = 0u128.wrapping_sub(u128::from((b >> i) & 1));
-        r ^= (a << i) & mask;
-    }
-    r
 }
 
 /// 128×128 → 256 carry-less multiplication by Karatsuba, as `(lo, hi)`.

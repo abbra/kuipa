@@ -1,8 +1,11 @@
 //! GF(2¹²⁸), as `x¹²⁸ + x⁷ + x² + x + 1`: the field the VOLE correlations
 //! and QuickSilver checks live in.  Bit `i` of the `u128` is the
-//! coefficient of `xⁱ`.  Multiplication is carry-less and branch-free.
+//! coefficient of `xⁱ`.  Multiplication is carry-less and branch-free, on the CPU's
+//! carry-less multiply where it has one.
 
 use std::ops::{Add, AddAssign, Mul};
+
+use crate::clmul::clmul64;
 
 /// An element of GF(2¹²⁸).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -64,17 +67,6 @@ pub(crate) fn halves(x: u128) -> (u64, u64) {
     let lo = u64::try_from(x & u128::from(u64::MAX)).expect("masked to 64 bits");
     let hi = u64::try_from(x >> 64).expect("shifted to 64 bits");
     (lo, hi)
-}
-
-/// 64×64 → 128 carry-less multiplication, branch-free.
-fn clmul64(a: u64, b: u64) -> u128 {
-    let a = u128::from(a);
-    let mut r = 0u128;
-    for i in 0..64 {
-        let mask = 0u128.wrapping_sub(u128::from((b >> i) & 1));
-        r ^= (a << i) & mask;
-    }
-    r
 }
 
 impl Mul for Gf {
