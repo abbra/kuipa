@@ -230,14 +230,22 @@ with open(sys.argv[1], encoding="utf-8") as fh:
 print()
 print("=== kuipa benchmark summary ===")
 print(f"{len(results)} benchmarks")
+def ms(v):
+    ns, us = v * 1e6, v * 1e3
+    if ns < 1000:
+        return f"mean {ns:8.1f} ns"
+    if us < 10000:
+        return f"mean {us:8.2f} µs"
+    return f"mean {v:10.3f} ms"
+
 group = None
 for r in results:
     if r["group"] != group:
         group = r["group"]
         print(f"\n[{group}]")
-    line = f"  {r['function']:<28} mean {r['mean_ms']:10.3f} ms"
+    line = f"  {r['function']:<28} {ms(r['mean_ms'])}"
     tp = r.get("throughput")
-    if tp and tp["kind"] == "Bytes":
+    if tp and r["mean_ms"] > 0:
         line += f"  ({tp['value'] / (r['mean_ms'] / 1e3) / 1e6:9.1f} MB/s)"
     elif tp:
         line += f"  ({tp['value'] / (r['mean_ms'] / 1e3):9.1f} /s)"
@@ -271,6 +279,15 @@ def label(d):
 print(f"baseline: {label(da)}")
 print(f"current:  {label(db)}")
 print()
+def ms(v):
+    """Print sub-millisecond benchmarks below ms; 0.000 ms hides a real change."""
+    ns, us = v * 1e6, v * 1e3
+    if ns < 1000:
+        return f"{ns:9.1f} ns"
+    if us < 10000:
+        return f"{us:9.2f} µs"
+    return f"{v:9.3f} ms"
+
 common = sorted(set(base) & set(new))
 rows = [(new[k]["mean_ms"] / base[k]["mean_ms"], k, base[k]["mean_ms"], new[k]["mean_ms"]) for k in common]
 regressions = [r for r in rows if r[0] > 1.10]
@@ -281,11 +298,11 @@ print(f"  regressions >10%: {len(regressions)}   improvements >10%: {len(improve
 if regressions:
     print("\nRegressions:")
     for ratio, k, b, n in sorted(regressions, reverse=True)[:15]:
-        print(f"  {ratio:5.2f}x  {k:<34} {b:9.3f} -> {n:9.3f} ms")
+        print(f"  {ratio:5.2f}x  {k:<34} {ms(b)} -> {ms(n)}")
 if improvements:
     print("\nImprovements:")
     for ratio, k, b, n in sorted(improvements)[:15]:
-        print(f"  {ratio:5.2f}x  {k:<34} {b:9.3f} -> {n:9.3f} ms")
+        print(f"  {ratio:5.2f}x  {k:<34} {ms(b)} -> {ms(n)}")
 missing = sorted(set(base) - set(new))
 if missing:
     print(f"\nOnly in baseline: {len(missing)} (e.g. {missing[0]})")
