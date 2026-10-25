@@ -241,18 +241,32 @@ fn count_proof(
     }
 }
 
+/// What a server's advertisement is verified against: the realm, its
+/// pinned anchors, and the heads, retired claims and frozen anchors that
+/// travel with them.
+#[derive(Clone, Copy)]
+pub(crate) struct Pins<'a> {
+    pub(crate) realm: &'a str,
+    pub(crate) anchors: &'a [Thumbprint],
+    pub(crate) heads: &'a [HeadPin],
+    pub(crate) retired: &'a [Hash],
+    pub(crate) frozen: &'a [Thumbprint],
+}
+
 /// Fetch and verify one server's advertisement.
-#[allow(clippy::too_many_arguments)] // heads, retired claims and frozen travel with the anchors
 pub(crate) fn verified(
     server: &str,
     trust: &Trust,
-    realm: &str,
-    anchors: &[Thumbprint],
-    heads: &[HeadPin],
-    retired: &[Hash],
-    frozen: &[Thumbprint],
+    pinned: Pins<'_>,
     known: Option<Epoch>,
 ) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), String> {
+    let Pins {
+        realm,
+        anchors,
+        heads,
+        retired,
+        frozen,
+    } = pinned;
     let endpoint = Endpoint::new(server, trust).map_err(|e| e.to_string())?;
     let mut pins: Vec<Thumbprint> = anchors.to_vec();
     pins.sort_unstable();
@@ -480,15 +494,10 @@ fn path_for(op: Operation, request: &Request) -> String {
 /// server whose verified advertisement describes another deployment stops
 /// the exchange before anything is sent: that is an attack or a
 /// misconfiguration, and failing over would hide it.
-#[allow(clippy::too_many_arguments)] // heads and frozen travel with the anchors
 fn exchange(
     deployment: &Deployment,
     trust: &Trust,
-    realm: &str,
-    anchors: &[Thumbprint],
-    heads: &[HeadPin],
-    retired: &[Hash],
-    frozen: &[Thumbprint],
+    pinned: Pins<'_>,
     known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -496,11 +505,7 @@ fn exchange(
     exchange_with(
         deployment,
         trust,
-        realm,
-        anchors,
-        heads,
-        retired,
-        frozen,
+        pinned,
         known,
         op,
         build,
@@ -513,15 +518,10 @@ fn exchange(
 }
 
 /// As [`exchange`], for any operation: `finish` opens the response.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange_with<T>(
     deployment: &Deployment,
     trust: &Trust,
-    realm: &str,
-    anchors: &[Thumbprint],
-    heads: &[HeadPin],
-    retired: &[Hash],
-    frozen: &[Thumbprint],
+    pinned: Pins<'_>,
     known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -529,15 +529,14 @@ pub(crate) fn exchange_with<T>(
 ) -> Result<(T, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        let (endpoint, adv, _) =
-            match verified(server, trust, realm, anchors, heads, retired, frozen, known) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(server = %server, "skipped, trying the next server: {e}");
-                    skipped.push(format!("{server}: {e}"));
-                    continue;
-                }
-            };
+        let (endpoint, adv, _) = match verified(server, trust, pinned, known) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(server = %server, "skipped, trying the next server: {e}");
+                skipped.push(format!("{server}: {e}"));
+                continue;
+            }
+        };
         check_deployment(server, &adv, deployment)?;
         // Once the advertisement verified, its CA authenticates TLS too.
         let endpoint = if matches!(trust, Trust::FirstContact) && crate::net::uses_tls(server) {
@@ -792,6 +791,15 @@ pub fn check_string(string: &EnrollmentString) -> Result<(), Error> {
     })
 }
 
+/// The host enrolling: its name, and how it authenticates.
+#[derive(Clone, Copy)]
+pub struct Host<'a> {
+    /// The host's fully qualified name.
+    pub fqdn: &'a str,
+    /// How the host authenticates to the realm.
+    pub auth: &'a Auth,
+}
+
 /// `kuipa enroll` (online): join `realm` through the first usable server
 /// of `deployment` whose advertisement verifies against `anchors` (the
 /// enrollment string's, or those pre-provisioned in `/etc/ipa/ku-anchors`
@@ -801,17 +809,16 @@ pub fn check_string(string: &EnrollmentString) -> Result<(), Error> {
 /// # Errors
 ///
 /// [`Outcome`] for retry/administrator cases, or any other error.
-#[allow(clippy::too_many_arguments)] // heads and frozen travel with the anchors
 pub fn enroll_online(
     paths: &Paths,
     realm: &str,
     anchors: &[Thumbprint],
     heads: &[HeadPin],
     frozen: &[Thumbprint],
-    auth: &Auth,
-    fqdn: &str,
+    host: Host<'_>,
     deployment: &Deployment,
 ) -> Result<Value, Error> {
+    let Host { fqdn, auth } = host;
     if deployment.servers.is_empty() {
         return Err("no server given (--server)".into());
     }
@@ -837,11 +844,13 @@ pub fn enroll_online(
     let (enrollment, adv) = exchange(
         deployment,
         &Trust::FirstContact,
-        realm,
-        anchors,
-        heads,
-        retired,
-        frozen,
+        Pins {
+            realm,
+            anchors,
+            heads,
+            retired,
+            frozen,
+        },
         None,
         op,
         |adv| {
@@ -1280,11 +1289,13 @@ pub(crate) fn all_servers(
             verified(
                 s,
                 trust,
-                &state.realm,
-                anchors,
-                heads,
-                retired,
-                frozen,
+                Pins {
+                    realm: &state.realm,
+                    anchors,
+                    heads,
+                    retired,
+                    frozen,
+                },
                 None,
             )
             .ok()
@@ -1341,11 +1352,13 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     let (enrollment, adv) = exchange(
         &Deployment::servers(&state.servers),
         &trust,
-        &state.realm,
-        &anchors,
-        &heads,
-        &retired,
-        &frozen,
+        Pins {
+            realm: &state.realm,
+            anchors: &anchors,
+            heads: &heads,
+            retired: &retired,
+            frozen: &frozen,
+        },
         known,
         Operation::Rekey,
         |adv| {
@@ -1368,13 +1381,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     // there was nothing to continue.
     let epoch = known.or(payload_epoch(&enrollment));
     let keytab = merge_previous(enrollment.keytab, old)?;
-    match sealer {
-        Some(sealer) => {
-            paths::write_file(&paths.run_keytab(), keytab.to_mit()?.as_ref(), 0o600)?;
-            paths::write_file(&paths.sealed(), &sealer.seal(&keytab)?.to_bytes(), 0o600)?;
-        }
-        None => paths::write_file(&paths.keytab(), keytab.to_mit()?.as_ref(), 0o600)?,
-    }
+    store_rotated_keytab(paths, sealer, &keytab)?;
     let heads = enrollment
         .anchors
         .iter()
@@ -1395,20 +1402,37 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
             "an anchor's claim log no longer extends the pinned window: its head is not pinned"
         );
     }
-    let mut servers = vec![enrollment.config.issuer.clone()];
-    servers.extend(
-        state
-            .servers
-            .iter()
-            .filter(|s| **s != enrollment.config.issuer)
-            .cloned(),
-    );
-    state.servers = servers;
+    state.servers = issuer_first(&enrollment.config.issuer, &state.servers);
     state.holder = holder;
     state.store(paths)?;
     Ok(
         json!({ "principal": principal.to_string(), "kvno": keytab.kvno(), "issuer": enrollment.config.issuer }),
     )
+}
+
+/// Write a rotated keytab where the daemon reads it: sealed to the escrow
+/// keys when protection is on, in the clear otherwise.
+fn store_rotated_keytab(
+    paths: &Paths,
+    sealer: Option<Sealer>,
+    keytab: &Keytab,
+) -> Result<(), Error> {
+    match sealer {
+        Some(sealer) => {
+            paths::write_file(&paths.run_keytab(), keytab.to_mit()?.as_ref(), 0o600)?;
+            paths::write_file(&paths.sealed(), &sealer.seal(keytab)?.to_bytes(), 0o600)?;
+        }
+        None => paths::write_file(&paths.keytab(), keytab.to_mit()?.as_ref(), 0o600)?,
+    }
+    Ok(())
+}
+
+/// `servers` with `issuer` first, as the server that answered is the one to
+/// try first next time.
+fn issuer_first(issuer: &str, servers: &[String]) -> Vec<String> {
+    let mut out = vec![issuer.to_owned()];
+    out.extend(servers.iter().filter(|s| s.as_str() != issuer).cloned());
+    out
 }
 
 /// `kuipa complete`: finish an offline enrollment (first contact, §8.5).
@@ -1626,11 +1650,13 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
     let (answer, _) = exchange_with(
         &Deployment::servers(&state.servers),
         &trust,
-        &state.realm,
-        &anchors,
-        &heads,
-        &retired,
-        &frozen,
+        Pins {
+            realm: &state.realm,
+            anchors: &anchors,
+            heads: &heads,
+            retired: &retired,
+            frozen: &frozen,
+        },
         known,
         Operation::Keys,
         |adv| {
@@ -1735,11 +1761,13 @@ fn register(
     let ((), adv) = exchange_with(
         &Deployment::servers(&state.servers),
         &trust,
-        &state.realm,
-        &anchors,
-        &heads,
-        &retired,
-        &frozen,
+        Pins {
+            realm: &state.realm,
+            anchors: &anchors,
+            heads: &heads,
+            retired: &retired,
+            frozen: &frozen,
+        },
         known,
         Operation::Register,
         |adv| {
@@ -2067,11 +2095,13 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         match verified(
             server,
             &trust,
-            &state.realm,
-            &anchors,
-            &heads,
-            &retired,
-            &frozen,
+            Pins {
+                realm: &state.realm,
+                anchors: &anchors,
+                heads: &heads,
+                retired: &retired,
+                frozen: &frozen,
+            },
             known,
         )
         .and_then(|(e, adv, advance)| {
@@ -2156,13 +2186,23 @@ pub fn advertisements(
     let mut servers = Vec::new();
     for server in &deployment.servers {
         // Read-only: what is shown is not pinned, so no retired claims.
-        let detail = match verified(server, &trust, realm, anchors, heads, &[], &[], None).and_then(
-            |(endpoint, adv, _)| {
-                adv.check_deployment(deployment)
-                    .map(|()| (endpoint, adv))
-                    .map_err(|e| e.to_string())
+        let detail = match verified(
+            server,
+            &trust,
+            Pins {
+                realm,
+                anchors,
+                heads,
+                retired: &[],
+                frozen: &[],
             },
-        ) {
+            None,
+        )
+        .and_then(|(endpoint, adv, _)| {
+            adv.check_deployment(deployment)
+                .map(|()| (endpoint, adv))
+                .map_err(|e| e.to_string())
+        }) {
             Ok((endpoint, adv)) => advertisement_detail(server, &endpoint, &adv, realm, anchors),
             Err(e) => Err(e),
         };
@@ -2443,11 +2483,13 @@ pub fn realm_info(
         match verified(
             server,
             &Trust::FirstContact,
-            realm,
-            anchors,
-            heads,
-            &[],
-            &[],
+            Pins {
+                realm,
+                anchors,
+                heads,
+                retired: &[],
+                frozen: &[],
+            },
             None,
         ) {
             Ok((_, adv, _)) => {
@@ -2610,11 +2652,13 @@ fn refresh_trust(
             match verified(
                 s,
                 &Trust::FirstContact,
-                &t.realm,
-                &t.anchors,
-                &heads,
-                &retired,
-                &[],
+                Pins {
+                    realm: &t.realm,
+                    anchors: &t.anchors,
+                    heads: &heads,
+                    retired: &retired,
+                    frozen: &[],
+                },
                 None,
             ) {
                 Ok((endpoint, v, _)) => Some((endpoint, v)),
@@ -2683,11 +2727,13 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
             match verified(
                 s,
                 &trust,
-                &state.realm,
-                &anchors,
-                &own_heads,
-                &own_retired,
-                &own_frozen,
+                Pins {
+                    realm: &state.realm,
+                    anchors: &anchors,
+                    heads: &own_heads,
+                    retired: &own_retired,
+                    frozen: &own_frozen,
+                },
                 None,
             ) {
                 Ok((_, v, _)) => Some(v),

@@ -51,7 +51,7 @@ fn server(
     let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let delegation = Delegation::issue(
         &anchor,
-        &realm.realm,
+        &realm.name,
         fqdn,
         signing.public(),
         now() - 60,
@@ -59,8 +59,8 @@ fn server(
     )
     .unwrap();
     let info = RealmInfo {
-        realm: realm.realm.clone(),
-        domain: realm.realm.to_lowercase(),
+        realm: realm.name.clone(),
+        domain: realm.name.to_lowercase(),
         basedn: "dc=test".into(),
         server: fqdn.into(),
         servers: vec![fqdn.into()],
@@ -137,15 +137,25 @@ fn exists(p: &Path) -> bool {
     p.exists()
 }
 
-#[test]
-#[allow(clippy::too_many_lines)]
-fn trusted_realm_against_real_kdcs() {
-    let Some(realm_a) = Realm::start(A, "trust-a") else {
-        return;
-    };
-    let Some(realm_b) = Realm::start(B, "trust-b") else {
-        return;
-    };
+/// Two running realms, A and B, with their servers and directories.
+struct Setup {
+    realm_a: Arc<Realm>,
+    realm_b: Arc<Realm>,
+    server_a: Arc<EnrollServer>,
+    anchor_a: Thumbprint,
+    dir_a: Arc<KdcDirectory>,
+    server_b: Arc<EnrollServer>,
+    anchor_b: Thumbprint,
+    dir_b: Arc<KdcDirectory>,
+    urls: [String; 2],
+    rt: tokio::runtime::Runtime,
+}
+
+/// Start both realms and their servers; `None` when the KDC tools are not
+/// installed.
+fn start() -> Option<Setup> {
+    let realm_a = Realm::start(A, "trust-a")?;
+    let realm_b = Realm::start(B, "trust-b")?;
     let (realm_a, realm_b) = (Arc::new(realm_a), Arc::new(realm_b));
     let listeners = [(); 2].map(|()| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
     let urls = listeners
@@ -171,18 +181,31 @@ fn trusted_realm_against_real_kdcs() {
         &[(HOST, b"Secret123")],
         Vec::new(),
     );
+    Some(Setup {
+        realm_a,
+        realm_b,
+        server_a,
+        anchor_a,
+        dir_a,
+        server_b,
+        anchor_b,
+        dir_b,
+        urls,
+        rt: tokio::runtime::Runtime::new().unwrap(),
+    })
+}
 
-    // ── B invites A; A's server establishes the trust (§17.4) ──
-    let invitation = Invitation::new(B, anchor_b).unwrap();
-    dir_b
+/// B invites A; A's server establishes the trust, and publishes B.
+fn establish_trust(s: &Setup) {
+    let invitation = Invitation::new(B, s.anchor_b).unwrap();
+    s.dir_b
         .add_trust_invitation(&invitation.secret_hash().unwrap(), now() + 3600)
         .unwrap();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let endpoints = std::collections::BTreeMap::from([(SERVER_B.to_owned(), urls[1].clone())]);
-    let dir_a_dyn: Arc<dyn Directory + Send + Sync> = dir_a.clone();
-    let (established, recorded) = rt
-        .block_on(kuipad::trust::establish(
-            &server_a,
+    let endpoints = std::collections::BTreeMap::from([(SERVER_B.to_owned(), s.urls[1].clone())]);
+    let dir_a_dyn: Arc<dyn Directory + Send + Sync> = s.dir_a.clone();
+    let (established, recorded) =
+        s.rt.block_on(kuipad::trust::establish(
+            &s.server_a,
             &invitation,
             &[SERVER_B.to_owned()],
             &endpoints,
@@ -192,15 +215,15 @@ fn trusted_realm_against_real_kdcs() {
     assert!(recorded, "A's directory records the trust and its keys");
     assert_eq!(established.partner.realm, B);
     assert_eq!(
-        dir_b.trusted_realms().unwrap()[0].realm,
+        s.dir_b.trusted_realms().unwrap()[0].realm,
         A,
         "and so does B's"
     );
-    assert_eq!(server_b.anchors(), [anchor_b]);
+    assert_eq!(s.server_b.anchors(), [s.anchor_b]);
     // The invitation was single use.
     assert!(
-        rt.block_on(kuipad::trust::establish(
-            &server_a,
+        s.rt.block_on(kuipad::trust::establish(
+            &s.server_a,
             &invitation,
             &[SERVER_B.to_owned()],
             &endpoints,
@@ -209,40 +232,48 @@ fn trusted_realm_against_real_kdcs() {
         .is_err()
     );
     // A publishes B from its directory, refreshed from B's advertisement.
-    rt.block_on(kuipad::trust::refresh(
-        &server_a,
+    s.rt.block_on(kuipad::trust::refresh(
+        &s.server_a,
         &dir_a_dyn,
         &[],
         &endpoints,
     ));
-    assert_eq!(server_a.trusts()[0].realm, B);
+    assert_eq!(s.server_a.trusts()[0].realm, B);
+}
 
-    // ── A host of realm A ──
-    let dir = realm_a.dir.join("root-web1");
+/// A host of realm A, enrolled with its one-time password.
+fn enroll_host(s: &Setup) -> Paths {
+    let dir = s.realm_a.dir.join("root-web1");
     std::fs::create_dir_all(&dir).unwrap();
     let p = Paths::new(&dir);
-    let mut s = EnrollmentString::new(
+    let mut string = EnrollmentString::new(
         A,
-        anchor_a,
+        s.anchor_a,
         tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
         Some(Secret::new(b"Secret123")),
     );
-    let otp = s.take_secret().unwrap();
+    let otp = string.take_secret().unwrap();
     flows::enroll_online(
         &p,
-        s.realm(),
-        &[*s.anchor()],
+        string.realm(),
+        &[*string.anchor()],
         &[],
         &[],
-        &Auth::LdapOtp(otp),
-        HOST,
+        flows::Host {
+            fqdn: HOST,
+            auth: &Auth::LdapOtp(otp),
+        },
         &Deployment::servers(&[SERVER_A.to_owned()]),
     )
     .unwrap();
     assert_eq!(p.trusted_realms().len(), 0);
+    p
+}
 
-    // ── Install B: verified with the anchor A vouches for ──
-    let result = flows::trusted_realms(&p).unwrap();
+/// The host installs B from its advertisement, verified with the anchor A
+/// vouches for; returns the snippet it installed.
+fn install_b(s: &Setup, p: &Paths) -> String {
+    let result = flows::trusted_realms(p).unwrap();
     assert_eq!(
         result["trusted_realms"][0]["status"], "installed",
         "{result}"
@@ -250,17 +281,17 @@ fn trusted_realm_against_real_kdcs() {
     assert_eq!(p.trusted_realms(), [B]);
     assert_eq!(
         paths::read_anchors_from(&p.trust_anchors(B)).unwrap(),
-        [anchor_b]
+        [s.anchor_b]
     );
     assert_eq!(
-        paths::read_anchors(&p).unwrap(),
-        [anchor_a],
+        paths::read_anchors(p).unwrap(),
+        [s.anchor_a],
         "B's anchors never join the host's own"
     );
     let pkinit = std::fs::read(p.trust_dir(B).join("pkinit-anchors.pem")).unwrap();
     assert_eq!(
         synta_certificate::pem_to_der(&pkinit),
-        std::slice::from_ref(&realm_b.chain.ca_der)
+        std::slice::from_ref(&s.realm_b.chain.ca_der)
     );
     let snippet = std::fs::read_to_string(p.trust_krb5_conf(B)).unwrap();
     assert!(
@@ -272,14 +303,15 @@ fn trusted_realm_against_real_kdcs() {
         snippet.contains(&format!("kdc = {SERVER_B}:88")),
         "{snippet}"
     );
+    snippet
+}
 
-    // ── Armour from B's KDC with B's chain, for B only ──
+/// Armour from B's KDC with B's chain, for B only; returns the armour cache.
+fn armour_from_b(s: &Setup, p: &Paths, snippet: &str) -> PathBuf {
+    let (realm_a, realm_b) = (&s.realm_a, &s.realm_b);
     let armor = realm_b.dir.join("armor.ccache");
     realm_b
-        .kinit_anonymous(
-            &armor,
-            &config([&realm_a, &realm_b], &p, &snippet, "b.conf"),
-        )
+        .kinit_anonymous(&armor, &config([realm_a, realm_b], p, snippet, "b.conf"))
         .expect("anonymous PKINIT to B with B's installed PKINIT anchors");
     let without: String = snippet
         .lines()
@@ -290,7 +322,7 @@ fn trusted_realm_against_real_kdcs() {
         realm_b
             .kinit_anonymous(
                 &realm_b.dir.join("x.ccache"),
-                &config([&realm_a, &realm_b], &p, &without, "b-bare.conf")
+                &config([realm_a, realm_b], p, &without, "b-bare.conf")
             )
             .is_err(),
         "without B's chain there is no armour"
@@ -304,24 +336,22 @@ fn trusted_realm_against_real_kdcs() {
         realm_b
             .kinit_anonymous(
                 &realm_b.dir.join("y.ccache"),
-                &config([&realm_a, &realm_b], &p, &a_chain, "b-a-chain.conf")
+                &config([realm_a, realm_b], p, &a_chain, "b-a-chain.conf")
             )
             .is_err(),
         "A's PKINIT anchors do not vouch for B's KDC"
     );
+    armor
+}
 
-    // ── A user of B gets a ticket for this A host over the trust, with
-    //    the cross-realm keys the establishment created ──
+/// A user of B gets a ticket for this A host over the trust, with the
+/// cross-realm keys the establishment created.
+fn user_of_b_gets_ticket(s: &Setup, p: &Paths, snippet: &str, armor: &Path) {
+    let (realm_a, realm_b) = (&s.realm_a, &s.realm_b);
     realm_b.add_user("alice@B.TEST", "Alice123");
-    let login = config([&realm_a, &realm_b], &p, &snippet, "login.conf");
+    let login = config([realm_a, realm_b], p, snippet, "login.conf");
     let user = realm_b.dir.join("alice.ccache");
-    realm_b.kinit(
-        "alice@B.TEST",
-        "Alice123",
-        &user,
-        Some(&armor),
-        Some(&login),
-    );
+    realm_b.kinit("alice@B.TEST", "Alice123", &user, Some(armor), Some(&login));
     let out = std::process::Command::new("kvno")
         .env("KRB5_CONFIG", &login)
         .env("KRB5CCNAME", format!("FILE:{}", user.display()))
@@ -334,12 +364,17 @@ fn trusted_realm_against_real_kdcs() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("host/{HOST}@{A}")));
+}
 
-    // ── Refresh, an unreachable B (files kept), removal, leave ──
-    let result = flows::trusted_realms(&p).unwrap();
+/// Refresh, an unreachable B (its files kept), a bad entry, removal, and
+/// leaving.
+fn refresh_remove_and_leave(s: &Setup, p: &Paths) {
+    let (anchor_a, anchor_b) = (s.anchor_a, s.anchor_b);
+    let result = flows::trusted_realms(p).unwrap();
     assert_eq!(result["trusted_realms"][0]["status"], "refreshed");
-    server_a.publish_trusts(vec![trust_b(&["ipa9.b.test"], anchor_b)]);
-    let err = flows::trusted_realms(&p).unwrap_err();
+    s.server_a
+        .publish_trusts(vec![trust_b(&["ipa9.b.test"], anchor_b)]);
+    let err = flows::trusted_realms(p).unwrap_err();
     assert!(
         err.downcast_ref::<Outcome>()
             .is_some_and(|o| matches!(o, Outcome::RetryLater(_))),
@@ -348,19 +383,34 @@ fn trusted_realm_against_real_kdcs() {
     assert!(exists(&p.trust_krb5_conf(B)), "last verified files kept");
     // A trust entry with A's own anchor is not a separate realm: the
     // client refuses A's advertisement and changes nothing.
-    server_a.publish_trusts(vec![trust_b(&[SERVER_B], anchor_a)]);
-    assert!(flows::trusted_realms(&p).is_err());
+    s.server_a
+        .publish_trusts(vec![trust_b(&[SERVER_B], anchor_a)]);
+    assert!(flows::trusted_realms(p).is_err());
     assert_eq!(p.trusted_realms(), [B]);
-    server_a.publish_trusts(vec![]);
-    let result = flows::trusted_realms(&p).unwrap();
+    s.server_a.publish_trusts(vec![]);
+    let result = flows::trusted_realms(p).unwrap();
     assert_eq!(result["trusted_realms"][0]["status"], "removed");
     assert_eq!(p.trusted_realms().len(), 0);
     assert!(!exists(&p.trust_krb5_conf(B)));
     assert!(!exists(&p.trust_dir(B)));
 
-    server_a.publish_trusts(vec![trust_b(&[SERVER_B], anchor_b)]);
-    flows::trusted_realms(&p).unwrap();
-    flows::leave(&p).unwrap();
+    s.server_a
+        .publish_trusts(vec![trust_b(&[SERVER_B], anchor_b)]);
+    flows::trusted_realms(p).unwrap();
+    flows::leave(p).unwrap();
     assert_eq!(p.trusted_realms().len(), 0);
     assert!(!exists(&p.trust_krb5_conf(B)));
+}
+
+#[test]
+fn trusted_realm_against_real_kdcs() {
+    let Some(s) = start() else {
+        return;
+    };
+    establish_trust(&s);
+    let p = enroll_host(&s);
+    let snippet = install_b(&s, &p);
+    let armor = armour_from_b(&s, &p, &snippet);
+    user_of_b_gets_ticket(&s, &p, &snippet, &armor);
+    refresh_remove_and_leave(&s, &p);
 }

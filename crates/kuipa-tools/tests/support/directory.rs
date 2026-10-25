@@ -70,8 +70,7 @@ impl KdcDirectory {
             .iter()
             .map(|s| {
                 let kt = realm.dir.join(format!("kuipa-{s}.keytab"));
-                std::fs::write(&kt, realm.new_keys(&format!("ipa-ku/{s}@{}", realm.realm)))
-                    .unwrap();
+                std::fs::write(&kt, realm.new_keys(&format!("ipa-ku/{s}@{}", realm.name))).unwrap();
                 GssServerCred::acquire(&format!("ipa-ku@{s}"), kt.to_str().unwrap()).unwrap()
             })
             .collect();
@@ -150,7 +149,7 @@ impl KdcDirectory {
     }
 
     fn keys(&self, fqdn: &str) -> Result<Keytab, DirectoryError> {
-        let principal = Principal::host(fqdn, &self.realm.realm).to_string();
+        let principal = Principal::host(fqdn, &self.realm.name).to_string();
         Ok(Keytab::from_mit(&self.realm.new_keys(&principal))?)
     }
 
@@ -189,7 +188,7 @@ impl Directory for KdcDirectory {
         salt: &[u8; 32],
         _: &[Enctype],
     ) -> Result<Keytab, DirectoryError> {
-        if self.realm.has(&format!("host/{fqdn}@{}", self.realm.realm)) {
+        if self.realm.has(&format!("host/{fqdn}@{}", self.realm.name)) {
             return Err("the host exists".into());
         }
         if !self.spent.lock().unwrap().insert(*salt) {
@@ -225,7 +224,7 @@ impl Directory for KdcDirectory {
         cb: &[u8; 32],
         _: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-        let host = Principal::host(fqdn, &self.realm.realm).to_string();
+        let host = Principal::host(fqdn, &self.realm.name).to_string();
         let (caller, binding) = self.accept_bound(token, cb)?;
         if caller != host {
             return Err("only the host may rekey itself".into());

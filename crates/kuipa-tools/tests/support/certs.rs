@@ -43,17 +43,29 @@ fn ec_key() -> Pkey<Private> {
     kgen.generate().unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A certificate's subject or issuer: its DER name and its key's SPKI.
+#[derive(Clone, Copy)]
+struct Party<'a> {
+    name: &'a [u8],
+    spki: &'a [u8],
+}
+
 fn sign_cert(
     issuer_key: &Pkey<Private>,
-    subject_name: &[u8],
-    issuer_name: &[u8],
-    subject_spki: &[u8],
-    issuer_spki: &[u8],
+    subject: Party<'_>,
+    issuer: Party<'_>,
     serial: i64,
     ca: bool,
     extra: &[(&[u32], bool, &[u8])],
 ) -> Vec<u8> {
+    let Party {
+        name: subject_name,
+        spki: subject_spki,
+    } = subject;
+    let Party {
+        name: issuer_name,
+        spki: issuer_spki,
+    } = issuer;
     let backend = synta_certificate::crypto::BackendPrivateKey::from_pkcs8_der_unchecked(
         issuer_key.to_pkcs8_der().unwrap(),
     );
@@ -105,10 +117,14 @@ pub fn kdc_chain(realm: &str) -> KdcChain {
         .unwrap();
     let ca_der = sign_cert(
         &ca_key,
-        &ca_name,
-        &ca_name,
-        &ca_spki,
-        &ca_spki,
+        Party {
+            name: &ca_name,
+            spki: &ca_spki,
+        },
+        Party {
+            name: &ca_name,
+            spki: &ca_spki,
+        },
         1,
         true,
         &[],
@@ -131,10 +147,14 @@ pub fn kdc_chain(realm: &str) -> KdcChain {
         .unwrap();
     let kdc_der = sign_cert(
         &ca_key,
-        &kdc_name,
-        &ca_name,
-        &kdc_spki,
-        &ca_spki,
+        Party {
+            name: &kdc_name,
+            spki: &kdc_spki,
+        },
+        Party {
+            name: &ca_name,
+            spki: &ca_spki,
+        },
         2,
         false,
         &[
