@@ -45,7 +45,8 @@ SAVE=1
 COMPARE_PREV=""
 RESULTS_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/kuipa-bench"
 OUTPUT_FILE=""
-CRITERION_DIR="$REPO_ROOT/target/criterion"
+# Criterion writes under the cargo target directory, wherever that is.
+CRITERION_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/criterion"
 RUN_STARTED=$(date +%s)
 COMPARE_DIR1=""
 COMPARE_DIR2=""
@@ -372,11 +373,22 @@ case "$COMMAND" in
         run_benchmarks
         collect_results >"$WORKDIR/results.json"
         print_summary "$WORKDIR/results.json"
-        [[ -n "$OUTPUT_FILE" ]] && cp "$WORKDIR/results.json" "$OUTPUT_FILE"
+        # A run that measured nothing — criterion writing somewhere else,
+        # every target filtered out — must not pass for a clean one.
+        if ! python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1])))' \
+            "$WORKDIR/results.json"; then
+            echo "No benchmark results found under $CRITERION_DIR" >&2
+            exit 1
+        fi
+        if [[ -n "$OUTPUT_FILE" ]]; then
+            cp "$WORKDIR/results.json" "$OUTPUT_FILE"
+        fi
         if [[ "$SAVE" == "1" ]]; then
             stamp=$(date -u +%Y%m%dT%H%M%SZ)
             save_results "$RESULTS_BASE/$stamp" "$WORKDIR/results.json"
-            [[ -n "$COMPARE_PREV" ]] && compare_results "$COMPARE_PREV" "$RESULTS_BASE/$stamp"
+            if [[ -n "$COMPARE_PREV" ]]; then
+                compare_results "$COMPARE_PREV" "$RESULTS_BASE/$stamp"
+            fi
         fi
         ;;
     *)
