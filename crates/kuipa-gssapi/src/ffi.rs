@@ -169,7 +169,9 @@ pub fn gss_krb5_nt_principal_name() -> GssOidDesc {
 pub enum Krb5ContextStruct {}
 pub type Krb5Context = *mut Krb5ContextStruct;
 
+#[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
 pub enum Krb5KeytabStruct {}
+#[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
 pub type Krb5Keytab = *mut Krb5KeytabStruct;
 
 pub enum Krb5CcacheStruct {}
@@ -212,6 +214,7 @@ impl Default for Krb5Creds {
 
 #[link(name = "krb5")]
 extern "C" {
+    #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub fn krb5_init_context(context: *mut Krb5Context) -> c_int;
     pub fn krb5_free_context(context: Krb5Context);
     pub fn krb5_parse_name(
@@ -220,20 +223,24 @@ extern "C" {
         principal_out: *mut Krb5Principal,
     ) -> c_int;
     pub fn krb5_free_principal(context: Krb5Context, val: Krb5Principal);
+    #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub fn krb5_kt_resolve(context: Krb5Context, name: *const c_char, id: *mut Krb5Keytab)
         -> c_int;
+    #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub fn krb5_kt_close(context: Krb5Context, id: Krb5Keytab) -> c_int;
     pub fn krb5_cc_resolve(
         context: Krb5Context,
         name: *const c_char,
         cache: *mut Krb5Ccache,
     ) -> c_int;
+    #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub fn krb5_cc_initialize(
         context: Krb5Context,
         cache: Krb5Ccache,
         principal: Krb5Principal,
     ) -> c_int;
     pub fn krb5_cc_close(context: Krb5Context, cache: Krb5Ccache) -> c_int;
+    #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub fn krb5_get_init_creds_keytab(
         context: Krb5Context,
         creds: *mut Krb5Creds,
@@ -243,6 +250,7 @@ extern "C" {
         in_tkt_service: *const c_char,
         k5_gic_options: *mut c_void,
     ) -> c_int;
+    #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub fn krb5_cc_store_cred(
         context: Krb5Context,
         cache: Krb5Ccache,

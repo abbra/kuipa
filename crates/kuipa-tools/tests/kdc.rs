@@ -238,9 +238,10 @@ fn check_channel_bindings(realm: &Realm) {
         .unwrap();
         let server =
             GssServerCred::acquire(&format!("ipa-ku@{SERVER}"), svc.to_str().unwrap()).unwrap();
-        let client = GssClientCred::from_keytab_initiate(
+        let client = GssClientCred::from_client_keytab(
             probe.to_str().unwrap(),
-            "host/probe.example.test@EXAMPLE.TEST",
+            Some("host/probe.example.test@EXAMPLE.TEST"),
+            None,
         )
         .unwrap();
         assert!(matches!(

@@ -71,10 +71,10 @@ impl KeytabInitiator {
 impl Initiator for KeytabInitiator {
     fn token(&self, peer: &str, cb: &[u8; 32]) -> Result<Vec<u8>, Error> {
         let _guard = lock(&self.lock);
-        let cred = kuipa_gssapi::GssClientCred::from_keytab_initiate_named(
+        let cred = kuipa_gssapi::GssClientCred::from_client_keytab(
             &self.keytab,
-            &self.principal,
-            &format!("MEMORY:kuipa-peer-{}", self.principal),
+            Some(&self.principal),
+            Some(&format!("MEMORY:kuipa-peer-{}", self.principal)),
         )?;
         match kuipa_gssapi::init_token(&cred, &format!("ipa-ku@{peer}"), Some(cb))? {
             kuipa_gssapi::InitStep::Complete(t) => Ok(t),

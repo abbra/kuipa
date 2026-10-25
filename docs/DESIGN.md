@@ -1260,6 +1260,21 @@ fit directly. SSSD's `ldap_child` and `krb5_child`, certmonger and
 they move to GSS-API through gssproxy. Service principals therefore come
 first; `host/<fqdn>` follows SSSD.
 
+kuipa's own clients are GSS-API consumers in the same way. Whenever kuipa
+or kuipad authenticates from a keytab (a rekey, a registration, `kuipa
+keys fetch`, `kuipa check`, `kuipa escrow`, the daemon's LDAP binds and
+anchor exchange), it asks GSS-API for an initiator credential with
+`gss_acquire_cred_from` and `{"client_keytab": path, "ccache": name}`
+(`GssClientCred::from_client_keytab`), and learns the principal it acts
+as from `gss_inquire_cred` when it does not name one. It never opens the
+keytab to get a ticket, so with `GSS_USE_PROXY=yes` gssproxy holds the
+keytab and kuipa needs no access to it; the ccache it names keeps a ticket
+already in the default ccache from standing in for the keytab's
+principal. Only where kuipa handles a keytab's contents (sealing it,
+rekeying it, reading its key versions) does it read the file. Heimdal has
+no credential store, so there kuipa still reads the keytab and gets the
+ticket with libkrb5.
+
 IPA servers' own keytabs stay plain: binding them to peer replicas would make
 a full-realm cold start depend on a non-network unlocker.
 
