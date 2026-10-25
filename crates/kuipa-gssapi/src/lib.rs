@@ -529,59 +529,64 @@ impl GssServerCred {
     /// `gss_display_name` to convert it to a UTF-8 string.  Returns `None`
     /// if either call fails or if the result is not valid UTF-8.
     pub fn principal_name(&self) -> Option<String> {
-        let mut minor: ffi::OmUint32 = 0;
-        let mut name: ffi::GssNameT = ptr::null_mut();
-
-        // SAFETY: self.raw is a valid gssproxy credential handle; name is an
-        // output-only pointer; the three trailing outputs we don't need are
-        // null (no-op).
-        let major = unsafe {
-            ffi::gss_inquire_cred(
-                &raw mut minor,
-                self.raw,
-                &raw mut name,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        if major != ffi::GSS_S_COMPLETE || name.is_null() {
-            tracing::debug!(
-                major,
-                minor,
-                "gss_inquire_cred failed or returned null name"
-            );
-            return None;
-        }
-
-        let mut buf = ffi::GssBufferDesc {
-            length: 0,
-            value: ptr::null_mut(),
-        };
-        let mut name_type: *mut ffi::GssOidDesc = ptr::null_mut();
-        // SAFETY: name is non-null, buf and name_type are valid output-only locals.
-        let major2 = unsafe {
-            ffi::gss_display_name(&raw mut minor, name, &raw mut buf, &raw mut name_type)
-        };
-
-        let result = if major2 == ffi::GSS_S_COMPLETE && !buf.value.is_null() {
-            // SAFETY: buf.value points to a GSSAPI-allocated buffer of length buf.length.
-            let slice = unsafe { std::slice::from_raw_parts(buf.value as *const u8, buf.length) };
-            std::str::from_utf8(slice).ok().map(str::to_owned)
-        } else {
-            None
-        };
-
-        // SAFETY: buf was returned by gss_display_name and must be released.
-        unsafe {
-            if !buf.value.is_null() {
-                ffi::gss_release_buffer(&raw mut minor, &raw mut buf);
-            }
-            ffi::gss_release_name(&raw mut minor, &raw mut name);
-        }
-
-        result
+        cred_principal_name(self.raw)
     }
+}
+
+/// The principal name of credential `cred`, as `gss_inquire_cred` and
+/// `gss_display_name` give it.
+fn cred_principal_name(cred: ffi::GssCredIdT) -> Option<String> {
+    let mut minor: ffi::OmUint32 = 0;
+    let mut name: ffi::GssNameT = ptr::null_mut();
+
+    // SAFETY: cred is a valid credential handle; name is an
+    // output-only pointer; the three trailing outputs we don't need are
+    // null (no-op).
+    let major = unsafe {
+        ffi::gss_inquire_cred(
+            &raw mut minor,
+            cred,
+            &raw mut name,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if major != ffi::GSS_S_COMPLETE || name.is_null() {
+        tracing::debug!(
+            major,
+            minor,
+            "gss_inquire_cred failed or returned null name"
+        );
+        return None;
+    }
+
+    let mut buf = ffi::GssBufferDesc {
+        length: 0,
+        value: ptr::null_mut(),
+    };
+    let mut name_type: *mut ffi::GssOidDesc = ptr::null_mut();
+    // SAFETY: name is non-null, buf and name_type are valid output-only locals.
+    let major2 =
+        unsafe { ffi::gss_display_name(&raw mut minor, name, &raw mut buf, &raw mut name_type) };
+
+    let result = if major2 == ffi::GSS_S_COMPLETE && !buf.value.is_null() {
+        // SAFETY: buf.value points to a GSSAPI-allocated buffer of length buf.length.
+        let slice = unsafe { std::slice::from_raw_parts(buf.value as *const u8, buf.length) };
+        std::str::from_utf8(slice).ok().map(str::to_owned)
+    } else {
+        None
+    };
+
+    // SAFETY: buf was returned by gss_display_name and must be released.
+    unsafe {
+        if !buf.value.is_null() {
+            ffi::gss_release_buffer(&raw mut minor, &raw mut buf);
+        }
+        ffi::gss_release_name(&raw mut minor, &raw mut name);
+    }
+
+    result
 }
 
 // ── GssClientCred ─────────────────────────────────────────────────────────────
@@ -627,6 +632,12 @@ impl Drop for GssClientCred {
 }
 
 impl GssClientCred {
+    /// The principal this credential acts as, e.g. `"alice@EXAMPLE.TEST"`;
+    /// `None` if it cannot be inquired.
+    pub fn principal_name(&self) -> Option<String> {
+        cred_principal_name(self.raw)
+    }
+
     /// Acquire an initiator credential from the caller's ambient Kerberos ticket cache.
     ///
     /// Equivalent to `from_ccache(false)`.  Requires a prior `kinit`; does not
