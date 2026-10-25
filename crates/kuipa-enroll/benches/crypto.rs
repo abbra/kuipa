@@ -245,6 +245,7 @@ fn vouchers(c: &mut Criterion) {
         hostgroup: "web".into(),
         not_before: at - 60,
         not_after: at + 3600,
+        lease: 0,
         binding: ephemeral.clone(),
     };
     let message = claims.message();
