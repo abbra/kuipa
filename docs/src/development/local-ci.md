@@ -96,8 +96,8 @@ session uses the playground's helpers the way a person would, with
 * a user's vaults: devices, sealing, the transparency log and witnesses,
   sessions, offline sessions;
 * realm limits, a vault shared with bob, a break-glass vault bob and
-  carol approve, bob's lost device recovered with a code, and carol's
-  deposits;
+  carol approve, bob's lost device recovered with a code and then
+  through the helpdesk, and carol's and web1's deposits;
 * signing files and a git commit;
 * failover to ipa2;
 * password, ticket, offline and voucher joins;
@@ -207,6 +207,7 @@ live in one shell; nothing touches the real system.
 | `pq_trusted CMD…` | run `CMD` with that user's ticket and configuration, e.g. `pq_trusted klist` or `pq_trusted kvno host/$PQ_HOST` (a ticket for this `EXAMPLE.TEST` host over the trust) |
 | `pq_admin_kinit` | log in as the administrator with a kuipa data directory and runtime directory of their own, for `kuipa seal` |
 | `pq_as USER CMD…` | run `CMD` as `bob` or `carol` (password `Secret123`), each with a ticket and a kuipa data directory of their own, for shared vaults, approvals and deposits: `pq_as bob kuipa seal list` |
+| `kuipa-playground recovery --vault OWNER/NAME [--required]` | name the realm's device escrow vault, as an administrator sets `cn=recovery,cn=kuipa,cn=etc`: new device keys are deposited there (`DESIGN-recovery.md` §4) |
 | `pq_down SERVER` / `pq_up` | make a server unreachable from this shell, and back (for failover) |
 | `pq_log [N]` | the servers' log |
 

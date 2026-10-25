@@ -110,6 +110,7 @@ fn run(args: &[String]) -> Result<(), Error> {
 
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &SERVERS, &[ADMIN]));
     publish_masters(&dir, &directory)?;
+    watch_recovery(&dir, &directory);
     configure_policy(&directory);
     seed_secrets(&directory);
     let Started {
@@ -182,6 +183,59 @@ fn run(args: &[String]) -> Result<(), Error> {
 /// Write the initial `cn=masters` state, and watch for changes from
 /// `kuipa-playground masters` (the promotion story of §18): a thread
 /// applies them to the directory and acknowledges them.
+/// `kuipa-playground recovery` (DESIGN-recovery.md §4): a thread applies
+/// `recovery.json`, the realm's device-key recovery settings, to the
+/// directory, and acknowledges each change in `recovery.ack`.
+fn watch_recovery(dir: &Path, directory: &Arc<KdcDirectory>) {
+    let watch = directory.clone();
+    let path = dir.join("recovery.json");
+    let ack = dir.join("recovery.ack");
+    std::thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && text != last
+                && let Ok(settings) = serde_json::from_str(&text)
+            {
+                *watch.recovery.lock().unwrap() = settings;
+                if std::fs::write(&ack, &text).is_ok() {
+                    last = text;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+}
+
+/// `kuipa-playground recovery --vault OWNER/NAME [--required]`: name the
+/// realm's device escrow vault, as an administrator would on
+/// `cn=recovery,cn=kuipa,cn=etc`.
+fn recovery(args: &[String]) -> Result<(), Error> {
+    let pg =
+        PathBuf::from(std::env::var("KUIPA_PLAYGROUND").map_err(|_| "run inside the playground")?);
+    let vault = option(args, "--vault")
+        .ok_or("usage: kuipa-playground recovery --vault OWNER/NAME [--required]")?;
+    let settings = kuipa_enroll::vault::RecoverySettings {
+        device_vault: vault,
+        required: args.iter().any(|a| a == "--required"),
+    };
+    let text = serde_json::to_string_pretty(&Some(&settings))?;
+    std::fs::write(pg.join("recovery.json"), &text)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(pg.join("recovery.ack")).is_ok_and(|a| a == text) {
+            println!(
+                "device keys are deposited in {}{}",
+                settings.device_vault,
+                if settings.required { " (required)" } else { "" }
+            );
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err("the playground did not acknowledge; is it running?".into())
+}
+
 fn publish_masters(dir: &Path, directory: &Arc<KdcDirectory>) -> Result<(), Error> {
     let initial = serde_json::to_string_pretty(&serde_json::json!({
         "masters": SERVERS,
@@ -416,6 +470,19 @@ fn start_trusted(
     Ok((*anchor.public().thumbprint(), directory, url))
 }
 
+/// The servers' rate limiter.  Every request of the scripted session comes
+/// from 127.0.0.1, much faster than a person types: only the per-address
+/// allowance is raised.
+fn session_limiter() -> kuipad::limit::Limiter {
+    kuipad::limit::Limiter::new(kuipad::limit::Limits {
+        per_source: kuipad::limit::Rate {
+            burst: 600.0,
+            per_minute: 600.0,
+        },
+        ..kuipad::limit::Limits::default()
+    })
+}
+
 /// Start every server on `rt`, each with its own anchor, and wait for the
 /// anchor exchange.
 fn start_servers(
@@ -511,7 +578,7 @@ fn start_servers(
             server: enroll.clone(),
             directory: directory.clone(),
             peers: Some(peers.clone()),
-            limiter: kuipad::limit::Limiter::default(),
+            limiter: session_limiter(),
             tang,
             keys: None,
             ledger: Some(ledger),
@@ -931,6 +998,7 @@ fn main() -> std::process::ExitCode {
         Some("run") => run(&args[1..]),
         Some("stage") => stage(&args[1..]),
         Some("masters") => masters(&args[1..]),
+        Some("recovery") => recovery(&args[1..]),
         _ => Err("usage: kuipa-playground {run --env-file F [--hosts N] | stage --host FQDN (--recipient JWK | --secret) --out FILE}".into()),
     };
     match result {
