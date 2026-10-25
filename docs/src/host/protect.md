@@ -96,3 +96,41 @@ built from its main branch):
 It stops copies taken out of reach of your servers. A recent copy restored
 inside your network still opens while the host or service is enabled.
 Delete hosts you retire. See [What kuipa protects](../security.md#copies-of-disks-snapshots-and-backups).
+
+## Deposit recovery keys with the helpdesk
+
+A disk that will not unlock (a dead TPM, a Tang server gone) needs its
+LUKS recovery key, and a restored backup needs its repository password.
+Keep them where the helpdesk can reach them and the host cannot read them
+back: a vault the host is a **depositor** of. Its owner shares it with
+your hosts first:
+
+```sh
+helpdesk$ kuipa seal share disks --depositor --group all-hosts
+```
+
+Then, as root on each host:
+
+```sh
+systemd-cryptenroll --recovery-key /dev/vda2 | kuipa escrow luks /dev/vda2 --vault helpdesk/disks
+kuipa escrow file restic /etc/restic/password --vault helpdesk/disks
+```
+
+* The host deposits with a ticket from its own keytab, and cannot list
+  other hosts' deposits or open its own. With `--keytab FILE`, a service
+  or user whose keytab is on the host deposits as itself instead, and is
+  the one the vault must name as a depositor
+  (`kuipa seal share disks --depositor --service backup/web1.example.test`):
+
+  ```sh
+  kuipa escrow file restic /etc/restic/password --vault helpdesk/disks \
+      --keytab /etc/backup/backup.keytab
+  ```
+* `kuipa escrow luks` takes the recovery key from what
+  `systemd-cryptenroll` prints, finds the volume's UUID with `cryptsetup
+  luksUUID` (or `--uuid`), and replaces the host's last deposit for that
+  volume. Run it again whenever the recovery key changes.
+* The helpdesk opens a deposit under the vault's policy, approvals
+  included: `kuipa seal deposit list disks`, then `deposit fetch` and
+  `kuipa seal open`.
+

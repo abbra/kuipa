@@ -381,7 +381,16 @@ struct CachedAdvertisement {
 pub struct Seal<'a> {
     host: &'a Paths,
     user: &'a UserPaths,
-    ccache: Option<&'a str>,
+    credential: Credential<'a>,
+}
+
+/// Whose ticket a vault operation carries.
+#[derive(Clone, Copy)]
+enum Credential<'a> {
+    /// The user's: the ticket in this ccache, else the default one.
+    Ccache(Option<&'a str>),
+    /// A keytab's principal: this keytab's, else the host's.
+    Keytab(Option<&'a Path>),
 }
 
 /// What `op_with_session` answers: the verified descriptors, the session
@@ -400,7 +409,23 @@ impl<'a> Seal<'a> {
     /// the ticket in `ccache` (else the default ccache, `KRB5CCNAME`).
     #[must_use]
     pub fn new(host: &'a Paths, user: &'a UserPaths, ccache: Option<&'a str>) -> Self {
-        Self { host, user, ccache }
+        Self {
+            host,
+            user,
+            credential: Credential::Ccache(ccache),
+        }
+    }
+
+    /// As the principal of `keytab` (a service's or a user's), or without
+    /// one as the host itself, with a ticket from that keytab and the kuipa
+    /// directory `user` (`kuipa escrow`, run as root).
+    #[must_use]
+    pub fn for_keytab(host: &'a Paths, user: &'a UserPaths, keytab: Option<&'a Path>) -> Self {
+        Self {
+            host,
+            user,
+            credential: Credential::Keytab(keytab),
+        }
     }
 
     fn public(&self) -> Result<PublicState, Error> {
@@ -408,9 +433,10 @@ impl<'a> Seal<'a> {
     }
 
     fn cred(&self) -> Result<GssClientCred, Error> {
-        Ok(match self.ccache {
-            Some(name) => GssClientCred::from_named_ccache(name)?,
-            None => GssClientCred::ambient()?,
+        Ok(match self.credential {
+            Credential::Ccache(Some(name)) => GssClientCred::from_named_ccache(name)?,
+            Credential::Ccache(None) => GssClientCred::ambient()?,
+            Credential::Keytab(keytab) => flows::keytab_cred(self.host, keytab)?,
         })
     }
 

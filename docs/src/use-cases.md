@@ -294,10 +294,11 @@ only under policy and recorded in the transparency log. The same slot
 can escrow LUKS and backup recovery keys.
 
 **Status:** partly. A recovery code you print brings your device key back
-on a new machine ([Sealing your own files](user/sealing.md#keep-a-recovery-code-in-case-it-was-your-only-device)).
+on a new machine ([Sealing your own files](user/sealing.md#keep-a-recovery-code-in-case-it-was-your-only-device)),
+and hosts and services deposit their LUKS and backup keys into a
+helpdesk vault they cannot open ([Protecting keytabs and files](host/protect.md#deposit-recovery-keys-with-the-helpdesk)).
 Still designed only: your device key deposited in a helpdesk vault and
-handed back under several people's approval, and hosts depositing their
-LUKS and backup keys the same way. See
+handed back under several people's approval. See
 [recovery](reference/design.md#kuipa-recovery-lost-devices-luks-and-backup-keys).
 
 ### Tie secrets to a TPM, passkey or attested hardware

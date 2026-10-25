@@ -12,15 +12,15 @@ the most managed:
    only with the helpdesk's own devices and M-of-N approval
    (DESIGN-approvals.md);
 3. the same deposits for machine secrets: **LUKS recovery keys** and
-   **backup repository keys**, deposited by hosts that cannot read them
-   back.
+   **backup repository keys**, deposited by hosts, or by services and
+   users through their keytabs, which cannot read them back.
 
 | piece | status |
 |---|---|
 | recovery codes (`kuipa seal recovery-code`, `recover code`, `recover finish`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | depositors, deposits, `kuipa seal deposit put`, `list`, `fetch`, `retire` | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | device-key deposits and delivery (`kuipa seal recover`) | designed; needs DESIGN-approvals.md |
-| `kuipa escrow luks`, `kuipa escrow file` | designed |
+| `kuipa escrow luks`, `kuipa escrow file` | implemented, tested against a real KDC (a LUKS key as `systemd-cryptenroll` prints it); **not yet run** against a real LUKS volume |
 
 Device-key deposits do not apply to keys that never leave hardware (a
 `pkcs11` device, §7.6.2): they cannot be copied, so they cannot be
@@ -182,18 +182,35 @@ old key right after.
 
 ## 5. LUKS and backup keys
 
-Hosts are depositors of a realm vault such as `helpdesk/disks`.
+Hosts, and services or users with a keytab on a host, are depositors of
+a realm vault such as `helpdesk/disks`.
 
-* `kuipa escrow luks DEVICE` (root) enrolls a recovery key in the LUKS2
-  header with `systemd-cryptenroll --recovery-key`, seals it to the
-  vault as a deposit of kind `luks` with subject `{host, uuid}`, and
-  replaces the host's previous deposit for that volume. Run again after
-  `cryptsetup luksKillSlot` or a reinstall, it keeps the deposit current.
-* `kuipa escrow file NAME FILE` deposits any small secret, such as a
-  restic or Borg repository password, as kind `file`.
+* `systemd-cryptenroll --recovery-key DEVICE | kuipa escrow luks DEVICE
+  --vault helpdesk/disks` (root) enrolls a recovery key in the LUKS2
+  header and deposits it as kind `luks`, with subject `{uuid}` (what
+  `cryptsetup luksUUID` says, or `--uuid`), in place of the host's
+  previous deposit for that volume. kuipa does not enroll the key itself:
+  it reads what `systemd-cryptenroll` prints (or `--key-file`), takes the
+  line shaped like a systemd recovery key (eight groups of eight modhex
+  characters) and refuses input without one, so a mistyped pipe deposits
+  nothing. Run again after `cryptsetup luksKillSlot` or a reinstall, it
+  keeps the deposit current.
+* `kuipa escrow file NAME FILE --vault V` deposits any small secret, such
+  as a restic or Borg repository password, as kind `file`, subject
+  `{name}`.
 
-The host's own principal deposits, with its host ticket; it can neither
-list other hosts' deposits nor open its own. When a disk will not unlock
+The host's own principal deposits, with a ticket from its keytab (the
+sealed one's unsealed copy when the keytab is protected); with `--keytab
+FILE`, the principal of that keytab does instead. The credential is
+GSS-API's: `gss_acquire_cred_from` with `client_keytab` (and a private
+in-memory ccache, so no ticket already in the default ccache stands in
+for the keytab's principal), named by `gss_inquire_cred`. kuipa never
+reads the keytab itself, so gssproxy can hold it and the process needs
+no access to the file; the host's keytab must act as the host. A backup
+service with its own keytab thus deposits its repository password as
+`backup/web1.example.test`, not as the host. Either keeps the vault's descriptor in the host's root-only
+state directory (`/var/lib/ipa-client/ku/escrow`), and can neither list
+other depositors' deposits nor open its own. When a disk will not unlock
 (a dead TPM, a lost Tang server), the helpdesk opens the deposit under
 the vault's policy and reads the key to whoever is at the console.
 
