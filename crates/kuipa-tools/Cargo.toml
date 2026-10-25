@@ -7,7 +7,7 @@ license.workspace = true
 description = "kuipa client tools for FreeIPA hosts: kuipa, kuipa-unseal and kuipa-voucher"
 
 [dependencies]
-kuipa-enroll.workspace = true
+kuipa-enroll = { workspace = true, features = ["tls"] }
 kuipa-gssapi = { path = "../kuipa-gssapi" }
 native-ossl.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking"] }

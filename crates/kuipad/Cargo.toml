@@ -9,7 +9,7 @@ description = "kuipa server daemon: serves /ipa/ku/ behind httpd, talks to 389-d
 [dependencies]
 agirru-crdt.workspace = true
 agirru-engine.workspace = true
-kuipa-enroll.workspace = true
+kuipa-enroll = { workspace = true, features = ["tls"] }
 kuipa-gssapi = { path = "../kuipa-gssapi" }
 kuipa-ldap = { path = "../kuipa-ldap" }
 native-ossl.workspace = true

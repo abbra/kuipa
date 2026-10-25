@@ -15,10 +15,19 @@ synta-mtc = { version = "0.5.1", default-features = false, features = ["std", "d
 # Parsing the CA certificates an advertisement carries.
 synta = { version = "0.5.1", default-features = false, features = ["std"] }
 synta-certificate = { version = "0.5.1", default-features = false, features = ["std", "derive"] }
+# TLS server verification (the `tls` feature), Merkle Tree CAs included.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
+rustls-native-ossl = { version = "0.3.3", optional = true }
+synta-x509-verification = { version = "0.5.1", default-features = false, features = ["openssl"], optional = true }
 native-ossl.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tang-pqc.workspace = true
+
+[features]
+# A rustls verifier for kuipad's TLS endpoints: ordinary CAs through
+# OpenSSL, Merkle Tree CAs through their proofs.
+tls = ["dep:rustls", "dep:rustls-native-ossl", "dep:synta-x509-verification", "synta-certificate/openssl"]
 
 [lints]
 workspace = true

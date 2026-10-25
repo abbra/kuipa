@@ -29,7 +29,6 @@ use native_ossl::util::SecretBuf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
 use tang_pqc::{Policy, SignedAdvertisement, Thumbprint};
 
 /// Errors.
@@ -93,15 +92,8 @@ fn client(ca: Option<&[Vec<u8>]>) -> Result<reqwest::Client, Error> {
         .with_safe_default_protocol_versions()?
         .dangerous();
     let config = match ca {
-        Some(certs) => {
-            let roots: Vec<_> = certs
-                .iter()
-                .map(|c| CertificateDer::from(c.as_slice()))
-                .collect();
-            builder.with_custom_certificate_verifier(Arc::new(
-                OsslServerCertVerifier::builder(&roots)?.build(),
-            ))
-        }
+        Some(certs) => builder
+            .with_custom_certificate_verifier(Arc::new(kuipa_enroll::tls::server_verifier(certs)?)),
         None => builder.with_custom_certificate_verifier(Arc::new(FirstContact(provider))),
     };
     Ok(reqwest::Client::builder()
