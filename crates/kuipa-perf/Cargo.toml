@@ -1,0 +1,28 @@
+[package]
+name = "kuipa-perf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Benchmark fixtures for kuipa: deterministic keytabs, realms, and real CA certificates"
+keywords = ["benchmark", "freeipa", "kerberos", "post-quantum"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+agirru-crdt.workspace = true
+kuipa-enroll.workspace = true
+native-ossl.workspace = true
+serde_json.workspace = true
+synta = { version = "0.5.1", default-features = false, features = ["std"] }
+synta-certificate = { version = "0.5.1", default-features = false, features = ["std", "openssl", "pqc"] }
+tang-pqc.workspace = true
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "certs"
+harness = false
+
+[lints]
+workspace = true
