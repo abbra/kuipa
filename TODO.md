@@ -61,6 +61,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         pkcs11-provider (no attestation yet: registered at `any`).
   - [ ] 9b. Passkeys (libfido2 FFI, relying-party verifier from ahdapa).
   - [x] Registered sealing (`sealing = registered`).
+  - [x] The factor sets a realm requires a policy to meet (§7.6.2).
   - [x] Shared vaults (§7.6.12): managers and members by user, group,
         host or service, devices held by members, `OWNER/NAME`
         references, `kuipa seal share`/`unshare`; departed members'
