@@ -11,3 +11,7 @@
 ---
 
 {{#include ../../DESIGN-sign.md}}
+
+---
+
+{{#include ../../DESIGN-approvals.md}}

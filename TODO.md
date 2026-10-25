@@ -142,7 +142,7 @@ design first.
 - [ ] Recovery slots held by a helpdesk group, also escrowing LUKS and
       backup recovery keys.
 - [ ] M-of-N approvals for break-glass releases, recorded in the
-      transparency log.
+      transparency log: designed in `docs/DESIGN-approvals.md`.
 - [ ] Short-lived CI runner identities: leases on top of vouchers, and
       pipeline secrets sealed to them.
 - [ ] Recipes in the book: Ansible vault passwords, `systemd-creds` and
