@@ -898,7 +898,14 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
         ..vault::Members::default()
     };
     let shared = seal
-        .share("team", vault::Members::default(), bob_only.clone())
+        .share(
+            "team",
+            [
+                vault::Members::default(),
+                bob_only.clone(),
+                vault::Members::default(),
+            ],
+        )
         .unwrap();
     assert_eq!(
         shared["vaults"][0]["members"][0], "user:bob@EXAMPLE.TEST",
@@ -941,7 +948,14 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
     );
     // Unshared, his device goes and nothing opens for him.
     let unshared = seal
-        .unshare("team", vault::Members::default(), bob_only)
+        .unshare(
+            "team",
+            [
+                vault::Members::default(),
+                bob_only,
+                vault::Members::default(),
+            ],
+        )
         .unwrap();
     assert_eq!(
         unshared["vaults"][0]["devices"].as_array().unwrap().len(),
@@ -1060,6 +1074,63 @@ fn lost_laptop(world: &Scenario, alice: &Alice) {
     let old_pass: &[u8] = b"laptop pass";
     assert!(on_laptop.open(&again[0], Some(old_pass)).is_err());
     assert!(on_laptop.open(&note, Some(old_pass)).is_err());
+}
+
+fn deposits(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    // ── A drop box: Bob deposits, only Alice opens (DESIGN-recovery.md §3) ──
+    let drop = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        sealing: vault::Sealing::Registered,
+        ..vault::Policy::default()
+    };
+    seal.create("drop", drop).unwrap();
+    seal.add_device("drop", b"correct horse").unwrap();
+    let bob_only = vault::Members {
+        users: vec!["bob".into()],
+        ..vault::Members::default()
+    };
+    seal.share(
+        "drop",
+        [
+            vault::Members::default(),
+            vault::Members::default(),
+            bob_only,
+        ],
+    )
+    .unwrap();
+    let bob_home = UserPaths::new(realm.dir.join("bob-depositor"));
+    let bob = Seal::new(a, &bob_home, Some(&alice.bob_cc));
+    let subject = std::collections::BTreeMap::from([("name".to_owned(), "restic".to_owned())]);
+    let made = bob
+        .deposit(
+            "alice/drop",
+            b"restic password",
+            vault::DepositKind::File,
+            subject,
+        )
+        .unwrap();
+    let id = made["deposits"][0]["id"].as_str().unwrap().to_owned();
+    assert!(
+        bob.deposit_file("alice/drop", &id).is_err(),
+        "Bob only deposits"
+    );
+    let listed = seal.deposits("drop").unwrap();
+    assert_eq!(
+        listed["deposits"][0]["depositor"], "bob@EXAMPLE.TEST",
+        "{listed}"
+    );
+    let sealed = seal.deposit_file("drop", &id).unwrap();
+    assert_eq!(
+        seal.open(&sealed, Some(b"correct horse")).unwrap().as_ref(),
+        b"restic password"
+    );
 }
 
 fn token_device(world: &Scenario, alice: &Alice) {
@@ -1505,6 +1576,7 @@ fn against_a_real_kdc() {
     shared_vault(&world, &alice);
     break_glass(&world, &alice);
     lost_laptop(&world, &alice);
+    deposits(&world, &alice);
     token_device(&world, &alice);
     unprotect_host(&world);
     admin_ticket(&world);

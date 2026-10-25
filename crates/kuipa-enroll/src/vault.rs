@@ -48,8 +48,8 @@ pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault session";
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
 /// Version 2 adds the receipts of the events an operation logged, 3 the
-/// release requests, 4 device escrows.
-const REPLY_VERSION: u8 = 4;
+/// release requests, 4 device escrows, 5 deposits.
+const REPLY_VERSION: u8 = 5;
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
 const SESSION_MAGIC: [u8; 4] = *b"IPST";
@@ -394,6 +394,9 @@ pub struct Limits {
     /// 0 keeps every vault to its owner.
     #[serde(default = "default_max_members")]
     pub max_members: usize,
+    /// Deposits per depositor and vault (`DESIGN-recovery.md` §3).
+    #[serde(default = "default_max_deposits")]
+    pub max_deposits: usize,
     /// The longest re-authentication session, in seconds.
     pub max_reauth: u64,
     /// Whether offline sessions are allowed at all.
@@ -450,6 +453,9 @@ pub struct LimitOverrides {
     /// [`Limits::max_members`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_members: Option<usize>,
+    /// [`Limits::max_deposits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_deposits: Option<usize>,
     /// [`Limits::max_reauth`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reauth: Option<u64>,
@@ -480,6 +486,10 @@ const fn default_max_members() -> usize {
     64
 }
 
+const fn default_max_deposits() -> usize {
+    32
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -488,6 +498,7 @@ impl Default for Limits {
             max_vaults: 16,
             max_devices: 8,
             max_members: default_max_members(),
+            max_deposits: default_max_deposits(),
             max_reauth: 12 * 3600,
             offline_sessions: false,
             without_device: true,
@@ -522,6 +533,7 @@ impl Limits {
         out.max_vaults = o.max_vaults.unwrap_or(out.max_vaults);
         out.max_devices = o.max_devices.unwrap_or(out.max_devices);
         out.max_members = o.max_members.unwrap_or(out.max_members);
+        out.max_deposits = o.max_deposits.unwrap_or(out.max_deposits);
         out.max_reauth = o.max_reauth.unwrap_or(out.max_reauth);
         out.offline_sessions = o.offline_sessions.unwrap_or(out.offline_sessions);
         out.without_device = o.without_device.unwrap_or(out.without_device);
@@ -677,6 +689,9 @@ pub struct Vault {
     /// Who opens and seals with it besides its owner and managers.
     #[serde(default, skip_serializing_if = "Members::is_empty")]
     pub members: Members,
+    /// Who seals to it and deposits, without opening.
+    #[serde(default, skip_serializing_if = "Members::is_empty")]
+    pub depositors: Members,
     /// Registered devices.
     #[serde(default)]
     pub devices: Vec<Device>,
@@ -703,6 +718,8 @@ pub type Members = crate::sign::Signers;
 /// What a principal may do with a vault (§7.6.12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
+    /// Seal to it and deposit, but never open (`DESIGN-recovery.md` §3).
+    Depositor,
     /// Open and seal, and register and remove its own devices.
     Member,
     /// Also change the policy, the managers and members, and revoke.
@@ -1203,22 +1220,39 @@ impl Vault {
             Some(Role::Manager)
         } else if self.members.admits(principal, groups) {
             Some(Role::Member)
+        } else if self.depositors.admits(principal, groups) {
+            Some(Role::Depositor)
         } else {
             None
         }
     }
 
+    /// Whether `principal`, a member of `groups`, may open the vault's
+    /// files: any role but depositor.
+    #[must_use]
+    pub fn opens(&self, principal: &Principal, groups: &[String]) -> bool {
+        self.role(principal, groups)
+            .is_some_and(|r| r >= Role::Member)
+    }
+
     /// Whether anyone besides the owner shares it.
     #[must_use]
     pub fn is_shared(&self) -> bool {
-        !self.managers.is_empty() || !self.members.is_empty()
+        !self.managers.is_empty() || !self.members.is_empty() || !self.depositors.is_empty()
     }
 
     /// Who shares it, as the transparency log digests it after a share or
     /// an unshare.
     #[must_use]
     pub fn sharing_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(&(&self.managers, &self.members)).unwrap_or_default()
+        // Depositors join the digest only when there are any, so the
+        // digests logged before them stay what they were.
+        if self.depositors.is_empty() {
+            serde_json::to_vec(&(&self.managers, &self.members))
+        } else {
+            serde_json::to_vec(&(&self.managers, &self.members, &self.depositors))
+        }
+        .unwrap_or_default()
     }
 
     /// Who holds `device`: its holder, else the owner.
@@ -1496,6 +1530,43 @@ impl ReleaseRequest {
     }
 }
 
+/// The largest deposit a server keeps, in bytes of its sealed file.
+pub const MAX_DEPOSIT: usize = 16 * 1024;
+
+/// What a deposit holds (`DESIGN-recovery.md` §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepositKind {
+    /// A user's device key, for helpdesk recovery.
+    Device,
+    /// A LUKS volume's recovery key.
+    Luks,
+    /// Any small secret: a backup repository's password, say.
+    File,
+}
+
+/// A file sealed to a vault that its servers keep for the members: its
+/// depositor may be gone when anyone needs it (`DESIGN-recovery.md` §3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deposit {
+    /// The id: 16 random bytes, hex.
+    pub id: String,
+    /// The vault.
+    pub vault: VaultId,
+    /// Who deposited it.
+    pub depositor: String,
+    /// What it holds.
+    pub kind: DepositKind,
+    /// What it is for, among the depositor's deposits of this kind: a
+    /// device id, a volume's UUID, a name.
+    pub subject: std::collections::BTreeMap<String, String>,
+    /// When it was deposited.
+    pub added: u64,
+    /// The sealed file (`IPUF`), base64url; left out of listings.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sealed: String,
+}
+
 /// The largest escrowed device key a server keeps, in bytes.
 pub const MAX_ESCROW_BLOB: usize = 16 * 1024;
 
@@ -1588,6 +1659,9 @@ pub enum VaultOp {
         /// New members.
         #[serde(default)]
         members: Members,
+        /// New depositors.
+        #[serde(default)]
+        depositors: Members,
     },
     /// Remove managers or members, and the devices they hold; managers
     /// only, but anyone may leave.
@@ -1600,6 +1674,9 @@ pub enum VaultOp {
         /// Members to remove.
         #[serde(default)]
         members: Members,
+        /// Depositors to remove.
+        #[serde(default)]
+        depositors: Members,
     },
     /// Ask for the release of the file whose bindings these are, from a
     /// vault with approvals (`DESIGN-approvals.md` §2).
@@ -1642,6 +1719,38 @@ pub enum VaultOp {
     },
     /// The caller's device keys kept under recovery codes.
     RecoverCode,
+    /// Keep `sealed`, a file sealed to the vault, as a deposit, in place
+    /// of the depositor's earlier one of the same kind and subject.
+    Deposit {
+        /// The vault.
+        name: String,
+        /// What it holds.
+        kind: DepositKind,
+        /// What it is for.
+        subject: std::collections::BTreeMap<String, String>,
+        /// The sealed file, base64url.
+        sealed: String,
+    },
+    /// The vault's deposits, without their files: all of them for its
+    /// members, their own for a depositor.
+    Deposits {
+        /// The vault.
+        name: String,
+    },
+    /// One deposit, with its file; members only.
+    FetchDeposit {
+        /// The vault.
+        name: String,
+        /// The deposit.
+        id: String,
+    },
+    /// Remove a deposit: a depositor's own, or any for a manager.
+    RetireDeposit {
+        /// The vault.
+        name: String,
+        /// The deposit.
+        id: String,
+    },
     /// Start a session for one of the vault's devices: re-authentication,
     /// or with `offline`, the release of the vault's session keys.
     Unlock {
@@ -1688,12 +1797,14 @@ pub struct Reply {
     pub requests: Vec<ReleaseRequest>,
     /// Device keys the operation escrowed or returned.
     pub escrows: Vec<DeviceEscrow>,
+    /// Deposits the operation made, listed or fetched.
+    pub deposits: Vec<Deposit>,
 }
 
 impl Reply {
-    /// Encode: `IPVR` version 4, `n(u64) [descriptor] session released
-    /// m(u8) [receipt] requests escrows` (session and released empty
-    /// without one, requests and escrows JSON lists).
+    /// Encode: `IPVR` version 5, `n(u64) [descriptor] session released
+    /// m(u8) [receipt] requests escrows deposits` (session and released
+    /// empty without one, the rest JSON lists).
     ///
     /// # Panics
     ///
@@ -1725,6 +1836,7 @@ impl Reply {
         }
         w.bytes(&serde_json::to_vec(&self.requests).unwrap_or_default());
         w.bytes(&serde_json::to_vec(&self.escrows).unwrap_or_default());
+        w.bytes(&serde_json::to_vec(&self.deposits).unwrap_or_default());
         w.finish()
     }
 
@@ -1755,6 +1867,8 @@ impl Reply {
             serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("release requests"))?;
         let escrows =
             serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("device escrows"))?;
+        let deposits =
+            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("deposits"))?;
         r.finish()?;
         Ok(Self {
             descriptors,
@@ -1763,6 +1877,7 @@ impl Reply {
             receipts,
             requests,
             escrows,
+            deposits,
         })
     }
 }

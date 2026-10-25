@@ -335,6 +335,37 @@ kuipa seal file break-glass root-password.txt
 * `--sealing registered` means sealing needs a server, and resealing
   (after you rotate the password) retires the old sealed copy everywhere.
 
+### Collect secrets you can open and others cannot
+
+Sometimes others should hand you a secret without being able to read it
+back: hosts handing over their backup passwords, colleagues dropping off
+an API key. Make them **depositors** of a vault:
+
+```sh
+alice$ kuipa seal create drop --require device,ticket --sealing registered
+alice$ kuipa seal share drop --depositor --group webservers --user bob
+```
+
+A depositor seals to the vault and leaves the file with the servers, which
+keep it until a member fetches it:
+
+```sh
+bob$   kuipa seal deposit put alice/drop restic-password.txt --name restic
+alice$ kuipa seal deposit list drop
+alice$ kuipa seal deposit fetch drop 5d1e…a0 --out restic.sealed
+alice$ kuipa seal open restic.sealed --out -
+```
+
+* Depositors never open: they register no device and fetch no deposit,
+  and the servers refuse them a release. They see only their own
+  deposits.
+* A new deposit with the same name replaces the depositor's last one;
+  with `--sealing registered`, the old copy stops opening at once.
+* A depositor retires their own deposits (`kuipa seal deposit retire`), a
+  manager anyone's.
+* Opening a deposit follows the vault's policy, approvals included: a
+  helpdesk vault can ask two leads to approve each one.
+
 ### A break-glass secret several people approve
 
 Some secrets should never open on one person's say-so. Give the vault

@@ -386,9 +386,6 @@ enum SealAction {
         vault: String,
         #[command(flatten)]
         who: MembersInput,
-        /// Make them managers rather than members.
-        #[arg(long)]
-        manager: bool,
     },
     /// Stop sharing a vault with managers or members, and drop the
     /// devices they hold.  Managers only, but a member may remove
@@ -398,9 +395,12 @@ enum SealAction {
         vault: String,
         #[command(flatten)]
         who: MembersInput,
-        /// Remove them as managers rather than members.
-        #[arg(long)]
-        manager: bool,
+    },
+    /// Leave sealed files with the servers as deposits, for the vault's
+    /// members (hosts' LUKS recovery keys, backup passwords, …).
+    Deposit {
+        #[command(subcommand)]
+        action: DepositAction,
     },
     /// Register or remove this host's device key.
     Device {
@@ -535,6 +535,45 @@ enum SealAction {
     },
 }
 
+/// `kuipa seal deposit` subcommands.
+#[derive(Subcommand)]
+enum DepositAction {
+    /// Seal a file to the vault and deposit it, in place of your earlier
+    /// deposit of the same name.
+    Put {
+        /// The vault.
+        vault: String,
+        /// The file to deposit.
+        file: String,
+        /// What it is, among your deposits (default: the file's name).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// List the vault's deposits: all of them for members, your own for a
+    /// depositor.
+    List {
+        /// The vault.
+        vault: String,
+    },
+    /// Fetch a deposit's sealed file, to open with `kuipa seal open`.
+    Fetch {
+        /// The vault.
+        vault: String,
+        /// The deposit's id.
+        id: String,
+        /// Where to write the sealed file.
+        #[arg(long, value_name = "FILE")]
+        out: String,
+    },
+    /// Remove a deposit: your own, or any as a manager.
+    Retire {
+        /// The vault.
+        vault: String,
+        /// The deposit's id.
+        id: String,
+    },
+}
+
 /// `kuipa seal recover` subcommands.
 #[derive(Subcommand)]
 enum RecoverAction {
@@ -580,21 +619,30 @@ struct MembersInput {
     /// A service (`HTTP/ci.example.test`); repeatable.
     #[arg(long = "service", value_name = "SERVICE")]
     services: Vec<String>,
+    /// As managers, rather than members.
+    #[arg(long, conflicts_with = "depositor")]
+    manager: bool,
+    /// As depositors, rather than members: they seal to the vault and
+    /// deposit, and never open it.
+    #[arg(long)]
+    depositor: bool,
 }
 
 impl MembersInput {
-    /// The set named, as managers or as members.
-    fn split(&self, manager: bool) -> (kuipa_enroll::vault::Members, kuipa_enroll::vault::Members) {
+    /// Those named, as managers, members or depositors: the sets `share`
+    /// and `unshare` take.
+    fn sets(&self) -> [kuipa_enroll::vault::Members; 3] {
         let set = kuipa_enroll::vault::Members {
             users: self.users.clone(),
             groups: self.groups.clone(),
             hosts: self.hosts.clone(),
             services: self.services.clone(),
         };
-        if manager {
-            (set, kuipa_enroll::vault::Members::default())
-        } else {
-            (kuipa_enroll::vault::Members::default(), set)
+        let none = kuipa_enroll::vault::Members::default;
+        match (self.manager, self.depositor) {
+            (true, _) => [set, none(), none()],
+            (_, true) => [none(), none(), set],
+            _ => [none(), set, none()],
         }
     }
 }
@@ -2181,6 +2229,33 @@ fn run_open(seal: &kuipa_tools::seal::Seal<'_>, action: &SealAction) -> Result<V
     }))
 }
 
+/// `kuipa seal deposit …`.
+fn run_deposit(seal: &kuipa_tools::seal::Seal<'_>, action: &DepositAction) -> Result<Value, Error> {
+    match action {
+        DepositAction::Put { vault, file, name } => {
+            let name = name.clone().unwrap_or_else(|| {
+                std::path::Path::new(file)
+                    .file_name()
+                    .map_or_else(|| file.clone(), |n| n.to_string_lossy().into_owned())
+            });
+            let subject = std::collections::BTreeMap::from([("name".to_owned(), name)]);
+            seal.deposit(
+                vault,
+                &std::fs::read(file)?,
+                kuipa_enroll::vault::DepositKind::File,
+                subject,
+            )
+        }
+        DepositAction::List { vault } => seal.deposits(vault),
+        DepositAction::Fetch { vault, id, out } => {
+            let sealed = seal.deposit_file(vault, id)?;
+            paths::write_file(std::path::Path::new(out), &sealed, 0o600)?;
+            Ok(serde_json::json!({ "vault": vault, "file": id, "sealed": out }))
+        }
+        DepositAction::Retire { vault, id } => seal.retire_deposit(vault, id),
+    }
+}
+
 /// `kuipa seal recover …`.
 fn run_recover(
     seal: &kuipa_tools::seal::Seal<'_>,
@@ -2256,22 +2331,9 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
     match action {
         SealAction::Create { vault, policy } => seal.create(vault, policy.policy()?),
         SealAction::Policy { vault, policy } => seal.set_policy(vault, policy.policy()?),
-        SealAction::Share {
-            vault,
-            who,
-            manager,
-        } => {
-            let (managers, members) = who.split(*manager);
-            seal.share(vault, managers, members)
-        }
-        SealAction::Unshare {
-            vault,
-            who,
-            manager,
-        } => {
-            let (managers, members) = who.split(*manager);
-            seal.unshare(vault, managers, members)
-        }
+        SealAction::Share { vault, who } => seal.share(vault, who.sets()),
+        SealAction::Unshare { vault, who } => seal.unshare(vault, who.sets()),
+        SealAction::Deposit { action } => run_deposit(&seal, action),
         SealAction::Device { action } => run_seal_device(&seal, &user, action),
         SealAction::File {
             vault,
@@ -2335,6 +2397,42 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
     }
 }
 
+/// Release requests or deposits; whether `value` was either.
+fn render_listing(value: &Value) -> bool {
+    if let Some(requests) = get(value, "requests").as_array() {
+        render_requests(requests);
+    } else if let Some(deposits) = get(value, "deposits").as_array() {
+        render_deposits(deposits);
+    } else {
+        return false;
+    }
+    true
+}
+
+/// `kuipa seal deposit put` and `list`.
+fn render_deposits(deposits: &[Value]) {
+    if deposits.is_empty() {
+        println!("No deposits.");
+    }
+    for d in deposits {
+        let subject: Vec<String> = get(d, "subject")
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("?")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        println!(
+            "Deposit {} ({}, {}) by {}",
+            get(d, "id").as_str().unwrap_or("?"),
+            get(d, "kind").as_str().unwrap_or("?"),
+            subject.join(", "),
+            get(d, "depositor").as_str().unwrap_or("?"),
+        );
+    }
+}
+
 /// `kuipa seal recovery-code` and `recover`; whether `value` was one.
 fn render_recovery(value: &Value) -> bool {
     if let Some(code) = get(value, "recovery_code").as_str() {
@@ -2394,11 +2492,7 @@ fn render_requests(requests: &[Value]) {
 }
 
 fn render_seal(value: &Value) {
-    if let Some(requests) = get(value, "requests").as_array() {
-        render_requests(requests);
-        return;
-    }
-    if render_recovery(value) {
+    if render_listing(value) || render_recovery(value) {
         return;
     }
     if let Some(until) = get(value, "session_until").as_u64() {
@@ -2435,7 +2529,7 @@ fn render_seal(value: &Value) {
             if get(factors, "ticket").as_bool().unwrap_or(false) {
                 needs.push("your Kerberos ticket".to_owned());
             }
-            for who in ["managers", "members"] {
+            for who in ["managers", "members", "depositors"] {
                 if !list(get(v, who)).is_empty() {
                     rows.field(who, get(v, who));
                 }

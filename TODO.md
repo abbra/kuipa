@@ -143,7 +143,8 @@ design first.
       backup recovery keys (`docs/DESIGN-recovery.md`):
   - [x] Recovery codes (`kuipa seal recovery-code`, `recover code`,
         `recover finish`).
-  - [ ] Depositors and deposits; `kuipa escrow luks`, `kuipa escrow file`.
+  - [x] Depositors and deposits (`kuipa seal deposit put|list|fetch|retire`).
+  - [ ] `kuipa escrow luks`, `kuipa escrow file` for hosts.
   - [ ] Device-key deposits in a helpdesk vault, and their delivery.
 - [x] M-of-N approvals for break-glass releases, recorded in the
       transparency log (`docs/DESIGN-approvals.md`).
@@ -173,6 +174,8 @@ design first.
       requests under a vault (`ipaKUReleaseRequest`,
       `ipaKUReleaseApproval`, `ipaKUReleaseDenied`, `ipaKUReleaseUses`),
       `ipaKUDeviceEscrow` on user entries (written by the daemon),
+      `ipaKUVaultDepositor` (indexed for equality), the `ipaKUDeposit`
+      class for deposits under a vault (`ipaKUDepositData`),
       `ipaKUServerEscrowKey` on
       `cn=masters` entries,
       `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`,
