@@ -260,8 +260,9 @@ bob$ kuipa seal open db-password.txt.sealed --out -
   their own device and their own ticket: Bob's ticket does not open with
   Alice's device.
 * Membership is checked at every open. Someone who leaves the `dba` group
-  in IPA opens nothing more; `kuipa seal unshare db --group dba` (or
-  `--user bob`) also removes their devices. A member can leave with
+  in IPA opens nothing more, and their devices are dropped from the vault
+  the next time anyone uses it. `kuipa seal unshare db --user bob` removes
+  someone named directly. A member can leave with
   `kuipa seal unshare alice/db --user bob`.
 * A file sealed before a member registered their device does not open for
   them until someone resealed it: `kuipa seal reseal alice/db *.sealed`.

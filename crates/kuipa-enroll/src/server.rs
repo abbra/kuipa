@@ -1457,7 +1457,18 @@ impl EnrollServer {
             }
         };
         for v in &mut vaults {
-            if self.maintain_epochs(v, now, rotate, directory)? {
+            // Whoever has no part in the vault any more (out of the group
+            // in IPA, or unshared) loses their devices, as a removal would.
+            let gone = prune_departed(v, directory)?;
+            for id in &gone {
+                receipts.extend(self.record_change(
+                    v,
+                    VaultAction::RemoveDevice,
+                    Some(id.clone()),
+                )?);
+            }
+            let rotated = self.maintain_epochs(v, now, rotate || !gone.is_empty(), directory)?;
+            if rotated || !gone.is_empty() {
                 directory.vault_update(v).map_err(Refusal)?;
             }
         }
@@ -1849,8 +1860,8 @@ impl EnrollServer {
     }
 
     /// Remove `managers` and `members` from `vault` for `caller`, whose
-    /// role is `role` (a member may remove only themselves), and the
-    /// devices of everyone left without a role.
+    /// role is `role` (a member may remove only themselves); their devices
+    /// go after the operation ([`prune_departed`]).
     fn unshare(
         &self,
         vault: &mut Vault,
@@ -1858,7 +1869,6 @@ impl EnrollServer {
         role: Role,
         managers: &Members,
         members: &Members,
-        directory: &dyn Directory,
     ) -> Result<(), Refusal> {
         let realm = &self.info.realm;
         let managers = managers.normalized(realm)?;
@@ -1873,15 +1883,6 @@ impl EnrollServer {
         }
         vault.managers = difference(&vault.managers, &managers);
         vault.members = difference(&vault.members, &members);
-        let mut kept = Vec::with_capacity(vault.devices.len());
-        for d in std::mem::take(&mut vault.devices) {
-            let holder: Principal = vault.holder(&d).parse()?;
-            let groups = groups_for(vault, &holder, directory)?;
-            if vault.role(&holder, &groups).is_some() {
-                kept.push(d);
-            }
-        }
-        vault.devices = kept;
         Ok(())
     }
 
@@ -1973,7 +1974,7 @@ impl EnrollServer {
                 members,
             } => {
                 let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
-                self.unshare(&mut vault, caller, role, &managers, &members, directory)?;
+                self.unshare(&mut vault, caller, role, &managers, &members)?;
                 vault
             }
             VaultOp::AddDevice {
@@ -2379,6 +2380,34 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
         ),
         VaultOp::Show { .. } | VaultOp::List | VaultOp::Register { .. } => return None,
     })
+}
+
+/// Drop the devices of `vault` whose holders have no part in it any more,
+/// and answer their ids.  The owner's are kept; a locked holder keeps
+/// theirs too (a lock can be lifted; the release checks it).
+fn prune_departed(vault: &mut Vault, directory: &dyn Directory) -> Result<Vec<String>, Refusal> {
+    let mut roles: HashMap<String, bool> = HashMap::new();
+    let mut gone = Vec::new();
+    let mut kept = Vec::with_capacity(vault.devices.len());
+    for d in std::mem::take(&mut vault.devices) {
+        let holder = vault.holder(&d).to_owned();
+        let stays = if let Some(&stays) = roles.get(&holder) {
+            stays
+        } else {
+            let principal: Principal = holder.parse()?;
+            let groups = groups_for(vault, &principal, directory)?;
+            let stays = vault.role(&principal, &groups).is_some();
+            roles.insert(holder, stays);
+            stays
+        };
+        if stays {
+            kept.push(d);
+        } else {
+            gone.push(d.id.clone());
+        }
+    }
+    vault.devices = kept;
+    Ok(gone)
 }
 
 /// Refuse unless `role` is at least `least`, to do `what`.
