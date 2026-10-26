@@ -22,6 +22,7 @@ use crate::join::{
 };
 use crate::keytab::{Enctype, Keytab, Principal};
 use crate::merkle;
+use crate::passkey::{Assertion, PasskeyInfo, UserPasskeys};
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
@@ -219,6 +220,17 @@ pub trait Directory {
     /// Any failure.
     fn vault_limits(&self) -> Result<Limits, DirectoryError> {
         Ok(Limits::default())
+    }
+
+    /// `principal`'s IPA passkeys (`ipaPassKey`) and whether the realm
+    /// requires user verification, for the passkey factor (§7.6.5).
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default passkeys are not supported.
+    fn passkeys(&self, principal: &Principal) -> Result<UserPasskeys, DirectoryError> {
+        let _ = principal;
+        Err("passkeys are not supported by this directory".into())
     }
 
     /// The realm's signing policy (`DESIGN-sign.md`): who may sign for
@@ -697,6 +709,9 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn vault_limits(&self) -> Result<Limits, DirectoryError> {
         (**self).vault_limits()
+    }
+    fn passkeys(&self, principal: &Principal) -> Result<UserPasskeys, DirectoryError> {
+        (**self).passkeys(principal)
     }
     fn sign_policy(&self) -> Result<crate::sign::SignPolicy, DirectoryError> {
         (**self).sign_policy()
@@ -1675,17 +1690,14 @@ impl EnrollServer {
             | VaultOp::RetireDeposit { .. }
             | VaultOp::RecoverySettings
             | VaultOp::DeviceKey { .. }
-            | VaultOp::Deliver { .. }) => {
+            | VaultOp::Deliver { .. }
+            | VaultOp::Passkeys) => {
                 side = self.side_op(&caller, op, now, directory)?;
                 (Vec::new(), None, None)
             }
-            VaultOp::Unlock {
-                name,
-                device,
-                offline,
-            } => {
+            op @ VaultOp::Unlock { .. } => {
                 let (vault, token, released) =
-                    self.start_session(&caller, &name, &device, offline, now, directory)?;
+                    self.start_session(&caller, &op, &cb, now, directory)?;
                 // Nothing is released before the answer, which waits for
                 // the record.
                 if let Some((action, device)) = event.take() {
@@ -1987,16 +1999,39 @@ impl EnrollServer {
     fn start_session(
         &self,
         caller: &Principal,
-        name: &str,
-        device: &str,
-        offline: bool,
+        op: &VaultOp,
+        cb: &[u8; 32],
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vault, SessionToken, Option<ReleasedKeys>), Refusal> {
+        let VaultOp::Unlock {
+            name,
+            device,
+            offline,
+            passkey,
+        } = op
+        else {
+            unreachable!("only unlock starts a session");
+        };
+        let offline = *offline;
         let (mut vault, role) = self.resolve_vault(caller, name, directory)?;
         need_member(role)?;
         if vault.state != State::Enabled {
             return Err(Refusal::because("the vault is revoked"));
+        }
+        // A session stands in for the passkey factor, so starting one
+        // needs an assertion, bound to this exchange.
+        if vault.policy.factors.passkey {
+            let assertion = passkey
+                .as_deref()
+                .ok_or_else(|| Refusal::because("the vault needs the caller's passkey"))?;
+            let assertion = tang_pqc::b64::decode(assertion).map_err(Error::from)?;
+            self.check_passkey(
+                caller,
+                &assertion,
+                &crate::vault::session_passkey_challenge(cb)?,
+                directory,
+            )?;
         }
         let sessions = &vault.policy.sessions;
         let length = if offline {
@@ -2016,7 +2051,7 @@ impl EnrollServer {
         let registered = vault
             .devices
             .iter()
-            .find(|d| d.id == device)
+            .find(|d| d.id == *device)
             .ok_or_else(|| Refusal::because("the device is not registered"))?;
         if vault.holder(registered) != caller.to_string() {
             return Err(Refusal::because("the device is another member's"));
@@ -2397,6 +2432,13 @@ impl EnrollServer {
             op @ (VaultOp::RecoverySettings
             | VaultOp::DeviceKey { .. }
             | VaultOp::Deliver { .. }) => self.recovery_op(caller, op, now, directory)?,
+            VaultOp::Passkeys => Reply {
+                passkeys: Some(PasskeyInfo::of(
+                    &self.info.domain,
+                    &directory.passkeys(caller).map_err(Refusal)?,
+                )),
+                ..Reply::default()
+            },
             op @ (VaultOp::EscrowCode { .. } | VaultOp::RecoverCode) => {
                 let (escrows, receipts) = self.escrow_op(caller, op, now, directory)?;
                 Reply {
@@ -2932,6 +2974,7 @@ impl EnrollServer {
         let vault = match op {
             VaultOp::List => return list_vaults(caller, directory),
             VaultOp::Unlock { .. }
+            | VaultOp::Passkeys
             | VaultOp::Request { .. }
             | VaultOp::Pending { .. }
             | VaultOp::Approve { .. }
@@ -3248,10 +3291,35 @@ impl EnrollServer {
                 return Err(Refusal::because("the device is not the ticket holder's"));
             }
             accepted.principal
-        } else {
-            let device = device.ok_or_else(|| Refusal::because("the vault needs a device"))?;
+        } else if let Some(device) = device {
             vault.holder(device).to_owned()
+        } else if vault.policy.factors.passkey {
+            // Without a ticket or a device, the passkey is the owner's.
+            vault.owner.clone()
+        } else {
+            return Err(Refusal::because("the vault needs a device"));
         })
+    }
+
+    /// Check `assertion` (encoded) over `challenge` against `who`'s IPA
+    /// passkeys, the realm's domain the relying party (§7.6.5).
+    fn check_passkey(
+        &self,
+        who: &Principal,
+        assertion: &[u8],
+        challenge: &[u8; 32],
+        directory: &dyn Directory,
+    ) -> Result<(), Refusal> {
+        let passkeys = directory.passkeys(who).map_err(Refusal)?;
+        Assertion::from_bytes(assertion)?
+            .verify(
+                &passkeys.keys(),
+                &self.info.domain,
+                challenge,
+                passkeys.user_verification,
+            )
+            .map_err(|e| Refusal::because(format!("{who}: {e}")))?;
+        Ok(())
     }
 
     /// The vault half of [`recover`](Self::recover): check the vault and
@@ -3281,9 +3349,6 @@ impl EnrollServer {
             return Err(Refusal::because("the vault has expired"));
         }
         let factors = &vault.policy.factors;
-        if factors.passkey {
-            return Err(Refusal::because("the passkey factor is not supported yet"));
-        }
         let device = match request.device() {
             Some(id) => Some(
                 vault
@@ -3314,6 +3379,18 @@ impl EnrollServer {
         }
         if !admit(&who) {
             return Err(Refusal::because(format!("{who} opens too often")));
+        }
+        // A session stands in for the passkey, as for the ticket.
+        if factors.passkey && request.session().is_empty() {
+            if request.passkey().is_empty() {
+                return Err(Refusal::because("the vault needs the opener's passkey"));
+            }
+            self.check_passkey(
+                &who,
+                request.passkey(),
+                &request.passkey_challenge()?,
+                directory,
+            )?;
         }
         if let Some(level) = factors.device {
             let device = device.ok_or_else(|| Refusal::because("the vault needs a device"))?;
@@ -3371,6 +3448,7 @@ fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
         ),
         VaultOp::Show { .. }
         | VaultOp::List
+        | VaultOp::Passkeys
         | VaultOp::Register { .. }
         | VaultOp::Request { .. }
         | VaultOp::Pending { .. }
