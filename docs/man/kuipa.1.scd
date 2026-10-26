@@ -182,8 +182,10 @@ Prints local *kuipa* configuration consistency.
 ## check [--server _HOST_]
 
 Check this host's enrollment status against the realm: every server, the
-delegations, a *kinit*(1), the sealed keytabs and files.  Exits 1 on a
-problem.
+delegations, a *kinit*(1), the sealed keytabs and files.  Then refresh the
+pinned anchors and their vouch heads from a Kerberos-bound answer, as a key
+rotation does but without new keys, so later exchanges are proven by a
+pinned head.  Exits 1 on a problem.
 
 ## leave
 

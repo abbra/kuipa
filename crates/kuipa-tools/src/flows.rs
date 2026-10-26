@@ -2167,8 +2167,10 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         }
     }
 
-    // Pins stay as they were (they are only rewritten from Kerberos-bound
-    // responses, §4.7); only the verified watermark moves.
+    // The verified watermark moves with the advertisements; the pins move
+    // only with a Kerberos-bound answer (§4.7): a pins refresh, which grows
+    // the head windows as a rekey would, so later exchanges are proven by
+    // head rather than by signature (§4.9).
     if let Some((seq, head)) = advanced {
         let pins = paths::read_anchor_pins(&paths.anchors())?;
         paths::write_anchor_pins(
@@ -2177,6 +2179,11 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
             &pins,
             Some((seq, head)),
         )?;
+    }
+    if !servers.iter().any(|s| s["ok"] == Value::Bool(true)) {
+        // Nothing verified: nothing to refresh from.
+    } else if let Err(e) = refresh_pins(paths, &state, &trust, advanced.or(known)) {
+        problems.push(format!("cannot refresh the pinned anchors and heads: {e}"));
     }
     let kinit = keytab_path
         .to_str()
@@ -2214,6 +2221,77 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         json!({ "ok": problems.is_empty(), "servers": servers, "kinit": kinit.is_ok(), "problems": problems }),
     )
 }
+/// Refresh the host's pins from a pins answer (§4.5): the realm's anchors,
+/// heads and epoch, bound to this host's Kerberos session, applied as a
+/// rekey's are (§4.7) but with no new keys.  Returns whether an anchor's
+/// claim log no longer extends the pinned window.
+fn refresh_pins(
+    paths: &Paths,
+    state: &State,
+    trust: &Trust,
+    known: Option<Epoch>,
+) -> Result<bool, Error> {
+    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let principal = Principal::host(&state.fqdn, &state.realm);
+    let keytab_path = live_keytab(paths, state);
+    let cred = GssClientCred::from_client_keytab(
+        keytab_path.to_str().ok_or("non-UTF-8 keytab path")?,
+        Some(&principal.to_string()),
+        None,
+    )?;
+    let (answer, adv) = exchange_with(
+        &Deployment::servers(&state.servers),
+        trust,
+        Pins {
+            realm: &state.realm,
+            anchors: &anchors,
+            heads: &heads,
+            retired: &retired,
+            frozen: &frozen,
+        },
+        known,
+        Operation::Pins,
+        |adv| {
+            let p = Prepared::new(
+                adv,
+                Operation::Pins,
+                &state.fqdn,
+                AuthType::Kerberos,
+                &Enctype::DEFAULT,
+            )?;
+            let target = format!("ipa-ku@{}", adv.server());
+            let (token, binding) = gss_token(&cred, &target, &p.channel_binding()?)?;
+            Ok(p.with_kerberos(binding).seal(&token, &[], &[])?)
+        },
+        |pending, response, adv| Ok(pending.finish_pins(response, adv)?),
+    )?;
+    let heads = answer
+        .anchors
+        .iter()
+        .copied()
+        .zip(answer.heads.iter().copied())
+        .collect::<Vec<_>>();
+    // As for a rekey (§4.8): the watermark advances only through the
+    // verified chain; the answer's own epoch stands in only when there was
+    // nothing to continue.
+    let epoch = known.or((answer.epoch_seq != 0).then_some((answer.epoch_seq, answer.epoch_head)));
+    let forked = write_windows(
+        paths,
+        &pins_to_merge(&paths.anchors())?,
+        epoch,
+        &state.realm,
+        &answer.issuer,
+        &heads,
+        adv.proved_heads(),
+    )?;
+    if forked {
+        tracing::warn!(
+            "an anchor's claim log no longer extends the pinned window: its head is not pinned"
+        );
+    }
+    Ok(forked)
+}
+
 /// `kuipa advertisement`: what each server of `deployment` advertises,
 /// verified against `anchors` as enrollment verifies (§4.4, §4.6), the
 /// anchor log behind the head the advertisement names: the landmark chain

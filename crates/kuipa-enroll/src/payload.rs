@@ -1,5 +1,6 @@
 //! What a successful join, rekey or bundle delivers to the host (§5.5,
-//! §8.4): its keys, the CA chain, the anchors and the realm configuration.
+//! §8.4): its keys, the CA chain, the anchors and the realm configuration;
+//! and what a pins refresh delivers (§4.5): the anchors alone.
 
 use native_ossl::util::SecretBuf;
 use tang_pqc::Thumbprint;
@@ -10,6 +11,7 @@ use crate::keytab::Keytab;
 use crate::merkle::Hash;
 
 const MAGIC: [u8; 4] = *b"IPJP";
+const PINS_MAGIC: [u8; 4] = *b"IPPN";
 
 /// The realm configuration a host needs, beyond its keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,9 +69,6 @@ impl Enrollment {
     pub fn to_bytes(&self) -> Result<SecretBuf> {
         let mut w = Writer::new(MAGIC);
         let c = &self.config;
-        if self.heads.len() != self.anchors.len() {
-            return Err(Error::Malformed("enrollment: heads do not match anchors"));
-        }
         w.str(&c.realm).str(&c.domain).str(&c.basedn).str(&c.issuer);
         w.u8(count(c.servers.len())?);
         for s in &c.servers {
@@ -83,21 +82,7 @@ impl Enrollment {
         for cert in &self.pkinit_anchors {
             w.bytes(cert);
         }
-        w.u8(count(self.anchors.len())?);
-        for (a, head) in self.anchors.iter().zip(&self.heads) {
-            w.fixed(a.as_bytes());
-            // A head is `(size, root)`, the root length prefixed (its
-            // length names its hash); an absent one is a zero size and an
-            // empty root.
-            match head {
-                Some((size, root)) => {
-                    w.u64(*size).bytes(root);
-                }
-                None => {
-                    w.u64(0).bytes(&[]);
-                }
-            }
-        }
+        write_anchors(&mut w, &self.anchors, &self.heads)?;
         w.u64(self.epoch_seq).fixed(&self.epoch_head);
         w.bytes(self.keytab.to_mit()?.as_ref());
         Ok(SecretBuf::new(w.finish()))
@@ -125,19 +110,7 @@ impl Enrollment {
         let pkinit_anchors = (0..r.u8()?)
             .map(|_| r.bytes().map(<[u8]>::to_vec))
             .collect::<Result<_, _>>()?;
-        let n = r.u8()?;
-        let mut anchors = Vec::with_capacity(n as usize);
-        let mut heads = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            anchors.push(Thumbprint::from_bytes(r.fixed()?));
-            let size = r.u64()?;
-            let root = r.bytes()?;
-            heads.push(if size == 0 {
-                None
-            } else {
-                Some((size, Hash::from_slice(root)?))
-            });
-        }
+        let (anchors, heads) = read_anchors(&mut r)?;
         let (epoch_seq, epoch_head) = (r.u64()?, r.fixed()?);
         let keytab = Keytab::from_mit(r.bytes()?)?;
         r.finish()?;
@@ -167,9 +140,148 @@ impl Enrollment {
     }
 }
 
+/// The anchors with their heads, aligned: a count, then per anchor its
+/// thumbprint and its head `(size, root)`, the root length prefixed (its
+/// length names its hash); an absent head is a zero size and an empty root.
+fn write_anchors(
+    w: &mut Writer,
+    anchors: &[Thumbprint],
+    heads: &[Option<(u64, Hash)>],
+) -> Result<()> {
+    if heads.len() != anchors.len() {
+        return Err(Error::Malformed("heads do not match anchors"));
+    }
+    w.u8(count(anchors.len())?);
+    for (a, head) in anchors.iter().zip(heads) {
+        w.fixed(a.as_bytes());
+        match head {
+            Some((size, root)) => {
+                w.u64(*size).bytes(root);
+            }
+            None => {
+                w.u64(0).bytes(&[]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Anchors with their vouch heads, aligned: what an enrollment and a pins
+/// refresh deliver.
+pub(crate) type AnchorHeads = (Vec<Thumbprint>, Vec<Option<(u64, Hash)>>);
+
+/// The anchors and heads [`write_anchors`] wrote.
+fn read_anchors(r: &mut Reader<'_>) -> Result<AnchorHeads> {
+    let n = r.u8()?;
+    let mut anchors = Vec::with_capacity(n as usize);
+    let mut heads = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        anchors.push(Thumbprint::from_bytes(r.fixed()?));
+        let size = r.u64()?;
+        let root = r.bytes()?;
+        heads.push(if size == 0 {
+            None
+        } else {
+            Some((size, Hash::from_slice(root)?))
+        });
+    }
+    Ok((anchors, heads))
+}
+
+/// What a pins refresh answers (`POST /ipa/ku/pins/{kid}`, §4.5): the
+/// realm's current anchors, their vouch heads and the anchor epoch, as a
+/// rekey delivers them but with no keys.  The answer is bound to the host's
+/// Kerberos session like a rekey's, so a host may update its pins from it
+/// (§4.7) without rotating its keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinsAnswer {
+    /// The realm.
+    pub realm: String,
+    /// The server that answered: its claim log backs the heads.
+    pub issuer: String,
+    /// The current realm anchors.
+    pub anchors: Vec<Thumbprint>,
+    /// Their current vouch heads, aligned with `anchors`.
+    pub heads: Vec<Option<(u64, Hash)>>,
+    /// The issuer's anchor epoch log sequence (§4.8); `0` for none.
+    pub epoch_seq: u64,
+    /// The hash of that entry.
+    pub epoch_head: crate::epoch::EpochHead,
+}
+
+impl PinsAnswer {
+    /// `IPPN ‖ 1 ‖ realm ‖ issuer ‖ anchors and heads ‖ epoch_seq ‖
+    /// epoch_head`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for heads that do not match the anchors, or
+    /// more than 255 anchors.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut w = Writer::new(PINS_MAGIC);
+        w.str(&self.realm).str(&self.issuer);
+        write_anchors(&mut w, &self.anchors, &self.heads)?;
+        w.u64(self.epoch_seq).fixed(&self.epoch_head);
+        Ok(w.finish())
+    }
+
+    /// Decode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`], also for an unsafe realm or issuer name.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, PINS_MAGIC, "pins")?;
+        let realm = r.str()?.to_owned();
+        let issuer = r.str()?.to_owned();
+        let (anchors, heads) = read_anchors(&mut r)?;
+        let (epoch_seq, epoch_head) = (r.u64()?, r.fixed()?);
+        r.finish()?;
+        if !crate::realm::is_safe_name(&realm) || !crate::realm::is_safe_name(&issuer) {
+            return Err(Error::Malformed("pins: unsafe name"));
+        }
+        Ok(Self {
+            realm,
+            issuer,
+            anchors,
+            heads,
+            epoch_seq,
+            epoch_head,
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn pins_answers_round_trip_and_keep_heads_aligned() {
+        let a = Thumbprint::from_bytes([1; 32]);
+        let b = Thumbprint::from_bytes([2; 32]);
+        let answer = PinsAnswer {
+            realm: "EXAMPLE.TEST".into(),
+            issuer: "ipa1.example.test".into(),
+            anchors: vec![a, b],
+            heads: vec![Some((3, crate::merkle::test_hash(3))), None],
+            epoch_seq: 2,
+            epoch_head: [7; 48],
+        };
+        assert_eq!(
+            PinsAnswer::from_bytes(&answer.to_bytes().unwrap()).unwrap(),
+            answer
+        );
+        let misaligned = PinsAnswer {
+            heads: vec![None],
+            ..answer.clone()
+        };
+        assert!(misaligned.to_bytes().is_err());
+        let unsafe_issuer = PinsAnswer {
+            issuer: "ipa1/../x".into(),
+            ..answer
+        };
+        assert!(PinsAnswer::from_bytes(&unsafe_issuer.to_bytes().unwrap()).is_err());
+    }
     use crate::keytab::{Enctype, KeytabEntry, Principal};
 
     pub(crate) fn keytab(fqdn: &str, kvno: u32) -> Keytab {

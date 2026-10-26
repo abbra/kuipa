@@ -1566,6 +1566,9 @@ impl EnrollServer {
             (Operation::Sign, AuthType::Kerberos) => {
                 return self.sign_op(request, ss.as_ref(), &t, &body, directory);
             }
+            (Operation::Pins, AuthType::Kerberos) => {
+                return self.pins_op(request, ss.as_ref(), &t, &body, directory);
+            }
             (op, auth) => {
                 return Err(Refusal::because(format!(
                     "{op:?} with {auth:?} is not supported"
@@ -1866,6 +1869,42 @@ impl EnrollServer {
             crate::sign::SignedStatement::sign(&self.keys.signing, &self.delegation(), statement)?;
         let answer = crate::sign::Answer::new(&asked, signed)?;
         Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
+    }
+
+    /// Answer a pins refresh (§4.5): this realm's anchors, their heads and
+    /// the anchor epoch, as a rekey delivers them, bound to the caller's
+    /// Kerberos session so a host may update its pins from it (§4.7).
+    /// They are public: any principal of the realm may ask.
+    fn pins_op(
+        &self,
+        request: &Request,
+        ss: &[u8],
+        t: &[u8],
+        body: &RequestBody,
+        directory: &dyn Directory,
+    ) -> Result<Response, Refusal> {
+        let cb = channel_binding(request.alg(), ss, t)?;
+        let accepted = directory
+            .accept_user(body.authenticator.as_ref(), &cb)
+            .map_err(Refusal)?;
+        let caller: Principal = accepted.principal.parse()?;
+        if caller.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        let (anchors, heads) = self.anchors_and_heads();
+        let epoch = self.epoch_head();
+        let answer = crate::payload::PinsAnswer {
+            realm: self.info.realm.clone(),
+            issuer: self.info.server.clone(),
+            anchors,
+            heads,
+            epoch_seq: epoch.map_or(0, |(seq, _)| seq),
+            epoch_head: epoch.map_or(crate::epoch::GENESIS, |(_, head)| head),
+        };
+        let bytes = answer
+            .to_bytes()
+            .map_err(|e| Refusal::because(e.to_string()))?;
+        Ok(request.respond(ss, t, Some(&accepted.binding), &bytes)?)
     }
 
     /// Answer a `tlog` lookup (`DESIGN-tlog.md` §6): the caller's own
@@ -3049,20 +3088,25 @@ impl EnrollServer {
         Ok(vec![vault])
     }
 
-    fn enrollment(&self, keytab: Keytab, directory: &dyn Directory) -> Result<Enrollment, Refusal> {
-        let anchors = self.anchors();
-        let heads = {
-            let p = self.published();
-            anchors
-                .iter()
-                .map(|a| {
-                    p.vouches.get(a).map(|v| {
-                        let v = v.vouch();
-                        (v.size, v.root)
-                    })
+    /// The trusted anchors, and each one's current vouch head where it
+    /// published one: what an enrollment and a pins refresh deliver.
+    fn anchors_and_heads(&self) -> crate::payload::AnchorHeads {
+        let p = self.published();
+        let heads = p
+            .anchors
+            .iter()
+            .map(|a| {
+                p.vouches.get(a).map(|v| {
+                    let v = v.vouch();
+                    (v.size, v.root)
                 })
-                .collect()
-        };
+            })
+            .collect();
+        (p.anchors.clone(), heads)
+    }
+
+    fn enrollment(&self, keytab: Keytab, directory: &dyn Directory) -> Result<Enrollment, Refusal> {
+        let (anchors, heads) = self.anchors_and_heads();
         let epoch = self.epoch_head();
         Ok(Enrollment {
             config: RealmConfig {

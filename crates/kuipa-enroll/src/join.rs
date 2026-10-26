@@ -60,6 +60,9 @@ pub enum Operation {
     /// `POST /ipa/ku/sign/{kid}`: a statement that the caller signed some
     /// digests (`DESIGN-sign.md`).
     Sign,
+    /// `POST /ipa/ku/pins/{kid}`: the realm's anchors, heads and epoch,
+    /// bound to the caller's Kerberos session, without new keys (§4.5).
+    Pins,
 }
 
 impl Operation {
@@ -73,6 +76,7 @@ impl Operation {
             Self::Keys => "keys",
             Self::Tlog => "tlog",
             Self::Sign => "sign",
+            Self::Pins => "pins",
         }
     }
 
@@ -90,7 +94,8 @@ impl Operation {
             | Self::Vault
             | Self::Keys
             | Self::Tlog
-            | Self::Sign => *b"IPJQ",
+            | Self::Sign
+            | Self::Pins => *b"IPJQ",
             Self::Stage => *b"IPSQ",
         }
     }
@@ -734,6 +739,29 @@ impl PendingJoin {
         }
         let answer = crate::tlog::Answer::from_bytes(self.open(response)?.as_ref())?;
         answer.verify(realm.signer(), policy)?;
+        Ok(answer)
+    }
+
+    /// Finish a pins refresh (§4.5): decrypt the answer, which the server
+    /// bound to this host's Kerberos session, and check it is for this
+    /// realm, from the server that answered.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`], [`Error::Malformed`], or [`Error::Mismatch`]
+    /// for another server, realm or issuer.
+    pub fn finish_pins(
+        self,
+        response: &Response,
+        realm: &VerifiedRealm,
+    ) -> Result<crate::payload::PinsAnswer> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        let answer = crate::payload::PinsAnswer::from_bytes(self.open(response)?.as_ref())?;
+        if answer.realm != realm.info().realm || answer.issuer != realm.server() {
+            return Err(Error::Mismatch("pins issuer"));
+        }
         Ok(answer)
     }
 
