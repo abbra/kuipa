@@ -12,7 +12,7 @@ the playground's KDC needs. On Fedora:
 
 ```sh
 sudo dnf install cargo gcc clang-devel pkgconf-pkg-config \
-    openssl-devel krb5-devel openldap-devel
+    openssl-devel krb5-devel openldap-devel libfido2-devel
 sudo dnf install krb5-server krb5-workstation krb5-pkinit   # the playground's KDC
 cargo build --release
 ```
