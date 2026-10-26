@@ -461,3 +461,136 @@ fn ids_and_thumbprints_may_begin_with_a_hyphen() {
         );
     }
 }
+
+/// A stand-in HTTP proxy on loopback: it records each request line and
+/// answers `502 Bad Gateway`, so nothing goes further.
+fn proxy() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                log.lock().unwrap().push(line.trim_end().to_owned());
+            }
+            // The rest of the head, then the answer.
+            while reader.read_line(&mut line).is_ok_and(|n| n > 2) {}
+            let _ = stream.write_all(
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    (url, seen)
+}
+
+/// Run `kuipa enroll` against ipa1.example.test with `env` and no other
+/// proxy settings; returns the exit status and standard error.
+fn enroll_with(name: &str, env: &[(&str, &str)]) -> (i32, String) {
+    let dir = std::env::temp_dir().join(format!("kuipa-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let string = EnrollmentString::new(
+        "EXAMPLE.TEST",
+        *anchor.public().thumbprint(),
+        unix_seconds(std::time::SystemTime::now()) + 86_400,
+        Some(Secret::new(b"Secret123")),
+    );
+    let file = dir.join("enrollment");
+    std::fs::write(&file, string.encode().as_ref()).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuipa"));
+    cmd.args(["enroll", "--server", "ipa1.example.test"])
+        .args(["--hostname", "web1.example.test"])
+        .arg("--enrollment-file")
+        .arg(&file)
+        .env("KUIPA_ROOT", &dir)
+        .env_remove("KUIPA_ENDPOINTS")
+        .env_remove("KUIPA_ENROLLMENT_FILE")
+        .env_remove("KUIPA_TRACE");
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
+    ] {
+        cmd.env_remove(var);
+    }
+    for (var, value) in env {
+        cmd.env(var, value);
+    }
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// HTTPS to a server goes through `$HTTPS_PROXY` as a `CONNECT` tunnel, and
+/// a proxy that refuses it is a server that could not be reached: retry
+/// later, saying why.
+#[test]
+fn https_goes_through_the_environments_proxy() {
+    let (url, seen) = proxy();
+    let (code, stderr) = enroll_with("https-proxy", &[("HTTPS_PROXY", &url)]);
+    assert_eq!(code, 75, "{stderr}");
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .all(|l| l == "CONNECT ipa1.example.test:443 HTTP/1.1"),
+        "{seen:?}"
+    );
+    assert!(!seen.is_empty(), "the proxy was not asked: {stderr}");
+    // The HTTP client keeps the proxy's status to itself, but says the
+    // tunnel failed, which is the hint a misconfigured proxy needs.
+    assert!(stderr.contains("tunnel error"), "{stderr}");
+
+    // ALL_PROXY serves when no HTTPS_PROXY is set, as in curl.
+    let (all, seen) = proxy();
+    let (code, stderr) = enroll_with("all-proxy", &[("all_proxy", &all)]);
+    assert_eq!(code, 75, "{stderr}");
+    assert!(!seen.lock().unwrap().is_empty(), "{stderr}");
+
+    // NO_PROXY exempts the server: the proxy is never asked.
+    let (url, seen) = proxy();
+    let (code, stderr) = enroll_with(
+        "no-proxy",
+        &[("HTTPS_PROXY", &url), ("NO_PROXY", ".example.test")],
+    );
+    assert_eq!(code, 75, "{stderr}");
+    assert_eq!(seen.lock().unwrap().len(), 0, "{stderr}");
+}
+
+/// A plain-HTTP endpoint goes through `$HTTP_PROXY`, by absolute URL.
+#[test]
+fn plain_http_goes_through_http_proxy() {
+    let (url, seen) = proxy();
+    let (code, stderr) = enroll_with(
+        "http-proxy",
+        &[
+            ("HTTP_PROXY", &url),
+            (
+                "KUIPA_ENDPOINTS",
+                "ipa1.example.test=http://ipa1.example.test:8080",
+            ),
+        ],
+    );
+    assert_ne!(code, 0, "{stderr}");
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.first()
+            .is_some_and(|l| l.starts_with("GET http://ipa1.example.test:8080/ipa/ku/")),
+        "{seen:?}: {stderr}"
+    );
+}

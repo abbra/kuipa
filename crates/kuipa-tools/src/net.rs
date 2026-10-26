@@ -7,6 +7,14 @@
 //! a Merkle Tree CA ([`kuipa_enroll::tls`]).
 //!
 //! Errors are classified for the failover rules of §4.6.
+//!
+//! An HTTP proxy is taken from the environment, as curl takes it:
+//! `HTTPS_PROXY` (or `https_proxy`) for `https://` servers, `HTTP_PROXY`
+//! (`http_proxy`) for plain ones, `ALL_PROXY` (`all_proxy`) for either,
+//! and `NO_PROXY` (`no_proxy`) for the hosts reached directly.  HTTPS
+//! goes through the proxy as a `CONNECT` tunnel, so the proxy sees the
+//! server's name and port, never the protocol.  A Unix socket is never
+//! proxied.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -255,6 +263,64 @@ pub fn clear_thread_endpoints() {
     THREAD_ENDPOINTS.with_borrow_mut(Vec::clear);
 }
 
+/// The first of `names` set to something in the environment.
+fn first_env(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()))
+}
+
+/// The proxy the environment names for `base`'s scheme, the way the
+/// HTTP client reads it, and `NO_PROXY`: for tracing only.  Credentials
+/// in the proxy URL are not shown.
+fn env_proxy(base: &str) -> Option<(String, Option<String>)> {
+    let specific = if base.starts_with("https://") {
+        first_env(&["HTTPS_PROXY", "https_proxy"])
+    } else if std::env::var_os("REQUEST_METHOD").is_some() {
+        // CGI: `HTTP_PROXY` may come from a request's `Proxy:` header.
+        None
+    } else {
+        first_env(&["HTTP_PROXY", "http_proxy"])
+    };
+    let proxy = specific.or_else(|| first_env(&["ALL_PROXY", "all_proxy"]))?;
+    Some((redact(&proxy), first_env(&["NO_PROXY", "no_proxy"])))
+}
+
+/// `url` without the credentials in its authority.
+fn redact(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once('@') {
+        Some((_, host)) => {
+            let path = &rest[authority.len()..];
+            let scheme = if scheme.is_empty() {
+                String::new()
+            } else {
+                format!("{scheme}://")
+            };
+            format!("{scheme}***@{host}{path}")
+        }
+        None => url.to_owned(),
+    }
+}
+
+/// `e` with its causes: reqwest's own message names only the URL, and the
+/// reason — a refused connection, a proxy's answer to `CONNECT`, a TLS
+/// alert — is in its sources.
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let next = cause.to_string();
+        if !text.contains(&next) {
+            text.push_str(": ");
+            text.push_str(&next);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 /// Where to reach `server` instead of `https://<server>/`: from
 /// [`set_thread_endpoint`], else `KUIPA_ENDPOINTS` (`fqdn=target,…`, target
 /// as for [`Endpoint::new`]), for talking to a daemon's socket directly, or
@@ -318,6 +384,16 @@ impl Endpoint {
             &Trust::FirstContact
         };
         install_provider();
+        if !server.starts_with("unix:")
+            && let Some((proxy, no_proxy)) = env_proxy(&base)
+        {
+            tracing::debug!(
+                server = name,
+                %proxy,
+                no_proxy = no_proxy.as_deref().unwrap_or("-"),
+                "through the environment's HTTP proxy, unless NO_PROXY exempts it"
+            );
+        }
         tracing::trace!(
             server = name,
             %base,
@@ -347,9 +423,9 @@ impl Endpoint {
 
     fn classify(e: &reqwest::Error) -> NetError {
         if e.is_connect() || e.is_builder() {
-            NetError::Unreachable(e.to_string())
+            NetError::Unreachable(chain(e))
         } else {
-            NetError::Unknown(e.to_string())
+            NetError::Unknown(chain(e))
         }
     }
 
@@ -651,5 +727,22 @@ impl Endpoint {
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(body);
         self.send("POST", &url, request, sent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_credentials_are_not_traced() {
+        assert_eq!(redact("http://proxy:3128"), "http://proxy:3128");
+        assert_eq!(
+            redact("http://user:p%40ss@proxy:3128/"),
+            "http://***@proxy:3128/"
+        );
+        assert_eq!(redact("user:pw@proxy:3128"), "***@proxy:3128");
+        // An `@` in the path is not credentials.
+        assert_eq!(redact("http://proxy/a@b"), "http://proxy/a@b");
     }
 }
