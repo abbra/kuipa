@@ -70,12 +70,24 @@ pub fn reacquire_server_cred(mode: &GssCredMode) -> Result<GssServerCred, GssErr
     }
 }
 
+/// Whether an initiator credential also serves as the S4U2Self
+/// impersonator or an ACCEPT responder (`GSS_C_BOTH`) or only initiates
+/// (`GSS_C_INITIATE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Impersonation {
+    /// `GSS_C_INITIATE` — pure initiator use (LDAP bind, token fetch).
+    No,
+    /// `GSS_C_BOTH` — also the impersonator for S4U2Self or an ACCEPT
+    /// responder for SPNEGO.
+    Both,
+}
+
 /// How the initiator (client) credential was originally acquired, allowing
 /// re-acquisition when the credential handle becomes stale.
 #[derive(Debug, Clone)]
 pub enum InitiatorCredMode {
     GssProxy {
-        has_principal: bool,
+        impersonation: Impersonation,
     },
     Keytab {
         keytab: String,
@@ -86,7 +98,7 @@ pub enum InitiatorCredMode {
 /// Re-acquire a `GssClientCred` using the same method as startup.
 pub fn reacquire_initiator_cred(mode: &InitiatorCredMode) -> Result<GssClientCred, GssError> {
     match mode {
-        InitiatorCredMode::GssProxy { has_principal } => GssClientCred::from_ccache(*has_principal),
+        InitiatorCredMode::GssProxy { impersonation } => GssClientCred::from_ccache(*impersonation),
         InitiatorCredMode::Keytab { keytab, ccache } => {
             GssClientCred::from_keytab_combined(keytab, ccache.as_deref())
         }
@@ -640,7 +652,7 @@ impl GssClientCred {
 
     /// Acquire an initiator credential from the caller's ambient Kerberos ticket cache.
     ///
-    /// Equivalent to `from_ccache(false)`.  Requires a prior `kinit`; does not
+    /// Equivalent to `from_ccache(Impersonation::No)`.  Requires a prior `kinit`; does not
     /// touch any keytab.  Intended for CLI tools that run in a user's login session.
     ///
     /// # Errors
@@ -648,7 +660,7 @@ impl GssClientCred {
     /// - [`GssError::AcquireCred`] — no valid TGT in the ccache or the Kerberos
     ///   library returned an error.
     pub fn ambient() -> Result<Self, GssError> {
-        Self::from_ccache(false)
+        Self::from_ccache(Impersonation::No)
     }
 
     /// Acquire a credential from the default Kerberos credential cache (ccache).
@@ -660,49 +672,47 @@ impl GssClientCred {
     /// `gss_acquire_cred` with no name does the same: the default ccache first,
     /// falling back to the default keytab.
     ///
-    /// `for_impersonation` controls the GSSAPI credential usage flag:
-    /// - `false` → `GSS_C_INITIATE` — for pure initiator use (LDAP bind,
-    ///   token fetch). Use when the credential will never be passed to
-    ///   `gss_acquire_cred_impersonate_name` or act as an ACCEPT responder.
-    /// - `true` → `GSS_C_BOTH` — when the same credential must also serve as
-    ///   the impersonator for S4U2Self or as an ACCEPT responder for SPNEGO.
-    ///   Note: in gssproxy mode with an existing ACCEPT credential in the
-    ///   union table, `GSS_C_BOTH` causes the union mechanism to pass that
-    ///   credential as `input_cred_handle`, triggering an AS exchange; only
-    ///   pass `true` when the impersonator role is actually required.
+    /// `impersonation` selects the GSSAPI credential usage flag:
+    /// [`Impersonation::No`] → `GSS_C_INITIATE` for pure initiator use;
+    /// [`Impersonation::Both`] → `GSS_C_BOTH` when the same credential must
+    /// also serve as the impersonator for S4U2Self or as an ACCEPT responder
+    /// for SPNEGO.  Note: in gssproxy mode with an existing ACCEPT
+    /// credential in the union table, `GSS_C_BOTH` causes the union
+    /// mechanism to pass that credential as `input_cred_handle`, triggering
+    /// an AS exchange; only ask for it when the impersonator role is
+    /// actually required.
     ///
-    /// A Heimdal build has no S4U2Self, so `for_impersonation == true` reports
+    /// A Heimdal build has no S4U2Self, so [`Impersonation::Both`] reports
     /// [`GssError::Unsupported`].
     ///
     /// # Errors
     ///
-    /// - [`GssError::Unsupported`] — `for_impersonation` under Heimdal.
+    /// - [`GssError::Unsupported`] — [`Impersonation::Both`] under Heimdal.
     /// - [`GssError::AcquireCred`] — no valid TGT in the ccache, or the
     ///   Kerberos library returned an error.
-    pub fn from_ccache(for_impersonation: bool) -> Result<Self, GssError> {
+    pub fn from_ccache(impersonation: Impersonation) -> Result<Self, GssError> {
         #[cfg(heimdal_kerberos)]
-        if for_impersonation {
+        if impersonation == Impersonation::Both {
             return Err(GssError::Unsupported {
                 feature: "S4U2Self impersonation credentials",
             });
         }
         #[cfg(mit_kerberos)]
-        return Self::from_ccache_mit(for_impersonation);
+        return Self::from_ccache_mit(impersonation);
         #[cfg(heimdal_kerberos)]
         return Self::from_ccache_heimdal();
     }
 
     #[cfg(mit_kerberos)]
-    fn from_ccache_mit(for_impersonation: bool) -> Result<Self, GssError> {
+    fn from_ccache_mit(impersonation: Impersonation) -> Result<Self, GssError> {
         let mut minor: ffi::OmUint32 = 0;
         let mut cred_handle: ffi::GssCredIdT = ptr::null_mut();
         let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
         let mut time_rec: ffi::OmUint32 = 0;
 
-        let cred_usage = if for_impersonation {
-            ffi::GSS_C_BOTH
-        } else {
-            ffi::GSS_C_INITIATE
+        let cred_usage = match impersonation {
+            Impersonation::No => ffi::GSS_C_INITIATE,
+            Impersonation::Both => ffi::GSS_C_BOTH,
         };
 
         // SAFETY: NULL for cred_store == GSS_C_NO_CRED_STORE; MIT Kerberos
