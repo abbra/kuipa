@@ -107,6 +107,9 @@ pub fn reacquire_initiator_cred(mode: &InitiatorCredMode) -> Result<GssClientCre
 
 // ── GssServerCred ─────────────────────────────────────────────────────────────
 
+/// Counter for unique private in-memory ccaches; see [`GssServerCred::acquire_mit`].
+#[cfg(mit_kerberos)]
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Server-side GSSAPI credential, acquired from a keytab at startup.
 ///
 /// The underlying `gss_cred_id_t` is safe to use from multiple threads
@@ -262,7 +265,6 @@ impl GssServerCred {
         // GSS_C_BOTH would use the process's default ccache (KRB5CCNAME) and
         // fail, or pick up someone else's TGT, whenever that holds another
         // principal.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let ccache_cstr = CString::new(format!(
             "MEMORY:kuipa-acceptor-{}-{}",
             std::process::id(),
@@ -284,7 +286,8 @@ impl GssServerCred {
             },
         ];
         let cred_store = ffi::GssKeyValueSetDesc {
-            count: elements.len() as ffi::OmUint32,
+            count: u32::try_from(elements.len())
+                .expect("credential store holds at most 3 elements"),
             elements: elements.as_mut_ptr(),
         };
 
@@ -301,48 +304,20 @@ impl GssServerCred {
         // environment without a reachable KDC), fall back to GSS_C_ACCEPT which
         // is sufficient for SPNEGO validation.
         let mut cred_usage = ffi::GSS_C_BOTH;
-        // SAFETY: all arguments are valid; svc_name was returned by gss_import_name,
-        // cred_store elements point to live CStrings, output pointers are valid locals.
-        let mut major = unsafe {
-            ffi::gss_acquire_cred_from(
+        // SAFETY: svc_name was returned by gss_import_name, cred_store elements
+        // point to live CStrings, and the output pointers are valid locals.
+        let major = unsafe {
+            Self::acquire_cred_both_then_accept(
                 &raw mut minor,
                 svc_name,
-                0, // GSS_C_INDEFINITE
-                ffi::GSS_C_NO_OID_SET,
-                cred_usage,
                 &raw const cred_store,
                 &raw mut cred_handle,
                 &raw mut actual_mechs,
                 &raw mut time_rec,
             )
         };
-
         if major != ffi::GSS_S_COMPLETE {
-            // Defensively release a potentially non-null cred_handle on failure.
-            if !cred_handle.is_null() {
-                unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
-                cred_handle = ptr::null_mut();
-            }
-            if !actual_mechs.is_null() {
-                unsafe { ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs) };
-                actual_mechs = ptr::null_mut();
-            }
-            let detail = format_gss_status(major, minor);
-            tracing::warn!(%detail, "GSS_C_BOTH acquire failed, retrying with GSS_C_ACCEPT (S4U2Self will be unavailable)");
             cred_usage = ffi::GSS_C_ACCEPT;
-            major = unsafe {
-                ffi::gss_acquire_cred_from(
-                    &raw mut minor,
-                    svc_name,
-                    0,
-                    ffi::GSS_C_NO_OID_SET,
-                    cred_usage,
-                    &raw const cred_store,
-                    &raw mut cred_handle,
-                    &raw mut actual_mechs,
-                    &raw mut time_rec,
-                )
-            };
         }
 
         // Snapshot the error minor before cleanup calls overwrite it.
@@ -380,6 +355,61 @@ impl GssServerCred {
         }
 
         Ok(GssServerCred { raw: cred_handle })
+    }
+
+    /// Acquire a credential for `svc_name` from `cred_store` as
+    /// `GSS_C_BOTH`, retrying as `GSS_C_ACCEPT` if that fails; returns the
+    /// major status of the last attempt.
+    ///
+    /// # Safety
+    ///
+    /// All pointers must satisfy `gss_acquire_cred_from` (RFC 2744 §5.2) for
+    /// the lifetime of this call.
+    #[cfg(mit_kerberos)]
+    unsafe fn acquire_cred_both_then_accept(
+        minor: *mut ffi::OmUint32,
+        svc_name: ffi::GssNameT,
+        cred_store: *const ffi::GssKeyValueSetDesc,
+        cred_handle: *mut ffi::GssCredIdT,
+        actual_mechs: *mut ffi::GssOidSetT,
+        time_rec: *mut ffi::OmUint32,
+    ) -> ffi::OmUint32 {
+        let major = ffi::gss_acquire_cred_from(
+            minor,
+            svc_name,
+            0, // GSS_C_INDEFINITE
+            ffi::GSS_C_NO_OID_SET,
+            ffi::GSS_C_BOTH,
+            cred_store,
+            cred_handle,
+            actual_mechs,
+            time_rec,
+        );
+        if major == ffi::GSS_S_COMPLETE {
+            return major;
+        }
+        // Defensively release a potentially non-null cred_handle on failure.
+        if !(*cred_handle).is_null() {
+            ffi::gss_release_cred(minor, cred_handle);
+            *cred_handle = ptr::null_mut();
+        }
+        if !(*actual_mechs).is_null() {
+            ffi::gss_release_oid_set(minor, actual_mechs);
+            *actual_mechs = ptr::null_mut();
+        }
+        let detail = format_gss_status(major, *minor);
+        tracing::warn!(%detail, "GSS_C_BOTH acquire failed, retrying with GSS_C_ACCEPT (S4U2Self will be unavailable)");
+        ffi::gss_acquire_cred_from(
+            minor,
+            svc_name,
+            0,
+            ffi::GSS_C_NO_OID_SET,
+            ffi::GSS_C_ACCEPT,
+            cred_store,
+            cred_handle,
+            actual_mechs,
+            time_rec,
+        )
     }
 
     /// The Heimdal path: resolve the keytab and import it as an ACCEPT
@@ -1031,7 +1061,8 @@ impl GssClientCred {
             });
         }
         let cred_store = ffi::GssKeyValueSetDesc {
-            count: elements.len() as ffi::OmUint32,
+            count: u32::try_from(elements.len())
+                .expect("credential store holds at most 3 elements"),
             elements: elements.as_mut_ptr(),
         };
 
@@ -2285,27 +2316,10 @@ impl GssServerContext {
         let mut time_rec: ffi::OmUint32 = 0;
         let mut delegated_cred: ffi::GssCredIdT = ptr::null_mut();
 
-        // `bindings_storage` must outlive the FFI call below.
-        let bindings_storage;
-        let chan_bindings_ptr: *const ffi::GssChannelBindingsStruct = match channel_binding {
-            None => ptr::null(),
-            Some(data) => {
-                bindings_storage = ffi::GssChannelBindingsStruct {
-                    initiator_addrtype: ffi::GSS_C_AF_UNSET,
-                    initiator_address: ffi::gss_c_no_buffer(),
-                    acceptor_addrtype: ffi::GSS_C_AF_UNSET,
-                    acceptor_address: ffi::gss_c_no_buffer(),
-                    application_data: ffi::GssBufferDesc {
-                        length: data.len(),
-                        // SAFETY: gss_accept_sec_context treats application_data as
-                        // read-only; *const → *mut cast is safe per RFC 2744 §2.
-                        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-                        value: data.as_ptr() as *mut _,
-                    },
-                };
-                &raw const bindings_storage
-            }
-        };
+        let chan_bindings = channel_binding.map(channel_bindings);
+        let chan_bindings_ptr: *const ffi::GssChannelBindingsStruct = chan_bindings
+            .as_ref()
+            .map_or(ptr::null(), |b| &raw const *b);
 
         // SAFETY: self.raw is GSS_C_NO_CONTEXT (initial call) or a valid partial
         // context from a prior gss_accept_sec_context; cred.raw is a live acceptor
@@ -2333,19 +2347,10 @@ impl GssServerContext {
             unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut delegated_cred) };
         }
 
-        // Copy output token before freeing the GSSAPI buffer.
-        let out_token: Vec<u8> = if output_buf.length > 0 && !output_buf.value.is_null() {
-            // SAFETY: output_buf.value is valid for output_buf.length bytes.
-            let slice = unsafe {
-                std::slice::from_raw_parts(output_buf.value as *const u8, output_buf.length)
-            };
-            let v = slice.to_vec();
-            // SAFETY: output_buf was populated by gss_accept_sec_context.
-            unsafe { ffi::gss_release_buffer(&raw mut minor, &raw mut output_buf) };
-            v
-        } else {
-            Vec::new()
-        };
+        // Copy and release the output token.
+        // SAFETY: minor is a live u32; output_buf was populated by
+        // gss_accept_sec_context or is GSS_C_NO_BUFFER.
+        let out_token = unsafe { Self::take_output_token(&raw mut minor, &raw mut output_buf) };
 
         let error_minor = minor;
 
@@ -2357,42 +2362,9 @@ impl GssServerContext {
                     // negotiated.  Not actionable; logged at debug to avoid noise.
                     tracing::debug!("GSSAPI context established without replay detection flag");
                 }
-                // Extract the principal name string.
-                let mut name_buf = ffi::gss_c_no_buffer();
-                // SAFETY: src_name is a valid GssNameT set by gss_accept_sec_context.
-                let major_dn = unsafe {
-                    ffi::gss_display_name(
-                        &raw mut minor,
-                        src_name,
-                        &raw mut name_buf,
-                        ptr::null_mut(),
-                    )
-                };
-                // Snapshot minor before gss_release_name overwrites it.
-                let dn_minor = minor;
-                // SAFETY: src_name is valid; gss_release_name takes ownership.
-                unsafe { ffi::gss_release_name(&raw mut minor, &raw mut src_name) };
-
-                let principal = if major_dn == ffi::GSS_S_COMPLETE && !name_buf.value.is_null() {
-                    // SAFETY: name_buf.value is valid for name_buf.length bytes.
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(name_buf.value as *const u8, name_buf.length)
-                    };
-                    let s = std::str::from_utf8(slice)
-                        .map(std::borrow::ToOwned::to_owned)
-                        .map_err(|_| GssError::InvalidUtf8);
-                    // SAFETY: name_buf was populated by gss_display_name.
-                    unsafe { ffi::gss_release_buffer(&raw mut minor, &raw mut name_buf) };
-                    s?
-                } else {
-                    // SAFETY: name_buf may be empty or null; gss_release_buffer handles both.
-                    unsafe { ffi::gss_release_buffer(&raw mut minor, &raw mut name_buf) };
-                    return Err(GssError::DisplayName {
-                        detail: format_gss_status(major_dn, dn_minor),
-                        major: major_dn,
-                        minor: dn_minor,
-                    });
-                };
+                // SAFETY: minor points to a live u32; src_name is a valid
+                // GssNameT set by gss_accept_sec_context, consumed here.
+                let principal = unsafe { Self::accepted_principal(&raw mut minor, src_name) }?;
 
                 let derived = prf
                     .map(|(input, len)| pseudo_random(self.raw, input, len))
@@ -2440,6 +2412,86 @@ impl GssServerContext {
                 })
             }
         }
+    }
+
+    /// Copy `buf` and release it.
+    ///
+    /// # Safety
+    ///
+    /// `minor` points to a live `u32`; `buf` is a `gss_buffer_t` either empty
+    /// (`GSS_C_NO_BUFFER`) or populated by a GSS-API call.
+    unsafe fn take_output_token(
+        minor: *mut ffi::OmUint32,
+        buf: *mut ffi::GssBufferDesc,
+    ) -> Vec<u8> {
+        if (*buf).length == 0 || (*buf).value.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: guaranteed by the caller.
+        let v = unsafe { std::slice::from_raw_parts((*buf).value as *const u8, (*buf).length) }
+            .to_vec();
+        // SAFETY: guaranteed by the caller.
+        unsafe { ffi::gss_release_buffer(minor, buf) };
+        v
+    }
+
+    /// Release `src_name` and return its display name, or a
+    /// [`GssError::DisplayName`] / [`GssError::InvalidUtf8`].
+    ///
+    /// # Safety
+    ///
+    /// `minor` is a live `u32`; `src_name` is a valid `GssNameT` (or null),
+    /// consumed here by `gss_release_name`.
+    unsafe fn accepted_principal(
+        minor: *mut ffi::OmUint32,
+        mut src_name: ffi::GssNameT,
+    ) -> Result<String, GssError> {
+        let mut name_buf = ffi::gss_c_no_buffer();
+        // SAFETY: guaranteed by the caller.
+        let major_dn =
+            unsafe { ffi::gss_display_name(minor, src_name, &raw mut name_buf, ptr::null_mut()) };
+        // Snapshot minor before gss_release_name overwrites it.
+        let dn_minor = *minor;
+        // SAFETY: src_name is valid; gss_release_name takes ownership.
+        unsafe { ffi::gss_release_name(minor, &raw mut src_name) };
+        if major_dn == ffi::GSS_S_COMPLETE && !name_buf.value.is_null() {
+            // SAFETY: name_buf.value is valid for name_buf.length bytes.
+            let slice =
+                unsafe { std::slice::from_raw_parts(name_buf.value as *const u8, name_buf.length) };
+            let s = std::str::from_utf8(slice)
+                .map(std::borrow::ToOwned::to_owned)
+                .map_err(|_| GssError::InvalidUtf8);
+            // SAFETY: name_buf was populated by gss_display_name.
+            unsafe { ffi::gss_release_buffer(minor, &raw mut name_buf) };
+            s
+        } else {
+            // SAFETY: name_buf may be empty or null; gss_release_buffer handles both.
+            unsafe { ffi::gss_release_buffer(minor, &raw mut name_buf) };
+            Err(GssError::DisplayName {
+                detail: format_gss_status(major_dn, dn_minor),
+                major: major_dn,
+                minor: dn_minor,
+            })
+        }
+    }
+}
+
+/// Pack `data` as GSS-API channel bindings with unset addresses — the shape
+/// `gss_accept_sec_context` expects for `GBG_CHANNEL_BINDING_TYPES`-free
+/// callers that only bind application data.
+fn channel_bindings(data: &[u8]) -> ffi::GssChannelBindingsStruct {
+    ffi::GssChannelBindingsStruct {
+        initiator_addrtype: ffi::GSS_C_AF_UNSET,
+        initiator_address: ffi::gss_c_no_buffer(),
+        acceptor_addrtype: ffi::GSS_C_AF_UNSET,
+        acceptor_address: ffi::gss_c_no_buffer(),
+        application_data: ffi::GssBufferDesc {
+            length: data.len(),
+            // SAFETY: gss_accept_sec_context treats application_data as
+            // read-only; *const → *mut cast is safe per RFC 2744 §2.
+            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
+            value: data.as_ptr() as *mut _,
+        },
     }
 }
 
