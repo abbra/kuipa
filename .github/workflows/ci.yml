@@ -31,7 +31,8 @@ env:
   #   nodejs, npm, node       — required by actions/checkout and actions/cache
   #   cargo, rust, rustfmt, cargo-clippy — Rust toolchain (not bundled in the base image)
   #   git-core                - commit signing tests in playground
-  #   kryoptic, pkcs11-provider - PKCS#11 tests
+  #   kryoptic, pkcs11-provider - PKCS#11 tests; ML-KEM keys on the token need
+  #                           pkcs11-provider 1.2 or later, hence Fedora 45 (44 has 1.1)
   # (update key suffix when changing packages)
   DNF_PACKAGES: >-
     tar gzip gcc make openssl-devel krb5-devel openldap-devel libfido2-devel clang-libs clang-devel
@@ -50,7 +51,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -77,8 +78,8 @@ jobs:
             target/debug/deps
             target/debug/build
             target/debug/examples
-          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-target-debug-stable-v1-
+          key: cargo-target-debug-stable-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v2-
       - name: Build workspace
         run: ./contrib/ci/local-ci.sh --no-deps build
       - name: Prune incremental artifacts before caching
@@ -89,7 +90,7 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -104,7 +105,7 @@ jobs:
   lint-workflows:
     name: Workflow Lint
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -119,7 +120,7 @@ jobs:
   deps:
     name: Dependency policy
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -135,7 +136,7 @@ jobs:
     name: Clippy
     needs: [build]
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -156,8 +157,8 @@ jobs:
             target/debug/deps
             target/debug/build
             target/debug/examples
-          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-target-debug-stable-v1-
+          key: cargo-target-debug-stable-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v2-
       - name: Run clippy
         run: ./contrib/ci/local-ci.sh --no-deps clippy
 
@@ -166,7 +167,7 @@ jobs:
     name: Documentation
     needs: [build]
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -187,8 +188,8 @@ jobs:
             target/debug/deps
             target/debug/build
             target/debug/examples
-          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-target-debug-stable-v1-
+          key: cargo-target-debug-stable-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v2-
       - name: Build documentation
         run: ./contrib/ci/local-ci.sh --no-deps doc
 
@@ -198,7 +199,7 @@ jobs:
     name: Test Suite
     needs: [build]
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -219,8 +220,8 @@ jobs:
             target/debug/deps
             target/debug/build
             target/debug/examples
-          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-target-debug-stable-v1-
+          key: cargo-target-debug-stable-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v2-
       - name: Run tests
         run: ./contrib/ci/local-ci.sh --no-deps test
 
@@ -232,7 +233,7 @@ jobs:
     name: Real-KDC Test
     needs: [build]
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -253,8 +254,8 @@ jobs:
             target/debug/deps
             target/debug/build
             target/debug/examples
-          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-target-debug-stable-v1-
+          key: cargo-target-debug-stable-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v2-
       - name: Run the client flows against a real KDC
         run: ./contrib/ci/local-ci.sh --no-deps kdc-test
 
@@ -271,7 +272,7 @@ jobs:
     runs-on: ubuntu-latest
     # Steps time out on their own (KUIPA_STEP_TIMEOUT); this bounds the rest.
     timeout-minutes: 30
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -292,8 +293,8 @@ jobs:
             target/debug/deps
             target/debug/build
             target/debug/examples
-          key: cargo-target-debug-stable-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-target-debug-stable-v1-
+          key: cargo-target-debug-stable-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-debug-stable-v2-
       - name: Run a traced playground session
         run: |
           pushd ./contrib/ci/playground
@@ -329,7 +330,7 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
@@ -352,7 +353,7 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
-    container: quay.io/fedora/fedora:latest
+    container: quay.io/fedora/fedora:45
     steps:
       - name: Enable test COPR repository
         run: dnf copr -y enable $COPR_REPO
