@@ -70,6 +70,10 @@ pub struct KdcDirectory {
     pub deposits: Mutex<HashMap<(VaultId, String), kuipa_enroll::vault::Deposit>>,
     /// The realm's device-key recovery settings (`DESIGN-recovery.md` §4).
     pub recovery: Mutex<Option<kuipa_enroll::vault::RecoverySettings>>,
+    /// IPA passkeys (`ipaPassKey` values) by principal.
+    pub passkeys: Mutex<HashMap<String, Vec<String>>>,
+    /// Whether the realm requires user verification (`ipa passkeyconfig`).
+    pub passkey_uv: Mutex<bool>,
     /// Acceptor credentials, one per server (`ipa-ku@<server>`).
     creds: Vec<GssServerCred>,
 }
@@ -114,6 +118,8 @@ impl KdcDirectory {
             escrows: Mutex::new(HashMap::new()),
             deposits: Mutex::new(HashMap::new()),
             recovery: Mutex::new(None),
+            passkeys: Mutex::new(HashMap::new()),
+            passkey_uv: Mutex::new(true),
             creds,
         }
     }
@@ -548,6 +554,22 @@ impl Directory for KdcDirectory {
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         Ok(self.locked.lock().unwrap().contains(&principal.to_string()))
+    }
+
+    fn passkeys(
+        &self,
+        principal: &Principal,
+    ) -> Result<kuipa_enroll::passkey::UserPasskeys, DirectoryError> {
+        Ok(kuipa_enroll::passkey::UserPasskeys {
+            values: self
+                .passkeys
+                .lock()
+                .unwrap()
+                .get(&principal.to_string())
+                .cloned()
+                .unwrap_or_default(),
+            user_verification: *self.passkey_uv.lock().unwrap(),
+        })
     }
 
     fn vaults_approved_by(

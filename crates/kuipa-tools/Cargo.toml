@@ -9,6 +9,8 @@ description = "kuipa client tools for FreeIPA hosts: kuipa, kuipa-unseal and kui
 [dependencies]
 kuipa-enroll = { workspace = true, features = ["tls"] }
 kuipa-gssapi = { path = "../kuipa-gssapi" }
+# Passkeys: the passkey factor and passkey-wrapped device keys (§7.6.5).
+kuipa-fido2 = { path = "../kuipa-fido2" }
 native-ossl.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -31,7 +33,14 @@ clap = { version = "4.6.7", features = ["derive"] }
 # The colour decision `clap` itself makes for its help output.
 anstream = "1.0"
 
+[features]
+# A software security key for `kuipa` (`$KUIPA_SOFT_FIDO2`): the
+# playground's, and the tests'.  Never in a build for real hosts.
+soft-fido2 = ["kuipa-enroll/testing"]
+
 [dev-dependencies]
+# The tests and the playground use the software security key.
+kuipa-tools = { path = ".", features = ["soft-fido2"] }
 # Test certificates (CA + PKINIT KDC chain), as in kurbu5-pkinit.
 synta = { version = "0.5.1", default-features = false, features = ["std"] }
 synta-certificate = "0.5.1"
