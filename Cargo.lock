@@ -1024,6 +1024,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuipa-fido2"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "native-ossl",
+ "pkg-config",
+ "thiserror",
+]
+
+[[package]]
 name = "kuipa-gssapi"
 version = "0.1.0"
 dependencies = [

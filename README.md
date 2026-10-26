@@ -55,6 +55,7 @@ which algorithms are used.
 | [`kuipa-tools`](crates/kuipa-tools) | Client programs: `kuipa`, `kuipa-unseal` and `kuipa-voucher` |
 | [`kuipa-gssapi`](crates/kuipa-gssapi) | GSSAPI bindings |
 | [`kuipa-ldap`](crates/kuipa-ldap) | OpenLDAP bindings |
+| [`kuipa-fido2`](crates/kuipa-fido2) | libfido2 bindings: passkey assertions and `hmac-secret`, classical and ML-DSA |
 | [`tang-pqc`](crates/tang-pqc) | Post-quantum Tang/Clevis-style key escrow with ML-KEM and ML-DSA |
 | [`tang-pqc-clevis`](crates/tang-pqc-clevis) | A post-quantum Tang client and the Clevis pin `tang-pqc` |
 | [`ml-dsa-blind`](crates/ml-dsa-blind) | Blind signing with stock FIPS 204 ML-DSA |
@@ -77,7 +78,7 @@ On Fedora:
 
 ```sh
 sudo dnf install cargo gcc clang-devel pkgconf-pkg-config \
-    openssl-devel krb5-devel openldap-devel
+    openssl-devel krb5-devel openldap-devel libfido2-devel
 sudo dnf install krb5-server krb5-workstation krb5-pkinit   # real-KDC tests
 ```
 

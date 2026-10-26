@@ -1,0 +1,15 @@
+[package]
+name = "kuipa-fido2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "libfido2 bindings for kuipa: CTAP assertions with hmac-secret and credentials, classical and ML-DSA"
+
+[dependencies]
+libc = "0.2"
+native-ossl.workspace = true
+thiserror = "2"
+
+[build-dependencies]
+pkg-config = "0.3"

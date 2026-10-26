@@ -14,7 +14,7 @@ printing `✓` for what it found and `○` for what is missing:
 | --- | --- |
 | `cargo` | everything |
 | `rustfmt`, `clippy` | the `fmt` and `clippy` jobs |
-| OpenSSL ≥ 3.5, krb5 and OpenLDAP development files, libclang | building (Fedora: `openssl-devel krb5-devel openldap-devel clang-devel`; bindgen needs libclang for native-ossl-sys) |
+| OpenSSL ≥ 3.5, krb5, OpenLDAP and libfido2 development files, libclang | building (Fedora: `openssl-devel krb5-devel openldap-devel libfido2-devel clang-devel`; bindgen needs libclang for native-ossl-sys) |
 | `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` (MIT krb5 1.22 or later), MIT `pkinit.so` | `kdc-test`, `playground-test` and `interactive` (Fedora: `krb5-server krb5-workstation krb5-pkinit`; macOS: `brew install krb5`, whose keg `bin`/`sbin` the script puts first on `PATH`) |
 | `python3` | `playground-test`, to render its report, and `bench`/`scripts/bench.sh`, to collect and compare results |
 | `rustup` with the MSRV toolchain | `msrv` (`rustup toolchain install 1.89`) |
