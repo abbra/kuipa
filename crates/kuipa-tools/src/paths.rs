@@ -554,7 +554,8 @@ pub const MAX_HEAD_WINDOW: usize = 4;
 /// (DESIGN-claim-logs.md §1.2–§1.3, `DESIGN-tlog.md` §8): a head that
 /// extends a pin's window is appended (the window trimmed to
 /// [`MAX_HEAD_WINDOW`], the oldest dropped first), with the claims its
-/// log retired; a head already in the window keeps it.  A head whose
+/// log retired; a head already in the window keeps it, and one of the same
+/// size with another root is a fork, reported and not pinned.  A head whose
 /// size is lower is a log that no longer extends what the host pinned —
 /// claim logs only grow — and is not pinned: the window keeps what it
 /// had, and the fork is reported.  A pin with no head yet starts its
@@ -599,8 +600,11 @@ pub fn merge_windows(
             // the exchange.
             continue;
         }
-        if pin.heads.iter().any(|(s, _)| s == size) {
-            continue; // Already pinned: the window keeps it.
+        if let Some((_, pinned)) = pin.heads.iter().find(|(s, _)| s == size) {
+            // Already pinned: the window keeps it.  Another root at the
+            // same size is another log: a fork, not pinned.
+            forked |= pinned != root;
+            continue;
         }
         match pin.heads.last() {
             Some((newest, _)) if *newest > *size => {
@@ -1321,6 +1325,14 @@ mod tests {
         let (kept, forked) = merge_windows(&grown, &[(a, Some((2, test_hash(4))))], &[]);
         assert!(forked);
         assert_eq!(kept[0].heads, grown[0].heads);
+        // The same size again: the same root is nothing new, another root
+        // is another log, a fork, and the window keeps its own.
+        let (same, forked) = merge_windows(&grown, &[(a, Some((5, test_hash(9))))], &[]);
+        assert!(!forked);
+        assert_eq!(same[0].heads, grown[0].heads);
+        let (other_root, forked) = merge_windows(&grown, &[(a, Some((5, test_hash(1))))], &[]);
+        assert!(forked);
+        assert_eq!(other_root[0].heads, grown[0].heads);
         // A new anchor starts its pin with what its first head retired.
         let (fresh, _) = merge_windows(
             &[],

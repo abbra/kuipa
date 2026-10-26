@@ -644,7 +644,6 @@ fn install(
         .collect::<Vec<_>>();
     write_windows(
         paths,
-        &pins_to_merge(&paths.anchors())?,
         payload_epoch(enrollment),
         &enrollment.config.realm,
         &enrollment.config.issuer,
@@ -1281,7 +1280,6 @@ fn extend_windows(
 /// signature backing of a head `proved` does not cover (§4).
 fn write_windows(
     paths: &Paths,
-    pins: &[paths::Pin],
     epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     realm: &str,
     issuer: &str,
@@ -1302,14 +1300,43 @@ fn write_windows(
     } else {
         None
     };
-    let (heads, learned) = backed(endpoint.as_ref(), realm, pins, heads, proved);
-    // With no pins there is nothing to keep consistent: no pages to read.
-    let (pins, forked) = match (&endpoint, pins.is_empty()) {
-        (Some(endpoint), false) => extend_windows(endpoint, pins, &heads, learned),
-        _ => (paths::merge_windows(pins, &heads, &learned).0, false),
-    };
-    paths::write_anchor_pins(&paths.anchors(), "kuipa realm anchors", &pins, epoch)?;
-    Ok(forked)
+    locked_pins(paths, || {
+        let pins = pins_to_merge(&paths.anchors())?;
+        let (heads, learned) = backed(endpoint.as_ref(), realm, &pins, heads, proved);
+        // With no pins there is nothing to keep consistent: no pages to read.
+        let (mut merged, forked) = match (&endpoint, pins.is_empty()) {
+            (Some(endpoint), false) => extend_windows(endpoint, &pins, &heads, learned),
+            _ => paths::merge_windows(&pins, &heads, &learned),
+        };
+        // The answer lists the realm's current anchors (§4.5): one it no
+        // longer lists was removed or replaced, and stops being pinned.
+        // A frozen pin is the operator's, and stays.
+        if !heads.is_empty() {
+            merged.retain(|p| p.frozen || heads.iter().any(|(a, _)| *a == p.anchor));
+        }
+        paths::write_anchor_pins(&paths.anchors(), "kuipa realm anchors", &merged, epoch)?;
+        Ok(forked)
+    })
+}
+
+/// Run `f`, which reads, merges and writes the host's pins, holding an
+/// exclusive lock beside the pins file: two kuipa runs at once (a check
+/// and a key rotation) never merge against a stale copy and overwrite each
+/// other.
+fn locked_pins<T>(paths: &Paths, f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    let anchors = paths.anchors();
+    if let Some(dir) = anchors.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(anchors.with_extension("lock"))?;
+    lock.lock()?;
+    let out = f();
+    let _ = lock.unlock();
+    out
 }
 
 /// Advertisements of every server of the realm that answers and describes
@@ -1433,7 +1460,6 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
         .collect::<Vec<_>>();
     let forked = write_windows(
         paths,
-        &pins_to_merge(&paths.anchors())?,
         epoch,
         &state.realm,
         &enrollment.config.issuer,
@@ -2155,7 +2181,11 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
                 .map_err(|e| e.to_string())
         }) {
             Ok((_, adv, advance)) => {
-                advanced = advance;
+                // The furthest verified advance wins: a server that
+                // advances nothing does not undo another's.
+                if advance.is_some_and(|(seq, _)| advanced.is_none_or(|(have, _)| seq > have)) {
+                    advanced = advance;
+                }
                 let (why, row) = server_health(server, &adv);
                 problems.extend(why);
                 servers.push(row);
@@ -2172,19 +2202,22 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
     // the head windows as a rekey would, so later exchanges are proven by
     // head rather than by signature (§4.9).
     if let Some((seq, head)) = advanced {
-        let pins = paths::read_anchor_pins(&paths.anchors())?;
-        paths::write_anchor_pins(
-            &paths.anchors(),
-            "kuipa realm anchors",
-            &pins,
-            Some((seq, head)),
-        )?;
+        locked_pins(paths, || {
+            let pins = paths::read_anchor_pins(&paths.anchors())?;
+            paths::write_anchor_pins(
+                &paths.anchors(),
+                "kuipa realm anchors",
+                &pins,
+                Some((seq, head)),
+            )
+        })?;
     }
-    if !servers.iter().any(|s| s["ok"] == Value::Bool(true)) {
+    let refreshed = if servers.iter().any(|s| s["ok"] == Value::Bool(true)) {
+        refresh_after_check(paths, &state, only, &trust, advanced.or(known))
+    } else {
         // Nothing verified: nothing to refresh from.
-    } else if let Err(e) = refresh_pins(paths, &state, &trust, advanced.or(known)) {
-        problems.push(format!("cannot refresh the pinned anchors and heads: {e}"));
-    }
+        json!(false)
+    };
     let kinit = keytab_path
         .to_str()
         .ok_or("non-UTF-8 keytab path")
@@ -2218,16 +2251,44 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
         }
     }
     Ok(
-        json!({ "ok": problems.is_empty(), "servers": servers, "kinit": kinit.is_ok(), "problems": problems }),
+        json!({ "ok": problems.is_empty(), "servers": servers, "kinit": kinit.is_ok(), "pins_refreshed": refreshed, "problems": problems }),
     )
 }
-/// Refresh the host's pins from a pins answer (§4.5): the realm's anchors,
-/// heads and epoch, bound to this host's Kerberos session, applied as a
-/// rekey's are (§4.7) but with no new keys.  Returns whether an anchor's
+/// `kuipa check`'s pins refresh, as its output reports it.  The refresh
+/// saves later exchanges a signature proof; a failure (a server too old to
+/// answer it, during an upgrade) leaves the pins as they were and is
+/// reported, not a problem.  It asks the servers the check looked at
+/// (`only`, else every one), no others.
+fn refresh_after_check(
+    paths: &Paths,
+    state: &State,
+    only: Option<&str>,
+    trust: &Trust,
+    known: Option<Epoch>,
+) -> Value {
+    let scope: Vec<String> = state
+        .servers
+        .iter()
+        .filter(|s| only.is_none_or(|o| o == s.as_str()))
+        .cloned()
+        .collect();
+    match refresh_pins(paths, state, &scope, trust, known) {
+        Ok(_) => json!(true),
+        Err(e) => {
+            tracing::debug!("pins not refreshed: {e}");
+            json!({ "error": e.to_string() })
+        }
+    }
+}
+
+/// Refresh the host's pins from a pins answer (§4.5): the realm's anchors
+/// and heads, bound to this host's Kerberos session, applied as a rekey's
+/// are (§4.7) but with no new keys, over the `servers` given.  Returns whether an anchor's
 /// claim log no longer extends the pinned window.
 fn refresh_pins(
     paths: &Paths,
     state: &State,
+    servers: &[String],
     trust: &Trust,
     known: Option<Epoch>,
 ) -> Result<bool, Error> {
@@ -2240,7 +2301,7 @@ fn refresh_pins(
         None,
     )?;
     let (answer, adv) = exchange_with(
-        &Deployment::servers(&state.servers),
+        &Deployment::servers(servers),
         trust,
         Pins {
             realm: &state.realm,
@@ -2271,14 +2332,11 @@ fn refresh_pins(
         .copied()
         .zip(answer.heads.iter().copied())
         .collect::<Vec<_>>();
-    // As for a rekey (§4.8): the watermark advances only through the
-    // verified chain; the answer's own epoch stands in only when there was
-    // nothing to continue.
-    let epoch = known.or((answer.epoch_seq != 0).then_some((answer.epoch_seq, answer.epoch_head)));
+    // The watermark moves only through the verified chain (§4.8): a pins
+    // answer carries none, and this keeps what the check verified.
     let forked = write_windows(
         paths,
-        &pins_to_merge(&paths.anchors())?,
-        epoch,
+        known,
         &state.realm,
         &answer.issuer,
         &heads,
@@ -2959,4 +3017,69 @@ pub fn leave(paths: &Paths) -> Result<Value, Error> {
         _ => {}
     }
     Ok(json!({ "left": true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pin of `anchor`; a frozen one needs a head to be frozen to.
+    fn pin(anchor: Thumbprint, frozen: bool) -> paths::Pin {
+        paths::Pin {
+            anchor,
+            exp: None,
+            heads: if frozen {
+                vec![(
+                    1,
+                    kuipa_enroll::merkle::Hash::zero(kuipa_enroll::merkle::TreeHash::Sha256),
+                )]
+            } else {
+                Vec::new()
+            },
+            frozen,
+            retired: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_kerberos_bound_answer_drops_the_anchors_it_no_longer_lists() {
+        // §4.5: the answer lists the realm's current anchors.  A pinned
+        // anchor it leaves out (removed, or replaced by a rotation) stops
+        // counting towards the quorum; a frozen pin is the operator's.
+        let root = std::env::temp_dir().join(format!("kuipa-flows-drop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = Paths::new(&root);
+        let (kept, removed, frozen, added) = (
+            Thumbprint::from_bytes([1; 32]),
+            Thumbprint::from_bytes([2; 32]),
+            Thumbprint::from_bytes([3; 32]),
+            Thumbprint::from_bytes([4; 32]),
+        );
+        fs::create_dir_all(paths.anchors().parent().unwrap()).unwrap();
+        paths::write_anchor_pins(
+            &paths.anchors(),
+            "test",
+            &[pin(kept, false), pin(removed, false), pin(frozen, true)],
+            None,
+        )
+        .unwrap();
+        // No heads named: nothing to fetch, nothing dialed.
+        let forked = write_windows(
+            &paths,
+            None,
+            "EXAMPLE.TEST",
+            "ipa1.example.test",
+            &[(kept, None), (added, None)],
+            &[],
+        )
+        .unwrap();
+        assert!(!forked);
+        let pinned: Vec<Thumbprint> = paths::read_anchor_pins(&paths.anchors())
+            .unwrap()
+            .iter()
+            .map(|p| p.anchor)
+            .collect();
+        assert_eq!(pinned, [kept, frozen, added]);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
