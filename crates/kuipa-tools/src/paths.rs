@@ -107,6 +107,13 @@ impl Paths {
         self.state_dir().join("escrow")
     }
 
+    /// The servers' advertisements kept between runs, to fetch them
+    /// conditionally (`net::cache_advertisements_in`).
+    #[must_use]
+    pub fn advertisements(&self) -> PathBuf {
+        self.state_dir().join("advertisements")
+    }
+
     /// The client state.
     #[must_use]
     pub fn state(&self) -> PathBuf {

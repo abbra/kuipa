@@ -132,6 +132,84 @@ fn tls_config(trust: &Trust) -> Result<rustls::ClientConfig, NetError> {
     Ok(config.with_no_client_auth())
 }
 
+/// Where advertisements are kept between runs, if anywhere: see
+/// [`cache_advertisements_in`].
+static ADVERTISEMENT_CACHE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Keep fetched advertisements in `dir`, and ask servers for them
+/// conditionally (`If-None-Match`): an unchanged advertisement then costs
+/// a `304 Not Modified` instead of 25-30 KB.  What a cache answers is the
+/// bytes a server served before, and every caller verifies them again,
+/// as of now, exactly as fresh ones; the cache saves the transfer, never
+/// a check.  Set once, by the `kuipa` command; tests and other tools
+/// fetch every time.
+pub fn cache_advertisements_in(dir: std::path::PathBuf) {
+    let _ = ADVERTISEMENT_CACHE.set(dir);
+}
+
+thread_local! {
+    /// The advertisement cache for the current thread only, ahead of
+    /// [`cache_advertisements_in`]: see [`set_thread_advertisement_cache`].
+    static THREAD_ADVERTISEMENT_CACHE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keep advertisements in `dir` for the current thread only, as
+/// [`cache_advertisements_in`] does for the whole process: for tests that
+/// run in parallel.
+#[doc(hidden)]
+pub fn set_thread_advertisement_cache(dir: Option<std::path::PathBuf>) {
+    THREAD_ADVERTISEMENT_CACHE.with_borrow_mut(|d| *d = dir);
+}
+
+/// Where this thread keeps advertisements, if anywhere.
+fn advertisement_cache() -> Option<std::path::PathBuf> {
+    THREAD_ADVERTISEMENT_CACHE
+        .with_borrow(Clone::clone)
+        .or_else(|| ADVERTISEMENT_CACHE.get().cloned())
+}
+
+/// The cached advertisement for `url`: its tag and its bytes.
+fn cached_advertisement(dir: &std::path::Path, url: &str) -> Option<(String, Vec<u8>)> {
+    let bytes = std::fs::read(dir.join(cache_name(url))).ok()?;
+    let at = bytes.iter().position(|b| *b == b'\n')?;
+    let tag = std::str::from_utf8(&bytes[..at]).ok()?.to_owned();
+    Some((tag, bytes[at + 1..].to_vec()))
+}
+
+/// Keep `body`, tagged `tag`, as the advertisement for `url`: the tag on
+/// the first line, the bytes after it.  Best effort: a cache that cannot
+/// be written only costs the next fetch.
+fn cache_advertisement(dir: &std::path::Path, url: &str, tag: &str, body: &[u8]) {
+    if tag.contains('\n') || std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let mut record = Vec::with_capacity(tag.len() + 1 + body.len());
+    record.extend_from_slice(tag.as_bytes());
+    record.push(b'\n');
+    record.extend_from_slice(body);
+    let path = dir.join(cache_name(url));
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &record).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// A cache file's name: the hex SHA-256 of the URL it answers, so each
+/// server and each choice of pins and heads has its own.
+fn cache_name(url: &str) -> String {
+    use std::fmt::Write as _;
+
+    tang_pqc::primitives::sha256(&[url.as_bytes()])
+        .map(|h| {
+            h.iter().fold(String::new(), |mut hex, b| {
+                let _ = write!(hex, "{b:02x}");
+                hex
+            })
+        })
+        .unwrap_or_default()
+}
+
 thread_local! {
     /// Endpoint overrides for the current thread only, ahead of
     /// `KUIPA_ENDPOINTS`: see [`set_thread_endpoint`].
@@ -366,9 +444,59 @@ impl Endpoint {
         } else {
             format!("{}adv?{}", self.base, query.join("&"))
         };
-        let body = self.send("GET", &url, self.client.get(&url), 0)?;
+        let body = match advertisement_cache() {
+            Some(dir) => self.fetch_cached(&dir, &url)?,
+            None => self.send("GET", &url, self.client.get(&url), 0)?,
+        };
         tang_pqc::SignedAdvertisement::from_json(&body)
             .map_err(|e| NetError::Unreachable(e.to_string()))
+    }
+
+    /// `GET url` through the cache in `dir`: conditionally when a copy is
+    /// kept, and keeping what a `200` answers with its tag.
+    fn fetch_cached(&self, dir: &std::path::Path, url: &str) -> Result<Vec<u8>, NetError> {
+        let kept = cached_advertisement(dir, url);
+        let mut request = self.client.get(url);
+        if let Some((tag, _)) = &kept {
+            request = request.header(reqwest::header::IF_NONE_MATCH, tag);
+        }
+        tracing::debug!(server = %self.name, "GET {url} (0 bytes)");
+        let start = Instant::now();
+        let response = request.send().map_err(|e| Self::classify(&e));
+        let ms = start.elapsed().as_millis();
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(server = %self.name, "GET failed after {ms} ms: {e}");
+                return Err(e);
+            }
+        };
+        if response.status() == StatusCode::NOT_MODIFIED
+            && let Some((_, body)) = kept
+        {
+            tracing::debug!(
+                server = %self.name,
+                "304 Not Modified: 0 bytes in {ms} ms; the kept {} bytes, verified as fresh ones",
+                body.len()
+            );
+            return Ok(body);
+        }
+        let tag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = Self::finish(response);
+        match &body {
+            Ok(body) => {
+                tracing::debug!(server = %self.name, "200 OK: {} bytes in {ms} ms", body.len());
+                if let Some(tag) = tag {
+                    cache_advertisement(dir, url, &tag, body);
+                }
+            }
+            Err(e) => tracing::debug!(server = %self.name, "GET failed after {ms} ms: {e}"),
+        }
+        body
     }
 
     /// The realm's anchor log: entries with sequence greater than

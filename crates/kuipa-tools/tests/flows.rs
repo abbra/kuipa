@@ -4218,3 +4218,67 @@ fn a_host_pins_what_its_anchors_logs_retired() {
     assert_eq!(pins[0].retired, vec![gone.leaf(S256).unwrap()], "{pins:?}");
     kuipa_tools::net::clear_thread_endpoints();
 }
+
+#[test]
+fn a_kept_advertisement_is_fetched_conditionally() {
+    // An unchanged advertisement costs a 304 instead of its bytes; what the
+    // cache gives back is what the server served, and a tag the server no
+    // longer has brings the fresh bytes and replaces what was kept.
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let fqdn = "cached1.example.test";
+    let (keys, info, delegation) = server_keys(&anchor, fqdn);
+    let url = spawn(Arc::new(App {
+        server: Arc::new(EnrollServer::new(keys, info, delegation)),
+        peers: None,
+        limiter: kuipad::limit::Limiter::default(),
+        tang: None,
+        keys: None,
+        ledger: None,
+        directory: Dir::default(),
+    }));
+    kuipa_tools::net::set_thread_endpoint(fqdn, &url);
+    let dir = std::env::temp_dir().join(format!("kuipa-flows-adv-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    kuipa_tools::net::set_thread_advertisement_cache(Some(dir.clone()));
+    let pins = [*anchor.public().thumbprint()];
+    let endpoint =
+        kuipa_tools::net::Endpoint::new(fqdn, &kuipa_tools::net::Trust::FirstContact).unwrap();
+
+    let fresh = endpoint.advertisement(&pins).unwrap().to_json();
+    let kept: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_none() && !p.ends_with(".writable"))
+        .collect();
+    let [file] = kept.as_slice() else {
+        panic!("one advertisement kept: {kept:?}");
+    };
+    let record = std::fs::read(file).unwrap();
+    let at = record.iter().position(|b| *b == b'\n').unwrap();
+    let tag = std::str::from_utf8(&record[..at]).unwrap().to_owned();
+    assert_eq!(&record[at + 1..], fresh.as_bytes());
+
+    // The server answers a matching tag with 304 and no body.
+    let http = reqwest::blocking::Client::new();
+    let anchor_q = format!("{url}/ipa/ku/adv?anchor={}", pins[0]);
+    let unchanged = http
+        .get(&anchor_q)
+        .header("If-None-Match", &tag)
+        .send()
+        .unwrap();
+    assert_eq!(unchanged.status(), 304);
+    assert!(unchanged.bytes().unwrap().is_empty());
+    // The client then answers the kept bytes, the same as fresh ones.
+    assert_eq!(endpoint.advertisement(&pins).unwrap().to_json(), fresh);
+
+    // A tag the server does not have: the fresh bytes, kept again.
+    let mut stale = b"\"not-this-one\"\n".to_vec();
+    stale.extend_from_slice(b"{}");
+    std::fs::write(file, stale).unwrap();
+    assert_eq!(endpoint.advertisement(&pins).unwrap().to_json(), fresh);
+    assert_eq!(std::fs::read(file).unwrap(), record);
+
+    kuipa_tools::net::set_thread_advertisement_cache(None);
+    kuipa_tools::net::clear_thread_endpoints();
+    let _ = std::fs::remove_dir_all(&dir);
+}

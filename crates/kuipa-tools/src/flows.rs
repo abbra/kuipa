@@ -2953,5 +2953,10 @@ pub fn leave(paths: &Paths) -> Result<Value, Error> {
     ] {
         paths::remove(&p)?;
     }
+    // The kept advertisements are only a cache: gone with the rest.
+    match fs::remove_dir_all(paths.advertisements()) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     Ok(json!({ "left": true }))
 }

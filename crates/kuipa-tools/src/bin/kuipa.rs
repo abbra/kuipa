@@ -2834,6 +2834,31 @@ fn render_seal(value: &Value) {
     }
 }
 
+/// Where to keep the servers' advertisements between runs: the host's
+/// state directory once the host is enrolled and this process may write
+/// there (root, or a `KUIPA_ROOT` of the caller's), else the user's own
+/// kuipa directory once it exists; none otherwise.  Nothing is created
+/// outside a directory kuipa already keeps.
+fn advertisement_cache(paths: &Paths) -> Option<std::path::PathBuf> {
+    let usable = |dir: std::path::PathBuf| {
+        (std::fs::create_dir(&dir).is_ok() || dir.is_dir())
+            && std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(".writable"))
+                .is_ok()
+    };
+    let host = paths.state().exists().then(|| paths.advertisements());
+    let user = kuipa_tools::seal::UserPaths::from_env()
+        .ok()
+        .filter(|u| u.device_key().parent().is_some_and(std::path::Path::is_dir))
+        .map(|u| u.advertisements());
+    [host, user]
+        .into_iter()
+        .flatten()
+        .find(|d| usable(d.clone()))
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let paths = Paths::from_env();
@@ -2847,6 +2872,9 @@ fn main() -> ExitCode {
     });
     let args = cli.args();
     tracing::debug!("kuipa {}", args.command);
+    if let Some(dir) = advertisement_cache(&paths) {
+        kuipa_tools::net::cache_advertisements_in(dir);
+    }
     let result = match &cli.command {
         Command::Seal { action } => run_seal(&paths, action),
         Command::Escrow { action } => run_escrow(&paths, action),
