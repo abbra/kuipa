@@ -168,6 +168,13 @@ Install and refresh the information about deployments this deployment trusts —
 their Kerberos KDCs and PKINIT anchors, verified — so their users can log in
 here; remove the others. Run at enrollment and from a timer.
 
+A trusted deployment whose KDCs are not reachable from here is reached
+through its KDC proxies (MS-KKDCP, FreeIPA's */KdcProxy*) when this
+deployment lists them for it, or else when it advertises them for
+itself: its *krb5.conf.d* snippet then names the proxy URLs as its
+*kdc*s, with *http_anchors* set to its IPA CA unless the proxies use
+the system's trust store.  MIT Kerberos only.
+
 ## advertisement
 
 Print what each server of the deployment advertises, verified against

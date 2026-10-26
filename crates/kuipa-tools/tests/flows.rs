@@ -16,7 +16,7 @@ use kuipa_enroll::epoch::{AnchorEpoch, SignedEpoch};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::payload::{Enrollment, RealmConfig};
-use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys};
+use kuipa_enroll::realm::{Deployment, KdcProxy, ProxyCa, RealmInfo, ServerKeys};
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::Paths;
@@ -1800,6 +1800,41 @@ struct TrustHeads {
     delegation: kuipa_enroll::delegation::Delegation,
 }
 
+/// What A lists for B's KDCs: the `KdcProxy` on B's IPA server, whose
+/// certificate B's IPA CA issued.
+fn b_kdc_proxy() -> KdcProxy {
+    KdcProxy {
+        urls: vec!["https://trustB1.example.test/KdcProxy".into()],
+        ca: ProxyCa::Realm,
+    }
+}
+
+/// B's snippet as installed in [`trust_heads_tail`]: A's word on B's KDC
+/// proxy wins over the front end B advertises for itself, and replaces
+/// B's KDCs, which are not reachable.
+fn assert_b_through_kdc_proxy(paths: &TempRoot, result: &serde_json::Value) {
+    let snippet = std::fs::read_to_string(paths.trust_krb5_conf("B.TEST")).unwrap();
+    let ca = paths.trust_dir("B.TEST").join("ca.crt");
+    assert!(
+        snippet.contains("kdc = https://trustB1.example.test/KdcProxy\n"),
+        "{snippet}"
+    );
+    assert!(
+        snippet.contains(&format!("http_anchors = FILE:{}\n", ca.display())),
+        "{snippet}"
+    );
+    assert!(!snippet.contains(":88"), "{snippet}");
+    assert!(!snippet.contains("id.b.test"), "{snippet}");
+    assert_eq!(
+        synta_certificate::pem_to_der(&std::fs::read(&ca).unwrap()),
+        [CA.to_vec()]
+    );
+    assert_eq!(
+        result["trusted_realms"][0]["kdc_proxy"][0], "https://trustB1.example.test/KdcProxy",
+        "{result}"
+    );
+}
+
 /// Realm A's trust of B, with B's heads, once A's server is up.
 fn trust_heads_tail(state: TrustHeads) {
     let TrustHeads {
@@ -1823,7 +1858,7 @@ fn trust_heads_tail(state: TrustHeads) {
         servers: vec!["trustB1.example.test".into()],
         anchors: vec![b_pin],
         heads: b_server.heads(),
-        kdc_proxy: None,
+        kdc_proxy: Some(b_kdc_proxy()),
     };
     // A, advertising the trust: B's entry with its heads, as kuipad's
     // refresh would publish it.
@@ -1869,6 +1904,8 @@ fn trust_heads_tail(state: TrustHeads) {
     assert_eq!(pins.len(), 1);
     assert_eq!(pins[0].anchor, b_pin);
     assert_eq!(pins[0].heads, vec![b_head], "B's head is pinned");
+
+    assert_b_through_kdc_proxy(&paths, &result);
 
     // B's next refresh verifies through the pinned head with no
     // signature served: ask B's advertisement with the head and check
@@ -1979,7 +2016,12 @@ fn trusted_realms_pins_and_uses_the_partners_heads() {
         anchors: vec![b_pin],
         heads: Vec::new(),
         trusts: Vec::new(),
-        kdc_proxy: None,
+        // A public front end B advertises for itself: what a host of A
+        // would use had A's entry for B named none.
+        kdc_proxy: Some(KdcProxy {
+            urls: vec!["https://id.b.test/KdcProxy".into()],
+            ca: ProxyCa::System,
+        }),
     };
     let b_claim = b_delegation.claim().unwrap();
     let b_vouch = SignedVouch::issue(

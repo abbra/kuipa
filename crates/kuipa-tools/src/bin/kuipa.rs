@@ -1881,6 +1881,7 @@ fn render_trusted_realms(value: &Value, paths: &Paths) {
         rows.field("verified through", get(t, "server"));
         rows.field("why it is not installed", get(t, "error"));
         rows.field("krb5.conf.d snippet", get(t, "krb5_conf"));
+        rows.field("KDCs reached through", get(t, "kdc_proxy"));
         if let Some(realm) = get(t, "realm").as_str() {
             rows.path("anchors, PKINIT anchors and CA", &paths.trust_dir(realm));
         }
@@ -1908,6 +1909,7 @@ fn render_advertisement(value: &Value, paths: &Paths) {
         rows.field("advertises realm", get(s, "realm"));
         rows.field("domain", get(s, "domain"));
         rows.field("KDCs", get(s, "kdcs"));
+        rows.field("KDC proxies", get(s, "kdc_proxy"));
         rows.field("advertisement signed by", get(s, "signer"));
         rows.field("delegated by this pinned anchor", get(s, "proven_by"));
         rows.left("its delegation", get(s, "delegation_days_left"), "days");
