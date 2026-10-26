@@ -309,13 +309,18 @@ impl ExchangeKeyPair {
         Ok(pair)
     }
 
-    /// Wrap an OpenSSL ML-KEM private key.
+    /// Wrap an OpenSSL ML-KEM private key.  The public half is rebuilt from
+    /// its raw bytes in the default provider: encapsulating to it is a
+    /// public operation, and a key held elsewhere (a PKCS#11 token) need
+    /// not be able to do it.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedKey`] if it is not ML-KEM-768 or ML-KEM-1024.
+    /// [`Error::UnsupportedKey`] if it is not ML-KEM-768 or ML-KEM-1024,
+    /// or an OpenSSL error exporting or importing the public key.
     pub fn from_pkey(pkey: Pkey<Private>) -> Result<Self> {
-        let public = ExchangeKey::from_pkey(Pkey::<Public>::from(pkey.clone()))?;
+        let held = ExchangeKey::from_pkey(Pkey::<Public>::from(pkey.clone()))?;
+        let public = ExchangeKey::from_bytes(held.alg, &held.encoded)?;
         Ok(Self {
             pkey,
             public,
