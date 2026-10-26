@@ -342,9 +342,12 @@ An auditor with no account replays a server's whole log from its public
 routes with `kuipa-audit tlog --server ipa1.example.test --state FILE`.
 It checks the head against the key ipa1's verified advertisement names,
 replays every leaf, and counts them by kind (`vault-device`,
-`escrow-release` and so on), without learning whose vault any of them
-concerns. Run again later, it requires the log to extend the head it
-recorded.
+`escrow-release` and so on). That is all it can learn: each leaf shows
+its kind and its day, and seals who it is about and what happened into a
+commitment that only the watch's lookup opens. Run again later, it
+requires the log to extend the head it recorded. (The playground's
+servers publish every event at once, so the session's watches see what
+its steps just did; a real server publishes its log once an hour.)
 
 The playground also runs a witness, whose key both servers trust
 (`kuipad add-witness-key` on a real server). `kuipa-witness run --once`

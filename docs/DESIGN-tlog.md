@@ -9,29 +9,30 @@ hold such events, and the order in which it replaces the claim log.
 
 | § | piece | what it adds | status |
 |---|---|---|---|
-| 1 | typed leaves | a kind inside every hashed leaf; an opaque subject index | implemented (`kuipa-enroll::tlog`) |
+| 1 | typed leaves | a kind inside every hashed leaf; users' and hosts' events committed, opened only to their subject | implemented (`kuipa-enroll::tlog`) |
 | 2 | tombstones | retiring a leaf appends, so heads only ever extend | implemented |
 | 3 | signed heads, consistency proofs | RFC 9162 consistency instead of refetching | implemented |
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented: `kuipa-witness`, served cosignatures |
-| 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, public routes | implemented (paged routes; tiles planned) |
-| 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow and Keys events, with receipts and lookups |
+| 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, openings kept for 13 months, heads published hourly, public routes | implemented (paged routes; tiles planned) |
+| 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow, signing and Keys events, with receipts and lookups |
 | 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | implemented |
 | 8 | claim-log migration | claims as kind-1 leaves, tombstones instead of restarts, the live tree, retired claims on hosts | implemented |
-| 9 | what a public reader learns | the attack model on the public routes, and its mitigations | analysis; mitigations proposed |
+| 9 | what a public reader learns | the attack model on the public routes | the mitigations are implemented (§1, §5) |
 
 ## 1. Typed leaves
 
 **The hash `H`.** A log is hashed with its server signing key's hash:
 SHA-256 for ML-DSA-44 and 65, SHA-384 for ML-DSA-87 (DESIGN.md §4.1.1).
 A CNSA 2.0 crypto policy allows only ML-DSA-87, so a CNSA log is SHA-384
-throughout: its id, leaf hashes, indexes, heads, proofs and receipts.
+throughout: its id, leaf hashes, commitments, heads, proofs and receipts.
 Every hash on the wire below is length prefixed, 32 or 48 bytes, and a
 verifier refuses a head or receipt whose hashes are not those of the
 key that signed it.
 
 A leaf is `IPLF ‖ 1 ‖ kind(2) ‖ time(u64) ‖ index(h) ‖ body` and its
-tree hash is RFC 9162's `H(0x00 ‖ leaf)`. A leaf whose index is not of
-the log's hash does not join the log. The kind sits inside the hashed
+tree hash is RFC 9162's `H(0x00 ‖ leaf)`. `index` is zeros of `H`'s
+length, which name the log's hash: a leaf whose index is of another
+length does not join the log. The kind sits inside the hashed
 bytes, so two leaves with the same body but different kinds are
 different leaves. A claim leaf can therefore never be read as a vault
 event. Unknown kinds parse, so mirrors and monitors keep working when a
@@ -48,14 +49,25 @@ server logs kinds they do not know yet.
 | 7 | token key epoch |
 | 0xFFFF | tombstone (§2) |
 
-`index` is `HMAC-H(k_index, subject)`. The subject is a vault id
-or a principal, and `k_index` is the logging server's own key (§5). The
-index lets the public log be mirrored and audited without listing who
-it is about. Only the server that logged a leaf, answering an
-authenticated lookup (§6), maps a subject to it. Servers use different
-keys, so an auditor reading two servers' logs cannot tell that two
-leaves concern the same vault. Leaves without a subject use zeros of
-`H`'s length.
+**Committed leaves.** Kinds 2 to 6 are the events of users and hosts.
+Their leaves are committed, so the public log says of each only its
+kind and its day (§9 says why):
+- `time` is the start of the event's day, UTC;
+- `body` is `IPLM ‖ 1 ‖ C`, with `C = H("ipa-ku-log/v1 commitment" ‖
+  opening)`;
+- the **opening** is `IPLO ‖ 1 ‖ kind(2) ‖ time(u64) ‖ salt(32) ‖
+  subject ‖ event`: the exact time, 32 random bytes, the subject (a
+  vault id or a principal) and the event, each length prefixed where
+  variable.
+
+`C` is binding: no other kind, time, subject or event opens the leaf, so
+a server cannot open it to something else later. It is hiding while the
+salt stays secret, so nobody can test a guess against it. A log refuses
+a committed leaf with any other index, a time within its day, or a body
+that is no commitment (`Log::check`). The server keeps the openings
+(§5) and reveals one only to its subject, in a lookup (§6), who checks
+that it opens its leaf. Claims, token keys and tombstones are public by
+nature and stay in the clear.
 
 Each server keeps its own log, `LogId = H("ipa-ku-log/v1 id" ‖
 len(realm) ‖ realm ‖ server)`, 32 or 48 bytes. Events go to the log of
@@ -165,14 +177,15 @@ comes from the system crypto policy (`Policy::from_system`).
 ## 6. Producers and receipts
 
 `EnrollServer` takes a `Ledger` (`with_ledger`). The default,
-`NoLedger`, records nothing; `kuipad` will implement one over its store
-(§5). Each event is appended after the operation's checks pass and
-before anything is stored or answered. A failed append refuses the
-request:
+`NoLedger`, records nothing; `kuipad` implements one over its store
+(§5). The server makes each event's opening, with its exact time and a
+fresh salt, and the ledger appends its leaf and keeps the opening. Each
+event is appended after the operation's checks pass and before anything
+is stored or answered. A failed append refuses the request:
 - a vault change is not stored;
 - an escrow share or offline session key is not released.
 
-| event | kind | subject | body |
+| event | kind | subject | event, in the opening |
 |---|---|---|---|
 | vault created, policy set, revoked | 3 | vault id | `IPLV`: action, `H` of the policy (zeros for revoke) |
 | vault shared or unshared (DESIGN.md §7.6.12) | 3 | vault id | `IPLV`: share or unshare, `H` of the managers, members and depositors after the change (depositors left out when there are none) |
@@ -182,14 +195,16 @@ request:
 | session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |
 | release requested, approved, denied (DESIGN-approvals.md) | 4 | vault id | `IPLV`: action, `H` of the request, or of `id ‖ " " ‖ approver` |
 | server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` (its KEM's suite hash, DESIGN.md §4.1.1) |
+| signing statement (DESIGN-sign.md) | 5 | the caller's principal | `IPGS`: purpose, batch size and root, time |
 | Keys fetch | 6 | the caller's principal | the `IPKG` fetch |
 
-Reads (`show`, `list`) and binding registration record nothing. Vault
-bodies never name the vault or its owner: the leaf's index stands for
-the vault. Opening machine (keytab) bindings is not recorded yet.
+Reads (`show`, `list`) and binding registration record nothing. Only the
+opening holds the event and its subject: the public leaf has neither.
+Opening machine (keytab) bindings is not recorded yet.
 
 A **receipt** (`IPLP`) is the server's signature, under
-`ipa-ku-log/v1 receipt`, over `log ‖ index ‖ leaf hash ‖ time`. Vault
+`ipa-ku-log/v1 receipt`, over `log ‖ index ‖ leaf hash ‖ time`, the
+event's exact time. Vault
 answers carry one per change, which is why `IPVR` moves to version 2.
 The signature is separate from the sealed answer around it, so a client
 can show a third party a promise the log did not keep. `proven_by`
@@ -202,19 +217,26 @@ their answers; owners find them through lookups.
 operation, labelled `tlog` in the transcript. Its data is `IPLQ ‖ 1 ‖
 vault ‖ from(u64)`:
 - naming a vault the caller owns asks for that vault's entries;
-- an empty name asks for those about the caller's principal (Keys
-  fetches, for a host).
+- an empty name asks for those about the caller's principal: signing
+  statements, and Keys fetches for a host.
 
 Nobody can look up another principal's entries, so auditors work from
-the public log (§5). The answer is `IPLR ‖ 1 ‖ signer(JWK) ‖ head(IPLS,
-empty for an empty log) ‖ n(u64) ‖ [index ‖ leaf(IPLF) ‖ m(1) ‖
-[hash(h)]]`. Each entry carries its inclusion path in the head. At most
-1024 entries come in one answer, and the client pages on with `from`.
+the public log (§5). The server finds the entries through the openings
+it keeps, so a lookup reaches back as far as the retention (§5). The
+answer is `IPLR ‖ 1 ‖ signer(JWK) ‖ head(IPLS, empty for an empty log) ‖
+n(u64) ‖ [index ‖ leaf(IPLF) ‖ m(1) ‖ [hash(h)] ‖ opening(IPLO)]`. Each
+entry carries its inclusion path in the head, which is the head being
+published (§5), and its opening. At most 1024 entries come in one
+answer, and the client pages on with `from`.
 
-The client accepts an answer only if three checks pass:
+The client accepts an answer only if four checks pass:
 - the signer key's thumbprint is the one its verified advertisement names;
 - the head's signature checks;
-- every entry is included in the head.
+- every entry is included in the head;
+- every opening opens its entry's leaf.
+
+That an opening is about the subject asked for is the client's own check
+(§7).
 
 Per-user completeness is not proven: a server could leave an entry out
 of an answer. Omissions are left to public auditing and witnesses; a
@@ -225,20 +247,37 @@ prefix-tree map would need a post-quantum VRF.
 `kuipad` keeps its log under the key directory:
 
 ```text
-tlog/index.key          the server's index key: 32 random bytes, 0600
-tlog/<log id>/leaves    the leaves in order, each a u32 length ‖ IPLF
+tlog/<log id>/leaves             the public leaves in order, each a u32 length ‖ IPLF
+tlog/<log id>/openings/YYYY-MM   the openings of the events of that month (UTC),
+                                 each a u32 length ‖ position(u64) ‖ IPLO, 0600
 ```
 
 The log id is in lowercase hex: 64 digits for a SHA-256 log, 96 for a
-SHA-384 one. A leaf is checked (`Log::check`),
-written and synced before it joins the in-memory log, so an append the
-server acknowledged survives a crash. A record cut short by a crash
-mid-write was never acknowledged, and is dropped when the store opens.
-A malformed complete record stops the daemon instead of being skipped.
+SHA-384 one. A leaf is checked (`Log::check`). Its opening is written
+and synced first, then the leaf, before it joins the in-memory log, so
+an append the server acknowledged survives a crash. A record cut short
+by a crash mid-write was never acknowledged, and is dropped when the
+store opens, and so is an opening whose leaf was never written. A
+malformed complete record, or an opening that does not open the leaf at
+its position, stops the daemon instead of being skipped.
 
-The head is signed with the server's signing key. It is signed again
-when the log has grown, or when the last signature is an hour old,
-since monitors want a recent time.
+**Retention.** A month's openings are deleted once the month is older
+than `tlog_retention_months` (13 by default): at start-up, and at the
+first event of each month. The month's leaves stay and keep verifying,
+but nobody, the server included, can say any more what they were or whom
+they were about, and lookups no longer find them. A stolen store exposes
+at most the retained months.
+
+**Publication.** The head is signed with the server's signing key, once
+per `tlog_head_interval` (an hour by default), when first asked for in a
+period. It covers the leaves appended **before the period began**: the
+period's own events wait for the next head, and the routes below serve
+nothing past the head being published. Someone polling the head learns
+how many events each period had, not when within it each one came. A
+quiet period still gets a new signature, since monitors want a recent
+time. An interval of zero publishes every append at once and re-signs a
+head when the log grows or the signature is an hour old; tests and the
+playground use it, servers should not.
 
 The routes are public, like the claim log:
 
@@ -249,9 +288,9 @@ The routes are public, like the claim log:
 | GET | `/ipa/ku/tlog/{id}/proof?index=i&size=n` | JSON `{path}`: leaf `i` in the tree of `n` leaves |
 | GET | `/ipa/ku/tlog/{id}/consistency?from=m&size=n` | JSON `{proof}`: the tree of `m` leaves is a prefix of the tree of `n` |
 
-Proofs are served at any size up to the current one, the size of a head
-the client holds, so a client never needs the newest head to check an
-old receipt. An id other than the server's own answers 404.
+Proofs are served at any size up to the published one, the size of a
+head the client holds, so a client never needs the newest head to check
+an old receipt. An id other than the server's own answers 404.
 
 A tlog-tiles layout, a C2SP signed-note checkpoint encoding, and a
 witness endpoint come with interoperable witnesses, once the ML-DSA note
@@ -268,6 +307,10 @@ the host's `realm.json` lists, it does three things:
   `GET …/consistency` otherwise. A smaller log, an empty one, or another
   server's log id counts as **forked**. The state is not advanced
   past a fork.
+- **Open.** It reads each entry's event and exact time from its opening,
+  which the answer's check made sure opens the leaf. An entry without an
+  opening, or opened to another vault's event, is flagged: the server is
+  hiding what it did.
 - **List and flag.** It lists every new entry, and flags those the vault
   descriptor stored on this host does not account for:
   - a device it does not list added, or starting a session or receiving
@@ -304,7 +347,8 @@ account, and only `--state` writes, to the file it names:
 
 The report is `verified`, `empty`, `forked: …` (exit status 2), or
 `unchecked: …` for a log larger than one run reads (2²⁰ leaves). It
-counts the leaves by kind, and names nobody. Leaves carry only indexes.
+counts the leaves by kind, and names nobody: committed leaves carry only
+their kind, their day and a commitment.
 
 ## 8. Claim logs on typed leaves
 
@@ -345,14 +389,12 @@ and no page walk.
 
 ## 9. What a public reader learns
 
-§1 gives the index one job: to let the public log be mirrored and
-audited "without listing who it is about". This section checks that
-claim against an attacker who reads the public routes (§5), a mirror of
-them, or a witness's copy. §4 and §6 cover the logs' *integrity*: forks
-and omissions. This section covers what the log *says*.
+The log's integrity is §3 and §4's: forks and omissions. This section is
+about what the log *says*, to an attacker who reads the public routes
+(§5), a mirror of them, or a witness's copy.
 
-**The attacker** reads every leaf of every server's log, for as long as
-it likes. It cannot read lookups (§6), which are sealed and
+**The attacker** reads every published leaf of every server's log, for
+as long as it likes. It cannot read lookups (§6), which are sealed and
 Kerberos-only. It may hold side information:
 - a signed statement it was handed, such as a public git commit;
 - a copy of a sealed file, such as from a backup;
@@ -362,56 +404,37 @@ Kerberos-only. It may hold side information:
   calendar;
 - a short list of likely policies, or group and member names.
 
-**What every leaf shows**, in the clear: its kind, its time to the
-second, its index, and its body. The body never names a vault, an
-owner, or a principal. It does hold:
-- **device ids**: `IPLV` device field, the device key's RFC 7638
-  thumbprint, for device, session and release events;
-- **unkeyed digests**: `log_digest`, the suite hash `H` with no key:
-  - the policy, for create and set;
-  - the managers, members and depositors, for share and unshare;
-  - the binding's `H(ct)`, for a release;
-  - a deposit's sealed file or id;
-- for signing statements: the purpose, the batch size and root, and the
-  time.
+**What a committed leaf shows**: its kind, its day, and a commitment (§1).
+Not the subject, not the event, not the time within the day, and nothing
+that two leaves have in common.
 
-| # | the attacker has | it learns | because |
+An earlier design published the event and a per-server pseudonym of its
+subject, `HMAC(server key, subject)`, in every leaf. Against it the
+attacker learned the following. The table says what closes each.
+
+| # | the attacker has | it learned | closed by |
 |---|---|---|---|
-| 1 | the public log alone | an activity profile per index on one server: how many devices, sessions, releases and approval steps, and when | the index is a stable pseudonym on one server (§1); the index key is never rotated (§5) |
-| 2 | one signed statement | that signer's index on that server, and so every statement it signed there: count, purposes, times. For a host, also its Keys fetches | the statement names its log and leaf position (`DESIGN-sign.md` §1), and signing and Keys leaves are both indexed by the caller's principal |
-| 3 | a copy of a sealed file | when that file was opened and from which device, and its vault's index, so 1 for the whole vault | release bodies carry `H(ct)`, computable from the binding in the file |
-| 4 | a vault's device ids | the vault's index on **every** server, defeating the per-server index keys | device ids are global thumbprints, in the clear |
-| 5 | guesses of policies or names | which vaults use a given policy, or a given membership, by testing digests offline | policy and membership digests are unkeyed hashes of low-entropy data |
-| 6 | the time someone acted | the leaf that matches, and so their index, and then 1 | times are exact to the second, and most logs are sparse |
-| 7 | a server's `index.key` (a compromise, a backup) | the subject of every past and future leaf in that server's log | one key for the log's whole life (§5): no forward secrecy for pseudonyms |
-| 8 | the public log alone | the realm's activity by kind and hour; replica promotions (kind 6) | kinds and times are public |
+| 1 | the public log alone | an activity profile per pseudonym on one server: how many devices, sessions, releases and approval steps, and when | committed leaves carry no index: no two can be linked (§1) |
+| 2 | one signed statement | the signer's pseudonym from the leaf the statement names, and so every statement it signed there, and a host's Keys fetches | the leaf it names is committed: kind 5 and a day, nothing else |
+| 3 | a copy of a sealed file | when the file was opened and from which device, by the binding's `H(ct)` in the release | `H(ct)` is inside the commitment, which a guess cannot be tested against |
+| 4 | a vault's device ids | the vault's pseudonym on every server, from the ids in the clear | device ids are inside the commitment |
+| 5 | guesses of policies or names | which vaults use a policy or a membership, by testing unkeyed digests | the digests are inside the commitment |
+| 6 | the time someone acted | the matching leaf, then row 1 | leaves show only the day; heads are published once a period, over the leaves before it (§5) |
+| 7 | a server's index key | every subject, past and future | there is no index key; a stolen store exposes the openings of the retained months only (§5) |
 
-**What it does not learn:**
-- the content of any sealed file or keytab;
-- any key or share;
-- the name behind an index, without the side information above;
-- anything about a lookup.
+**What remains public**, by design:
+- the kinds of events, how many there are per day, and how many per
+  publication period, which is what auditors and witnesses count;
+- a statement's log position, which its holder can find in the log: a
+  kind-5 leaf of some day;
+- replica promotions in kind 6, as a count.
 
-The claim logs (§8) are public in full on purpose: they list the servers
-each anchor vouches for, which every advertisement already shows.
+**Against the logging server itself** none of this helps: it makes the
+openings and knows who asks, as for tang-pqc recoveries (DESIGN.md
+§7.2). A subject's watch (§7) can check every opening it is given, but
+not that it was given all of them (§6).
 
-**Accepted by design.** Rows 2 and 8 follow from the logs' purpose.
-A signer *wants* its statements found, and an auditor needs kinds and
-counts. Row 2 still lets anyone who sees one public signature count all
-of a person's signatures on that server. Say so to signers.
-
-**Mitigations**, none implemented yet:
-
-| # | change | addresses | cost |
-|---|---|---|---|
-| a | key every body digest: `HMAC-H(k_index, …)` in place of `H(…)` | 3, 5 | owners still verify through lookups, which the server answers. A third party can no longer match a digest it computed, which is the point |
-| b | log a per-server keyed device id: `HMAC-H(k_index, device id)` | 4 | `kuipa tlog watch` matches devices through the lookup's answers, not the raw id |
-| c | rotate the index key per epoch (for example monthly), keeping old keys for lookups only, and delete them on a schedule | 1, 7 | a subject's leaves link only within an epoch; a stolen key exposes one epoch; lookups map a subject once per kept epoch |
-| d | coarse leaf times in the public body (to the hour), with the exact time only in receipts and lookups | 6 | witnesses and auditors lose exact ordering by time, but not by position |
-| e | index signing leaves by a per-statement value, and let the lookup map the principal to them | 2 | a published statement no longer links the signer's others; the signer still finds them all |
-
-(a), (b) and (d) change leaf bodies, so they need a new body version.
-Old leaves stay as they are. (c) and (e) change only how indexes are
-made, so the leaf format stays. None of them helps against the logging
-server itself: it holds the keys and knows who asks, as for tang-pqc
-recoveries (DESIGN.md §7.2).
+**The cost.** Owners and subjects see their events only through lookups,
+for as long as the retention lasts, and only once a head covering them
+is published: up to one `tlog_head_interval` after the event. Receipts
+are signed at once, and prove against that head when it comes.

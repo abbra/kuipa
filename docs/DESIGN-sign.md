@@ -48,11 +48,12 @@ The server, in order:
 3. Builds the **batch**: an RFC 9162 tree over the digests' leaves,
    `H(0x00 ‖ IPGL ‖ 1 ‖ alg ‖ digest)`, in request order. One statement
    covers them all.
-4. Appends a kind-5 leaf to its log. Its index is the caller's
-   principal, and its body is `IPGS ‖ 1 ‖ purpose ‖ batch size ‖ batch
-   root ‖ time`, with no name in it. A server that keeps no log
-   refuses, because a statement nobody can find in a log is one its
-   signer cannot monitor.
+4. Appends a kind-5 leaf to its log, committed (DESIGN-tlog.md §1): its
+   opening holds the caller's principal as the subject and `IPGS ‖ 1 ‖
+   purpose ‖ batch size ‖ batch root ‖ time` as the event, and the
+   public leaf only the kind, the day and the commitment. A server that
+   keeps no log refuses, because a statement nobody can find in a log is
+   one its signer cannot monitor.
 5. Signs the **statement** under the ML-DSA context `ipa-ku-sign/v1
    statement`, with the log's position in it:
 
@@ -95,10 +96,13 @@ policy refuses anything else.
 
 ## 3. Monitoring
 
-Each statement's log leaf is indexed by its signer. A principal's
-lookup with no vault named (DESIGN-tlog.md §6) lists everything signed
-in its name. Auditors see statements counted by kind, without names
-(`kuipa-audit tlog`).
+Each statement's log leaf is committed, with the signer as the subject
+of its opening. A principal's lookup with no vault named
+(DESIGN-tlog.md §6) lists everything signed in its name, with the
+openings. Auditors see statements counted by kind and day, without
+names or purposes (`kuipa-audit tlog`). A statement names its log
+position, so whoever holds one can find its leaf, and learns nothing
+from it beyond its kind and day: not the signer's other statements.
 
 ## 4. Clients
 

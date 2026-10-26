@@ -193,8 +193,13 @@ start. The first watch only records where each log stands; run it once soon afte
 creating a vault. A periodic job (a systemd user timer, cron) can run it
 for you: it exits non-zero when something needs a look.
 
-The log never names you or your vault, only an opaque index, so anyone
-can audit it without learning whose vault an entry is about.
+What anyone can read in the log is only what kind of event each entry
+is and on which day it happened. Who it is about, what it was and when
+in the day are sealed into it, and only your lookups, with your ticket,
+open them, so anyone can audit the log without learning anything about
+your vault. The servers keep those openings for 13 months (as the realm
+sets it), so a watch reaches that far back. A server publishes its log
+once an hour, so an event shows up in your watch within the hour.
 
 ### You lost a laptop
 

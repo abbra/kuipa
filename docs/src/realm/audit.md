@@ -95,6 +95,23 @@ check the entries about their own vaults with `kuipa tlog watch`
 Anyone can read the whole log at `/ipa/ku/tlog/<log id>/`, with no
 login.
 
+What anyone can read is only each entry's kind (a device change, a
+release, a statement…) and its day. Who an entry is about, what exactly
+happened and when in the day are sealed into the entry; the server keeps
+the key to each one and opens it only for the user or host the entry is
+about, in their own lookups. Two settings in `kuipad.json` decide how
+much the public log gives away:
+
+* `tlog_head_interval` (3600 seconds): the server publishes a new head
+  once per interval, covering what happened before the interval began.
+  Watching the log grow then shows how many events an hour had, not
+  when each one happened. Users see their own events in `kuipa tlog
+  watch` within the interval.
+* `tlog_retention_months` (13): how long the server keeps the means to
+  open its entries. Older entries stay in the log and keep it
+  verifiable, but nobody can look them up or say whom they were about,
+  even with the server's disk.
+
 A log is only useful if everyone sees the same one. A server could show
 one history to its auditors and another to a user. **Witnesses** stop
 that from going unnoticed. A witness is a small program, run by someone
