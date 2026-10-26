@@ -17,6 +17,7 @@ hold such events, and the order in which it replaces the claim log.
 | 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow and Keys events, with receipts and lookups |
 | 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | implemented |
 | 8 | claim-log migration | claims as kind-1 leaves, tombstones instead of restarts, the live tree, retired claims on hosts | implemented |
+| 9 | what a public reader learns | the attack model on the public routes, and its mitigations | analysis; mitigations proposed |
 
 ## 1. Typed leaves
 
@@ -341,3 +342,76 @@ read-only `kuipa advertisement`. Extending a window reads the head's
 vouch once and checks both prefixes against it: the old head's and the
 new one's. The vouch carries every entry, so the check needs no proof
 and no page walk.
+
+## 9. What a public reader learns
+
+§1 gives the index one job: to let the public log be mirrored and
+audited "without listing who it is about". This section checks that
+claim against an attacker who reads the public routes (§5), a mirror of
+them, or a witness's copy. §4 and §6 cover the logs' *integrity*: forks
+and omissions. This section covers what the log *says*.
+
+**The attacker** reads every leaf of every server's log, for as long as
+it likes. It cannot read lookups (§6), which are sealed and
+Kerberos-only. It may hold side information:
+- a signed statement it was handed, such as a public git commit;
+- a copy of a sealed file, such as from a backup;
+- a vault's device ids, as any member of a shared vault sees them in the
+  vault descriptor;
+- when someone did something, such as from a ticket, a chat, or a
+  calendar;
+- a short list of likely policies, or group and member names.
+
+**What every leaf shows**, in the clear: its kind, its time to the
+second, its index, and its body. The body never names a vault, an
+owner, or a principal. It does hold:
+- **device ids**: `IPLV` device field, the device key's RFC 7638
+  thumbprint, for device, session and release events;
+- **unkeyed digests**: `log_digest`, the suite hash `H` with no key:
+  - the policy, for create and set;
+  - the managers, members and depositors, for share and unshare;
+  - the binding's `H(ct)`, for a release;
+  - a deposit's sealed file or id;
+- for signing statements: the purpose, the batch size and root, and the
+  time.
+
+| # | the attacker has | it learns | because |
+|---|---|---|---|
+| 1 | the public log alone | an activity profile per index on one server: how many devices, sessions, releases and approval steps, and when | the index is a stable pseudonym on one server (§1); the index key is never rotated (§5) |
+| 2 | one signed statement | that signer's index on that server, and so every statement it signed there: count, purposes, times. For a host, also its Keys fetches | the statement names its log and leaf position (`DESIGN-sign.md` §1), and signing and Keys leaves are both indexed by the caller's principal |
+| 3 | a copy of a sealed file | when that file was opened and from which device, and its vault's index, so 1 for the whole vault | release bodies carry `H(ct)`, computable from the binding in the file |
+| 4 | a vault's device ids | the vault's index on **every** server, defeating the per-server index keys | device ids are global thumbprints, in the clear |
+| 5 | guesses of policies or names | which vaults use a given policy, or a given membership, by testing digests offline | policy and membership digests are unkeyed hashes of low-entropy data |
+| 6 | the time someone acted | the leaf that matches, and so their index, and then 1 | times are exact to the second, and most logs are sparse |
+| 7 | a server's `index.key` (a compromise, a backup) | the subject of every past and future leaf in that server's log | one key for the log's whole life (§5): no forward secrecy for pseudonyms |
+| 8 | the public log alone | the realm's activity by kind and hour; replica promotions (kind 6) | kinds and times are public |
+
+**What it does not learn:**
+- the content of any sealed file or keytab;
+- any key or share;
+- the name behind an index, without the side information above;
+- anything about a lookup.
+
+The claim logs (§8) are public in full on purpose: they list the servers
+each anchor vouches for, which every advertisement already shows.
+
+**Accepted by design.** Rows 2 and 8 follow from the logs' purpose.
+A signer *wants* its statements found, and an auditor needs kinds and
+counts. Row 2 still lets anyone who sees one public signature count all
+of a person's signatures on that server. Say so to signers.
+
+**Mitigations**, none implemented yet:
+
+| # | change | addresses | cost |
+|---|---|---|---|
+| a | key every body digest: `HMAC-H(k_index, …)` in place of `H(…)` | 3, 5 | owners still verify through lookups, which the server answers. A third party can no longer match a digest it computed, which is the point |
+| b | log a per-server keyed device id: `HMAC-H(k_index, device id)` | 4 | `kuipa tlog watch` matches devices through the lookup's answers, not the raw id |
+| c | rotate the index key per epoch (for example monthly), keeping old keys for lookups only, and delete them on a schedule | 1, 7 | a subject's leaves link only within an epoch; a stolen key exposes one epoch; lookups map a subject once per kept epoch |
+| d | coarse leaf times in the public body (to the hour), with the exact time only in receipts and lookups | 6 | witnesses and auditors lose exact ordering by time, but not by position |
+| e | index signing leaves by a per-statement value, and let the lookup map the principal to them | 2 | a published statement no longer links the signer's others; the signer still finds them all |
+
+(a), (b) and (d) change leaf bodies, so they need a new body version.
+Old leaves stay as they are. (c) and (e) change only how indexes are
+made, so the leaf format stays. None of them helps against the logging
+server itself: it holds the keys and knows who asks, as for tang-pqc
+recoveries (DESIGN.md §7.2).
