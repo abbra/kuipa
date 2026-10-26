@@ -1871,8 +1871,8 @@ impl EnrollServer {
         Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
     }
 
-    /// Answer a pins refresh (§4.5): this realm's anchors, their heads and
-    /// the anchor epoch, as a rekey delivers them, bound to the caller's
+    /// Answer a pins refresh (§4.5): this realm's anchors and their heads,
+    /// as a rekey delivers them, bound to the caller's
     /// Kerberos session so a host may update its pins from it (§4.7).
     /// They are public: any principal of the realm may ask.
     fn pins_op(
@@ -1892,14 +1892,11 @@ impl EnrollServer {
             return Err(Refusal::because("wrong realm"));
         }
         let (anchors, heads) = self.anchors_and_heads();
-        let epoch = self.epoch_head();
         let answer = crate::payload::PinsAnswer {
             realm: self.info.realm.clone(),
             issuer: self.info.server.clone(),
             anchors,
             heads,
-            epoch_seq: epoch.map_or(0, |(seq, _)| seq),
-            epoch_head: epoch.map_or(crate::epoch::GENESIS, |(_, head)| head),
         };
         let bytes = answer
             .to_bytes()

@@ -581,10 +581,12 @@ therefore keeps working as servers come and go, as long as one anchor it
 stores still signs: each rekey refreshes the list. A replaced anchor (a
 server reinstalled with a new one) is handled like a new server.
 
-**Pins refresh.** `POST /ipa/ku/pins/{kid}` delivers the same anchors,
-their vouch heads and the anchor epoch (`IPPN`), with no keys: a Kerberos
+**Pins refresh.** `POST /ipa/ku/pins/{kid}` delivers the same anchors and
+their vouch heads (`IPPN`), with no keys and no anchor epoch (the
+watermark moves only through the verified chain, §4.8): a Kerberos
 exchange like a rekey's, its answer bound to the host's session (§5.1),
-so it may update the pins as a rekey does (§4.7). `kuipa check` asks for
+so it may update the pins as a rekey does (§4.7), anchors the realm no
+longer lists included. `kuipa check` asks for
 it after verifying the servers, and grows the head windows through the
 claim log's consistency check (DESIGN-claim-logs.md §1.3). Heads stay
 current between monthly rekeys, so a server's claim, renewed every 60
@@ -2370,7 +2372,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/register/{kid}` | `IPJQ` (operation data `IPRP`) → `IPJS` (payload `IPRA`) (§7.5) |
 | POST | `/ipa/ku/keys/{kid}` | `IPJQ` (operation data `IPKG`) → `IPJS` (payload `IPKR`) (§18) |
 | POST | `/ipa/ku/sign/{kid}` | `IPJQ` (operation data `IPGQ`) → `IPJS` (payload `IPGR`): a statement that the caller signed digests (DESIGN-sign.md) |
-| POST | `/ipa/ku/pins/{kid}` | `IPJQ` → `IPJS` (payload `IPPN`): the realm's anchors, heads and epoch, bound to the caller's Kerberos session (§4.5) |
+| POST | `/ipa/ku/pins/{kid}` | `IPJQ` → `IPJS` (payload `IPPN`): the realm's anchors and heads, bound to the caller's Kerberos session (§4.5) |
 | POST | `/ipa/ku/tlog/{kid}` | `IPJQ` (operation data `IPLQ`) → `IPJS` (payload `IPLR`): the caller's own transparency-log entries (DESIGN-tlog.md §6) |
 | POST | `/ipa/ku/vault/{kid}` | `IPJQ` (operation data: a JSON vault operation) → `IPJS` (payload `IPVR`) (§7.6) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
@@ -2524,8 +2526,7 @@ IPJS  ct_e sealed                                                               
 IPJP  realm domain basedn issuer n[server] n[ca_cert] n[pkinit_anchor]
       n[anchor(32) size(u64) root(h, empty when size is 0)]
       epoch_seq(u64) epoch_head(48) keytab                                     enrollment payload
-IPPN  realm issuer n[anchor(32) size(u64) root(h, empty when size is 0)]
-      epoch_seq(u64) epoch_head(48)                                            pins refresh payload (§4.5)
+IPPN  realm issuer n[anchor(32) size(u64) root(h, empty when size is 0)]      pins refresh payload (§4.5)
 IPSX  mode(1) alg(1) ek_m not_after(u64)                                         staging parameters
 IPSP  bundle secret                                                              stage result
 IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)

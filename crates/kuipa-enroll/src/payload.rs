@@ -189,8 +189,9 @@ fn read_anchors(r: &mut Reader<'_>) -> Result<AnchorHeads> {
 }
 
 /// What a pins refresh answers (`POST /ipa/ku/pins/{kid}`, §4.5): the
-/// realm's current anchors, their vouch heads and the anchor epoch, as a
-/// rekey delivers them but with no keys.  The answer is bound to the host's
+/// realm's current anchors and their vouch heads, as a rekey delivers them
+/// but with no keys and no anchor epoch: the watermark moves only through
+/// the verified chain (§4.8).  The answer is bound to the host's
 /// Kerberos session like a rekey's, so a host may update its pins from it
 /// (§4.7) without rotating its keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,15 +204,10 @@ pub struct PinsAnswer {
     pub anchors: Vec<Thumbprint>,
     /// Their current vouch heads, aligned with `anchors`.
     pub heads: Vec<Option<(u64, Hash)>>,
-    /// The issuer's anchor epoch log sequence (§4.8); `0` for none.
-    pub epoch_seq: u64,
-    /// The hash of that entry.
-    pub epoch_head: crate::epoch::EpochHead,
 }
 
 impl PinsAnswer {
-    /// `IPPN ‖ 1 ‖ realm ‖ issuer ‖ anchors and heads ‖ epoch_seq ‖
-    /// epoch_head`.
+    /// `IPPN ‖ 1 ‖ realm ‖ issuer ‖ anchors and heads`.
     ///
     /// # Errors
     ///
@@ -221,7 +217,6 @@ impl PinsAnswer {
         let mut w = Writer::new(PINS_MAGIC);
         w.str(&self.realm).str(&self.issuer);
         write_anchors(&mut w, &self.anchors, &self.heads)?;
-        w.u64(self.epoch_seq).fixed(&self.epoch_head);
         Ok(w.finish())
     }
 
@@ -235,7 +230,6 @@ impl PinsAnswer {
         let realm = r.str()?.to_owned();
         let issuer = r.str()?.to_owned();
         let (anchors, heads) = read_anchors(&mut r)?;
-        let (epoch_seq, epoch_head) = (r.u64()?, r.fixed()?);
         r.finish()?;
         if !crate::realm::is_safe_name(&realm) || !crate::realm::is_safe_name(&issuer) {
             return Err(Error::Malformed("pins: unsafe name"));
@@ -245,8 +239,6 @@ impl PinsAnswer {
             issuer,
             anchors,
             heads,
-            epoch_seq,
-            epoch_head,
         })
     }
 }
@@ -264,8 +256,6 @@ pub(crate) mod tests {
             issuer: "ipa1.example.test".into(),
             anchors: vec![a, b],
             heads: vec![Some((3, crate::merkle::test_hash(3))), None],
-            epoch_seq: 2,
-            epoch_head: [7; 48],
         };
         assert_eq!(
             PinsAnswer::from_bytes(&answer.to_bytes().unwrap()).unwrap(),
