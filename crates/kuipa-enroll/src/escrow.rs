@@ -263,8 +263,8 @@ impl Sealer {
     /// # Errors
     ///
     /// [`Error::Missing`] without servers or when one has no escrow key,
-    /// [`Error::WrongRealm`] for a server of another realm, or a crypto
-    /// error.
+    /// [`Error::WrongRealm`] for a server of another realm,
+    /// [`Error::Malformed`] for more than 255 servers, or a crypto error.
     pub fn prepare(
         principal: &Principal,
         kind: Kind,
@@ -273,6 +273,10 @@ impl Sealer {
         if servers.is_empty() {
             return Err(Error::Missing("escrow servers"));
         }
+        if servers.len() > 255 {
+            return Err(Error::Malformed("too many escrow servers to seal"));
+        }
+
         let ctx = context(principal);
         let mut dek = SecretBuf::with_len(32);
         Rand::fill_private(dek.as_mut_slice())?;
@@ -483,7 +487,8 @@ impl Sealed {
     ///
     /// # Panics
     ///
-    /// Never for keytabs sealed by this crate (at most 255 servers).
+    /// Never: sealing refuses more than 255 servers, and decoding reads the
+    /// count as a `u8`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(self.kind.magic());

@@ -1122,7 +1122,8 @@ impl SessionSealedFile {
     ///
     /// # Panics
     ///
-    /// Never for files sealed by this crate (at most 255 devices).
+    /// Never: sealing refuses more than 255 devices, and decoding reads the
+    /// count as a `u8`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(SESSION_FILE_MAGIC);
@@ -1184,6 +1185,10 @@ fn device_slots(vault: &Vault, committed: &[u8]) -> Result<(Vec<DeviceSlot>, Sec
     if vault.devices.is_empty() {
         return Err(Error::Missing("registered devices"));
     }
+    if vault.devices.len() > 255 {
+        return Err(Error::Malformed("too many devices to seal"));
+    }
+
     let mut b = SecretBuf::with_len(32);
     Rand::fill_private(b.as_mut_slice())?;
     let mut devices = Vec::new();
@@ -1922,11 +1927,15 @@ impl Reply {
     /// m(u8) [receipt] requests escrows deposits devices recovery`
     /// (session and released empty without one, the rest JSON).
     ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] with more receipts than the `u8` count carries.
+    ///
     /// # Panics
     ///
-    /// Never for fewer than 2⁶⁴ descriptors.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// If `descriptors` holds more than `u64::MAX` entries; a reply built
+    /// through the API never does.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let version = if self.passkeys.is_some() {
             REPLY_VERSION_PASSKEYS
         } else {
@@ -1951,7 +1960,7 @@ impl Reply {
                 .map(ReleasedKeys::to_bytes)
                 .unwrap_or_default(),
         );
-        w.u8(u8::try_from(self.receipts.len()).expect("few receipts"));
+        w.u8(u8::try_from(self.receipts.len()).map_err(|_| Error::Malformed("too many receipts"))?);
         for receipt in &self.receipts {
             w.bytes(&receipt.to_bytes());
         }
@@ -1963,7 +1972,7 @@ impl Reply {
         if let Some(passkeys) = &self.passkeys {
             w.bytes(&serde_json::to_vec(passkeys).unwrap_or_default());
         }
-        w.finish()
+        Ok(w.finish())
     }
 
     /// Decode.
@@ -2397,7 +2406,8 @@ impl SealedVaultFile {
     ///
     /// [`Error::Policy`] for a revoked vault, [`Error::Missing`] without
     /// servers or, when the policy needs a device, without registered
-    /// devices; [`Error::WrongRealm`] or a crypto error.
+    /// devices; [`Error::WrongRealm`], [`Error::Malformed`] for more than
+    /// 255 servers, or a crypto error.
     pub fn seal(
         descriptor: &VerifiedDescriptor,
         servers: &[&VerifiedRealm],
@@ -2410,6 +2420,10 @@ impl SealedVaultFile {
         if servers.is_empty() {
             return Err(Error::Missing("escrow servers"));
         }
+        if servers.len() > 255 {
+            return Err(Error::Malformed("too many servers to seal"));
+        }
+
         let principal = descriptor.owner().clone();
         let committed = commitment_data(&principal, &vault.id);
         let ctx = BindingContext::new(escrow::DOMAIN, &committed);
@@ -2560,8 +2574,8 @@ impl SealedVaultFile {
     ///
     /// # Panics
     ///
-    /// Never for files sealed by this crate (at most 255 servers and
-    /// devices).
+    /// Never: sealing refuses more than 255 servers and devices, and
+    /// decoding reads both counts as `u8`s.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(FILE_MAGIC);
@@ -2752,5 +2766,66 @@ mod tests {
         // What a realm stores reads back the same.
         let again: Limits = serde_json::from_slice(&serde_json::to_vec(&limits).unwrap()).unwrap();
         assert_eq!(again, limits);
+    }
+
+    fn devices(n: usize) -> Vec<Device> {
+        (0..n)
+            .map(|i| {
+                let pair = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+                Device::new(pair.public(), &format!("d{i}"), DeviceType::File, NOW)
+            })
+            .collect()
+    }
+
+    fn vault_with(devices: Vec<Device>) -> Vault {
+        Vault {
+            id: VaultId::machine(
+                &"alice@EXAMPLE.TEST".parse().unwrap(),
+                escrow::Kind::File,
+                KemAlg::MlKem768,
+            )
+            .unwrap(),
+            owner: "alice@EXAMPLE.TEST".into(),
+            name: "v".into(),
+            policy: policy(factors(Some(Level::Any), false)),
+            managers: Members::default(),
+            members: Members::default(),
+            depositors: Members::default(),
+            devices,
+            state: State::Enabled,
+            unlocks: 0,
+            session_keys: Vec::new(),
+            bindings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sealing_stops_at_the_slot_count_and_errors_beyond_it() {
+        // The `u8` slot count: 255 devices seal, 256 error instead of
+        // panicking at encode time.
+        assert!(device_slots(&vault_with(devices(255)), b"committed").is_ok());
+        let err = device_slots(&vault_with(devices(256)), b"committed");
+        assert!(matches!(err, Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn a_reply_encodes_255_receipts_and_errors_on_the_256th() {
+        let receipt = Receipt {
+            log: crate::tlog::LogId(crate::merkle::Hash::zero(crate::merkle::TreeHash::Sha256)),
+            index: 1,
+            leaf: crate::merkle::Hash::zero(crate::merkle::TreeHash::Sha256),
+            time: NOW,
+            signature: Vec::new(),
+        };
+        let at = Reply {
+            receipts: vec![receipt.clone(); 255],
+            ..Reply::default()
+        };
+        assert!(at.to_bytes().is_ok());
+        let over = Reply {
+            receipts: vec![receipt; 256],
+            ..Reply::default()
+        };
+        assert!(matches!(over.to_bytes(), Err(Error::Malformed(_))));
     }
 }
