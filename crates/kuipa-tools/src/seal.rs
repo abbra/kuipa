@@ -1267,14 +1267,11 @@ impl<'a> Seal<'a> {
         let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
-        let mut pins = anchors.clone();
-        pins.sort_unstable();
-        pins.dedup();
         let now = unix_seconds(flows::now());
         let mut cache = Vec::new();
         let mut verified = Vec::new();
         for server in &public.servers {
-            let Ok((endpoint, v, _)) = flows::verified(
+            let Ok((_, v, _)) = flows::verified(
                 server,
                 &trust,
                 flows::Pins {
@@ -1288,13 +1285,12 @@ impl<'a> Seal<'a> {
             ) else {
                 continue;
             };
-            if let Ok(adv) = endpoint.advertisement(&pins) {
-                cache.push(CachedAdvertisement {
-                    server: server.clone(),
-                    fetched: now,
-                    advertisement: adv.to_json(),
-                });
-            }
+            // What was just verified is what sealing keeps: no second fetch.
+            cache.push(CachedAdvertisement {
+                server: server.clone(),
+                fetched: now,
+                advertisement: v.signed().to_json(),
+            });
             verified.push(v);
         }
         if verified.is_empty() {
