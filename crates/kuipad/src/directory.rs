@@ -35,6 +35,7 @@ use std::time::SystemTime;
 use kuipa_enroll::escrow::{Kind, RegisterParams, VaultId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
+use kuipa_enroll::passkey::UserPasskeys;
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
 use kuipa_enroll::vault::{
@@ -924,6 +925,38 @@ impl Directory for LdapDirectory {
 
     fn recovery_settings(&self) -> Result<Option<RecoverySettings>, DirectoryError> {
         self.realm_setting("recovery", RECOVERY_ATTR)
+    }
+
+    fn passkeys(&self, principal: &Principal) -> Result<UserPasskeys, DirectoryError> {
+        let mut conn = self.service_conn()?;
+        let values = self
+            .principal_entry(&mut conn, principal, &["ipaPassKey"])?
+            .and_then(|e| e.attrs.get("ipapasskey").cloned())
+            .unwrap_or_default();
+        // `ipa passkeyconfig`: user verification is required unless
+        // turned off, as FreeIPA and SSSD default to.
+        let dn = format!("cn=passkeyconfig,cn=etc,{}", self.cfg.basedn);
+        let user_verification = match conn.search(
+            &dn,
+            Scope::Base,
+            "(objectClass=*)",
+            &["ipaRequireUserVerification"],
+        ) {
+            Ok(entries) => entries
+                .first()
+                .and_then(|e| e.attrs.get("iparequireuserverification"))
+                .and_then(|v| v.first())
+                .is_none_or(|v| !v.eq_ignore_ascii_case("false")),
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => true,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(UserPasskeys {
+            values,
+            user_verification,
+        })
     }
 
     fn voucher_settings(
