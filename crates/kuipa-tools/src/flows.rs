@@ -22,7 +22,7 @@ use kuipa_enroll::realm::{
     Deployment, KdcProxy, TrustedRealm, VerifiedRealm, krb5_proxied_realm_section,
     krb5_realm_section,
 };
-use kuipa_gssapi::{GssClientCred, GssError};
+use kuipa_gssapi::{GssClientCred, GssError, is_mit_kerberos};
 use native_ossl::util::SecretBuf;
 use serde_json::{Value, json};
 use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, b64, unix_seconds};
@@ -2708,7 +2708,48 @@ pub fn realm_info(
 /// those the own realm lists for it, else those its verified
 /// advertisement names for itself.
 fn trust_kdc_proxy<'a>(t: &'a TrustedRealm, adv: &'a VerifiedRealm) -> Option<&'a KdcProxy> {
-    t.kdc_proxy.as_ref().or(adv.info().kdc_proxy.as_ref())
+    // Heimdal does not speak MS-KKDCP: proxy URLs in its `krb5.conf`
+    // would report an installed trust the host cannot reach, so the
+    // realm is written with its direct KDCs instead.
+    is_mit_kerberos()
+        .then(|| t.kdc_proxy.as_ref().or(adv.info().kdc_proxy.as_ref()))
+        .flatten()
+}
+
+/// The lock file of a realm's trust installation: a sibling of its
+/// install directory, so the directory stays removable.
+fn trust_lock_file(paths: &Paths, realm: &str) -> std::path::PathBuf {
+    paths
+        .trust_dir(realm)
+        .with_file_name(format!("{realm}.kuipa-lock"))
+}
+
+/// The exclusive lock on one realm's trust files, held until the guard
+/// drops: two concurrent refreshes of the same realm must not interleave
+/// the CA, anchors and snippet of different advertisements.
+struct TrustLock {
+    file: std::fs::File,
+}
+
+impl Drop for TrustLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn trust_lock(paths: &Paths, realm: &str) -> Result<TrustLock, Error> {
+    let path = trust_lock_file(paths, realm);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock()
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    Ok(TrustLock { file })
 }
 
 /// Write a trusted realm's files from its verified advertisement.  The
@@ -2720,6 +2761,7 @@ fn install_trust(
     adv: &VerifiedRealm,
     endpoint: &Endpoint,
 ) -> Result<(), Error> {
+    let _lock = trust_lock(paths, &t.realm)?;
     let dir = paths.trust_dir(&t.realm);
     let pkinit = dir.join("pkinit-anchors.pem");
     let ca = dir.join("ca.crt");
@@ -2811,6 +2853,7 @@ fn install_trust(
 
 /// Remove a trusted realm's files, the anchors file last.
 fn remove_trust(paths: &Paths, realm: &str) -> Result<(), Error> {
+    let _lock = trust_lock(paths, realm)?;
     let dir = paths.trust_dir(realm);
     for p in [
         paths.trust_krb5_conf(realm),
