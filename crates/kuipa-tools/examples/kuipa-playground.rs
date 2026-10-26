@@ -610,6 +610,7 @@ fn start_trusted(
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     };
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &[TRUSTED_SERVER], &[]));
     let app = Arc::new(App {
@@ -718,6 +719,7 @@ fn start_servers(
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         };
         anchors.push(*anchor.public().thumbprint());
         let key_dir = dir.join(format!("keys-{server}"));
@@ -866,6 +868,7 @@ fn start_chain_servers(
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         };
         let enroll = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
         enroll.publish(

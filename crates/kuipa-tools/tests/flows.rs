@@ -203,6 +203,7 @@ fn server_keys(anchor: &SigningKey, fqdn: &str) -> (ServerKeys, RealmInfo, Deleg
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         },
         delegation,
     )
@@ -1186,6 +1187,7 @@ fn advertisement_lists_details_landmarks_and_an_anchor_index() {
         servers: vec!["ipa1.b.test".into()],
         anchors: vec![other_pin],
         heads: Vec::new(),
+        kdc_proxy: None,
     }];
     info.validate().unwrap();
     let dir = Dir::default();
@@ -1821,6 +1823,7 @@ fn trust_heads_tail(state: TrustHeads) {
         servers: vec!["trustB1.example.test".into()],
         anchors: vec![b_pin],
         heads: b_server.heads(),
+        kdc_proxy: None,
     };
     // A, advertising the trust: B's entry with its heads, as kuipad's
     // refresh would publish it.
@@ -1976,6 +1979,7 @@ fn trusted_realms_pins_and_uses_the_partners_heads() {
         anchors: vec![b_pin],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     };
     let b_claim = b_delegation.claim().unwrap();
     let b_vouch = SignedVouch::issue(
@@ -2027,6 +2031,7 @@ fn trust_info_of(anchor: &SigningKey) -> RealmInfo {
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
@@ -2234,6 +2239,7 @@ fn mirror_info_of(anchor: &SigningKey) -> RealmInfo {
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
@@ -2436,6 +2442,7 @@ fn info_of(anchor: &SigningKey) -> RealmInfo {
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
@@ -2524,6 +2531,7 @@ fn claim_log_info_of(anchor: &SigningKey) -> RealmInfo {
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
@@ -2793,6 +2801,7 @@ fn window_info_of(anchor: &SigningKey) -> RealmInfo {
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
@@ -2934,6 +2943,7 @@ fn audit_info_of(anchor: &SigningKey) -> RealmInfo {
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
@@ -2964,6 +2974,7 @@ fn info_named(server: &str, anchors: &[tang_pqc::Thumbprint]) -> RealmInfo {
         anchors: anchors.to_vec(),
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
@@ -3103,6 +3114,7 @@ fn forged_head_tail(state: ForgedHeads) {
             size: 99,
             root: test_hash(7),
         }],
+        kdc_proxy: None,
     }];
     info.validate().unwrap();
     let a = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
@@ -3230,6 +3242,7 @@ fn a_forged_partner_head_is_not_pinned() {
         anchors: vec![b_pin],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     };
     let b_server = Arc::new(EnrollServer::new(
         ServerKeys {

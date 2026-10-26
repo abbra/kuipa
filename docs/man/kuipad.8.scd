@@ -121,9 +121,20 @@ Print the Tang signing keys' thumbprints.
 	*ca_file*.  The optional keys are *pkinit_anchors_file*,
 	*key_dir*, *listen* (default *unix:/run/ipa/kuipad.sock*),
 	*peers*, *discover_peers*, *peer_endpoints*, *peer_interval*,
-	*anchor*, *vouch_interval*, *rate_limit*, *trusts* and
-	*enctypes*.  Unknown keys are refused, so a typo stops the
-	daemon instead of being ignored.
+	*anchor*, *vouch_interval*, *rate_limit*, *trusts*,
+	*kdc_proxy* and *enctypes*.  Unknown keys are refused, so a typo
+	stops the daemon instead of being ignored.
+
+	*kdc_proxy* names this realm's KDC proxies (MS-KKDCP, FreeIPA's
+	*/KdcProxy*) for realms that trust it, when its KDCs are not
+	reachable from their hosts: *{"urls": ["https://ipa1.example.test/KdcProxy"]}*.
+	Their TLS certificates are checked against the IPA CA, or with
+	*"ca": "system"* against the hosts' system trust store, for a
+	front end with a public certificate.  A *trusts* entry takes the
+	same *kdc_proxy* key, for the trusted realm: what this realm's
+	hosts use to reach its KDCs.  A trust established with
+	*establish-trust* takes the partner's own *kdc_proxy* from its
+	advertisement.
 
 */var/lib/ipa/ku/*
 	The key directory (*key_dir*): the anchor and signing JWKs, the
@@ -169,6 +180,22 @@ kuipad trust-invitation > invite
 ```
 kuipad establish-trust --invitation-file invite \\       
                        --server ipa1.a.example.test
+```
+
+Trust a realm whose KDCs are only reachable through a KDC proxy, as
+*trusts* in */etc/ipa/kuipad.json*:
+
+```
+"trusts": [{
+  "realm": "FEDORAPROJECT.ORG",
+  "domain": "fedoraproject.org",
+  "servers": ["id.fedoraproject.org"],
+  "anchors": ["..."],
+  "kdc_proxy": {
+    "urls": ["https://id.fedoraproject.org/KdcProxy"],
+    "ca": "system"
+  }
+}]
 ```
 
 Serve post-quantum Tang:

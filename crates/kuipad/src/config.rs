@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kuipa_enroll::keytab::Enctype;
-use kuipa_enroll::realm::{RealmInfo, TrustedRealm};
+use kuipa_enroll::realm::{KdcProxy, ProxyCa, RealmInfo, TrustedRealm};
 use serde::Deserialize;
 use tang_pqc::Thumbprint;
 
@@ -68,6 +68,10 @@ pub struct Config {
     /// Trusted realms to advertise, with their anchors (§17).
     #[serde(default)]
     pub trusts: Vec<TrustConfig>,
+    /// This realm's KDC proxies, advertised for realms that trust it,
+    /// when its KDCs are not reachable from their hosts.
+    #[serde(default)]
+    pub kdc_proxy: Option<KdcProxyConfig>,
     /// Allowed enctypes, strongest first.
     #[serde(default = "default_enctypes")]
     pub enctypes: Vec<i32>,
@@ -121,6 +125,57 @@ pub struct TrustConfig {
     pub servers: Vec<String>,
     /// Its anchors (base64url thumbprints), from its trust invitation.
     pub anchors: Vec<String>,
+    /// The KDC proxies this realm's hosts use for it; absent, its KDCs
+    /// are reached directly (or through the proxies it advertises).
+    #[serde(default)]
+    pub kdc_proxy: Option<KdcProxyConfig>,
+}
+
+impl TrustConfig {
+    /// As advertised, with no heads: configuration cannot know the
+    /// partner's; the trust refresh fills them from its advertisement
+    /// (DESIGN-claim-logs.md §3).
+    fn trusted_realm(&self) -> Result<TrustedRealm, Error> {
+        Ok(TrustedRealm {
+            realm: self.realm.clone(),
+            domain: self.domain.clone(),
+            servers: self.servers.clone(),
+            anchors: self
+                .anchors
+                .iter()
+                .map(|a| a.parse())
+                .collect::<Result<_, _>>()?,
+            heads: Vec::new(),
+            kdc_proxy: self
+                .kdc_proxy
+                .as_ref()
+                .map(KdcProxyConfig::to_proxy)
+                .transpose()?,
+        })
+    }
+}
+
+/// A realm's KDC proxies (MS-KKDCP, FreeIPA's `/KdcProxy`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KdcProxyConfig {
+    /// The proxy URLs, `https://<host>[:<port>][/<path>]`.
+    pub urls: Vec<String>,
+    /// What authenticates their TLS certificates: `"realm"` (default),
+    /// the realm's IPA CA, or `"system"`, the system trust store.
+    #[serde(default)]
+    pub ca: Option<String>,
+}
+
+impl KdcProxyConfig {
+    fn to_proxy(&self) -> Result<KdcProxy, Error> {
+        let proxy = KdcProxy {
+            urls: self.urls.clone(),
+            ca: self.ca.as_deref().map_or(Ok(ProxyCa::Realm), str::parse)?,
+        };
+        proxy.validate()?;
+        Ok(proxy)
+    }
 }
 
 /// The `keys` operation's configuration (§18.5).
@@ -240,23 +295,13 @@ impl Config {
             trusts: self
                 .trusts
                 .iter()
-                .map(|t| {
-                    Ok(TrustedRealm {
-                        realm: t.realm.clone(),
-                        domain: t.domain.clone(),
-                        servers: t.servers.clone(),
-                        anchors: t
-                            .anchors
-                            .iter()
-                            .map(|a| a.parse())
-                            .collect::<Result<_, _>>()?,
-                        // Configuration cannot know the partner's
-                        // heads; the trust refresh fills them from
-                        // its advertisement (DESIGN-claim-logs.md §3).
-                        heads: Vec::new(),
-                    })
-                })
+                .map(TrustConfig::trusted_realm)
                 .collect::<Result<_, Error>>()?,
+            kdc_proxy: self
+                .kdc_proxy
+                .as_ref()
+                .map(KdcProxyConfig::to_proxy)
+                .transpose()?,
         };
         info.validate()?;
         Ok(info)
@@ -266,24 +311,9 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// A malformed anchor.
+    /// A malformed anchor or KDC proxy.
     pub fn trusted_realms(&self) -> Result<Vec<TrustedRealm>, Error> {
-        self.trusts
-            .iter()
-            .map(|t| {
-                Ok(TrustedRealm {
-                    realm: t.realm.clone(),
-                    domain: t.domain.clone(),
-                    servers: t.servers.clone(),
-                    anchors: t
-                        .anchors
-                        .iter()
-                        .map(|a| a.parse())
-                        .collect::<Result<_, _>>()?,
-                    heads: Vec::new(),
-                })
-            })
-            .collect()
+        self.trusts.iter().map(TrustConfig::trusted_realm).collect()
     }
 
     /// The directory side of the configuration.
@@ -298,6 +328,44 @@ impl Config {
             keytab: self.keytab.clone(),
             ca_file: self.ca_file.clone(),
             enctypes: self.enctypes.iter().copied().map(Enctype).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trust(kdc_proxy: &str) -> Result<TrustedRealm, Error> {
+        let anchor = Thumbprint::from_bytes([7; 32]);
+        let json = format!(
+            r#"{{"realm": "B.TEST", "domain": "b.test", "servers": ["ipa1.b.test"],
+                "anchors": ["{anchor}"]{kdc_proxy}}}"#
+        );
+        serde_json::from_str::<TrustConfig>(&json)?.trusted_realm()
+    }
+
+    #[test]
+    fn trusted_realm_kdc_proxies() {
+        assert_eq!(trust("").unwrap().kdc_proxy, None);
+        let t = trust(r#", "kdc_proxy": {"urls": ["https://ipa1.b.test/KdcProxy"]}"#).unwrap();
+        assert_eq!(
+            t.kdc_proxy,
+            Some(KdcProxy {
+                urls: vec!["https://ipa1.b.test/KdcProxy".into()],
+                ca: ProxyCa::Realm,
+            })
+        );
+        let t = trust(r#", "kdc_proxy": {"urls": ["https://id.b.test/KdcProxy"], "ca": "system"}"#)
+            .unwrap();
+        assert_eq!(t.kdc_proxy.unwrap().ca, ProxyCa::System);
+        for bad in [
+            r#", "kdc_proxy": {"urls": ["https://id.b.test/KdcProxy"], "ca": "public"}"#,
+            r#", "kdc_proxy": {"urls": ["http://id.b.test/KdcProxy"]}"#,
+            r#", "kdc_proxy": {"urls": []}"#,
+            r#", "kdc_proxy": {"url": "https://id.b.test/KdcProxy"}"#,
+        ] {
+            assert!(trust(bad).is_err(), "{bad}");
         }
     }
 }

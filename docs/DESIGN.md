@@ -2699,6 +2699,30 @@ reads it from its configuration (`trusts`, §11.1) and can replace it at
 run time (`EnrollServer::publish_trusts`); in FreeIPA it would come from
 the trust objects in LDAP.
 
+An entry may also name B's KDC proxies, for a B whose KDCs are not
+reachable from A's hosts (a deployment that exposes only HTTPS, such as
+the Fedora Project's):
+
+```json
+"kdc_proxy": {"urls":["https://id.b.test/KdcProxy"], "ca":"system"}
+```
+
+The URLs are MS-KKDCP proxies (FreeIPA's `/KdcProxy`); `ca` says what
+authenticates their TLS certificates: `realm` (the default, and then
+absent) for B's IPA CA, as for a proxy on B's IPA servers, or `system`
+for the host's trust store, as for a front end with a public
+certificate. Each URL must be `https://` with a safe host name
+(§17.1), an optional port and a path of letters, digits, `.`, `-`,
+`_`, `~` and `/`, at most 16 of them: nothing that could end the
+`kdc` value in the generated configuration. A realm advertises its
+own proxies in the same form, as `kdc_proxy` in its `ipa` member
+(from `kdc_proxy` in the daemon's configuration); A's refresh of a
+partner recorded by §17.4 copies them from B's verified advertisement,
+and a hand-configured entry states them itself. Kerberos keeps
+authenticating the KDC through the proxy: its TLS adds no trust B's
+anchors and PKINIT chain do not already give, and hides the exchange
+from the network.
+
 ### 17.3 `kuipa trusted-realms`
 
 On an enrolled host, this command makes the installed trusted realms match

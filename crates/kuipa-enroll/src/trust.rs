@@ -162,6 +162,8 @@ fn get_realm(r: &mut Reader) -> Result<TrustedRealm> {
         // partner's first refresh, from its advertisement
         // (DESIGN-claim-logs.md §3).
         heads: Vec::new(),
+        // Nor KDC proxies: those, too, come with the refresh.
+        kdc_proxy: None,
     })
 }
 
@@ -629,6 +631,7 @@ mod tests {
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         };
         let copy = SigningKey::from_jwk(signing.to_jwk().unwrap().as_ref()).unwrap();
         let keys = ServerKeys {

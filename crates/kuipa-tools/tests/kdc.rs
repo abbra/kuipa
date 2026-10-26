@@ -316,6 +316,7 @@ fn start_ipa_server(
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     };
     let own_anchor = *anchor.public().thumbprint();
     let key_dir = realm.dir.join(format!("keys-{fqdn}"));
