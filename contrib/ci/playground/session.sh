@@ -339,6 +339,56 @@ step 0 "Now it opens" \
 step 75 "Once: the request is used up" \
     'kuipa seal open "$KUIPA_PLAYGROUND/root.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" --request "$rq_id"'
 
+section "A device key on a token" \
+    "On another machine, the administrator's device key is an ML-KEM key on a PKCS#11 token: it never leaves the token, and every use needs the token's PIN. The playground's token is kryoptic, in software; a smart card or HSM with PKCS#11 3.2 works the same way."
+step 0 "Make an ML-KEM-768 key on the token" \
+    'uri=$(pq_token admin-dev) && echo "$uri"' "pkcs11:token=kuipa;object=admin-dev"
+step 0 "Create a vault and register the token's key as its device" \
+    'echo 1234 > "$KUIPA_PLAYGROUND/token-pin" && kuipa seal create hw --require device,ticket && KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-token" kuipa seal device add hw --pkcs11 "$uri" --module "$PQ_TOKEN_MODULE" --passphrase-file "$KUIPA_PLAYGROUND/token-pin"' \
+    "pkcs11, any"
+step 0 "Seal a file to it: no key file is written on this machine" \
+    'echo "on the token" > "$KUIPA_PLAYGROUND/hw.txt" && KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-token" kuipa seal file hw "$KUIPA_PLAYGROUND/hw.txt" && test ! -e "$KUIPA_PLAYGROUND/users/admin-token/device.key"'
+step 0 "Open it: the token decapsulates, with its PIN" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-token" kuipa seal open "$KUIPA_PLAYGROUND/hw.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/token-pin" | cat' \
+    "on the token"
+step 1 "A wrong PIN opens nothing" \
+    'echo 0000 > "$KUIPA_PLAYGROUND/wrong-pin" && KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-token" kuipa seal open "$KUIPA_PLAYGROUND/hw.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong-pin"'
+
+section "Passkeys on a security key" \
+    "The administrator registers a post-quantum (ML-DSA-65) passkey in IPA, on a security key with a PIN: here the software security key kuipa is built with for the playground. A vault can require one of the user's IPA passkeys, which the servers check, and a device key can be wrapped by a passkey's hmac-secret, so every use needs a touch. Classical passkeys (ES256, EdDSA, RS256, ES384) work the same way."
+step 0 "Register an ML-DSA-65 passkey, as ipa user-add-passkey --register does" \
+    'pq_passkey mldsa65 --pin 4321' "registered to admin@EXAMPLE.TEST"
+step 0 "A vault that needs a device and a passkey, with sessions" \
+    'kuipa seal create signing --require device,passkey --session-hours 1' \
+    "a registered device (any) and one of your IPA passkeys"
+step 0 "Register a device key wrapped by a passkey of its own on the same security key" \
+    'echo 4321 > "$KUIPA_PLAYGROUND/key-pin" && KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-key" kuipa seal device add signing --passkey --passphrase-file "$KUIPA_PLAYGROUND/key-pin"' \
+    "passkey, any" "a new credential"
+step 0 "Seal a file to it" \
+    'echo "release key" > "$KUIPA_PLAYGROUND/sign.txt" && KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-key" kuipa seal file signing "$KUIPA_PLAYGROUND/sign.txt"'
+step 0 "Open it: one touch unwraps the device key, one signs the server's challenge" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-key" kuipa seal open "$KUIPA_PLAYGROUND/sign.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/key-pin" | cat' \
+    "release key" 'rp_id="kuipa:example.test"' 'rp_id="example.test" alg="mldsa65" user_verified=true'
+step 1 "A wrong PIN opens nothing" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-key" kuipa seal open "$KUIPA_PLAYGROUND/sign.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong-pin"' \
+    "FIDO_ERR_PIN_INVALID"
+step 0 "A session starts with one assertion" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-key" kuipa seal unlock signing --passphrase-file "$KUIPA_PLAYGROUND/key-pin"' \
+    "Session started"
+step 0 "While it lasts, files open without a touch or the PIN" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-key" kuipa seal open "$KUIPA_PLAYGROUND/sign.txt.sealed" --out - </dev/null | cat' \
+    "release key"
+step 0 "End the session" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-key" kuipa seal lock signing' "has ended"
+step 0 "A classical passkey: bob's ES256, on a key without a PIN, where the realm does not require user verification" \
+    'kuipa-playground passkey --user-verification off && pq_as bob pq_passkey es256' \
+    "do not require user verification" "registered to bob@EXAMPLE.TEST"
+step 0 "bob seals and opens with it, a touch each time and no PIN" \
+    'b=(pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-key") && "${b[@]}" kuipa seal create bobsign --require device,passkey && "${b[@]}" kuipa seal device add bobsign --passkey </dev/null && echo "bob note" > "$KUIPA_PLAYGROUND/bob-sign.txt" && "${b[@]}" kuipa seal file bobsign "$KUIPA_PLAYGROUND/bob-sign.txt" && "${b[@]}" kuipa seal open "$KUIPA_PLAYGROUND/bob-sign.txt.sealed" --out - </dev/null | cat' \
+    "bob note" 'alg="es256" user_verified=false'
+step 0 "The realm requires user verification again" \
+    'kuipa-playground passkey --user-verification on' "require user verification"
+
 section "Recovering a lost device" \
     "bob escrows his device key under a recovery code he writes down. His laptop is lost: on a new one the code brings the key back and his files open again; finishing reseals them to the new laptop's device and retires the old one."
 step 0 "bob makes a recovery code for his device" \

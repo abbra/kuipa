@@ -559,7 +559,10 @@ PG_WORK="" PG_PID="" PG_ENV="" PG_LOG="" PG_BIN=""
 
 pg_start() {
     local hosts="$1"
-    cargo build -p kuipa-tools -p tang-pqc-clevis --bins --example kuipa-playground || return 1
+    # kuipa with its software security key (soft-fido2): the playground's
+    # passkeys live in files, not on attached keys.
+    cargo build -p kuipa-tools -p tang-pqc-clevis --bins --example kuipa-playground \
+        --features kuipa-tools/soft-fido2 || return 1
     PG_BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
     PG_WORK="$(mktemp -d /tmp/kuipa-playground.XXXXXXXXXX)"
     PG_ENV="$PG_WORK/env.sh" PG_LOG="$PG_WORK/servers.log"
@@ -666,6 +669,8 @@ run_interactive_playground() {
     echo "    kuipa complete                       # first contact: rekey the staged keys"
     echo "    pq_admin_kinit; kuipa seal create team --require device,ticket"
     echo "    kuipa seal share team --user bob; pq_as bob kuipa seal list"
+    echo "    pq_passkey mldsa65 --pin 1234          # an IPA passkey on a software security key"
+    echo "    kuipa seal device add VAULT --pkcs11 \"\$(pq_token dev)\" --module \$PQ_TOKEN_MODULE"
     echo
     echo "  Exit this shell (exit or Ctrl-D) to tear the playground down."
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
