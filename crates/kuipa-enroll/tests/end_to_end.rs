@@ -4298,3 +4298,56 @@ fn passkey_alone(c: &PasskeyCase) {
     assert_eq!(open(&c.es256).unwrap().as_ref(), b"note\n");
     assert!(matches!(open(&c.bobs), Err(Error::Refused)));
 }
+
+/// A pins refresh by `caller`, sealed with `bound`'s binding, at server 0.
+fn pins_refresh(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    caller: &str,
+    bound: &str,
+) -> Result<kuipa_enroll::payload::PinsAnswer, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Pins,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let (request, pending) = p
+        .with_kerberos(fake_binding(bound, &cb))
+        .seal(&gss_token(caller, &cb), &[], &[])
+        .unwrap();
+    let response = r.send(0, Operation::Pins, &request)?;
+    pending.finish_pins(&response, adv).map_err(|_| ())
+}
+
+#[test]
+fn a_pins_refresh_answers_the_realms_anchors_bound_to_the_session() {
+    // §4.5: what a rekey delivers about the realm's anchors, without new
+    // keys, and as bound to the caller's Kerberos session as a rekey is.
+    let r = realm();
+    let adv = r.verify(0);
+    let host = format!("host/{HOST}@{REALM}");
+    let answer = pins_refresh(&r, &adv, &host, &host).unwrap();
+    assert_eq!(answer.realm, REALM);
+    assert_eq!(answer.issuer, SERVERS[0]);
+    assert_eq!(answer.anchors, r.servers[0].anchors());
+    let heads: Vec<_> = r.servers[0]
+        .heads()
+        .iter()
+        .map(|h| (h.anchor, h.size, h.root))
+        .collect();
+    let answered: Vec<_> = answer
+        .anchors
+        .iter()
+        .zip(&answer.heads)
+        .filter_map(|(a, h)| h.map(|(size, root)| (*a, size, root)))
+        .collect();
+    assert_eq!(answered, heads);
+
+    // An answer bound to another session than the client's does not open:
+    // only the server holding its Kerberos key could have bound it.
+    assert!(pins_refresh(&r, &adv, &host, ALICE).is_err());
+}

@@ -26,7 +26,7 @@ usage.
 | `trusted-realms` | install and refresh the realms this realm trusts; remove the others |
 | `advertisement` | what each server advertises, verified, and an index of every anchor and key it names; writes nothing |
 | `status` | the host's state, from its files |
-| `check [--server S]` | every server, the delegations, a `kinit`, the sealed keytabs and files; exit 1 on a problem |
+| `check [--server S]` | every server, the delegations, a `kinit`, the sealed keytabs and files; then refreshes the pinned anchors and heads from a Kerberos-bound answer; exit 1 on a problem |
 | `leave` | remove kuipa's state, writing protected keytabs and files back in plain form |
 | `keys fetch NAMESPACE/NICKNAME [--out F] [--alg A]` | on a new IPA replica: fetch a named secret (`dm`, `ra`, `ca`, `ca_wrapped`, `lwca`) by the host's keytab |
 | `tlog witnesses [--add JWK] [--remove THP] [--required N]` | the transparency-log witnesses this host trusts, and how many must cosign a head (changes need root) |

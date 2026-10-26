@@ -121,6 +121,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
         .route("/ipa/ku/tlog/{id}", post(tlog::<D>))
         .route("/ipa/ku/sign/{kid}", post(sign::<D>))
+        .route("/ipa/ku/pins/{kid}", post(pins::<D>))
         .route("/ipa/ku/tlog/{id}/head", get(log_head::<D>))
         .route("/ipa/ku/tlog/{id}/cosign", post(log_cosign::<D>))
         .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves::<D>))
@@ -629,6 +630,17 @@ async fn sign<D: Directory + Send + Sync + 'static>(
 ) -> Response {
     // Kerberos-only, like vault operations: the source's bucket applies.
     exchange(app, Operation::Sign, kid, &headers, body).await
+}
+
+async fn pins<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    Path(kid): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // A host refreshing its pins: the host's bucket applies, as for a
+    // rekey.
+    exchange(app, Operation::Pins, kid, &headers, body).await
 }
 
 async fn recover<D: Directory + Send + Sync + 'static>(
