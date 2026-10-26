@@ -16,6 +16,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # COPR repository for test builds (PQC-enabled libfido2, opensc, ...)
+  COPR_REPO: abbra/pqc
   # System packages required to build the workspace and to run JavaScript-based
   # GitHub Actions (actions/checkout, actions/cache) inside the container.
   #   tar, gzip               — archive tools needed by actions/checkout and actions/cache
@@ -49,6 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES
       - uses: actions/checkout@v7
@@ -86,6 +90,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES
       - uses: actions/checkout@v7
@@ -99,6 +105,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES yamllint
       - uses: actions/checkout@v7
@@ -112,6 +120,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES
       - uses: actions/checkout@v7
@@ -126,6 +136,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES
       - uses: actions/checkout@v7
@@ -155,6 +167,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES
       - uses: actions/checkout@v7
@@ -185,6 +199,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES
       - uses: actions/checkout@v7
@@ -217,6 +233,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES $KDC_TEST_PACKAGES
       - uses: actions/checkout@v7
@@ -254,6 +272,8 @@ jobs:
     timeout-minutes: 30
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         run: dnf install -y $DNF_PACKAGES $KDC_TEST_PACKAGES python3
       - uses: actions/checkout@v7
@@ -310,6 +330,8 @@ jobs:
     timeout-minutes: 45
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies
         # bench.sh collects criterion's estimates with python3.
         run: dnf install -y $DNF_PACKAGES python3
@@ -331,6 +353,8 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/fedora/fedora:latest
     steps:
+      - name: Enable test COPR repository
+        run: dnf copr -y enable $COPR_REPO
       - name: Install native dependencies and rustup
         run: dnf install -y $DNF_PACKAGES rustup
       - uses: actions/checkout@v7
