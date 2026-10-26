@@ -99,6 +99,13 @@ impl UserPaths {
         self.dir.join("device.key")
     }
 
+    /// The servers' advertisements kept between runs, when this user may
+    /// not write the host's (`net::cache_advertisements_in`).
+    #[must_use]
+    pub fn advertisements(&self) -> PathBuf {
+        self.dir.join("advertisements")
+    }
+
     /// A lost host's device key, recovered here until `kuipa seal recover
     /// finish --retire-old` (`DESIGN-recovery.md` §2).
     #[must_use]

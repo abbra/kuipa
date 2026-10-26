@@ -19,6 +19,7 @@ All paths hang off `$KUIPA_ROOT` (default `/`).
 | `/var/lib/ipa-client/ku/krb5.conf`, `pkinit-anchors.pem` | Kerberos configuration from the enrollment | 0644 |
 | `/var/lib/ipa-client/ku/recipient.jwk`, `recipient.pub.jwk` | the machine key for a mode A bundle | 0600, 0644 |
 | `/var/lib/ipa-client/ku/pending.json` | steps left after an offline enrollment | 0600 |
+| `/var/lib/ipa-client/ku/advertisements/` | the servers' advertisements, kept to fetch them conditionally; verified again at every use | 0644 |
 
 ## A user's own files
 
@@ -29,6 +30,7 @@ All paths hang off `$KUIPA_ROOT` (default `/`).
 | `…/device.pkcs11` | where a token device is: its module and URI |
 | `…/vaults/<name>.vault` | each vault's last signed description |
 | `…/servers.json` | the servers' advertisements, for sealing offline |
+| `…/advertisements/` | the servers' advertisements, kept to fetch them conditionally when the host's own cannot be written |
 | `$KUIPA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/kuipa`, `sessions/<vault id>` | a live session: its token, the unwrapped device key, released offline keys (memory only) |
 
 ## On an IPA server

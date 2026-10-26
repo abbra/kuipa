@@ -461,6 +461,17 @@ only with the client's pins, by one proof at most. The server keeps one
 signed advertisement per choice of proofs, re-signed at half life and
 discarded when the exchange publishes.
 
+**Conditional fetches.** Since an advertisement stays the same until it is
+re-signed or the exchange publishes, the server tags it with a hash of
+its bytes (`ETag`) and answers a matching `If-None-Match` with `304 Not
+Modified`. `kuipa` keeps each advertisement with its tag
+(`/var/lib/ipa-client/ku/advertisements/`, or the user's kuipa directory
+when that cannot be written) and asks conditionally. A kept
+advertisement is verified again at every use, as of that moment and
+against the current pins, exactly as fresh bytes are: the cache saves
+the transfer, never a check, and a `304` can only hand back bytes this
+host already received, which anyone could replay anyway.
+
 The `ipa` member carries certificates, not hashes: before enrollment the
 advertisement is the only authenticated source of the PKINIT anchors an
 armoured `kinit` needs (§5.4), and its CA authenticates the server's TLS

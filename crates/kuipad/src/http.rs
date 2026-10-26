@@ -183,16 +183,38 @@ fn wanted_heads(query: Option<&str>) -> Vec<HeadPin> {
 async fn advertisement<D: Directory + Send + Sync + 'static>(
     State(app): State<Arc<App<D>>>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
     match app.server.advertisement_with_heads(
         &wanted_anchors(query.as_deref()),
         &wanted_heads(query.as_deref()),
     ) {
-        Ok(adv) => (
-            [(header::CONTENT_TYPE, "application/jose+json")],
-            adv.to_json(),
-        )
-            .into_response(),
+        Ok(adv) => {
+            // The advertisement stays the same until it is re-signed or the
+            // exchange publishes, so a client that kept it is told so in
+            // a few bytes (`If-None-Match`).  Its tag is a hash of the
+            // bytes; what it kept still gets verified like fresh bytes.
+            let json = adv.to_json();
+            let Ok(digest) = tang_pqc::primitives::sha256(&[json.as_bytes()]) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let tag = format!("\"{}\"", b64::encode(&digest));
+            let unchanged = headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.split(',').any(|t| t.trim() == tag));
+            if unchanged {
+                return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response();
+            }
+            (
+                [
+                    (header::CONTENT_TYPE, "application/jose+json".to_owned()),
+                    (header::ETAG, tag),
+                ],
+                json,
+            )
+                .into_response()
+        }
         Err(e) => {
             eprintln!("kuipad: advertisement: {e}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
