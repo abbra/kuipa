@@ -59,7 +59,16 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] 8. Offline sessions.
   - [x] 9a. PKCS#11 devices: an ML-KEM key on a token through
         pkcs11-provider (no attestation yet: registered at `any`).
-  - [ ] 9b. Passkeys (libfido2 FFI, relying-party verifier from ahdapa).
+  - [x] 9b. Passkeys, classical (ES256, ES384, EdDSA, RS256) and
+        ML-DSA-44/65/87: the passkey factor (relying-party verifier from
+        ahdapa in `kuipa_enroll::passkey`, assertions in `IPEQ` v3 and in
+        the session `unlock`, `ipaPassKey` and `ipaRequireUserVerification`
+        read by kuipad, the `passkeys` vault operation for allow lists) and
+        passkey-wrapped device keys (`hmac-secret`, `kuipa seal device add
+        --passkey`), through the new `kuipa-fido2` libfido2 FFI crate; no
+        attestation yet: registered at `any`.  Tested with a software
+        authenticator; **not yet run against a real security key** or
+        against FreeIPA's LDAP.
   - [x] Registered sealing (`sealing = registered`).
   - [x] Realm limits per group, and the factor sets a policy must meet
         (§7.6.2).
