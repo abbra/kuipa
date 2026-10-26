@@ -120,7 +120,7 @@ pub const LDAP_OPT_TIMEOUT: c_int = 0x5014;
 
 /// Option: pass a `gss_cred_id_t` to the SASL GSSAPI plugin.
 ///
-/// OpenLDAP stores the `invalue` argument to `ldap_set_option` directly as the
+/// `OpenLDAP` stores the `invalue` argument to `ldap_set_option` directly as the
 /// `gss_cred_id_t` — it does NOT dereference it.  Pass the credential handle
 /// itself, not a pointer to it.  When set, the GSSAPI plugin uses this credential
 /// instead of calling `gss_acquire_cred(GSS_C_NO_CREDENTIAL)`.  Used to inject

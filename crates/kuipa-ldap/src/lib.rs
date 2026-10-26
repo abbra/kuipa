@@ -87,6 +87,7 @@ pub enum Auth {
 /// The characters `*`, `(`, `)`, `\`, and `\0` must be encoded as their
 /// hex escape (`\2a`, `\28`, `\29`, `\5c`, `\00`).  Every other character
 /// passes through unchanged.
+#[must_use]
 pub fn filter_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -107,6 +108,7 @@ pub fn filter_escape(s: &str) -> String {
 /// Leading `#`, leading/trailing space, and the characters `\`, `"`, `+`,
 /// `,`, `;`, `<`, `>`, `=`, and `\0` are escaped.  All other characters
 /// pass through unchanged.
+#[must_use]
 pub fn dn_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.char_indices() {
