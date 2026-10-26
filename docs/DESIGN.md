@@ -1408,7 +1408,7 @@ The **policy**:
 | `factors.device` | `none`, or the least device-key level: `any`, `hardware-wrapped`, `hardware-bound` | by the server: the answer is encrypted to a registered device key of that level, and the file's device share needs it (§7.6.4) |
 | `factors.ticket` | an unlock needs a ticket naming the owner as client: one from the owner's login (PAM through SSSD, `kinit`) or obtained for them by the host through protocol transition and S4U2Proxy (sshd on Fedora and RHEL after a public-key login), which then attests the host's vouch, not the owner's credentials | by the server |
 | `ticket.delegation` | `allow` (the default), `refuse` (only tickets from the owner's own credentials), or `via` a list of services a delegated ticket may have passed through (e.g. only `host/devvm1.example.test`) | by the server, from the PAC's S4U delegation info |
-| `factors.passkey` | an unlock needs a passkey assertion from any of the owner's IPA passkeys (`ipaPassKey`): managing a user's passkeys in IPA manages their vault access too | by the server |
+| `factors.passkey` | an unlock needs a passkey assertion from any of the opener's IPA passkeys (`ipaPassKey`): the owner's, or the holder's of the ticket or device a shared vault is opened with; managing a user's passkeys in IPA manages their vault access too (implemented, §7.6.5) | by the server |
 | `not_after` | no unlock after this time | by the server |
 | `max_unlocks` | releases over the vault's life | by the server, approximately across replicas (§7.6.7) |
 | `sessions.reauth` | the longest re-authentication session, or off | by the server (§7.6.6) |
@@ -1469,7 +1469,7 @@ Devices registered before shared vaults have none and are the owner's.
 | type | where the decapsulation key is | highest level |
 |---|---|---|
 | `file` | `device.key` in the user's kuipa directory: `IPDK(kdf, iterations, salt, GCM_k(private JWK))` with `k = PBKDF2-HMAC-SHA-512(passphrase, salt)`, 600 000 iterations (native-ossl exports no encrypted PKCS#8 for ML-KEM keys, so the format is kuipa's own) | `any` |
-| `passkey` | a key file encrypted under the FIDO2 `hmac-secret` (WebAuthn PRF) output of a passkey; every use needs a touch or PIN | `hardware-wrapped` |
+| `passkey` | a key file encrypted under the FIDO2 `hmac-secret` (WebAuthn PRF) output of a passkey; every use needs a touch, and the PIN if one was given (implemented: `kuipa seal device add --passkey` makes a non-discoverable credential of the device's own, under the RP ID `kuipa:<realm>`, ML-DSA first where the key offers it; `device.key` becomes `IPDK kdf(2) rp_id credential_id uv salt(32) GCM_k(private JWK)` with `k = HKDF(hmac-secret(salt), "passkey device key", salt ‖ credential_id)`, `uv` saying whether the PIN verified the user, since `hmac-secret` answers differently with and without) | `hardware-wrapped` |
 | `pkcs11-wrapped` | a key file wrapped by an AES key on a PKCS#11 token (`CKM_AES_KEY_WRAP_KWP`); RSA or EC wrapping is refused (harvest-now-decrypt-later) | `hardware-wrapped` |
 | `pkcs11` | an ML-KEM key generated on a PKCS#11 3.2 token (`CKM_ML_KEM`), non-extractable, used by `pkcs11:` URI through OpenSSL's pkcs11-provider (implemented: kuipa loads the provider into its own library context with a configuration written to the user's runtime directory, passes the PIN as the URI's `pin-value`, and decapsulates on the token; the host remembers the module and URI in `device.pkcs11`; tested with kryoptic) | `hardware-bound` |
 
@@ -1632,15 +1632,44 @@ the one place where a limit stops being the server's to enforce.
   new files. A vault without offline sessions has no session key, no
   `ipaKUVaultSessionKey`, and no session-mode files.
 
-**Passkeys without a browser.** The client is `kuipa`, not a browser, so it
-talks to the authenticator through libfido2 at the CTAP level, as SSSD's
-`passkey_child` does for passkey logins: the challenge is the CTAP
-`clientDataHash`, set to the request hash directly, with no
+**Passkeys without a browser** (implemented). The client is `kuipa`, not
+a browser, so it talks to the authenticator through libfido2 at the CTAP
+level, as SSSD's `passkey_child` does for passkey logins: the challenge is
+the CTAP `clientDataHash`, set to the request hash directly, with no
 `clientDataJSON` around it, and the RP ID is the one the realm's passkeys
 are registered under (the IPA domain, as `ipa passkeyconfig` and SSSD use
 it), with user verification as that configuration requires. The same
 libfido2 calls give the `hmac-secret` output for passkey-wrapped device
-keys.
+keys. In detail:
+
+* The assertion travels in `IPEQ` version 3 (which also makes the release
+  request id optional; versions 1 and 2 stay as they were for requests
+  without an assertion) as `IPPA credential_id authenticator_data
+  signature`. Its challenge is `H("ipa-ku-enroll/v1 vault passkey" ‖ the
+  request without its token and assertion)`, taken to 32 bytes as the
+  ticket's channel binding is (whose own input now leaves out the
+  assertion too), so an assertion serves its request alone: a replay only
+  releases to the requester's ephemeral key again.
+* kuipad, the relying party, finds the opener's `ipaPassKey` value with
+  the assertion's credential id, checks the RP ID hash, user presence,
+  user verification when `ipaRequireUserVerification` (default on) asks
+  for it, and the signature over `authenticatorData ‖ clientDataHash` with
+  the algorithm the stored SPKI implies: ES256 (P-256), ES384 (P-384),
+  EdDSA (Ed25519), RS256 (RSA, 2048 bits or more), or pure ML-DSA-44,
+  ML-DSA-65 or ML-DSA-87 with the empty context, as FreeIPA stores them
+  once SSSD registers them. IPA keeps no signature counter, so none is
+  checked, as SSSD checks none.
+* The opener is the session's holder, else the ticket's principal, else
+  the device's holder, else (a policy with the passkey alone) the owner.
+* A session stands in for the passkey as it does for the ticket, so the
+  vault operation `unlock` of a vault with the passkey factor carries the
+  caller's assertion over `H("ipa-ku-enroll/v1 vault session passkey" ‖
+  cb)`, `cb` the operation exchange's channel binding.
+* The vault operation `passkeys` answers the caller's credential ids, their
+  algorithms, the RP ID and whether the user is verified, for the
+  authenticator's allow list; `kuipa` keeps the answer in `passkeys.json`
+  for an hour, and uses it after that only when the realm cannot be asked.
+  The answer is a reply of version 7, written only for this operation.
 
 **Delegated tickets.** A ticket from S4U2Proxy is as good as the host that
 obtained it: whoever holds that host's keys can obtain one for any user its
@@ -1744,15 +1773,15 @@ only when it is not a terminal, unless `--force`.
 * `kuipad`: the vault container and limits, vault and device operations
   (Kerberos-authenticated, as the registration of §7.5), the recovery
   checks, the counter in the anchor exchange's CRDT, and relying-party
-  verification of passkey assertions and FIDO MDS attestation copied from
-  ahdapa (`src/auth/passkey.rs`, `src/auth/fido_mds.rs`) into a kuipa
-  crate, adapted to CTAP-level assertions (a raw `clientDataHash`, not a
-  browser's `clientDataJSON`). ahdapa has no client side: there the browser
-  is the client.
+  verification of passkey assertions (implemented: `kuipa_enroll::passkey`,
+  from ahdapa's `src/auth/passkey.rs`) and FIDO MDS attestation (not yet,
+  from `src/auth/fido_mds.rs`), adapted to CTAP-level assertions (a raw
+  `clientDataHash`, not a browser's `clientDataJSON`). ahdapa has no client
+  side: there the browser is the client.
 * `kuipa`: `kuipa seal`; device key types: PBES2 PKCS#8 files (OpenSSL),
-  PKCS#11 through pkcs11-provider, and a borrowed libfido2 FFI crate for
-  `hmac-secret` and assertions (against the libfido2 from abbra/pqc for
-  ML-DSA passkeys).
+  PKCS#11 through pkcs11-provider, and a libfido2 FFI crate
+  (`kuipa-fido2`, implemented) for `hmac-secret` and assertions (against
+  the libfido2 from abbra/pqc for ML-DSA passkeys).
 * FreeIPA: schema and ACIs for the container, `vault-limits`, and a
   framework front end for administrators (list, revoke, set limits).
 
@@ -2921,7 +2950,7 @@ a static table is the smallest surface to audit.
 | TPM factor for sealed keytabs, `prepare --tpm` | designed |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
-| user vaults, unified recovery (§7.6): vault model and descriptor, devices (passphrase files, PKCS#11 tokens), the ticket factor, sessions, offline sessions, unlock counts, registered sealing, shared vaults (§7.6.12), release approvals (DESIGN-approvals.md), machine vaults for host and service escrow, `kuipa seal` | implemented, tested against a real KDC; **not yet**: passkeys, attestation for the `hardware-*` levels, PAC delegation info for `ticket.delegation`; the LDAP side **not yet run against FreeIPA** |
+| user vaults, unified recovery (§7.6): vault model and descriptor, devices (passphrase files, passkey-wrapped files, PKCS#11 tokens), the ticket and passkey factors (classical and ML-DSA passkeys), sessions, offline sessions, unlock counts, registered sealing, shared vaults (§7.6.12), release approvals (DESIGN-approvals.md), machine vaults for host and service escrow, `kuipa seal` | implemented, tested against a real KDC; **not yet**: attestation for the `hardware-*` levels, PAC delegation info for `ticket.delegation`; the LDAP side **not yet run against FreeIPA** |
 | gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change merged as gssapi/gssproxy#135, **awaiting an upstream release** |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
 

@@ -3,15 +3,16 @@
 > **Status: partly implemented.** This guide describes `kuipa seal` as
 > the design's [user vaults](../reference/design.md#76-user-vaults-being-implemented)
 > section has it. Working today: `create`,
-> `policy`, `device add|remove` with passphrase-protected device keys or
-> an ML-KEM key on a PKCS#11 token (`--pkcs11 URI`, registered at level
-> `any` until attestation is checked), `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
-> with the `device` and `ticket` factors, re-authentication sessions
+> `policy`, `device add|remove` with passphrase-protected device keys,
+> keys wrapped by a passkey on a FIDO2 security key (`--passkey`) or an
+> ML-KEM key on a PKCS#11 token (`--pkcs11 URI`), all registered at level
+> `any` until attestation is checked, `file`, `open`, `reseal`, `show`, `list`, `revoke`, `unlock` and `lock`,
+> with the `device`, `ticket` and `passkey` factors, re-authentication sessions
 > (`--session-hours`), offline sessions (`--offline-hours`, where the realm
 > allows them), unlock limits (`--max-unlocks`), registered sealing
 > (`--sealing registered`, `kuipa seal retire`), shared vaults
 > (`share`, `unshare`) and approvals (`--approvals`, `request`,
-> `approve`). Not yet: passkeys,
+> `approve`). Not yet:
 > the attested `hardware-*` levels, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
 > only the default `allow` is accepted). A vault policy asking for any of
@@ -109,15 +110,32 @@ passkey: either as the device (the key file is wrapped by the passkey, so
 every open needs a touch), or as a factor the server checks, or both.
 
 ```sh
-kuipa seal create signing --require device=hardware-wrapped,passkey
+kuipa seal create signing --require device,passkey
 kuipa seal device add signing --passkey
 kuipa seal file signing ~/release-signing.key
 ```
 
-Any passkey registered to your IPA account (the ones you log in with) is
-accepted for the `passkey` factor. If you remove a passkey from your
-account, it stops opening these files too. Post-quantum (ML-DSA) passkeys
-work where your libfido2 supports them.
+Any passkey registered to your IPA account (the ones you log in with,
+`ipa user-add-passkey --register`) is accepted for the `passkey` factor:
+the security key signs a challenge made from the open request itself, and
+the server checks the signature against your account. If you remove a
+passkey from your account, it stops opening these files too. Classical
+passkeys (ES256, ES384, EdDSA, RS256) and post-quantum ones (ML-DSA-44,
+ML-DSA-65, ML-DSA-87) both work; the post-quantum ones need a libfido2 and
+a security key that support them, as SSSD does to register them.
+
+`device add --passkey` makes a credential of the device's own on the
+security key (not one of your IPA passkeys) and wraps a new device key
+with its `hmac-secret`: one touch makes it, one wraps the key. Give the
+security key's PIN, or leave it empty for a key without one; with a PIN,
+every open asks for it again. Opening then takes a touch for the device
+key and, with the `passkey` factor, one for the assertion; when the realm
+requires user verification (`ipa passkeyconfig`), the device's PIN serves
+for both. A session (`kuipa seal unlock`) takes one assertion to start,
+then none until it ends. Until attestation is checked, a passkey-wrapped
+device registers at level `any`, so require `device` rather than
+`device=hardware-wrapped` for now. With another security key for the
+factor, give its PIN with `--passkey-pin-file` (or at the prompt).
 
 ### Use a smart card or hardware token
 
