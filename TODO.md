@@ -113,7 +113,9 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       signed-note checkpoint with a witness endpoint (§6); logging the
       opening of machine (keytab) bindings, which only vault releases are
       today; mirroring the logs in `kuipa-mirror`; token-key epochs
-      (kind 7) once tokens exist.
+      (kind 7) once tokens exist; the privacy mitigations of
+      `DESIGN-tlog.md` §9: keyed body digests and device ids, index-key
+      epochs, coarse public times, per-statement signing indexes.
 - [x] Kerberos-bound signing (`DESIGN-sign.md`): the `sign` operation,
       the signing policy with `memberOf` groups, batches, offline bundles,
       `kuipa sign`, `kuipa-gitsign`.
