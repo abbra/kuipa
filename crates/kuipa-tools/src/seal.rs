@@ -7,10 +7,13 @@
 //! `~/.local/share/kuipa`, mode 0700):
 //!
 //! ```text
-//! device.key            the device's ML-KEM key, under the passphrase (IPDK)
+//! device.key            the device's ML-KEM key, under the passphrase or
+//!                       a passkey's hmac-secret (IPDK)
 //! vaults/<name>.vault   the last signed descriptor of each vault (IPVD)
 //! servers.json          the servers' signed advertisements, with when they
 //!                       were fetched, for sealing offline
+//! passkeys.json         the user's IPA passkeys, as the realm last listed
+//!                       them, for the passkey factor's allow list
 //! ```
 //!
 //! `vaults/<name>.tlog` holds what `kuipa tlog watch` last verified of
@@ -29,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use kuipa_enroll::join::{AuthType, Operation, Prepared};
 use kuipa_enroll::keytab::Enctype;
+use kuipa_enroll::passkey::PasskeyInfo;
 use kuipa_enroll::realm::{Deployment, VerifiedRealm};
 use kuipa_enroll::vault::{
     Descriptor, DeviceKey, DeviceType, Policy, SealedVaultFile, SessionSealedFile, SessionToken,
@@ -47,13 +51,18 @@ use tang_pqc::{ExchangeKeyPair, KemAlg, SignedAdvertisement, Thumbprint, unix_se
 
 use crate::flows::{self, Outcome};
 use crate::net::Endpoint;
+use crate::passkey::{Authenticator, Fido2, pin_of};
 use crate::paths::{self, Error, Paths, PublicState};
 
 const DEVICE_KEY_MAGIC: [u8; 4] = *b"IPDK";
 const SESSION_FILE_MAGIC: [u8; 4] = *b"IPSS";
 /// KDF id 1: PBKDF2-HMAC-SHA-512.
 const KDF_PBKDF2_SHA512: u8 = 1;
+/// KDF id 2: a passkey's `hmac-secret` output, through HKDF (§7.6.2).
+const KDF_FIDO2_HMAC_SECRET: u8 = 2;
 const PBKDF2_ITERATIONS: u64 = 600_000;
+/// How long the user's listed passkeys are used before asking again.
+const PASSKEYS_MAX_AGE: u64 = 3600;
 
 /// A user's kuipa data directory.
 #[derive(Clone, Debug)]
@@ -98,9 +107,13 @@ impl UserPaths {
     }
 
     /// The recovered key under `secret`, if there is one.
-    fn recovered(&self, secret: &[u8]) -> Result<Option<ExchangeKeyPair>, Error> {
+    fn recovered(
+        &self,
+        secret: &[u8],
+        auth: &dyn Authenticator,
+    ) -> Result<Option<ExchangeKeyPair>, Error> {
         match fs::read(self.recovered_key()) {
-            Ok(bytes) => Ok(Some(unprotect_key(&bytes, secret)?)),
+            Ok(bytes) => Ok(Some(unprotect_any(&bytes, secret, auth)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -108,13 +121,50 @@ impl UserPaths {
 
     /// The device to open a file with device slots `ids`: the recovered
     /// key when the file has a slot for it, else this host's device.
-    fn device_for(&self, ids: &[Thumbprint], secret: &[u8]) -> Result<HostDevice, Error> {
-        if let Some(old) = self.recovered(secret)?
+    fn device_for(
+        &self,
+        ids: &[Thumbprint],
+        secret: &[u8],
+        auth: &dyn Authenticator,
+    ) -> Result<HostDevice, Error> {
+        if let Some(old) = self.recovered(secret, auth)?
             && ids.contains(old.public().kid())
         {
             return Ok(HostDevice::File(old));
         }
-        self.device(secret)
+        self.device(secret, auth)
+    }
+
+    /// The passkey this host's device key is wrapped by, if it is.
+    fn passkey_wrap(&self) -> Option<PasskeyWrap> {
+        let bytes = fs::read(self.device_key()).ok()?;
+        PasskeyWrap::of(&bytes)
+    }
+
+    /// Whether this host's device key is wrapped by a passkey: its
+    /// secret is the security key's PIN, which may be empty.
+    #[must_use]
+    pub fn passkey_device(&self) -> bool {
+        self.passkey_wrap().is_some()
+    }
+
+    /// `key` protected as this host's keys are: under the passkey that
+    /// wraps the device key, else under the passphrase `secret`.
+    fn protect(
+        &self,
+        key: &ExchangeKeyPair,
+        secret: &[u8],
+        auth: &dyn Authenticator,
+    ) -> Result<Vec<u8>, Error> {
+        match self.passkey_wrap() {
+            Some(wrap) => protect_with_passkey(key, &wrap, pin_of(secret)?, auth),
+            None => protect_key(key, secret),
+        }
+    }
+
+    /// The user's passkeys as last listed.
+    fn passkeys(&self) -> PathBuf {
+        self.dir.join("passkeys.json")
     }
 
     fn vaults(&self) -> PathBuf {
@@ -142,18 +192,20 @@ impl UserPaths {
         serde_json::from_slice(&fs::read(self.token_device()).ok()?).ok()
     }
 
-    /// This host's device under `secret` (the file's passphrase or the
-    /// token's PIN).
-    fn device(&self, secret: &[u8]) -> Result<HostDevice, Error> {
-        match self.token() {
-            Some(t) => Ok(HostDevice::Token(crate::pkcs11::TokenKey::open(
+    /// This host's device under `secret` (the file's passphrase, or the
+    /// PIN of the token or of the security key whose passkey wraps it).
+    fn device(&self, secret: &[u8], auth: &dyn Authenticator) -> Result<HostDevice, Error> {
+        if let Some(t) = self.token() {
+            return Ok(HostDevice::Token(crate::pkcs11::TokenKey::open(
                 &t.module,
                 &t.uri,
                 secret,
                 &Self::runtime().unwrap_or_else(|_| self.dir.clone()),
-            )?)),
-            None => Ok(HostDevice::File(read_device_key(self, secret)?)),
+            )?));
         }
+        let bytes = fs::read(self.device_key())
+            .map_err(|_| "this host has no device key: run `kuipa seal device add VAULT` first")?;
+        Ok(HostDevice::File(unprotect_any(&bytes, secret, auth)?))
     }
 
     /// The runtime directory for sessions: `$KUIPA_RUNTIME_DIR`, else
@@ -241,6 +293,112 @@ fn unprotect_key(bytes: &[u8], secret: &[u8]) -> Result<ExchangeKeyPair, Error> 
     Ok(ExchangeKeyPair::from_jwk(jwk.as_ref())?)
 }
 
+/// The passkey a key file is wrapped by: its relying party, credential,
+/// and whether the user was verified when it was wrapped (`hmac-secret`
+/// answers differently with and without).
+struct PasskeyWrap {
+    rp_id: String,
+    credential_id: Vec<u8>,
+    uv: bool,
+}
+
+impl PasskeyWrap {
+    /// The wrap of a key file, if a passkey wraps it.
+    fn of(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes, DEVICE_KEY_MAGIC, "device key").ok()?;
+        if r.u8().ok()? != KDF_FIDO2_HMAC_SECRET {
+            return None;
+        }
+        Some(Self {
+            rp_id: r.str().ok()?.to_owned(),
+            credential_id: r.bytes().ok()?.to_vec(),
+            uv: r.u8().ok()? != 0,
+        })
+    }
+
+    /// The key that encrypts the file: `HKDF(hmac-secret(salt), "passkey
+    /// device key", salt ‖ credential id)`, the passkey's answer for
+    /// `salt`, which only it gives.
+    fn sealing_key(
+        &self,
+        salt: &[u8; 32],
+        pin: Option<&str>,
+        auth: &dyn Authenticator,
+    ) -> Result<SecretBuf, Error> {
+        // The challenge is checked by nobody: only the hmac-secret counts.
+        let mut cdh = [0u8; 32];
+        Rand::fill(&mut cdh)?;
+        // A PIN verifies the user, which changes the answer: give it only
+        // when the key was wrapped with one.
+        let answer = auth.assert(
+            &kuipa_fido2::AssertionRequest {
+                rp_id: &self.rp_id,
+                client_data_hash: &cdh,
+                allow: std::slice::from_ref(&self.credential_id),
+                user_verification: self.uv,
+                hmac_salt: Some(salt),
+            },
+            pin.filter(|_| self.uv),
+        )?;
+        let secret = answer
+            .hmac_secret
+            .ok_or("the security key gave no hmac-secret")?;
+        Ok(kuipa_enroll::vault::DOMAIN.derive_key(
+            primitives::SHA256,
+            &[secret.as_ref()],
+            "passkey device key",
+            &[salt, &self.credential_id],
+        )?)
+    }
+}
+
+/// `key` wrapped by the passkey `wrap` (one touch):
+/// `IPDK kdf(2) rp_id credential_id uv(u8) salt(32) GCM_k(private JWK)`.
+fn protect_with_passkey(
+    key: &ExchangeKeyPair,
+    wrap: &PasskeyWrap,
+    pin: Option<&str>,
+    auth: &dyn Authenticator,
+) -> Result<Vec<u8>, Error> {
+    let mut salt = [0u8; 32];
+    Rand::fill(&mut salt)?;
+    let sealing = wrap.sealing_key(&salt, pin, auth)?;
+    let sealed = primitives::seal(sealing.as_ref(), key.to_jwk()?.as_ref())?;
+    Ok(Writer::new(DEVICE_KEY_MAGIC)
+        .u8(KDF_FIDO2_HMAC_SECRET)
+        .str(&wrap.rp_id)
+        .bytes(&wrap.credential_id)
+        .u8(u8::from(wrap.uv))
+        .fixed(&salt)
+        .bytes(&sealed)
+        .finish())
+}
+
+/// The key in a key file under `secret`: a passphrase, or for a
+/// passkey-wrapped one the security key's PIN (one touch).
+fn unprotect_any(
+    bytes: &[u8],
+    secret: &[u8],
+    auth: &dyn Authenticator,
+) -> Result<ExchangeKeyPair, Error> {
+    let Some(wrap) = PasskeyWrap::of(bytes) else {
+        return unprotect_key(bytes, secret);
+    };
+    let mut r = Reader::new(bytes, DEVICE_KEY_MAGIC, "device key")?;
+    r.u8()?;
+    r.str()?;
+    r.bytes()?;
+    r.u8()?;
+    let salt: [u8; 32] = r.fixed()?;
+    let sealed = r.bytes()?.to_vec();
+    r.finish()?;
+    let sealing = wrap.sealing_key(&salt, pin_of(secret)?, auth)?;
+    let jwk = primitives::open(sealing.as_ref(), &sealed).map_err(
+        |_| "the security key does not open this device key (another key, or another PIN setting)",
+    )?;
+    Ok(ExchangeKeyPair::from_jwk(jwk.as_ref())?)
+}
+
 /// The base32 alphabet of RFC 4648.
 const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -283,6 +441,17 @@ struct LiveSession {
     token: SessionToken,
     key: Option<ExchangeKeyPair>,
     epochs: Vec<(u64, ExchangeKeyPair)>,
+}
+
+/// Makes a vault operation, encoded, for the exchange whose channel
+/// binding it is given.
+type MakeOp<'a> = &'a mut dyn FnMut(&[u8; 32]) -> Result<Vec<u8>, Error>;
+
+/// The user's passkeys as the realm last listed them, and when.
+#[derive(Serialize, Deserialize)]
+struct CachedPasskeys {
+    fetched: u64,
+    info: PasskeyInfo,
 }
 
 /// Where this host's token device is: its PKCS#11 module and key URI.
@@ -382,6 +551,8 @@ pub struct Seal<'a> {
     host: &'a Paths,
     user: &'a UserPaths,
     credential: Credential<'a>,
+    authenticator: &'a dyn Authenticator,
+    passkey_pin: Option<SecretBuf>,
 }
 
 /// Whose ticket a vault operation carries.
@@ -409,7 +580,26 @@ impl<'a> Seal<'a> {
             host,
             user,
             credential: Credential::Ccache(ccache),
+            authenticator: &Fido2,
+            passkey_pin: None,
         }
+    }
+
+    /// Ask `authenticator` for passkey assertions instead of the security
+    /// keys attached to the host.
+    #[must_use]
+    pub fn with_authenticator(mut self, authenticator: &'a dyn Authenticator) -> Self {
+        self.authenticator = authenticator;
+        self
+    }
+
+    /// Verify the user to the security key with `pin` for the passkey
+    /// factor (empty for none).  Without it, a host whose device key a
+    /// passkey wraps uses the device's PIN.
+    #[must_use]
+    pub fn with_passkey_pin(mut self, pin: SecretBuf) -> Self {
+        self.passkey_pin = Some(pin);
+        self
     }
 
     /// As the principal of `keytab` (a service's or a user's), or without
@@ -421,6 +611,8 @@ impl<'a> Seal<'a> {
             host,
             user,
             credential: Credential::Keytab(keytab),
+            authenticator: &Fido2,
+            passkey_pin: None,
         }
     }
 
@@ -443,6 +635,14 @@ impl<'a> Seal<'a> {
     }
 
     fn op_with_session(&self, op: &VaultOp) -> Result<OpAnswer, Error> {
+        let extra = op.to_bytes();
+        self.op_bound(&mut |_| Ok(extra.clone()))
+    }
+
+    /// As [`op_with_session`](Self::op_with_session), the operation made
+    /// for each exchange from its channel binding (`make(cb)`, encoded),
+    /// for an operation that carries something bound to the exchange.
+    fn op_bound(&self, make: MakeOp<'_>) -> Result<OpAnswer, Error> {
         let public = self.public()?;
         // This host's pins, windows and freezes included (§1.4, §2): a
         // vault descriptor is fetched through a verified advertisement,
@@ -452,7 +652,6 @@ impl<'a> Seal<'a> {
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
         let me = cred.principal_name();
-        let extra = op.to_bytes();
         let (reply, _) = flows::exchange_with(
             &Deployment::servers(&public.servers),
             &trust,
@@ -474,7 +673,9 @@ impl<'a> Seal<'a> {
                     &Enctype::DEFAULT,
                 )?;
                 let target = format!("ipa-ku@{}", adv.server());
-                let (token, binding) = flows::gss_token(&cred, &target, &p.channel_binding()?)?;
+                let cb = p.channel_binding()?;
+                let extra = make(&cb)?;
+                let (token, binding) = flows::gss_token(&cred, &target, &cb)?;
                 Ok(p.with_kerberos(binding).seal(&token, &[], &extra)?)
             },
             |pending, response, adv| Ok(pending.finish_vault(response, adv)?),
@@ -503,12 +704,32 @@ impl<'a> Seal<'a> {
     /// A wrong passphrase, a policy without sessions, no runtime
     /// directory, or any other error.
     pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
-        let key = self.user.device(passphrase)?;
-        let OpAnswer { vaults, reply } = self.op_with_session(&VaultOp::Unlock {
-            name: name.into(),
-            device: key.public().kid().to_string(),
-            offline,
-            passkey: None,
+        let key = self.user.device(passphrase, self.authenticator)?;
+        // A session stands in for the passkey: starting one takes it, over
+        // this exchange's challenge.
+        let info = if self.vault_needs_passkey(name) {
+            Some(self.passkey_info()?)
+        } else {
+            None
+        };
+        let pin = self.factor_pin(Some(passphrase))?;
+        let device = key.public().kid().to_string();
+        let OpAnswer { vaults, reply } = self.op_bound(&mut |cb| {
+            let passkey = match &info {
+                Some(info) => Some(tang_pqc::b64::encode(&self.passkey_assertion(
+                    info,
+                    &kuipa_enroll::vault::session_passkey_challenge(cb)?,
+                    pin,
+                )?)),
+                None => None,
+            };
+            Ok(VaultOp::Unlock {
+                name: name.into(),
+                device: device.clone(),
+                offline,
+                passkey,
+            }
+            .to_bytes())
         })?;
         let (session, released) = (reply.session, reply.released);
         let session = session.ok_or("the server started no session")?;
@@ -557,6 +778,143 @@ impl<'a> Seal<'a> {
             .id;
         paths::remove(&UserPaths::session(&id)?)?;
         Ok(json!({ "locked": name }))
+    }
+
+    /// The user's IPA passkeys, as the realm lists them (cached for an
+    /// hour), else as it last listed them.
+    fn passkey_info(&self) -> Result<PasskeyInfo, Error> {
+        let now = unix_seconds(flows::now());
+        let cached: Option<CachedPasskeys> = fs::read(self.user.passkeys())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if let Some(c) = &cached
+            && now.saturating_sub(c.fetched) <= PASSKEYS_MAX_AGE
+        {
+            return Ok(c.info.clone());
+        }
+        let listed = self.op_with_session(&VaultOp::Passkeys).and_then(|a| {
+            a.reply
+                .passkeys
+                .ok_or_else(|| "the server listed no passkeys".into())
+        });
+        match (listed, cached) {
+            (Ok(info), _) => {
+                let fresh = CachedPasskeys {
+                    fetched: now,
+                    info: info.clone(),
+                };
+                self.user
+                    .write(&self.user.passkeys(), &serde_json::to_vec_pretty(&fresh)?)?;
+                Ok(info)
+            }
+            (Err(_), Some(c)) => Ok(c.info),
+            (Err(e), None) => Err(format!("your passkeys could not be listed: {e}").into()),
+        }
+    }
+
+    /// The PIN for the passkey factor: the one given, else for a host
+    /// whose device key a passkey wraps the device's (`device_secret`).
+    fn factor_pin<'s>(&'s self, device_secret: Option<&'s [u8]>) -> Result<Option<&'s str>, Error> {
+        match (&self.passkey_pin, device_secret) {
+            (Some(pin), _) => pin_of(pin.as_ref()),
+            (None, Some(secret)) if self.user.passkey_device() => pin_of(secret),
+            _ => Ok(None),
+        }
+    }
+
+    /// An assertion (encoded) from one of the user's IPA passkeys over
+    /// `challenge`.
+    fn passkey_assertion(
+        &self,
+        info: &PasskeyInfo,
+        challenge: &[u8; 32],
+        pin: Option<&str>,
+    ) -> Result<Vec<u8>, Error> {
+        if info.credentials.is_empty() {
+            return Err(
+                "you have no IPA passkeys: register one (`ipa user-add-passkey --register`)".into(),
+            );
+        }
+        let allow = info.credential_ids()?;
+        let a = self.authenticator.assert(
+            &kuipa_fido2::AssertionRequest {
+                rp_id: &info.rp_id,
+                client_data_hash: challenge,
+                allow: &allow,
+                user_verification: info.user_verification,
+                hmac_salt: None,
+            },
+            pin,
+        )?;
+        Ok(kuipa_enroll::passkey::Assertion {
+            credential_id: a.credential_id,
+            authenticator_data: a.authenticator_data,
+            signature: a.signature,
+        }
+        .to_bytes())
+    }
+
+    /// The stored descriptor of the vault `id`, verified.
+    fn stored_by_id(&self, id: &kuipa_enroll::escrow::VaultId) -> Option<VerifiedDescriptor> {
+        let public = self.public().ok()?;
+        let anchors = paths::read_anchors(self.host).ok()?;
+        let policy = tang_pqc::Policy::from_system().ok()?;
+        fs::read_dir(self.user.vaults())
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "vault"))
+            .filter_map(|e| fs::read(e.path()).ok())
+            .filter_map(|b| {
+                Descriptor::from_bytes(&b)
+                    .ok()?
+                    .verify(&public.realm, &anchors, &policy)
+                    .ok()
+            })
+            .find(|d| d.vault().id == *id)
+    }
+
+    /// Whether opening `sealed` takes a passkey assertion: its vault's
+    /// policy has the passkey factor, and no session stands in for it.
+    /// A vault not described here yet is listed first, with a ticket.
+    #[must_use]
+    pub fn needs_passkey(&self, sealed: &[u8]) -> bool {
+        if sealed.starts_with(b"IPUS") {
+            return false;
+        }
+        let Some(id) = vault_of(sealed) else {
+            return false;
+        };
+        if Self::session_for(&id).is_some() {
+            return false;
+        }
+        let stored = self.stored_by_id(&id).or_else(|| {
+            self.op(&VaultOp::List).ok()?;
+            self.stored_by_id(&id)
+        });
+        stored.is_some_and(|d| d.vault().policy.factors.passkey)
+    }
+
+    /// Whether vault `name`'s policy has the passkey factor, as its
+    /// stored descriptor (else a fresh one) says.
+    #[must_use]
+    pub fn vault_needs_passkey(&self, name: &str) -> bool {
+        let stored = self.stored(name).ok().flatten().or_else(|| {
+            self.op(&VaultOp::Show { name: name.into() })
+                .ok()?
+                .into_iter()
+                .next()
+        });
+        stored.is_some_and(|d| d.vault().policy.factors.passkey)
+    }
+
+    /// Whether the passkey factor would verify the user: the realm
+    /// requires it, or its setting is not known here yet.
+    #[must_use]
+    pub fn passkey_verifies_user(&self) -> bool {
+        fs::read(self.user.passkeys())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<CachedPasskeys>(&b).ok())
+            .is_none_or(|c| c.info.user_verification)
     }
 
     /// The live session of vault `id`, if any; an ended one is removed.
@@ -1006,18 +1364,83 @@ impl<'a> Seal<'a> {
     /// error.
     pub fn add_device(&self, name: &str, passphrase: &[u8]) -> Result<Value, Error> {
         let (key, kind) = if self.user.token().is_some() {
-            (self.user.device(passphrase)?, DeviceType::Pkcs11)
-        } else if self.user.device_key().exists() {
             (
-                HostDevice::File(read_device_key(self.user, passphrase)?),
-                DeviceType::File,
+                self.user.device(passphrase, self.authenticator)?,
+                DeviceType::Pkcs11,
             )
+        } else if self.user.device_key().exists() {
+            let kind = if self.user.passkey_device() {
+                DeviceType::Passkey
+            } else {
+                DeviceType::File
+            };
+            (self.user.device(passphrase, self.authenticator)?, kind)
         } else {
             let key = ExchangeKeyPair::generate(KemAlg::MlKem768)?;
             write_device_key(self.user, &key, passphrase)?;
             (HostDevice::File(key), DeviceType::File)
         };
-        if let HostDevice::File(k) = &key {
+        self.register_device(name, &key, kind)
+    }
+
+    /// `kuipa seal device add --passkey`: make this host's device key
+    /// now, wrapped by the `hmac-secret` output of a new credential on the
+    /// security key (two touches: the credential, then the wrap), and
+    /// register it in vault `name`.  `pin` (empty for none) verifies the
+    /// user, and must then be given at every use.  The credential is the
+    /// device's own, under the relying party `kuipa:<realm>`, not one of
+    /// the user's IPA passkeys.  No attestation is verified yet, so the
+    /// device registers at level `any`.
+    ///
+    /// # Errors
+    ///
+    /// A device key already here, no security key, a key without
+    /// `hmac-secret`, a refusal, or any other error.
+    pub fn add_passkey_device(&self, name: &str, pin: &[u8]) -> Result<Value, Error> {
+        if self.user.device_key().exists() || self.user.token().is_some() {
+            return Err("this host already has a device key: one device per host".into());
+        }
+        let public = self.public()?;
+        let me = self
+            .cred()?
+            .principal_name()
+            .ok_or("cannot tell whose ticket this is")?;
+        let pin = pin_of(pin)?;
+        let mut user_id = [0u8; 32];
+        Rand::fill(&mut user_id)?;
+        let rp_id = format!("kuipa:{}", public.realm.to_lowercase());
+        let credential = self.authenticator.make_credential(
+            &kuipa_fido2::CredentialRequest {
+                rp_id: &rp_id,
+                rp_name: "kuipa device key",
+                user_id: &user_id,
+                user_name: &me,
+                algorithms: crate::passkey::DEVICE_ALGORITHMS,
+                hmac_secret: true,
+            },
+            pin,
+        )?;
+        let wrap = PasskeyWrap {
+            rp_id,
+            credential_id: credential.id,
+            uv: pin.is_some(),
+        };
+        let key = ExchangeKeyPair::generate(KemAlg::MlKem768)?;
+        let wrapped = protect_with_passkey(&key, &wrap, pin, self.authenticator)?;
+        self.user.write(&self.user.device_key(), &wrapped)?;
+        self.register_device(name, &HostDevice::File(key), DeviceType::Passkey)
+    }
+
+    /// Register this host's device `key`, of type `kind`, in vault `name`,
+    /// depositing it first where the realm keeps device keys for
+    /// recovery.
+    fn register_device(
+        &self,
+        name: &str,
+        key: &HostDevice,
+        kind: DeviceType,
+    ) -> Result<Value, Error> {
+        if let HostDevice::File(k) = key {
             self.deposit_device_key(k)?;
         }
         let public = self.public()?;
@@ -1269,7 +1692,9 @@ impl<'a> Seal<'a> {
         if self.user.token().is_some() {
             return Err("a token's key never leaves the token: it has no recovery code".into());
         }
-        let key = read_device_key(self.user, passphrase)?;
+        let HostDevice::File(key) = self.user.device(passphrase, self.authenticator)? else {
+            return Err("a token's key never leaves the token: it has no recovery code".into());
+        };
         let code = new_recovery_code()?;
         let blob = protect_key(&key, recovery_secret(&code)?.as_ref())?;
         let device = key.public().kid().to_string();
@@ -1296,8 +1721,8 @@ impl<'a> Seal<'a> {
             );
         }
         if self.user.device_key().exists() {
-            // One passphrase for both keys of this host.
-            read_device_key(self.user, passphrase)?;
+            // One passphrase (or passkey) for both keys of this host.
+            self.user.device(passphrase, self.authenticator)?;
         }
         let secret = recovery_secret(code)?;
         let escrows = self.op_with_session(&VaultOp::RecoverCode)?.reply.escrows;
@@ -1308,8 +1733,10 @@ impl<'a> Seal<'a> {
                 unprotect_key(&blob, secret.as_ref()).ok()
             })
             .ok_or("the code opens none of your escrowed device keys")?;
-        self.user
-            .write(&self.user.recovered_key(), &protect_key(&key, passphrase)?)?;
+        self.user.write(
+            &self.user.recovered_key(),
+            &self.user.protect(&key, passphrase, self.authenticator)?,
+        )?;
         Ok(json!({ "recovered": key.public().kid().to_string() }))
     }
 
@@ -1332,7 +1759,7 @@ impl<'a> Seal<'a> {
     ) -> Result<(Value, Vec<Vec<u8>>), Error> {
         let old = self
             .user
-            .recovered(passphrase)?
+            .recovered(passphrase, self.authenticator)?
             .ok_or("nothing recovered here: run `kuipa seal recover code` first")?;
         let old_id = old.public().kid().to_string();
         let me = self
@@ -1357,7 +1784,12 @@ impl<'a> Seal<'a> {
                 passphrase,
             )?;
         }
-        let new_id = self.user.device(passphrase)?.public().kid().to_string();
+        let new_id = self
+            .user
+            .device(passphrase, self.authenticator)?
+            .public()
+            .kid()
+            .to_string();
         for (name, _) in &held {
             let current = self.op(&VaultOp::Show { name: name.clone() })?;
             if !current
@@ -1445,7 +1877,7 @@ impl<'a> Seal<'a> {
     ///
     /// No device key here, or a wrong passphrase.
     pub fn recover_helpdesk(&self, passphrase: &[u8]) -> Result<Value, Error> {
-        let key = self.user.device(passphrase)?;
+        let key = self.user.device(passphrase, self.authenticator)?;
         Ok(json!({ "helpdesk_device": key.public().kid().to_string() }))
     }
 
@@ -1512,7 +1944,7 @@ impl<'a> Seal<'a> {
                 "a recovered key is already here: `kuipa seal recover finish` first".into(),
             );
         }
-        let device = self.user.device(passphrase)?;
+        let device = self.user.device(passphrase, self.authenticator)?;
         let mine = device.public().kid().to_string();
         let escrows = self.op_with_session(&VaultOp::RecoverCode)?.reply.escrows;
         let key = escrows
@@ -1523,8 +1955,10 @@ impl<'a> Seal<'a> {
                 kuipa_enroll::vault::open_delivery(&blob, device.as_device()).ok()
             })
             .ok_or("nothing was delivered to this host's device")?;
-        self.user
-            .write(&self.user.recovered_key(), &protect_key(&key, passphrase)?)?;
+        self.user.write(
+            &self.user.recovered_key(),
+            &self.user.protect(&key, passphrase, self.authenticator)?,
+        )?;
         Ok(json!({ "recovered": key.public().kid().to_string() }))
     }
 
@@ -1646,25 +2080,7 @@ impl<'a> Seal<'a> {
             .map(kuipa_enroll::vault::ReleaseRequest::id_bytes)
             .transpose()?;
         if sealed.starts_with(b"IPUS") {
-            // Sealed for offline sessions: opened here, without a server.
-            let file = SessionSealedFile::from_bytes(sealed)?;
-            let live = Self::session_for(file.vault()).ok_or(
-                "this file opens in an offline session: run `kuipa seal unlock VAULT --offline`",
-            )?;
-            let (_, epoch_key) = live
-                .epochs
-                .iter()
-                .find(|(e, _)| *e == file.epoch())
-                .ok_or("the session was started before this file's epoch: unlock again")?;
-            let fetched;
-            let device = if let Some(k) = &live.key {
-                k as &dyn DeviceKey
-            } else {
-                let secret = passphrase.ok_or("the file needs this host's token: give its PIN")?;
-                fetched = self.user.device(secret)?;
-                fetched.as_device()
-            };
-            return Ok(file.open(epoch_key, device)?);
+            return self.open_offline(sealed, passphrase);
         }
         let file = SealedVaultFile::from_bytes(sealed)?;
         let session = Self::session_for(file.vault());
@@ -1677,10 +2093,34 @@ impl<'a> Seal<'a> {
             } else {
                 let passphrase = passphrase
                     .ok_or("the file needs this host's device key: give its passphrase or PIN")?;
-                unwrapped = self.user.device_for(&file.devices(), passphrase)?;
+                unwrapped =
+                    self.user
+                        .device_for(&file.devices(), passphrase, self.authenticator)?;
                 Some(unwrapped.as_device())
             };
         let trust = flows::ca_trust(self.host)?;
+        // A passkey only when the vault asks for one: each takes a touch.
+        let passkey_info = if session.is_none() && self.needs_passkey(sealed) {
+            Some(self.passkey_info()?)
+        } else {
+            None
+        };
+        let pin = self.factor_pin(passphrase)?;
+        let failure: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
+        let mut make_assertion = |_: &str, challenge: &[u8; 32]| {
+            if failure.borrow().is_some() {
+                return None;
+            }
+            let info = passkey_info.as_ref()?;
+            self.passkey_assertion(info, challenge, pin)
+                .map_err(|e| *failure.borrow_mut() = Some(e))
+                .ok()
+        };
+        let passkey: Option<kuipa_enroll::vault::PasskeySource<'_>> = if passkey_info.is_some() {
+            Some(&mut make_assertion)
+        } else {
+            None
+        };
         // A ticket is sent whenever one is available: vaults that do not
         // ask for it ignore it.
         let cred = self.cred().ok();
@@ -1701,7 +2141,7 @@ impl<'a> Seal<'a> {
                 session: session.as_ref().map(|l| &l.token),
                 ticket,
                 release,
-                passkey: None,
+                passkey,
             },
             |server, request| {
                 tracing::debug!(
@@ -1719,13 +2159,37 @@ impl<'a> Seal<'a> {
                     .ok()
             },
         )
-        .map_err(|e| match e {
-            kuipa_enroll::Error::Refused => Outcome::RetryLater(
+        .map_err(|e| match (e, failure.take()) {
+            // The passkey failed before any server could answer.
+            (kuipa_enroll::Error::Refused, Some(passkey)) => passkey,
+            (kuipa_enroll::Error::Refused, None) => Outcome::RetryLater(
                 "no server would open it: the vault's policy refused, or no server answered".into(),
             )
             .into(),
-            e => e.into(),
+            (e, _) => e.into(),
         })
+    }
+
+    /// Open a file sealed for offline sessions, here, without a server.
+    fn open_offline(&self, sealed: &[u8], passphrase: Option<&[u8]>) -> Result<SecretBuf, Error> {
+        let file = SessionSealedFile::from_bytes(sealed)?;
+        let live = Self::session_for(file.vault()).ok_or(
+            "this file opens in an offline session: run `kuipa seal unlock VAULT --offline`",
+        )?;
+        let (_, epoch_key) = live
+            .epochs
+            .iter()
+            .find(|(e, _)| *e == file.epoch())
+            .ok_or("the session was started before this file's epoch: unlock again")?;
+        let fetched;
+        let device = if let Some(k) = &live.key {
+            k as &dyn DeviceKey
+        } else {
+            let secret = passphrase.ok_or("the file needs this host's token: give its PIN")?;
+            fetched = self.user.device(secret, self.authenticator)?;
+            fetched.as_device()
+        };
+        Ok(file.open(epoch_key, device)?)
     }
 
     /// `kuipa seal reseal`: open each file and seal it again to the

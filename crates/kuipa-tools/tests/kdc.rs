@@ -25,6 +25,7 @@ use kuipa_enroll::join::{
     kerberos_prf_input,
 };
 use kuipa_enroll::keytab::{Enctype, Keytab};
+use kuipa_enroll::passkey::Algorithm;
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::parse_stage_result;
 use kuipa_enroll::vault;
@@ -33,6 +34,7 @@ use kuipa_gssapi::{
 };
 use kuipa_tools::flows::{self, Auth, Outcome, Target};
 use kuipa_tools::net::{Endpoint, Trust};
+use kuipa_tools::passkey::soft::SoftFido2;
 use kuipa_tools::paths::{self, Paths};
 use kuipa_tools::seal::{Seal, UserPaths};
 use kuipad::http::{App, router};
@@ -1366,6 +1368,118 @@ fn token_device(world: &Scenario, alice: &Alice) {
     }
 }
 
+fn passkeys(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let directory = &world.directory;
+    let me = "alice@EXAMPLE.TEST".to_owned();
+    // Alice's security key holds a post-quantum IPA passkey, registered as
+    // `ipa user-add-passkey --register --cose-type mldsa65` would; the
+    // realm requires user verification, so its PIN.
+    let key = SoftFido2::new(Some("4321"));
+    let ml_dsa = key
+        .add_ipa_passkey("example.test", Algorithm::MlDsa(SignatureAlg::MlDsa65))
+        .unwrap();
+    directory
+        .passkeys
+        .lock()
+        .unwrap()
+        .insert(me.clone(), vec![ml_dsa.clone()]);
+    let home = UserPaths::new(realm.dir.join("alice-passkey-home"));
+    let seal = Seal::new(a, &home, Some(&alice.cc)).with_authenticator(&key);
+    let policy = vault::Policy {
+        factors: vault::Factors {
+            device: Some(vault::Level::Any),
+            ticket: false,
+            passkey: true,
+        },
+        sessions: vault::Sessions {
+            reauth: Some(600),
+            offline: None,
+            epoch: None,
+        },
+        ..vault::Policy::default()
+    };
+    seal.create("pk", policy).unwrap();
+    // The device key is wrapped by a passkey of its own on the same key:
+    // one touch makes it, one wraps the key.
+    let added = seal.add_passkey_device("pk", b"4321").unwrap();
+    assert_eq!(
+        added["vaults"][0]["devices"][0]["type"], "passkey",
+        "{added}"
+    );
+    assert_eq!(key.touches(), 2);
+    assert!(home.passkey_device());
+    let note = seal.seal("pk", b"behind a passkey").unwrap();
+    assert!(Seal::needs_secret(&note));
+    assert!(seal.needs_passkey(&note));
+    // Opening takes two touches, the device key's and the factor's, and
+    // the device's PIN serves for both.
+    assert_eq!(
+        seal.open(&note, Some(b"4321")).unwrap().as_ref(),
+        b"behind a passkey"
+    );
+    assert_eq!(key.touches(), 4);
+    assert!(seal.open(&note, Some(b"0000")).is_err(), "a wrong PIN");
+    // The server checks the passkey is Alice's in IPA now, not as the
+    // host last listed them.
+    directory
+        .passkeys
+        .lock()
+        .unwrap()
+        .insert(me.clone(), Vec::new());
+    assert!(seal.open(&note, Some(b"4321")).is_err(), "no IPA passkey");
+    directory
+        .passkeys
+        .lock()
+        .unwrap()
+        .insert(me.clone(), vec![ml_dsa.clone()]);
+    // A session starts with the passkey, then stands in for it: only the
+    // session's own start touches the key.
+    seal.unlock("pk", b"4321", false).unwrap();
+    let touched = key.touches();
+    assert!(!seal.needs_passkey(&note));
+    assert_eq!(
+        seal.open(&note, None).unwrap().as_ref(),
+        b"behind a passkey"
+    );
+    assert_eq!(key.touches(), touched, "no touch in a session");
+    seal.lock("pk").unwrap();
+
+    // A classical passkey on a key without a PIN, in a realm that does not
+    // require user verification: with Alice's ticket, no device.
+    *directory.passkey_uv.lock().unwrap() = false;
+    let classic = SoftFido2::new(None);
+    let es256 = classic
+        .add_ipa_passkey("example.test", Algorithm::Es256)
+        .unwrap();
+    directory
+        .passkeys
+        .lock()
+        .unwrap()
+        .insert(me.clone(), vec![ml_dsa, es256]);
+    let laptop = UserPaths::new(realm.dir.join("alice-classic-home"));
+    let seal = Seal::new(a, &laptop, Some(&alice.cc)).with_authenticator(&classic);
+    let policy = vault::Policy {
+        factors: vault::Factors {
+            device: None,
+            ticket: true,
+            passkey: true,
+        },
+        ..vault::Policy::default()
+    };
+    seal.create("pk-classic", policy).unwrap();
+    let note = seal.seal("pk-classic", b"classic").unwrap();
+    assert!(!Seal::needs_secret(&note));
+    assert_eq!(seal.open(&note, None).unwrap().as_ref(), b"classic");
+    assert_eq!(classic.touches(), 1);
+    // Bob's ticket with Alice's passkey: the passkey must be the ticket
+    // holder's.
+    let as_bob = Seal::new(a, &laptop, Some(&alice.bob_cc)).with_authenticator(&classic);
+    assert!(as_bob.open(&note, None).is_err());
+    *directory.passkey_uv.lock().unwrap() = true;
+}
+
 fn unprotect_host(world: &Scenario) {
     let a = &world.web1;
     flows::unprotect(a, &Target::Host).unwrap();
@@ -1775,6 +1889,7 @@ fn against_a_real_kdc() {
     escrows(&world, &alice);
     helpdesk_recovery(&world, &alice);
     token_device(&world, &alice);
+    passkeys(&world, &alice);
     unprotect_host(&world);
     admin_ticket(&world);
     let conf_path = bootstrap_2fa(&world);

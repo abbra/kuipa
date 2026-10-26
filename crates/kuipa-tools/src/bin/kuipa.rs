@@ -445,6 +445,10 @@ enum SealAction {
         /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
+        /// Read the PIN of the security key holding your IPA passkey from
+        /// this file, for a vault with the passkey factor.
+        #[arg(long, value_name = "FILE")]
+        passkey_pin_file: Option<String>,
         /// The approved release request (`kuipa seal request`), for a vault
         /// with approvals.
         #[arg(long, value_name = "ID")]
@@ -503,6 +507,10 @@ enum SealAction {
         /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
+        /// Read the PIN of the security key holding your IPA passkey from
+        /// this file, for a vault with the passkey factor.
+        #[arg(long, value_name = "FILE")]
+        passkey_pin_file: Option<String>,
     },
     /// Start a session: until it ends, files of the vault open on this
     /// host without the passphrase or a ticket.
@@ -512,6 +520,10 @@ enum SealAction {
         /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
+        /// Read the PIN of the security key holding your IPA passkey from
+        /// this file, for a vault with the passkey factor.
+        #[arg(long, value_name = "FILE")]
+        passkey_pin_file: Option<String>,
         /// An offline session: files sealed with --session open without a
         /// server until it ends.
         #[arg(long)]
@@ -771,17 +783,23 @@ impl MembersInput {
 #[derive(Subcommand)]
 enum DeviceAction {
     /// Register this host's device key in a vault, making it (under a
-    /// passphrase) if this host has none, or using an ML-KEM key on a
-    /// PKCS#11 token.
+    /// passphrase, or wrapped by a security key's passkey) if this host
+    /// has none, or using an ML-KEM key on a PKCS#11 token.
     Add {
         /// The vault.
         vault: String,
-        /// Read the passphrase (or the token's PIN) from this file.
+        /// Read the passphrase (or the token's or security key's PIN) from
+        /// this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
         /// The ML-KEM key on a token, as a `pkcs11:` URI.
-        #[arg(long, value_name = "URI")]
+        #[arg(long, value_name = "URI", conflicts_with = "passkey")]
         pkcs11: Option<String>,
+        /// Make the device key now, wrapped by the hmac-secret of a new
+        /// passkey on the attached FIDO2 security key (classical or
+        /// ML-DSA): every use needs a touch, and the PIN if one was given.
+        #[arg(long)]
+        passkey: bool,
         /// The token's PKCS#11 module.
         #[arg(
             long,
@@ -2255,8 +2273,12 @@ fn list(value: &Value) -> Vec<&Value> {
 }
 
 /// A passphrase from `file`, or asked for on the terminal (twice when
-/// `confirm`).
+/// `confirm`).  For a host whose device key a passkey wraps, the security
+/// key's PIN, which may be empty.
 fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
+    if kuipa_tools::seal::UserPaths::from_env().is_ok_and(|u| u.passkey_device()) {
+        return security_key_pin(file, "security key PIN (empty if none)");
+    }
     let value = match file {
         Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
         None if std::io::stdin().is_terminal() => {
@@ -2272,6 +2294,37 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
         return Err("missing passphrase".into());
     }
     Ok(value)
+}
+
+/// A security key's PIN from `file`, or asked for on the terminal; empty
+/// for none, as it is without a terminal.
+fn security_key_pin(file: Option<&str>, what: &str) -> Result<SecretBuf, Error> {
+    match file {
+        Some(path) => Ok(first_line(&SecretBuf::new(std::fs::read(path)?))),
+        None if std::io::stdin().is_terminal() => Ok(prompt(what, true)?),
+        None => Ok(SecretBuf::with_len(0)),
+    }
+}
+
+/// `seal` with the PIN for the passkey factor when it will be `needed`:
+/// from `file`, else asked on a terminal when the realm verifies the user,
+/// unless this host's device key is itself wrapped by a passkey, whose
+/// PIN serves.
+fn with_passkey_pin<'a>(
+    seal: kuipa_tools::seal::Seal<'a>,
+    user: &kuipa_tools::seal::UserPaths,
+    needed: bool,
+    file: Option<&str>,
+) -> Result<kuipa_tools::seal::Seal<'a>, Error> {
+    if !needed
+        || (file.is_none()
+            && (user.passkey_device()
+                || !seal.passkey_verifies_user()
+                || !std::io::stdin().is_terminal()))
+    {
+        return Ok(seal);
+    }
+    Ok(seal.with_passkey_pin(security_key_pin(file, "passkey PIN (empty if none)")?))
 }
 
 /// `kuipa keys fetch` (§18.4): the value on standard output, or in a
@@ -2329,12 +2382,17 @@ fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
 }
 
 /// `kuipa seal open`.
-fn run_open(seal: &kuipa_tools::seal::Seal<'_>, action: &SealAction) -> Result<Value, Error> {
+fn run_open(
+    seal: kuipa_tools::seal::Seal<'_>,
+    user: &kuipa_tools::seal::UserPaths,
+    action: &SealAction,
+) -> Result<Value, Error> {
     let SealAction::Open {
         sealed,
         out,
         force,
         passphrase_file,
+        passkey_pin_file,
         request,
     } = action
     else {
@@ -2345,6 +2403,8 @@ fn run_open(seal: &kuipa_tools::seal::Seal<'_>, action: &SealAction) -> Result<V
     let pass = kuipa_tools::seal::Seal::needs_secret(&bytes)
         .then(|| passphrase(passphrase_file.as_deref(), false))
         .transpose()?;
+    let needs_passkey = seal.needs_passkey(&bytes);
+    let seal = with_passkey_pin(seal, user, needs_passkey, passkey_pin_file.as_deref())?;
     let plain = seal.open_with(&bytes, pass.as_ref().map(AsRef::as_ref), request.as_deref())?;
     target.write(plain.as_ref())?;
     Ok(serde_json::json!({
@@ -2456,9 +2516,16 @@ fn run_seal_device(
             vault,
             passphrase_file,
             pkcs11,
+            passkey,
             module,
         } => {
-            if let Some(uri) = pkcs11 {
+            if *passkey {
+                let pin = security_key_pin(
+                    passphrase_file.as_deref(),
+                    "security key PIN (empty if none)",
+                )?;
+                seal.add_passkey_device(vault, pin.as_ref())
+            } else if let Some(uri) = pkcs11 {
                 let pin = passphrase(passphrase_file.as_deref(), false)?;
                 seal.add_token_device(vault, std::path::Path::new(module), uri, pin.as_ref())
             } else {
@@ -2474,7 +2541,10 @@ fn run_seal_device(
 /// `kuipa seal …`: as the user, with their ticket.
 fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
     let user = kuipa_tools::seal::UserPaths::from_env()?;
-    let seal = kuipa_tools::seal::Seal::new(paths, &user, None);
+    // The attached security keys, or the playground's software one.
+    let authenticator = kuipa_tools::passkey::from_env()?;
+    let seal =
+        kuipa_tools::seal::Seal::new(paths, &user, None).with_authenticator(authenticator.as_ref());
     match action {
         SealAction::Create { vault, policy } => seal.create(vault, policy.policy()?),
         SealAction::Policy { vault, policy } => seal.set_policy(vault, policy.policy()?),
@@ -2498,13 +2568,16 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             paths::write_file(std::path::Path::new(&out), &sealed, 0o600)?;
             Ok(serde_json::json!({ "vault": vault, "file": file, "sealed": out }))
         }
-        open @ SealAction::Open { .. } => run_open(&seal, open),
+        open @ SealAction::Open { .. } => run_open(seal, &user, open),
         SealAction::Reseal {
             vault,
             sealed,
             passphrase_file,
+            passkey_pin_file,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
+            let needed = seal.vault_needs_passkey(vault);
+            let seal = with_passkey_pin(seal, &user, needed, passkey_pin_file.as_deref())?;
             for path in sealed {
                 let again = seal.reseal(vault, &std::fs::read(path)?, Some(pass.as_ref()))?;
                 paths::write_file(std::path::Path::new(path), &again, 0o600)?;
@@ -2514,9 +2587,12 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
         SealAction::Unlock {
             vault,
             passphrase_file,
+            passkey_pin_file,
             offline,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
+            let needed = seal.vault_needs_passkey(vault);
+            let seal = with_passkey_pin(seal, &user, needed, passkey_pin_file.as_deref())?;
             seal.unlock(vault, pass.as_ref(), *offline)
         }
         SealAction::Lock { vault } => seal.lock(vault),
@@ -2648,6 +2724,24 @@ fn render_requests(requests: &[Value]) {
     }
 }
 
+/// What opening a vault with `factors` needs, in words.
+fn opening_needs(factors: &Value) -> String {
+    let mut needs = Vec::new();
+    if let Some(level) = get(factors, "device").as_str() {
+        needs.push(format!("a registered device ({level})"));
+    }
+    if get(factors, "ticket").as_bool().unwrap_or(false) {
+        needs.push("your Kerberos ticket".to_owned());
+    }
+    if get(factors, "passkey").as_bool().unwrap_or(false) {
+        needs.push("one of your IPA passkeys".to_owned());
+    }
+    match needs.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => needs.concat(),
+    }
+}
+
 fn render_seal(value: &Value) {
     if render_listing(value) || render_recovery(value) {
         return;
@@ -2678,20 +2772,12 @@ fn render_seal(value: &Value) {
             let mut rows = Rows::default();
             rows.field("id", get(v, "id"));
             let policy = get(v, "policy");
-            let factors = get(policy, "factors");
-            let mut needs = Vec::new();
-            if let Some(level) = get(factors, "device").as_str() {
-                needs.push(format!("a registered device ({level})"));
-            }
-            if get(factors, "ticket").as_bool().unwrap_or(false) {
-                needs.push("your Kerberos ticket".to_owned());
-            }
             for who in ["managers", "members", "depositors"] {
                 if !list(get(v, who)).is_empty() {
                     rows.field(who, get(v, who));
                 }
             }
-            rows.row("opening needs", needs.join(" and "));
+            rows.row("opening needs", opening_needs(get(policy, "factors")));
             rows.until("expires", get(policy, "not_after"));
             rows.field("unlocks so far", get(v, "unlocks"));
             rows.field("unlocks allowed", get(policy, "max_unlocks"));

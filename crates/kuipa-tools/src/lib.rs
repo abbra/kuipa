@@ -7,6 +7,7 @@ pub mod flows;
 pub mod mirror;
 pub mod net;
 pub mod output;
+pub mod passkey;
 pub mod paths;
 pub mod pkcs11;
 pub mod preauth;
