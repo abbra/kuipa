@@ -31,11 +31,12 @@ env:
   #   nodejs, npm, node       — required by actions/checkout and actions/cache
   #   cargo, rust, rustfmt, cargo-clippy — Rust toolchain (not bundled in the base image)
   #   git-core                - commit signing tests in playground
+  #   kryoptic, pkcs11-provider - PKCS#11 tests
   # (update key suffix when changing packages)
   DNF_PACKAGES: >-
     tar gzip gcc make openssl-devel krb5-devel openldap-devel libfido2-devel clang-libs clang-devel
     pkgconf-pkg-config nodejs /usr/bin/npm /usr/bin/node
-    cargo rust rustfmt cargo-clippy git-core
+    cargo rust rustfmt cargo-clippy git-core opensc pkcs11-provider kryoptic
   # Additional packages needed only by the kdc-test job: a real MIT KDC and
   # its admin tools (krb5-server), kinit (krb5-workstation) and MIT's
   # pkinit.so for anonymous PKINIT (krb5-pkinit).
