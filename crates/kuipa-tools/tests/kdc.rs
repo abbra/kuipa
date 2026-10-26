@@ -321,7 +321,12 @@ fn start_ipa_server(
     let key_dir = realm.dir.join(format!("keys-{fqdn}"));
     std::fs::create_dir_all(&key_dir).unwrap();
     let alg = kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg());
-    let ledger = Arc::new(kuipad::ledger::FileLedger::open(&key_dir, REALM, fqdn, alg).unwrap());
+    // Published at once, so the test sees each event as it happens.
+    let ledger = Arc::new(
+        kuipad::ledger::FileLedger::open(&key_dir, REALM, fqdn, alg)
+            .unwrap()
+            .with_head_interval(std::time::Duration::ZERO),
+    );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
     let settings = Settings {
         me: fqdn.into(),

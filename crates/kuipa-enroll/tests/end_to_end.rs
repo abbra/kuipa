@@ -1717,8 +1717,7 @@ fn user_vault_seals_and_opens_under_its_policy() {
 /// A ledger over an in-memory log, as the daemon keeps one on disk.
 #[derive(Debug)]
 struct MemoryLedger {
-    key: [u8; 32],
-    log: Mutex<(Log, Vec<Leaf>)>,
+    log: Mutex<(Log, Vec<Leaf>, Vec<tlog::Opening>)>,
 }
 
 impl MemoryLedger {
@@ -1726,13 +1725,17 @@ impl MemoryLedger {
     fn new(server: &str) -> Self {
         let id = LogId::of(REALM, server, TreeHash::Sha256).unwrap();
         Self {
-            key: [7; 32],
-            log: Mutex::new((Log::new(id), Vec::new())),
+            log: Mutex::new((Log::new(id), Vec::new(), Vec::new())),
         }
     }
 
     fn leaves(&self) -> Vec<Leaf> {
         self.log.lock().unwrap().1.clone()
+    }
+
+    /// The openings the server keeps beside the public leaves.
+    fn openings(&self) -> Vec<tlog::Opening> {
+        self.log.lock().unwrap().2.clone()
     }
 
     fn head(&self) -> (Head, Log) {
@@ -1742,26 +1745,18 @@ impl MemoryLedger {
 }
 
 impl Ledger for MemoryLedger {
-    fn append(
-        &self,
-        kind: tlog::Kind,
-        subject: &[u8],
-        body: &[u8],
-    ) -> Result<Option<Appended>, DirectoryError> {
-        let leaf = Leaf {
-            kind,
-            time: now(),
-            index: tlog::index(TreeHash::Sha256, &self.key, subject)?,
-            body: body.to_vec(),
-        };
+    fn append(&self, opening: tlog::Opening) -> Result<Option<Appended>, DirectoryError> {
+        let leaf = opening.leaf(TreeHash::Sha256)?;
         let mut log = self.log.lock().unwrap();
         let index = log.0.append(&leaf)?;
         log.1.push(leaf.clone());
+        let time = opening.time;
+        log.2.push(opening);
         Ok(Some(Appended {
             log: log.0.id(),
             index,
             leaf: leaf.hash()?,
-            time: leaf.time,
+            time,
         }))
     }
 
@@ -1784,20 +1779,20 @@ impl Ledger for MemoryLedger {
         size: u64,
         max: usize,
     ) -> Result<Vec<tlog::Entry>, DirectoryError> {
-        let index = tlog::index(TreeHash::Sha256, &self.key, subject)?;
         let log = self.log.lock().unwrap();
         let size = usize::try_from(size)?;
         let hashes = &log.0.hashes()[..size];
-        Ok(log.1[..size]
+        Ok(log.2[..size]
             .iter()
             .enumerate()
             .skip(usize::try_from(from)?)
-            .filter(|(_, l)| l.index == index)
+            .filter(|(_, o)| o.subject == subject)
             .take(max)
-            .map(|(i, l)| tlog::Entry {
+            .map(|(i, o)| tlog::Entry {
                 index: i as u64,
-                leaf: l.clone(),
+                leaf: log.1[i].clone(),
                 path: kuipa_enroll::merkle::path(hashes, i).unwrap(),
+                opening: Some(o.clone()),
             })
             .collect())
     }
@@ -1834,12 +1829,7 @@ fn tlog_lookup(
 struct BrokenLedger;
 
 impl Ledger for BrokenLedger {
-    fn append(
-        &self,
-        _: tlog::Kind,
-        _: &[u8],
-        _: &[u8],
-    ) -> Result<Option<Appended>, DirectoryError> {
+    fn append(&self, _: tlog::Opening) -> Result<Option<Appended>, DirectoryError> {
         Err("disk full".into())
     }
 }
@@ -1924,23 +1914,30 @@ fn opened_file_logs_release(
             ask,
         )
         .unwrap();
-    let leaves = ledger.leaves();
-    let release = leaves.last().unwrap();
+    let (leaves, openings) = (ledger.leaves(), ledger.openings());
+    let release = openings.last().unwrap();
     assert_eq!(release.kind, tlog::Kind::ESCROW_RELEASE);
-    let event = VaultEvent::from_bytes(&release.body).unwrap();
+    let event = VaultEvent::from_bytes(&release.event).unwrap();
     assert_eq!(event.action, VaultAction::Release);
-    assert_eq!(
-        event.device.as_deref(),
-        Some(v.vault().devices[0].id.as_str())
-    );
+    let device_id = v.vault().devices[0].id.as_str();
+    assert_eq!(event.device.as_deref(), Some(device_id));
 
-    // Every leaf is indexed by the vault, and none names it or its owner.
-    let index = tlog::index(TreeHash::Sha256, &ledger.key, sealed.vault().as_bytes()).unwrap();
-    for leaf in &leaves {
-        assert_eq!(leaf.index, index);
+    // Every opening is about the vault and opens its leaf; no public leaf
+    // names the vault, its owner, the device or the binding released, or
+    // says more than the day it was logged.
+    for (leaf, opening) in leaves.iter().zip(&openings) {
+        assert_eq!(opening.subject, sealed.vault().as_bytes());
+        assert!(opening.opens(leaf).unwrap());
+        assert_eq!(leaf.time, tlog::public_time(opening.time));
         let bytes = leaf.to_bytes();
-        for name in [&b"personal"[..], b"alice"] {
-            assert!(!bytes.windows(name.len()).any(|w| w == name));
+        for secret in [
+            &b"personal"[..],
+            b"alice",
+            sealed.vault().as_bytes(),
+            device_id.as_bytes(),
+            &event.digest,
+        ] {
+            assert!(!bytes.windows(secret.len()).any(|w| w == secret));
         }
     }
 }
@@ -2024,7 +2021,7 @@ fn vault_events_are_logged_with_receipts() {
     let leaves = ledger.leaves();
     assert_eq!(leaves[0].kind, tlog::Kind::VAULT_POLICY);
     assert_eq!(leaves[1].kind, tlog::Kind::VAULT_DEVICE);
-    let event = VaultEvent::from_bytes(&leaves[1].body).unwrap();
+    let event = VaultEvent::from_bytes(&ledger.openings()[1].event).unwrap();
     assert_eq!(event.action, VaultAction::AddDevice);
     assert_eq!(
         event.device.as_deref(),
@@ -2032,15 +2029,30 @@ fn vault_events_are_logged_with_receipts() {
     );
 
     opened_file_logs_release(&r, &advs, &ledger, &device, &v);
-    let leaves = ledger.leaves();
+    owner_looks_up_and_checks_the_openings(&r, adv, &ledger, event);
+    ledger_failure_refuses_the_change(&mut r, adv, &anchors);
+}
 
-    // The owner looks their vault's entries up, with proofs the client
-    // checks against the head; pages on with `from`.
-    let answer = lookup_entries(&r, adv, ALICE, "personal", 0).unwrap();
+/// The owner looks their vault's entries up, with proofs the client
+/// checks against the head and the openings of their leaves; nobody else
+/// can, and a lying answer does not verify.
+fn owner_looks_up_and_checks_the_openings(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    ledger: &MemoryLedger,
+    event: VaultEvent,
+) {
+    let leaves = ledger.leaves();
+    // Pages on with `from`.
+    let answer = lookup_entries(r, adv, ALICE, "personal", 0).unwrap();
     assert_eq!(answer.entries.len(), leaves.len());
     assert_eq!(answer.entries[1].leaf, leaves[1]);
     assert_eq!(
-        lookup_entries(&r, adv, ALICE, "personal", 2)
+        answer.entries[1].opening.as_ref(),
+        Some(&ledger.openings()[1])
+    );
+    assert_eq!(
+        lookup_entries(r, adv, ALICE, "personal", 2)
             .unwrap()
             .entries
             .len(),
@@ -2048,16 +2060,24 @@ fn vault_events_are_logged_with_receipts() {
     );
     // Nothing is about Alice's principal; Bob cannot look up her vault.
     assert_eq!(
-        lookup_entries(&r, adv, ALICE, "", 0).unwrap().entries,
+        lookup_entries(r, adv, ALICE, "", 0).unwrap().entries,
         [] as [kuipa_enroll::tlog::Entry; 0]
     );
-    assert!(lookup_entries(&r, adv, BOB, "personal", 0).is_err());
-    // A tampered answer does not verify.
+    assert!(lookup_entries(r, adv, BOB, "personal", 0).is_err());
+    // A tampered answer does not verify, nor one whose opening says
+    // another event happened.
     let mut forged = answer.clone();
     forged.entries[0].leaf.body.push(0);
     assert!(forged.verify(adv.signer(), &Policy::default()).is_err());
-
-    ledger_failure_refuses_the_change(&mut r, adv, &anchors);
+    let mut lying = answer.clone();
+    if let Some(o) = lying.entries[1].opening.as_mut() {
+        o.event = VaultEvent {
+            action: VaultAction::RemoveDevice,
+            ..event
+        }
+        .to_bytes();
+    }
+    assert!(lying.verify(adv.signer(), &Policy::default()).is_err());
 }
 
 fn vault_reply(r: &Realm, adv: &VerifiedRealm, caller: &str, op: &VaultOp) -> vault::Reply {
@@ -3989,15 +4009,20 @@ fn signing_is_stated_logged_and_bound_by_policy() {
             .is_err()
     );
 
-    // The statement is in the log, under Alice's index, naming nobody.
+    // The statement is in the log, committed: its leaf names nobody and no
+    // purpose, and only its opening says it is Alice's.
     let leaves = ledger.leaves();
-    let leaf = &leaves[usize::try_from(v.index).unwrap()];
+    let at = usize::try_from(v.index).unwrap();
+    let leaf = &leaves[at];
     assert_eq!(leaf.kind, tlog::Kind::STATEMENT);
     assert_eq!(
         leaf.index,
-        tlog::index(TreeHash::Sha256, &ledger.key, ALICE.as_bytes()).unwrap()
+        kuipa_enroll::merkle::Hash::zero(TreeHash::Sha256)
     );
-    assert!(!leaf.to_bytes().windows(5).any(|w| w == b"alice"));
+    for secret in [&b"alice"[..], b"blob"] {
+        assert!(!leaf.to_bytes().windows(secret.len()).any(|w| w == secret));
+    }
+    assert_eq!(ledger.openings()[at].subject, ALICE.as_bytes());
     // Alice finds it with a lookup of her principal's entries.
     let mine = tlog_lookup(
         &r,

@@ -3892,7 +3892,6 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     // DESIGN-tlog.md §5: a server's log is public — its signed head, its
     // leaves, and inclusion and consistency proofs at any size a client
     // holds a head for — and only under the log's own id.
-    use kuipa_enroll::server::Ledger;
     use kuipa_enroll::tlog::{Kind, Leaf, SignedHead};
 
     let dir = std::env::temp_dir().join(format!("kuipa-flows-tlog-{}", std::process::id()));
@@ -3901,7 +3900,9 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     let (keys, info, delegation) = server_keys(&anchor, "tlog1.example.test");
     let signer = keys.signing.public().clone();
     let ledger = Arc::new(
-        kuipad::ledger::FileLedger::open(&dir, REALM, "tlog1.example.test", tree(&keys)).unwrap(),
+        kuipad::ledger::FileLedger::open(&dir, REALM, "tlog1.example.test", tree(&keys))
+            .unwrap()
+            .with_head_interval(std::time::Duration::ZERO),
     );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
     let url = spawn(Arc::new(App {
@@ -3936,12 +3937,12 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     // Nothing logged yet: no head to serve.
     assert_eq!(get("head").status(), 404);
     for i in 0..2u8 {
-        ledger.append(Kind::VAULT_DEVICE, b"vault", &[i]).unwrap();
+        log_event(&ledger, Kind::VAULT_DEVICE, b"vault", &[i]);
     }
     let old = SignedHead::from_bytes(&get("head").bytes().unwrap()).unwrap();
     old.verify(&signer, &tang_pqc::Policy::default()).unwrap();
     for i in 0..3u8 {
-        ledger.append(Kind::ESCROW_RELEASE, b"vault", &[i]).unwrap();
+        log_event(&ledger, Kind::ESCROW_RELEASE, b"vault", &[i]);
     }
     let new = SignedHead::from_bytes(&get("head").bytes().unwrap()).unwrap();
     assert_eq!((old.head.size, new.head.size), (2, 5));
@@ -3975,8 +3976,22 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Log an event about `subject` in `ledger` now, as a server does.
+fn log_event(
+    ledger: &kuipad::ledger::FileLedger,
+    kind: kuipa_enroll::tlog::Kind,
+    subject: &[u8],
+    event: &[u8],
+) {
+    use kuipa_enroll::server::Ledger;
+
+    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    let opening = kuipa_enroll::tlog::Opening::new(kind, now, subject, event.to_vec()).unwrap();
+    ledger.append(opening).unwrap();
+}
+
 /// A server named `fqdn` with its own transparency log in `dir`, served
-/// for this test's thread.
+/// for this test's thread, publishing every event at once.
 fn tlog_server(
     anchor: &SigningKey,
     fqdn: &str,
@@ -3987,6 +4002,7 @@ fn tlog_server(
     let ledger = Arc::new(
         kuipad::ledger::FileLedger::open(dir, REALM, fqdn, tree(&keys))
             .unwrap()
+            .with_head_interval(std::time::Duration::ZERO)
             .with_witnesses(witnesses.iter().map(|w| w.public().clone()).collect()),
     );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
@@ -4008,7 +4024,6 @@ fn audit_replays_a_servers_transparency_log() {
     // DESIGN-tlog.md §5: kuipa-audit tlog checks a server's head against
     // the key its verified advertisement names, replays every leaf, and
     // with a state file requires the next run's log to extend this one.
-    use kuipa_enroll::server::Ledger;
     use kuipa_enroll::tlog::Kind;
 
     let base = std::env::temp_dir().join(format!("kuipa-flows-audit-tlog-{}", std::process::id()));
@@ -4023,9 +4038,9 @@ fn audit_replays_a_servers_transparency_log() {
     let ledger = tlog_server(&anchor, fqdn, &base.join("one"), &[]);
     assert_eq!(audit()["state"], "empty");
     for i in 0..3u8 {
-        ledger.append(Kind::VAULT_DEVICE, b"v", &[i]).unwrap();
+        log_event(&ledger, Kind::VAULT_DEVICE, b"v", &[i]);
     }
-    ledger.append(Kind::KEYS_FETCH, b"host", b"x").unwrap();
+    log_event(&ledger, Kind::KEYS_FETCH, b"host", b"x");
     let first = audit();
     assert_eq!(first["state"], "verified", "{first}");
     assert_eq!(first["size"], 4, "{first}");
@@ -4033,7 +4048,7 @@ fn audit_replays_a_servers_transparency_log() {
     assert_eq!(first["kinds"]["keys-fetch"], 1, "{first}");
 
     // The log grew: still verified, and it extends what was recorded.
-    ledger.append(Kind::ESCROW_RELEASE, b"v", b"y").unwrap();
+    log_event(&ledger, Kind::ESCROW_RELEASE, b"v", b"y");
     let grown = audit();
     assert_eq!(grown["state"], "verified", "{grown}");
     assert_eq!(grown["previous"]["size"], 4, "{grown}");
@@ -4046,7 +4061,7 @@ fn audit_replays_a_servers_transparency_log() {
     // rewritten — is forked against the recorded head.
     let rewritten = tlog_server(&anchor, fqdn, &base.join("two"), &[]);
     for i in 0..6u8 {
-        rewritten.append(Kind::VAULT_POLICY, b"v", &[i]).unwrap();
+        log_event(&rewritten, Kind::VAULT_POLICY, b"v", &[i]);
     }
     let forked = audit();
     assert!(
@@ -4066,7 +4081,6 @@ fn a_witness_cosigns_only_heads_that_extend() {
     // key signed and that extends the last it cosigned; the server serves
     // trusted cosignatures; a rewritten log is reported forked, never
     // cosigned.
-    use kuipa_enroll::server::Ledger;
     use kuipa_enroll::tlog::Kind;
 
     let base = std::env::temp_dir().join(format!("kuipa-flows-witness-{}", std::process::id()));
@@ -4094,13 +4108,13 @@ fn a_witness_cosigns_only_heads_that_extend() {
     let ledger = tlog_server(&anchor, fqdn, &base.join("one"), &[&witness]);
     assert_eq!(pass(&witness, &state), "empty");
     for i in 0..3u8 {
-        ledger.append(Kind::VAULT_DEVICE, b"v", &[i]).unwrap();
+        log_event(&ledger, Kind::VAULT_DEVICE, b"v", &[i]);
     }
     assert_eq!(pass(&witness, &state), "cosigned");
     assert_eq!(cosigners(), 1);
     assert_eq!(pass(&witness, &state), "unchanged");
     // The log grew: re-signed, cosigned again through a consistency proof.
-    ledger.append(Kind::ESCROW_RELEASE, b"v", b"x").unwrap();
+    log_event(&ledger, Kind::ESCROW_RELEASE, b"v", b"x");
     assert_eq!(cosigners(), 0);
     assert_eq!(pass(&witness, &state), "cosigned");
     assert_eq!(cosigners(), 1);
@@ -4112,7 +4126,7 @@ fn a_witness_cosigns_only_heads_that_extend() {
     // refusing.
     let rewritten = tlog_server(&anchor, fqdn, &base.join("two"), &[&witness]);
     for i in 0..6u8 {
-        rewritten.append(Kind::VAULT_POLICY, b"v", &[i]).unwrap();
+        log_event(&rewritten, Kind::VAULT_POLICY, b"v", &[i]);
     }
     assert_eq!(pass(&witness, &state), "forked");
     assert_eq!(pass(&witness, &state), "forked");
