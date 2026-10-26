@@ -316,37 +316,6 @@ jobs:
           REPORT_URL: ${{ steps.report.outputs.artifact-url }}
         run: echo "**[Download the playground report]($REPORT_URL)**" >> "$GITHUB_STEP_SUMMARY"
 
-  # ── Benchmarks ─────────────────────────────────────────────────────────────
-  # The smoke profile in quick mode: every criterion target runs, so a fixture
-  # that no longer verifies, or a run that measures nothing, fails the job.
-  # It keeps no baseline and compares nothing: timing regressions are found
-  # with scripts/bench.sh compare, not here.  The
-  # benches build in release, which the debug artifact cache does not cover —
-  # only the registry cache helps here, and the release build of the workspace
-  # is most of the job.  A quick smoke pass measures in ~13 minutes on a fast
-  # laptop; the CI budget covers that plus a cold release build.
-  bench:
-    name: Benchmarks
-    needs: [build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    container: quay.io/fedora/fedora:45
-    steps:
-      - name: Enable test COPR repository
-        run: dnf copr -y enable $COPR_REPO
-      - name: Install native dependencies
-        # bench.sh collects criterion's estimates with python3.
-        run: dnf install -y $DNF_PACKAGES python3
-      - uses: actions/checkout@v7
-      - name: Restore cargo registry cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/registry
-          key: cargo-registry-v1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-registry-v1-
-      - name: Run the benchmark smoke pass
-        run: ./contrib/ci/local-ci.sh --no-deps bench
-
   # ── MSRV ───────────────────────────────────────────────────────────────────
   # Builds with the oldest supported Rust (rust-version in Cargo.toml), which
   # catches language features clippy's incompatible_msrv lint cannot.

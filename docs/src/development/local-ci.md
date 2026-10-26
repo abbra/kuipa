@@ -59,7 +59,7 @@ KUIPA_KRB5_VENDOR=heimdal ./contrib/ci/local-ci.sh build clippy test
 | `kdc-test` | `cargo test -p kuipa-tools --test kdc --test trust --test voucher` with `KUIPA_REQUIRE_KDC=1`, so missing KDC tools fail the job instead of skipping the tests; `SKIP` (not `FAIL`) under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
 | `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report/` (see below); `SKIP` under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
 | `msrv` (opt-in) | `cargo build --workspace --all-targets` with the `rust-version` toolchain | |
-| `bench` (opt-in) | the criterion targets in quick mode under the `smoke` profile (`scripts/bench.sh --quick --no-save`): a fixture that no longer verifies panics, so this job doubles as a protocol self-check; it keeps no baseline, so it does not catch timing regressions (see [Benchmarks](../reference/benchmarks.md)) | `build` |
+| `bench` (opt-in, local only) | the criterion targets in quick mode under the `smoke` profile (`scripts/bench.sh --quick --no-save`): a fixture that no longer verifies panics, so this job doubles as a protocol self-check; it keeps no baseline, so it does not catch timing regressions, and the GitHub workflow does not run it (see [Benchmarks](../reference/benchmarks.md)) | `build` |
 
 Dependencies are run on demand: `local-ci.sh clippy` builds first. Inside
 CI, `--no-deps` turns that off because the workflow's `needs:` already
