@@ -573,6 +573,20 @@ impl LdapConnection {
             });
         }
 
+        let controls = self.parse_result_controls(res, &format!("extended operation {oid}"))?;
+        Ok(ExtendedResult {
+            oid: response_oid,
+            value: response_value,
+            controls,
+        })
+    }
+
+    /// Parse a result message (freeing it) and return its response controls.
+    fn parse_result_controls(
+        &mut self,
+        res: *mut ffi::LDAPMessage,
+        context: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, LdapError> {
         let mut errcode: c_int = ffi::LDAP_SUCCESS;
         let mut diag: *mut c_char = ptr::null_mut();
         let mut ctrls: *mut *mut ffi::LDAPControl = ptr::null_mut();
@@ -619,17 +633,13 @@ impl LdapConnection {
             return Err(LdapError::Protocol {
                 code: errcode,
                 msg: format!(
-                    "extended operation {oid}: {}{}",
+                    "{context}: {}{}",
                     err_string(errcode),
                     diagnostic.map(|d| format!(" ({d})")).unwrap_or_default()
                 ),
             });
         }
-        Ok(ExtendedResult {
-            oid: response_oid,
-            value: response_value,
-            controls,
-        })
+        Ok(controls)
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -727,7 +737,7 @@ impl LdapConnection {
         // Free the entire result chain.
         // SAFETY: res is a valid LDAPMessage* returned by ldap_result; collect_entries does not free it (per its contract), so this is the single owner freeing it.
         unsafe { ffi::ldap_msgfree(res) };
-        entries
+        Ok(entries)
     }
 
     // ── Modify ────────────────────────────────────────────────────────────────
@@ -1037,17 +1047,14 @@ pub struct SearchEntry {
 ///
 /// `res` must be a valid (possibly NULL) result chain from `ldap_search_ext_s`.
 /// The caller must free `res` with `ldap_msgfree` after this function returns.
-unsafe fn collect_entries(
-    ld: *mut LDAP,
-    res: *mut ffi::LDAPMessage,
-) -> Result<Vec<SearchEntry>, LdapError> {
+unsafe fn collect_entries(ld: *mut LDAP, res: *mut ffi::LDAPMessage) -> Vec<SearchEntry> {
     let mut entries = Vec::new();
     let mut entry = ffi::ldap_first_entry(ld, res);
     while !entry.is_null() {
-        entries.push(decode_entry(ld, entry)?);
+        entries.push(decode_entry(ld, entry));
         entry = ffi::ldap_next_entry(ld, entry);
     }
-    Ok(entries)
+    entries
 }
 
 /// Decode one LDAP entry into a [`SearchEntry`].
@@ -1056,10 +1063,7 @@ unsafe fn collect_entries(
 ///
 /// `ld` and `entry` must be valid non-null pointers from `ldap_first/next_entry`.
 /// The caller retains ownership of both; this function does not free them.
-unsafe fn decode_entry(
-    ld: *mut LDAP,
-    entry: *mut ffi::LDAPMessage,
-) -> Result<SearchEntry, LdapError> {
+unsafe fn decode_entry(ld: *mut LDAP, entry: *mut ffi::LDAPMessage) -> SearchEntry {
     let mut se = SearchEntry::default();
 
     // DN
@@ -1095,7 +1099,7 @@ unsafe fn decode_entry(
         ffi::ber_free(ber, 0);
     }
 
-    Ok(se)
+    se
 }
 
 /// Decode a NULL-terminated `berval**` into parallel string and byte vectors.
@@ -1119,7 +1123,14 @@ unsafe fn decode_bervals(vals_ptr: *mut *mut berval) -> (Vec<String>, Vec<Vec<u8
         let bytes = if (*bv).bv_val.is_null() {
             &[][..]
         } else {
-            unsafe { std::slice::from_raw_parts((*bv).bv_val as *const u8, (*bv).bv_len as usize) }
+            unsafe {
+                std::slice::from_raw_parts(
+                    (*bv).bv_val as *const u8,
+                    // A bv_len larger than `usize` cannot describe a readable
+                    // buffer on any real target; treat it as empty.
+                    usize::try_from((*bv).bv_len).unwrap_or(0),
+                )
+            }
         };
         bin_vals.push(bytes.to_vec());
         str_vals.push(String::from_utf8_lossy(bytes).into_owned());
@@ -1171,7 +1182,8 @@ unsafe fn berval_bytes(bv: &ffi::berval) -> Vec<u8> {
         return Vec::new();
     }
     // SAFETY: guaranteed by the caller.
-    unsafe { std::slice::from_raw_parts(bv.bv_val as *const u8, bv.bv_len as usize).to_vec() }
+    let len = usize::try_from(bv.bv_len).unwrap_or(0);
+    unsafe { std::slice::from_raw_parts(bv.bv_val as *const u8, len).to_vec() }
 }
 
 /// The result of [`LdapConnection::extended_operation`].
