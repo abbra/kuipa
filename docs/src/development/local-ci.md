@@ -142,6 +142,12 @@ $ cd contrib/ci/playground && npm i
 
 If dependencies aren't installed, SVG captures will be skipped.
 
+`KUIPA_KEEP_PLAYGROUND=1` keeps the playground's files after the session:
+the servers' key directories (`keys-<server>/`, the transparency log
+included), the hosts' and users' files, and the servers' log, to inspect
+or measure them. `contrib/ci/playground/sizes.py` prints the request and
+response sizes per route from a report ([Sizing](../reference/sizing.md)).
+
 The report goes to `kuipa-playground-report/` in the repository, or
 wherever `KUIPA_PLAYGROUND_REPORT` names: `index.html` plus the `svg/`
 captures. In GitHub Actions the job uploads the directory as the
