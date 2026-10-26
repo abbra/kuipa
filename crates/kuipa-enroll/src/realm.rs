@@ -315,7 +315,7 @@ impl TrustJson {
                 .collect::<Result<_>>()
                 .ok()?,
             kdc_proxy: match self.kdc_proxy {
-                Some(p) => Some(p.parse()?),
+                Some(p) => Some(p.parse().filter(|p| p.validate().is_ok())?),
                 None => None,
             },
             realm: self.realm,
@@ -1041,7 +1041,8 @@ pub fn krb5_realm_section(
 /// checked against `ca_file` (the realm's IPA CA, PEM) for
 /// [`ProxyCa::Realm`], or the system trust store for
 /// [`ProxyCa::System`].  MIT Kerberos only: Heimdal does not speak
-/// MS-KKDCP.
+/// MS-KKDCP.  A URL that is not safe in generated configuration
+/// ([`is_safe_proxy_url`]) is left out rather than interpolated.
 #[must_use]
 pub fn krb5_proxied_realm_section(
     realm: &str,
@@ -1052,7 +1053,7 @@ pub fn krb5_proxied_realm_section(
 ) -> String {
     let mut unique: Vec<&str> = Vec::new();
     for u in &proxy.urls {
-        if !unique.contains(&u.as_str()) {
+        if is_safe_proxy_url(u) && !unique.contains(&u.as_str()) {
             unique.push(u);
         }
     }
