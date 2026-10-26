@@ -1436,26 +1436,32 @@ impl<'a> Seal<'a> {
     }
 
     /// Register this host's device `key`, of type `kind`, in vault `name`,
-    /// depositing it first where the realm keeps device keys for
-    /// recovery.
+    /// depositing it first where the realm keeps device keys for recovery.
+    /// A refused registration retires that deposit again, so a rejected
+    /// device leaves no orphaned escrow behind.
     fn register_device(
         &self,
         name: &str,
         key: &HostDevice,
         kind: DeviceType,
     ) -> Result<Value, Error> {
-        if let HostDevice::File(k) = key {
-            self.deposit_device_key(k)?;
-        }
+        let deposit = match key {
+            HostDevice::File(k) => self.deposit_device_key(k)?,
+            HostDevice::Token(_) => None,
+        };
         let public = self.public()?;
-        let v = self.op(&VaultOp::AddDevice {
+        let registered = self.op(&VaultOp::AddDevice {
             name: name.into(),
             label: public.fqdn,
             kind,
             alg: key.public().alg().id(),
             key: tang_pqc::b64::encode(key.public().as_bytes()),
-        })?;
-        Ok(describe_all(&v))
+        });
+        if let Some((vault, id)) = deposit.filter(|_| registered.is_err()) {
+            self.retire_deposit(&vault, &id)
+                .map_err(|e| format!("the refused device's deposit was not retired: {e}"))?;
+        }
+        Ok(describe_all(&registered?))
     }
 
     /// `kuipa seal device add --pkcs11 URI`: make the ML-KEM key at `uri`
@@ -1837,22 +1843,27 @@ impl<'a> Seal<'a> {
     }
 
     /// Where the realm keeps device keys for recovery, deposit `key` there
-    /// (`DESIGN-recovery.md` §4), unless the user already has.  A failure
+    /// (`DESIGN-recovery.md` §4), unless the user already has.  Answers
+    /// the id of the deposit this call made, if it made one.  A failure
     /// stops the registration only where the realm requires the deposit.
-    fn deposit_device_key(&self, key: &ExchangeKeyPair) -> Result<(), Error> {
+    fn deposit_device_key(&self, key: &ExchangeKeyPair) -> Result<Option<(String, String)>, Error> {
         let Some(settings) = self.recovery()? else {
-            return Ok(());
+            return Ok(None);
         };
         match self.deposit_device_key_to(&settings.device_vault, key) {
             Err(e) if !settings.required => {
                 tracing::warn!("the device key was not deposited for recovery: {e}");
-                Ok(())
+                Ok(None)
             }
-            done => done,
+            done => done.map(|id| id.map(|id| (settings.device_vault.clone(), id))),
         }
     }
 
-    fn deposit_device_key_to(&self, vault: &str, key: &ExchangeKeyPair) -> Result<(), Error> {
+    fn deposit_device_key_to(
+        &self,
+        vault: &str,
+        key: &ExchangeKeyPair,
+    ) -> Result<Option<String>, Error> {
         let id = key.public().kid().to_string();
         let mine = self
             .op_with_session(&VaultOp::Deposits { name: vault.into() })?
@@ -1862,16 +1873,20 @@ impl<'a> Seal<'a> {
             d.kind == kuipa_enroll::vault::DepositKind::Device
                 && d.subject.get("device") == Some(&id)
         }) {
-            return Ok(());
+            return Ok(None);
         }
         let subject = std::collections::BTreeMap::from([("device".to_owned(), id)]);
-        self.deposit(
+        let answer = self.deposit(
             vault,
             key.to_jwk()?.as_ref(),
             kuipa_enroll::vault::DepositKind::Device,
             subject,
         )?;
-        Ok(())
+        Ok(answer["deposits"]
+            .as_array()
+            .and_then(|d| d.first())
+            .and_then(|d| d["id"].as_str())
+            .map(str::to_owned))
     }
 
     /// `kuipa seal recover helpdesk`: this host's device, which the
