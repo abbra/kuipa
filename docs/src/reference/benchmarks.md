@@ -83,9 +83,13 @@ Comparison reads the stored files, so a baseline survives `cargo clean`.
 `local-ci.sh bench` (opt-in, like `msrv`) runs the smoke profile in quick mode
 and fails if any benchmark panics — which is the fixture crate's verification
 assertion firing, so the job doubles as a protocol self-check — or if the run
-collected no results at all. The workflow job runs on every PR. It keeps no
-baseline and compares nothing, so it does not catch timing regressions: use
-`scripts/bench.sh compare` against a saved run for that.
+collected no results at all. It keeps no baseline and compares nothing, so it
+does not catch timing regressions: use `scripts/bench.sh compare` against a
+saved run, on a machine you control, for that.
+
+The GitHub workflow does not run benchmarks: its runners are shared and
+unknown, and a run nothing is compared with measures nothing.  Its clippy
+job builds every bench target (`--all-targets`), so they keep compiling.
 
 ## Reading the numbers
 
