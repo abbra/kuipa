@@ -15,6 +15,8 @@ use kuipa_enroll::join::{
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::merkle::TreeHash;
+use kuipa_enroll::passkey::soft::SoftAuthenticator;
+use kuipa_enroll::passkey::{Algorithm, UserPasskeys};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::{
     Accepted, Appended, Directory, DirectoryError, Ledger, Staged, parse_stage_result,
@@ -80,6 +82,10 @@ struct MemoryDirectory {
     deposits: RefCell<HashMap<(VaultId, String), vault::Deposit>>,
     /// The realm's device-key recovery settings (§4).
     recovery: RefCell<Option<vault::RecoverySettings>>,
+    /// IPA passkeys (`ipaPassKey` values) by principal.
+    passkeys: RefCell<HashMap<String, Vec<String>>>,
+    /// Whether the realm requires user verification.
+    passkey_uv: std::cell::Cell<bool>,
 }
 
 /// A stand-in for the GSS-API pseudo-random output both ends of a context
@@ -483,6 +489,18 @@ impl Directory for MemoryDirectory {
 
     fn vault_limits(&self) -> Result<vault::Limits, DirectoryError> {
         Ok(self.limits.borrow().clone())
+    }
+
+    fn passkeys(&self, principal: &Principal) -> Result<UserPasskeys, DirectoryError> {
+        Ok(UserPasskeys {
+            values: self
+                .passkeys
+                .borrow()
+                .get(&principal.to_string())
+                .cloned()
+                .unwrap_or_default(),
+            user_verification: self.passkey_uv.get(),
+        })
     }
 
     fn sign_policy(&self) -> Result<kuipa_enroll::sign::SignPolicy, DirectoryError> {
@@ -1403,6 +1421,7 @@ impl VaultCase {
                 session: None,
                 ticket: Some(&mut ticket),
                 release: None,
+                passkey: None,
             },
             |s, req| ask_server(&self.r, s, req),
         )
@@ -1528,6 +1547,7 @@ fn alice_opens_her_file(c: &VaultCase) {
             session: None,
             ticket: None,
             release: None,
+            passkey: None,
         },
         |s, req| ask_server(&c.r, s, req),
     );
@@ -1623,6 +1643,7 @@ fn bobs_vault_cannot_release(c: &VaultCase) {
                 session: None,
                 ticket: Some(&mut |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb))),
                 release: None,
+                passkey: None,
             },
             |s, req| {
                 seen.push(req.clone());
@@ -1898,6 +1919,7 @@ fn opened_file_logs_release(
                 session: None,
                 ticket: Some(&mut ticket),
                 release: None,
+                passkey: None,
             },
             ask,
         )
@@ -2093,6 +2115,7 @@ fn sessions_stop_without_policy(
         name: "s".into(),
         device: device.public().kid().to_string(),
         offline: false,
+        passkey: None,
     };
     let (request, _) = p
         .with_kerberos(fake_binding(ALICE, &cb))
@@ -2219,6 +2242,7 @@ fn vault_sessions_and_unlock_limits() {
             name: "s".into(),
             device: device.public().kid().to_string(),
             offline: false,
+            passkey: None,
         },
     );
     let session = reply.session.unwrap();
@@ -2240,6 +2264,7 @@ fn vault_sessions_and_unlock_limits() {
                 session: Some(&session),
                 ticket: None,
                 release: None,
+                passkey: None,
             },
             ask,
         )
@@ -2327,6 +2352,7 @@ fn open_as(
             session: None,
             ticket: Some(&mut ticket),
             release: None,
+            passkey: None,
         },
         |s, req| ask_server(r, s, req),
     )
@@ -2519,6 +2545,7 @@ fn members_open_and_membership(c: &Shared) {
         name: "alice/db".into(),
         device: device.into(),
         offline: false,
+        passkey: None,
     };
     let reply = vault_reply(r, adv, BOB, &unlock(&bob_device));
     let session = reply.session.unwrap();
@@ -2529,6 +2556,7 @@ fn members_open_and_membership(c: &Shared) {
                 session: Some(&session),
                 ticket: None,
                 release: None,
+                passkey: None,
             },
             |s, req| ask_server(r, s, req),
         )
@@ -2702,6 +2730,7 @@ fn openers_have_their_own_allowance(c: &Shared) {
                 session: None,
                 ticket: Some(&mut ticket),
                 release: None,
+                passkey: None,
             },
             |s, req| {
                 let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
@@ -2989,6 +3018,7 @@ impl BreakGlass {
                 session: None,
                 ticket: Some(&mut ticket),
                 release: id.map(|i| vault::ReleaseRequest::id_bytes(i).unwrap()),
+                passkey: None,
             },
             |s, req| ask_server(&self.r, s, req),
         )
@@ -3511,6 +3541,7 @@ fn unlock_travel(
             name: "travel".into(),
             device: device.public().kid().to_string(),
             offline: true,
+            passkey: None,
         },
     )
 }
@@ -3702,6 +3733,7 @@ fn registered_sealing_opens_only_registered_files() {
                 session: None,
                 ticket: None,
                 release: None,
+                passkey: None,
             },
             ask,
         )
@@ -3994,4 +4026,250 @@ fn signing_is_stated_logged_and_bound_by_policy() {
     assert!(sign_as(&r, &adv, ALICE, &other).is_err());
     r.dir.disabled.borrow_mut().insert(ALICE.into());
     assert!(sign_as(&r, &adv, ALICE, &asked).is_err());
+}
+
+/// Alice's passkeys, ML-DSA and ES256, and Bob's, in a realm that
+/// requires user verification.
+struct PasskeyCase {
+    r: Realm,
+    advs: [VerifiedRealm; 2],
+    anchors: Vec<Thumbprint>,
+    mldsa: SoftAuthenticator,
+    es256: SoftAuthenticator,
+    bobs: SoftAuthenticator,
+}
+
+impl PasskeyCase {
+    fn new() -> Self {
+        let r = realm();
+        let advs = [r.verify(0), r.verify(1)];
+        let anchors = r.all_anchors();
+        let c = Self {
+            r,
+            advs,
+            anchors,
+            mldsa: SoftAuthenticator::new(Algorithm::MlDsa(SignatureAlg::MlDsa65)),
+            es256: SoftAuthenticator::new(Algorithm::Es256),
+            bobs: SoftAuthenticator::new(Algorithm::EdDsa),
+        };
+        let mut passkeys = c.r.dir.passkeys.borrow_mut();
+        passkeys.insert(ALICE.into(), vec![c.mldsa.ipa_value(), c.es256.ipa_value()]);
+        passkeys.insert(BOB.into(), vec![c.bobs.ipa_value()]);
+        drop(passkeys);
+        c.r.dir.passkey_uv.set(true);
+        c
+    }
+
+    /// Create Alice's vault `name` with `factors` (and sessions when it
+    /// has a device), register `device` if given, and seal `contents`.
+    fn seal(
+        &self,
+        name: &str,
+        factors: Factors,
+        device: Option<&ExchangeKeyPair>,
+        contents: &[u8],
+    ) -> SealedVaultFile {
+        let adv = &self.advs[0];
+        let policy = vault::Policy {
+            sessions: vault::Sessions {
+                reauth: factors.device.map(|_| 600),
+                offline: None,
+                epoch: None,
+            },
+            factors,
+            ..vault::Policy::default()
+        };
+        vault_op(
+            &self.r,
+            adv,
+            ALICE,
+            &VaultOp::Create {
+                name: name.into(),
+                policy,
+            },
+        )
+        .unwrap();
+        let described = match device {
+            Some(d) => vault_op(&self.r, adv, ALICE, &add_device_op(name, d)),
+            None => vault_op(&self.r, adv, ALICE, &VaultOp::Show { name: name.into() }),
+        }
+        .unwrap();
+        let v = described[0]
+            .verify(REALM, &self.anchors, &Policy::default())
+            .unwrap();
+        SealedVaultFile::seal(&v, &[&self.advs[0], &self.advs[1]], contents).unwrap()
+    }
+
+    /// Open `sealed` with `device` and whatever `sign` makes of each
+    /// request's challenge.
+    fn open(
+        &self,
+        sealed: &SealedVaultFile,
+        device: Option<&ExchangeKeyPair>,
+        sign: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    ) -> Result<SecretBuf, Error> {
+        let mut passkey = |_: &str, challenge: &[u8; 32]| sign(challenge);
+        sealed.open(
+            Unlock {
+                device: device.map(|d| d as &dyn vault::DeviceKey),
+                session: None,
+                ticket: None,
+                release: None,
+                passkey: Some(&mut passkey),
+            },
+            |s, req| {
+                // Version 3 carries a release id and an assertion both.
+                let both = req.clone().with_release([7; 16]);
+                assert_eq!(EscrowRequest::from_bytes(&both.to_bytes()).unwrap(), both);
+                ask_server(&self.r, s, req)
+            },
+        )
+    }
+}
+
+/// What `a` signs for a challenge, with the authenticator data `flags`.
+fn assert_by(a: &SoftAuthenticator, flags: u8) -> impl Fn(&[u8; 32]) -> Option<Vec<u8>> + '_ {
+    move |c| Some(a.assert_with("example.test", c, flags).to_bytes())
+}
+
+/// Start a session on Alice's vault `keys` for `device` as `caller`, with
+/// `auth`'s assertion over the exchange's challenge when given.
+fn session_with_passkey(
+    r: &Realm,
+    adv: &VerifiedRealm,
+    caller: &str,
+    device: &ExchangeKeyPair,
+    auth: Option<&SoftAuthenticator>,
+) -> Result<vault::Reply, ()> {
+    let p = Prepared::new(
+        adv,
+        Operation::Vault,
+        HOST,
+        AuthType::Kerberos,
+        &Enctype::DEFAULT,
+    )
+    .unwrap();
+    let cb = p.channel_binding().unwrap();
+    let challenge = vault::session_passkey_challenge(&cb).unwrap();
+    let op = VaultOp::Unlock {
+        name: "keys".into(),
+        device: device.public().kid().to_string(),
+        offline: false,
+        passkey: auth
+            .map(|a| tang_pqc::b64::encode(&a.assert("example.test", &challenge).to_bytes())),
+    };
+    let (request, pending) = p
+        .with_kerberos(fake_binding(caller, &cb))
+        .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
+        .unwrap();
+    let response = r.send(0, Operation::Vault, &request)?;
+    vault::Reply::from_bytes(pending.open(&response).map_err(|_| ())?.as_ref()).map_err(|_| ())
+}
+
+/// The passkey factor (§7.6.5): an assertion from one of the opener's IPA
+/// passkeys, classical or ML-DSA, over the request's own challenge, with
+/// user verification when the realm requires it; a session stands in for
+/// it once an assertion started the session.
+#[test]
+fn passkey_factor() {
+    let c = PasskeyCase::new();
+    let adv = &c.advs[0];
+
+    // What the client allows its authenticator to answer with.
+    let info = vault_reply(&c.r, adv, ALICE, &VaultOp::Passkeys)
+        .passkeys
+        .unwrap();
+    assert_eq!(info.rp_id, "example.test");
+    assert!(info.user_verification);
+    assert_eq!(
+        info.credential_ids().unwrap(),
+        vec![c.mldsa.id().to_vec(), c.es256.id().to_vec()]
+    );
+
+    let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let factors = Factors {
+        device: Some(Level::Any),
+        ticket: false,
+        passkey: true,
+    };
+    let sealed = c.seal("keys", factors, Some(&device), b"pin=1234\n");
+    let open = |sign: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>| c.open(&sealed, Some(&device), sign);
+
+    // Either of Alice's passkeys, classical or post-quantum.
+    for a in [&c.mldsa, &c.es256] {
+        assert_eq!(open(&assert_by(a, 0x05)).unwrap().as_ref(), b"pin=1234\n");
+    }
+    // Not without user verification, which the realm requires.
+    assert!(matches!(
+        open(&assert_by(&c.mldsa, 0x01)),
+        Err(Error::Refused)
+    ));
+    c.r.dir.passkey_uv.set(false);
+    assert!(open(&assert_by(&c.mldsa, 0x01)).is_ok());
+    // Not Bob's passkey, not one for another relying party, not one made
+    // for another request, and not without one.
+    assert!(matches!(
+        open(&assert_by(&c.bobs, 0x05)),
+        Err(Error::Refused)
+    ));
+    assert!(matches!(
+        open(&|ch| Some(c.mldsa.assert("other.test", ch).to_bytes())),
+        Err(Error::Refused)
+    ));
+    assert!(matches!(
+        open(&|_| Some(c.mldsa.assert("example.test", &[0u8; 32]).to_bytes())),
+        Err(Error::Refused)
+    ));
+    assert!(matches!(open(&|_| None), Err(Error::Refused)));
+    let plain = sealed.open(
+        Unlock {
+            device: Some(&device),
+            session: None,
+            ticket: None,
+            release: None,
+            passkey: None,
+        },
+        |s, req| ask_server(&c.r, s, req),
+    );
+    assert!(matches!(plain, Err(Error::Refused)));
+
+    passkey_sessions(&c, &sealed, &device);
+    passkey_alone(&c);
+}
+
+/// A session needs the caller's own assertion to start, and then stands
+/// in for it.
+fn passkey_sessions(c: &PasskeyCase, sealed: &SealedVaultFile, device: &ExchangeKeyPair) {
+    let adv = &c.advs[0];
+    assert!(session_with_passkey(&c.r, adv, ALICE, device, None).is_err());
+    assert!(session_with_passkey(&c.r, adv, ALICE, device, Some(&c.bobs)).is_err());
+    let session = session_with_passkey(&c.r, adv, ALICE, device, Some(&c.mldsa))
+        .unwrap()
+        .session
+        .unwrap();
+    let in_session = sealed.open(
+        Unlock {
+            device: Some(device),
+            session: Some(&session),
+            ticket: None,
+            release: None,
+            passkey: None,
+        },
+        |s, req| ask_server(&c.r, s, req),
+    );
+    assert_eq!(in_session.unwrap().as_ref(), b"pin=1234\n");
+}
+
+/// With the passkey alone, without a ticket or a device, it is the
+/// owner's.
+fn passkey_alone(c: &PasskeyCase) {
+    let factors = Factors {
+        device: None,
+        ticket: false,
+        passkey: true,
+    };
+    let notes = c.seal("notes", factors, None, b"note\n");
+    let open = |a: &SoftAuthenticator| c.open(&notes, None, &assert_by(a, 0x05));
+    assert_eq!(open(&c.es256).unwrap().as_ref(), b"note\n");
+    assert!(matches!(open(&c.bobs), Err(Error::Refused)));
 }

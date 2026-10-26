@@ -508,6 +508,7 @@ impl<'a> Seal<'a> {
             name: name.into(),
             device: key.public().kid().to_string(),
             offline,
+            passkey: None,
         })?;
         let (session, released) = (reply.session, reply.released);
         let session = session.ok_or("the server started no session")?;
@@ -1700,6 +1701,7 @@ impl<'a> Seal<'a> {
                 session: session.as_ref().map(|l| &l.token),
                 ticket,
                 release,
+                passkey: None,
             },
             |server, request| {
                 tracing::debug!(

@@ -49,8 +49,10 @@ const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
 /// Version 2 adds the receipts of the events an operation logged, 3 the
 /// release requests, 4 device escrows, 5 deposits, 6 devices and the
-/// realm's recovery settings.
+/// realm's recovery settings, 7 the caller's passkeys (written only when
+/// asked for, so older clients read every other reply).
 const REPLY_VERSION: u8 = 6;
+const REPLY_VERSION_PASSKEYS: u8 = 7;
 const FILE_MAGIC: [u8; 4] = *b"IPUF";
 const ANSWER_MAGIC: [u8; 4] = *b"IPVA";
 const SESSION_MAGIC: [u8; 4] = *b"IPST";
@@ -161,7 +163,9 @@ pub struct Factors {
     /// manager's or member's.
     #[serde(default)]
     pub ticket: bool,
-    /// A passkey assertion from one of the owner's IPA passkeys.
+    /// A passkey assertion from one of the opener's IPA passkeys: the
+    /// owner's, or in a shared vault the holder's of the device or ticket
+    /// it opens with.
     #[serde(default)]
     pub passkey: bool,
 }
@@ -346,9 +350,6 @@ impl Policy {
             return Err(Self::refuse(
                 "a vault needs a factor besides the server: device, ticket or passkey",
             ));
-        }
-        if f.passkey {
-            return Err(Self::refuse("the passkey factor is not supported yet"));
         }
         if self.max_unlocks == Some(0) {
             return Err(Self::refuse("a vault that never unlocks"));
@@ -1848,7 +1849,29 @@ pub enum VaultOp {
         /// An offline session (§7.6.6).
         #[serde(default)]
         offline: bool,
+        /// For a vault with the passkey factor: the caller's passkey
+        /// assertion (an encoded [`Assertion`](crate::passkey::Assertion),
+        /// base64url) over [`session_passkey_challenge`] of the exchange.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passkey: Option<String>,
     },
+    /// The caller's passkeys, for their authenticator's allow list.
+    Passkeys,
+}
+
+/// The challenge a passkey signs to start a session (`VaultOp::Unlock`):
+/// `H("ipa-ku-enroll/v1 vault session passkey" ‖ cb)`, `cb` the channel
+/// binding of the operation's exchange, so an assertion serves that
+/// exchange alone.
+///
+/// # Errors
+///
+/// An OpenSSL error.
+pub fn session_passkey_challenge(cb: &[u8; 32]) -> Result<[u8; 32]> {
+    Ok(primitives::sha256(&[
+        b"ipa-ku-enroll/v1 vault session passkey",
+        cb,
+    ])?)
 }
 
 impl VaultOp {
@@ -1890,6 +1913,8 @@ pub struct Reply {
     pub devices: Vec<Device>,
     /// The realm's recovery settings, when asked for.
     pub recovery: Option<RecoverySettings>,
+    /// The caller's passkeys, when asked for.
+    pub passkeys: Option<crate::passkey::PasskeyInfo>,
 }
 
 impl Reply {
@@ -1902,7 +1927,12 @@ impl Reply {
     /// Never for fewer than 2⁶⁴ descriptors.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::with_version(REPLY_MAGIC, REPLY_VERSION);
+        let version = if self.passkeys.is_some() {
+            REPLY_VERSION_PASSKEYS
+        } else {
+            REPLY_VERSION
+        };
+        let mut w = Writer::with_version(REPLY_MAGIC, version);
         w.u64(u64::try_from(self.descriptors.len()).expect("few descriptors"));
         for d in &self.descriptors {
             w.bytes(&d.to_bytes());
@@ -1930,6 +1960,9 @@ impl Reply {
         w.bytes(&serde_json::to_vec(&self.deposits).unwrap_or_default());
         w.bytes(&serde_json::to_vec(&self.devices).unwrap_or_default());
         w.bytes(&serde_json::to_vec(&self.recovery).unwrap_or_default());
+        if let Some(passkeys) = &self.passkeys {
+            w.bytes(&serde_json::to_vec(passkeys).unwrap_or_default());
+        }
         w.finish()
     }
 
@@ -1939,7 +1972,12 @@ impl Reply {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::with_version(bytes, REPLY_MAGIC, REPLY_VERSION, "vault reply")?;
+        let version = if bytes.get(4) == Some(&REPLY_VERSION_PASSKEYS) {
+            REPLY_VERSION_PASSKEYS
+        } else {
+            REPLY_VERSION
+        };
+        let mut r = Reader::with_version(bytes, REPLY_MAGIC, version, "vault reply")?;
         let n = r.u64()?;
         let mut descriptors = Vec::new();
         for _ in 0..n {
@@ -1966,6 +2004,11 @@ impl Reply {
             serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("devices"))?;
         let recovery = serde_json::from_slice(r.bytes()?)
             .map_err(|_| Error::Malformed("recovery settings"))?;
+        let passkeys = if version == REPLY_VERSION_PASSKEYS {
+            Some(serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("passkeys"))?)
+        } else {
+            None
+        };
         r.finish()?;
         Ok(Self {
             descriptors,
@@ -1977,6 +2020,7 @@ impl Reply {
             deposits,
             devices,
             recovery,
+            passkeys,
         })
     }
 }
@@ -2324,6 +2368,11 @@ fn data_key(hash: &std::ffi::CStr, a: &[u8], b: &[u8], committed: &[u8]) -> Resu
 /// channel binding, or gives up on that server.
 pub type TicketSource<'a> = &'a mut dyn FnMut(&str, &[u8; 32]) -> Option<Vec<u8>>;
 
+/// Makes a passkey assertion (an encoded
+/// [`Assertion`](crate::passkey::Assertion)) for the request to `server`
+/// over the given challenge, or gives up on that server.
+pub type PasskeySource<'a> = &'a mut dyn FnMut(&str, &[u8; 32]) -> Option<Vec<u8>>;
+
 /// What an unlock needs from its caller.
 pub struct Unlock<'a> {
     /// The device to answer to, and whose share to open.
@@ -2335,6 +2384,9 @@ pub struct Unlock<'a> {
     pub ticket: Option<TicketSource<'a>>,
     /// The approved release request, for a vault with approvals.
     pub release: Option<[u8; 16]>,
+    /// A passkey assertion over the request's
+    /// [`EscrowRequest::passkey_challenge`], when the vault needs one.
+    pub passkey: Option<PasskeySource<'a>>,
 }
 
 impl SealedVaultFile {
@@ -2474,6 +2526,12 @@ impl SealedVaultFile {
                     continue;
                 };
                 request = request.with_ticket(token);
+            }
+            if let Some(passkey) = unlock.passkey.as_mut() {
+                let Some(assertion) = passkey(&slot.server, &request.passkey_challenge()?) else {
+                    continue;
+                };
+                request = request.with_passkey(assertion);
             }
             let Some(answer) = recover(&slot.server, &request) else {
                 continue;

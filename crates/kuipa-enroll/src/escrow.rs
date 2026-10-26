@@ -624,7 +624,7 @@ impl RegisterParams {
 /// `POST /ipa/ku/rec/{kid}`: the unified recovery request (§7.6.5): a
 /// `tang-pqc` recovery request naming the principal and the vault, with the
 /// binding's commitment to both; for a user vault also the device to answer
-/// to and the owner's GSS-API token.
+/// to, the owner's GSS-API token and a passkey assertion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscrowRequest {
     principal: Principal,
@@ -635,10 +635,14 @@ pub struct EscrowRequest {
     session: Vec<u8>,
     ticket: Vec<u8>,
     release: Option<[u8; 16]>,
+    passkey: Vec<u8>,
 }
 
 /// `IPEQ` version 2 adds the release request id (`DESIGN-approvals.md` §4).
 const REQUEST_VERSION_RELEASE: u8 = 2;
+/// `IPEQ` version 3 adds a passkey assertion, and the release request id
+/// becomes optional (§7.6.5).
+const REQUEST_VERSION_PASSKEY: u8 = 3;
 
 impl EscrowRequest {
     /// A request for a user vault, answered to `device` if given.
@@ -659,6 +663,7 @@ impl EscrowRequest {
             session: Vec::new(),
             ticket: Vec::new(),
             release: None,
+            passkey: Vec::new(),
         }
     }
 
@@ -708,22 +713,60 @@ impl EscrowRequest {
         &self.ticket
     }
 
+    /// The same request carrying a passkey assertion (encoded
+    /// [`Assertion`](crate::passkey::Assertion)) made over
+    /// [`passkey_challenge`](Self::passkey_challenge).
+    #[must_use]
+    pub fn with_passkey(mut self, assertion: Vec<u8>) -> Self {
+        self.passkey = assertion;
+        self
+    }
+
+    /// The passkey assertion, empty without one.
+    #[must_use]
+    pub fn passkey(&self) -> &[u8] {
+        &self.passkey
+    }
+
+    /// The request without its ticket and assertion, which both bind to it.
+    fn bare(&self) -> Vec<u8> {
+        Self {
+            ticket: Vec::new(),
+            passkey: Vec::new(),
+            ..self.clone()
+        }
+        .to_bytes()
+    }
+
     /// The channel binding of the token: `H("ipa-ku-enroll/v1 vault
-    /// unlock" ‖ the request without its token)`, `H` the recovery KEM's
-    /// suite hash (SHA-256 for ML-KEM-768, SHA-384 for ML-KEM-1024),
-    /// taken to the 32 bytes every channel binding has.
+    /// unlock" ‖ the request without its token and assertion)`, `H` the
+    /// recovery KEM's suite hash (SHA-256 for ML-KEM-768, SHA-384 for
+    /// ML-KEM-1024), taken to the 32 bytes every channel binding has.
     ///
     /// # Errors
     ///
     /// An OpenSSL error.
     pub fn ticket_binding(&self) -> Result<[u8; crate::join::CHANNEL_BINDING_LEN]> {
-        let bare = Self {
-            ticket: Vec::new(),
-            ..self.clone()
-        };
         let digest = primitives::digest(
             self.request.alg().hash(),
-            &[b"ipa-ku-enroll/v1 vault unlock", &bare.to_bytes()],
+            &[b"ipa-ku-enroll/v1 vault unlock", &self.bare()],
+        )?;
+        Ok(crate::join::channel_binding_of(&digest))
+    }
+
+    /// The challenge a passkey signs, as its CTAP `clientDataHash`: as
+    /// [`ticket_binding`](Self::ticket_binding), under its own label
+    /// (`"ipa-ku-enroll/v1 vault passkey"`).  A fresh recovery request
+    /// makes every challenge new; a replayed one only releases to the
+    /// requester's ephemeral key again.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn passkey_challenge(&self) -> Result<[u8; 32]> {
+        let digest = primitives::digest(
+            self.request.alg().hash(),
+            &[b"ipa-ku-enroll/v1 vault passkey", &self.bare()],
         )?;
         Ok(crate::join::channel_binding_of(&digest))
     }
@@ -756,10 +799,19 @@ impl EscrowRequest {
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Version 1 without a release request, as every client sent it.
-        let mut w = match self.release {
+        // Version 1 without a release request or an assertion, as every
+        // client sent it, and version 2 with a release request alone, so
+        // older servers still take what they understand.
+        let version = if !self.passkey.is_empty() {
+            Some(REQUEST_VERSION_PASSKEY)
+        } else if self.release.is_some() {
+            Some(REQUEST_VERSION_RELEASE)
+        } else {
+            None
+        };
+        let mut w = match version {
             None => Writer::new(REQUEST_MAGIC),
-            Some(_) => Writer::with_version(REQUEST_MAGIC, REQUEST_VERSION_RELEASE),
+            Some(v) => Writer::with_version(REQUEST_MAGIC, v),
         };
         w.str(&self.principal.to_string())
             .fixed(self.vault.as_bytes())
@@ -768,8 +820,17 @@ impl EscrowRequest {
             .bytes(self.device.as_ref().map_or(&[][..], |d| d.as_bytes()))
             .bytes(&self.session)
             .bytes(&self.ticket);
-        if let Some(id) = &self.release {
-            w.fixed(id);
+        match version {
+            Some(REQUEST_VERSION_PASSKEY) => {
+                w.bytes(self.release.as_ref().map_or(&[][..], |id| &id[..]))
+                    .bytes(&self.passkey);
+            }
+            Some(_) => {
+                if let Some(id) = &self.release {
+                    w.fixed(id);
+                }
+            }
+            None => {}
         }
         w.finish()
     }
@@ -780,16 +841,13 @@ impl EscrowRequest {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let versioned = bytes.get(4) == Some(&REQUEST_VERSION_RELEASE);
-        let mut r = if versioned {
-            Reader::with_version(
-                bytes,
-                REQUEST_MAGIC,
-                REQUEST_VERSION_RELEASE,
-                "escrow request",
-            )?
-        } else {
-            Reader::new(bytes, REQUEST_MAGIC, "escrow request")?
+        let version = bytes
+            .get(4)
+            .copied()
+            .filter(|v| [REQUEST_VERSION_RELEASE, REQUEST_VERSION_PASSKEY].contains(v));
+        let mut r = match version {
+            Some(v) => Reader::with_version(bytes, REQUEST_MAGIC, v, "escrow request")?,
+            None => Reader::new(bytes, REQUEST_MAGIC, "escrow request")?,
         };
         let principal = r.str()?.parse()?;
         let vault = VaultId::from_bytes(r.fixed()?);
@@ -803,7 +861,17 @@ impl EscrowRequest {
         };
         let session = r.bytes()?.to_vec();
         let ticket = r.bytes()?.to_vec();
-        let release = if versioned { Some(r.fixed()?) } else { None };
+        let (release, passkey) = match version {
+            Some(REQUEST_VERSION_PASSKEY) => {
+                let release = match r.bytes()? {
+                    [] => None,
+                    id => Some(id.try_into().map_err(|_| Error::Malformed("release id"))?),
+                };
+                (release, r.bytes()?.to_vec())
+            }
+            Some(_) => (Some(r.fixed()?), Vec::new()),
+            None => (None, Vec::new()),
+        };
         r.finish()?;
         Ok(Self {
             principal,
@@ -814,6 +882,7 @@ impl EscrowRequest {
             session,
             ticket,
             release,
+            passkey,
         })
     }
 }
