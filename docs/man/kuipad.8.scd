@@ -136,6 +136,11 @@ Print the Tang signing keys' thumbprints.
 	*establish-trust* takes the partner's own *kdc_proxy* from its
 	advertisement.
 
+	Requests to other servers honour *HTTPS_PROXY*, *HTTP_PROXY*,
+	*ALL_PROXY* and *NO_PROXY* in the daemon's environment; list the
+	realm's own servers in *NO_PROXY* when only other realms are
+	behind the proxy.
+
 */var/lib/ipa/ku/*
 	The key directory (*key_dir*): the anchor and signing JWKs, the
 	join, escrow, trust, voucher and succession keys, the Tang keys,

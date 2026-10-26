@@ -494,6 +494,18 @@ trusting one, or set _N_; _N_ cannot exceed the witnesses trusted.
 *KRB5CCNAME*
 	The ticket cache *--use-ccache* enrolls with.
 
+*HTTPS_PROXY*, *HTTP_PROXY*, *ALL_PROXY*, *NO_PROXY*
+	An HTTP proxy for the servers, read as curl reads them (lower-case
+	names too): *HTTPS_PROXY* for HTTPS servers, which goes through it
+	as a *CONNECT* tunnel; *HTTP_PROXY* for plain HTTP ones;
+	*ALL_PROXY* for either; *NO_PROXY*, a comma-separated list of
+	hosts and *.domain* suffixes reached directly.  Use an *http://*
+	proxy URL; credentials may be given in it.  Unix sockets are
+	never proxied.  For the services (*kuipa-unseal.service*,
+	*kuipa-rotate.service*) set them in a drop-in, e.g.
+	*Environment=HTTPS_PROXY=http://proxy.example.test:3128*.
+	Kerberos traffic does not use them.
+
 # FILES
 
 */etc/ipa/ku-anchors*

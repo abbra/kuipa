@@ -2187,6 +2187,16 @@ installed CA (`kuipa_enroll::tls::server_verifier`). Plain `http://` and
 `unix:` targets are accepted for tests and local use. kuipad's own clients
 (trust refresh, peer exchange) verify the same way.
 
+An HTTP proxy comes from the environment, read as curl reads it:
+`HTTPS_PROXY` for `https://` servers (a `CONNECT` tunnel, so TLS and the
+checks above run end to end and the proxy learns only the server's name
+and port), `HTTP_PROXY` for plain ones, `ALL_PROXY` for either, and
+`NO_PROXY` for hosts reached directly; `unix:` targets never use one. The
+protocol needs nothing from the proxy: it authenticates the server by its
+anchors (§4.3), whatever carries the bytes. A transport error reports its
+whole cause chain, so a proxy that refuses the tunnel is visible as such,
+and counts as an unreachable server for failover (§4.6).
+
 The CA may be a Merkle Tree CA (draft-ietf-plants-merkle-tree-certs), and
 the verifier sorts the advertised certificates by kind. Ordinary CAs go into
 OpenSSL's store, which verifies ordinary chains as before. A server
