@@ -3011,10 +3011,15 @@ pub fn leave(paths: &Paths) -> Result<Value, Error> {
     ] {
         paths::remove(&p)?;
     }
-    // The kept advertisements are only a cache: gone with the rest.
-    match fs::remove_dir_all(paths.advertisements()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
+    // The kept advertisements are only a cache: gone with the rest, the
+    // host's and, if it kept them in its own directory, the caller's.
+    // Other users' directories are theirs.
+    let user = crate::seal::UserPaths::from_env().map(|u| u.advertisements());
+    for dir in std::iter::once(paths.advertisements()).chain(user.ok()) {
+        match fs::remove_dir_all(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
     }
     Ok(json!({ "left": true }))
 }
