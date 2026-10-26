@@ -35,59 +35,70 @@ It grows by about 190 bytes per server, plus the CA chain and PKINIT
 anchors as they are (a classical CA certificate is about 1.5 KB, an
 ML-DSA one about 5.5 KB).
 
-**A host that pins two or more anchors fetches it twice per exchange**:
-once, then again for a second anchor's proof of the same server (DESIGN
-§4.4), whatever the number of anchors. So the floor of almost any client
-action is **about 50–57 KB downloaded**. The second fetch only needs the
-delegation member: serving that alone, or the vouch-head proofs of DESIGN
-§4.9 (a few hundred bytes), would roughly halve client traffic.
+Three things keep it from being paid on every exchange:
+- **One fetch proves the quorum.** A host that pins two or more anchors
+  needs two distinct anchors' proofs of a server (DESIGN §4.4); the
+  advertisement carries both (§4.3), so one fetch is enough.
+- **Pinned heads instead of signatures.** A head proof is a few hundred
+  bytes where a signature proof is about 7.5 KB (DESIGN §4.9). Hosts pin
+  heads at enrollment and refresh them at every `kuipa check` and key
+  rotation (§4.5), so most proofs are heads: a typical advertisement is
+  about **19 KB**, up to 38 KB with two signature proofs.
+- **Conditional fetches.** `kuipa` keeps each advertisement and asks again
+  with `If-None-Match`; an unchanged one costs a `304 Not Modified`, a few
+  hundred bytes of headers, and is verified again like fresh bytes (§4.3).
+  An advertisement changes when it is re-signed or the anchor exchange
+  publishes, every few days.
+
+So the advertisement costs about 19 KB at a host's first contact with a
+server, and almost nothing afterwards.
 
 ## Client actions
 
 Downloaded and uploaded bytes per action, for a host that pins two
-anchors in a realm of two servers. *adv* is one advertisement fetch, about
-25–29 KB. **Measured**, from the playground report.
+anchors in a realm of two servers, with the advertisements already kept
+from earlier actions, as in steady use. **Measured**, from the playground
+report.
 
 ### Hosts
 
 | action | requests | up | down |
 |---|---|---|---|
-| enroll: OTP, password, ticket or voucher | 2 adv, join or rekey, 2 claim-log pages | 3.2–7.1 KB | 70 KB |
+| enroll: OTP, password, ticket or voucher (first contact) | 2 adv, join or rekey, 2 claim-log pages | 3.2–7.1 KB | 70 KB |
 | enroll offline: the bundle, out of band | — | — | 17.9 KB bundle |
-| … and its first contact | 2 adv, rekey | 3.3 KB | 50 KB |
-| rotate keys (monthly timer) | 2 adv, rekey | 3.3 KB | 50 KB |
-| health check (`kuipa check`) | 2 adv **per server** | — | 48 KB × servers |
-| seal the keytab or a file (`kuipa protect`) | 6 adv, rekey or register, unseal check | 5.8 KB | 145 KB |
+| rotate keys (monthly timer) | adv, rekey | 3.3 KB | 21 KB |
+| health check (`kuipa check`), with its pins refresh | adv per server, pins | 3.3 KB | 20 KB |
+| seal the keytab or a file (`kuipa protect`) | 3 adv (304), rekey or register, unseal check | 5.8 KB | 1.2–2.4 KB |
 | **unseal at boot** (`kuipa-unseal`), per sealed keytab or file | recovery request only: the sealed file keeps the server's key | 2.3 KB | 57 bytes |
-| install trusted realms | 3 adv | — | 74 KB |
-| fetch replica secrets (`kuipa keys fetch`), per secret | 2 adv, keys | 3.3 KB | 49 KB |
+| install trusted realms | 2 adv | — | 26 KB |
+| fetch replica secrets (`kuipa keys fetch`), per secret | adv (304), keys | 3.3 KB | 1.2 KB |
 | post-quantum Tang: provision / recover | `adv` 10.3 KB, then `rec` | 2.2 KB | 57 bytes |
 
 ### Users
 
 | action | requests | up | down |
 |---|---|---|---|
-| a vault operation (create, policy, add device, share, approve, list…) | 2 adv, vault | 3.2–14 KB | 50–100 KB: the reply carries the signed vault descriptor, about 23 KB |
-| seal a file (offline once the vault is described) | 6 adv, for the servers' escrow keys | — | 150 KB |
+| a vault operation (create, policy, add device, share, approve, list…) | adv, vault | 3.2–14 KB | about 26 KB: the reply carries the signed vault descriptor, about 23 KB |
+| seal a file (offline once the vault is described) | 2 adv (304), for the servers' escrow keys | — | 0 |
 | **open a sealed file** | recovery request only | 3.2 KB | 1.2 KB |
 | open within a session | recovery request with the session token | 23 KB | 1.2 KB |
-| start a session, or an offline one | 2 adv, vault | 3.3 KB | 97–101 KB |
-| watch the vault (`kuipa tlog watch`), per server | 2 adv, lookup | 3.3 KB | 53–60 KB |
-| sign files or a commit (`kuipa sign`) | 2 adv, sign | 3.3 KB | 70 KB (a 21 KB signature bundle back) |
+| start a session, or an offline one | adv, vault | 3.3 KB | 49 KB |
+| watch the vault (`kuipa tlog watch`), per server | adv (304), lookup | 3.3 KB | 5–6 KB |
+| sign files or a commit (`kuipa sign`) | adv (304), sign | 3.3 KB | 22 KB (the signature bundle) |
 
-The frequent actions are cheap: unsealing at boot and opening a sealed
-file make one small request each. What costs is the advertisement, on
-every action that talks to a server first.
+Before these changes, the same session downloaded 11.5 MB in 389
+advertisement fetches; it now downloads 2.6 MB in 208, most of them
+`304`s. What remains is mostly the actions' own answers: vault
+descriptors, signature bundles, enrollments.
 
 ### Per host and per user, per day
 
-Key rotation runs monthly from `kuipa-rotate.timer`, about 53 KB. A host
+Key rotation runs monthly from `kuipa-rotate.timer`, about 24 KB. A host
 that also runs `kuipa check` and `kuipa trusted-realms` daily, as the docs
-suggest, adds **(48 KB × servers) + 74 KB a day**, under 0.2 MB for a realm
-of two servers, plus 2.3 KB per sealed keytab or file at each boot. A user
-who opens 20 sealed files and runs an hourly watch against two servers
-adds about 24 × 110 KB + 20 × 4.4 KB ≈ **2.7 MB a day**: the watch,
-which is all advertisements, is nearly all of it.
+suggest, adds about **50 KB a day** for a realm of two servers, plus
+2.3 KB per sealed keytab or file at each boot. A user who opens 20 sealed
+files and runs an hourly watch against two servers adds about
+24 × 12 KB + 20 × 4.4 KB ≈ **0.4 MB a day**.
 
 ## Between servers
 
@@ -125,7 +136,8 @@ Traffic per server per day, computed from the above:
 
 Large realms should give the anchor role to a few servers, as DESIGN
 §4.2 says: it cuts the exchange by an order of magnitude. Hosts are not
-affected either way: they still fetch two advertisements per exchange.
+affected either way: their advertisements carry two proofs whatever the
+number of anchors.
 
 ### Witnesses and auditors
 
