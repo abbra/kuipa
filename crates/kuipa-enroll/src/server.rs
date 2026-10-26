@@ -1767,7 +1767,7 @@ impl EnrollServer {
             receipts,
             ..side
         };
-        Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes())?)
+        Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes()?)?)
     }
 
     /// Answer a `keys` fetch (§18.2): authenticate the caller by their
@@ -2926,6 +2926,9 @@ impl EnrollServer {
         let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
         need_member(role)?;
         let me = caller.to_string();
+        if vault.devices.len() >= 255 {
+            return Err(Refusal::because("too many devices"));
+        }
         if vault
             .devices
             .iter()
