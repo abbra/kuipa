@@ -102,11 +102,9 @@ fn brew_prefix(formula: &str) -> Option<PathBuf> {
 
 /// Whether `dir` holds any build of `stem` (shared, static, or versioned).
 fn has_library(dir: &Path, stem: &str) -> bool {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with(stem))
-        })
-        .unwrap_or(false)
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(stem))
+    })
 }

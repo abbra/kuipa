@@ -42,8 +42,9 @@ pub(crate) unsafe extern "C" fn sasl_interact_gssapi(
     defaults: *mut c_void,
     interact_raw: *mut c_void,
 ) -> c_int {
-    if !defaults.is_null() {
-        tracing::trace!(cred = ?defaults, "sasl_interact: injecting GSS credential");
+    if defaults.is_null() {
+        tracing::trace!("sasl_interact: no credential (defaults is null)");
+    } else {
         let rc = ffi::ldap_set_option(ld, ffi::LDAP_OPT_X_SASL_GSS_CREDS, defaults.cast_const());
         if rc != ffi::LDAP_SUCCESS {
             // Fail rather than continue with whatever identity the
@@ -52,9 +53,6 @@ pub(crate) unsafe extern "C" fn sasl_interact_gssapi(
             tracing::error!(rc, "ldap_set_option(LDAP_OPT_X_SASL_GSS_CREDS) failed");
             return rc;
         }
-        tracing::trace!(rc, "ldap_set_option(LDAP_OPT_X_SASL_GSS_CREDS) succeeded");
-    } else {
-        tracing::trace!("sasl_interact: no credential (defaults is null)");
     }
     // SAFETY: libldap provides a non-null, properly aligned, SASL_CB_LIST_END-
     // terminated sasl_interact array for the lifetime of this callback. Advancing
@@ -125,6 +123,12 @@ impl LdapConnection {
     /// `timeout_secs` sets both the TCP-level connect timeout and the default
     /// operation timeout (`LDAP_OPT_NETWORK_TIMEOUT` + `LDAP_OPT_TIMEOUT`).
     /// Pass 0 to use the OS default (no finite timeout).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if `ldap_initialize` or protocol setup fails,
+    /// [`LdapError::Tls`] if the CA file cannot be read or TLS/STARTTLS negotiation fails, and
+    /// [`LdapError::NulByte`] if `tls_ca_cert_file` has an interior NUL.
     pub fn connect(
         uri: &str,
         tls_ca_cert_file: Option<&str>,
@@ -250,6 +254,11 @@ impl LdapConnection {
     /// |---------|-----------|---------------|
     /// | [`Auth::Simple`] | LDAP simple bind (DN + password) | `bind_dn` and `password` |
     /// | [`Auth::Gssapi`] | SASL GSSAPI (Kerberos) | valid TGT in the credential cache |
+    ///
+    /// # Errors
+    ///
+    /// Every failure is reported as [`LdapError::Protocol`], either from
+    /// the server-side bind result or from SASL mechanism negotiation.
     pub fn bind(&mut self, auth: &Auth) -> Result<(), LdapError> {
         match auth {
             Auth::Simple { bind_dn, password } => {
@@ -303,6 +312,12 @@ impl LdapConnection {
     /// SPNEGO to fall back to the default service credential.  With `GSSAPI`,
     /// the interposer receives the proxymech handle directly and forwards it
     /// to the gssproxy daemon, which performs S4U2Proxy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the SASL bind loop exceeds
+    /// `MAX_SASL_ROUNDS`, `ldap_result` fails mid-exchange, or the server
+    /// rejects the bind.
     pub fn bind_with_s4u_cred(
         &mut self,
         cred: &kuipa_gssapi::GssClientCred,
@@ -325,12 +340,12 @@ impl LdapConnection {
         mech: &std::ffi::CStr,
         defaults: *mut c_void,
     ) -> Result<(), LdapError> {
+        const MAX_SASL_ROUNDS: u32 = 10;
         debug!(mech = %mech.to_string_lossy(), "SASL bind starting");
 
         let mut result: *mut ffi::LDAPMessage = ptr::null_mut();
         let mut rmech: *const c_char = ptr::null();
         let mut iterations: u32 = 0;
-        const MAX_SASL_ROUNDS: u32 = 10;
         loop {
             if iterations >= MAX_SASL_ROUNDS {
                 if !result.is_null() {
@@ -473,6 +488,12 @@ impl LdapConnection {
     ///
     /// FreeIPA's `KEYTAB_GET` operation returns its reply in a response
     /// control rather than in the response value, so both are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the extended request is rejected,
+    /// `ldap_result` times out, or the result code is not
+    /// `LDAP_SUCCESS`; [`LdapError::NulByte`] if `oid` has an interior NUL.
     pub fn extended_operation(
         &mut self,
         oid: &str,
@@ -483,9 +504,7 @@ impl LdapConnection {
             bv_len: v.len() as ffi::ber_len_t,
             bv_val: v.as_ptr() as *mut c_char,
         });
-        let req_ptr = req_bv
-            .as_mut()
-            .map_or(ptr::null_mut(), |bv| bv as *mut ffi::berval);
+        let req_ptr = req_bv.as_mut().map_or(ptr::null_mut(), ptr::from_mut);
         let mut msgid: c_int = -1;
         // SAFETY: self.ld is non-null; oid_c and the request berval (pointing
         // into `value`) outlive the call, which copies them into the request.
@@ -628,6 +647,12 @@ impl LdapConnection {
     /// * `filter` — RFC 4515 filter string, e.g. `"(objectClass=certProfile)"`.
     /// * `attrs`  — Attribute names to retrieve.  An empty slice requests all
     ///   attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the search request or result
+    /// retrieval fails; [`LdapError::NulByte`] if `base`, `filter`, or any
+    /// entry of `attrs` has an interior NUL.
     pub fn search(
         &mut self,
         base: &str,
@@ -715,6 +740,12 @@ impl LdapConnection {
     ///
     /// All allocations needed by libldap are on the stack for the duration of
     /// the call; nothing escapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the server rejects the modify;
+    /// [`LdapError::NulByte`] if `dn` or any attribute name has an interior
+    /// NUL.
     pub fn modify_s(
         &mut self,
         dn: &str,
@@ -750,7 +781,7 @@ impl LdapConnection {
         // Build pointer-to-berval vecs now that berval_vecs is fully populated
         // (and won't be reallocated).
         for bvs in &mut berval_vecs {
-            let mut ptrs: Vec<*mut ffi::berval> = bvs.iter_mut().map(|b| b as *mut _).collect();
+            let mut ptrs: Vec<*mut ffi::berval> = bvs.iter_mut().map(ptr::from_mut).collect();
             ptrs.push(ptr::null_mut()); // NULL sentinel
             bvptr_vecs.push(ptrs);
         }
@@ -767,7 +798,7 @@ impl LdapConnection {
 
         // NULL-terminated array of *mut LDAPMod.
         let mut mod_ptrs: Vec<*mut ffi::LDAPMod> =
-            ldap_mods.iter_mut().map(|m| m as *mut _).collect();
+            ldap_mods.iter_mut().map(ptr::from_mut).collect();
         mod_ptrs.push(ptr::null_mut());
 
         // SAFETY: self.ld is non-null; dn_c is a valid NUL-terminated C string;
@@ -793,6 +824,13 @@ impl LdapConnection {
     ///
     /// `credential` must be the concatenated `password+otp_code` string; the
     /// caller is responsible for zeroing it after this call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the bind request or result
+    /// retrieval fails or the server rejects the credentials;
+    /// [`LdapError::NulByte`] if `bind_dn` or `credential` has an interior
+    /// NUL.
     pub fn bind_simple_otp_required(
         &mut self,
         bind_dn: &str,
@@ -837,6 +875,12 @@ impl LdapConnection {
     ///
     /// `attrs` is a list of `(attr_name, values)` pairs.  All attributes are
     /// added with `LDAP_MOD_ADD | LDAP_MOD_BVALUES`, so values are binary-safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the server rejects the add;
+    /// [`LdapError::NulByte`] if `dn` or any attribute name has an interior
+    /// NUL.
     pub fn add_s(&mut self, dn: &str, attrs: &[(&str, Vec<&[u8]>)]) -> Result<(), LdapError> {
         let dn_c = cstr(dn)?;
 
@@ -861,7 +905,7 @@ impl LdapConnection {
         }
 
         for bvs in &mut berval_vecs {
-            let mut ptrs: Vec<*mut ffi::berval> = bvs.iter_mut().map(|b| b as *mut _).collect();
+            let mut ptrs: Vec<*mut ffi::berval> = bvs.iter_mut().map(ptr::from_mut).collect();
             ptrs.push(ptr::null_mut());
             bvptr_vecs.push(ptrs);
         }
@@ -875,7 +919,7 @@ impl LdapConnection {
         }
 
         let mut mod_ptrs: Vec<*mut ffi::LDAPMod> =
-            ldap_mods.iter_mut().map(|m| m as *mut _).collect();
+            ldap_mods.iter_mut().map(ptr::from_mut).collect();
         mod_ptrs.push(ptr::null_mut());
 
         // SAFETY: self.ld is non-null; all backing allocations remain valid for
@@ -900,6 +944,10 @@ impl LdapConnection {
     ///
     /// Returns `Ok(Some(suffix))` on success, `Ok(None)` when the server does not
     /// advertise a naming context, and `Err` on connection/protocol failures.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`LdapError::Protocol`] from the rootDSE search.
     pub fn fetch_naming_context(&mut self) -> Result<Option<String>, LdapError> {
         let entries = self.search(
             "",
@@ -917,6 +965,12 @@ impl LdapConnection {
     }
 
     /// Delete an existing LDAP entry by DN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the server rejects the delete
+    /// (including `NO_SUCH_OBJECT`); [`LdapError::NulByte`] if `dn` has an
+    /// interior NUL.
     pub fn delete_s(&mut self, dn: &str) -> Result<(), LdapError> {
         let dn_c = cstr(dn)?;
         // SAFETY: self.ld is non-null; dn_c is a valid NUL-terminated string
@@ -1216,7 +1270,7 @@ mod tests {
     #[test]
     fn search_entry_default_is_empty() {
         let e = SearchEntry::default();
-        assert!(e.dn.is_empty());
+        assert_eq!(e.dn, "");
         assert!(e.attrs.is_empty());
         assert!(e.bin_attrs.is_empty());
     }
