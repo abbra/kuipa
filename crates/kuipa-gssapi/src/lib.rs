@@ -52,6 +52,15 @@ pub use kinit::{ticket, NoPreauth, Preauth};
 pub use status::format_gss_status;
 pub use thread_ccache::{set_thread_ccache, thread_ccache_name};
 
+/// Whether this build links MIT Kerberos (the cfg `build.rs` sets):
+/// MS-KKDCP KDC proxies are MIT-only, Heimdal does not speak them.
+/// `cfg(mit_kerberos)` is set only in this crate's compilation unit,
+/// so callers test this instead.
+#[must_use]
+pub const fn is_mit_kerberos() -> bool {
+    cfg!(mit_kerberos)
+}
+
 // ── Credential re-acquisition ────────────────────────────────────────────────
 
 /// How the server credential was originally acquired, allowing re-acquisition
