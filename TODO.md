@@ -164,6 +164,13 @@ design first.
       transparency log (`docs/DESIGN-approvals.md`).
 - [x] Short-lived CI runner identities (voucher leases, `ticket.leased`)
       and pipeline secrets in shared vaults (`docs/DESIGN-ci.md`).
+- [ ] Trust bundles from the realm (`docs/src/use-cases.md`, "Deliver CA
+      bundles without trusting DNS or TLS"): refresh the CA chain at
+      `rotate-keys` and `check`; a realm-managed bundle in the
+      advertisement (extra CAs, distrusted keys by SPKI hash); install
+      into the system trust store with `update-ca-trust` and its
+      blocklist; a dracut module carrying the pinned anchors and the
+      last verified bundle into the initramfs.
 - [ ] Recipes in the book: Ansible vault passwords, `systemd-creds` and
       container secrets, `tang-pqc` file encryption, `realm-info` for
       unenrolled machines.

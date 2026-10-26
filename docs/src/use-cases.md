@@ -35,6 +35,7 @@ source tree.
 | [Keep keytabs useless in backups and snapshots](#keep-keytabs-useless-in-backups-and-snapshots) | host admins | works |
 | [Seal any file to a host](#seal-any-file-to-a-host) | host admins | works |
 | [Unlock encrypted disks with a post-quantum Tang](#unlock-encrypted-disks-with-a-post-quantum-tang) | host admins | works, not yet tested with real Clevis and LUKS |
+| [Deliver CA bundles without trusting DNS or TLS](#deliver-ca-bundles-without-trusting-dns-or-tls) | realm admins, host admins | partly |
 | [Give CI runners short-lived identities](#give-ci-runners-short-lived-identities) | platform teams | works |
 | [Accept users of a trusted realm](#accept-users-of-a-trusted-realm) | realm admins | works |
 | [Move secrets between IPA replicas](#move-secrets-between-ipa-replicas) | realm admins | works |
@@ -137,6 +138,46 @@ network, but Tang's key exchange is classical.
 **Status:** works as a command and over HTTP. It is **not yet tested
 under real Clevis, with LUKS2, or in an initramfs**. See
 [Keys and rotation](realm/keys.md#tang).
+
+### Deliver CA bundles without trusting DNS or TLS
+
+**Why.** A host's trust store decides which TLS servers it believes, and
+it is usually fetched over the very DNS and TLS it is meant to secure,
+or baked into an image and never refreshed. When a CA fails, every
+store must change quickly. In October 2026 eight eMudhra intermediate
+CAs turned out to have private keys anyone could recover from their
+certificates. Browsers blocked them within days, but trust stores in
+containers, images, vendored bundles and early boot change only when
+someone rebuilds them. An enrolled host has a better source: its own
+realm, which it already authenticates with post-quantum anchors.
+
+**What kuipa does.** The realm's advertisement carries its CA chain and
+PKINIT anchors, signed by the server and vouched for by the anchors a
+host pins. A host installs them at enrollment, `kuipa realm-info` does
+the same for a machine that is not enrolled, and `kuipa trusted-realms`
+for each trusted realm. Nothing in the path depends on DNS, on TLS, or
+on a CA: an attacker who controls both still cannot change what the
+host installs. Every entry must be a CA certificate before anything is
+written, and Merkle Tree CAs are accepted.
+
+**What it would do.** Make the realm the source of a host's whole trust
+bundle, kept current:
+- refresh the CA chain at every key rotation and health check, not only
+  at enrollment;
+- carry a realm-managed bundle in the advertisement: extra CAs the
+  realm adds, and **distrusted** keys by SPKI hash, as browsers block
+  intermediates, so one change by an administrator reaches every host
+  at its next check;
+- install them into the system trust store (`update-ca-trust`, with
+  distrusted keys in the blocklist), and into containers at start;
+- carry the pinned anchors and the last verified bundle into the
+  initramfs (a dracut module, as `tang-pqc` has), so early-boot HTTPS
+  (network root, provisioning, `tang-pqc` over `https`) trusts what the
+  realm decided, verified before the root file system is mounted.
+
+**Status:** partly. Authenticated delivery of the realm's own CA chain
+works; refresh, distrust lists, the system trust store and the
+initramfs are planned.
 
 ### Give CI runners short-lived identities
 
