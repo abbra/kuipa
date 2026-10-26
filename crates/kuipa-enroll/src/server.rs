@@ -1677,7 +1677,6 @@ impl EnrollServer {
         }
         let op = VaultOp::from_bytes(&body.extra)?;
         let now = unix_seconds(SystemTime::now());
-        let delegation = self.delegation();
         let mut event = vault_event(&op);
         // Whoever loses a device or their membership must not open files
         // sealed for offline sessions from now on: a new epoch starts.
@@ -1730,26 +1729,72 @@ impl EnrollServer {
             }
         };
         for v in &mut vaults {
-            // Whoever has no part in the vault any more (out of the group
-            // in IPA, or unshared) loses their devices, as a removal would.
-            let gone = prune_departed(v, directory)?;
-            for id in &gone {
-                receipts.extend(self.record_change(
-                    v,
-                    VaultAction::RemoveDevice,
-                    Some(id.clone()),
-                )?);
-            }
-            let rotated = self.maintain_epochs(v, now, rotate || !gone.is_empty(), directory)?;
-            if rotated || !gone.is_empty() {
-                directory.vault_update(v).map_err(Refusal)?;
-            }
+            receipts.extend(self.settle_vault(v, now, rotate, directory)?);
         }
-        let descriptors = vaults
+        let descriptors = self.public_descriptors(&vaults, now, directory)?;
+        receipts.append(&mut side.receipts);
+        if receipts.len() > 255 {
+            // The wire counts receipts in a `u8`; the committed change
+            // stands and its log entries speak for the receipts that
+            // do not fit.
+            eprintln!(
+                "kuipad: the reply carries {} receipts: 255 are sent",
+                receipts.len()
+            );
+            receipts.truncate(255);
+        }
+        let reply = Reply {
+            descriptors,
+            session,
+            released,
+            receipts,
+            ..side
+        };
+        Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes()?)?)
+    }
+
+    /// Settle a vault a vault operation touched: whoever has no part in it
+    /// any more (out of the group in IPA, or unshared) loses their
+    /// devices, as a removal would, and its epochs move on — at once when
+    /// `rotate` or someone left. Stores the vault if it changed and
+    /// answers the receipts of the removals.
+    fn settle_vault(
+        &self,
+        vault: &mut Vault,
+        now: u64,
+        rotate: bool,
+        directory: &dyn Directory,
+    ) -> Result<Vec<Receipt>, Refusal> {
+        let gone = prune_departed(vault, directory)?;
+        let mut receipts = Vec::new();
+        for id in &gone {
+            receipts.extend(self.record_change(
+                vault,
+                VaultAction::RemoveDevice,
+                Some(id.clone()),
+            )?);
+        }
+        let rotated = self.maintain_epochs(vault, now, rotate || !gone.is_empty(), directory)?;
+        if rotated || !gone.is_empty() {
+            directory.vault_update(vault).map_err(Refusal)?;
+        }
+        Ok(receipts)
+    }
+
+    /// Sign the descriptors of `vaults`, each for as long as its owner's
+    /// limits allow. Descriptors carry each epoch's public key, never its
+    /// slots.
+    fn public_descriptors(
+        &self,
+        vaults: &[Vault],
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Vec<Descriptor>, Refusal> {
+        let delegation = self.delegation();
+        vaults
             .iter()
             .map(|v| {
                 let max_age = limits_for(&v.owner, directory)?.descriptor_age;
-                // Descriptors carry each epoch's public key, never its slots.
                 let mut public = v.clone();
                 for k in &mut public.session_keys {
                     k.slots.clear();
@@ -1764,16 +1809,7 @@ impl EnrollServer {
                     max_age,
                 )?)
             })
-            .collect::<Result<Vec<_>, Refusal>>()?;
-        receipts.append(&mut side.receipts);
-        let reply = Reply {
-            descriptors,
-            session,
-            released,
-            receipts,
-            ..side
-        };
-        Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes()?)?)
+            .collect()
     }
 
     /// Answer a `keys` fetch (§18.2): authenticate the caller by their
