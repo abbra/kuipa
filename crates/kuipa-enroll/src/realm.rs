@@ -468,6 +468,9 @@ pub struct VerifiedRealm {
     /// checked against (§2 gate).
     claim: Claim,
     adv: Advertisement,
+    /// The signed advertisement as served, to keep without fetching it
+    /// again (it verifies again wherever it is read back).
+    signed: SignedAdvertisement,
     epoch: Option<(u64, crate::epoch::EpochHead)>,
 }
 
@@ -529,6 +532,7 @@ impl VerifiedRealm {
         if delegation.realm != realm {
             return Err(Error::WrongRealm);
         }
+        let signed = adv.clone();
         let adv = adv.verify_at(&delegation.key, policy, now)?;
         let info =
             RealmInfo::from_value(adv.member(MEMBER_IPA).ok_or(Error::Missing("realm info"))?)?;
@@ -553,6 +557,7 @@ impl VerifiedRealm {
             proved_heads,
             claim,
             adv,
+            signed,
             epoch,
         })
     }
@@ -710,6 +715,13 @@ impl VerifiedRealm {
     #[must_use]
     pub fn advertisement(&self) -> &Advertisement {
         &self.adv
+    }
+
+    /// The signed advertisement this was verified from, as served: to keep
+    /// it, for verifying again later, without fetching it again.
+    #[must_use]
+    pub fn signed(&self) -> &SignedAdvertisement {
+        &self.signed
     }
 
     /// Require every certificate to be one the advertisement lists, and at
