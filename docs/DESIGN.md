@@ -443,16 +443,22 @@ half life. The JWK Set carries two extension members:
          "pkinit_anchors":["<b64url DER>"],
          "anchors":["<b64url thumbprint>", …],
          "heads":[{"anchor":"<b64url thumbprint>","size":12,"root":"<b64url hash>"}, …]},
- "delegation": {"claim":"…","proofs":[<one proof>]}}
+ "delegation": {"claim":"…","proofs":[<one or two proofs>]}}
 ```
 
 `anchors` lists the trusted anchors, the server's own first. The
-`delegation` carries **one** proof: the client names the anchors it pins as
-`?anchor=<thumbprint>` (repeated, in order of preference, at most 16 used),
-and the server includes the proof of the first of them that vouches for its
-claim, or else its own anchor's. The size of an advertisement
-therefore does not grow with the number of servers. The server keeps one
-signed advertisement per chosen proof, re-signed at half life and
+`delegation` carries the proofs the client needs: the client names the
+anchors it pins as `?anchor=<thumbprint>` (repeated, in order of
+preference, at most 16 used), and the server includes the proof of the
+first of them that vouches for its claim, or else its own anchor's, and
+then the proofs of further pinned anchors until two distinct anchors prove
+it (`SERVED_PROOFS`). A client pinning two anchors so counts its quorum
+(§4.4) from one advertisement instead of fetching a second one for the
+other anchor's proof. A pinned head's proof (§4.9) replaces its anchor's
+signature, and costs a few hundred bytes instead of about 7.5 KB. The size
+of an advertisement therefore does not grow with the number of servers,
+only with the client's pins, by one proof at most. The server keeps one
+signed advertisement per choice of proofs, re-signed at half life and
 discarded when the exchange publishes.
 
 The `ipa` member carries certificates, not hashes: before enrollment the
@@ -534,8 +540,10 @@ voucher) and `realm-info` can take `--realm R` instead: the advertisement is
 then verified against the anchors pre-provisioned in `/etc/ipa/ku-anchors`
 (an image, configuration management). Listing two or more changes what the
 host demands: the claim must be provable by two distinct listed anchors,
-each asked for its own proof (`?anchor=`, §4.3), and pins that resolve
-through a succession to the same current key count once. That is the
+each with its own proof — both usually served in the same advertisement
+(§4.3), another fetch with that anchor alone (`?anchor=`) when not — and
+pins that resolve through a succession to the same current key count
+once. That is the
 second anchor's purpose: a realm whose anchors exchanged (§4.3) answers
 for both, a host vouched by a single key — a stolen one included —
 answers with one, and the theft surfaces as a refusal (§4.7, §13). A

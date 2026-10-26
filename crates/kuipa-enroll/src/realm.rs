@@ -592,6 +592,14 @@ impl VerifiedRealm {
         &self.delegation.anchor
     }
 
+    /// Every pinned anchor whose own proof of the delegation checked,
+    /// [`anchor`](Self::anchor) first: one advertisement can carry a
+    /// client's whole quorum (DESIGN §4.4).
+    #[must_use]
+    pub fn proven_by(&self) -> &[crate::delegation::ProvenBy] {
+        &self.delegation.proven_by
+    }
+
     /// The pinned anchor whose **head** proved the delegation, if one did
     /// (§4.9): `None` when a signature was checked.  A frozen pin
     /// demands one of these (DESIGN-claim-logs.md §2).

@@ -1176,7 +1176,36 @@ pub struct VerifiedDelegation {
     /// The successions followed from a pinned anchor to `anchor`, as
     /// `(old, new)` from the pinned one; empty if `anchor` is pinned.
     pub succeeded: Vec<(Thumbprint, Thumbprint)>,
+    /// Every pinned anchor whose own proof checks, `anchor` first, each
+    /// once: what a client counts towards its quorum (§4.4) without
+    /// asking again.  Beyond `anchor`, only direct proofs by a pinned
+    /// anchor count; a succession is followed for `anchor` alone.
+    pub proven_by: Vec<ProvenBy>,
 }
+
+/// A pinned anchor that proves a delegation's claim, and how.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProvenBy {
+    /// The anchor.
+    pub anchor: Thumbprint,
+    /// Whether by one of its pinned heads (§4.9), else by its signature.
+    pub head: bool,
+}
+
+/// What a delegation's proofs are checked against: the client's pinned
+/// anchors, heads and retired claims, its policy, and the time.
+struct Pins<'a> {
+    anchors: &'a [Thumbprint],
+    heads: &'a [HeadPin],
+    retired: &'a [Hash],
+    policy: &'a Policy,
+    at: u64,
+}
+
+/// How many distinct anchors' proofs an advertisement carries for a client
+/// that pins several: a client's quorum (§4.4), so one fetch proves the
+/// claim twice.
+pub const SERVED_PROOFS: usize = 2;
 
 impl Delegation {
     /// `claim` without proofs.
@@ -1359,10 +1388,13 @@ impl Delegation {
         self.claim == other.claim
     }
 
-    /// The same claim with one proof: by the first anchor in `wanted` that
-    /// has one, else by the server's own anchor, else the first.
+    /// The same claim with the proofs a client pinning `wanted` needs: by
+    /// the first anchor in `wanted` that has one, else by the server's own
+    /// anchor, else the first; then by further anchors in `wanted`, until
+    /// [`SERVED_PROOFS`] distinct anchors prove it, so the client counts
+    /// its quorum (§4.4) from one advertisement.
     ///
-    /// Advertisements carry one proof, chosen from the anchors the client
+    /// Advertisements carry these, chosen from the anchors the client
     /// pins, instead of every anchor's (§4.3).
     ///
     /// If no wanted anchor has a proof, the proof is the one reached by the
@@ -1370,10 +1402,11 @@ impl Delegation {
     /// one, and the delegation keeps that chain.  With nothing wanted (a
     /// bundle, whose reader is unknown) it keeps every succession.
     ///
-    /// With `wanted_heads` (§4.9), a head proof for the first pinned head
-    /// wins over everything: no signature is needed, and none is served.
-    /// A client that pins a head for an anchor that also has a signature
-    /// proof served gets the head proof only.
+    /// With `wanted_heads` (§4.9), head proofs for the pinned heads win
+    /// over everything: no signature is needed for their anchors, and none
+    /// is served.  A client that pins a head for an anchor that also has a
+    /// signature proof served gets the head proof only; signatures are
+    /// added only for other wanted anchors, up to [`SERVED_PROOFS`].
     #[must_use]
     pub fn select(&self, wanted: &[Thumbprint]) -> Self {
         self.select_with_heads(wanted, &[])
@@ -1385,23 +1418,39 @@ impl Delegation {
         let own = self.claim().ok().and_then(|c| c.anchor);
         let by = |a: &Thumbprint| self.proofs.iter().find(|p| p.signer() == Some(*a));
         let proofs = self.head_proofs();
-        let matching: Vec<Value> = proofs
+        let matching: Vec<&HeadProof> = proofs
             .iter()
             .filter(|p| {
                 heads
                     .iter()
                     .any(|h| h.anchor == *p.anchor() && h.size == p.size)
             })
-            .map(HeadProof::to_json)
             .collect();
         if !matching.is_empty() {
-            // The head wins over everything (§4.9): no signature, and
-            // **every** matching head — a frozen host's §2 gate demands
-            // a proof per frozen anchor, not the first one.
+            // The head wins over everything (§4.9): no signature for its
+            // anchor, and **every** matching head — a frozen host's §2
+            // gate demands a proof per frozen anchor, not the first one.
+            // Other wanted anchors' signatures make up the quorum.
+            let mut covered: Vec<Thumbprint> = Vec::new();
+            for p in &matching {
+                if !covered.contains(p.anchor()) {
+                    covered.push(*p.anchor());
+                }
+            }
+            let mut signed = Vec::new();
+            for w in wanted {
+                if covered.len() >= SERVED_PROOFS {
+                    break;
+                }
+                if let Some(p) = by(w).filter(|_| !covered.contains(w)) {
+                    covered.push(*w);
+                    signed.push(p.clone());
+                }
+            }
             return Self {
                 claim: self.claim.clone(),
-                proofs: Vec::new(),
-                head_proofs: matching,
+                proofs: signed,
+                head_proofs: matching.iter().map(|p| p.to_json()).collect(),
                 successions: Vec::new(),
             };
         }
@@ -1430,9 +1479,18 @@ impl Delegation {
                 },
             ),
         };
+        let mut served: Vec<Proof> = chosen.cloned().into_iter().collect();
+        for w in wanted {
+            if served.len() >= SERVED_PROOFS {
+                break;
+            }
+            if let Some(p) = by(w).filter(|p| !served.iter().any(|s| s.signer() == p.signer())) {
+                served.push(p.clone());
+            }
+        }
         Self {
             claim: self.claim.clone(),
-            proofs: chosen.cloned().into_iter().collect(),
+            proofs: served,
             head_proofs: Vec::new(),
             successions,
         }
@@ -1512,6 +1570,13 @@ impl Delegation {
         policy: &Policy,
         at: u64,
     ) -> Result<VerifiedDelegation> {
+        let pins = Pins {
+            anchors,
+            heads,
+            retired,
+            policy,
+            at,
+        };
         let claim = self.claim()?;
         let head_proofs = self.head_proofs();
         if let Some(anchor) = head_proofs
@@ -1521,6 +1586,8 @@ impl Delegation {
             if !claim.valid_at(at) {
                 return Err(Error::Expired);
             }
+            let first = ProvenBy { anchor, head: true };
+            let proven_by = self.proven_by(&claim, first, &pins);
             return Ok(VerifiedDelegation {
                 realm: claim.realm,
                 server: claim.server,
@@ -1532,6 +1599,7 @@ impl Delegation {
                 // No vouch lifetime: the pinned head is the proof.
                 vouched_until: u64::MAX,
                 succeeded: Vec::new(),
+                proven_by,
             });
         }
         let proven = |pinned: &[Thumbprint]| {
@@ -1558,6 +1626,11 @@ impl Delegation {
         if !claim.valid_at(at) {
             return Err(Error::Expired);
         }
+        let first = ProvenBy {
+            anchor,
+            head: false,
+        };
+        let proven_by = self.proven_by(&claim, first, &pins);
         Ok(VerifiedDelegation {
             realm: claim.realm,
             server: claim.server,
@@ -1568,7 +1641,36 @@ impl Delegation {
             head_anchor: None,
             vouched_until: vouch.exp,
             succeeded,
+            proven_by,
         })
+    }
+
+    /// `first`, then every other pinned anchor whose own proof of `claim`
+    /// checks against `pins`: by a pinned head, else by a signature in its
+    /// lifetime.  Each anchor once.
+    fn proven_by(&self, claim: &Claim, first: ProvenBy, pins: &Pins<'_>) -> Vec<ProvenBy> {
+        let mut out = vec![first];
+        let by_head = self
+            .head_proofs()
+            .iter()
+            .filter_map(|p| p.check(claim, pins.heads, pins.retired))
+            .map(|anchor| ProvenBy { anchor, head: true })
+            .collect::<Vec<_>>();
+        let by_signature = self
+            .proofs
+            .iter()
+            .filter_map(|p| p.check(claim, Some(pins.anchors), pins.policy))
+            .filter(|(_, v)| v.valid_at(pins.at))
+            .map(|(anchor, _)| ProvenBy {
+                anchor,
+                head: false,
+            });
+        for p in by_head.into_iter().chain(by_signature) {
+            if !out.iter().any(|o| o.anchor == p.anchor) {
+                out.push(p);
+            }
+        }
+        out
     }
 
     /// The anchors reachable from `pinned` through carried successions that
@@ -2361,6 +2463,87 @@ mod tests {
             default.signers(&Policy::default()),
             [*own.public().thumbprint()]
         );
+    }
+
+    /// A delegation of `c` with a proof by each of `anchors`, every vouch
+    /// covering `c` alone.
+    fn proved_by(c: &Claim, anchors: &[&SigningKey]) -> (Delegation, Vec<SignedVouch>) {
+        let mut d = Delegation::new(c);
+        let mut vouches = Vec::new();
+        for a in anchors {
+            let v = SignedVouch::issue(
+                a,
+                "R",
+                [c.leaf(TreeHash::Sha256).unwrap()],
+                NOW,
+                NOW + VOUCH_VALIDITY,
+                None,
+            )
+            .unwrap();
+            d.add(v.proof(c, a.public()).unwrap());
+            vouches.push(v);
+        }
+        (d, vouches)
+    }
+
+    #[test]
+    fn a_client_pinning_two_anchors_gets_both_proofs_at_once() {
+        let (first, second, third, signing) = (key(), key(), key(), key());
+        let claimed = claim(&first, "s", &signing);
+        let (delegation, _) = proved_by(&claimed, &[&first, &second, &third]);
+        let thp = |k: &SigningKey| *k.public().thumbprint();
+        let policy = Policy::default();
+
+        // Two pinned anchors: both proofs, not the third's.
+        let served = delegation.select(&[thp(&second), thp(&first)]);
+        assert_eq!(served.signers(&policy), [thp(&second), thp(&first)]);
+        let v = served
+            .verify_at_with_heads(&[thp(&first), thp(&second)], &[], &[], &policy, NOW)
+            .unwrap();
+        let proven: Vec<_> = v.proven_by.iter().map(|p| (p.anchor, p.head)).collect();
+        assert_eq!(proven, [(thp(&second), false), (thp(&first), false)]);
+
+        // One pinned anchor: one proof, as before.
+        assert_eq!(
+            delegation.select(&[thp(&first)]).signers(&policy),
+            [thp(&first)]
+        );
+        // At most SERVED_PROOFS, however many are pinned.
+        let all = delegation.select(&[thp(&first), thp(&second), thp(&third)]);
+        assert_eq!(all.signers(&policy).len(), SERVED_PROOFS);
+        // A proof the client does not pin proves nothing to it.
+        let v = all
+            .verify_at_with_heads(&[thp(&first)], &[], &[], &policy, NOW)
+            .unwrap();
+        assert_eq!(v.proven_by.len(), 1);
+    }
+
+    #[test]
+    fn a_pinned_head_and_another_anchors_signature_make_the_quorum() {
+        let (first, second, signing) = (key(), key(), key());
+        let claimed = claim(&first, "s", &signing);
+        let (mut delegation, vouches) = proved_by(&claimed, &[&first, &second]);
+        let thp = |k: &SigningKey| *k.public().thumbprint();
+        let head = HeadPin {
+            anchor: thp(&first),
+            size: 1,
+            root: vouches[0].vouch().root,
+        };
+        delegation.add_head_proofs([vouches[0]
+            .head_proof(&claimed, &thp(&first), (head.size, head.root))
+            .unwrap()
+            .unwrap()]);
+        let policy = Policy::default();
+
+        // a by its head, with no signature of a's; b by its signature.
+        let served = delegation.select_with_heads(&[thp(&first), thp(&second)], &[head]);
+        assert_eq!(served.signers(&policy), [thp(&second)]);
+        assert_eq!(served.head_proofs().len(), 1);
+        let v = served
+            .verify_at_with_heads(&[thp(&first), thp(&second)], &[head], &[], &policy, NOW)
+            .unwrap();
+        let proven: Vec<_> = v.proven_by.iter().map(|p| (p.anchor, p.head)).collect();
+        assert_eq!(proven, [(thp(&first), true), (thp(&second), false)]);
     }
 
     #[test]

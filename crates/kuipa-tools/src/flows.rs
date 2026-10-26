@@ -312,6 +312,19 @@ pub(crate) fn verified(
             if proven.contains(a) {
                 continue;
             }
+            // The advertisement may carry this anchor's own proof already
+            // (§4.3): count it without asking again.  A frozen anchor
+            // counts only by its own pinned head (§2).
+            let in_advertisement = advertisement.proven_by().iter().find(|p| p.anchor == *a);
+            let counts = in_advertisement.is_some_and(|p| {
+                !frozen.contains(a)
+                    || (p.head && head_proves(&advertisement, a, &window_of(&wanted_heads, a)))
+            });
+            if counts {
+                tracing::debug!(server = %server, "claim also proven by pinned anchor {a}, in the same advertisement");
+                proven.push(*a);
+                continue;
+            }
             // A frozen anchor counts head-wise only (§2); a signature
             // proof, even a valid one for this very claim, is what the
             // freeze removes.
