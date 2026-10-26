@@ -226,7 +226,11 @@ to your vault or opens your files, you should find out.
 
 **What kuipa does.** Every change to your vault and every key release is
 recorded in the servers' transparency logs. `kuipa tlog watch` lists
-anything your own machine did not do.
+the entries about your vault and flags those that the vault description
+stored on your machine does not explain: a device it does not know, a
+policy or sharing it does not show, a revocation. A change you made from
+another machine is flagged too, until `kuipa seal show` updates the
+description here.
 
 **Status:** works. See [Sealing your own files](user/sealing.md#see-who-touched-your-vault).
 

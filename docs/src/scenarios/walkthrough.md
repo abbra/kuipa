@@ -335,8 +335,15 @@ Vault personal: 1 unexpected.
 ```
 
 `kuipa seal show personal` stores the current description, which
-accepts the device. The next watch is clean, and the next open shows up
-as one more `release`.
+accepts the device. The next watch is clean. So the watch flags what
+this host's description does not explain, not what this host did not
+do: when the laptop seals a file of its own and opens it, the release
+names a device the description lists, and nothing is flagged. A policy
+set from the laptop (`kuipa seal policy … --max-unlocks 1000`) is
+flagged here as `set-policy (a policy the stored descriptor does not
+show)`, though the owner made it, until `kuipa seal show` stores the new
+policy on this host too. The next open here shows up as one more
+`release`.
 
 An auditor with no account replays a server's whole log from its public
 routes with `kuipa-audit tlog --server ipa1.example.test --state FILE`.

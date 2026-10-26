@@ -223,7 +223,7 @@ step 1 "A wrong passphrase does not open the device key" \
     'echo wrong > "$KUIPA_PLAYGROUND/wrong" && kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong"'
 
 section "Your vault's transparency log" \
-    "Every server logs each change to a vault and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the vault and flags what the vault description stored on this host does not account for; kuipa-audit tlog replays a server's whole log, naming nobody."
+    "Every server logs each change to a vault and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the vault and flags what the vault description stored on this host does not explain: a listed device is expected wherever it is used, and a change this host does not know of, even the owner's own from another machine, is flagged until seal show stores it; kuipa-audit tlog replays a server's whole log, naming nobody."
 step 0 "The first watch records where each log stands" \
     'kuipa tlog watch personal' "baseline" "add-device" "release" "UTC" "0 unexpected"
 step 0 "Nothing new since: a quiet watch" \
@@ -236,6 +236,14 @@ step 0 "Accept it: seal show stores the current description" \
     'kuipa seal show personal'
 step 0 "The flag was reported once; the next watch is clean" \
     'kuipa tlog watch personal' "0 unexpected"
+step 0 "The laptop seals and opens a file of its own: a listed device, nothing flagged" \
+    'L="$KUIPA_PLAYGROUND/users/admin-laptop" && echo "from the laptop" > "$KUIPA_PLAYGROUND/laptop.txt" && KUIPA_USER_DIR="$L" kuipa seal file personal "$KUIPA_PLAYGROUND/laptop.txt" && KUIPA_USER_DIR="$L" kuipa seal open "$KUIPA_PLAYGROUND/laptop.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && kuipa tlog watch personal' \
+    "release" "0 unexpected"
+step 1 "The policy is changed from the laptop: this host's description does not show it" \
+    'KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-laptop" kuipa seal policy --require device,ticket personal --max-unlocks 1000 >/dev/null && kuipa tlog watch personal' \
+    "UNEXPECTED" "set-policy" "1 unexpected"
+step 0 "seal show stores the new policy here, and the watch is clean again" \
+    'kuipa seal show personal >/dev/null && kuipa tlog watch personal' "0 unexpected"
 step 0 "Opening a file is logged as a release; --json keeps Unix times" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && w=$(kuipa --json tlog watch personal) && echo "$w" && grep -Eq "\"time\":[0-9]+[,}]" <<<"$w"' \
     '"action":"release"' '"unexpected":0'
