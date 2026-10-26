@@ -208,6 +208,8 @@ live in one shell; nothing touches the real system.
 | `pq_trusted CMD…` | run `CMD` with that user's ticket and configuration, e.g. `pq_trusted klist` or `pq_trusted kvno host/$PQ_HOST` (a ticket for this `EXAMPLE.TEST` host over the trust) |
 | `pq_admin_kinit` | log in as the administrator with a kuipa data directory and runtime directory of their own, for `kuipa seal` |
 | `pq_as USER CMD…` | run `CMD` as `bob` or `carol` (password `Secret123`), each with a ticket and a kuipa data directory of their own, for shared vaults, approvals and deposits: `pq_as bob kuipa seal list` |
+| `pq_passkey [ALG] [--pin PIN]` | register a new IPA passkey (`mldsa65` by default; `es256`, `es384`, `eddsa`, `rs256`, `mldsa44`, `mldsa87`) on the logged-in user's software security key, as `ipa user-add-passkey --register` does, setting the key's PIN first with `--pin`. `pq_admin_kinit` and `pq_as` give each user a key of their own (`$KUIPA_SOFT_FIDO2`): the playground's `kuipa` is built with the `soft-fido2` feature, so it uses that file instead of attached FIDO2 keys. `kuipa-playground passkey --user-verification on\|off` stands in for `ipa passkeyconfig-mod` |
+| `pq_token LABEL` | make an ML-KEM-768 key `LABEL` on the playground's software PKCS#11 token (kryoptic, token `kuipa`, PIN `1234`) and print its URI, for `kuipa seal device add VAULT --pkcs11 URI --module $PQ_TOKEN_MODULE` |
 | `kuipa-playground recovery --vault OWNER/NAME [--required]` | name the realm's device escrow vault, as an administrator sets `cn=recovery,cn=kuipa,cn=etc`: new device keys are deposited there (`DESIGN-recovery.md` §4) |
 | `pq_down SERVER` / `pq_up` | make a server unreachable from this shell, and back (for failover) |
 | `pq_log [N]` | the servers' log |

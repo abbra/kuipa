@@ -15,7 +15,15 @@
 //! kuipa-playground stage --host FQDN (--recipient JWK | --secret) --out FILE
 //!     what `ipa host-add --pq-stage` would do, with the admin ticket in
 //!     KRB5CCNAME; prints the enrollment string to use with the bundle
+//! kuipa-playground passkey [--user PRINCIPAL [--alg ALG]] [--pin PIN | --no-pin]
+//!                          [--user-verification on|off]
+//!     what `ipa user-add-passkey --register` and `ipa passkeyconfig-mod`
+//!     would do, with the software security key $KUIPA_SOFT_FIDO2
 //! ```
+//!
+//! Hardware-bound devices use software stand-ins: a kryoptic PKCS#11 token
+//! (`pq_token`) and the software security key `kuipa` is built with for
+//! the playground (`soft-fido2`, `pq_passkey`).
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -66,6 +74,9 @@ const CHAIN_SERVERS: [&str; 3] = [
     "ipa-kdccert.example.test",
     "ipa-mtc.example.test",
 ];
+
+/// The software PKCS#11 token's module (kryoptic).
+const TOKEN_MODULE: &str = "/usr/lib64/pkcs11/libkryoptic_pkcs11.so";
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -121,6 +132,7 @@ fn run(args: &[String]) -> Result<(), Error> {
     let chain_directory = Arc::new(KdcDirectory::new(realm.clone(), &CHAIN_SERVERS, &[ADMIN]));
     publish_masters(&dir, &directory)?;
     watch_recovery(&dir, &directory);
+    watch_passkeys(&dir, &directory);
     configure_policy(&directory);
     seed_secrets(&directory);
     let Started {
@@ -239,6 +251,112 @@ fn recovery(args: &[String]) -> Result<(), Error> {
                 settings.device_vault,
                 if settings.required { " (required)" } else { "" }
             );
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err("the playground did not acknowledge; is it running?".into())
+}
+
+/// The users' IPA passkeys and the realm's passkey configuration, as
+/// `kuipa-playground passkey` writes them to `passkeys.json`.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PlaygroundPasskeys {
+    /// `ipaPassKey` values by principal.
+    users: std::collections::BTreeMap<String, Vec<String>>,
+    /// `ipaRequireUserVerification`.
+    user_verification: bool,
+}
+
+/// `kuipa-playground passkey`: a thread applies `passkeys.json` to the
+/// directory, and acknowledges each change in `passkeys.ack`.
+fn watch_passkeys(dir: &Path, directory: &Arc<KdcDirectory>) {
+    let watch = directory.clone();
+    let path = dir.join("passkeys.json");
+    let ack = dir.join("passkeys.ack");
+    std::thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && text != last
+                && let Ok(state) = serde_json::from_str::<PlaygroundPasskeys>(&text)
+            {
+                *watch.passkeys.lock().unwrap() = state.users.into_iter().collect();
+                *watch.passkey_uv.lock().unwrap() = state.user_verification;
+                if std::fs::write(&ack, &text).is_ok() {
+                    last = text;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+}
+
+/// `kuipa-playground passkey [--user PRINCIPAL [--alg ALG]] [--pin PIN |
+/// --no-pin] [--user-verification on|off]`: on the software security key
+/// `$KUIPA_SOFT_FIDO2`, set or remove the PIN, and make a credential for
+/// the realm's domain registered as one of `PRINCIPAL`'s IPA passkeys
+/// (`ipa user-add-passkey --register`, ALG `mldsa65` by default); set
+/// whether the realm requires user verification (`ipa passkeyconfig-mod
+/// --require-user-verification`, on by default).
+fn passkey(args: &[String]) -> Result<(), Error> {
+    use kuipa_tools::passkey::soft::SoftFido2;
+    let pg =
+        PathBuf::from(std::env::var("KUIPA_PLAYGROUND").map_err(|_| "run inside the playground")?);
+    let path = pg.join("passkeys.json");
+    let mut state: PlaygroundPasskeys = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)?,
+        Err(_) => PlaygroundPasskeys {
+            user_verification: true,
+            ..PlaygroundPasskeys::default()
+        },
+    };
+    let key = || -> Result<SoftFido2, Error> {
+        let file = std::env::var_os("KUIPA_SOFT_FIDO2").ok_or(
+            "no software security key: $KUIPA_SOFT_FIDO2 (pq_admin_kinit or pq_as set it)",
+        )?;
+        SoftFido2::open(Path::new(&file))
+    };
+    if let Some(pin) = option(args, "--pin") {
+        key()?.set_pin(Some(&pin))?;
+        println!("the security key's PIN is set");
+    }
+    if args.iter().any(|a| a == "--no-pin") {
+        key()?.set_pin(None)?;
+        println!("the security key has no PIN");
+    }
+    if let Some(uv) = option(args, "--user-verification") {
+        state.user_verification = uv == "on";
+        println!(
+            "passkey logins {} user verification (ipa passkeyconfig)",
+            if state.user_verification {
+                "require"
+            } else {
+                "do not require"
+            }
+        );
+    }
+    if let Some(user) = option(args, "--user") {
+        let user = if user.contains('@') {
+            user
+        } else {
+            format!("{user}@{REALM}")
+        };
+        let name = option(args, "--alg").unwrap_or_else(|| "mldsa65".to_owned());
+        let alg = kuipa_enroll::passkey::Algorithm::from_name(&name).ok_or_else(|| {
+            format!(
+                "unknown algorithm {name}: es256, es384, eddsa, rs256, mldsa44, mldsa65 or mldsa87"
+            )
+        })?;
+        let value = key()?.add_ipa_passkey(DOMAIN, alg)?;
+        state.users.entry(user.clone()).or_default().push(value);
+        println!("a new {name} passkey on the security key is registered to {user} (ipaPassKey)");
+    }
+    let text = serde_json::to_string_pretty(&state)?;
+    std::fs::write(&path, &text)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(pg.join("passkeys.ack")).is_ok_and(|a| a == text) {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -890,6 +1008,10 @@ export PQ_TRUSTED_KDC_SOCKET={trusted_socket}
 # The realm's enrollment string without a secret: realm-info, ticket and
 # password joins and bundles find it without anything typed.
 export KUIPA_ENROLLMENT_FILE="$KUIPA_PLAYGROUND/enroll/realm"
+# A software PKCS#11 token (kryoptic) for hardware-bound device keys:
+# pq_token makes ML-KEM keys on it.
+export KRYOPTIC_CONF="$KUIPA_PLAYGROUND/token/kryoptic.conf"
+export PQ_TOKEN_MODULE={token_module}
 "#,
         ccache = shell_quote(&format!("FILE:{}", dir.join("admin.ccache").display())),
         dir = shell_quote(&dir.display().to_string()),
@@ -900,6 +1022,16 @@ export KUIPA_ENROLLMENT_FILE="$KUIPA_PLAYGROUND/enroll/realm"
         trusted_realm = TRUSTED_REALM,
         trusted_socket = shell_quote(&trusted.socket.display().to_string()),
         dns = dns,
+        token_module = shell_quote(TOKEN_MODULE),
+    )?;
+    let token = dir.join("token");
+    std::fs::create_dir_all(&token)?;
+    std::fs::write(
+        token.join("kryoptic.conf"),
+        format!(
+            "[[slots]]\nslot = 42\ndbtype = \"sqlite\"\ndbargs = \"{}\"\n",
+            token.join("token.sql").display()
+        ),
     )?;
     shell_functions(&mut env)?;
     Ok(env)
@@ -977,6 +1109,8 @@ pq_admin_kinit() {{
     export KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin"
     # Sessions stay inside the playground, not in the real runtime directory.
     export KUIPA_RUNTIME_DIR="$KUIPA_PLAYGROUND/run-user/admin"
+    # The administrator's security key: the playground's software one.
+    export KUIPA_SOFT_FIDO2="$KUIPA_PLAYGROUND/users/admin.fido2.json"
     klist
 }}
 # pq_as USER CMD...: run CMD as USER of this realm (bob or carol), with a
@@ -989,7 +1123,41 @@ pq_as() {{
     mkdir -p "$KUIPA_PLAYGROUND/users"
     [ -f "$cc" ] || echo {ADMIN_PASSWORD} | KRB5CCNAME="FILE:$cc" kinit "$user@{REALM}" >/dev/null || return
     KRB5CCNAME="FILE:$cc" KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/$user" \
-        KUIPA_RUNTIME_DIR="$KUIPA_PLAYGROUND/run-user/$user" "$@"
+        KUIPA_RUNTIME_DIR="$KUIPA_PLAYGROUND/run-user/$user" \
+        KUIPA_SOFT_FIDO2="$KUIPA_PLAYGROUND/users/$user.fido2.json" "$@"
+}}
+# pq_passkey [ALG] [--pin PIN]: register a new IPA passkey (ALG mldsa65 by
+# default; es256, es384, eddsa, rs256, mldsa44, mldsa87) on the logged-in
+# user's software security key, as `ipa user-add-passkey --register` does;
+# with --pin, set the key's PIN first.  pq_as USER pq_passkey for others.
+pq_passkey() {{
+    local alg=mldsa65 pin=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --pin) pin=(--pin "$2"); shift 2 ;;
+            *) alg="$1"; shift ;;
+        esac
+    done
+    local me
+    me=$(klist 2>/dev/null | sed -n 's/^Default principal: //p')
+    [ -n "$me" ] || {{ echo "nobody logged in: pq_admin_kinit first"; return 1; }}
+    kuipa-playground passkey "${{pin[@]}}" --user "$me" --alg "$alg"
+}}
+# pq_token LABEL: make an ML-KEM-768 key LABEL on the playground's software
+# PKCS#11 token (kryoptic; label kuipa, PIN 1234) and print its URI, for
+# `kuipa seal device add VAULT --pkcs11 URI --module $PQ_TOKEN_MODULE`.
+pq_token() {{
+    local label="${{1:?usage: pq_token LABEL}}"
+    [ -f "$PQ_TOKEN_MODULE" ] || {{ echo "no software token: install kryoptic"; return 1; }}
+    local t=(pkcs11-tool --module "$PQ_TOKEN_MODULE")
+    if [ ! -f "$KUIPA_PLAYGROUND/token/initialized" ]; then
+        "${{t[@]}}" --init-token --label kuipa --so-pin 12345678 >/dev/null || return
+        "${{t[@]}}" --token-label kuipa --login --so-pin 12345678 --init-pin --pin 1234 >/dev/null || return
+        : > "$KUIPA_PLAYGROUND/token/initialized"
+    fi
+    "${{t[@]}}" --token-label kuipa --login --pin 1234 --keypairgen --key-type ML-KEM-768 \
+        --label "$label" --id "$(printf '%s' "$label" | od -An -tx1 | tr -d ' \n')" >/dev/null || return
+    echo "pkcs11:token=kuipa;object=$label"
 }}
 pq_trust() {{ kuipa trusted-realms "$@"; }}
 "#,
@@ -1181,6 +1349,7 @@ fn main() -> std::process::ExitCode {
         Some("stage") => stage(&args[1..]),
         Some("masters") => masters(&args[1..]),
         Some("recovery") => recovery(&args[1..]),
+        Some("passkey") => passkey(&args[1..]),
         _ => Err("usage: kuipa-playground {run --env-file F [--hosts N] | stage --host FQDN (--recipient JWK | --secret) --out FILE}".into()),
     };
     match result {

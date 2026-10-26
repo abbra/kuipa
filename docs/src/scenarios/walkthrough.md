@@ -388,6 +388,89 @@ session's end is the date above, not a server's decision (see
 `kuipa seal revoke personal` ends the section: the vault prints
 `revoked`, and no server opens its files any more.
 
+### Hardware-bound devices: a token and passkeys
+
+Two later sections of the session replace the passphrase file with
+hardware, in software: a PKCS#11 token (kryoptic) and a FIDO2 security
+key. The playground builds `kuipa` with its software security key
+(`soft-fido2`), and `pq_admin_kinit` and `pq_as` point
+`$KUIPA_SOFT_FIDO2` at a key file of each user's own. Each device lives
+on "another machine", a data directory of its own
+(`KUIPA_USER_DIR=…/admin-token`, `…/admin-key`): a host has one device.
+
+**A device key on a token.** `pq_token admin-dev` makes an ML-KEM-768
+key on the token (label `kuipa`, PIN 1234) and prints its URI,
+`pkcs11:token=kuipa;object=admin-dev`. `kuipa seal device add hw
+--pkcs11 "$uri" --module "$PQ_TOKEN_MODULE"` registers its public half:
+
+```
+          devices: web1.example.test (admin@EXAMPLE.TEST, pkcs11, any): QBHeQXonviA_lUiaOYbw9musPQULyXqAtJZ60qVl-aI
+```
+
+No `device.key` is written: the private key stays on the token, which
+decapsulates every open, through OpenSSL's pkcs11-provider, after the
+PIN logs in. With a wrong PIN the token shows no key: `kuipa seal: no
+private key at pkcs11:token=kuipa;object=admin-dev`. The level is `any`
+until token attestation is checked.
+
+**Passkeys.** `pq_passkey mldsa65 --pin 4321` does what `ipa
+user-add-passkey --register` does: a new ML-DSA-65 credential on the
+administrator's security key, for the realm's domain, its public key
+stored as one of their `ipaPassKey` values. A vault can then require one
+of the user's IPA passkeys, and its description says so:
+
+```
+Vault signing (admin@EXAMPLE.TEST), enabled:
+                       id: f51b573d980469e5b04e0155d52375fb
+            opening needs: a registered device (any) and one of your IPA passkeys
+                  expires: 2027-11-30 05:29:55 UTC
+           unlocks so far: 0
+longest session (seconds): 3600
+        delegated tickets: allow
+                  devices: none
+             described by: ipa1.example.test
+```
+
+`kuipa seal device add signing --passkey` makes a second credential on
+the same key, the device's own (relying party `kuipa:example.test`, not
+an IPA passkey), and wraps a new device key with its `hmac-secret`: one
+touch for the credential, one for the wrap. The trace shows each touch
+of the software key:
+
+```
+INFO software security key touched: a new credential rp_id="kuipa:example.test" alg="mldsa65"
+INFO software security key touched rp_id="kuipa:example.test" alg="mldsa65" user_verified=true hmac_secret=true
+```
+
+Opening `sign.txt.sealed` then takes one touch to unwrap the device key
+and one assertion per server tried, made over that server's request.
+The server checks the assertion against the administrator's
+`ipaPassKey` values, including user verification, which the realm
+requires by default. In this run ipa1 rate-limited the administrator,
+who had opened many files by then, so the open went on to ipa2 with a
+fresh assertion:
+
+```
+INFO software security key touched rp_id="kuipa:example.test" alg="mldsa65" user_verified=true hmac_secret=true
+INFO software security key touched rp_id="example.test" alg="mldsa65" user_verified=true hmac_secret=false
+INFO software security key touched rp_id="example.test" alg="mldsa65" user_verified=true hmac_secret=false
+release key
+```
+
+One PIN serves both: the device's is also given to the passkey factor.
+A wrong one is the key's refusal, `kuipa seal: software security key:
+FIDO_ERR_PIN_INVALID`. `kuipa seal unlock signing` starts a session
+with one assertion, bound to its own exchange. While the session lasts,
+the file opens with no touch and no PIN.
+
+Classical passkeys work the same way. `kuipa-playground passkey
+--user-verification off` stands in for `ipa passkeyconfig-mod
+--require-user-verification=false`. Then bob registers an ES256 passkey
+on his key, which has no PIN (`pq_as bob pq_passkey es256`). He seals a
+note to a vault of his with `--require device,passkey` and opens it
+with a touch each time and no PIN (`alg="es256" user_verified=false` in
+the trace).
+
 ## 7. Failover: `pq_enroll web2` with ipa1 down
 
 With ipa1 unreachable, web2 enrolls through ipa2 — `issuer:
