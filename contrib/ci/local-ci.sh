@@ -570,7 +570,10 @@ pg_start() {
     # ready, which takes a few seconds (two realms, keys, the anchor
     # exchange) and longer on a slow runner.
     local wait="${KUIPA_PLAYGROUND_START_TIMEOUT:-120}"
-    "$PG_BIN/examples/kuipa-playground" run --env-file "$PG_ENV" --hosts "$hosts" >"$PG_LOG" 2>&1 </dev/null &
+    # KUIPA_KEEP_PLAYGROUND also keeps the realm's own directory (keys,
+    # logs, hosts), which the KDC fixture removes unless KUIPA_KEEP_REALM.
+    KUIPA_KEEP_REALM="${KUIPA_KEEP_REALM:-${KUIPA_KEEP_PLAYGROUND:-}}" \
+        "$PG_BIN/examples/kuipa-playground" run --env-file "$PG_ENV" --hosts "$hosts" >"$PG_LOG" 2>&1 </dev/null &
     PG_PID=$!
     local deadline=$((SECONDS + wait))
     while [[ ! -f "$PG_ENV" && $SECONDS -lt $deadline ]]; do
@@ -592,7 +595,13 @@ pg_stop() {
         kill "$PG_PID" 2>/dev/null || true
         wait "$PG_PID" 2>/dev/null || true
     fi
-    [[ -n "$PG_WORK" ]] && rm -rf "$PG_WORK"
+    # KUIPA_KEEP_PLAYGROUND=1 keeps the servers' and hosts' files, to
+    # inspect them (or measure them, docs/src/reference/sizing.md).
+    if [[ -n "$PG_WORK" && -n "${KUIPA_KEEP_PLAYGROUND:-}" ]]; then
+        echo "Keeping the playground's files in $PG_WORK"
+    elif [[ -n "$PG_WORK" ]]; then
+        rm -rf "$PG_WORK"
+    fi
     PG_PID="" PG_WORK=""
 }
 

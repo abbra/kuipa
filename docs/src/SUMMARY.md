@@ -40,6 +40,7 @@
 - [Files and environment](reference/files.md)
 - [Design](reference/design.md)
 - [Benchmarks](reference/benchmarks.md)
+- [Sizing: storage and traffic](reference/sizing.md)
 
 # Development
 
