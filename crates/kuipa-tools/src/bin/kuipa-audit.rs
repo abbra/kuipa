@@ -52,7 +52,7 @@ enum Command {
         #[arg(long)]
         server: String,
         /// The anchor whose claim log.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         anchor: String,
         /// The leaf index to start after (default 0).
         #[arg(long)]
@@ -65,11 +65,11 @@ enum Command {
         #[arg(long)]
         server: String,
         /// Only these anchors (default: every pinned one).
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         anchor: Vec<String>,
         /// A head to check, as `<thumbprint> <size> <root>`; repeatable.
         /// Default: this host's pinned windows.
-        #[arg(long, value_name = "THP SIZE ROOT")]
+        #[arg(long, value_name = "THP SIZE ROOT", allow_hyphen_values = true)]
         pinned_head: Vec<String>,
     },
     /// The heads each server answers for the realm's anchors, and
@@ -87,7 +87,7 @@ enum Command {
         server: String,
         /// Anchors to verify the advertisement with; repeatable.
         /// Default: this host's pinned anchors.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         anchor: Vec<String>,
         /// Record the verified head in this file, and require the next
         /// run's log to extend it.

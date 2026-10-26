@@ -344,7 +344,7 @@ enum TlogAction {
         #[arg(long, value_name = "FILE")]
         add: Option<std::path::PathBuf>,
         /// Stop trusting the witness with this thumbprint.
-        #[arg(long, value_name = "THUMBPRINT")]
+        #[arg(long, value_name = "THUMBPRINT", allow_hyphen_values = true)]
         remove: Option<String>,
         /// How many trusted witnesses must cosign a head.
         #[arg(long, value_name = "N")]
@@ -704,7 +704,7 @@ enum RecoverAction {
         #[arg(long, value_name = "USER")]
         user: String,
         /// The user's new device (`kuipa seal recover helpdesk` printed it).
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ID", allow_hyphen_values = true)]
         device: String,
         /// The approved release request, for a vault with approvals.
         #[arg(long, value_name = "ID")]
@@ -814,6 +814,7 @@ enum DeviceAction {
         /// The vault.
         vault: String,
         /// The device's id (see `kuipa seal show`).
+        #[arg(allow_hyphen_values = true)]
         id: String,
     },
 }
