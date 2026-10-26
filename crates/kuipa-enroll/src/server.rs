@@ -1445,15 +1445,21 @@ impl EnrollServer {
         }
         let info = RealmInfo {
             anchors: published.anchors.clone(),
-            heads: published
-                .vouches
-                .iter()
-                .map(|(a, v)| HeadPin {
-                    anchor: *a,
-                    size: v.vouch().size,
-                    root: v.vouch().root,
-                })
-                .collect(),
+            heads: {
+                // HashMap order is arbitrary; sort so the same published
+                // state always signs the same advertisement bytes.
+                let mut heads: Vec<HeadPin> = published
+                    .vouches
+                    .iter()
+                    .map(|(a, v)| HeadPin {
+                        anchor: *a,
+                        size: v.vouch().size,
+                        root: v.vouch().root,
+                    })
+                    .collect();
+                heads.sort_by_key(|h| h.anchor);
+                heads
+            },
             trusts: published.trusts.clone(),
             ..self.info.clone()
         };
