@@ -28,12 +28,16 @@ tang-pqc.workspace = true
 # A rustls verifier for kuipad's TLS endpoints: ordinary CAs through
 # OpenSSL, Merkle Tree CAs through their proofs.
 tls = ["dep:rustls", "dep:rustls-native-ossl", "dep:synta-x509-verification", "synta-certificate/openssl"]
+# A software passkey authenticator (`passkey::soft`), for tests.
+testing = []
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 criterion = "0.8"
+# The integration tests use the software passkey authenticator.
+kuipa-enroll = { path = ".", features = ["testing"] }
 kuipa-perf.workspace = true
 
 [[bench]]
