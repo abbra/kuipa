@@ -909,8 +909,12 @@ fn start_ledger(
     witness: &tang_pqc::VerifyingKey,
 ) -> Result<Arc<kuipad::ledger::FileLedger>, Error> {
     let alg = kuipa_enroll::merkle::TreeHash::for_signer(signing.public().alg());
+    // Every event is published at once, so the session's watches see
+    // what its steps just did; a real server publishes a head an hour
+    // (`tlog_head_interval`).
     Ok(Arc::new(
         kuipad::ledger::FileLedger::open(key_dir, REALM, server, alg)?
+            .with_head_interval(std::time::Duration::ZERO)
             .with_witnesses(vec![witness.clone()]),
     ))
 }

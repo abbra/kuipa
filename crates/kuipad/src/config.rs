@@ -77,6 +77,24 @@ pub struct Config {
     /// The `keys` operation's handlers (§18.5); absent disables it.
     #[serde(default)]
     pub keys: Option<KeysConfig>,
+    /// Seconds between published transparency-log heads
+    /// (`DESIGN-tlog.md` §5): a head covers what was logged before its
+    /// period began, so watching it grow tells how many events a period
+    /// had, not when each happened.  Zero publishes every event at once.
+    #[serde(default = "default_tlog_head_interval")]
+    pub tlog_head_interval: u64,
+    /// Months of transparency-log openings kept (`DESIGN-tlog.md` §5):
+    /// older events can no longer be looked up or said to be about anyone.
+    #[serde(default = "default_tlog_retention_months")]
+    pub tlog_retention_months: u32,
+}
+
+fn default_tlog_head_interval() -> u64 {
+    crate::ledger::HEAD_INTERVAL.as_secs()
+}
+
+fn default_tlog_retention_months() -> u32 {
+    crate::ledger::RETENTION_MONTHS
 }
 
 fn default_key_dir() -> PathBuf {

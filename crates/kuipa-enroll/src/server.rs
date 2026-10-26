@@ -25,7 +25,7 @@ use crate::merkle;
 use crate::passkey::{Assertion, PasskeyInfo, UserPasskeys};
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
-use crate::tlog::{Entry, Kind, LogId, Receipt, SignedHead, VaultAction, VaultEvent};
+use crate::tlog::{Entry, Kind, LogId, Opening, Receipt, SignedHead, VaultAction, VaultEvent};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::vault::{
     Approval, DEFAULT_EPOCH, Deposit, Descriptor, DeviceEscrow, Limits, Members, Recovered,
@@ -864,7 +864,8 @@ pub struct Appended {
     pub index: u64,
     /// The leaf's tree hash.
     pub leaf: merkle::Hash,
-    /// The leaf's time.
+    /// When the event was logged: the opening's exact time, not the
+    /// leaf's day.
     pub time: u64,
 }
 
@@ -874,19 +875,14 @@ pub struct Appended {
 /// operation releases leaves the server unrecorded; a failed append
 /// refuses the request.
 pub trait Ledger: Send + Sync + fmt::Debug {
-    /// Append a leaf of `kind` about `subject` (hashed into the leaf's
-    /// index by the ledger's key) and say where it landed; `None` when
-    /// this ledger keeps no log.
+    /// Append the committed leaf of `opening` and say where it landed;
+    /// `None` when this ledger keeps no log.  The ledger keeps the opening
+    /// beside the log, for [`find`](Self::find), and never publishes it.
     ///
     /// # Errors
     ///
     /// Any storage failure.
-    fn append(
-        &self,
-        kind: Kind,
-        subject: &[u8],
-        body: &[u8],
-    ) -> Result<Option<Appended>, DirectoryError>;
+    fn append(&self, opening: Opening) -> Result<Option<Appended>, DirectoryError>;
 
     /// The log's current head, signed with `key` at `now`; none for an
     /// empty log or a ledger that keeps none.
@@ -904,7 +900,8 @@ pub trait Ledger: Send + Sync + fmt::Debug {
     }
 
     /// Up to `max` leaves about `subject` from index `from`, among the
-    /// first `size` leaves, each with its inclusion path in that tree.
+    /// first `size` leaves, each with its inclusion path in that tree and
+    /// its opening, by the openings the ledger still keeps.
     ///
     /// # Errors
     ///
@@ -926,7 +923,7 @@ pub trait Ledger: Send + Sync + fmt::Debug {
 pub struct NoLedger;
 
 impl Ledger for NoLedger {
-    fn append(&self, _: Kind, _: &[u8], _: &[u8]) -> Result<Option<Appended>, DirectoryError> {
+    fn append(&self, _: Opening) -> Result<Option<Appended>, DirectoryError> {
         Ok(None)
     }
 }
@@ -1122,16 +1119,18 @@ impl EnrollServer {
         self
     }
 
-    /// Append an event to the ledger, and sign a receipt for where it
-    /// landed (none when the ledger keeps no log).
     /// The hash of this server's log: its signing key's
     /// ([`TreeHash::for_signer`](merkle::TreeHash::for_signer)).
     fn tree_hash(&self) -> merkle::TreeHash {
         merkle::TreeHash::for_signer(self.keys.signing.public().alg())
     }
 
+    /// Append an event about `subject` to the ledger, committed, and sign
+    /// a receipt for where it landed (none when the ledger keeps no log).
     fn record(&self, kind: Kind, subject: &[u8], body: &[u8]) -> Result<Option<Receipt>, Refusal> {
-        let Some(a) = self.ledger.append(kind, subject, body).map_err(Refusal)? else {
+        let now = unix_seconds(SystemTime::now());
+        let opening = Opening::new(kind, now, subject, body.to_vec())?;
+        let Some(a) = self.ledger.append(opening).map_err(Refusal)? else {
             return Ok(None);
         };
         Ok(Some(Receipt::issue(
@@ -1842,20 +1841,13 @@ impl EnrollServer {
         let leaves = asked.leaves(tree)?;
         let batch_root = merkle::root(&leaves)?;
         let now = unix_seconds(SystemTime::now());
-        let Some(appended) = self
-            .ledger
-            .append(
-                Kind::STATEMENT,
-                caller.to_string().as_bytes(),
-                &crate::sign::Statement::log_body(
-                    &asked.purpose,
-                    leaves.len() as u64,
-                    &batch_root,
-                    now,
-                ),
-            )
-            .map_err(Refusal)?
-        else {
+        let opening = Opening::new(
+            Kind::STATEMENT,
+            now,
+            caller.to_string().as_bytes(),
+            crate::sign::Statement::log_body(&asked.purpose, leaves.len() as u64, &batch_root, now),
+        )?;
+        let Some(appended) = self.ledger.append(opening).map_err(Refusal)? else {
             return Err(Refusal::because(
                 "this server keeps no transparency log: it states nothing it cannot show",
             ));

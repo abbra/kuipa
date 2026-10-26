@@ -1011,6 +1011,7 @@ impl<'a> Seal<'a> {
         })?;
         let vault = stored.vault();
         let expected = Expected {
+            subject: vault.id.as_bytes().to_vec(),
             devices: vault.devices.iter().map(|d| d.id.clone()).collect(),
             policy: serde_json::to_vec(&vault.policy)?,
             sharing: vault.sharing_bytes(),
@@ -2310,6 +2311,8 @@ impl<E: Into<Error>> From<E> for WatchError {
 
 /// What the stored descriptor accounts for.
 struct Expected {
+    /// The vault's id: every entry's opening must name it.
+    subject: Vec<u8>,
     devices: BTreeSet<String>,
     /// The policy's JSON, digested with each log's hash to compare.
     policy: Vec<u8>,
@@ -2328,9 +2331,26 @@ fn describe_event(
 ) -> Value {
     use kuipa_enroll::tlog::{VaultAction as A, VaultEvent};
 
-    let Ok(event) = VaultEvent::from_bytes(&e.leaf.body) else {
-        return json!({
+    // The answer's check made sure an opening opens its leaf; that it is
+    // about this vault is this watch's to check.  A server that will not
+    // open an entry, or opens it to another vault's event, hides what it
+    // did: flagged, whatever the watch's state.
+    let refused = |why: &str| {
+        json!({
             "server": server, "index": e.index, "time": e.leaf.time,
+            "action": format!("kind {}", e.leaf.kind.0),
+            "unexpected": true, "why": why,
+        })
+    };
+    let Some(opening) = &e.opening else {
+        return refused("the server would not open this entry");
+    };
+    if opening.subject != expected.subject {
+        return refused("the server opened this entry to another vault's event");
+    }
+    let Ok(event) = VaultEvent::from_bytes(&opening.event) else {
+        return json!({
+            "server": server, "index": e.index, "time": opening.time,
             "action": format!("kind {}", e.leaf.kind.0), "unexpected": false,
         });
     };
@@ -2388,7 +2408,7 @@ fn describe_event(
     json!({
         "server": server,
         "index": e.index,
-        "time": e.leaf.time,
+        "time": opening.time,
         "action": action,
         "device": device,
         "unexpected": flag && why.is_some(),
@@ -2399,6 +2419,89 @@ fn describe_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-leaf lookup answer's entry for `opening`, its leaf made from
+    /// it, as a server answers.
+    fn entry(
+        opening: Option<kuipa_enroll::tlog::Opening>,
+        made_from: &kuipa_enroll::tlog::Opening,
+    ) -> kuipa_enroll::tlog::Entry {
+        kuipa_enroll::tlog::Entry {
+            index: 0,
+            leaf: made_from
+                .leaf(kuipa_enroll::merkle::TreeHash::Sha256)
+                .expect("a leaf"),
+            path: Vec::new(),
+            opening,
+        }
+    }
+
+    #[test]
+    fn the_watch_reads_openings_and_flags_what_the_server_will_not_open() {
+        use kuipa_enroll::tlog::{Kind, Opening, VaultAction, VaultEvent};
+
+        let expected = Expected {
+            subject: b"vault-1".to_vec(),
+            devices: BTreeSet::from(["dev-1".to_owned()]),
+            policy: Vec::new(),
+            sharing: Vec::new(),
+            revoked: false,
+        };
+        let event = |device: &str| {
+            VaultEvent {
+                action: VaultAction::Release,
+                device: Some(device.into()),
+                digest: kuipa_enroll::merkle::Hash::zero(kuipa_enroll::merkle::TreeHash::Sha256),
+            }
+            .to_bytes()
+        };
+        let mine = Opening::new(
+            Kind::ESCROW_RELEASE,
+            1_800_000_123,
+            b"vault-1",
+            event("dev-1"),
+        )
+        .unwrap();
+
+        // The event and its exact time come from the opening.
+        let listed = describe_event("ipa1", &entry(Some(mine.clone()), &mine), &expected, true);
+        assert_eq!(listed["action"], "release", "{listed}");
+        assert_eq!(listed["time"], 1_800_000_123, "{listed}");
+        assert_eq!(listed["unexpected"], false, "{listed}");
+        let other_device = Opening::new(
+            Kind::ESCROW_RELEASE,
+            1_800_000_200,
+            b"vault-1",
+            event("dev-2"),
+        )
+        .unwrap();
+        let flagged = describe_event(
+            "ipa1",
+            &entry(Some(other_device.clone()), &other_device),
+            &expected,
+            true,
+        );
+        assert_eq!(flagged["unexpected"], true, "{flagged}");
+
+        // An entry the server will not open, or opens to another vault's
+        // event, is flagged even on a baseline watch.
+        let unopened = describe_event("ipa1", &entry(None, &mine), &expected, false);
+        assert_eq!(unopened["unexpected"], true, "{unopened}");
+        let theirs = Opening::new(
+            Kind::ESCROW_RELEASE,
+            1_800_000_123,
+            b"vault-2",
+            event("dev-1"),
+        )
+        .unwrap();
+        let elsewhere = describe_event(
+            "ipa1",
+            &entry(Some(theirs.clone()), &theirs),
+            &expected,
+            false,
+        );
+        assert_eq!(elsewhere["unexpected"], true, "{elsewhere}");
+    }
 
     #[test]
     fn recovery_codes_are_128_bits_written_in_groups() {

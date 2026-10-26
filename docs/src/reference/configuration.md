@@ -25,6 +25,8 @@
 | `rate_limit` | see [Limits](../realm/limits.md) | `{"per_host": {"burst", "per_minute"}, "per_source": {…}}` |
 | `trusts` | `[]` | trusted realms configured by hand: `{"realm", "domain", "servers", "anchors"}` |
 | `enctypes` | `[20, 19, 18, 17]` | Kerberos enctypes to issue keys for, strongest first |
+| `tlog_head_interval` | `3600` | seconds between published transparency-log heads: a head covers what was logged before its period began, so watching it says how many events a period had, not when each happened; `0` publishes every event at once (tests only) |
+| `tlog_retention_months` | `13` | months of transparency-log openings kept: older events stay in the log but can no longer be looked up or tied to anyone |
 
 Unknown keys are refused, so a typo stops the daemon instead of being
 ignored.

@@ -9,10 +9,14 @@
 //! check that with a consistency proof instead of refetching the log.
 //!
 //! A leaf's kind is inside its hashed bytes, so leaves of different kinds
-//! can never be confused.  A leaf carries an opaque `index` — an HMAC of
-//! its subject (a vault, a principal) under a realm secret — so the log
-//! can be published and audited without listing who it is about; only an
-//! authenticated lookup maps a subject to its index.
+//! can never be confused.  The events of users and hosts — vault changes,
+//! releases, signing statements, Keys fetches — are **committed**: their
+//! public leaf carries only the kind, the day, and a hiding commitment to
+//! the event ([`Opening`]), so the log can be published, mirrored and
+//! audited without saying who an event is about, what it was, or when in
+//! the day it happened.  Only the logging server holds the openings, and
+//! only an authenticated lookup reveals them, to the event's own subject,
+//! who checks each against its leaf.
 //!
 //! Witnesses cosign heads ([`SignedHead::cosign`]) only after checking
 //! that the new head extends the last one they cosigned ([`witness`]),
@@ -23,8 +27,6 @@
 
 use std::collections::BTreeSet;
 
-use native_ossl::digest::DigestAlg;
-use native_ossl::mac::HmacCtx;
 use tang_pqc::wire::{Reader, Writer};
 use tang_pqc::{Policy, SigningKey, Thumbprint, VerifyingKey, primitives};
 
@@ -40,7 +42,10 @@ const RECEIPT_MAGIC: [u8; 4] = *b"IPLP";
 const VAULT_EVENT_MAGIC: [u8; 4] = *b"IPLV";
 const QUERY_MAGIC: [u8; 4] = *b"IPLQ";
 const ANSWER_MAGIC: [u8; 4] = *b"IPLR";
+const COMMITMENT_MAGIC: [u8; 4] = *b"IPLM";
+const OPENING_MAGIC: [u8; 4] = *b"IPLO";
 const HEAD_CONTEXT: &[u8] = b"ipa-ku-log/v1 head";
+const COMMITMENT_CONTEXT: &[u8] = b"ipa-ku-log/v1 commitment";
 const COSIGNATURE_CONTEXT: &[u8] = b"ipa-ku-log/v1 cosignature";
 const RECEIPT_CONTEXT: &[u8] = b"ipa-ku-log/v1 receipt";
 const LOG_ID_CONTEXT: &[u8] = b"ipa-ku-log/v1 id";
@@ -53,6 +58,21 @@ pub const MAX_ANSWER: usize = 1024;
 
 /// Most cosignatures a signed head carries.
 pub const MAX_COSIGNATURES: usize = 16;
+
+/// The step of a committed leaf's public time: a day.  Every event of a
+/// day shares its time, so a reader who knows when someone acted cannot
+/// pick out their leaf by it; the exact time is in the [`Opening`].
+pub const PUBLIC_TIME_STEP: u64 = 86_400;
+
+/// The length of an opening's salt: the commitment hides the event as long
+/// as the salt cannot be guessed.
+const SALT_LEN: usize = 32;
+
+/// `time` as a committed leaf shows it: the start of its day (UTC).
+#[must_use]
+pub const fn public_time(time: u64) -> u64 {
+    time - time % PUBLIC_TIME_STEP
+}
 
 /// A leaf's kind.  Unknown kinds parse, so monitors and mirrors keep
 /// working when a server logs kinds they do not know yet.
@@ -76,6 +96,21 @@ impl Kind {
     pub const TOKEN_KEY: Self = Self(7);
     /// A leaf that is no longer current ([`Tombstone`]).
     pub const TOMBSTONE: Self = Self(0xFFFF);
+
+    /// Whether leaves of this kind are committed ([`Opening`]): the events
+    /// of users and hosts.  Claims, token keys and tombstones are public
+    /// by nature and stay in the clear.
+    #[must_use]
+    pub const fn is_committed(self) -> bool {
+        matches!(
+            self,
+            Self::VAULT_DEVICE
+                | Self::VAULT_POLICY
+                | Self::ESCROW_RELEASE
+                | Self::STATEMENT
+                | Self::KEYS_FETCH
+        )
+    }
 }
 
 /// One log entry.
@@ -83,9 +118,11 @@ impl Kind {
 pub struct Leaf {
     /// What the body is.
     pub kind: Kind,
-    /// When the server logged it (Unix seconds).
+    /// When the server logged it (Unix seconds); for a committed kind, the
+    /// start of that day ([`public_time`]).
     pub time: u64,
-    /// The subject's [`index`], or zeros for none; of the log's hash.
+    /// Zeros of the log's hash: its length names the hash.  A committed
+    /// leaf says nothing of its subject, so no two leaves can be linked.
     pub index: Hash,
     /// The kind's own encoding.
     pub body: Vec<u8>,
@@ -187,21 +224,117 @@ impl Tombstone {
     }
 }
 
-/// The opaque index of `subject` under the server's index key, in a log
-/// of `alg`: `HMAC-H(key, subject)`, `H` the log's hash.
+/// What a committed leaf hides, and what proves it: the event, its
+/// subject (a vault id, a principal), its exact time and a random salt.
+/// The leaf's body is `H("ipa-ku-log/v1 commitment" ‖ opening)` under the
+/// log's hash ([`leaf`](Self::leaf)): binding, so a server cannot open a
+/// leaf to another event, subject or time, and hiding while the salt
+/// stays with the server, so nobody can test a guess against it.
 ///
-/// # Errors
-///
-/// An OpenSSL error.
-pub fn index(alg: TreeHash, key: &[u8; 32], subject: &[u8]) -> Result<Hash> {
-    let mut mac = HmacCtx::new(&DigestAlg::fetch(alg.openssl_name(), None)?, key)?;
-    mac.update(subject)?;
-    let mut out = [0u8; primitives::SHA384_LEN];
-    let n = mac.finish(&mut out)?;
-    if n != alg.output_len() {
-        return Err(Error::Malformed("log index"));
+/// The server keeps it beside the log and reveals it only to the
+/// subject, in a lookup ([`Entry::opening`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Opening {
+    /// The leaf's kind; [`Kind::is_committed`].
+    pub kind: Kind,
+    /// When the server logged it (Unix seconds).
+    pub time: u64,
+    /// Who it is about: a vault id, or a principal's name.
+    pub subject: Vec<u8>,
+    /// The kind's own encoding: a [`VaultEvent`], a statement's log body
+    /// (`crate::sign::Statement::log_body`), a Keys fetch.
+    pub event: Vec<u8>,
+    salt: [u8; SALT_LEN],
+}
+
+impl Opening {
+    /// An opening of `event` about `subject` at `time`, with a fresh salt.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for a kind that is not committed or an event
+    /// past [`MAX_BODY`], or a random-generator failure.
+    pub fn new(kind: Kind, time: u64, subject: &[u8], event: Vec<u8>) -> Result<Self> {
+        if !kind.is_committed() {
+            return Err(Error::Malformed("an opening of an uncommitted kind"));
+        }
+        if event.len() > MAX_BODY {
+            return Err(Error::Malformed("log event"));
+        }
+        let mut salt = [0u8; SALT_LEN];
+        native_ossl::rand::Rand::fill(&mut salt)?;
+        Ok(Self {
+            kind,
+            time,
+            subject: subject.to_vec(),
+            event,
+            salt,
+        })
     }
-    Hash::from_slice(&out[..n])
+
+    /// The public leaf, in a log of `alg`: the kind, the day, zeros for the
+    /// index, and the commitment (`IPLM ‖ 1 ‖ commitment`) as the body.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn leaf(&self, alg: TreeHash) -> Result<Leaf> {
+        let commitment =
+            primitives::digest(alg.openssl_name(), &[COMMITMENT_CONTEXT, &self.to_bytes()])?;
+        Ok(Leaf {
+            kind: self.kind,
+            time: public_time(self.time),
+            index: Hash::zero(alg),
+            body: Writer::new(COMMITMENT_MAGIC).bytes(&commitment).finish(),
+        })
+    }
+
+    /// Whether this opens `leaf`: the same leaf, made from it.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn opens(&self, leaf: &Leaf) -> Result<bool> {
+        Ok(self.leaf(leaf.index.alg())? == *leaf)
+    }
+
+    /// `IPLO ‖ 1 ‖ kind(2) ‖ time ‖ salt(32) ‖ subject ‖ event`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        Writer::new(OPENING_MAGIC)
+            .fixed(&self.kind.0.to_be_bytes())
+            .u64(self.time)
+            .fixed(&self.salt)
+            .bytes(&self.subject)
+            .bytes(&self.event)
+            .finish()
+    }
+
+    /// Parse an opening, **unchecked**: see [`opens`](Self::opens).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`], also for a kind that is not committed.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes, OPENING_MAGIC, "log opening")?;
+        let kind = Kind(u16::from_be_bytes(r.fixed()?));
+        let time = r.u64()?;
+        let salt = r.fixed()?;
+        let subject = r.bytes()?.to_vec();
+        let event = r.bytes()?;
+        if !kind.is_committed() || event.len() > MAX_BODY {
+            return Err(Error::Malformed("log opening"));
+        }
+        let event = event.to_vec();
+        r.finish()?;
+        Ok(Self {
+            kind,
+            time,
+            subject,
+            event,
+            salt,
+        })
+    }
 }
 
 /// A log's identity: one per server, stable across key rotations.  Its
@@ -263,6 +396,22 @@ impl std::str::FromStr for LogId {
         }
         Ok(Self(Hash::from_slice(&id)?))
     }
+}
+
+/// Whether `leaf` has a committed leaf's shape: zeros for the index, the
+/// start of a day for the time, and a commitment of the log's hash as the
+/// body.  What it commits to only its [`Opening`] can say.
+fn is_commitment(leaf: &Leaf) -> bool {
+    let alg = leaf.index.alg();
+    let commitment = || -> Result<Hash> {
+        let mut r = Reader::new(&leaf.body, COMMITMENT_MAGIC, "log commitment")?;
+        let c = Hash::from_slice(r.bytes()?)?;
+        r.finish()?;
+        Ok(c)
+    };
+    leaf.index == Hash::zero(alg)
+        && leaf.time == public_time(leaf.time)
+        && commitment().is_ok_and(|c| c.alg() == alg)
 }
 
 /// A log, as the hashes and kinds of its leaves: enough to append, prove
@@ -358,6 +507,11 @@ impl Log {
     pub fn check(&self, leaf: &Leaf) -> Result<Option<u64>> {
         if leaf.index.alg() != self.alg() {
             return Err(Error::Malformed("log leaf of another hash"));
+        }
+        if leaf.kind.is_committed() && !is_commitment(leaf) {
+            return Err(Error::Malformed(
+                "a committed leaf with an index, a time within its day, or a body that is no commitment",
+            ));
         }
         if leaf.kind != Kind::TOMBSTONE {
             return Ok(None);
@@ -952,7 +1106,8 @@ impl Query {
     }
 }
 
-/// One leaf a lookup found, with its inclusion path in the answer's head.
+/// One leaf a lookup found, with its inclusion path in the answer's head
+/// and, for a committed leaf, what it hides.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// The leaf's index.
@@ -961,6 +1116,9 @@ pub struct Entry {
     pub leaf: Leaf,
     /// Its inclusion path in the tree of the answer's head.
     pub path: Vec<Hash>,
+    /// The leaf's opening; none when the server no longer keeps it (past
+    /// its retention) or the leaf is not committed.
+    pub opening: Option<Opening>,
 }
 
 /// What a lookup answers: the log's signed head, the key that signed it,
@@ -978,7 +1136,8 @@ pub struct Answer {
 
 impl Answer {
     /// `IPLR ‖ 1 ‖ signer(JWK) ‖ head (IPLS, empty for none) ‖ n(u64) ‖
-    /// [index ‖ leaf(IPLF) ‖ m(1) ‖ [hash]]`, hashes length prefixed.
+    /// [index ‖ leaf(IPLF) ‖ m(1) ‖ [hash] ‖ opening (IPLO, empty for
+    /// none)]`, hashes length prefixed.
     ///
     /// # Panics
     ///
@@ -1002,6 +1161,12 @@ impl Answer {
             for h in &e.path {
                 w.bytes(h);
             }
+            w.bytes(
+                &e.opening
+                    .as_ref()
+                    .map(Opening::to_bytes)
+                    .unwrap_or_default(),
+            );
         }
         w.finish()
     }
@@ -1030,7 +1195,16 @@ impl Answer {
             let path = (0..r.u8()?)
                 .map(|_| Hash::from_slice(r.bytes()?))
                 .collect::<Result<_>>()?;
-            entries.push(Entry { index, leaf, path });
+            let opening = match r.bytes()? {
+                [] => None,
+                b => Some(Opening::from_bytes(b)?),
+            };
+            entries.push(Entry {
+                index,
+                leaf,
+                path,
+                opening,
+            });
         }
         r.finish()?;
         Ok(Self {
@@ -1042,14 +1216,16 @@ impl Answer {
 
     /// Check the answer came from the server whose signing key is
     /// `signer` (the thumbprint its verified advertisement names): the
-    /// head's signature, and every entry's inclusion in it.  Returns the
-    /// verified head, none for an empty log.
+    /// head's signature, every entry's inclusion in it, and that every
+    /// opening opens its entry's leaf.  Returns the verified head, none for
+    /// an empty log.  Whether an opening names the subject asked about is
+    /// the caller's to check.
     ///
     /// # Errors
     ///
     /// [`Error::Mismatch`] for another server's key, entries without a
-    /// head, or an entry the head does not include;
-    /// [`Error::UntrustedAnchor`] for a bad head signature.
+    /// head, an entry the head does not include, or an opening of another
+    /// leaf; [`Error::UntrustedAnchor`] for a bad head signature.
     pub fn verify(&self, signer: &Thumbprint, policy: &Policy) -> Result<Option<&Head>> {
         if self.signer.thumbprint() != signer {
             return Err(Error::Mismatch("log signer"));
@@ -1065,6 +1241,11 @@ impl Answer {
         for e in &self.entries {
             if e.index >= head.head.size || !head.head.includes(&e.leaf, e.index, &e.path)? {
                 return Err(Error::Mismatch("log entry"));
+            }
+            if let Some(opening) = &e.opening
+                && !opening.opens(&e.leaf)?
+            {
+                return Err(Error::Mismatch("log entry opening"));
             }
         }
         Ok(Some(&head.head))
@@ -1093,13 +1274,13 @@ mod tests {
     }
 
     fn log_of(n: u8) -> (Log, Vec<Leaf>) {
-        let leaves: Vec<Leaf> = (0..n).map(|i| leaf(Kind::VAULT_DEVICE, i)).collect();
+        let leaves: Vec<Leaf> = (0..n).map(|i| leaf(Kind::CLAIM, i)).collect();
         (Log::replay(id(), &leaves).unwrap(), leaves)
     }
 
     #[test]
     fn leaves_round_trip_and_keep_unknown_kinds() {
-        for kind in [Kind::CLAIM, Kind::STATEMENT, Kind(0x1234)] {
+        for kind in [Kind::CLAIM, Kind::TOKEN_KEY, Kind(0x1234)] {
             let l = leaf(kind, 7);
             assert_eq!(Leaf::from_bytes(&l.to_bytes()).unwrap(), l);
         }
@@ -1114,20 +1295,16 @@ mod tests {
     #[test]
     fn the_kind_is_hashed() {
         // Same body, time and index under two kinds: two different leaves.
-        let a = leaf(Kind::VAULT_DEVICE, 1);
+        let a = leaf(Kind::CLAIM, 1);
         let b = Leaf {
-            kind: Kind::VAULT_POLICY,
+            kind: Kind::TOKEN_KEY,
             ..a.clone()
         };
         assert_ne!(a.hash().unwrap(), b.hash().unwrap());
     }
 
     #[test]
-    fn indexes_are_keyed_and_log_ids_separate_servers() {
-        let a = index(TreeHash::Sha256, &[1; 32], b"vault-1").unwrap();
-        assert_eq!(a, index(TreeHash::Sha256, &[1; 32], b"vault-1").unwrap());
-        assert_ne!(a, index(TreeHash::Sha256, &[2; 32], b"vault-1").unwrap());
-        assert_ne!(a, index(TreeHash::Sha256, &[1; 32], b"vault-2").unwrap());
+    fn log_ids_separate_servers() {
         assert_ne!(
             id(),
             LogId::of("EXAMPLE.TEST", "ipa2.example.test", TreeHash::Sha256).unwrap()
@@ -1208,7 +1385,7 @@ mod tests {
         assert!(!head.extends(&other, &proof).unwrap());
         let later = Head { time: T + 1, ..old };
         assert!(!head.extends(&later, &proof).unwrap());
-        let forked = Log::replay(id(), &[leaf(Kind::CLAIM, 0), leaf(Kind::CLAIM, 1)])
+        let forked = Log::replay(id(), &[leaf(Kind::TOKEN_KEY, 0), leaf(Kind::TOKEN_KEY, 1)])
             .unwrap()
             .head(T - 1)
             .unwrap();
@@ -1255,7 +1432,7 @@ mod tests {
         assert!(parsed.verify(server.public(), &cnsa).is_err());
 
         // A witness refuses a fork, and a bad log signature.
-        let other: Vec<Leaf> = (0..6).map(|i| leaf(Kind::CLAIM, i)).collect();
+        let other: Vec<Leaf> = (0..6).map(|i| leaf(Kind::TOKEN_KEY, i)).collect();
         let forked = Log::replay(id(), &other).unwrap();
         let mut fork = SignedHead::issue(&server, forked.head(T + 5).unwrap()).unwrap();
         assert!(matches!(
@@ -1337,8 +1514,8 @@ mod tests {
     #[test]
     fn a_cnsa_log_is_sha_384_throughout() {
         // Under a CNSA 2.0 policy the server key is ML-DSA-87, so the log
-        // id, the subject index, every tree hash and every proof are
-        // SHA-384, and nothing SHA-256 gets in.
+        // id, every commitment, tree hash and proof are SHA-384, and
+        // nothing SHA-256 gets in.
         let server = SigningKey::generate(SignatureAlg::MlDsa87).unwrap();
         let alg = TreeHash::for_signer(server.public().alg());
         assert_eq!(alg, TreeHash::Sha384);
@@ -1347,14 +1524,15 @@ mod tests {
         assert_eq!(cnsa.to_string().parse::<LogId>().unwrap(), cnsa);
         assert_ne!(cnsa.0.as_bytes(), id().0.as_bytes());
         let leaves: Vec<Leaf> = (0..5u8)
-            .map(|n| Leaf {
-                kind: Kind::VAULT_DEVICE,
-                time: T,
-                index: index(alg, &[1; 32], &[n]).unwrap(),
-                body: vec![n],
+            .map(|n| {
+                Opening::new(Kind::VAULT_DEVICE, T, &[n], vec![n])
+                    .unwrap()
+                    .leaf(alg)
+                    .unwrap()
             })
             .collect();
         assert_eq!(leaves[0].index.len(), 48);
+        assert!(is_commitment(&leaves[0]));
         let mut log = Log::replay(cnsa, &leaves[..3]).unwrap();
         let old = log.head(T).unwrap();
         for l in &leaves[3..] {
@@ -1392,7 +1570,7 @@ mod tests {
 
         // A SHA-256 leaf does not join a SHA-384 log, and a SHA-256 proof
         // does not prove into it.
-        assert!(log.append(&leaf(Kind::VAULT_DEVICE, 1)).is_err());
+        assert!(log.append(&leaf(Kind::CLAIM, 1)).is_err());
         assert!(
             log.append(&Leaf::tombstone(TreeHash::Sha256, T, 0, "x"))
                 .is_err()
@@ -1425,6 +1603,7 @@ mod tests {
                 index: i,
                 leaf: leaves[usize::try_from(i).unwrap()].clone(),
                 path: log.inclusion(i).unwrap(),
+                opening: None,
             })
             .collect();
         let answer = Answer {
@@ -1456,6 +1635,116 @@ mod tests {
             ..parsed
         };
         assert!(empty.verify(&thp, &policy).unwrap().is_none());
+    }
+
+    #[test]
+    fn openings_bind_their_leaf_and_hide_the_event() {
+        let event = VaultEvent {
+            action: VaultAction::AddDevice,
+            device: Some("dev-1".into()),
+            digest: crate::merkle::test_hash(0),
+        }
+        .to_bytes();
+        let o = Opening::new(Kind::VAULT_DEVICE, T + 4000, b"vault-1", event.clone()).unwrap();
+        let leaf = o.leaf(TreeHash::Sha256).unwrap();
+        assert!(o.opens(&leaf).unwrap());
+        assert_eq!(Opening::from_bytes(&o.to_bytes()).unwrap(), o);
+
+        // The public leaf: the day, no index, and a commitment of the
+        // log's hash; nothing of the subject, the device or the time.
+        assert_eq!(leaf.time, public_time(T + 4000));
+        assert_eq!(leaf.time % PUBLIC_TIME_STEP, 0);
+        assert_eq!(leaf.index, Hash::zero(TreeHash::Sha256));
+        assert!(is_commitment(&leaf));
+        for secret in [&b"vault-1"[..], b"dev-1", &event] {
+            assert!(!leaf.body.windows(secret.len()).any(|w| w == secret));
+        }
+
+        // Hiding: the same event twice makes two unrelated leaves.
+        let again = Opening::new(Kind::VAULT_DEVICE, T + 4000, b"vault-1", event.clone()).unwrap();
+        assert_ne!(again.leaf(TreeHash::Sha256).unwrap(), leaf);
+
+        // Binding: no other subject, time, event or kind opens it.
+        let mut other = o.clone();
+        other.subject = b"vault-2".to_vec();
+        assert!(!other.opens(&leaf).unwrap());
+        let mut other = o.clone();
+        other.time += 1;
+        assert!(!other.opens(&leaf).unwrap());
+        let mut other = o.clone();
+        other.event.push(0);
+        assert!(!other.opens(&leaf).unwrap());
+        let mut other = o.clone();
+        other.kind = Kind::VAULT_POLICY;
+        assert!(!other.opens(&leaf).unwrap());
+
+        // Only the events of users and hosts are committed.
+        assert!(Opening::new(Kind::CLAIM, T, b"x", Vec::new()).is_err());
+        let mut claim = o.to_bytes();
+        claim[5..7].copy_from_slice(&Kind::CLAIM.0.to_be_bytes());
+        assert!(Opening::from_bytes(&claim).is_err());
+    }
+
+    #[test]
+    fn a_log_takes_only_committed_leaves_of_committed_kinds() {
+        let o = Opening::new(Kind::STATEMENT, T + 7, b"alice@EXAMPLE.TEST", vec![1]).unwrap();
+        let good = o.leaf(TreeHash::Sha256).unwrap();
+        let mut log = Log::new(id());
+        log.append(&good).unwrap();
+        // An index, a time within the day, or a body that is no
+        // commitment would let a server say more than the kind and day.
+        let indexed = Leaf {
+            index: crate::merkle::test_hash(1),
+            ..good.clone()
+        };
+        let timed = Leaf {
+            time: T + 7,
+            ..good.clone()
+        };
+        let plain = Leaf {
+            body: vec![1, 2, 3],
+            ..good.clone()
+        };
+        for bad in [indexed, timed, plain] {
+            assert!(log.append(&bad).is_err(), "{bad:?}");
+        }
+        // Claims and unknown kinds stay as they are.
+        log.append(&leaf(Kind::CLAIM, 1)).unwrap();
+        log.append(&leaf(Kind(0x1234), 2)).unwrap();
+    }
+
+    #[test]
+    fn answers_carry_openings_that_must_open_their_leaves() {
+        let server = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let thp = *server.public().thumbprint();
+        let policy = Policy::default();
+        let openings: Vec<Opening> = (0..3u8)
+            .map(|n| Opening::new(Kind::ESCROW_RELEASE, T, b"vault-1", vec![n]).unwrap())
+            .collect();
+        let leaves: Vec<Leaf> = openings
+            .iter()
+            .map(|o| o.leaf(TreeHash::Sha256).unwrap())
+            .collect();
+        let log = Log::replay(id(), &leaves).unwrap();
+        let entry = |i: usize, opening: Option<Opening>| Entry {
+            index: i as u64,
+            leaf: leaves[i].clone(),
+            path: log.inclusion(i as u64).unwrap(),
+            opening,
+        };
+        let answer = Answer {
+            signer: server.public().clone(),
+            head: Some(SignedHead::issue(&server, log.head(T).unwrap()).unwrap()),
+            entries: vec![entry(0, Some(openings[0].clone())), entry(2, None)],
+        };
+        let parsed = Answer::from_bytes(&answer.to_bytes()).unwrap();
+        assert_eq!(parsed.entries, answer.entries);
+        parsed.verify(&thp, &policy).unwrap();
+
+        // An opening of another leaf is refused.
+        let mut swapped = parsed;
+        swapped.entries[1].opening = Some(openings[1].clone());
+        assert!(swapped.verify(&thp, &policy).is_err());
     }
 
     #[test]

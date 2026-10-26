@@ -21,6 +21,8 @@
   },
   "trusts": [],
   "enctypes": [20, 19, 18, 17],
+  "tlog_head_interval": 3600,
+  "tlog_retention_months": 13,
   "keys": {
     "enabled": true,
     "handlers": {

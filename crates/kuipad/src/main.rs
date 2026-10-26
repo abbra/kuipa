@@ -157,8 +157,11 @@ async fn serve(cfg: Config) -> Result<(), Error> {
             &cfg.server,
             kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg()),
         )?
-        .with_witnesses(store.witness_keys()?),
+        .with_witnesses(store.witness_keys()?)
+        .with_head_interval(std::time::Duration::from_secs(cfg.tlog_head_interval))
+        .with_retention(cfg.tlog_retention_months),
     );
+    ledger.expire(tang_pqc::unix_seconds(std::time::SystemTime::now()))?;
     eprintln!(
         "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
         ledger.id(),
