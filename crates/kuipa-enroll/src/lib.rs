@@ -11,6 +11,7 @@
 //! * [`join`]: join, rekey and stage requests (§5, §6).
 //! * [`bundle`]: offline enrollment bundles (§8).
 //! * [`escrow`]: sealed keytabs (§7).
+//! * [`vault`], [`passkey`]: user vaults and the passkey factor (§7.6).
 //! * [`sign`]: Kerberos-bound signing statements (`docs/DESIGN-sign.md`).
 //! * [`tlog`]: typed transparency logs with tombstones and witness
 //!   cosignatures (`docs/DESIGN-tlog.md`).
@@ -27,6 +28,7 @@ pub mod join;
 pub mod keys;
 pub mod keytab;
 pub mod merkle;
+pub mod passkey;
 pub mod payload;
 pub mod realm;
 pub mod server;

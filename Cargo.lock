@@ -1010,6 +1010,7 @@ version = "0.1.0"
 dependencies = [
  "agirru-crdt",
  "criterion",
+ "kuipa-enroll",
  "kuipa-perf",
  "native-ossl",
  "rustls",

@@ -38,6 +38,8 @@ pub enum Error {
     Deployment(String),
     /// A vault policy or operation is refused (§7.6).
     Policy(String),
+    /// A passkey assertion does not satisfy the passkey factor (§7.6.5).
+    Passkey(&'static str),
     /// An advertised CA certificate or PKINIT anchor is not a certificate a
     /// host may install as a CA: which list, which entry (from 1), and
     /// what it is instead ([`check_ca`](crate::certs::check_ca)).
@@ -67,6 +69,7 @@ impl fmt::Display for Error {
             Self::Insecure(what) => write!(f, "{what} requires an explicit opt-in"),
             Self::PeerSync(what) => write!(f, "peer sync refused: {what}"),
             Self::Deployment(why) | Self::Policy(why) => f.write_str(why),
+            Self::Passkey(why) => write!(f, "passkey: {why}"),
             Self::NotCa { list, entry, what } => write!(f, "{list} {entry} is {what}"),
         }
     }
