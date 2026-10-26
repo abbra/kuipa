@@ -384,3 +384,80 @@ fn unseal_output_targets_are_checked_before_anything_is_read() {
     let (code, _, _) = unseal(&["--force"]);
     assert_eq!(code, 2);
 }
+
+/// Run binary `exe` with `args` in an empty root, with no server reachable;
+/// standard error.
+fn run(exe: &str, args: &[&str]) -> String {
+    let root = std::env::temp_dir().join(format!("kuipa-cli-hyphen-{}", std::process::id()));
+    let out = Command::new(exe)
+        .args(args)
+        .env("KUIPA_ROOT", &root)
+        .env("KUIPA_ENDPOINTS", "ipa1.example.test=http://127.0.0.1:9")
+        .env_remove("KUIPA_TRACE")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn ids_and_thumbprints_may_begin_with_a_hyphen() {
+    // Device ids and key thumbprints are base64url: one in 64 begins with
+    // `-`, and must still be taken as the value it is, not as an option.
+    let id = "-mIdStartsWithAHyphen0000000000000000000000";
+    let kuipa = env!("CARGO_BIN_EXE_kuipa");
+    let audit = env!("CARGO_BIN_EXE_kuipa-audit");
+    let witness = env!("CARGO_BIN_EXE_kuipa-witness");
+    let head = format!("{id} 1 AAAA");
+    let cases: [(&str, Vec<&str>); 7] = [
+        (kuipa, vec!["seal", "device", "remove", "v", id]),
+        (
+            kuipa,
+            vec![
+                "seal", "recover", "deliver", "00ff", "--user", "bob", "--device", id,
+            ],
+        ),
+        (kuipa, vec!["tlog", "witnesses", "--remove", id]),
+        (
+            audit,
+            vec!["claim-log", "--server", "ipa1.example.test", "--anchor", id],
+        ),
+        (
+            audit,
+            vec![
+                "coverage",
+                "--server",
+                "ipa1.example.test",
+                "--anchor",
+                id,
+                "--pinned-head",
+                &head,
+            ],
+        ),
+        (
+            audit,
+            vec!["tlog", "--server", "ipa1.example.test", "--anchor", id],
+        ),
+        (
+            witness,
+            vec![
+                "run",
+                "--once",
+                "--key",
+                "/nonexistent",
+                "--state",
+                "/nonexistent",
+                "--server",
+                "ipa1.example.test",
+                "--anchor",
+                id,
+            ],
+        ),
+    ];
+    for (exe, args) in cases {
+        let stderr = run(exe, &args);
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{args:?}: {stderr}"
+        );
+    }
+}

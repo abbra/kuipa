@@ -60,7 +60,7 @@ enum Command {
         server: Vec<String>,
         /// Anchors to verify the servers' advertisements with; repeatable.
         /// Default: this host's pinned anchors.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         anchor: Vec<String>,
         /// Seconds between passes (default 60).
         #[arg(long, default_value = "60")]
