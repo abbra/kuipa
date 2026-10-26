@@ -108,14 +108,14 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       tombstones, signed heads, consistency proofs, witness cosignatures
       (`kuipa-witness`, required counts on hosts), vault, escrow, Keys and
       signing events with receipts, `kuipa tlog watch`, `kuipa-audit tlog`;
-      claim logs migrated onto typed leaves.
+      claim logs migrated onto typed leaves; committed leaves (only the
+      kind and the day public, openings to the subject in lookups, kept
+      13 months) and heads published hourly (`DESIGN-tlog.md` §1, §5, §9).
 - [ ] Transparency logs, remaining: the tlog-tiles layout and a C2SP
       signed-note checkpoint with a witness endpoint (§6); logging the
       opening of machine (keytab) bindings, which only vault releases are
       today; mirroring the logs in `kuipa-mirror`; token-key epochs
-      (kind 7) once tokens exist; the privacy mitigations of
-      `DESIGN-tlog.md` §9: keyed body digests and device ids, index-key
-      epochs, coarse public times, per-statement signing indexes.
+      (kind 7) once tokens exist.
 - [x] Kerberos-bound signing (`DESIGN-sign.md`): the `sign` operation,
       the signing policy with `memberOf` groups, batches, offline bundles,
       `kuipa sign`, `kuipa-gitsign`.
