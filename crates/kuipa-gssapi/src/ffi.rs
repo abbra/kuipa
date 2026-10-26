@@ -479,7 +479,7 @@ pub type Krb5ResponderContext = *mut Krb5ResponderContextStruct;
 #[cfg(mit_kerberos)]
 #[repr(C)]
 pub struct Krb5OtpTokenInfo {
-    /// Which answers the token needs: the flags below, ORed.
+    /// Which answers the token needs: the flags below, `ORed`.
     pub flags: c_int,
     /// The token's format, or -1 when unspecified.
     pub format: c_int,
