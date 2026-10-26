@@ -101,25 +101,25 @@ fn detect_krb5(requested: Option<Vendor>) -> Krb5Install {
     }
     let install = krb5_via_config_tool(requested)
         .or_else(|| krb5_via_keg_prefix(requested))
-        .unwrap_or_else(|| match requested {
+        .unwrap_or_else(|| {
             // A named vendor that nothing on this machine provides: fail with
             // the reason instead of compiling against the other one.
-            Some(vendor) => panic!(
-                "KUIPA_KRB5_VENDOR={} but no {} installation was found \
-                 (pkg-config, krb5-config and the Homebrew kegs were all checked)",
-                vendor.label(),
-                vendor.label()
-            ),
+            if let Some(vendor) = requested {
+                panic!(
+                    "KUIPA_KRB5_VENDOR={} but no {} installation was found \
+                     (pkg-config, krb5-config and the Homebrew kegs were all checked)",
+                    vendor.label(),
+                    vendor.label()
+                );
+            }
             // Nothing knows where krb5 lives — a cross-compile toolchain
             // locates it on its own, and Linux distros put MIT krb5 on the
             // default search path.
-            None => {
-                println!("cargo:rustc-link-lib=gssapi_krb5");
-                Krb5Install {
-                    vendor: Vendor::Mit,
-                    include_paths: Vec::new(),
-                    lflags: Vec::new(),
-                }
+            println!("cargo:rustc-link-lib=gssapi_krb5");
+            Krb5Install {
+                vendor: Vendor::Mit,
+                include_paths: Vec::new(),
+                lflags: Vec::new(),
             }
         });
     install.print_link_metadata();
@@ -361,7 +361,7 @@ fn krb5_via_config_tool(requested: Option<Vendor>) -> Option<Krb5Install> {
 }
 
 /// Which Kerberos a `krb5-config` belongs to.  Anything unrecognised — Apple's
-/// deprecated MITKerberosShim, a distro patch with its own string — is None,
+/// deprecated `MITKerberosShim`, a distro patch with its own string — is `None`,
 /// because compiling against an unknown vendor's headers with MIT's cfg would
 /// be a silent ABI gamble.
 fn config_tool_vendor(prog: &Path) -> Option<Vendor> {
@@ -456,13 +456,11 @@ fn krb5_via_keg_prefix(requested: Option<Vendor>) -> Option<Krb5Install> {
 
 /// Whether `dir` holds any build of `stem` (shared, static, or versioned).
 fn has_library(dir: &Path, stem: &str) -> bool {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with(stem))
-        })
-        .unwrap_or(false)
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(stem))
+    })
 }
 
 /// `brew --prefix <formula>`, if brew is installed and the formula is.

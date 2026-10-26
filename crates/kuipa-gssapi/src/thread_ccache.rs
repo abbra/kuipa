@@ -27,16 +27,18 @@ use crate::status::format_gss_status;
 /// A build against Heimdal has no per-thread credential cache name to set —
 /// MIT alone exposes `gss_krb5_ccache_name` — and reports
 /// [`GssError::Unsupported`].
+///
+/// # Errors
+///
+/// [`GssError::NulInKeytabPath`] if `name` contains a NUL byte, or
+/// [`GssError::SetCcache`] if `gss_krb5_ccache_name` rejects the name.
 #[cfg(mit_kerberos)]
 pub fn set_thread_ccache(name: Option<&str>) -> Result<Option<String>, GssError> {
     let name_cstr = name
         .map(CString::new)
         .transpose()
         .map_err(|_| GssError::NulInKeytabPath)?;
-    let name_ptr: *const libc::c_char = name_cstr
-        .as_deref()
-        .map(CStr::as_ptr)
-        .unwrap_or(ptr::null());
+    let name_ptr: *const libc::c_char = name_cstr.as_deref().map_or(ptr::null(), CStr::as_ptr);
 
     let mut minor: ffi::OmUint32 = 0;
     let mut old_name: *const libc::c_char = ptr::null();
@@ -74,6 +76,9 @@ pub fn set_thread_ccache(name: Option<&str>) -> Result<Option<String>, GssError>
 /// set.  Callers that need a per-task cache on a Heimdal build pass its name
 /// to the credential itself instead.
 #[cfg(heimdal_kerberos)]
+/// # Errors
+///
+/// Always [`GssError::Unsupported`]: Heimdal has no per-thread ccache name.
 pub fn set_thread_ccache(_name: Option<&str>) -> Result<Option<String>, GssError> {
     Err(GssError::Unsupported {
         feature: "a thread-local credential cache (`gss_krb5_ccache_name`, MIT Kerberos only)",
@@ -85,6 +90,7 @@ pub fn set_thread_ccache(_name: Option<&str>) -> Result<Option<String>, GssError
 /// Each blocking thread gets its own stable name, so repeated impersonation
 /// calls on the same thread overwrite the same MEMORY: ccache rather than
 /// creating new ones.
+#[must_use]
 pub fn thread_ccache_name() -> String {
     thread_local! {
         static NAME: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };

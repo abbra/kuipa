@@ -866,7 +866,7 @@ unsafe extern "C" fn prompter(
             }
         }
     }
-    for i in 0..num_prompts.max(0) as usize {
+    for i in 0..usize::try_from(num_prompts.max(0)).unwrap_or(0) {
         // SAFETY: prompts holds num_prompts entries.
         let prompt = unsafe { &*prompts.add(i) };
         let label = if prompt.prompt.is_null() {

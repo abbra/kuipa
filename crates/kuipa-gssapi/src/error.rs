@@ -187,8 +187,8 @@ pub enum GssError {
     Unsupported { feature: &'static str },
 }
 
-const GSS_S_CALL_INACCESSIBLE_READ: OmUint32 = 0x01000000;
-const GSS_CALLING_ERROR_MASK: OmUint32 = 0xFF000000;
+const GSS_S_CALL_INACCESSIBLE_READ: OmUint32 = 0x0100_0000;
+const GSS_CALLING_ERROR_MASK: OmUint32 = 0xFF00_0000;
 
 impl GssError {
     /// Whether this error indicates the credential handle has become stale
@@ -196,6 +196,7 @@ impl GssError {
     ///
     /// Re-acquiring the server credential from the original source
     /// (keytab / gssproxy) and retrying the operation usually succeeds.
+    #[must_use]
     pub fn is_stale_credential(&self) -> bool {
         let major = match self {
             GssError::ImpersonateCred { major, .. }

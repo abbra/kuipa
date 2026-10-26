@@ -63,6 +63,11 @@ pub enum GssCredMode {
 }
 
 /// Re-acquire a `GssServerCred` using the same method as startup.
+///
+/// # Errors
+///
+/// [`GssError::Unsupported`] under Heimdal, or [`GssError::AcquireCred`] if
+/// the credential cannot be acquired.
 pub fn reacquire_server_cred(mode: &GssCredMode) -> Result<GssServerCred, GssError> {
     match mode {
         GssCredMode::GssProxy { service } => GssServerCred::from_gssproxy(service),
@@ -96,6 +101,12 @@ pub enum InitiatorCredMode {
 }
 
 /// Re-acquire a `GssClientCred` using the same method as startup.
+///
+/// # Errors
+///
+/// [`GssError::AcquireCred`], [`GssError::ImportName`],
+/// [`GssError::KeytabNotReadable`], [`GssError::Krb5`], or a NUL-byte error
+/// as for [`GssClientCred::from_client_keytab`].
 pub fn reacquire_initiator_cred(mode: &InitiatorCredMode) -> Result<GssClientCred, GssError> {
     match mode {
         InitiatorCredMode::GssProxy { impersonation } => GssClientCred::from_ccache(*impersonation),
@@ -570,6 +581,7 @@ impl GssServerCred {
     /// Calls `gss_inquire_cred` to retrieve the internal name, then
     /// `gss_display_name` to convert it to a UTF-8 string.  Returns `None`
     /// if either call fails or if the result is not valid UTF-8.
+    #[must_use]
     pub fn principal_name(&self) -> Option<String> {
         cred_principal_name(self.raw)
     }
@@ -676,6 +688,7 @@ impl Drop for GssClientCred {
 impl GssClientCred {
     /// The principal this credential acts as, e.g. `"alice@EXAMPLE.TEST"`;
     /// `None` if it cannot be inquired.
+    #[must_use]
     pub fn principal_name(&self) -> Option<String> {
         cred_principal_name(self.raw)
     }
@@ -850,6 +863,11 @@ impl GssClientCred {
     /// - [`GssError::Krb5`] — Heimdal could not read the keytab or obtain the
     ///   TGT.
     /// - [`GssError::AcquireCred`] — credential acquisition failed.
+    ///
+    /// # Panics
+    ///
+    /// If the generated in-memory ccache name cannot become a `CString`; a
+    /// numeric counter guarantees it can.
     pub fn from_client_keytab(
         keytab_file: &str,
         principal: Option<&str>,
@@ -1332,6 +1350,7 @@ impl GssClientCred {
     ///
     /// The pointer is valid only as long as `self` is alive.  Intended for
     /// injection into Cyrus SASL via `sasl_setprop(conn, SASL_GSS_CREDS, ptr)`.
+    #[must_use]
     pub fn as_ptr(&self) -> *mut std::ffi::c_void {
         self.raw.cast()
     }
@@ -1571,9 +1590,9 @@ impl GssClientCred {
     ///
     /// - [`GssError::ExportCred`] — store or file I/O failed.
     pub fn export(&self) -> Result<Vec<u8>, GssError> {
-        debug_assert!(!self.raw.is_null(), "export called on null credential");
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt as _;
+        debug_assert!(!self.raw.is_null(), "export called on null credential");
         // A random, unguessable name: 128 bits from OpenSSL's DRBG, the
         // same one that protects everything else, so no other process can
         // find the file (let alone pre-create it) during its short life.
@@ -1968,6 +1987,7 @@ impl std::fmt::Debug for GssClientContext {
         f.debug_struct("GssClientContext")
             .field("raw", &self.raw)
             .field("target_name", &self.target_name)
+            .field("krb5", &self.krb5)
             .finish()
     }
 }
@@ -2003,10 +2023,10 @@ impl GssClientContext {
     /// - [`GssError::NulInTargetName`] — `target_service` contains a NUL byte.
     /// - [`GssError::ImportName`] — `gss_import_name` rejected the name.
     pub fn new(target_service: &str) -> Result<Self, GssError> {
-        Self::with_name_type(target_service, ffi::gss_c_nt_hostbased_service())
+        Self::with_name_type(target_service, &ffi::gss_c_nt_hostbased_service())
     }
 
-    fn with_name_type(target_service: &str, svc_oid: ffi::GssOidDesc) -> Result<Self, GssError> {
+    fn with_name_type(target_service: &str, svc_oid: &ffi::GssOidDesc) -> Result<Self, GssError> {
         let svc_cstr = CString::new(target_service).map_err(|_| GssError::NulInTargetName)?;
         let mut minor: ffi::OmUint32 = 0;
         let svc_buf = ffi::GssBufferDesc {
@@ -2021,7 +2041,7 @@ impl GssClientContext {
             ffi::gss_import_name(
                 &raw mut minor,
                 &raw const svc_buf,
-                &raw const svc_oid,
+                &raw const *svc_oid,
                 &raw mut target_name,
             )
         };
@@ -2058,7 +2078,7 @@ impl GssClientContext {
         } else {
             ffi::gss_c_nt_hostbased_service()
         };
-        let mut ctx = Self::with_name_type(target, name_type)?;
+        let mut ctx = Self::with_name_type(target, &name_type)?;
         ctx.krb5 = true;
         Ok(ctx)
     }
@@ -2528,7 +2548,7 @@ pub enum InitStep {
 /// credential produces a gssproxy-managed S4U2Self credential, so the subsequent
 /// `gss_init_sec_context` is handled remotely without triggering `init_ctx_local`.
 ///
-/// This mirrors the pattern used by mod_auth_gssapi for S4U2Self LDAP lookups.
+/// This mirrors the pattern used by `mod_auth_gssapi` for S4U2Self LDAP lookups.
 ///
 /// # Errors
 ///
