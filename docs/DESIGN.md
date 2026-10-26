@@ -2745,7 +2745,10 @@ what the host's own realm advertises:
 
    The snippet has no `[libdefaults]`; it names B's servers as KDCs (the
    answering one first) and sets `pkinit_anchors` and `pkinit_pool` to B's
-   chain. MIT's `includedir` reads only file names of letters, digits, `-`
+   chain. When A's entry for B names KDC proxies, or else B's own
+   advertisement does (§17.2), the proxy URLs are B's `kdc`s instead,
+   with `http_anchors` set to B's `ca.crt` unless they use the system
+   trust store; MIT Kerberos reaches B's KDCs through them over HTTPS. MIT's `includedir` reads only file names of letters, digits, `-`
    and `_`, hence the name.
 4. Remove realms that are installed but no longer listed.
 
