@@ -3123,8 +3123,8 @@ impl EnrollServer {
         })
     }
 
-    /// This realm as a trust partner sees it: realm, domain, servers and
-    /// trusted anchors.
+    /// This realm as a trust partner sees it: realm, domain, servers,
+    /// trusted anchors and KDC proxies.
     #[must_use]
     pub fn as_partner(&self) -> TrustedRealm {
         TrustedRealm {
@@ -3136,6 +3136,7 @@ impl EnrollServer {
             // (DESIGN-claim-logs.md §3): this realm's heads for the
             // same anchors, as the advertisement carries them.
             heads: self.heads(),
+            kdc_proxy: self.info.kdc_proxy.clone(),
         }
     }
 

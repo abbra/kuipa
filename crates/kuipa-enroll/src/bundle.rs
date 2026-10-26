@@ -535,6 +535,7 @@ mod tests {
                 anchors: vec![*anchor.public().thumbprint()],
                 heads: Vec::new(),
                 trusts: Vec::new(),
+                kdc_proxy: None,
             };
             let adv = keys
                 .advertisement(&info, &delegation, now(), now() + 3600, None)

@@ -604,6 +604,7 @@ fn server(anchor: &SigningKey, fqdn: &str) -> (EnrollServer, Delegation) {
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         },
         own.clone(),
     );

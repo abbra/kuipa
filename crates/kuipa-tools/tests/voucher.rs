@@ -119,6 +119,7 @@ impl Ipa {
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         };
         let keys = ServerKeys {
             signing,

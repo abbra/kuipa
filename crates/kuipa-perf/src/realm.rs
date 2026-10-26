@@ -149,6 +149,7 @@ fn info(anchor: &SigningKey, fqdn: &str, servers: &[String], cas: &[Vec<u8>]) ->
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts: Vec::new(),
+        kdc_proxy: None,
     }
 }
 

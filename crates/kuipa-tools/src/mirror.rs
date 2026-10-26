@@ -359,6 +359,7 @@ mod tests {
             anchors: vec![thp],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         };
         let keys = ServerKeys {
             signing,

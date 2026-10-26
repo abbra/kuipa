@@ -299,6 +299,8 @@ pub async fn refresh(
                         // those anchors — what a host of this realm
                         // pins for it (DESIGN-claim-logs.md §3).
                         heads,
+                        // The KDC proxies it advertises for itself.
+                        kdc_proxy: info.kdc_proxy.clone(),
                     };
                     break;
                 }

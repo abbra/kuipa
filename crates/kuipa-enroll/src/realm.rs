@@ -69,6 +69,126 @@ pub struct RealmInfo {
     pub heads: Vec<HeadPin>,
     /// Realms this realm trusts, with the anchors it vouches for (§17).
     pub trusts: Vec<TrustedRealm>,
+    /// This realm's KDC proxies, when its KDCs are not reachable
+    /// directly: what a trusting realm's hosts use to reach them.
+    pub kdc_proxy: Option<KdcProxy>,
+}
+
+/// How a realm's KDCs are reached when they are not reachable directly:
+/// MS-KKDCP proxies (FreeIPA's `/KdcProxy`) over HTTPS.  A host's
+/// `krb5.conf` then lists the proxy URLs as the realm's `kdc`s.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KdcProxy {
+    /// The proxy URLs, `https://<host>[:<port>][/<path>]`, in order.
+    pub urls: Vec<String>,
+    /// What authenticates the proxies' TLS certificates.
+    pub ca: ProxyCa,
+}
+
+/// The certificates a host trusts for a KDC proxy's TLS server (krb5's
+/// `http_anchors`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProxyCa {
+    /// The realm's own IPA CA, from its verified advertisement: a proxy
+    /// on the IPA servers themselves.
+    #[default]
+    Realm,
+    /// The system's trust store: a front end with a public certificate.
+    System,
+}
+
+impl ProxyCa {
+    /// The wire and configuration name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Realm => "realm",
+            Self::System => "system",
+        }
+    }
+}
+
+impl std::str::FromStr for ProxyCa {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "realm" => Ok(Self::Realm),
+            "system" => Ok(Self::System),
+            _ => Err(Error::Malformed("KDC proxy CA")),
+        }
+    }
+}
+
+/// At most this many proxy URLs per realm.
+const MAX_KDC_PROXIES: usize = 16;
+
+impl KdcProxy {
+    /// Check that there are one to 16 URLs, each safe in generated
+    /// Kerberos configuration ([`is_safe_proxy_url`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`].
+    pub fn validate(&self) -> Result<()> {
+        if (1..=MAX_KDC_PROXIES).contains(&self.urls.len())
+            && self.urls.iter().all(|u| is_safe_proxy_url(u))
+        {
+            Ok(())
+        } else {
+            Err(Error::Malformed("KDC proxy"))
+        }
+    }
+}
+
+/// Whether `url` is safe as a KDC proxy in generated Kerberos
+/// configuration: `https://`, a host name that is [safe](is_safe_name),
+/// an optional port, and a path of ASCII letters, digits, `.`, `-`, `_`,
+/// `~` and `/` only — nothing that could end the `kdc` value or start
+/// another relation.
+#[must_use]
+pub fn is_safe_proxy_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(h, p)| (h, Some(p)));
+    url.len() <= 512
+        && is_safe_name(host)
+        && port.is_none_or(|p| {
+            p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|p| p > 0)
+        })
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~' | b'/'))
+}
+
+#[derive(Serialize, Deserialize)]
+struct KdcProxyJson {
+    urls: Vec<String>,
+    /// Absent for the default, the realm's own CA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca: Option<String>,
+}
+
+impl From<&KdcProxy> for KdcProxyJson {
+    fn from(p: &KdcProxy) -> Self {
+        Self {
+            urls: p.urls.clone(),
+            ca: (p.ca != ProxyCa::Realm).then(|| p.ca.as_str().to_owned()),
+        }
+    }
+}
+
+impl KdcProxyJson {
+    fn parse(self) -> Option<KdcProxy> {
+        Some(KdcProxy {
+            ca: self.ca.map_or(Ok(ProxyCa::Realm), |c| c.parse()).ok()?,
+            urls: self.urls,
+        })
+    }
 }
 
 /// A trusted realm, as the advertising realm vouches for it (§17): where
@@ -91,6 +211,10 @@ pub struct TrustedRealm {
     /// Empty where unknown (an older partner, or none of its anchors
     /// vouched yet).
     pub heads: Vec<HeadPin>,
+    /// The KDC proxies this realm's hosts use for it, when its KDCs are
+    /// not reachable directly.  `None`: its KDCs, or the proxies its
+    /// own advertisement names.
+    pub kdc_proxy: Option<KdcProxy>,
 }
 
 impl TrustedRealm {
@@ -129,6 +253,10 @@ impl TrustedRealm {
             || self.anchors.is_empty()
             || self.servers.is_empty()
             || self.anchors.iter().any(|a| anchors.contains(a))
+            || self
+                .kdc_proxy
+                .as_ref()
+                .is_some_and(|p| p.validate().is_err())
         {
             return Err(Error::Malformed("trusted realm"));
         }
@@ -158,6 +286,9 @@ struct TrustJson {
     /// heads (DESIGN-claim-logs.md §3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     heads: Vec<serde_json::Value>,
+    /// Absent when its KDCs are reached directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kdc_proxy: Option<KdcProxyJson>,
 }
 
 impl From<&TrustedRealm> for TrustJson {
@@ -168,6 +299,7 @@ impl From<&TrustedRealm> for TrustJson {
             servers: t.servers.clone(),
             anchors: t.anchors.iter().map(ToString::to_string).collect(),
             heads: t.heads.iter().map(HeadPin::to_json).collect(),
+            kdc_proxy: t.kdc_proxy.as_ref().map(KdcProxyJson::from),
         }
     }
 }
@@ -182,6 +314,10 @@ impl TrustJson {
                 .map(HeadPin::from_json)
                 .collect::<Result<_>>()
                 .ok()?,
+            kdc_proxy: match self.kdc_proxy {
+                Some(p) => Some(p.parse()?),
+                None => None,
+            },
             realm: self.realm,
             domain: self.domain,
             servers: self.servers,
@@ -215,6 +351,8 @@ struct InfoJson {
     heads: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     trusts: Vec<TrustJson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kdc_proxy: Option<KdcProxyJson>,
 }
 
 fn parse_anchors(items: &[String]) -> Option<Vec<Thumbprint>> {
@@ -238,6 +376,7 @@ impl RealmInfo {
             anchors: self.anchors.iter().map(ToString::to_string).collect(),
             heads: self.heads.iter().map(HeadPin::to_json).collect(),
             trusts: self.trusts.iter().map(TrustJson::from).collect(),
+            kdc_proxy: self.kdc_proxy.as_ref().map(KdcProxyJson::from),
         })
         .expect("serialisable")
     }
@@ -248,6 +387,8 @@ impl RealmInfo {
     /// ([`certs::check_ca`](crate::certs::check_ca)), and every trusted
     /// realm clearly separate — not this realm, not listed twice, with
     /// servers, and with anchors of its own, none of them this realm's.
+    /// KDC proxies, this realm's and its trusted realms', must be
+    /// [valid](KdcProxy::validate).
     ///
     /// # Errors
     ///
@@ -259,6 +400,9 @@ impl RealmInfo {
             .chain(&self.servers);
         if !names.into_iter().all(|n| is_safe_name(n)) {
             return Err(Error::Malformed("realm info names"));
+        }
+        if let Some(p) = &self.kdc_proxy {
+            p.validate()?;
         }
         for (list, certs) in [
             ("CA certificate", &self.ca_certs),
@@ -294,7 +438,12 @@ impl RealmInfo {
             .map(TrustJson::parse)
             .collect::<Option<_>>()
             .ok_or_else(malformed)?;
+        let kdc_proxy = match j.kdc_proxy {
+            Some(p) => Some(p.parse().ok_or_else(malformed)?),
+            None => None,
+        };
         let info = Self {
+            kdc_proxy,
             ca_certs: decode_all(&j.ca_certs).ok_or_else(malformed)?,
             pkinit_anchors: decode_all(&j.pkinit_anchors).ok_or_else(malformed)?,
             anchors: parse_anchors(&j.anchors).ok_or_else(malformed)?,
@@ -880,11 +1029,48 @@ pub fn krb5_realm_section(
             unique.push(k);
         }
     }
-    let mut lines = vec!["[realms]".to_owned(), format!("    {realm} = {{")];
-    lines.extend(unique.iter().map(|k| format!("        kdc = {k}:88")));
+    let mut relations: Vec<String> = unique.iter().map(|k| format!("kdc = {k}:88")).collect();
     if let Some(primary) = unique.first() {
-        lines.push(format!("        master_kdc = {primary}:88"));
+        relations.push(format!("master_kdc = {primary}:88"));
     }
+    realm_section(realm, domain, relations, pkinit_anchors_file)
+}
+
+/// [`krb5_realm_section`] for a realm whose KDCs are reached through
+/// `proxy`: each URL is a `kdc`, and the proxies' TLS certificates are
+/// checked against `ca_file` (the realm's IPA CA, PEM) for
+/// [`ProxyCa::Realm`], or the system trust store for
+/// [`ProxyCa::System`].  MIT Kerberos only: Heimdal does not speak
+/// MS-KKDCP.
+#[must_use]
+pub fn krb5_proxied_realm_section(
+    realm: &str,
+    domain: &str,
+    proxy: &KdcProxy,
+    ca_file: &str,
+    pkinit_anchors_file: &str,
+) -> String {
+    let mut unique: Vec<&str> = Vec::new();
+    for u in &proxy.urls {
+        if !unique.contains(&u.as_str()) {
+            unique.push(u);
+        }
+    }
+    let mut relations: Vec<String> = unique.iter().map(|u| format!("kdc = {u}")).collect();
+    if proxy.ca == ProxyCa::Realm {
+        relations.push(format!("http_anchors = FILE:{ca_file}"));
+    }
+    realm_section(realm, domain, relations, pkinit_anchors_file)
+}
+
+fn realm_section(
+    realm: &str,
+    domain: &str,
+    relations: Vec<String>,
+    pkinit_anchors_file: &str,
+) -> String {
+    let mut lines = vec!["[realms]".to_owned(), format!("    {realm} = {{")];
+    lines.extend(relations.into_iter().map(|r| format!("        {r}")));
     lines.extend([
         format!("        pkinit_anchors = FILE:{pkinit_anchors_file}"),
         format!("        pkinit_pool = FILE:{pkinit_anchors_file}"),
@@ -946,6 +1132,7 @@ pub(crate) mod tests {
             anchors: vec![*anchor.public().thumbprint()],
             heads: Vec::new(),
             trusts: Vec::new(),
+            kdc_proxy: None,
         };
         TestRealm {
             anchor,
@@ -978,6 +1165,7 @@ pub(crate) mod tests {
             servers: vec![format!("ipa1.{}", realm.to_ascii_lowercase())],
             anchors: vec![anchor],
             heads: Vec::new(),
+            kdc_proxy: None,
         }
     }
 
@@ -1305,6 +1493,130 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn kdc_proxy_urls_are_safe_in_krb5_conf() {
+        for ok in [
+            "https://ipa1.b.test/KdcProxy",
+            "https://id.fedoraproject.org/KdcProxy",
+            "https://kdc.b.test:8443/KdcProxy",
+            "https://kdc.b.test",
+            "https://kdc.b.test/a/b~c_d.e-f/",
+        ] {
+            assert!(is_safe_proxy_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://ipa1.b.test/KdcProxy",
+            "ipa1.b.test/KdcProxy",
+            "https://",
+            "https:///KdcProxy",
+            "https://ipa1.b.test:/KdcProxy",
+            "https://ipa1.b.test:0/KdcProxy",
+            "https://ipa1.b.test:65536/KdcProxy",
+            "https://ipa1.b.test:+443/KdcProxy",
+            "https://user@ipa1.b.test/KdcProxy",
+            "https://ipa1.b.test/KdcProxy?x=1",
+            "https://ipa1.b.test/Kdc Proxy",
+            "https://ipa1.b.test/KdcProxy\n    }",
+            "https://ipa1.b.test/KdcProxy}",
+            "https://-b.test/KdcProxy",
+        ] {
+            assert!(!is_safe_proxy_url(bad), "{bad}");
+        }
+        let long = format!("https://b.test/{}", "a".repeat(500));
+        assert!(!is_safe_proxy_url(&long));
+    }
+
+    #[test]
+    fn kdc_proxies_round_trip_and_are_checked() {
+        let mut t = test_realm("ipa1.example.test");
+        let other = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let proxy = |ca, urls: &[&str]| KdcProxy {
+            urls: urls.iter().map(|u| (*u).to_owned()).collect(),
+            ca,
+        };
+        let b = TrustedRealm {
+            kdc_proxy: Some(proxy(ProxyCa::Realm, &["https://ipa1.b.test/KdcProxy"])),
+            ..trusted("B.TEST", *other.public().thumbprint())
+        };
+        // The default CA is no member at all; another one is named.
+        let json = b.to_json();
+        assert!(json.contains(r#""kdc_proxy":{"urls":["https://ipa1.b.test/KdcProxy"]}"#));
+        assert_eq!(TrustedRealm::from_json(json.as_bytes()).unwrap(), b);
+        t.info.trusts = vec![b.clone()];
+        t.info.kdc_proxy = Some(proxy(
+            ProxyCa::System,
+            &["https://id.example.test/KdcProxy"],
+        ));
+        let value = t.info.to_value();
+        assert_eq!(value["kdc_proxy"]["ca"], "system");
+        assert_eq!(RealmInfo::from_value(&value).unwrap(), t.info);
+        // An unknown CA, an unsafe URL or no URL at all is refused, in
+        // the realm's own entry or a trusted realm's.
+        let mut unknown = value.clone();
+        unknown["kdc_proxy"]["ca"] = "anything".into();
+        assert!(RealmInfo::from_value(&unknown).is_err());
+        for bad in [
+            proxy(ProxyCa::Realm, &[]),
+            proxy(ProxyCa::Realm, &["https://b.test/KdcProxy\n[libdefaults]"]),
+        ] {
+            let own = RealmInfo {
+                kdc_proxy: Some(bad.clone()),
+                ..t.info.clone()
+            };
+            assert!(RealmInfo::from_value(&own.to_value()).is_err(), "{bad:?}");
+            let theirs = RealmInfo {
+                trusts: vec![TrustedRealm {
+                    kdc_proxy: Some(bad.clone()),
+                    ..b.clone()
+                }],
+                ..t.info.clone()
+            };
+            assert!(
+                RealmInfo::from_value(&theirs.to_value()).is_err(),
+                "{bad:?}"
+            );
+        }
+        // An advertisement without proxies is what it was before them.
+        t.info.trusts = vec![trusted("B.TEST", *other.public().thumbprint())];
+        t.info.kdc_proxy = None;
+        assert!(!t.info.to_value().to_string().contains("kdc_proxy"));
+    }
+
+    #[test]
+    fn proxied_realm_section() {
+        let proxy = KdcProxy {
+            urls: vec![
+                "https://ipa1.b.test/KdcProxy".into(),
+                "https://ipa2.b.test/KdcProxy".into(),
+                "https://ipa1.b.test/KdcProxy".into(),
+            ],
+            ca: ProxyCa::Realm,
+        };
+        let s = krb5_proxied_realm_section("B.TEST", "b.test", &proxy, "/ca.crt", "/p.pem");
+        assert!(!s.contains("[libdefaults]"));
+        assert_eq!(
+            s.lines()
+                .filter(|l| l.trim().starts_with("kdc = "))
+                .map(str::trim)
+                .collect::<Vec<_>>(),
+            [
+                "kdc = https://ipa1.b.test/KdcProxy",
+                "kdc = https://ipa2.b.test/KdcProxy"
+            ]
+        );
+        assert!(!s.contains("master_kdc"), "{s}");
+        assert!(s.contains("http_anchors = FILE:/ca.crt"), "{s}");
+        assert!(s.contains("pkinit_anchors = FILE:/p.pem"), "{s}");
+        assert!(s.contains(".b.test = B.TEST"), "{s}");
+        // A public front end: the system's trust store, so no anchors.
+        let public = KdcProxy {
+            ca: ProxyCa::System,
+            ..proxy
+        };
+        let s = krb5_proxied_realm_section("B.TEST", "b.test", &public, "/ca.crt", "/p.pem");
+        assert!(!s.contains("http_anchors"), "{s}");
+    }
+
+    #[test]
     fn trusted_realm_heads_round_trip() {
         let a = *test_realm("ipa1.example.test").anchor.public().thumbprint();
         let head = HeadPin {
@@ -1318,6 +1630,7 @@ pub(crate) mod tests {
             servers: vec!["ipa1.b.test".into()],
             anchors: vec![a],
             heads: vec![head],
+            kdc_proxy: None,
         };
         assert_eq!(TrustedRealm::from_json(t.to_json().as_bytes()).unwrap(), t);
         // pins(): the head for an anchor it lists, none for one it

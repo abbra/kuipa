@@ -69,6 +69,7 @@ fn server(
         anchors: vec![*anchor.public().thumbprint()],
         heads: Vec::new(),
         trusts,
+        kdc_proxy: None,
     };
     info.validate().unwrap();
     let keys = ServerKeys {
@@ -115,6 +116,7 @@ fn trust_b(servers: &[&str], anchor: Thumbprint) -> TrustedRealm {
         servers: servers.iter().map(|s| (*s).to_owned()).collect(),
         anchors: vec![anchor],
         heads: Vec::new(),
+        kdc_proxy: None,
     }
 }
 
