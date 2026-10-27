@@ -1,0 +1,22 @@
+[package]
+name = "ring"
+# Stays 0.17-compatible so consumers' `ring = "0.17"` requirements match
+# the patch in the workspace Cargo.toml.
+version = "0.17.14"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The ring 0.17 API, backed by OpenSSL through native-ossl (ring-native-ossl), so no BoringSSL is built"
+
+[dependencies]
+ring-native-ossl = "=0.3.3"
+
+# Mirror ring's feature surface so consumers' feature requests resolve; all
+# are no-ops: every value comes from OpenSSL.
+[features]
+default = []
+alloc = []
+std = []
+
+[lints]
+workspace = true
