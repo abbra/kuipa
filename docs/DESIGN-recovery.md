@@ -7,7 +7,8 @@ every device. This design adds three ways back, from the most private to
 the most managed:
 
 1. a **recovery code** the user prints and keeps, which no one else can
-   use;
+   use, or **recovery shards**: the same recovery split over several
+   papers, of which a few are enough (§2.1);
 2. **deposits** of the user's device key into a helpdesk seal, opened
    only with the helpdesk's own devices and M-of-N approval
    (DESIGN-approvals.md);
@@ -18,6 +19,7 @@ the most managed:
 | piece | status |
 |---|---|
 | recovery codes (`kuipa seal recovery-code`, `recover code`, `recover finish`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
+| recovery shards (`kuipa seal recovery-shards`, `recover shards`): N of M paper shards | designed here (§2.1), **not implemented** |
 | depositors, deposits, `kuipa seal deposit put`, `list`, `fetch`, `retire` | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | device-key deposits and delivery (`kuipa seal recover helpdesk`, `deliver`, `fetch`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | `kuipa escrow luks`, `kuipa escrow file` | implemented, tested against a real KDC (a LUKS key as `systemd-cryptenroll` prints it); **not yet run** against a real LUKS volume |
@@ -81,6 +83,166 @@ code has the full 128 bits: no one guesses it, whatever the iteration
 count. The code is the user's to keep, on paper or in a password manager;
 kuipa never stores it. A user who has their code and their password has
 everything back; a user without the code needs the helpdesk.
+
+### 2.1 Recovery shards: a paper key that needs N of M
+
+A recovery code is a **bearer token**: whoever finds the paper, and the
+user's ticket, has the device key back. It protects one device, and a
+device registered after the code was printed is not covered until the user
+prints another. A user who wants the paper to be their last resort asks
+for more of it:
+
+1. **no single paper is enough**: N of M papers, kept in different places,
+   so that losing or losing sight of a few neither opens nor loses the key;
+2. **the papers survive damage**: a stain, a tear or a misread word must
+   not make a share unusable, so each share carries heavy error correction;
+3. **the papers alone do not suffice**: a passphrase the user remembers is
+   part of the key;
+4. **a paper explains itself**, in English and in a form a program reads,
+   years later;
+5. **new devices need no paper**: the paper holds a key pair, so a device
+   registered later is protected with the public half and nobody has to
+   gather the shares.
+
+`kuipa seal recovery-shards create --shares M --threshold N` makes a
+**recovery key** and splits it. The command, and everything below, is an
+alternative to `recovery-code`: a user may hold a code, a shard set, or
+both, per device.
+
+**The key.** A recovery key is an ML-KEM key pair (ML-KEM-1024 under
+CNSA 2.0, as the KEM suite, §5.1 of DESIGN.md) made from a 32-byte seed
+`s`: `(d, z) = HKDF(s, "ipa-ku recovery key v1")`. Only the seed is secret.
+The public key and its thumbprint (the **key id**) are public and the
+server keeps them (below).
+
+**The passphrase.** The user chooses one. The seed is not split as it
+is; it is first hidden under the passphrase:
+
+```text
+pad  = scrypt(passphrase, salt, N = 2^17, r = 8, p = 1)[0..32]   (the cost is in the header)
+w    = s XOR pad
+```
+
+`w` has no authentication tag on purpose, so that a wrong passphrase gives
+a wrong seed and nothing says so: the only check is that the public key
+derived from a candidate seed has the key id. An attacker who has N shares
+learns `w`, and then tries passphrases against the public key id at the
+cost of one scrypt each. The passphrase therefore needs the strength of a
+password protecting a key file, and the command refuses an empty one
+unless asked with `--no-passphrase`.
+
+**Splitting.** `w` is split bytewise with **Shamir's scheme over GF(256)**
+into M shares of 32 bytes, any N of which give `w` back (N from 2, M at
+most 16); the polynomials' random coefficients come from OpenSSL's
+generator. Fewer than N shares give no information about `w`. A share is
+32 bytes of one point of the polynomials, and its x-coordinate.
+
+**Words and error correction.** A share is written as words of a list of
+1024 (10 bits each; the SLIP-39 list, whose words differ in their first
+four letters, so four letters identify one). The share's bytes, with a
+header, are the words' **data symbols**, and a Reed-Solomon code over
+GF(2^10) adds `P` **parity words** (24 by default; `--parity` allows 4 to
+200). A word is one symbol, so a damaged word costs one symbol and not a
+whole byte or two:
+
+| the reader | the code corrects |
+|---|---|
+| marks a word as unreadable (`?`), so its place is known (an erasure) | up to `P` of them: 24 of 55 words |
+| types a wrong word without knowing (an error) | up to `P/2`: 12 of 55 words |
+| both | `e` erasures and `r` errors while `e + 2r <= P` |
+
+A share the code cannot repair is reported as such, and the other
+shares are enough while N of them are intact. The words are printed in
+numbered lines of five, so a lost word is a known place:
+
+```text
+kuipa recovery shard 2 of 5 (any 3 are needed)           set 8F3A1
+for alice, realm EXAMPLE.TEST      recovery key id  Zr9Q…k2w
+made 2026-10-27 by kuipa 0.4      the passphrase you chose is also needed
+
+ 01  humidity   disease    academic   always     aluminum
+ 02  …
+```
+
+**The header.** The first data words say, protected by the same
+code: the format version, a 20-bit **set id** that every share of one set
+carries (so shares of two sets are never mixed), N, M, this share's index,
+the scrypt cost, and `P`. Beside the words the page says the same in
+English, and how to decode a share with nothing but the page: the word
+list, the code (the field polynomial and generator), Shamir's scheme, the
+scrypt parameters, the seed's HKDF label and ML-KEM's key generation. The
+English is for the person; nothing reads it back, and the words do not
+depend on it.
+
+**What the server keeps.** The recovery key's public key, its id and the
+set id are registered with the seal operation `escrow-shards`, authenticated
+by the owner's ticket and logged, on the owner's own entry (a value of
+`ipaKUDeviceEscrow` of kind `shards-key`). For each device key, the client
+makes a **blob** for the recovery public key, in the format of a device-key
+delivery (`IPDD`, §4: an ML-KEM encapsulation to the recovery key, the
+private JWK under a key derived from it) and stores it as a value of kind
+`shards`. Nothing the server holds is secret: the blobs open only with the
+recovery private key. `kuipa seal device add` makes the blob for a new key
+file as soon as the user has a shard set (as it deposits a key when the
+realm names a device seal, §4), so the new device is covered **without
+any paper**. A token's key never leaves the token and has no blob.
+
+**Recovering.** On a new host, with a ticket, `kuipa seal recover shards`
+asks for shards: for each, the words by line, `?` for a word that cannot be
+read, a blank line to go on to the next. It repairs each, drops a share
+whose code cannot be repaired, refuses shares of different sets, and
+stops asking at N consistent shares; then it asks for the passphrase,
+recombines `w`, takes `s = w XOR pad`, makes the key pair and checks the key
+id against the printed and the registered one, so a wrong passphrase or
+a wrong share is told apart from damage. Only then does it ask the server for the
+blobs (the operation `recover-shards`, logged, which `kuipa tlog watch`
+always flags, as for `recover-code`), opens them, and keeps the old keys
+as `recovered.key` for `recover finish` (§2).
+
+**Checking before it matters.** `kuipa seal recovery-shards check`
+takes shards in the same way and reports, per share, how many words it
+repaired and whether the set would recover, against the registered key id,
+without asking for any blob. A paper backup is only as good as the day it
+is tested; the command is for that day, and the user is told to run it
+after printing.
+
+**Replacing a set.** A shard set is replaced, not edited: a lost paper
+is no reason to believe it is lost safely. `recovery-shards create` again
+makes a new key and set, and makes the blobs for every device key this host
+holds (the other hosts do it with `recovery-shards enroll`; a device whose
+key is nowhere is not covered until it is seen). The old set's registration
+and blobs are removed; whoever kept an old paper holds nothing the server
+accepts.
+
+| someone has | recovery code | recovery shards |
+|---|---|---|
+| the directory, the blobs | nothing (128-bit code) | nothing (they open only with the recovery key) |
+| one or a few shards (fewer than N) | — | nothing |
+| N shards, not the passphrase | — | a passphrase search against the key id, at one scrypt each |
+| N shards and the passphrase | — | the old device keys, then with the user's ticket their files |
+| the paper of the code | the old device key, and with the ticket their files | — |
+
+Decisions:
+
+* **A key pair, not a symmetric key.** A code encrypts to the device
+  key's holder and so needs the code each time. A recovery public key
+  lets any host protect its device key with no secret in hand, and keeps
+  the paper offline.
+* **Shamir over the hidden seed, not the key.** The seed is 32 bytes,
+  so a share is short, and keeping the passphrase outside the split makes
+  the shares worthless without it however many are gathered.
+* **Reed-Solomon over words.** The symbol is the word the user reads, so an
+  unreadable word is a clean erasure, which the code corrects twice as
+  well as an error. It is the SLIP-39 idea, with the checksum grown into
+  correction.
+* **Not SLIP-39.** SLIP-39 splits a symmetric secret and its checksum finds
+  errors without correcting them; neither is what this wants, so shares
+  are not interchangeable with its tools. Its word list is reused.
+* **No verifiable sharing.** The client that makes the shares is the
+  user's, so a share set the user's own client got wrong is found by
+  `check`, not by commitments in the shares.
+* **No deniable passphrase.** A wrong passphrase gives another key, which
+  opens nothing; kuipa does not make it look like a real one.
 
 ## 3. Depositors and deposits
 
