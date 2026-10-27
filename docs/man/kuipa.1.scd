@@ -38,7 +38,8 @@ During the join process with a Kerberos principal, *kuipa* will ask for
 credentials required by the IPA server, including multi-factor authentication.
 
 When *--server* option is omitted, servers are found through the DNS SRV records
-of the realm's domain.
+of the realm's domain, through the system's DNS configuration or the one
+nameserver *$KUIPA_DNS* names (see there).
 
 # GLOBAL FLAGS
 
@@ -483,6 +484,19 @@ trusting one, or set _N_; _N_ cannot exceed the witnesses trusted.
 *KUIPA_ROOT*
 	Prefix for every system path (default */*), so the tools can be
 	exercised without touching the system.
+
+*KUIPA_DNS*
+	The one nameserver to ask for the SRV records, instead of the
+	system's DNS configuration: an _address:port_ (plain DNS over UDP
+	and TCP), dot:// followed by host and port (DNS over TLS,
+	RFC 7858, default port 853) or doh:// followed by host, port and
+	path (DNS over HTTPS, RFC 8484, default port 443 and path
+	/dns-query).  A dot:// or doh:// host that is a name, not an
+	address, is resolved through the system's DNS configuration.
+
+*KUIPA_DNS_CA*
+	PEM certificates to verify dot:// and doh:// nameservers with,
+	instead of the system's root certificates.
 
 *KUIPA_USER_DIR*
 	*seal*'s data directory, instead of *$XDG_DATA_HOME/kuipa*
