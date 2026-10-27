@@ -6,9 +6,9 @@ The realm keeps two public, append-only records:
   Merkle tree whose head the anchor signs. They say which servers the
   realm vouched for.
 * **Transparency logs.** Each server's record of what it did with users'
-  and hosts' secrets: vault changes, releases of vault keys, replica
+  and hosts' secrets: seal changes, releases of seal keys, replica
   secret fetches and signing statements. Leaves name no one; an index stands
-  for the vault or principal. See
+  for the seal or principal. See
   [below](#the-transparency-log-and-its-witnesses).
 
 `kuipa-audit` checks both. `kuipa-mirror` serves the claim logs to a
@@ -87,11 +87,11 @@ trust.
 ## The transparency log and its witnesses
 
 Every server appends an entry to its transparency log before it changes
-a vault, releases a vault's key share, hands out a replica secret or
+a seal, releases a seal's key share, hands out a replica secret or
 signs a statement. If the entry cannot be written, the request is
 refused. Opening a sealed host or service keytab is not logged yet. Users
-check the entries about their own vaults with `kuipa tlog watch`
-([Sealing your own files](../user/sealing.md#see-who-touched-your-vault)).
+check the entries about their own seals with `kuipa tlog watch`
+([Sealing your own files](../user/sealing.md#see-who-touched-your-seal)).
 Anyone can read the whole log at `/ipa/ku/tlog/<log id>/`, with no
 login.
 

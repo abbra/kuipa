@@ -38,7 +38,7 @@ Common ones:
 | an LDAP bind failure on an OTP join | the OTP was mistyped or already spent: issue a new one |
 | `… may not rekey …` | the host's keys are for another host name |
 | `binding not registered or its principal disabled` | the sealed keytab or file was resealed, retired, or its host or service deleted or locked |
-| `the binding is not committed to this vault` | a sealed file presented under another principal or vault: tampering or a bug |
+| `the binding is not committed to this seal` | a sealed file presented under another principal or seal: tampering or a bug |
 | `unknown join key` / `unknown escrow key` | the host used a key the server has pruned: rotate keys, or keep retired keys longer |
 
 ## The advertisement does not verify

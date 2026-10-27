@@ -69,8 +69,8 @@ its keytab, then `kuipa sign blob …`. Many artifacts go in one request
 ## Seeing what was signed in your name
 
 Every statement is in the log of the server that made it, filed under
-your principal but without your name. Run `kuipa tlog watch` on a vault
-to check that vault. Your signing statements are your principal's own
+your principal but without your name. Run `kuipa tlog watch` on a seal
+to check that seal. Your signing statements are your principal's own
 entries (see the design's `tlog` lookups).
 
 ## What it does not do

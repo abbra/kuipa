@@ -290,12 +290,12 @@ file opens any more.
 
 ## 6. Sealing your own files: `kuipa seal`
 
-A user's vaults, run as the user with their ticket (`pq_admin_kinit`
-here). A vault is created with the factors its opens need — this one a
+A user's seals, run as the user with their ticket (`pq_admin_kinit`
+here). A seal is created with the factors its opens need — this one a
 registered device under a passphrase plus the ticket:
 
 ```
-Vault personal (admin@EXAMPLE.TEST), enabled:
+Seal personal (admin@EXAMPLE.TEST), enabled:
                id: 39942eb30c05fd03877c5d4fdd9cd79d
     opening needs: a registered device (any) and your Kerberos ticket
           expires: 2027-11-27 12:21:03 UTC
@@ -305,7 +305,7 @@ delegated tickets: allow
      described by: ipa1.example.test
 ```
 
-The vault's expiry prints as a UTC date, not a Unix counter — a person
+The seal's expiry prints as a UTC date, not a Unix counter — a person
 decides with the calendar. Adding this host's device key lists it under
 `devices:` with its thumbprint; sealing and opening a file round-trips
 (`token=playground-user` back on standard output), and a wrong
@@ -313,7 +313,7 @@ passphrase is refused: `kuipa seal: wrong passphrase`.
 
 Each of those steps went into the transparency log of the server that
 handled it. `kuipa tlog watch personal` checks every server's log for
-the vault. The first watch lists the history and only records where
+the seal. The first watch lists the history and only records where
 each log stands:
 
 ```
@@ -321,17 +321,17 @@ each log stands:
         ok  ipa1.example.test #1 at 2026-10-24 12:30:16 UTC: add-device device L_LxP5xhTXsQXtHSYqZqQIyZBjoFUtliO4nZOqL0UMk
         ok  ipa1.example.test #2 at 2026-10-24 12:30:16 UTC: release device L_LxP5xhTXsQXtHSYqZqQIyZBjoFUtliO4nZOqL0UMk
   baseline  ipa1.example.test: first watch, history not flagged
-Vault personal: 0 unexpected.
+Seal personal: 0 unexpected.
 ```
 
-ipa2 handled nothing for this vault, so its log is empty and the watch
+ipa2 handled nothing for this seal, so its log is empty and the watch
 has nothing to list from it. A second device registered from another
-data directory (`KUIPA_USER_DIR=…/admin-laptop`) is not in the vault
+data directory (`KUIPA_USER_DIR=…/admin-laptop`) is not in the seal
 description this host stored, so the next watch flags it and exits 1:
 
 ```
 UNEXPECTED  ipa1.example.test #3 at 2026-10-24 12:30:17 UTC: add-device device hjrpLcMII4mUXrCDd8os2VrTEeXa1rwbAERAd0yzhjo (a device the stored descriptor does not list)
-Vault personal: 1 unexpected.
+Seal personal: 1 unexpected.
 ```
 
 `kuipa seal show personal` stores the current description, which
@@ -348,7 +348,7 @@ policy on this host too. The next open here shows up as one more
 An auditor with no account replays a server's whole log from its public
 routes with `kuipa-audit tlog --server ipa1.example.test --state FILE`.
 It checks the head against the key ipa1's verified advertisement names,
-replays every leaf, and counts them by kind (`vault-device`,
+replays every leaf, and counts them by kind (`seal-device`,
 `escrow-release` and so on). That is all it can learn: each leaf shows
 its kind and its day, and seals who it is about and what happened into a
 commitment that only the watch's lookup opens. Run again later, it
@@ -371,7 +371,7 @@ The watch lists the new release, reports
 without recording the head. After the witness's next pass, the same
 watch is clean.
 
-A second vault allows hour-long sessions and ten unlocks
+A second seal allows hour-long sessions and ten unlocks
 (`--session-hours 1 --max-unlocks 10`, shown as `unlocks allowed: 10`
 and `longest session (seconds): 3600`). One unlock — passphrase and
 ticket, once — starts it:
@@ -385,7 +385,7 @@ Until that date, opens need neither the passphrase nor a ticket;
 counts `unlocks so far: 1`.
 
 Offline sessions (`travel`, `--offline-hours 2`) go further: the
-device's unlock releases the vault's session key to this host, so files
+device's unlock releases the seal's session key to this host, so files
 sealed `--session` open with every server down:
 
 ```
@@ -395,7 +395,7 @@ Offline session started: files sealed with --session open on this host without a
 With both servers unreachable the boarding pass still opens; the
 session's end is the date above, not a server's decision (see
 [Sealing your own files](../user/sealing.md) for what that costs).
-`kuipa seal revoke personal` ends the section: the vault prints
+`kuipa seal revoke personal` ends the section: the seal prints
 `revoked`, and no server opens its files any more.
 
 ### Hardware-bound devices: a token and passkeys
@@ -426,11 +426,11 @@ until token attestation is checked.
 **Passkeys.** `pq_passkey mldsa65 --pin 4321` does what `ipa
 user-add-passkey --register` does: a new ML-DSA-65 credential on the
 administrator's security key, for the realm's domain, its public key
-stored as one of their `ipaPassKey` values. A vault can then require one
+stored as one of their `ipaPassKey` values. A seal can then require one
 of the user's IPA passkeys, and its description says so:
 
 ```
-Vault signing (admin@EXAMPLE.TEST), enabled:
+Seal signing (admin@EXAMPLE.TEST), enabled:
                        id: f51b573d980469e5b04e0155d52375fb
             opening needs: a registered device (any) and one of your IPA passkeys
                   expires: 2027-11-30 05:29:55 UTC
@@ -477,7 +477,7 @@ Classical passkeys work the same way. `kuipa-playground passkey
 --user-verification off` stands in for `ipa passkeyconfig-mod
 --require-user-verification=false`. Then bob registers an ES256 passkey
 on his key, which has no PIN (`pq_as bob pq_passkey es256`). He seals a
-note to a vault of his with `--require device,passkey` and opens it
+note to a seal of his with `--require device,passkey` and opens it
 with a touch each time and no PIN (`alg="es256" user_verified=false` in
 the trace).
 

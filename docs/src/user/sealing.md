@@ -1,7 +1,7 @@
 # Sealing your own files with `kuipa seal`
 
 > **Status: partly implemented.** This guide describes `kuipa seal` as
-> the design's [user vaults](../reference/design.md#76-user-vaults-being-implemented)
+> the design's [user seals](../reference/design.md#76-user-seals-being-implemented)
 > section has it. Working today: `create`,
 > `policy`, `device add|remove` with passphrase-protected device keys,
 > keys wrapped by a passkey on a FIDO2 security key (`--passkey`) or an
@@ -10,12 +10,12 @@
 > with the `device`, `ticket` and `passkey` factors, re-authentication sessions
 > (`--session-hours`), offline sessions (`--offline-hours`, where the realm
 > allows them), unlock limits (`--max-unlocks`), registered sealing
-> (`--sealing registered`, `kuipa seal retire`), shared vaults
+> (`--sealing registered`, `kuipa seal retire`), shared seals
 > (`share`, `unshare`) and approvals (`--approvals`, `request`,
 > `approve`). Not yet:
 > the attested `hardware-*` levels, and refusing or
 > limiting delegated tickets (the server cannot tell them apart yet, so
-> only the default `allow` is accepted). A vault policy asking for any of
+> only the default `allow` is accepted). A seal policy asking for any of
 > those is refused.
 
 `kuipa seal` lets any user of an IPA realm encrypt their own files so that a
@@ -30,21 +30,21 @@ keeps the data with you.
 
 ## The idea in one page
 
-* A **vault** is a set of rules on the IPA servers, owned by you: which
+* A **seal** is a set of rules on the IPA servers, owned by you: which
   factors opening a file needs, until when, how many times. You create
-  vaults yourself, within limits your administrators set, and can share
+  seals yourself, within limits your administrators set, and can share
   one with other users, a group or a host group.
 * A **device** is a key that belongs to you and lives on one machine or
   token: a passphrase-protected key file, a key wrapped by a passkey, or a
-  key on a smart card or token. You register each device in the vault.
+  key on a smart card or token. You register each device in the seal.
 * **Sealing** a file encrypts it so that opening needs the server's share
-  *and*, if the vault asks for it, a registered device. Sealing works
+  *and*, if the seal asks for it, a registered device. Sealing works
   offline.
-* **Opening** a sealed file asks a server, which checks the vault's rules
+* **Opening** a sealed file asks a server, which checks the seal's rules
   and answers only to a registered device. A server's answer alone cannot
   open your files, and neither can your device alone.
 
-Each vault chooses its factors from:
+Each seal chooses its factors from:
 
 | factor | what it asks of you | good for |
 |---|---|---|
@@ -52,11 +52,11 @@ Each vault chooses its factors from:
 | `ticket` | your Kerberos ticket: the one your login gave you on an IPA-enrolled system (PAM, or SSH with protocol transition), or `kinit` | tying opens to your login session |
 | `passkey` | a touch (and PIN) on one of the passkeys registered to your IPA account | proof that you are present |
 
-A vault needs at least one of them; the server's agreement alone is never
+A seal needs at least one of them; the server's agreement alone is never
 enough.
 
 A ticket that a machine obtained for you (sshd does after a public-key
-login) records which machines it went through. A vault accepts such
+login) records which machines it went through. A seal accepts such
 tickets by default; it can refuse them (`--ticket-delegation refuse`), or
 accept them only through named machines (`--ticket-via host/devvm1…`).
 
@@ -155,7 +155,7 @@ could be decrypted later by a quantum computer.
 ### Open the same files from your laptop and your workstation
 
 Register a device on each machine. Every file is sealed to all the devices
-the vault has at the time, so either machine can open it.
+the seal has at the time, so either machine can open it.
 
 ```sh
 laptop$      kuipa seal device add personal --passphrase
@@ -169,9 +169,9 @@ them from a machine that can:
 kuipa seal reseal personal ~/secrets/*.sealed
 ```
 
-### See who touched your vault
+### See who touched your seal
 
-Every server records each change to your vault, and each time it hands
+Every server records each change to your seal, and each time it hands
 out its share of one of your files, in a public transparency log that it
 cannot rewrite unnoticed. To check it:
 
@@ -180,7 +180,7 @@ kuipa tlog watch personal
 ```
 
 It lists everything since the last watch, server by server. Anything the
-vault description stored on this machine does not account for is marked
+seal description stored on this machine does not account for is marked
 `UNEXPECTED`: a device you don't know of added, or opening files, or a
 policy you didn't set. If you made the change yourself from another
 machine, `kuipa seal show personal` updates the description, and the
@@ -190,20 +190,20 @@ server that changed to keys of another strength, as a change of the
 crypto policy makes it do, keeps a new log under a new id: that is
 `NEW LOG`, not a fork, and the new log is read and checked from its
 start. The first watch only records where each log stands; run it once soon after
-creating a vault. A periodic job (a systemd user timer, cron) can run it
+creating a seal. A periodic job (a systemd user timer, cron) can run it
 for you: it exits non-zero when something needs a look.
 
 What anyone can read in the log is only what kind of event each entry
 is and on which day it happened. Who it is about, what it was and when
 in the day are sealed into it, and only your lookups, with your ticket,
 open them, so anyone can audit the log without learning anything about
-your vault. The servers keep those openings for 13 months (as the realm
+your seal. The servers keep those openings for 13 months (as the realm
 sets it), so a watch reaches that far back. A server publishes its log
 once an hour, so an event shows up in your watch within the hour.
 
 ### You lost a laptop
 
-Remove its device from the vault, from any other machine (or ask an
+Remove its device from the seal, from any other machine (or ask an
 administrator):
 
 ```sh
@@ -215,13 +215,13 @@ the laptop has its sealed files and its device key file, but the servers
 won't help them, so they can't open anything, even with your passphrase.
 Your other devices keep working.
 
-If you suspect your password was compromised too, and a vault requires only
-`ticket`, revoke that vault: a ticket-only vault does not protect against
+If you suspect your password was compromised too, and a seal requires only
+`ticket`, revoke that seal: a ticket-only seal does not protect against
 someone who has your password and a copy of the file.
 
 ### Keep a recovery code, in case it was your only device
 
-If a vault needs your device and you lose every device, the servers will
+If a seal needs your device and you lose every device, the servers will
 not open your files for anyone, you included. A recovery code is your way
 back. Make one on each machine whose device key you would miss:
 
@@ -245,19 +245,19 @@ new$ kuipa seal recover finish ~/secrets/*.sealed --retire-old
 ```
 
 `recover code` brings the old device key back onto the new laptop.
-`recover finish` registers the new laptop's own device in every vault where
+`recover finish` registers the new laptop's own device in every seal where
 the old one was, and reseals the files you list to it. `--retire-old` then
-removes the old device from those vaults, so whoever has the lost laptop
+removes the old device from those seals, so whoever has the lost laptop
 can open nothing. Leave `--retire-old` off until every file is resealed: a
 file still sealed only to the old device stops opening once it is retired.
 
-Every escrow and every fetch of it is in your vaults' transparency logs, so
+Every escrow and every fetch of it is in your seals' transparency logs, so
 `kuipa tlog watch` shows if someone with your password tried.
 
 ### No code? The helpdesk can bring your device back
 
 If your realm keeps device keys for recovery, `kuipa seal device add`
-deposits each new device's key in a helpdesk vault, sealed so that only
+deposits each new device's key in a helpdesk seal, sealed so that only
 the helpdesk opens it, and only under its policy (usually several people
 approving). Your realm may require it. If you lose every device and have
 no code:
@@ -276,14 +276,14 @@ new$ kuipa seal recover finish ~/secrets/*.sealed --retire-old
 ```
 
 Only your new device opens what the helpdesk delivered, and the
-delivery is in your vaults' logs. The helpdesk member who delivered it
+delivery is in your seals' logs. The helpdesk member who delivered it
 held your old key for a moment, after the others approved: that is why
 `recover finish --retire-old` retires it.
 
 ### Stay signed in for a working day
 
 Typing a passphrase or touching a key for every open gets tiring. If the
-vault's policy allows it, one unlock starts a **session**:
+seal's policy allows it, one unlock starts a **session**:
 
 ```sh
 kuipa seal create work --require device,ticket --session-hours 8
@@ -297,13 +297,13 @@ runtime directory (`$XDG_RUNTIME_DIR`: memory only, yours alone, gone when
 you log out), so neither the passphrase nor a ticket is asked for.
 
 During a session each open still goes to a server, so the session's end,
-revocation and the vault's limits still apply, and every open is logged.
-Sessions are capped by the vault's policy and by the realm.
+revocation and the seal's limits still apply, and every open is logged.
+Sessions are capped by the seal's policy and by the realm.
 
 ### Work offline for a while (if your administrators allow it)
 
 Travelling without a network? Some realms allow **offline sessions**: one
-unlock gives your device the key to open the vault's session files offline
+unlock gives your device the key to open the seal's session files offline
 for a set time.
 
 ```sh
@@ -315,16 +315,16 @@ kuipa seal lock travel                       # when you are back
 ```
 
 Offline sessions are off unless your administrators enable them for the
-realm *and* you enable them for the vault. Know what they cost: while a
+realm *and* you enable them for the seal. Know what they cost: while a
 session is unlocked, the key is on your machine, and the servers can no
 longer enforce when it ends or count your opens. They are for convenience
 on a machine you trust, not for your most sensitive files.
 
 ### Share a secret with your team
 
-A database password the whole team needs belongs in a vault you share,
+A database password the whole team needs belongs in a seal you share,
 not in a chat message. Share it with the IPA group, and make a colleague
-a manager so the vault does not depend on you alone:
+a manager so the seal does not depend on you alone:
 
 ```sh
 alice$ kuipa seal create db --require device,ticket
@@ -332,7 +332,7 @@ alice$ kuipa seal share db --group dba
 alice$ kuipa seal share db --manager --user carol
 ```
 
-Others name your vault `alice/db`. Each member registers their own device
+Others name your seal `alice/db`. Each member registers their own device
 from their own machine, and `kuipa seal list` shows it among theirs:
 
 ```sh
@@ -345,7 +345,7 @@ bob$ kuipa seal open db-password.txt.sealed --out -
   their own device and their own ticket: Bob's ticket does not open with
   Alice's device.
 * Membership is checked at every open. Someone who leaves the `dba` group
-  in IPA opens nothing more, and their devices are dropped from the vault
+  in IPA opens nothing more, and their devices are dropped from the seal
   the next time anyone uses it. `kuipa seal unshare db --user bob` removes
   someone named directly. A member can leave with
   `kuipa seal unshare alice/db --user bob`.
@@ -355,8 +355,8 @@ bob$ kuipa seal open db-password.txt.sealed --out -
   itself, then reseal.
 
 Managers change the policy, share and unshare, and revoke. Members open,
-seal, start sessions and manage their own devices. The vault stays yours
-(it counts against your vault limit) but keeps working for the team if
+seal, start sessions and manage their own devices. The seal stays yours
+(it counts against your seal limit) but keeps working for the team if
 your account is disabled.
 
 For a fleet, share with a host group (`--group webservers`) or hosts
@@ -388,14 +388,14 @@ kuipa seal file break-glass root-password.txt
 
 Sometimes others should hand you a secret without being able to read it
 back: hosts handing over their backup passwords, colleagues dropping off
-an API key. Make them **depositors** of a vault:
+an API key. Make them **depositors** of a seal:
 
 ```sh
 alice$ kuipa seal create drop --require device,ticket --sealing registered
 alice$ kuipa seal share drop --depositor --group webservers --user bob
 ```
 
-A depositor seals to the vault and leaves the file with the servers, which
+A depositor seals to the seal and leaves the file with the servers, which
 keep it until a member fetches it:
 
 ```sh
@@ -412,12 +412,12 @@ alice$ kuipa seal open restic.sealed --out -
   with `--sealing registered`, the old copy stops opening at once.
 * A depositor retires their own deposits (`kuipa seal deposit retire`), a
   manager anyone's.
-* Opening a deposit follows the vault's policy, approvals included: a
-  helpdesk vault can ask two leads to approve each one.
+* Opening a deposit follows the seal's policy, approvals included: a
+  helpdesk seal can ask two leads to approve each one.
 
 ### A break-glass secret several people approve
 
-Some secrets should never open on one person's say-so. Give the vault
+Some secrets should never open on one person's say-so. Give the seal
 approvers, and every release waits until enough of them, other than
 whoever asks, have agreed:
 
@@ -460,13 +460,13 @@ alice$ kuipa seal open root-password.txt.sealed --out - --request 3f0c…e9
   realm's administrators, who can reach the servers' share: keep the
   device factor on.
 
-Such vaults cannot have offline sessions, which would open files without
+Such seals cannot have offline sessions, which would open files without
 asking a server.
 
 ### When you leave, or your account is disabled
 
-Disabling your IPA account, or revoking a vault, stops every future open on
-every machine at once. Nothing has to be found and deleted first. Vaults
+Disabling your IPA account, or revoking a seal, stops every future open on
+every machine at once. Nothing has to be found and deleted first. Seals
 you share keep opening for their other members; their managers, or your
 administrators, can revoke them.
 
@@ -480,22 +480,22 @@ already unlocked, has its plaintext or key on that machine.
 | a copy of the sealed file | no |
 | the copy and network access to the IPA servers | no |
 | the copy and your device key file, but not its passphrase, touch or token | no |
-| the copy and your password, vault requires `device` | no |
-| the copy and your password, vault requires only `ticket` | **yes**: require `device` or `passkey` too |
-| an IPA administrator, with the servers' keys | no, if the vault requires `device`: your device holds the other half |
-| anyone, after your account, the vault or that device is revoked | no new opens |
+| the copy and your password, seal requires `device` | no |
+| the copy and your password, seal requires only `ticket` | **yes**: require `device` or `passkey` too |
+| an IPA administrator, with the servers' keys | no, if the seal requires `device`: your device holds the other half |
+| anyone, after your account, the seal or that device is revoked | no new opens |
 | root on your machine while you have a file open or a session unlocked | yes: nothing on a machine protects against its own root |
 
 ## What it does not do
 
-* **Keep a secret from a vault's own members.** Everyone you share a
-  vault with can open every file sealed to it, and sees its members,
+* **Keep a secret from a seal's own members.** Everyone you share a
+  seal with can open every file sealed to it, and sees its members,
   devices and policy.
 * **Open files with no network.** Every open needs a server, except during
   an offline session.
 * **Run unattended out of the box.** A job that opens files while
   nobody is around needs a device that works without you (for example a
-  token whose PIN the job holds, which counts as level `any`) and a vault
+  token whose PIN the job holds, which counts as level `any`) and a seal
   without `ticket` and `passkey`, or a session you started. For services and hosts, `kuipa protect` (run as
   root) is the right tool: those files are meant to open at boot without a
   human.
@@ -504,16 +504,16 @@ already unlocked, has its plaintext or key on that machine.
 
 ## For administrators
 
-Users manage their own vaults; administrators set the limits and can step
+Users manage their own seals; administrators set the limits and can step
 in:
 
-* **Realm limits**, for the whole realm or for members of a group: the longest expiry, the largest `--max-unlocks`, vaults
-  per user, devices per member of a vault, how many managers and members
-  a shared vault may have, the longest sessions, which factor
+* **Realm limits**, for the whole realm or for members of a group: the longest expiry, the largest `--max-unlocks`, seals
+  per user, devices per member of a seal, how many managers and members
+  a shared seal may have, the longest sessions, which factor
   combinations are allowed (for example: never `ticket` alone), and whether
   offline sessions are allowed at all (off by default).
-* **Revoke** a user's vault or one of its devices; disabling the user stops
-  all their vaults.
+* **Revoke** a user's seal or one of its devices; disabling the user stops
+  all their seals.
 * **Audit**: every open, unlock, device change and refusal is logged by the
   server that handled it. Opens, unlocks and changes also go to the
   server's public transparency log (`/ipa/ku/tlog/`), where owners check

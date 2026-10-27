@@ -3,7 +3,7 @@
 The claim log of DESIGN.md §4.9 records one thing — server claims —
 and restarts whenever a claim drops out, so a host can only check it
 by refetching every leaf. Users need more. "Who added a device to my
-vault?" and "who released my escrow share?" should have answers that
+seal?" and "who released my escrow share?" should have answers that
 a server cannot quietly rewrite. This document designs a log that can
 hold such events, and the order in which it replaces the claim log.
 
@@ -14,7 +14,7 @@ hold such events, and the order in which it replaces the claim log.
 | 3 | signed heads, consistency proofs | RFC 9162 consistency instead of refetching | implemented |
 | 4 | witness cosignatures | a fork needs the witnesses to collude | implemented: `kuipa-witness`, served cosignatures |
 | 5 | storage and serving | `/var/lib/ipa/ku/tlog/`, openings kept for 13 months, heads published hourly, public routes | implemented (paged routes; tiles planned) |
-| 6 | producers and lookups | vault, Keys, signing and token events; the `tlog` operation | implemented for vault, escrow, signing and Keys events, with receipts and lookups |
+| 6 | producers and lookups | seal, Keys, signing and token events; the `tlog` operation | implemented for seal, escrow, signing and Keys events, with receipts and lookups |
 | 7 | clients | `kuipa tlog watch`, `kuipa-audit tlog`, `kuipa-mirror --witness` | implemented |
 | 8 | claim-log migration | claims as kind-1 leaves, tombstones instead of restarts, the live tree, retired claims on hosts | implemented |
 | 9 | what a public reader learns | the attack model on the public routes | the mitigations are implemented (§1, §5) |
@@ -34,15 +34,15 @@ tree hash is RFC 9162's `H(0x00 ‖ leaf)`. `index` is zeros of `H`'s
 length, which name the log's hash: a leaf whose index is of another
 length does not join the log. The kind sits inside the hashed
 bytes, so two leaves with the same body but different kinds are
-different leaves. A claim leaf can therefore never be read as a vault
+different leaves. A claim leaf can therefore never be read as a seal
 event. Unknown kinds parse, so mirrors and monitors keep working when a
 server logs kinds they do not know yet.
 
 | kind | meaning |
 |---|---|
 | 1 | server claim (`IPDC` body) |
-| 2 | vault device added or removed |
-| 3 | vault policy set, or vault revoked |
+| 2 | seal device added or removed |
+| 3 | seal policy set, or seal revoked |
 | 4 | escrow share released (unlock, offline session, override) |
 | 5 | signing statement |
 | 6 | Keys-operation fetch |
@@ -57,7 +57,7 @@ kind and its day (§9 says why):
   opening)`;
 - the **opening** is `IPLO ‖ 1 ‖ kind(2) ‖ time(u64) ‖ salt(32) ‖
   subject ‖ event`: the exact time, 32 random bytes, the subject (a
-  vault id or a principal) and the event, each length prefixed where
+  seal id or a principal) and the event, each length prefixed where
   variable.
 
 `C` is binding: no other kind, time, subject or event opens the leaf, so
@@ -182,19 +182,19 @@ comes from the system crypto policy (`Policy::from_system`).
 fresh salt, and the ledger appends its leaf and keeps the opening. Each
 event is appended after the operation's checks pass and before anything
 is stored or answered. A failed append refuses the request:
-- a vault change is not stored;
+- a seal change is not stored;
 - an escrow share or offline session key is not released.
 
 | event | kind | subject | event, in the opening |
 |---|---|---|---|
-| vault created, policy set, revoked | 3 | vault id | `IPLV`: action, `H` of the policy (zeros for revoke) |
-| vault shared or unshared (DESIGN.md §7.6.12) | 3 | vault id | `IPLV`: share or unshare, `H` of the managers, members and depositors after the change (depositors left out when there are none) |
-| file deposited, deposit retired (DESIGN-recovery.md §3) | 3 | vault id | `IPLV`: action, `H` of the sealed file, or of the deposit's id |
-| device added or removed | 2 | vault id | `IPLV`: action, the device's id |
-| device key escrowed under a recovery code, or fetched (DESIGN-recovery.md) | 2 | vault id of each vault where the holder holds the device | `IPLV`: action, the device's id |
-| session started, offline session keys released | 4 | vault id | `IPLV`: action, the device's id |
-| release requested, approved, denied (DESIGN-approvals.md) | 4 | vault id | `IPLV`: action, `H` of the request, or of `id ‖ " " ‖ approver` |
-| server share of a sealed file released | 4 | vault id | `IPLV`: release, the device (if any), the binding's `H(ct)` (its KEM's suite hash, DESIGN.md §4.1.1) |
+| seal created, policy set, revoked | 3 | seal id | `IPLV`: action, `H` of the policy (zeros for revoke) |
+| seal shared or unshared (DESIGN.md §7.6.12) | 3 | seal id | `IPLV`: share or unshare, `H` of the managers, members and depositors after the change (depositors left out when there are none) |
+| file deposited, deposit retired (DESIGN-recovery.md §3) | 3 | seal id | `IPLV`: action, `H` of the sealed file, or of the deposit's id |
+| device added or removed | 2 | seal id | `IPLV`: action, the device's id |
+| device key escrowed under a recovery code, or fetched (DESIGN-recovery.md) | 2 | seal id of each seal where the holder holds the device | `IPLV`: action, the device's id |
+| session started, offline session keys released | 4 | seal id | `IPLV`: action, the device's id |
+| release requested, approved, denied (DESIGN-approvals.md) | 4 | seal id | `IPLV`: action, `H` of the request, or of `id ‖ " " ‖ approver` |
+| server share of a sealed file released | 4 | seal id | `IPLV`: release, the device (if any), the binding's `H(ct)` (its KEM's suite hash, DESIGN.md §4.1.1) |
 | signing statement (DESIGN-sign.md) | 5 | the caller's principal | `IPGS`: purpose, batch size and root, time |
 | Keys fetch | 6 | the caller's principal | the `IPKG` fetch |
 
@@ -204,7 +204,7 @@ Opening machine (keytab) bindings is not recorded yet.
 
 A **receipt** (`IPLP`) is the server's signature, under
 `ipa-ku-log/v1 receipt`, over `log ‖ index ‖ leaf hash ‖ time`, the
-event's exact time. Vault
+event's exact time. Seal
 answers carry one per change, which is why `IPVR` moves to version 2.
 The signature is separate from the sealed answer around it, so a client
 can show a third party a promise the log did not keep. `proven_by`
@@ -215,8 +215,8 @@ their answers; owners find them through lookups.
 
 **Lookups.** `POST /ipa/ku/tlog/{kid}` is a sealed, Kerberos-only
 operation, labelled `tlog` in the transcript. Its data is `IPLQ ‖ 1 ‖
-vault ‖ from(u64)`:
-- naming a vault the caller owns asks for that vault's entries;
+seal ‖ from(u64)`:
+- naming a seal the caller owns asks for that seal's entries;
 - an empty name asks for those about the caller's principal: signing
   statements, and Keys fetches for a host.
 
@@ -300,7 +300,7 @@ format is settled.
 
 An owner's monitor, run as the user with their ticket. For each server
 the host's `realm.json` lists, it does three things:
-- **Look up.** It runs `tlog` lookups for the vault from the size the
+- **Look up.** It runs `tlog` lookups for the seal from the size the
   last watch saw, paging on `from`. `finish_tlog` checks each answer.
 - **Check the log extends.** The new head must extend the one last
   seen: the same root at the same size, or a consistency proof from
@@ -309,18 +309,18 @@ the host's `realm.json` lists, it does three things:
   past a fork.
 - **Open.** It reads each entry's event and exact time from its opening,
   which the answer's check made sure opens the leaf. An entry without an
-  opening, or opened to another vault's event, is flagged: the server is
+  opening, or opened to another seal's event, is flagged: the server is
   hiding what it did.
-- **List and flag.** It lists every new entry, and flags those the vault
+- **List and flag.** It lists every new entry, and flags those the seal
   descriptor stored on this host does not account for:
   - a device it does not list added, or starting a session or receiving
     a release;
   - a device it lists removed;
   - a policy digest other than its policy's;
-  - a revocation while it shows the vault enabled.
+  - a revocation while it shows the seal enabled.
 
 The first watch of a server is a baseline: history is listed, not
-flagged. `vaults/<name>.tlog` in the user's directory keeps, per server,
+flagged. `seals/<name>.tlog` in the user's directory keeps, per server,
 the log id, size and root last verified. An unreadable state file is an
 error, not a fresh baseline, so a corrupted file cannot silence a watch.
 The result's `ok` is false for any flag, any fork, or any server that
@@ -398,8 +398,8 @@ as long as it likes. It cannot read lookups (§6), which are sealed and
 Kerberos-only. It may hold side information:
 - a signed statement it was handed, such as a public git commit;
 - a copy of a sealed file, such as from a backup;
-- a vault's device ids, as any member of a shared vault sees them in the
-  vault descriptor;
+- a seal's device ids, as any member of a shared seal sees them in the
+  seal descriptor;
 - when someone did something, such as from a ticket, a chat, or a
   calendar;
 - a short list of likely policies, or group and member names.
@@ -417,8 +417,8 @@ attacker learned the following. The table says what closes each.
 | 1 | the public log alone | an activity profile per pseudonym on one server: how many devices, sessions, releases and approval steps, and when | committed leaves carry no index: no two can be linked (§1) |
 | 2 | one signed statement | the signer's pseudonym from the leaf the statement names, and so every statement it signed there, and a host's Keys fetches | the leaf it names is committed: kind 5 and a day, nothing else |
 | 3 | a copy of a sealed file | when the file was opened and from which device, by the binding's `H(ct)` in the release | `H(ct)` is inside the commitment, which a guess cannot be tested against |
-| 4 | a vault's device ids | the vault's pseudonym on every server, from the ids in the clear | device ids are inside the commitment |
-| 5 | guesses of policies or names | which vaults use a policy or a membership, by testing unkeyed digests | the digests are inside the commitment |
+| 4 | a seal's device ids | the seal's pseudonym on every server, from the ids in the clear | device ids are inside the commitment |
+| 5 | guesses of policies or names | which seals use a policy or a membership, by testing unkeyed digests | the digests are inside the commitment |
 | 6 | the time someone acted | the matching leaf, then row 1 | leaves show only the day; heads are published once a period, over the leaves before it (§5) |
 | 7 | a server's index key | every subject, past and future | there is no index key; a stolen store exposes the openings of the retained months only (§5) |
 

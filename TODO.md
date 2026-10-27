@@ -30,32 +30,32 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       tlog-witness implementation, once the ML-DSA note format is
       settled (`DESIGN-tlog.md` §6).
 - [ ] Extend the Tamarin model (`contrib/tamarin/kuipa.spthy`) beyond the
-      core exchange: user vaults and the unified recovery request (§7.6),
+      core exchange: user seals and the unified recovery request (§7.6),
       vouchers (§9), trust establishment (§17.4), signing statements
       (`DESIGN-sign.md`). Re-prove whenever a modelled flow changes;
       encodings and hash choices are abstracted and need no re-proof.
 
 ## Protocol and implementation
 
-- [ ] User vaults (`kuipa seal`) and the unified recovery request (§7.6),
+- [ ] User seals (`kuipa seal`) and the unified recovery request (§7.6),
       in phases:
   - [x] 1. `tang-pqc` commitments (`provision_committed`,
         `OpenedRequest::verify_commitment`).
   - [x] 2. Unified recovery request; host and service escrow as machine
-        vaults carrying the commitment.
-  - [x] 3. Vault model: policy, limits, devices, signed descriptor, `IPUF`
-        two-share format, answers encrypted to the device, server vault
+        seals carrying the commitment.
+  - [x] 3. Seal model: policy, limits, devices, signed descriptor, `IPUF`
+        two-share format, answers encrypted to the device, server seal
         operations and the ticket factor (with `ticket.delegation` checked
         against whatever the directory reports as transited services).
-  - [x] 4. The vault container in LDAP, HTTP routes, test directories.
+  - [x] 4. The seal container in LDAP, HTTP routes, test directories.
   - [ ] 5. Delegated tickets: PAC S4U delegation info for
         `ticket.delegation` (deferred; work in progress on branch
-        `vault-pac-delegation`: generated NDR from pidl-rs, committed,
+        `seal-pac-delegation`: generated NDR from pidl-rs, committed,
         with `samba-ndr` as the dependency). Until then kuipad reports the
         delegation as unknown, which only `allow` accepts.
   - [x] 6. `kuipa seal` with passphrase file devices and per-user state.
   - [x] 7. Re-authentication sessions; the unlock counter (per-server
-        values on the vault entry).
+        values on the seal entry).
   - [x] 8. Offline sessions.
   - [x] 9a. PKCS#11 devices: an ML-KEM key on a token through
         pkcs11-provider (no attestation yet: registered at `any`).
@@ -63,7 +63,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         ML-DSA-44/65/87: the passkey factor (relying-party verifier from
         ahdapa in `kuipa_enroll::passkey`, assertions in `IPEQ` v3 and in
         the session `unlock`, `ipaPassKey` and `ipaRequireUserVerification`
-        read by kuipad, the `passkeys` vault operation for allow lists) and
+        read by kuipad, the `passkeys` seal operation for allow lists) and
         passkey-wrapped device keys (`hmac-secret`, `kuipa seal device add
         --passkey`), through the new `kuipa-fido2` libfido2 FFI crate; no
         attestation yet: registered at `any`.  Tested with a software
@@ -72,10 +72,10 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
   - [x] Registered sealing (`sealing = registered`).
   - [x] Realm limits per group, and the factor sets a policy must meet
         (§7.6.2).
-  - [x] Shared vaults (§7.6.12): managers and members by user, group,
+  - [x] Shared seals (§7.6.12): managers and members by user, group,
         host or service, devices held by members, `OWNER/NAME`
         references, `kuipa seal share`/`unshare`; departed members'
-        devices pruned at every vault operation; user-vault releases
+        devices pruned at every seal operation; user-seal releases
         rate-limited per opener.
   - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
 - [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
@@ -106,14 +106,14 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       transition (§16).
 - [x] Typed transparency logs (`DESIGN-tlog.md`): typed leaves,
       tombstones, signed heads, consistency proofs, witness cosignatures
-      (`kuipa-witness`, required counts on hosts), vault, escrow, Keys and
+      (`kuipa-witness`, required counts on hosts), seal, escrow, Keys and
       signing events with receipts, `kuipa tlog watch`, `kuipa-audit tlog`;
       claim logs migrated onto typed leaves; committed leaves (only the
       kind and the day public, openings to the subject in lookups, kept
       13 months) and heads published hourly (`DESIGN-tlog.md` §1, §5, §9).
 - [ ] Transparency logs, remaining: the tlog-tiles layout and a C2SP
       signed-note checkpoint with a witness endpoint (§6); logging the
-      opening of machine (keytab) bindings, which only vault releases are
+      opening of machine (keytab) bindings, which only seal releases are
       today; mirroring the logs in `kuipa-mirror`; token-key epochs
       (kind 7) once tokens exist.
 - [x] Kerberos-bound signing (`DESIGN-sign.md`): the `sign` operation,
@@ -158,12 +158,12 @@ design first.
   - [x] `kuipa escrow luks`, `kuipa escrow file` for hosts, and services
         or users by their keytabs; **not yet run** against a real LUKS
         volume.
-  - [x] Device-key deposits in a helpdesk vault, and their delivery
+  - [x] Device-key deposits in a helpdesk seal, and their delivery
         (`kuipa seal recover helpdesk|deliver|fetch`).
 - [x] M-of-N approvals for break-glass releases, recorded in the
       transparency log (`docs/DESIGN-approvals.md`).
 - [x] Short-lived CI runner identities (voucher leases, `ticket.leased`)
-      and pipeline secrets in shared vaults (`docs/DESIGN-ci.md`).
+      and pipeline secrets in shared seals (`docs/DESIGN-ci.md`).
 - [ ] Trust bundles from the realm (`docs/src/use-cases.md`, "Deliver CA
       bundles without trusting DNS or TLS"): refresh the CA chain at
       `rotate-keys` and `check`; a realm-managed bundle in the
@@ -171,7 +171,7 @@ design first.
       into the system trust store with `update-ca-trust` and its
       blocklist; a dracut module carrying the pinned anchors and the
       last verified bundle into the initramfs.
-- [ ] Recipes in the book: Ansible vault passwords, `systemd-creds` and
+- [ ] Recipes in the book: Ansible seal passwords, `systemd-creds` and
       container secrets, `tang-pqc` file encryption, `realm-info` for
       unenrolled machines.
 
@@ -186,20 +186,20 @@ design first.
       `ipa-custodia`, the vendored server, the `cn=custodia` tree and
       `_wait_keys`.
 - [ ] FreeIPA server: schema (`ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`,
-      the `ipaKUVault` class with `ipaKUVaultOwner`, `ipaKUVaultName`,
-      `ipaKUVaultPolicy`, `ipaKUVaultDevice`, `ipaKUVaultState`,
-      `ipaKUVaultUnlocks`, `ipaKUVaultSessionKey`, `ipaKUVaultBinding`,
-      `ipaKUVaultManager`, `ipaKUVaultMember`, `ipaKUVaultApprover`
+      the `ipaKUSeal` class with `ipaKUSealOwner`, `ipaKUSealName`,
+      `ipaKUSealPolicy`, `ipaKUSealDevice`, `ipaKUSealState`,
+      `ipaKUSealUnlocks`, `ipaKUSealSessionKey`, `ipaKUSealBinding`,
+      `ipaKUSealManager`, `ipaKUSealMember`, `ipaKUSealApprover`
       (indexed for equality), the `ipaKURelease` class for release
-      requests under a vault (`ipaKUReleaseRequest`,
+      requests under a seal (`ipaKUReleaseRequest`,
       `ipaKUReleaseApproval`, `ipaKUReleaseDenied`, `ipaKUReleaseUses`),
       `ipaKUDeviceEscrow` on user entries (written by the daemon),
-      `ipaKUVaultDepositor` (indexed for equality), the `ipaKUDeposit`
-      class for deposits under a vault (`ipaKUDepositData`), `ipaKURecovery`
+      `ipaKUSealDepositor` (indexed for equality), the `ipaKUDeposit`
+      class for deposits under a seal (`ipaKUDepositData`), `ipaKURecovery`
       on a `cn=recovery,cn=kuipa,cn=etc` entry,
       `ipaKUServerEscrowKey` on
       `cn=masters` entries,
-      `ipaKUVaultLimits`, the `cn=vaults,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKULease` on host entries
+      `ipaKUSealLimits`, the `cn=seals,cn=kuipa,cn=etc` container, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKULease` on host entries
       (written by the daemon, which may delete only entries carrying it),
       `ipaKUVouchers` on a `cn=vouchers,cn=kuipa,cn=etc` entry,
       `ipaKUTrustInvitation`,

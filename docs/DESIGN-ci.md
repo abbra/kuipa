@@ -4,11 +4,11 @@ CI runners are created by the hundred and destroyed after a job or a day,
 and usually get their secrets from a long-lived token pasted into the CI
 system. kuipa already joins machines without a password, by vouchers
 (DESIGN.md §9), and opens sealed files for a host by its ticket (shared
-vaults, §7.6.12). This design adds the two missing pieces:
+seals, §7.6.12). This design adds the two missing pieces:
 
 1. a **lease**: a voucher can say how long the host it creates may live,
    and the realm ends that host on its own when the lease runs out;
-2. **pipeline secrets**: files sealed to a shared vault whose members are
+2. **pipeline secrets**: files sealed to a shared seal whose members are
    the runners' host group, which open only for a leased host, with its
    ticket, while its lease lasts.
 
@@ -16,7 +16,7 @@ vaults, §7.6.12). This design adds the two missing pieces:
 |---|---|
 | the voucher `lease`, leased host entries, their removal | implemented |
 | the `ticket.leased` policy option | implemented |
-| `ticket.delegation = refuse` for runner vaults | needs the PAC's S4U delegation info (TODO.md, vaults 5); until then it refuses every ticket |
+| `ticket.delegation = refuse` for runner seals | needs the PAC's S4U delegation info (TODO.md, seals 5); until then it refuses every ticket |
 | runner setup: voucher join, protected keytab in gssproxy | works today (DESIGN.md §7.4, §9) |
 
 ## 1. Leases
@@ -52,11 +52,11 @@ kuipad checks every five minutes.
 
 ## 2. Pipeline secrets
 
-A pipeline's secrets are files sealed to a shared vault owned by the
+A pipeline's secrets are files sealed to a shared seal owned by the
 people who run the pipeline:
 
 ```text
-vault ci-admins/deploy (owner: a CI administrator)
+seal ci-admins/deploy (owner: a CI administrator)
   members:  hostgroup ci-deploy-runners
   managers: group ci-admins
   factors:  ticket;  ticket.delegation = refuse;  ticket.leased = true
@@ -66,7 +66,7 @@ vault ci-admins/deploy (owner: a CI administrator)
 * **No device factor.** A runner lives too briefly for files to be
   sealed to its device: every new runner would need every file resealed.
   The ticket alone opens, which the realm limits must allow for the
-  vault's owner (DESIGN.md §7.6.2: a group entry for the CI
+  seal's owner (DESIGN.md §7.6.2: a group entry for the CI
   administrators with `"factors": [{"ticket": true}]`).
 * **`ticket.leased`**, a new policy option: the opener must be a host
   whose entry has an `ipaKULease` still in the future. Without it, any
@@ -96,14 +96,14 @@ without a leased runner's ticket they are useless.
    through `kuipa-unseal --memfd` (DESIGN.md §7.4): a copy of the VM's
    disk holds no usable keytab.
 4. A job runs `kuipa seal open deploy-key.sealed --out -` with the
-   host's ticket; the server checks the vault's policy, the host group,
+   host's ticket; the server checks the seal's policy, the host group,
    the lease and the binding, and releases.
 5. The VM is destroyed after its job. If it is not, its lease ends
    anyway: no tickets, and its entry is deleted an hour later.
 
 One runner should serve one job, or jobs of one trust level: a runner
 that ran another project's job holds that project's released secrets in
-memory. Separate host groups per project or environment keep the vaults
+memory. Separate host groups per project or environment keep the seals
 apart.
 
 ## 4. What each party gets
@@ -115,7 +115,7 @@ apart.
 | it and a runner's keytab, during the lease | the secret, as the runner would |
 | it and a runner's keytab, after the lease | nothing: no ticket, then no host |
 | it and a long-lived host's keytab, the host in the runners' group | nothing: not leased |
-| the realm's escrow keys | the secret: a vault without the device factor (DESIGN.md §7.6.10) |
+| the realm's escrow keys | the secret: a seal without the device factor (DESIGN.md §7.6.10) |
 
 ## 5. Decisions
 

@@ -13,7 +13,7 @@ cryptography wherever they travel or rest:
 * **At rest.** A keytab, or any file, can be sealed on disk so that a copy
   (a backup, a disk image, a snapshot) opens only with the help of the
   realm's servers, and stops opening when the host is removed.
-* **Your own files.** Users seal files to a vault of their own, under a
+* **Your own files.** Users seal files to a seal of their own, under a
   policy they choose: a copy opens only with their device, their login,
   and a server that agrees.
 * **Signing under your login.** Users and CI sign files and git commits
@@ -44,7 +44,7 @@ SHA-2 from OpenSSL, within the system's crypto policy.
 
 | program | runs on | does |
 |---|---|---|
-| `kuipad` | IPA servers, behind httpd | answers enrollments, rekeys, unseal requests and vault operations; keeps the server's keys; vouches for the other servers |
+| `kuipad` | IPA servers, behind httpd | answers enrollments, rekeys, unseal requests and seal operations; keeps the server's keys; vouches for the other servers |
 | `kuipa` | enrolled hosts and their users | enrolls the host, rotates its keys, protects keytabs and files, checks health; `kuipa seal` for users' own files |
 | `kuipa-unseal` | enrolled hosts | opens sealed keytabs and files at boot, or for gssproxy, without a human |
 | `kuipa-voucher` | wherever vouchers are issued | issues and requests single-use enrollment vouchers |
@@ -71,7 +71,7 @@ flowchart LR
 ## How this book is organised
 
 * [Concepts](concepts.md) explains anchors, advertisements, enrollment,
-  sealing and vaults, the ideas the rest of the book uses.
+  sealing and seals, the ideas the rest of the book uses.
 * [What kuipa protects](security.md) says, in plain words, which attacks
   it stops and which it does not. Read it before deciding where to use it.
 * [Quick start](quickstart.md) tries everything in a throwaway playground

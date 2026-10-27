@@ -19,7 +19,7 @@ HTTPS endpoints under */ipa/ku/* behind *httpd*(8):
 - enrollment and rekey,
 - the anchor exchange and advertisement,
 - vouchers (see *kuipa-voucher*(1)),
-- user vaults,
+- user seals,
 - trust establishment between IPA deployments, and
 - a post-quantum Tang service at */ipa/ku/tang* (see *tang-pqc*(1)).
 

@@ -31,7 +31,7 @@ flowchart LR
 3. **A key directory**, `/var/lib/ipa/ku`, with the server's anchor and
    keys.
 4. **The LDAP schema and access controls** for kuipa's attributes (escrow
-   bindings, staging, vouchers, trusts, vaults). Not published yet.
+   bindings, staging, vouchers, trusts, seals). Not published yet.
 
 ## 1. The service principal and its keytab
 

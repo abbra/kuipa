@@ -64,7 +64,7 @@ h: 32 bytes (SHA-256) or 48 (SHA-384), length prefixed, as the key decides
 ```
 
 The answer `IPGR` is the signed statement (with the server's delegation
-and public key, as a vault descriptor carries them) and each digest's
+and public key, as a seal descriptor carries them) and each digest's
 path in the batch. The client makes one **bundle** per digest: `IPGB ‖
 statement ‖ digest ‖ index ‖ path`. It checks each bundle against the
 batch and the purpose it asked for, and refuses an answer that does not
@@ -97,7 +97,7 @@ policy refuses anything else.
 ## 3. Monitoring
 
 Each statement's log leaf is committed, with the signer as the subject
-of its opening. A principal's lookup with no vault named
+of its opening. A principal's lookup with no seal named
 (DESIGN-tlog.md §6) lists everything signed in its name, with the
 openings. Auditors see statements counted by kind and day, without
 names or purposes (`kuipa-audit tlog`). A statement names its log

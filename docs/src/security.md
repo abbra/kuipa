@@ -6,7 +6,7 @@ its assumptions, is in the design's
 [security analysis](reference/design.md#13-security-analysis), and in its
 tables for [a sealed host keytab](reference/design.md#73-file-mode-implemented),
 [other sealed keytabs and files](reference/design.md#75-other-keytabs-and-any-file-implemented)
-and [users' vaults](reference/design.md#7610-what-each-attacker-gets).
+and [users' seals](reference/design.md#7610-what-each-attacker-gets).
 
 Assumptions throughout: ML-KEM and ML-DSA are as strong as their standards
 claim, including against quantum computers, and the enrollment string (or
@@ -51,7 +51,7 @@ keytabs to the machine's TPM, which closes the gap, is planned.
 sealed *files* of a disabled host still open. Delete the host, or lock it,
 to retire them.
 
-## Users' vaults
+## Users' seals
 
 | attacker has | file sealed with a device | ticket only |
 |---|---|---|
@@ -59,7 +59,7 @@ to retire them.
 | the copy and the user's device key file, without its passphrase or token PIN | nothing | — |
 | the copy and the user's password | nothing | **the file**: require a device too |
 | the realm's servers and their keys (an IPA administrator) | nothing: the device share is missing | the file |
-| anything, after the vault, the device or the user is revoked or disabled | nothing new | nothing new |
+| anything, after the seal, the device or the user is revoked or disabled | nothing new | nothing new |
 | a released offline-session key | that epoch's session files, for as long as it keeps the key | — |
 | root on the user's machine while a file is open or a session is unlocked | the open files and the session's keys | the same |
 
@@ -90,7 +90,7 @@ and `kuipa tlog watch` see a new log, not a rewritten one.
 
 The rest follows the same way. What belongs to an ML-KEM exchange is
 hashed with that KEM's hash: a sealed file's bindings and keys, machine
-vault ids, the voucher binding. That is SHA-256 for ML-KEM-768, so files
+seal ids, the voucher binding. That is SHA-256 for ML-KEM-768, so files
 sealed under the default policy still open, and SHA-384 for ML-KEM-1024.
 What no key decides is SHA-384 under every policy: the anchor epoch
 chain, trust invitations, and the binding that authenticates anchor
