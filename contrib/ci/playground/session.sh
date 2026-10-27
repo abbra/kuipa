@@ -442,6 +442,27 @@ step 0 "bob fetches it on the new desk, and his file opens there" \
     'desk new-desk kuipa seal recover fetch --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" && desk new-desk kuipa seal open "$KUIPA_PLAYGROUND/keys.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | cat' \
     "is recovered on this host" "vpn=bob-secret"
 
+section "Paper keys for a lost device" \
+    "bob prints three papers of a two-of-three set: their words, with a recovery passphrase he keeps apart from them, stand for his device key (DESIGN-recovery.md). One paper and no passphrase tells a reader nothing; any two papers are enough. His desk is lost: on a new one he reads two papers, and his file opens there."
+step 0 "bob makes papers for his desk's device key" \
+    'bp() { pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-paper-$1" "${@:2}"; } && echo "six honest words to open the papers" > "$KUIPA_PLAYGROUND/bob-words" && mkdir -p "$KUIPA_PLAYGROUND/papers" && bp desk kuipa seal create paperkeys --require device,ticket && bp desk kuipa seal device add paperkeys --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" && echo "door=4711" > "$KUIPA_PLAYGROUND/paperkeys.txt" && bp desk kuipa seal file paperkeys "$KUIPA_PLAYGROUND/paperkeys.txt" && bp desk kuipa seal recovery-shards create --threshold 2 --shares 3 --recovery-file "$KUIPA_PLAYGROUND/bob-words" --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | tee "$KUIPA_PLAYGROUND/papers/all.txt"' \
+    "Recovery shard set" "any 2 are needed"
+step 0 "Each paper is kept as its own page" \
+    "python3 -c \"import sys;[open(sys.argv[1]+'/paper-'+str(k+1),'w').write(chr(10).join(l for l in p.split(chr(10)) if l[:2].isdigit())+chr(10)) for k,p in enumerate(p for p in sys.stdin.read().split(chr(10)*2) if p.startswith('kuipa recovery'))]\" \"$KUIPA_PLAYGROUND/papers\" < \"$KUIPA_PLAYGROUND/papers/all.txt\" && ls \"$KUIPA_PLAYGROUND/papers\"" \
+    "paper-1" "paper-3"
+step 0 "The papers are checked on the desk that made them, before they are trusted" \
+    '{ cat "$KUIPA_PLAYGROUND/papers/paper-2"; echo; cat "$KUIPA_PLAYGROUND/papers/paper-3"; } | bp desk kuipa seal recovery-shards check --recovery-file "$KUIPA_PLAYGROUND/bob-words"' \
+    "would recover the set for key"
+step 1 "A wrong recovery passphrase does not make that key" \
+    'echo "five dishonest words" > "$KUIPA_PLAYGROUND/bob-lies" && { cat "$KUIPA_PLAYGROUND/papers/paper-2"; echo; cat "$KUIPA_PLAYGROUND/papers/paper-3"; } | bp desk kuipa seal recovery-shards check --recovery-file "$KUIPA_PLAYGROUND/bob-lies"' \
+    "not the one registered"
+step 0 "The desk is lost: on a new one, two papers bring the key back" \
+    '{ cat "$KUIPA_PLAYGROUND/papers/paper-2"; echo; cat "$KUIPA_PLAYGROUND/papers/paper-3"; } | bp new-desk kuipa seal recover shards --recovery-file "$KUIPA_PLAYGROUND/bob-words" --passphrase-file "$KUIPA_PLAYGROUND/bob-pass"' \
+    "is recovered on this host"
+step 0 "The file sealed on the lost desk opens there" \
+    'bp new-desk kuipa seal open "$KUIPA_PLAYGROUND/paperkeys.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | cat' \
+    "door=4711"
+
 section "Deposits" \
     "carol is a depositor of the administrator's drop seal: she seals a backup password to it and leaves it with the servers, and cannot read it back. The administrator lists, fetches and opens it. Then web1, a depositor too, deposits its LUKS recovery key with its own keytab."
 step 0 "Create the drop seal, with carol as a depositor" \
