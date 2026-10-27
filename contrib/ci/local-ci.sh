@@ -147,6 +147,7 @@ has_krb5kdc=0
 has_msrv=0
 has_mdbook=0
 has_mdbook_mermaid=0
+has_scdoc=0
 
 detect_tools() {
     echo -e "${BOLD}${CYAN}Tool availability check:${NC}"
@@ -222,6 +223,13 @@ detect_tools() {
         echo -e "  ${GREEN}✓${NC} mdbook-mermaid (found)"
     else
         echo -e "  ${YELLOW}○${NC} mdbook-mermaid (optional, for diagrams in the book; cargo install mdbook-mermaid)"
+    fi
+
+    if command -v scdoc >/dev/null 2>&1; then
+        has_scdoc=1
+        echo -e "  ${GREEN}✓${NC} scdoc $(scdoc --version 2>/dev/null | cut -d' ' -f2)"
+    else
+        echo -e "  ${YELLOW}○${NC} scdoc (optional, for the man pages; your distribution's scdoc package)"
     fi
 
     if [[ -n "$MSRV" ]] && command -v rustup >/dev/null 2>&1 \
@@ -452,6 +460,28 @@ job_doc() {
 
     echo "Building documentation…"
     cargo doc --workspace --no-deps --all-features || return 1
+
+    if [[ "$has_scdoc" -eq 1 ]]; then
+        echo "Compiling the man pages…"
+        local out
+        out=$(mktemp -d)
+        local page
+        for page in docs/man/*.scd; do
+            scdoc < "$page" > "$out/$(basename "${page%.scd}")" || return 1
+        done
+        # A compiled page must also render: catches empty output and
+        # truncated sources.
+        if command -v man >/dev/null 2>&1; then
+            for page in "$out"/*; do
+                MANWIDTH=80 man -l "$page" > /dev/null || return 1
+            done
+        else
+            warn "man not found — rendering the compiled pages is skipped"
+        fi
+        rm -rf "$out"
+    else
+        warn "scdoc not found — skipping the man pages (install your distribution's scdoc package)"
+    fi
 
     if [[ "$has_mdbook" -eq 0 ]]; then
         warn "mdbook not found — skipping the book (install with: cargo install mdbook)"
