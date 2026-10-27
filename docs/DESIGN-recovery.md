@@ -19,7 +19,7 @@ the most managed:
 | piece | status |
 |---|---|
 | recovery codes (`kuipa seal recovery-code`, `recover code`, `recover finish`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
-| recovery shards (`kuipa seal recovery-shards`, `recover shards`): N of M paper shards | designed here (§2.1); the share format, Shamir splitting, word code and passphrase mask are implemented and tested (`kuipa-enroll::shards`); the server operations and commands are **not** |
+| recovery shards (`kuipa seal recovery-shards`, `recover shards`): N of M paper shards | implemented, tested against a real KDC (the share format, Shamir splitting, word code and passphrase mask in `kuipa-enroll::shards`; the `escrow-shards`/`enroll-shards`/`recover-shards` operations and the commands); the LDAP side **not yet run against FreeIPA** |
 | depositors, deposits, `kuipa seal deposit put`, `list`, `fetch`, `retire` | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | device-key deposits and delivery (`kuipa seal recover helpdesk`, `deliver`, `fetch`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | `kuipa escrow luks`, `kuipa escrow file` | implemented, tested against a real KDC (a LUKS key as `systemd-cryptenroll` prints it); **not yet run** against a real LUKS volume |
