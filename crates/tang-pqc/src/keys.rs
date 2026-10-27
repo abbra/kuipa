@@ -303,6 +303,23 @@ impl ExchangeKeyPair {
         Self::generate(KemAlg::preferred()?)
     }
 
+    /// The key pair FIPS 203 key generation makes from `seed`, the 64 bytes `d ‖ z`: the same pair
+    /// the private JWK holding that seed loads as. For keys that must be made again from a secret
+    /// someone keeps (a recovery key kept on paper), not for fresh keys, which
+    /// [`generate`](Self::generate) makes with a random seed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] for a seed that is not 64 bytes,
+    /// [`Error::DisabledBySystemPolicy`] if the system crypto policy disables `alg`.
+    pub fn from_seed_bytes(alg: KemAlg, seed: &[u8]) -> Result<Self> {
+        if seed.len() != KemAlg::SEED_LEN {
+            return Err(Error::Malformed("ML-KEM seed must be 64 bytes"));
+        }
+        alg.ensure_allowed()?;
+        Self::from_seed(alg, SecretBuf::from_slice(seed))
+    }
+
     fn from_seed(alg: KemAlg, seed: SecretBuf) -> Result<Self> {
         let mut pair = Self::from_pkey(keygen_from_seed(alg.name(), &seed)?)?;
         pair.seed = Some(seed);
@@ -796,6 +813,22 @@ mod tests {
             let k = ExchangeKeyPair::generate(alg).unwrap();
             let k2 = ExchangeKeyPair::from_jwk(k.to_jwk().unwrap().as_ref()).unwrap();
             assert_eq!(k.public().kid(), k2.public().kid());
+        }
+    }
+
+    #[test]
+    fn seed_bytes_give_the_same_pair_as_the_jwk() {
+        for alg in KemAlg::ALL {
+            let k = ExchangeKeyPair::generate(alg).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_slice(k.to_jwk().unwrap().as_ref()).unwrap();
+            let seed = b64::decode(v["priv"].as_str().unwrap()).unwrap();
+            let made = ExchangeKeyPair::from_seed_bytes(alg, &seed).unwrap();
+            assert_eq!(made.public().kid(), k.public().kid());
+            assert!(matches!(
+                ExchangeKeyPair::from_seed_bytes(alg, &seed[..63]),
+                Err(Error::Malformed(_))
+            ));
         }
     }
 
