@@ -467,6 +467,12 @@ enum SealCommand {
         #[command(subcommand)]
         action: RecoverAction,
     },
+    /// The N-of-M paper-shard backup of your device keys: make, check or
+    /// join a set (`DESIGN-recovery.md`).
+    RecoveryShards {
+        #[command(subcommand)]
+        action: RecoveryShardsAction,
+    },
     /// Ask the seal's approvers to approve the release of a sealed file.
     Request {
         /// The seal.
@@ -731,6 +737,67 @@ enum RecoverAction {
         #[arg(long)]
         retire_old: bool,
         /// Read the device passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Bring back a lost device's key with its paper shards: read the
+    /// words of at least N papers ("?" for a word you cannot read), then
+    /// the recovery passphrase.
+    Shards {
+        /// The device whose key to recover, if the set covers several.
+        #[arg(long, value_name = "ID", allow_hyphen_values = true)]
+        device: Option<String>,
+        /// Read the recovery passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        recovery_file: Option<String>,
+        /// Read this host's device passphrase (or the one to protect the
+        /// recovered key with) from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+}
+
+/// `kuipa seal recovery-shards` subcommands.
+#[derive(Subcommand)]
+enum RecoveryShardsAction {
+    /// Make a new set of papers for this host's device key and register
+    /// the recovery key they stand for: print one page per paper, and
+    /// keep the pages apart.  A new set replaces the old one whole.
+    Create {
+        /// How many papers are enough to recover (2 to --shares).
+        #[arg(long, value_name = "N", default_value_t = 3)]
+        threshold: u8,
+        /// How many papers to print (at most 16).
+        #[arg(long, value_name = "M", default_value_t = 5)]
+        shares: u8,
+        /// Read the recovery passphrase from this file (asked for twice
+        /// otherwise; it is part of the key, and kuipa asks for at least
+        /// 16 characters).
+        #[arg(long, value_name = "FILE")]
+        recovery_file: Option<String>,
+        /// Accept a shorter recovery passphrase than kuipa advises.
+        #[arg(long)]
+        weak_passphrase: bool,
+        /// Make papers with no recovery passphrase at all: the papers
+        /// alone are then the key.
+        #[arg(long)]
+        no_passphrase: bool,
+        /// Read the device key's passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<String>,
+    },
+    /// Check papers without recovering: report what each repairs and
+    /// whether the set would recover.  A paper backup is only as good as
+    /// the day it was tested: run this after printing, and now and then.
+    Check {
+        /// Read the recovery passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        recovery_file: Option<String>,
+    },
+    /// Cover this host's device key under the set already registered, so
+    /// a device added after the papers were printed needs no new paper.
+    Enroll {
+        /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
     },
@@ -2448,6 +2515,100 @@ fn run_deposit(
     }
 }
 
+/// The words of one paper after another, from standard input: a blank
+/// line ends a paper, end of input ends the last.  A word that cannot be
+/// read is typed `?`, as the pages explain.
+fn read_words() -> Result<Vec<String>, Error> {
+    let mut words = Vec::new();
+    let mut text = String::new();
+    for line in std::io::stdin().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            if !text.is_empty() {
+                words.push(std::mem::take(&mut text));
+            }
+            continue;
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    if !text.is_empty() {
+        words.push(text);
+    }
+    if words.is_empty() {
+        return Err("no papers: type each paper's words, a blank line between".into());
+    }
+    Ok(words)
+}
+
+/// The recovery passphrase: a phrase, not a password.  Short ones are
+/// refused, because the papers alone let an attacker try passphrases
+/// offline at PBKDF2 cost (`DESIGN-recovery.md` §2.1); `weak` and
+/// `none` accept a short or empty one, which is the user's risk.
+fn recovery_passphrase(file: Option<&str>, weak: bool, none: bool) -> Result<SecretBuf, Error> {
+    let value = match file {
+        Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
+        None if std::io::stdin().is_terminal() => {
+            let first = prompt("recovery passphrase", true)?;
+            if prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
+                return Err("the passphrases differ".into());
+            }
+            first
+        }
+        None => return Err("no passphrase: give --passphrase-file or run on a terminal".into()),
+    };
+    let chars = String::from_utf8_lossy(value.as_ref()).chars().count();
+    if chars == 0 && !none {
+        return Err(
+            "an empty passphrase means the papers alone are the key: say --no-passphrase if that is what you want"
+                .into(),
+        );
+    }
+    if chars < kuipa_enroll::shards::MIN_PASSPHRASE_CHARS && !(weak || none) {
+        return Err(format!(
+            "a recovery passphrase is at least {} characters: five or six random words. (With --weak-passphrase kuipa makes one of what you typed.)",
+            kuipa_enroll::shards::MIN_PASSPHRASE_CHARS
+        )
+        .into());
+    }
+    Ok(value)
+}
+
+/// `kuipa seal recovery-shards …`.
+fn run_recovery_shards(
+    client: &kuipa_tools::seal::SealClient<'_>,
+    action: &RecoveryShardsAction,
+) -> Result<Value, Error> {
+    match action {
+        RecoveryShardsAction::Create {
+            threshold,
+            shares,
+            recovery_file,
+            weak_passphrase,
+            no_passphrase,
+            passphrase_file,
+        } => {
+            if *threshold > *shares {
+                return Err("--threshold cannot be more than --shares".into());
+            }
+            let recovery =
+                recovery_passphrase(recovery_file.as_deref(), *weak_passphrase, *no_passphrase)?;
+            // The device key keeps its own passphrase: the recovery
+            // passphrase only hides the seed (DESIGN-recovery.md §2.1).
+            let device = passphrase(passphrase_file.as_deref(), false)?;
+            client.recovery_shards(recovery.as_ref(), device.as_ref(), *threshold, *shares)
+        }
+        RecoveryShardsAction::Check { recovery_file } => {
+            let words = read_words()?;
+            let pass = recovery_passphrase(recovery_file.as_deref(), true, true)?;
+            client.recovery_shards_check(&words, pass.as_ref())
+        }
+        RecoveryShardsAction::Enroll { passphrase_file } => {
+            client.recovery_shards_enroll(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        }
+    }
+}
+
 /// `kuipa seal recover …`.
 fn run_recover(
     client: &kuipa_tools::seal::SealClient<'_>,
@@ -2507,6 +2668,24 @@ fn run_recover(
                 paths::write_file(std::path::Path::new(path), &bytes, 0o600)?;
             }
             Ok(value)
+        }
+        RecoverAction::Shards {
+            device,
+            recovery_file,
+            passphrase_file,
+        } => {
+            println!(
+                "Read the words of any of your papers, in any order: a word you cannot read is ?; a blank line ends a paper."
+            );
+            let words = read_words()?;
+            // Any length: a set made with --no-passphrase has none, and
+            // the key id says whether the phrase typed is the right one.
+            let recovery = recovery_passphrase(recovery_file.as_deref(), true, true)?;
+            // The passphrase that protects the recovered key here is the
+            // device passphrase, as `recover code` asks for.
+            let first = !user.device_key().exists();
+            let pass = passphrase(passphrase_file.as_deref(), first)?;
+            client.recover_shards(&words, recovery.as_ref(), pass.as_ref(), device.as_deref())
         }
     }
 }
@@ -2622,6 +2801,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
         SealCommand::Deny { seal, id } => client.decide(seal, id, true),
         SealCommand::Show { seal } => client.show(seal),
         SealCommand::List => client.list(),
+        SealCommand::RecoveryShards { action } => run_recovery_shards(&client, action),
         SealCommand::Revoke { seal } => client.revoke(seal),
     }
 }
@@ -2675,6 +2855,53 @@ fn render_recovery(value: &Value) -> bool {
         println!(
             "Write it down and keep it away from this host. It is shown only now; with it and your password, `kuipa seal recover code` brings this device's key back on another host."
         );
+    } else if let Some(pages) = get(value, "pages").as_array() {
+        println!(
+            "Recovery shard set {} for the key {}; {} of {} papers, and the recovery passphrase you chose, open your device keys.",
+            get(value, "set").as_str().unwrap_or("?"),
+            get(value, "recovery_key").as_str().unwrap_or("?"),
+            get(value, "threshold").as_u64().unwrap_or(0),
+            get(value, "shares").as_u64().unwrap_or(0),
+        );
+        for page in pages {
+            println!();
+            println!(
+                "kuipa recovery shard {} of {} (any {} are needed)  set {}",
+                get(page, "index").as_u64().unwrap_or(0),
+                get(value, "shares").as_u64().unwrap_or(0),
+                get(value, "threshold").as_u64().unwrap_or(0),
+                get(value, "set").as_str().unwrap_or("?"),
+            );
+            for line in list(get(page, "lines")) {
+                println!("{}", line.as_str().unwrap_or("?"));
+            }
+        }
+        println!();
+        println!(
+            "Print or copy each page onto paper, and keep the pages apart. The words alone are not the key: the passphrase is part of it. Check the papers now with `kuipa seal recovery-shards check` — a paper backup is only as good as the day it was tested."
+        );
+    } else if get(value, "repaired").is_array() && !get(value, "recovered").is_string() {
+        println!(
+            "Those papers would recover the set for key {}: the passphrase and the key id match.",
+            get(value, "recovery_key").as_str().unwrap_or("?")
+        );
+        for s in list(get(value, "repaired")) {
+            println!(
+                "  paper {}: {} unreadable word(s), {} wrong word(s) repaired",
+                get(s, "index").as_u64().unwrap_or(0),
+                get(s, "erased").as_u64().unwrap_or(0),
+                get(s, "wrong").as_u64().unwrap_or(0),
+            );
+        }
+    } else if get(value, "hint").is_string() {
+        println!(
+            "The set covers several devices ({}): run again with --device.",
+            list(get(value, "devices"))
+                .iter()
+                .map(|d| d.as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     } else if let Some(device) = get(value, "helpdesk_device").as_str() {
         println!(
             "This host's device is {device}. Give it to the helpdesk, with the id of the lost device; once they have delivered its key, run `kuipa seal recover fetch`."
@@ -2689,6 +2916,14 @@ fn render_recovery(value: &Value) -> bool {
         println!(
             "Device {device} is recovered on this host. Run `kuipa seal recover finish FILE.sealed…` to reseal your files to this host's own device."
         );
+        for s in list(get(value, "repaired")) {
+            println!(
+                "  paper {}: {} unreadable, {} wrong",
+                get(s, "index").as_u64().unwrap_or(0),
+                get(s, "erased").as_u64().unwrap_or(0),
+                get(s, "wrong").as_u64().unwrap_or(0),
+            );
+        }
     } else if get(value, "resealed").is_number() && get(value, "device").is_string() {
         println!(
             "This host's device {} is registered in {} seal(s), and {} file(s) are resealed to it.",
