@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tang-pqc", "crates/kuipa-enroll", "crates/kuipa-gssapi", "crates/kuipa-ldap", "crates/kuipa-fido2", "crates/kuipad", "crates/kuipa-tools", "crates/tang-pqc-clevis", "crates/ml-dsa-blind", "crates/ml-dsa-zk", "crates/kuipa-perf", "shims/rand"]
+members = ["crates/tang-pqc", "crates/kuipa-enroll", "crates/kuipa-gssapi", "crates/kuipa-ldap", "crates/kuipa-fido2", "crates/kuipad", "crates/kuipa-tools", "crates/tang-pqc-clevis", "crates/ml-dsa-blind", "crates/ml-dsa-zk", "crates/kuipa-perf", "shims/rand", "shims/ring"]
 resolver = "3"
 
 [workspace.package]
@@ -28,7 +28,9 @@ missing_docs = "warn"
 pedantic = { level = "warn", priority = -1 }
 incompatible_msrv = "deny"
 
-# hickory's DNS client needs a random generator; take it from OpenSSL
-# instead of rand's RustCrypto ChaCha (see shims/rand).
+# hickory's DNS client needs a random generator and a TLS provider; take
+# both from OpenSSL instead of rand's RustCrypto ChaCha and ring's
+# BoringSSL (see shims/rand and shims/ring).
 [patch.crates-io]
 rand = { path = "shims/rand" }
+ring = { path = "shims/ring" }
