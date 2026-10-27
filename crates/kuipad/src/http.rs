@@ -79,7 +79,7 @@ fn plausible_name(name: &str) -> bool {
 
 /// As [`admit`]; with no `host`, only the source's bucket is used: for
 /// operations that are only ever Kerberos-authenticated (registration,
-/// vault operations), where there is nothing to guess, and whose many
+/// seal operations), where there is nothing to guess, and whose many
 /// users on one host must not share that host's allowance.
 fn admit_for<D>(
     app: &App<D>,
@@ -113,7 +113,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/rekey/{kid}", post(rekey::<D>))
         .route("/ipa/ku/stage/{kid}", post(stage::<D>))
         .route("/ipa/ku/register/{kid}", post(register::<D>))
-        .route("/ipa/ku/vault/{kid}", post(vault::<D>))
+        .route("/ipa/ku/seal/{kid}", post(seal::<D>))
         .route("/ipa/ku/keys/{kid}", post(keys::<D>))
         .route("/ipa/ku/rec/{kid}", post(recover::<D>))
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
@@ -335,7 +335,7 @@ async fn log_head<D: Directory + Send + Sync + 'static>(
 /// A witness's cosignature on the head being served (`IPLS` with its
 /// cosignature, DESIGN-tlog.md §4): JSON `{cosignatures}` (the trusted
 /// ones the served head now carries) when one was added, `409` for a head no longer served (fetch it again), `403` for
-/// no trusted cosignature.  Rate limited by source like vault operations.
+/// no trusted cosignature.  Rate limited by source like seal operations.
 async fn log_cosign<D: Directory + Send + Sync + 'static>(
     State(app): State<Arc<App<D>>>,
     Path(id): Path<String>,
@@ -551,7 +551,7 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     let what = format!("{op:?} {}", request.fqdn());
     let host = match op {
         Operation::Register
-        | Operation::Vault
+        | Operation::Seal
         | Operation::Keys
         | Operation::Tlog
         | Operation::Sign => None,
@@ -613,13 +613,13 @@ async fn register<D: Directory + Send + Sync + 'static>(
     exchange(app, Operation::Register, kid, &headers, body).await
 }
 
-async fn vault<D: Directory + Send + Sync + 'static>(
+async fn seal<D: Directory + Send + Sync + 'static>(
     State(app): State<Arc<App<D>>>,
     Path(kid): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    exchange(app, Operation::Vault, kid, &headers, body).await
+    exchange(app, Operation::Seal, kid, &headers, body).await
 }
 
 async fn keys<D: Directory + Send + Sync + 'static>(
@@ -628,7 +628,7 @@ async fn keys<D: Directory + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Like registration and vault operations: only ever
+    // Like registration and seal operations: only ever
     // Kerberos-authenticated, so only the source's bucket applies.
     exchange(app, Operation::Keys, kid, &headers, body).await
 }
@@ -639,7 +639,7 @@ async fn tlog<D: Directory + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // A lookup of the caller's own entries: Kerberos-only, like vault
+    // A lookup of the caller's own entries: Kerberos-only, like seal
     // operations.
     exchange(app, Operation::Tlog, kid, &headers, body).await
 }
@@ -650,7 +650,7 @@ async fn sign<D: Directory + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Kerberos-only, like vault operations: the source's bucket applies.
+    // Kerberos-only, like seal operations: the source's bucket applies.
     exchange(app, Operation::Sign, kid, &headers, body).await
 }
 
@@ -677,10 +677,10 @@ async fn recover<D: Directory + Send + Sync + 'static>(
         Err(e) => return refused("recover", &e),
     };
     let what = format!("recover {}", request.principal());
-    // A machine vault is opened by its principal, limited before anything
-    // is decapsulated.  A user vault's `P` is its owner, whoever opens it:
+    // A machine seal is opened by its principal, limited before anything
+    // is decapsulated.  A user seal's `P` is its owner, whoever opens it:
     // only the source is limited first, and the opener once known, so a
-    // shared vault's members each have their own allowance (§7.6.12).
+    // shared seal's members each have their own allowance (§7.6.12).
     let machine = app.server.is_machine_request(&request);
     let principal = request.principal().to_string();
     let host = machine.then_some(principal.as_str());

@@ -45,8 +45,8 @@
 //! kuipa status | check [--server S]         is this host healthy?
 //! kuipa escrow luks|file                   deposit recovery keys, as the
 //!                                            host or a service's keytab, into
-//!                                            a vault it cannot open
-//! kuipa seal …                              a user's own and shared vaults:
+//!                                            a seal it cannot open
+//! kuipa seal …                              a user's own and shared seals:
 //!                                            create, share, devices, seal
 //!                                            and open files
 //!                                            (runs as the user, with their
@@ -266,13 +266,13 @@ enum Command {
     },
     /// Remove kuipa's state from this host.
     Leave,
-    /// Seal your own files to a vault of yours: runs as you, with your
+    /// Seal your own files to a seal of yours: runs as you, with your
     /// Kerberos ticket.
     Seal {
         #[command(subcommand)]
         action: SealCommand,
     },
-    /// Deposit recovery keys into a vault the depositor cannot open, with a
+    /// Deposit recovery keys into a seal the depositor cannot open, with a
     /// ticket from the host's keytab or a service's (run as root).
     Escrow {
         #[command(subcommand)]
@@ -331,12 +331,12 @@ enum SignAction {
 /// `kuipa tlog` subcommands.
 #[derive(Subcommand)]
 enum TlogAction {
-    /// Check every server's log for vault `vault`: list what happened
+    /// Check every server's log for seal `seal`: list what happened
     /// since the last watch, and flag what your stored descriptor does
     /// not account for.  Exits non-zero for a flag or a forked log.
     Watch {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
     },
     /// Show the witnesses this host trusts; as root, change them.
     Witnesses {
@@ -369,43 +369,43 @@ enum KeysAction {
     },
 }
 
-/// `kuipa seal` subcommands.  A vault is named by its name when it is the
+/// `kuipa seal` subcommands.  A seal is named by its name when it is the
 /// user's own, and as `OWNER/NAME` when it is shared with them.
 #[derive(Subcommand)]
 enum SealCommand {
-    /// Create a vault, owned by you.
+    /// Create a seal, owned by you.
     Create {
-        /// The vault's name.
-        vault: String,
+        /// The seal's name.
+        seal: String,
         #[command(flatten)]
         policy: PolicyInput,
     },
-    /// Replace a vault's policy.
+    /// Replace a seal's policy.
     Policy {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         #[command(flatten)]
         policy: PolicyInput,
     },
-    /// Share a vault: its members open and seal files and register their
+    /// Share a seal: its members open and seal files and register their
     /// own devices; its managers also change its policy, members and
     /// state.  Managers only.
     Share {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         #[command(flatten)]
         who: MembersInput,
     },
-    /// Stop sharing a vault with managers or members, and drop the
+    /// Stop sharing a seal with managers or members, and drop the
     /// devices they hold.  Managers only, but a member may remove
     /// themselves.
     Unshare {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         #[command(flatten)]
         who: MembersInput,
     },
-    /// Leave sealed files with the servers as deposits, for the vault's
+    /// Leave sealed files with the servers as deposits, for the seal's
     /// members (hosts' LUKS recovery keys, backup passwords, …).
     Deposit {
         #[command(subcommand)]
@@ -416,11 +416,11 @@ enum SealCommand {
         #[command(subcommand)]
         action: DeviceAction,
     },
-    /// Seal a file to a vault (offline when this host has a recent
-    /// description of the vault).
+    /// Seal a file to a seal (offline when this host has a recent
+    /// description of the seal).
     File {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The file to seal.
         file: String,
         /// Where to write the sealed file (default: FILE.sealed).
@@ -446,10 +446,10 @@ enum SealCommand {
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
         /// Read the PIN of the security key holding your IPA passkey from
-        /// this file, for a vault with the passkey factor.
+        /// this file, for a seal with the passkey factor.
         #[arg(long, value_name = "FILE")]
         passkey_pin_file: Option<String>,
-        /// The approved release request (`kuipa seal request`), for a vault
+        /// The approved release request (`kuipa seal request`), for a seal
         /// with approvals.
         #[arg(long, value_name = "ID")]
         request: Option<String>,
@@ -467,61 +467,61 @@ enum SealCommand {
         #[command(subcommand)]
         action: RecoverAction,
     },
-    /// Ask the vault's approvers to approve the release of a sealed file.
+    /// Ask the seal's approvers to approve the release of a sealed file.
     Request {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The sealed file.
         sealed: String,
         /// Why, for the approvers.
         #[arg(long, value_name = "TEXT")]
         reason: String,
     },
-    /// List open release requests: of the vault, or of every vault you
+    /// List open release requests: of the seal, or of every seal you
     /// approve for or have a part in.
     Pending {
-        /// The vault.
-        vault: Option<String>,
+        /// The seal.
+        seal: Option<String>,
     },
     /// Approve a release request.
     Approve {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The request's id (see `kuipa seal pending`).
         id: String,
     },
     /// Deny a release request: it ends on every server.
     Deny {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The request's id.
         id: String,
     },
-    /// Open sealed files and seal them again to the vault's current
+    /// Open sealed files and seal them again to the seal's current
     /// devices.
     Reseal {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The sealed files, rewritten in place.
         sealed: Vec<String>,
         /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
         /// Read the PIN of the security key holding your IPA passkey from
-        /// this file, for a vault with the passkey factor.
+        /// this file, for a seal with the passkey factor.
         #[arg(long, value_name = "FILE")]
         passkey_pin_file: Option<String>,
     },
-    /// Start a session: until it ends, files of the vault open on this
+    /// Start a session: until it ends, files of the seal open on this
     /// host without the passphrase or a ticket.
     Unlock {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// Read the device key's passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
         /// Read the PIN of the security key holding your IPA passkey from
-        /// this file, for a vault with the passkey factor.
+        /// this file, for a seal with the passkey factor.
         #[arg(long, value_name = "FILE")]
         passkey_pin_file: Option<String>,
         /// An offline session: files sealed with --session open without a
@@ -529,30 +529,30 @@ enum SealCommand {
         #[arg(long)]
         offline: bool,
     },
-    /// End the vault's session on this host.
+    /// End the seal's session on this host.
     Lock {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
     },
     /// With registered sealing: make sealed files, and every copy of
     /// them, unopenable.
     Retire {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The sealed files.
         sealed: Vec<String>,
     },
-    /// Describe a vault.
+    /// Describe a seal.
     Show {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
     },
-    /// Describe all your vaults and those shared with you.
+    /// Describe all your seals and those shared with you.
     List,
-    /// Revoke a vault: no file sealed to it opens any more.
+    /// Revoke a seal: no file sealed to it opens any more.
     Revoke {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
     },
 }
 
@@ -566,9 +566,9 @@ enum EscrowAction {
     Luks {
         /// The LUKS volume.
         device: String,
-        /// The vault this host is a depositor of (`OWNER/NAME`).
-        #[arg(long, value_name = "VAULT")]
-        vault: String,
+        /// The seal this host is a depositor of (`OWNER/NAME`).
+        #[arg(long, value_name = "SEAL")]
+        seal: String,
         /// Read the recovery key from this file instead.
         #[arg(long, value_name = "FILE")]
         key_file: Option<String>,
@@ -587,9 +587,9 @@ enum EscrowAction {
         name: String,
         /// The file.
         file: String,
-        /// The vault this host is a depositor of (`OWNER/NAME`).
-        #[arg(long, value_name = "VAULT")]
-        vault: String,
+        /// The seal this host is a depositor of (`OWNER/NAME`).
+        #[arg(long, value_name = "SEAL")]
+        seal: String,
         /// Deposit as the principal of this keytab (a service's or a
         /// user's) rather than as the host.
         #[arg(long, value_name = "FILE")]
@@ -602,7 +602,7 @@ fn run_escrow(paths: &Paths, action: &EscrowAction) -> Result<Value, Error> {
     match action {
         EscrowAction::Luks {
             device,
-            vault,
+            seal,
             key_file,
             uuid,
             keytab,
@@ -618,19 +618,19 @@ fn run_escrow(paths: &Paths, action: &EscrowAction) -> Result<Value, Error> {
                 paths,
                 keytab: keytab.as_deref().map(std::path::Path::new),
             };
-            kuipa_tools::escrow::escrow_luks(&by, vault, device, input.as_ref(), uuid.as_deref())
+            kuipa_tools::escrow::escrow_luks(&by, seal, device, input.as_ref(), uuid.as_deref())
         }
         EscrowAction::File {
             name,
             file,
-            vault,
+            seal,
             keytab,
         } => {
             let by = kuipa_tools::escrow::Depositor {
                 paths,
                 keytab: keytab.as_deref().map(std::path::Path::new),
             };
-            kuipa_tools::escrow::escrow_file(&by, vault, name, &std::fs::read(file)?)
+            kuipa_tools::escrow::escrow_file(&by, seal, name, &std::fs::read(file)?)
         }
     }
 }
@@ -638,27 +638,27 @@ fn run_escrow(paths: &Paths, action: &EscrowAction) -> Result<Value, Error> {
 /// `kuipa seal deposit` subcommands.
 #[derive(Subcommand)]
 enum DepositAction {
-    /// Seal a file to the vault and deposit it, in place of your earlier
+    /// Seal a file to the seal and deposit it, in place of your earlier
     /// deposit of the same name.
     Put {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The file to deposit.
         file: String,
         /// What it is, among your deposits (default: the file's name).
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
-    /// List the vault's deposits: all of them for members, your own for a
+    /// List the seal's deposits: all of them for members, your own for a
     /// depositor.
     List {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
     },
     /// Fetch a deposit's sealed file, to open with `kuipa seal open`.
     Fetch {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The deposit's id.
         id: String,
         /// Where to write the sealed file.
@@ -667,8 +667,8 @@ enum DepositAction {
     },
     /// Remove a deposit: your own, or any as a manager.
     Retire {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The deposit's id.
         id: String,
     },
@@ -689,13 +689,13 @@ enum RecoverAction {
         passphrase_file: Option<String>,
     },
     /// Print this host's device, for the helpdesk to deliver a lost
-    /// device's key to (register it in a vault first).
+    /// device's key to (register it in a seal first).
     Helpdesk {
         /// Read the device passphrase from this file.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<String>,
     },
-    /// As the helpdesk: open a device deposit of the realm's device vault
+    /// As the helpdesk: open a device deposit of the realm's device seal
     /// and deliver the key to the user's new device.
     Deliver {
         /// The deposit's id (`kuipa seal deposit list`).
@@ -706,7 +706,7 @@ enum RecoverAction {
         /// The user's new device (`kuipa seal recover helpdesk` printed it).
         #[arg(long, value_name = "ID", allow_hyphen_values = true)]
         device: String,
-        /// The approved release request, for a vault with approvals.
+        /// The approved release request, for a seal with approvals.
         #[arg(long, value_name = "ID")]
         request: Option<String>,
         /// Read this host's device passphrase from this file.
@@ -726,7 +726,7 @@ enum RecoverAction {
     Finish {
         /// Sealed files, rewritten in place.
         sealed: Vec<String>,
-        /// Remove the recovered device from your vaults and forget it here:
+        /// Remove the recovered device from your seals and forget it here:
         /// files not resealed now stop opening.
         #[arg(long)]
         retire_old: bool,
@@ -754,7 +754,7 @@ struct MembersInput {
     /// As managers, rather than members.
     #[arg(long, conflicts_with = "depositor")]
     manager: bool,
-    /// As depositors, rather than members: they seal to the vault and
+    /// As depositors, rather than members: they seal to the seal and
     /// deposit, and never open it.
     #[arg(long)]
     depositor: bool,
@@ -763,14 +763,14 @@ struct MembersInput {
 impl MembersInput {
     /// Those named, as managers, members or depositors: the sets `share`
     /// and `unshare` take.
-    fn sets(&self) -> [kuipa_enroll::vault::Members; 3] {
-        let set = kuipa_enroll::vault::Members {
+    fn sets(&self) -> [kuipa_enroll::seal::Members; 3] {
+        let set = kuipa_enroll::seal::Members {
             users: self.users.clone(),
             groups: self.groups.clone(),
             hosts: self.hosts.clone(),
             services: self.services.clone(),
         };
-        let none = kuipa_enroll::vault::Members::default;
+        let none = kuipa_enroll::seal::Members::default;
         match (self.manager, self.depositor) {
             (true, _) => [set, none(), none()],
             (_, true) => [none(), none(), set],
@@ -782,12 +782,12 @@ impl MembersInput {
 /// `kuipa seal device` subcommands.
 #[derive(Subcommand)]
 enum DeviceAction {
-    /// Register this host's device key in a vault, making it (under a
+    /// Register this host's device key in a seal, making it (under a
     /// passphrase, or wrapped by a security key's passkey) if this host
     /// has none, or using an ML-KEM key on a PKCS#11 token.
     Add {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// Read the passphrase (or the token's or security key's PIN) from
         /// this file.
         #[arg(long, value_name = "FILE")]
@@ -809,17 +809,17 @@ enum DeviceAction {
         )]
         module: String,
     },
-    /// Remove a device from a vault.
+    /// Remove a device from a seal.
     Remove {
-        /// The vault.
-        vault: String,
+        /// The seal.
+        seal: String,
         /// The device's id (see `kuipa seal show`).
         #[arg(allow_hyphen_values = true)]
         id: String,
     },
 }
 
-/// A vault policy on the command line.
+/// A seal policy on the command line.
 #[derive(clap::Args)]
 struct PolicyInput {
     /// Factors an unlock needs besides the server: `device` (or
@@ -827,7 +827,7 @@ struct PolicyInput {
     /// comma-separated or repeated.
     #[arg(long, value_name = "FACTORS", value_delimiter = ',', required = true)]
     require: Vec<String>,
-    /// How many days the vault lives (default: the realm's limit).
+    /// How many days the seal lives (default: the realm's limit).
     #[arg(long, value_name = "DAYS")]
     expires: Option<u64>,
     /// Which delegated tickets satisfy `ticket`: `allow` or `refuse`.
@@ -840,7 +840,7 @@ struct PolicyInput {
     /// with `kuipa-voucher request --lease-hours`.
     #[arg(long)]
     ticket_leased: bool,
-    /// How many times, in all, the servers may open files of the vault.
+    /// How many times, in all, the servers may open files of the seal.
     #[arg(long, value_name = "N")]
     max_unlocks: Option<u64>,
     /// Allow sessions of up to this many hours (`kuipa seal unlock`).
@@ -877,16 +877,16 @@ struct PolicyInput {
 }
 
 impl PolicyInput {
-    fn approvals(&self) -> Result<Option<kuipa_enroll::vault::Approvals>, Error> {
+    fn approvals(&self) -> Result<Option<kuipa_enroll::seal::Approvals>, Error> {
         let Some(m) = self.approvals else {
             return Ok(None);
         };
-        Ok(Some(kuipa_enroll::vault::Approvals {
+        Ok(Some(kuipa_enroll::seal::Approvals {
             m,
-            from: kuipa_enroll::vault::Members {
+            from: kuipa_enroll::seal::Members {
                 users: self.approver_users.clone(),
                 groups: self.approver_groups.clone(),
-                ..kuipa_enroll::vault::Members::default()
+                ..kuipa_enroll::seal::Members::default()
             },
             window: self
                 .approval_hours
@@ -896,8 +896,8 @@ impl PolicyInput {
         }))
     }
 
-    fn policy(&self) -> Result<kuipa_enroll::vault::Policy, Error> {
-        use kuipa_enroll::vault::{Factors, Level, Policy, TicketDelegation};
+    fn policy(&self) -> Result<kuipa_enroll::seal::Policy, Error> {
+        use kuipa_enroll::seal::{Factors, Level, Policy, TicketDelegation};
         let mut factors = Factors::default();
         for f in &self.require {
             match f.trim() {
@@ -931,8 +931,8 @@ impl PolicyInput {
             })
             .transpose()?;
         let sealing = match self.sealing.as_deref() {
-            None | Some("offline") => kuipa_enroll::vault::Sealing::Offline,
-            Some("registered") => kuipa_enroll::vault::Sealing::Registered,
+            None | Some("offline") => kuipa_enroll::seal::Sealing::Offline,
+            Some("registered") => kuipa_enroll::seal::Sealing::Registered,
             Some(other) => return Err(format!("--sealing {other:?}: offline or registered").into()),
         };
         Ok(Policy {
@@ -943,7 +943,7 @@ impl PolicyInput {
             sealing,
             approvals: self.approvals()?,
             max_unlocks: self.max_unlocks,
-            sessions: kuipa_enroll::vault::Sessions {
+            sessions: kuipa_enroll::seal::Sessions {
                 reauth: self
                     .session_hours
                     .map(|h| h.checked_mul(3600).ok_or("--session-hours is too large"))
@@ -1685,7 +1685,7 @@ fn render_sign(value: &Value) {
 
 fn render_tlog(value: &Value) {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
-    if value.get("vault").is_none() {
+    if value.get("seal").is_none() {
         // `kuipa tlog witnesses`
         let list = get(value, "witnesses")
             .as_array()
@@ -1751,8 +1751,8 @@ fn render_tlog(value: &Value) {
         println!("  baseline  {}: first watch, history not flagged", text(s));
     }
     println!(
-        "Vault {}: {} unexpected.",
-        text(get(value, "vault")),
+        "Seal {}: {} unexpected.",
+        text(get(value, "seal")),
         get(value, "unexpected").as_u64().unwrap_or_default()
     );
 }
@@ -2355,9 +2355,9 @@ fn run_sign(paths: &Paths, action: &SignAction) -> Result<Value, Error> {
 
 fn run_tlog(paths: &Paths, action: &TlogAction) -> Result<Value, Error> {
     match action {
-        TlogAction::Watch { vault } => {
+        TlogAction::Watch { seal } => {
             let user = kuipa_tools::seal::UserPaths::from_env()?;
-            kuipa_tools::seal::SealClient::new(paths, &user, None).watch(vault)
+            kuipa_tools::seal::SealClient::new(paths, &user, None).watch(seal)
         }
         TlogAction::Witnesses {
             add,
@@ -2424,7 +2424,7 @@ fn run_deposit(
     action: &DepositAction,
 ) -> Result<Value, Error> {
     match action {
-        DepositAction::Put { vault, file, name } => {
+        DepositAction::Put { seal, file, name } => {
             let name = name.clone().unwrap_or_else(|| {
                 std::path::Path::new(file)
                     .file_name()
@@ -2432,19 +2432,19 @@ fn run_deposit(
             });
             let subject = std::collections::BTreeMap::from([("name".to_owned(), name)]);
             client.deposit(
-                vault,
+                seal,
                 &std::fs::read(file)?,
-                kuipa_enroll::vault::DepositKind::File,
+                kuipa_enroll::seal::DepositKind::File,
                 subject,
             )
         }
-        DepositAction::List { vault } => client.deposits(vault),
-        DepositAction::Fetch { vault, id, out } => {
-            let sealed = client.deposit_file(vault, id)?;
+        DepositAction::List { seal } => client.deposits(seal),
+        DepositAction::Fetch { seal, id, out } => {
+            let sealed = client.deposit_file(seal, id)?;
             paths::write_file(std::path::Path::new(out), &sealed, 0o600)?;
-            Ok(serde_json::json!({ "vault": vault, "file": id, "sealed": out }))
+            Ok(serde_json::json!({ "seal": seal, "file": id, "sealed": out }))
         }
-        DepositAction::Retire { vault, id } => client.retire_deposit(vault, id),
+        DepositAction::Retire { seal, id } => client.retire_deposit(seal, id),
     }
 }
 
@@ -2519,7 +2519,7 @@ fn run_seal_device(
 ) -> Result<Value, Error> {
     match action {
         DeviceAction::Add {
-            vault,
+            seal,
             passphrase_file,
             pkcs11,
             passkey,
@@ -2530,17 +2530,17 @@ fn run_seal_device(
                     passphrase_file.as_deref(),
                     "security key PIN (empty if none)",
                 )?;
-                client.add_passkey_device(vault, pin.as_ref())
+                client.add_passkey_device(seal, pin.as_ref())
             } else if let Some(uri) = pkcs11 {
                 let pin = passphrase(passphrase_file.as_deref(), false)?;
-                client.add_token_device(vault, std::path::Path::new(module), uri, pin.as_ref())
+                client.add_token_device(seal, std::path::Path::new(module), uri, pin.as_ref())
             } else {
                 let first = !user.device_key().exists() && !user.token_device().exists();
                 let pass = passphrase(passphrase_file.as_deref(), first)?;
-                client.add_device(vault, pass.as_ref())
+                client.add_device(seal, pass.as_ref())
             }
         }
-        DeviceAction::Remove { vault, id } => client.remove_device(vault, id),
+        DeviceAction::Remove { seal, id } => client.remove_device(seal, id),
     }
 }
 
@@ -2552,14 +2552,14 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
     let client = kuipa_tools::seal::SealClient::new(paths, &user, None)
         .with_authenticator(authenticator.as_ref());
     match action {
-        SealCommand::Create { vault, policy } => client.create(vault, policy.policy()?),
-        SealCommand::Policy { vault, policy } => client.set_policy(vault, policy.policy()?),
-        SealCommand::Share { vault, who } => client.share(vault, who.sets()),
-        SealCommand::Unshare { vault, who } => client.unshare(vault, who.sets()),
+        SealCommand::Create { seal, policy } => client.create(seal, policy.policy()?),
+        SealCommand::Policy { seal, policy } => client.set_policy(seal, policy.policy()?),
+        SealCommand::Share { seal, who } => client.share(seal, who.sets()),
+        SealCommand::Unshare { seal, who } => client.unshare(seal, who.sets()),
         SealCommand::Deposit { action } => run_deposit(&client, action),
         SealCommand::Device { action } => run_seal_device(&client, &user, action),
         SealCommand::File {
-            vault,
+            seal,
             file,
             out,
             session,
@@ -2567,62 +2567,62 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             let out = out.clone().unwrap_or_else(|| format!("{file}.sealed"));
             let contents = std::fs::read(file)?;
             let sealed = if *session {
-                client.seal_session(vault, &contents)?
+                client.seal_session(seal, &contents)?
             } else {
-                client.seal(vault, &contents)?
+                client.seal(seal, &contents)?
             };
             paths::write_file(std::path::Path::new(&out), &sealed, 0o600)?;
-            Ok(serde_json::json!({ "vault": vault, "file": file, "sealed": out }))
+            Ok(serde_json::json!({ "seal": seal, "file": file, "sealed": out }))
         }
         open @ SealCommand::Open { .. } => run_open(client, &user, open),
         SealCommand::Reseal {
-            vault,
+            seal,
             sealed,
             passphrase_file,
             passkey_pin_file,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
-            let needed = client.vault_needs_passkey(vault);
+            let needed = client.seal_needs_passkey(seal);
             let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
             for path in sealed {
-                let again = client.reseal(vault, &std::fs::read(path)?, Some(pass.as_ref()))?;
+                let again = client.reseal(seal, &std::fs::read(path)?, Some(pass.as_ref()))?;
                 paths::write_file(std::path::Path::new(path), &again, 0o600)?;
             }
-            Ok(serde_json::json!({ "vault": vault, "resealed": sealed }))
+            Ok(serde_json::json!({ "seal": seal, "resealed": sealed }))
         }
         SealCommand::Unlock {
-            vault,
+            seal,
             passphrase_file,
             passkey_pin_file,
             offline,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
-            let needed = client.vault_needs_passkey(vault);
+            let needed = client.seal_needs_passkey(seal);
             let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
-            client.unlock(vault, pass.as_ref(), *offline)
+            client.unlock(seal, pass.as_ref(), *offline)
         }
-        SealCommand::Lock { vault } => client.lock(vault),
-        SealCommand::Retire { vault, sealed } => {
+        SealCommand::Lock { seal } => client.lock(seal),
+        SealCommand::Retire { seal, sealed } => {
             for path in sealed {
-                client.retire(vault, &std::fs::read(path)?)?;
+                client.retire(seal, &std::fs::read(path)?)?;
             }
-            Ok(serde_json::json!({ "vault": vault, "retired": sealed }))
+            Ok(serde_json::json!({ "seal": seal, "retired": sealed }))
         }
         SealCommand::Request {
-            vault,
+            seal,
             sealed,
             reason,
-        } => client.request(vault, &std::fs::read(sealed)?, reason),
-        SealCommand::Pending { vault } => client.pending(vault.as_deref()),
+        } => client.request(seal, &std::fs::read(sealed)?, reason),
+        SealCommand::Pending { seal } => client.pending(seal.as_deref()),
         SealCommand::RecoveryCode { passphrase_file } => {
             client.recovery_code(passphrase(passphrase_file.as_deref(), false)?.as_ref())
         }
         SealCommand::Recover { action } => run_recover(&client, &user, action),
-        SealCommand::Approve { vault, id } => client.decide(vault, id, false),
-        SealCommand::Deny { vault, id } => client.decide(vault, id, true),
-        SealCommand::Show { vault } => client.show(vault),
+        SealCommand::Approve { seal, id } => client.decide(seal, id, false),
+        SealCommand::Deny { seal, id } => client.decide(seal, id, true),
+        SealCommand::Show { seal } => client.show(seal),
         SealCommand::List => client.list(),
-        SealCommand::Revoke { vault } => client.revoke(vault),
+        SealCommand::Revoke { seal } => client.revoke(seal),
     }
 }
 
@@ -2691,9 +2691,9 @@ fn render_recovery(value: &Value) -> bool {
         );
     } else if get(value, "resealed").is_number() && get(value, "device").is_string() {
         println!(
-            "This host's device {} is registered in {} vault(s), and {} file(s) are resealed to it.",
+            "This host's device {} is registered in {} seal(s), and {} file(s) are resealed to it.",
             get(value, "device").as_str().unwrap_or("?"),
-            list(get(value, "vaults")).len(),
+            list(get(value, "seals")).len(),
             get(value, "resealed")
         );
         match get(value, "retired").as_str() {
@@ -2715,9 +2715,9 @@ fn render_requests(requests: &[Value]) {
     }
     for r in requests {
         println!(
-            "Release request {} of vault {}, by {}:",
+            "Release request {} of seal {}, by {}:",
             get(r, "id").as_str().unwrap_or("?"),
-            get(r, "vault").as_str().unwrap_or("?"),
+            get(r, "seal").as_str().unwrap_or("?"),
             get(r, "requester").as_str().unwrap_or("?"),
         );
         let mut rows = Rows::default();
@@ -2730,7 +2730,7 @@ fn render_requests(requests: &[Value]) {
     }
 }
 
-/// What opening a vault with `factors` needs, in words.
+/// What opening a seal with `factors` needs, in words.
 fn opening_needs(factors: &Value) -> String {
     let mut needs = Vec::new();
     if let Some(level) = get(factors, "device").as_str() {
@@ -2764,13 +2764,13 @@ fn render_seal(value: &Value) {
             );
         }
     }
-    if let Some(vaults) = get(value, "vaults").as_array() {
-        if vaults.is_empty() {
-            println!("No vaults.");
+    if let Some(seals) = get(value, "seals").as_array() {
+        if seals.is_empty() {
+            println!("No seals.");
         }
-        for v in vaults {
+        for v in seals {
             println!(
-                "Vault {} ({}), {}:",
+                "Seal {} ({}), {}:",
                 get(v, "name").as_str().unwrap_or("?"),
                 get(v, "owner").as_str().unwrap_or("?"),
                 get(v, "state").as_str().unwrap_or("?")
@@ -2816,9 +2816,9 @@ fn render_seal(value: &Value) {
         && get(value, "file").is_string()
     {
         println!(
-            "{} is sealed to vault {} as {out}.",
+            "{} is sealed to seal {} as {out}.",
             get(value, "file").as_str().unwrap_or("The file"),
-            get(value, "vault").as_str().unwrap_or("?")
+            get(value, "seal").as_str().unwrap_or("?")
         );
     } else if get(value, "written").is_string() {
         println!(
@@ -2830,9 +2830,9 @@ fn render_seal(value: &Value) {
         println!("No copy of these opens any more:");
         items(get(value, "retired"), "  ");
     } else if let Some(name) = get(value, "locked").as_str() {
-        println!("Vault {name}'s session on this host has ended.");
+        println!("Seal {name}'s session on this host has ended.");
     } else if get(value, "resealed").is_array() {
-        println!("Sealed again to the vault's current devices:");
+        println!("Sealed again to the seal's current devices:");
         items(get(value, "resealed"), "  ");
     } else {
         println!("{value}");

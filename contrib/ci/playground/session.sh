@@ -207,14 +207,14 @@ step 0 "Write the plain file back and retire its bindings" \
     "are retired"
 
 section "Sealing your own files" \
-    "A user seals files of their own to a vault of theirs: opening needs this host's device key (under a passphrase), the user's Kerberos ticket, and a server that agrees. Nothing here runs as root."
+    "A user seals files of their own to a seal of theirs: opening needs this host's device key (under a passphrase), the user's Kerberos ticket, and a server that agrees. Nothing here runs as root."
 step 0 "Log in as the administrator" 'pq_admin_kinit'
-step 0 "Create a vault that needs a device and the ticket" \
+step 0 "Create a seal that needs a device and the ticket" \
     'kuipa seal create personal --require device,ticket' \
     "opening needs: a registered device (any) and your Kerberos ticket"
 step 0 "Register this host's device key, made under a passphrase" \
     'echo "correct horse" > "$KUIPA_PLAYGROUND/pass" && kuipa seal device add personal --passphrase-file "$KUIPA_PLAYGROUND/pass"'
-step 0 "Seal a file, offline once the vault is described" \
+step 0 "Seal a file, offline once the seal is described" \
     'echo "token=playground-user" > "$KUIPA_PLAYGROUND/notes.txt" && kuipa seal file personal "$KUIPA_PLAYGROUND/notes.txt"'
 step 0 "Open it to standard output: only the plaintext arrives" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" | cat' \
@@ -222,8 +222,8 @@ step 0 "Open it to standard output: only the plaintext arrives" \
 step 1 "A wrong passphrase does not open the device key" \
     'echo wrong > "$KUIPA_PLAYGROUND/wrong" && kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong"'
 
-section "Your vault's transparency log" \
-    "Every server logs each change to a vault and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the vault and flags what the vault description stored on this host does not explain: a listed device is expected wherever it is used, and a change this host does not know of, even the owner's own from another machine, is flagged until seal show stores it; kuipa-audit tlog replays a server's whole log, naming nobody."
+section "Your seal's transparency log" \
+    "Every server logs each change to a seal and each release of its share of a file, in a public log it cannot rewrite unnoticed.  kuipa tlog watch checks every server's log for the seal and flags what the seal description stored on this host does not explain: a listed device is expected wherever it is used, and a change this host does not know of, even the owner's own from another machine, is flagged until seal show stores it; kuipa-audit tlog replays a server's whole log, naming nobody."
 step 0 "The first watch records where each log stands" \
     'kuipa tlog watch personal' "baseline" "add-device" "release" "UTC" "0 unexpected"
 step 0 "Nothing new since: a quiet watch" \
@@ -249,7 +249,7 @@ step 0 "Opening a file is logged as a release; --json keeps Unix times" \
     '"action":"release"' '"unexpected":0'
 step 0 "An auditor replays ipa1's whole log from its public routes" \
     'kuipa-audit tlog --server ipa1.example.test --state "$KUIPA_PLAYGROUND/tlog-audit.json"' \
-    "verified" "vault-device" "escrow-release"
+    "verified" "seal-device" "escrow-release"
 step 0 "The next audit requires the log to extend the recorded head" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" >/dev/null && kuipa-audit tlog --server ipa1.example.test --state "$KUIPA_PLAYGROUND/tlog-audit.json"' \
     "verified" "recorded"
@@ -272,7 +272,7 @@ step 0 "After the witness's next pass it is, and the watch moves on" \
     'kuipa-witness run --once --key "$KUIPA_PLAYGROUND/witness/witness.jwk" --state "$KUIPA_PLAYGROUND/witness/state.json" --server ipa1.example.test >/dev/null && kuipa tlog watch personal' \
     "release" "0 unexpected"
 
-step 0 "A vault that allows hour-long sessions and 10 unlocks" \
+step 0 "A seal that allows hour-long sessions and 10 unlocks" \
     'kuipa seal create daily --require device,ticket --session-hours 1 --max-unlocks 10 && kuipa seal device add daily --passphrase-file "$KUIPA_PLAYGROUND/pass"' \
     "unlocks allowed: 10"
 step 0 "Seal a note to it" \
@@ -283,35 +283,35 @@ step 0 "Open without the passphrase while the session lasts" \
     'kuipa seal open "$KUIPA_PLAYGROUND/daily.txt.sealed" --out - </dev/null | cat' "daily note"
 step 0 "End the session" 'kuipa seal lock daily' "has ended"
 step 0 "The servers counted the releases" 'kuipa seal show daily' "unlocks so far: 1"
-step 0 "Offline sessions (this realm allows them): a vault opts in" \
+step 0 "Offline sessions (this realm allows them): a seal opts in" \
     'kuipa seal create travel --require device,ticket --offline-hours 2 && kuipa seal device add travel --passphrase-file "$KUIPA_PLAYGROUND/pass"'
 step 0 "Seal a file for offline use" \
     'echo "boarding pass" > "$KUIPA_PLAYGROUND/pass.txt" && kuipa seal file travel "$KUIPA_PLAYGROUND/pass.txt" --session'
-step 0 "Release the vault's session key to this device" \
+step 0 "Release the seal's session key to this device" \
     'kuipa seal unlock travel --offline --passphrase-file "$KUIPA_PLAYGROUND/pass"' "Offline session started"
 step 0 "With every server down, the file still opens" \
     'pq_down ipa1 >/dev/null && pq_down ipa2 >/dev/null && kuipa seal open "$KUIPA_PLAYGROUND/pass.txt.sealed" --out - </dev/null | cat; pq_up' \
     "boarding pass"
 step 0 "End the offline session" 'kuipa seal lock travel' "has ended"
-step 0 "Revoke the vault" 'kuipa seal revoke personal' "revoked"
-step 75 "No server opens a file of a revoked vault" \
+step 0 "Revoke the seal" 'kuipa seal revoke personal' "revoked"
+step 75 "No server opens a file of a revoked seal" \
     'kuipa seal open "$KUIPA_PLAYGROUND/notes.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
 
 section "Realm limits" \
-    "The realm sets what users may choose. Here every vault needs a device, and only the travellers group may have offline sessions: the administrator, who made the offline vault above, is a traveller; bob is not."
-step fail "A vault without the device factor is refused (the server log says why)" \
+    "The realm sets what users may choose. Here every seal needs a device, and only the travellers group may have offline sessions: the administrator, who made the offline seal above, is a traveller; bob is not."
+step fail "A seal without the device factor is refused (the server log says why)" \
     'kuipa seal create weak --require ticket' "refused the request"
 step fail "bob is no traveller: no offline sessions for him" \
     'pq_as bob kuipa seal create trip --require device,ticket --offline-hours 2' \
     "refused the request"
 
-section "Sharing a vault with a team" \
-    "The administrator shares a vault with bob. bob names it admin/team, registers a device of his own, and opens with his own device and ticket."
-step 0 "Create the team vault and share it with bob" \
+section "Sharing a seal with a team" \
+    "The administrator shares a seal with bob. bob names it admin/team, registers a device of his own, and opens with his own device and ticket."
+step 0 "Create the team seal and share it with bob" \
     'kuipa seal create team --require device,ticket && kuipa seal device add team --passphrase-file "$KUIPA_PLAYGROUND/pass" && kuipa seal share team --user bob' \
     "members: user:bob@EXAMPLE.TEST"
-step 0 "bob finds it among his vaults, under its owner" \
-    'pq_as bob kuipa seal list' "Vault team (admin@EXAMPLE.TEST)"
+step 0 "bob finds it among his seals, under its owner" \
+    'pq_as bob kuipa seal list' "Seal team (admin@EXAMPLE.TEST)"
 step 0 "bob registers his own device in it" \
     'echo "bob staple" > "$KUIPA_PLAYGROUND/bob-pass" && pq_as bob kuipa seal device add admin/team --passphrase-file "$KUIPA_PLAYGROUND/bob-pass"' \
     "bob@EXAMPLE.TEST"
@@ -325,8 +325,8 @@ step 0 "And bob with his" \
     "db=hunter2"
 
 section "Break-glass approvals" \
-    "Every release of this vault waits for two approvals, from bob and carol. The administrator asks, saying why; bob and carol approve with their own tickets; then the administrator opens that one file, once."
-step 0 "Create the vault and seal the root password to it" \
+    "Every release of this seal waits for two approvals, from bob and carol. The administrator asks, saying why; bob and carol approve with their own tickets; then the administrator opens that one file, once."
+step 0 "Create the seal and seal the root password to it" \
     'kuipa seal create root-pw --require device,ticket --approvals 2 --approver-user bob --approver-user carol && kuipa seal device add root-pw --passphrase-file "$KUIPA_PLAYGROUND/pass" && echo "root=correct-battery" > "$KUIPA_PLAYGROUND/root.txt" && kuipa seal file root-pw "$KUIPA_PLAYGROUND/root.txt"'
 step 75 "Without approvals, the device and the ticket are not enough" \
     'kuipa seal open "$KUIPA_PLAYGROUND/root.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass"'
@@ -351,7 +351,7 @@ section "A device key on a token" \
     "On another machine, the administrator's device key is an ML-KEM key on a PKCS#11 token: it never leaves the token, and every use needs the token's PIN. The playground's token is kryoptic, in software; a smart card or HSM with PKCS#11 3.2 works the same way."
 step 0 "Make an ML-KEM-768 key on the token" \
     'uri=$(pq_token admin-dev) && echo "$uri"' "pkcs11:token=kuipa;object=admin-dev"
-step 0 "Create a vault and register the token's key as its device" \
+step 0 "Create a seal and register the token's key as its device" \
     'echo 1234 > "$KUIPA_PLAYGROUND/token-pin" && kuipa seal create hw --require device,ticket && KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-token" kuipa seal device add hw --pkcs11 "$uri" --module "$PQ_TOKEN_MODULE" --passphrase-file "$KUIPA_PLAYGROUND/token-pin"' \
     "pkcs11, any"
 step 0 "Seal a file to it: no key file is written on this machine" \
@@ -363,10 +363,10 @@ step 1 "A wrong PIN opens nothing" \
     'echo 0000 > "$KUIPA_PLAYGROUND/wrong-pin" && KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/admin-token" kuipa seal open "$KUIPA_PLAYGROUND/hw.txt.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/wrong-pin"'
 
 section "Passkeys on a security key" \
-    "The administrator registers a post-quantum (ML-DSA-65) passkey in IPA, on a security key with a PIN: here the software security key kuipa is built with for the playground. A vault can require one of the user's IPA passkeys, which the servers check, and a device key can be wrapped by a passkey's hmac-secret, so every use needs a touch. Classical passkeys (ES256, EdDSA, RS256, ES384) work the same way."
+    "The administrator registers a post-quantum (ML-DSA-65) passkey in IPA, on a security key with a PIN: here the software security key kuipa is built with for the playground. A seal can require one of the user's IPA passkeys, which the servers check, and a device key can be wrapped by a passkey's hmac-secret, so every use needs a touch. Classical passkeys (ES256, EdDSA, RS256, ES384) work the same way."
 step 0 "Register an ML-DSA-65 passkey, as ipa user-add-passkey --register does" \
     'pq_passkey mldsa65 --pin 4321' "registered to admin@EXAMPLE.TEST"
-step 0 "A vault that needs a device and a passkey, with sessions" \
+step 0 "A seal that needs a device and a passkey, with sessions" \
     'kuipa seal create signing --require device,passkey --session-hours 1' \
     "a registered device (any) and one of your IPA passkeys"
 step 0 "Register a device key wrapped by a passkey of its own on the same security key" \
@@ -418,12 +418,12 @@ step 0 "The new laptop opens the resealed file" \
     "db=hunter2"
 
 section "The helpdesk brings a device back" \
-    "carol runs the helpdesk vault the realm names for device keys; the administrator approves each release from it. bob's desk deposits its device key when he registers it. The desk is lost, bob has no recovery code: carol delivers the key to his new desk, encrypted to its device."
-step 0 "carol creates the helpdesk vault; the administrator approves its releases" \
+    "carol runs the helpdesk seal the realm names for device keys; the administrator approves each release from it. bob's desk deposits its device key when he registers it. The desk is lost, bob has no recovery code: carol delivers the key to his new desk, encrypted to its device."
+step 0 "carol creates the helpdesk seal; the administrator approves its releases" \
     'echo "carol staple" > "$KUIPA_PLAYGROUND/carol-pass" && pq_as carol kuipa seal create device-escrow --require device,ticket --approvals 1 --approver-user admin && pq_as carol kuipa seal device add device-escrow --passphrase-file "$KUIPA_PLAYGROUND/carol-pass" && pq_as carol kuipa seal share device-escrow --depositor --user bob' \
     "depositors: user:bob@EXAMPLE.TEST"
 step 0 "The realm keeps device keys there" \
-    'kuipa-playground recovery --vault carol/device-escrow' "device keys are deposited in carol/device-escrow"
+    'kuipa-playground recovery --seal carol/device-escrow' "device keys are deposited in carol/device-escrow"
 step 0 "bob's desk registers a device: its key is deposited first" \
     'desk() { pq_as bob env KUIPA_USER_DIR="$KUIPA_PLAYGROUND/users/bob-$1" "${@:2}"; } && desk desk kuipa seal create keys --require device,ticket && desk desk kuipa seal device add keys --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" && echo "vpn=bob-secret" > "$KUIPA_PLAYGROUND/keys.txt" && desk desk kuipa seal file keys "$KUIPA_PLAYGROUND/keys.txt" && old=$(desk desk kuipa --json seal recover helpdesk --passphrase-file "$KUIPA_PLAYGROUND/bob-pass" | python3 -c "import json,sys; print(json.load(sys.stdin)[\"helpdesk_device\"])") && pq_as carol kuipa seal deposit list device-escrow' \
     "(device, device=" "by bob@EXAMPLE.TEST"
@@ -443,14 +443,14 @@ step 0 "bob fetches it on the new desk, and his file opens there" \
     "is recovered on this host" "vpn=bob-secret"
 
 section "Deposits" \
-    "carol is a depositor of the administrator's drop vault: she seals a backup password to it and leaves it with the servers, and cannot read it back. The administrator lists, fetches and opens it. Then web1, a depositor too, deposits its LUKS recovery key with its own keytab."
-step 0 "Create the drop vault, with carol as a depositor" \
+    "carol is a depositor of the administrator's drop seal: she seals a backup password to it and leaves it with the servers, and cannot read it back. The administrator lists, fetches and opens it. Then web1, a depositor too, deposits its LUKS recovery key with its own keytab."
+step 0 "Create the drop seal, with carol as a depositor" \
     'kuipa seal create drop --require device,ticket --sealing registered && kuipa seal device add drop --passphrase-file "$KUIPA_PLAYGROUND/pass" && kuipa seal share drop --depositor --user carol' \
     "depositors: user:carol@EXAMPLE.TEST"
 step 0 "carol deposits a backup password" \
     'echo "restic=s3cret" > "$KUIPA_PLAYGROUND/restic.txt" && pq_as carol kuipa seal deposit put admin/drop "$KUIPA_PLAYGROUND/restic.txt" --name restic' \
     "name=restic" "by carol@EXAMPLE.TEST"
-step 0 "The administrator lists the vault's deposits" \
+step 0 "The administrator lists the seal's deposits" \
     'dep=$(kuipa --json seal deposit list drop) && echo "$dep" && did=$(sed -n "s/.*\"id\":\"\([0-9a-f]\{32\}\)\".*/\1/p" <<<"$dep") && test -n "$did"' \
     '"depositor":"carol@EXAMPLE.TEST"'
 step fail "carol, a depositor, cannot fetch it back" \
@@ -462,7 +462,7 @@ step 0 "web1 becomes a depositor too" \
     'kuipa seal share drop --depositor --host web1.example.test' \
     "host:web1.example.test"
 step 0 "web1 deposits its LUKS recovery key, with its own keytab" \
-    'printf "A secret recovery key has been generated for this volume:\n\n    fejrltbu-bjitujnh-dfhrrbrk-hgbtdbgg-cbbitcrk-kclhkdgb-gbbhgjvb-ldbbrleb\n" > "$KUIPA_PLAYGROUND/cryptenroll.txt" && kuipa escrow luks /dev/vda2 --vault admin/drop --uuid 0b9c7f1e-6d2a-4c55-9a51-3e1f6b2d8c70 < "$KUIPA_PLAYGROUND/cryptenroll.txt"' \
+    'printf "A secret recovery key has been generated for this volume:\n\n    fejrltbu-bjitujnh-dfhrrbrk-hgbtdbgg-cbbitcrk-kclhkdgb-gbbhgjvb-ldbbrleb\n" > "$KUIPA_PLAYGROUND/cryptenroll.txt" && kuipa escrow luks /dev/vda2 --seal admin/drop --uuid 0b9c7f1e-6d2a-4c55-9a51-3e1f6b2d8c70 < "$KUIPA_PLAYGROUND/cryptenroll.txt"' \
     "luks" "by host/web1.example.test@EXAMPLE.TEST"
 step 0 "The helpdesk reads it back when the disk will not unlock" \
     'lid=$(kuipa --json seal deposit list drop | tr "{" "\n" | grep "\"kind\":\"luks\"" | sed -n "s/.*\"id\":\"\([0-9a-f]\{32\}\)\".*/\1/p") && kuipa seal deposit fetch drop "$lid" --out "$KUIPA_PLAYGROUND/luks.sealed" && kuipa seal open "$KUIPA_PLAYGROUND/luks.sealed" --out - --passphrase-file "$KUIPA_PLAYGROUND/pass" | cat' \
@@ -521,8 +521,8 @@ section "Voucher enrollment" \
 step 0 "Enroll web6 with a bound voucher" 'pq_voucher web6 --bound'
 
 section "CI runners with leases" \
-    "carol, a CI administrator, keeps the deploy token in a vault of the ci-runners host group that opens with a ticket alone, and only for a host whose lease is running. The autoscaler's voucher gives runner1 a 4-hour lease: the KDC issues it no ticket after that, and the realm removes it an hour later."
-step 0 "carol makes the pipeline vault and seals the deploy token to it" \
+    "carol, a CI administrator, keeps the deploy token in a seal of the ci-runners host group that opens with a ticket alone, and only for a host whose lease is running. The autoscaler's voucher gives runner1 a 4-hour lease: the KDC issues it no ticket after that, and the realm removes it an hour later."
+step 0 "carol makes the pipeline seal and seals the deploy token to it" \
     'pq_as carol kuipa seal create deploy --require ticket --ticket-leased --sealing registered && pq_as carol kuipa seal share deploy --group ci-runners && echo "token=deploy-secret" > "$KUIPA_PLAYGROUND/deploy.txt" && pq_as carol kuipa seal file deploy "$KUIPA_PLAYGROUND/deploy.txt"' \
     "members: group:ci-runners"
 step 0 "runner1 joins with a leased voucher" \

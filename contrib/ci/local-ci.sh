@@ -679,7 +679,7 @@ run_interactive_playground() {
     echo "    pq_admin_kinit; kuipa seal create team --require device,ticket"
     echo "    kuipa seal share team --user bob; pq_as bob kuipa seal list"
     echo "    pq_passkey mldsa65 --pin 1234          # an IPA passkey on a software security key"
-    echo "    kuipa seal device add VAULT --pkcs11 \"\$(pq_token dev)\" --module \$PQ_TOKEN_MODULE"
+    echo "    kuipa seal device add SEAL --pkcs11 \"\$(pq_token dev)\" --module \$PQ_TOKEN_MODULE"
     echo
     echo "  Exit this shell (exit or Ctrl-D) to tear the playground down."
     echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"

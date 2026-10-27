@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kuipa_enroll::vault::DeviceKey;
+use kuipa_enroll::seal::DeviceKey;
 use native_ossl::lib_ctx::{LibCtx, Provider};
 use native_ossl::store::{Store, StoreObject};
 use native_ossl::util::SecretBuf;

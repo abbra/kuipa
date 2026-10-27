@@ -614,7 +614,7 @@ mod tests {
         let ledger = eager(&dir);
         for i in 0..3u8 {
             let a = ledger
-                .append(event(Kind::VAULT_DEVICE, T, b"vault", &[i]))
+                .append(event(Kind::SEAL_DEVICE, T, b"seal", &[i]))
                 .unwrap()
                 .unwrap();
             assert_eq!(a.index, u64::from(i));
@@ -646,7 +646,7 @@ mod tests {
                 .iter()
                 .all(|l| l.index == Hash::zero(TreeHash::Sha256))
         );
-        let found = Ledger::find(&again, b"vault", 0, 4, 10).unwrap();
+        let found = Ledger::find(&again, b"seal", 0, 4, 10).unwrap();
         assert_eq!(found.len(), 3);
         assert!(found.iter().all(|e| {
             e.opening
@@ -671,14 +671,14 @@ mod tests {
         let dir = temp("torn-opening");
         let ledger = eager(&dir);
         ledger
-            .append(event(Kind::VAULT_POLICY, T, b"v", b"a"))
+            .append(event(Kind::SEAL_POLICY, T, b"v", b"a"))
             .unwrap();
         let path = ledger.path().to_owned();
         let month_file = ledger.openings_dir.join(month_name(month(T).unwrap()));
         drop(ledger);
         // A crash between the opening and its leaf: an opening for
         // position 1, and no leaf 1.
-        let o = event(Kind::VAULT_POLICY, T, b"v", b"b").to_bytes();
+        let o = event(Kind::SEAL_POLICY, T, b"v", b"b").to_bytes();
         let mut record = u32::try_from(o.len() + 8).unwrap().to_be_bytes().to_vec();
         record.extend_from_slice(&1u64.to_be_bytes());
         record.extend_from_slice(&o);
@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(reopened.size(), 1);
         // The next append takes position 1 with its own opening.
         reopened
-            .append(event(Kind::VAULT_POLICY, T, b"w", b"c"))
+            .append(event(Kind::SEAL_POLICY, T, b"w", b"c"))
             .unwrap();
         drop(reopened);
         let again = eager(&dir);
@@ -719,10 +719,10 @@ mod tests {
         let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         assert!(ledger.signed_head(&key, 100).unwrap().is_none());
         ledger
-            .append(event(Kind::VAULT_POLICY, T, b"v", b"a"))
+            .append(event(Kind::SEAL_POLICY, T, b"v", b"a"))
             .unwrap();
         ledger
-            .append(event(Kind::VAULT_DEVICE, T, b"v", b"b"))
+            .append(event(Kind::SEAL_DEVICE, T, b"v", b"b"))
             .unwrap();
         let old = ledger.signed_head(&key, 100).unwrap().unwrap();
         old.verify(key.public(), &Policy::default()).unwrap();
@@ -766,11 +766,11 @@ mod tests {
         let start = T - T % hour;
         // Two events in the first hour; nothing is published within it.
         ledger
-            .append(event(Kind::VAULT_DEVICE, start + 10, b"v", b"a"))
+            .append(event(Kind::SEAL_DEVICE, start + 10, b"v", b"a"))
             .unwrap();
         assert!(ledger.signed_head(&key, start + 20).unwrap().is_none());
         ledger
-            .append(event(Kind::VAULT_DEVICE, start + 30, b"v", b"b"))
+            .append(event(Kind::SEAL_DEVICE, start + 30, b"v", b"b"))
             .unwrap();
         assert_eq!(ledger.leaves(0, 10), [] as [Leaf; 0]);
         assert!(ledger.inclusion(0, 1).is_err());
@@ -780,7 +780,7 @@ mod tests {
         let h1 = ledger.signed_head(&key, start + hour + 5).unwrap().unwrap();
         assert_eq!(h1.head.size, 2);
         ledger
-            .append(event(Kind::VAULT_DEVICE, start + hour + 6, b"v", b"c"))
+            .append(event(Kind::SEAL_DEVICE, start + hour + 6, b"v", b"c"))
             .unwrap();
         assert_eq!(
             ledger.signed_head(&key, start + 2 * hour - 1).unwrap(),
@@ -801,7 +801,7 @@ mod tests {
 
         // After a restart, the period's own events still wait.
         ledger
-            .append(event(Kind::VAULT_DEVICE, start + 3 * hour + 1, b"v", b"d"))
+            .append(event(Kind::SEAL_DEVICE, start + 3 * hour + 1, b"v", b"d"))
             .unwrap();
         drop(ledger);
         let reopened = open(&dir);
@@ -820,7 +820,7 @@ mod tests {
         for (i, subject) in [b"a", b"b", b"a", b"a"].iter().enumerate() {
             let body = [u8::try_from(i).unwrap()];
             ledger
-                .append(event(Kind::VAULT_DEVICE, T, *subject, &body))
+                .append(event(Kind::SEAL_DEVICE, T, *subject, &body))
                 .unwrap();
         }
         let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
@@ -893,7 +893,7 @@ mod tests {
         let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         let policy = Policy::default();
         ledger
-            .append(event(Kind::VAULT_DEVICE, T, b"v", b"a"))
+            .append(event(Kind::SEAL_DEVICE, T, b"v", b"a"))
             .unwrap();
         let served = ledger.signed_head(&key, 100).unwrap().unwrap();
 
@@ -917,7 +917,7 @@ mod tests {
         // Once the log grows the head is re-signed: an old cosignature is
         // for a head no longer served.
         ledger
-            .append(event(Kind::VAULT_DEVICE, T, b"v", b"b"))
+            .append(event(Kind::SEAL_DEVICE, T, b"v", b"b"))
             .unwrap();
         let next = ledger.signed_head(&key, 103).unwrap().unwrap();
         assert_eq!(

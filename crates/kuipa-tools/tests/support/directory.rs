@@ -7,12 +7,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use kuipa_enroll::escrow::{Kind, RegisterParams, VaultId};
+use kuipa_enroll::escrow::{Kind, RegisterParams, SealId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::realm::TrustedRealm;
+use kuipa_enroll::seal::{Approval, ReleaseRequest, Seal};
 use kuipa_enroll::server::{Accepted, Directory, DirectoryError, Staged};
-use kuipa_enroll::vault::{Approval, ReleaseRequest, Vault};
 use kuipa_gssapi::{AcceptStep, GssServerCred};
 
 use super::kdc::Realm;
@@ -38,12 +38,12 @@ pub struct KdcDirectory {
     pub invitations: Mutex<HashMap<[u8; 48], u64>>,
     /// Recorded trusted realms.
     pub trusts: Mutex<Vec<TrustedRealm>>,
-    /// User vaults.
-    pub vaults: Mutex<HashMap<VaultId, Vault>>,
+    /// User seals.
+    pub seals: Mutex<HashMap<SealId, Seal>>,
     /// Locked principals (`nsAccountLock`).
     pub locked: Mutex<HashSet<String>>,
-    /// Releases per vault and server.
-    pub unlocks: Mutex<HashMap<(VaultId, String), u64>>,
+    /// Releases per seal and server.
+    pub unlocks: Mutex<HashMap<(SealId, String), u64>>,
     /// Servers' published escrow keys.
     pub escrow_keys: Mutex<Vec<(String, tang_pqc::ExchangeKey)>>,
     /// The server list (`cn=masters`) for the keys operation's policy.
@@ -53,23 +53,23 @@ pub struct KdcDirectory {
     /// The `keys` operation's secrets, by `namespace/nickname` (§18.2):
     /// the playground stands in for the handler executables.
     pub key_secrets: Mutex<std::collections::BTreeMap<(u8, String), Vec<u8>>>,
-    /// The realm's vault limits.
-    pub limits: Mutex<kuipa_enroll::vault::Limits>,
+    /// The realm's seal limits.
+    pub limits: Mutex<kuipa_enroll::seal::Limits>,
     /// The realm's signing policy (`DESIGN-sign.md`).
     pub sign_policy: Mutex<kuipa_enroll::sign::SignPolicy>,
     /// User groups by principal, as `memberOf` lists them (host groups
     /// come from `hostgroups`).
     pub groups: Mutex<HashMap<String, Vec<String>>>,
-    /// Release requests by vault and id (`DESIGN-approvals.md`).
-    pub releases: Mutex<HashMap<(VaultId, String), ReleaseRequest>>,
-    /// Their uses, by vault, id and server.
-    release_uses: Mutex<HashMap<(VaultId, String, String), u64>>,
+    /// Release requests by seal and id (`DESIGN-approvals.md`).
+    pub releases: Mutex<HashMap<(SealId, String), ReleaseRequest>>,
+    /// Their uses, by seal, id and server.
+    release_uses: Mutex<HashMap<(SealId, String, String), u64>>,
     /// Device keys kept under recovery codes, by holder.
-    pub escrows: Mutex<HashMap<String, Vec<kuipa_enroll::vault::DeviceEscrow>>>,
-    /// Deposits by vault and id (`DESIGN-recovery.md` §3).
-    pub deposits: Mutex<HashMap<(VaultId, String), kuipa_enroll::vault::Deposit>>,
+    pub escrows: Mutex<HashMap<String, Vec<kuipa_enroll::seal::DeviceEscrow>>>,
+    /// Deposits by seal and id (`DESIGN-recovery.md` §3).
+    pub deposits: Mutex<HashMap<(SealId, String), kuipa_enroll::seal::Deposit>>,
     /// The realm's device-key recovery settings (`DESIGN-recovery.md` §4).
-    pub recovery: Mutex<Option<kuipa_enroll::vault::RecoverySettings>>,
+    pub recovery: Mutex<Option<kuipa_enroll::seal::RecoverySettings>>,
     /// IPA passkeys (`ipaPassKey` values) by principal.
     pub passkeys: Mutex<HashMap<String, Vec<String>>>,
     /// Whether the realm requires user verification (`ipa passkeyconfig`).
@@ -103,14 +103,14 @@ impl KdcDirectory {
             hostgroups: Mutex::new(HashMap::new()),
             invitations: Mutex::new(HashMap::new()),
             trusts: Mutex::new(Vec::new()),
-            vaults: Mutex::new(HashMap::new()),
+            seals: Mutex::new(HashMap::new()),
             locked: Mutex::new(HashSet::new()),
             unlocks: Mutex::new(HashMap::new()),
             escrow_keys: Mutex::new(Vec::new()),
             masters: Mutex::new(servers.iter().map(|s| (*s).to_owned()).collect()),
             ca_masters: Mutex::new(Vec::new()),
             key_secrets: Mutex::new(std::collections::BTreeMap::new()),
-            limits: Mutex::new(kuipa_enroll::vault::Limits::default()),
+            limits: Mutex::new(kuipa_enroll::seal::Limits::default()),
             sign_policy: Mutex::new(kuipa_enroll::sign::SignPolicy::default()),
             groups: Mutex::new(HashMap::new()),
             releases: Mutex::new(HashMap::new()),
@@ -162,7 +162,7 @@ impl KdcDirectory {
         Err(last.map_or_else(|| "no acceptor".into(), Into::into))
     }
 
-    fn total(&self, id: &VaultId) -> u64 {
+    fn total(&self, id: &SealId) -> u64 {
         self.unlocks
             .lock()
             .unwrap()
@@ -422,19 +422,19 @@ impl Directory for KdcDirectory {
             })
     }
 
-    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        self.vaults.lock().unwrap().insert(vault.id, vault.clone());
+    fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        self.seals.lock().unwrap().insert(seal.id, seal.clone());
         Ok(())
     }
 
-    fn vault_get(&self, id: &VaultId) -> Result<Option<Vault>, DirectoryError> {
-        Ok(self.vaults.lock().unwrap().get(id).cloned().map(|mut v| {
+    fn seal_get(&self, id: &SealId) -> Result<Option<Seal>, DirectoryError> {
+        Ok(self.seals.lock().unwrap().get(id).cloned().map(|mut v| {
             v.unlocks = self.total(id);
             v
         }))
     }
 
-    fn vault_limits(&self) -> Result<kuipa_enroll::vault::Limits, DirectoryError> {
+    fn seal_limits(&self) -> Result<kuipa_enroll::seal::Limits, DirectoryError> {
         Ok(self.limits.lock().unwrap().clone())
     }
 
@@ -481,9 +481,9 @@ impl Directory for KdcDirectory {
         Ok(())
     }
 
-    fn vault_unlock(
+    fn seal_unlock(
         &self,
-        id: &VaultId,
+        id: &SealId,
         server: &str,
         limit: Option<u64>,
     ) -> Result<bool, DirectoryError> {
@@ -499,22 +499,22 @@ impl Directory for KdcDirectory {
         Ok(true)
     }
 
-    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        self.vaults.lock().unwrap().insert(vault.id, vault.clone());
+    fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        self.seals.lock().unwrap().insert(seal.id, seal.clone());
         Ok(())
     }
 
-    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+    fn seals_of(&self, owner: &Principal) -> Result<Vec<Seal>, DirectoryError> {
         let owner = owner.to_string();
-        let vaults: Vec<Vault> = self
-            .vaults
+        let seals: Vec<Seal> = self
+            .seals
             .lock()
             .unwrap()
             .values()
             .filter(|v| v.owner == owner)
             .cloned()
             .collect();
-        Ok(vaults
+        Ok(seals
             .into_iter()
             .map(|mut v| {
                 v.unlocks = self.total(&v.id);
@@ -523,14 +523,14 @@ impl Directory for KdcDirectory {
             .collect())
     }
 
-    fn vaults_shared_with(
+    fn seals_shared_with(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
-        let wanted = kuipa_enroll::vault::Members::matching_entries(principal, groups);
-        let vaults: Vec<Vault> = self
-            .vaults
+    ) -> Result<Vec<Seal>, DirectoryError> {
+        let wanted = kuipa_enroll::seal::Members::matching_entries(principal, groups);
+        let seals: Vec<Seal> = self
+            .seals
             .lock()
             .unwrap()
             .values()
@@ -543,7 +543,7 @@ impl Directory for KdcDirectory {
             })
             .cloned()
             .collect();
-        Ok(vaults
+        Ok(seals
             .into_iter()
             .map(|mut v| {
                 v.unlocks = self.total(&v.id);
@@ -572,14 +572,14 @@ impl Directory for KdcDirectory {
         })
     }
 
-    fn vaults_approved_by(
+    fn seals_approved_by(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
-        let wanted = kuipa_enroll::vault::Members::matching_entries(principal, groups);
+    ) -> Result<Vec<Seal>, DirectoryError> {
+        let wanted = kuipa_enroll::seal::Members::matching_entries(principal, groups);
         Ok(self
-            .vaults
+            .seals
             .lock()
             .unwrap()
             .values()
@@ -595,30 +595,30 @@ impl Directory for KdcDirectory {
 
     fn recovery_settings(
         &self,
-    ) -> Result<Option<kuipa_enroll::vault::RecoverySettings>, DirectoryError> {
+    ) -> Result<Option<kuipa_enroll::seal::RecoverySettings>, DirectoryError> {
         Ok(self.recovery.lock().unwrap().clone())
     }
 
-    fn deposit_add(&self, deposit: &kuipa_enroll::vault::Deposit) -> Result<(), DirectoryError> {
+    fn deposit_add(&self, deposit: &kuipa_enroll::seal::Deposit) -> Result<(), DirectoryError> {
         self.deposits
             .lock()
             .unwrap()
-            .insert((deposit.vault, deposit.id.clone()), deposit.clone());
+            .insert((deposit.seal, deposit.id.clone()), deposit.clone());
         Ok(())
     }
 
-    fn deposits(&self, id: &VaultId) -> Result<Vec<kuipa_enroll::vault::Deposit>, DirectoryError> {
+    fn deposits(&self, id: &SealId) -> Result<Vec<kuipa_enroll::seal::Deposit>, DirectoryError> {
         Ok(self
             .deposits
             .lock()
             .unwrap()
             .values()
-            .filter(|d| d.vault == *id)
+            .filter(|d| d.seal == *id)
             .cloned()
             .collect())
     }
 
-    fn deposit_remove(&self, id: &VaultId, deposit: &str) -> Result<(), DirectoryError> {
+    fn deposit_remove(&self, id: &SealId, deposit: &str) -> Result<(), DirectoryError> {
         self.deposits
             .lock()
             .unwrap()
@@ -629,7 +629,7 @@ impl Directory for KdcDirectory {
     fn device_escrow_set(
         &self,
         principal: &Principal,
-        escrow: &kuipa_enroll::vault::DeviceEscrow,
+        escrow: &kuipa_enroll::seal::DeviceEscrow,
     ) -> Result<(), DirectoryError> {
         let mut all = self.escrows.lock().unwrap();
         let mine = all.entry(principal.to_string()).or_default();
@@ -641,7 +641,7 @@ impl Directory for KdcDirectory {
     fn device_escrows(
         &self,
         principal: &Principal,
-    ) -> Result<Vec<kuipa_enroll::vault::DeviceEscrow>, DirectoryError> {
+    ) -> Result<Vec<kuipa_enroll::seal::DeviceEscrow>, DirectoryError> {
         Ok(self
             .escrows
             .lock()
@@ -655,18 +655,18 @@ impl Directory for KdcDirectory {
         self.releases
             .lock()
             .unwrap()
-            .insert((request.vault, request.id.clone()), request.clone());
+            .insert((request.seal, request.id.clone()), request.clone());
         Ok(())
     }
 
-    fn releases(&self, id: &VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+    fn releases(&self, id: &SealId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
         let uses = self.release_uses.lock().unwrap();
         Ok(self
             .releases
             .lock()
             .unwrap()
             .values()
-            .filter(|r| r.vault == *id)
+            .filter(|r| r.seal == *id)
             .cloned()
             .map(|mut r| {
                 r.uses = uses
@@ -681,7 +681,7 @@ impl Directory for KdcDirectory {
 
     fn release_mark(
         &self,
-        id: &VaultId,
+        id: &SealId,
         request: &str,
         approval: &Approval,
         deny: bool,
@@ -700,7 +700,7 @@ impl Directory for KdcDirectory {
 
     fn release_use(
         &self,
-        id: &VaultId,
+        id: &SealId,
         request: &str,
         server: &str,
         limit: u64,

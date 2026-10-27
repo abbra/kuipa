@@ -1,7 +1,7 @@
 //! Typed transparency logs (`docs/DESIGN-tlog.md`).
 //!
 //! Each server keeps one append-only log of typed leaves — the claims
-//! its anchor vouches for, and the vault, signing and token events it
+//! its anchor vouches for, and the seal, signing and token events it
 //! handled — and signs its head with its delegation-vouched key.  Unlike
 //! the claim log of §4.9, a leaf that stops being current is not dropped
 //! (which restarted that log): a [`Kind::TOMBSTONE`] leaf naming it is
@@ -9,7 +9,7 @@
 //! check that with a consistency proof instead of refetching the log.
 //!
 //! A leaf's kind is inside its hashed bytes, so leaves of different kinds
-//! can never be confused.  The events of users and hosts — vault changes,
+//! can never be confused.  The events of users and hosts — seal changes,
 //! releases, signing statements, Keys fetches — are **committed**: their
 //! public leaf carries only the kind, the day, and a hiding commitment to
 //! the event ([`Opening`]), so the log can be published, mirrored and
@@ -39,7 +39,7 @@ const HEAD_MAGIC: [u8; 4] = *b"IPLH";
 const SIGNED_HEAD_MAGIC: [u8; 4] = *b"IPLS";
 const COSIGNATURE_MAGIC: [u8; 4] = *b"IPLC";
 const RECEIPT_MAGIC: [u8; 4] = *b"IPLP";
-const VAULT_EVENT_MAGIC: [u8; 4] = *b"IPLV";
+const SEAL_EVENT_MAGIC: [u8; 4] = *b"IPLV";
 const QUERY_MAGIC: [u8; 4] = *b"IPLQ";
 const ANSWER_MAGIC: [u8; 4] = *b"IPLR";
 const COMMITMENT_MAGIC: [u8; 4] = *b"IPLM";
@@ -82,10 +82,10 @@ pub struct Kind(pub u16);
 impl Kind {
     /// A server claim (`IPDC`) its anchor vouches for.
     pub const CLAIM: Self = Self(1);
-    /// A device added to or removed from a user vault.
-    pub const VAULT_DEVICE: Self = Self(2);
-    /// A vault policy set, or a vault revoked.
-    pub const VAULT_POLICY: Self = Self(3);
+    /// A device added to or removed from a user seal.
+    pub const SEAL_DEVICE: Self = Self(2);
+    /// A seal policy set, or a seal revoked.
+    pub const SEAL_POLICY: Self = Self(3);
     /// An escrow share released (unlock, offline session, override).
     pub const ESCROW_RELEASE: Self = Self(4);
     /// A signing statement.
@@ -104,8 +104,8 @@ impl Kind {
     pub const fn is_committed(self) -> bool {
         matches!(
             self,
-            Self::VAULT_DEVICE
-                | Self::VAULT_POLICY
+            Self::SEAL_DEVICE
+                | Self::SEAL_POLICY
                 | Self::ESCROW_RELEASE
                 | Self::STATEMENT
                 | Self::KEYS_FETCH
@@ -225,7 +225,7 @@ impl Tombstone {
 }
 
 /// What a committed leaf hides, and what proves it: the event, its
-/// subject (a vault id, a principal), its exact time and a random salt.
+/// subject (a seal id, a principal), its exact time and a random salt.
 /// The leaf's body is `H("ipa-ku-log/v1 commitment" ‖ opening)` under the
 /// log's hash ([`leaf`](Self::leaf)): binding, so a server cannot open a
 /// leaf to another event, subject or time, and hiding while the salt
@@ -239,9 +239,9 @@ pub struct Opening {
     pub kind: Kind,
     /// When the server logged it (Unix seconds).
     pub time: u64,
-    /// Who it is about: a vault id, or a principal's name.
+    /// Who it is about: a seal id, or a principal's name.
     pub subject: Vec<u8>,
-    /// The kind's own encoding: a [`VaultEvent`], a statement's log body
+    /// The kind's own encoding: a [`SealEvent`], a statement's log body
     /// (`crate::sign::Statement::log_body`), a Keys fetch.
     pub event: Vec<u8>,
     salt: [u8; SALT_LEN],
@@ -929,11 +929,11 @@ impl Receipt {
     }
 }
 
-/// What a vault event did.
+/// What a seal event did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum VaultAction {
-    /// The vault was created.
+pub enum SealAction {
+    /// The seal was created.
     Create = 1,
     /// Its policy was replaced.
     SetPolicy = 2,
@@ -945,7 +945,7 @@ pub enum VaultAction {
     RemoveDevice = 5,
     /// A re-authentication session was started.
     Session = 6,
-    /// An offline session released the vault's session keys.
+    /// An offline session released the seal's session keys.
     OfflineSession = 7,
     /// A server share of a sealed file was released.
     Release = 8,
@@ -973,7 +973,7 @@ pub enum VaultAction {
     Deliver = 18,
 }
 
-impl VaultAction {
+impl SealAction {
     /// The kind of leaf that records it.
     #[must_use]
     pub const fn kind(self) -> Kind {
@@ -984,12 +984,12 @@ impl VaultAction {
             | Self::Share
             | Self::Unshare
             | Self::Deposit
-            | Self::RetireDeposit => Kind::VAULT_POLICY,
+            | Self::RetireDeposit => Kind::SEAL_POLICY,
             Self::AddDevice
             | Self::RemoveDevice
             | Self::EscrowCode
             | Self::RecoverCode
-            | Self::Deliver => Kind::VAULT_DEVICE,
+            | Self::Deliver => Kind::SEAL_DEVICE,
             Self::Session
             | Self::OfflineSession
             | Self::Release
@@ -1019,44 +1019,44 @@ impl VaultAction {
             16 => Self::Deposit,
             17 => Self::RetireDeposit,
             18 => Self::Deliver,
-            _ => return Err(Error::Malformed("vault event action")),
+            _ => return Err(Error::Malformed("seal event action")),
         })
     }
 }
 
-/// The body of a vault leaf.  It names no vault and no owner — the leaf's
-/// index stands for the vault — only what happened: the device involved,
+/// The body of a seal leaf.  It names no seal and no owner — the leaf's
+/// index stands for the seal — only what happened: the device involved,
 /// and a digest of the policy set or of the file's binding released.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VaultEvent {
+pub struct SealEvent {
     /// What happened.
-    pub action: VaultAction,
+    pub action: SealAction,
     /// The device's id, if one was involved.
     pub device: Option<String>,
     /// SHA-256 of the policy set, the binding released, or zeros.
     pub digest: Hash,
 }
 
-impl VaultEvent {
+impl SealEvent {
     /// `IPLV ‖ 1 ‖ action(1) ‖ device (empty for none) ‖ digest`, the digest
     /// length prefixed.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        Writer::new(VAULT_EVENT_MAGIC)
+        Writer::new(SEAL_EVENT_MAGIC)
             .u8(self.action as u8)
             .str(self.device.as_deref().unwrap_or_default())
             .bytes(&self.digest)
             .finish()
     }
 
-    /// Parse a vault leaf's body.
+    /// Parse a seal leaf's body.
     ///
     /// # Errors
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, VAULT_EVENT_MAGIC, "vault event")?;
-        let action = VaultAction::from_code(r.u8()?)?;
+        let mut r = Reader::new(bytes, SEAL_EVENT_MAGIC, "seal event")?;
+        let action = SealAction::from_code(r.u8()?)?;
         let device = match r.str()? {
             "" => None,
             d => Some(d.to_owned()),
@@ -1072,22 +1072,22 @@ impl VaultEvent {
 }
 
 /// A lookup of the caller's own entries in one server's log (the `tlog`
-/// operation): those about one of their vaults, or with no vault named,
+/// operation): those about one of their seals, or with no seal named,
 /// those about the caller's principal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Query {
-    /// The vault's name, or empty for the caller's principal.
-    pub vault: String,
+    /// The seal's name, or empty for the caller's principal.
+    pub seal: String,
     /// The first leaf index to look at.
     pub from: u64,
 }
 
 impl Query {
-    /// `IPLQ ‖ 1 ‖ vault ‖ from`.
+    /// `IPLQ ‖ 1 ‖ seal ‖ from`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         Writer::new(QUERY_MAGIC)
-            .str(&self.vault)
+            .str(&self.seal)
             .u64(self.from)
             .finish()
     }
@@ -1099,10 +1099,10 @@ impl Query {
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, QUERY_MAGIC, "log query")?;
-        let vault = r.str()?.to_owned();
+        let seal = r.str()?.to_owned();
         let from = r.u64()?;
         r.finish()?;
-        Ok(Self { vault, from })
+        Ok(Self { seal, from })
     }
 }
 
@@ -1525,7 +1525,7 @@ mod tests {
         assert_ne!(cnsa.0.as_bytes(), id().0.as_bytes());
         let leaves: Vec<Leaf> = (0..5u8)
             .map(|n| {
-                Opening::new(Kind::VAULT_DEVICE, T, &[n], vec![n])
+                Opening::new(Kind::SEAL_DEVICE, T, &[n], vec![n])
                     .unwrap()
                     .leaf(alg)
                     .unwrap()
@@ -1587,7 +1587,7 @@ mod tests {
     #[test]
     fn queries_and_answers_round_trip_and_verify() {
         let q = Query {
-            vault: "personal".into(),
+            seal: "personal".into(),
             from: 3,
         };
         assert_eq!(Query::from_bytes(&q.to_bytes()).unwrap(), q);
@@ -1639,13 +1639,13 @@ mod tests {
 
     #[test]
     fn openings_bind_their_leaf_and_hide_the_event() {
-        let event = VaultEvent {
-            action: VaultAction::AddDevice,
+        let event = SealEvent {
+            action: SealAction::AddDevice,
             device: Some("dev-1".into()),
             digest: crate::merkle::test_hash(0),
         }
         .to_bytes();
-        let o = Opening::new(Kind::VAULT_DEVICE, T + 4000, b"vault-1", event.clone()).unwrap();
+        let o = Opening::new(Kind::SEAL_DEVICE, T + 4000, b"seal-1", event.clone()).unwrap();
         let leaf = o.leaf(TreeHash::Sha256).unwrap();
         assert!(o.opens(&leaf).unwrap());
         assert_eq!(Opening::from_bytes(&o.to_bytes()).unwrap(), o);
@@ -1656,17 +1656,17 @@ mod tests {
         assert_eq!(leaf.time % PUBLIC_TIME_STEP, 0);
         assert_eq!(leaf.index, Hash::zero(TreeHash::Sha256));
         assert!(is_commitment(&leaf));
-        for secret in [&b"vault-1"[..], b"dev-1", &event] {
+        for secret in [&b"seal-1"[..], b"dev-1", &event] {
             assert!(!leaf.body.windows(secret.len()).any(|w| w == secret));
         }
 
         // Hiding: the same event twice makes two unrelated leaves.
-        let again = Opening::new(Kind::VAULT_DEVICE, T + 4000, b"vault-1", event.clone()).unwrap();
+        let again = Opening::new(Kind::SEAL_DEVICE, T + 4000, b"seal-1", event.clone()).unwrap();
         assert_ne!(again.leaf(TreeHash::Sha256).unwrap(), leaf);
 
         // Binding: no other subject, time, event or kind opens it.
         let mut other = o.clone();
-        other.subject = b"vault-2".to_vec();
+        other.subject = b"seal-2".to_vec();
         assert!(!other.opens(&leaf).unwrap());
         let mut other = o.clone();
         other.time += 1;
@@ -1675,7 +1675,7 @@ mod tests {
         other.event.push(0);
         assert!(!other.opens(&leaf).unwrap());
         let mut other = o.clone();
-        other.kind = Kind::VAULT_POLICY;
+        other.kind = Kind::SEAL_POLICY;
         assert!(!other.opens(&leaf).unwrap());
 
         // Only the events of users and hosts are committed.
@@ -1719,7 +1719,7 @@ mod tests {
         let thp = *server.public().thumbprint();
         let policy = Policy::default();
         let openings: Vec<Opening> = (0..3u8)
-            .map(|n| Opening::new(Kind::ESCROW_RELEASE, T, b"vault-1", vec![n]).unwrap())
+            .map(|n| Opening::new(Kind::ESCROW_RELEASE, T, b"seal-1", vec![n]).unwrap())
             .collect();
         let leaves: Vec<Leaf> = openings
             .iter()
@@ -1748,33 +1748,33 @@ mod tests {
     }
 
     #[test]
-    fn vault_events_round_trip_and_map_to_kinds() {
+    fn seal_events_round_trip_and_map_to_kinds() {
         for (action, kind) in [
-            (VaultAction::Create, Kind::VAULT_POLICY),
-            (VaultAction::RemoveDevice, Kind::VAULT_DEVICE),
-            (VaultAction::Unshare, Kind::VAULT_POLICY),
-            (VaultAction::Approve, Kind::ESCROW_RELEASE),
-            (VaultAction::RecoverCode, Kind::VAULT_DEVICE),
-            (VaultAction::Deposit, Kind::VAULT_POLICY),
-            (VaultAction::Release, Kind::ESCROW_RELEASE),
+            (SealAction::Create, Kind::SEAL_POLICY),
+            (SealAction::RemoveDevice, Kind::SEAL_DEVICE),
+            (SealAction::Unshare, Kind::SEAL_POLICY),
+            (SealAction::Approve, Kind::ESCROW_RELEASE),
+            (SealAction::RecoverCode, Kind::SEAL_DEVICE),
+            (SealAction::Deposit, Kind::SEAL_POLICY),
+            (SealAction::Release, Kind::ESCROW_RELEASE),
         ] {
             assert_eq!(action.kind(), kind);
             for device in [None, Some("dev-1".to_owned())] {
-                let e = VaultEvent {
+                let e = SealEvent {
                     action,
                     device,
                     digest: crate::merkle::test_hash(3),
                 };
-                assert_eq!(VaultEvent::from_bytes(&e.to_bytes()).unwrap(), e);
+                assert_eq!(SealEvent::from_bytes(&e.to_bytes()).unwrap(), e);
             }
         }
-        let mut bad = VaultEvent {
-            action: VaultAction::Revoke,
+        let mut bad = SealEvent {
+            action: SealAction::Revoke,
             device: None,
             digest: crate::merkle::test_hash(0),
         }
         .to_bytes();
         bad[5] = 99;
-        assert!(VaultEvent::from_bytes(&bad).is_err());
+        assert!(SealEvent::from_bytes(&bad).is_err());
     }
 }

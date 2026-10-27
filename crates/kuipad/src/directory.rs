@@ -19,10 +19,10 @@
 //!   host entry (as `ipa host-add` lays it out) with the spent salt in
 //!   `ipaKUVoucherSpent`, so an existing host or a spent salt fails, add it
 //!   to the voucher's host group, and create keys with `KEYTAB_GET`.
-//! * Vaults (§7.6), as the daemon once the owner's ticket is accepted: one
-//!   entry per vault under `cn=vaults,cn=kuipa,cn=etc,$SUFFIX` (owner, name,
+//! * Seals (§7.6), as the daemon once the owner's ticket is accepted: one
+//!   entry per seal under `cn=seals,cn=kuipa,cn=etc,$SUFFIX` (owner, name,
 //!   policy and devices as JSON, state), the realm limits as JSON on
-//!   `cn=vault-limits,cn=kuipa,cn=etc,$SUFFIX`.
+//!   `cn=seal-limits,cn=kuipa,cn=etc,$SUFFIX`.
 //! * Trusts (§17.4), as the daemon: invitations and partners are values on
 //!   `cn=trusts,cn=kuipa,cn=etc,$SUFFIX`; an invitation is used up by
 //!   deleting its exact value, which only one server can do.  The
@@ -32,16 +32,16 @@
 
 use std::time::SystemTime;
 
-use kuipa_enroll::escrow::{Kind, RegisterParams, VaultId};
+use kuipa_enroll::escrow::{Kind, RegisterParams, SealId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::passkey::UserPasskeys;
+use kuipa_enroll::seal::{
+    Approval, Deposit, Device, DeviceEscrow, Limits, Members, RecoverySettings, ReleaseRequest,
+    Seal, State,
+};
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
-use kuipa_enroll::vault::{
-    Approval, Deposit, Device, DeviceEscrow, Limits, Members, RecoverySettings, ReleaseRequest,
-    State, Vault,
-};
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
 use native_ossl::util::SecretBuf;
@@ -62,35 +62,35 @@ const NO_SUCH_ATTRIBUTE: std::ffi::c_int = 16;
 const NO_SUCH_OBJECT: std::ffi::c_int = 32;
 /// Spent voucher salts on created hosts (new schema).
 const VOUCHER_SPENT_ATTR: &str = "ipaKUVoucherSpent";
-/// Vault entries and their attributes (new schema, §7.6.2).
-const VAULT_CLASS: &str = "ipaKUVault";
-const VAULT_OWNER_ATTR: &str = "ipaKUVaultOwner";
-const VAULT_NAME_ATTR: &str = "ipaKUVaultName";
-const VAULT_POLICY_ATTR: &str = "ipaKUVaultPolicy";
-const VAULT_DEVICE_ATTR: &str = "ipaKUVaultDevice";
-const VAULT_STATE_ATTR: &str = "ipaKUVaultState";
+/// Seal entries and their attributes (new schema, §7.6.2).
+const SEAL_CLASS: &str = "ipaKUSeal";
+const SEAL_OWNER_ATTR: &str = "ipaKUSealOwner";
+const SEAL_NAME_ATTR: &str = "ipaKUSealName";
+const SEAL_POLICY_ATTR: &str = "ipaKUSealPolicy";
+const SEAL_DEVICE_ATTR: &str = "ipaKUSealDevice";
+const SEAL_STATE_ATTR: &str = "ipaKUSealState";
 /// Per-server release counts, `<server> <count>`, one value per server
 /// (§7.6.7).
-const VAULT_UNLOCKS_ATTR: &str = "ipaKUVaultUnlocks";
+const SEAL_UNLOCKS_ATTR: &str = "ipaKUSealUnlocks";
 /// Offline-session keys, one JSON value per epoch (§7.6.6).
-const VAULT_SESSION_KEY_ATTR: &str = "ipaKUVaultSessionKey";
-/// Registered bindings of a vault's files, hex `H(ct)` (§7.6.2).
-const VAULT_BINDING_ATTR: &str = "ipaKUVaultBinding";
-/// Who shares a vault (§7.6.12), one `kind:name` value each
+const SEAL_SESSION_KEY_ATTR: &str = "ipaKUSealSessionKey";
+/// Registered bindings of a seal's files, hex `H(ct)` (§7.6.2).
+const SEAL_BINDING_ATTR: &str = "ipaKUSealBinding";
+/// Who shares a seal (§7.6.12), one `kind:name` value each
 /// (`user:bob@REALM`, `group:dba`, `host:web1.example.test`,
 /// `service:HTTP/ci.example.test@REALM`): its managers, and its members.
-const VAULT_MANAGER_ATTR: &str = "ipaKUVaultManager";
-const VAULT_MEMBER_ATTR: &str = "ipaKUVaultMember";
-/// Who deposits to a vault without opening it (`DESIGN-recovery.md` §3).
-const VAULT_DEPOSITOR_ATTR: &str = "ipaKUVaultDepositor";
-/// Deposits, child entries of their vault, each kept whole as JSON.
+const SEAL_MANAGER_ATTR: &str = "ipaKUSealManager";
+const SEAL_MEMBER_ATTR: &str = "ipaKUSealMember";
+/// Who deposits to a seal without opening it (`DESIGN-recovery.md` §3).
+const SEAL_DEPOSITOR_ATTR: &str = "ipaKUSealDepositor";
+/// Deposits, child entries of their seal, each kept whole as JSON.
 const DEPOSIT_CLASS: &str = "ipaKUDeposit";
 const DEPOSIT_ATTR: &str = "ipaKUDepositData";
-/// Who approves a vault's releases (`DESIGN-approvals.md`), as its
+/// Who approves a seal's releases (`DESIGN-approvals.md`), as its
 /// policy's `approvals.from`, one `kind:name` value each: kept beside the
 /// policy so approvers can be searched for.
-const VAULT_APPROVER_ATTR: &str = "ipaKUVaultApprover";
-/// Release requests, child entries of their vault: the request (JSON),
+const SEAL_APPROVER_ATTR: &str = "ipaKUSealApprover";
+/// Release requests, child entries of their seal: the request (JSON),
 /// one `<approver> <time>` value per approval, the denial as one, and
 /// per-server use counts `<server> <count>` (as unlock counts, §7.6.7).
 const RELEASE_CLASS: &str = "ipaKURelease";
@@ -109,25 +109,25 @@ const RECOVERY_ATTR: &str = "ipaKURecovery";
 const LEASE_ATTR: &str = "ipaKULease";
 /// The realm's voucher settings, JSON, on `cn=vouchers,cn=kuipa,cn=etc`.
 const VOUCHERS_ATTR: &str = "ipaKUVouchers";
-/// Every attribute a vault is read from.
-const VAULT_ATTRS: &[&str] = &[
-    VAULT_OWNER_ATTR,
-    VAULT_NAME_ATTR,
-    VAULT_POLICY_ATTR,
-    VAULT_MANAGER_ATTR,
-    VAULT_MEMBER_ATTR,
-    VAULT_DEPOSITOR_ATTR,
-    VAULT_DEVICE_ATTR,
-    VAULT_STATE_ATTR,
-    VAULT_UNLOCKS_ATTR,
-    VAULT_SESSION_KEY_ATTR,
-    VAULT_BINDING_ATTR,
+/// Every attribute a seal is read from.
+const SEAL_ATTRS: &[&str] = &[
+    SEAL_OWNER_ATTR,
+    SEAL_NAME_ATTR,
+    SEAL_POLICY_ATTR,
+    SEAL_MANAGER_ATTR,
+    SEAL_MEMBER_ATTR,
+    SEAL_DEPOSITOR_ATTR,
+    SEAL_DEVICE_ATTR,
+    SEAL_STATE_ATTR,
+    SEAL_UNLOCKS_ATTR,
+    SEAL_SESSION_KEY_ATTR,
+    SEAL_BINDING_ATTR,
 ];
 /// A server's current escrow key on its `cn=masters` entry, `<KEM id>
 /// <base64url key>` (§7.6.6).
 const SERVER_ESCROW_KEY_ATTR: &str = "ipaKUServerEscrowKey";
-/// The realm's vault limits, JSON (new schema).
-const VAULT_LIMITS_ATTR: &str = "ipaKUVaultLimits";
+/// The realm's seal limits, JSON (new schema).
+const SEAL_LIMITS_ATTR: &str = "ipaKUSealLimits";
 /// The realm's signing policy (`DESIGN-sign.md`), JSON, on
 /// `cn=sign-policy,cn=kuipa,cn=etc`.
 const SIGN_POLICY_ATTR: &str = "ipaKUSignPolicy";
@@ -167,9 +167,9 @@ pub struct LdapDirectory {
     initiator: std::sync::Mutex<()>,
 }
 
-/// A vault's attributes as the directory stores them: its name, the
+/// A seal's attributes as the directory stores them: its name, the
 /// policy, the session keys and the devices, each as JSON.
-type VaultAttrs = (String, Vec<String>, &'static str, Vec<String>);
+type SealAttrs = (String, Vec<String>, &'static str, Vec<String>);
 
 impl LdapDirectory {
     /// Acquire the daemon's acceptor credential.
@@ -313,32 +313,32 @@ impl LdapDirectory {
         ))
     }
 
-    fn vaults_dn(&self) -> String {
-        format!("cn=vaults,cn=kuipa,cn=etc,{}", self.cfg.basedn)
+    fn seals_dn(&self) -> String {
+        format!("cn=seals,cn=kuipa,cn=etc,{}", self.cfg.basedn)
     }
 
-    fn vault_dn(&self, id: &VaultId) -> String {
-        format!("cn={id},{}", self.vaults_dn())
+    fn seal_dn(&self, id: &SealId) -> String {
+        format!("cn={id},{}", self.seals_dn())
     }
 
-    /// A vault from its entry.
-    fn vault_from(entry: &kuipa_ldap::SearchEntry) -> Result<Vault, DirectoryError> {
+    /// A seal from its entry.
+    fn seal_from(entry: &kuipa_ldap::SearchEntry) -> Result<Seal, DirectoryError> {
         let one = |attr: &str| -> Result<String, DirectoryError> {
             entry
                 .attrs
                 .get(&attr.to_lowercase())
                 .and_then(|v| v.first().cloned())
-                .ok_or_else(|| format!("vault entry {} has no {attr}", entry.dn).into())
+                .ok_or_else(|| format!("seal entry {} has no {attr}", entry.dn).into())
         };
         let id = entry
             .dn
             .strip_prefix("cn=")
             .and_then(|r| r.split(',').next())
-            .ok_or("vault entry without cn")?
+            .ok_or("seal entry without cn")?
             .parse()?;
         let devices = entry
             .attrs
-            .get(&VAULT_DEVICE_ATTR.to_lowercase())
+            .get(&SEAL_DEVICE_ATTR.to_lowercase())
             .into_iter()
             .flatten()
             .map(|d| serde_json::from_str::<Device>(d))
@@ -353,44 +353,44 @@ impl LdapDirectory {
                     .map(String::as_str),
             )
         };
-        let state = match one(VAULT_STATE_ATTR)?.as_str() {
+        let state = match one(SEAL_STATE_ATTR)?.as_str() {
             "enabled" => State::Enabled,
             _ => State::Revoked,
         };
-        Ok(Vault {
+        Ok(Seal {
             id,
-            owner: one(VAULT_OWNER_ATTR)?,
-            name: one(VAULT_NAME_ATTR)?,
-            policy: serde_json::from_str(&one(VAULT_POLICY_ATTR)?)?,
-            managers: members(VAULT_MANAGER_ATTR),
-            members: members(VAULT_MEMBER_ATTR),
-            depositors: members(VAULT_DEPOSITOR_ATTR),
+            owner: one(SEAL_OWNER_ATTR)?,
+            name: one(SEAL_NAME_ATTR)?,
+            policy: serde_json::from_str(&one(SEAL_POLICY_ATTR)?)?,
+            managers: members(SEAL_MANAGER_ATTR),
+            members: members(SEAL_MEMBER_ATTR),
+            depositors: members(SEAL_DEPOSITOR_ATTR),
             devices,
             state,
             unlocks: Self::unlock_counts(entry).iter().map(|(_, n)| n).sum(),
             session_keys: entry
                 .attrs
-                .get(&VAULT_SESSION_KEY_ATTR.to_lowercase())
+                .get(&SEAL_SESSION_KEY_ATTR.to_lowercase())
                 .into_iter()
                 .flatten()
                 .map(|k| serde_json::from_str(k))
                 .collect::<Result<_, _>>()?,
             bindings: entry
                 .attrs
-                .get(&VAULT_BINDING_ATTR.to_lowercase())
+                .get(&SEAL_BINDING_ATTR.to_lowercase())
                 .cloned()
                 .unwrap_or_default(),
         })
     }
 
-    /// The vaults in the container that match `filter`.
-    fn vaults_matching(&self, filter: &str) -> Result<Vec<Vault>, DirectoryError> {
-        let filter = format!("(&(objectClass={VAULT_CLASS}){filter})");
+    /// The seals in the container that match `filter`.
+    fn seals_matching(&self, filter: &str) -> Result<Vec<Seal>, DirectoryError> {
+        let filter = format!("(&(objectClass={SEAL_CLASS}){filter})");
         let entries = match self.service_conn()?.search(
-            &self.vaults_dn(),
+            &self.seals_dn(),
             Scope::OneLevel,
             &filter,
-            VAULT_ATTRS,
+            SEAL_ATTRS,
         ) {
             Ok(e) => e,
             Err(kuipa_ldap::LdapError::Protocol {
@@ -399,14 +399,14 @@ impl LdapDirectory {
             }) => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        entries.iter().map(Self::vault_from).collect()
+        entries.iter().map(Self::seal_from).collect()
     }
 
-    /// The per-server release counts on a vault entry.
+    /// The per-server release counts on a seal entry.
     fn unlock_counts(entry: &kuipa_ldap::SearchEntry) -> Vec<(String, u64)> {
         entry
             .attrs
-            .get(&VAULT_UNLOCKS_ATTR.to_lowercase())
+            .get(&SEAL_UNLOCKS_ATTR.to_lowercase())
             .into_iter()
             .flatten()
             .filter_map(|v| {
@@ -416,18 +416,17 @@ impl LdapDirectory {
             .collect()
     }
 
-    /// The `kind:name` values of who approves `vault`'s releases.
-    fn approvers(vault: &Vault) -> Vec<String> {
-        vault
-            .policy
+    /// The `kind:name` values of who approves `seal`'s releases.
+    fn approvers(seal: &Seal) -> Vec<String> {
+        seal.policy
             .approvals
             .as_ref()
             .map(|a| a.from.entries())
             .unwrap_or_default()
     }
 
-    fn release_dn(&self, vault: &VaultId, id: &str) -> String {
-        format!("cn={id},{}", self.vault_dn(vault))
+    fn release_dn(&self, seal: &SealId, id: &str) -> String {
+        format!("cn={id},{}", self.seal_dn(seal))
     }
 
     /// A release request from its entry.
@@ -463,19 +462,19 @@ impl LdapDirectory {
         Ok(request)
     }
 
-    fn vault_attrs(vault: &Vault) -> Result<VaultAttrs, DirectoryError> {
-        let policy = serde_json::to_string(&vault.policy)?;
-        let keys = vault
+    fn seal_attrs(seal: &Seal) -> Result<SealAttrs, DirectoryError> {
+        let policy = serde_json::to_string(&seal.policy)?;
+        let keys = seal
             .session_keys
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<_, _>>()?;
-        let devices = vault
+        let devices = seal
             .devices
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<_, _>>()?;
-        let state = match vault.state {
+        let state = match seal.state {
             State::Enabled => "enabled",
             State::Revoked => "revoked",
         };
@@ -917,9 +916,9 @@ impl Directory for LdapDirectory {
         Ok(answer.value)
     }
 
-    fn vault_limits(&self) -> Result<Limits, DirectoryError> {
+    fn seal_limits(&self) -> Result<Limits, DirectoryError> {
         Ok(self
-            .realm_setting("vault-limits", VAULT_LIMITS_ATTR)?
+            .realm_setting("seal-limits", SEAL_LIMITS_ATTR)?
             .unwrap_or_default())
     }
 
@@ -1043,46 +1042,46 @@ impl Directory for LdapDirectory {
             .collect())
     }
 
-    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
-        let (managers, members) = (vault.managers.entries(), vault.members.entries());
-        let approvers = Self::approvers(vault);
-        let depositors = vault.depositors.entries();
-        let id = vault.id.to_string();
+    fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        let (policy, devices, state, keys) = Self::seal_attrs(seal)?;
+        let (managers, members) = (seal.managers.entries(), seal.members.entries());
+        let approvers = Self::approvers(seal);
+        let depositors = seal.depositors.entries();
+        let id = seal.id.to_string();
         self.service_conn()?.add_s(
-            &self.vault_dn(&vault.id),
+            &self.seal_dn(&seal.id),
             &[
                 (
                     "objectClass",
-                    vec![b"top".as_slice(), VAULT_CLASS.as_bytes()],
+                    vec![b"top".as_slice(), SEAL_CLASS.as_bytes()],
                 ),
                 ("cn", vec![id.as_bytes()]),
-                (VAULT_OWNER_ATTR, vec![vault.owner.as_bytes()]),
-                (VAULT_NAME_ATTR, vec![vault.name.as_bytes()]),
-                (VAULT_POLICY_ATTR, vec![policy.as_bytes()]),
+                (SEAL_OWNER_ATTR, vec![seal.owner.as_bytes()]),
+                (SEAL_NAME_ATTR, vec![seal.name.as_bytes()]),
+                (SEAL_POLICY_ATTR, vec![policy.as_bytes()]),
                 (
-                    VAULT_MANAGER_ATTR,
+                    SEAL_MANAGER_ATTR,
                     managers.iter().map(String::as_bytes).collect(),
                 ),
                 (
-                    VAULT_MEMBER_ATTR,
+                    SEAL_MEMBER_ATTR,
                     members.iter().map(String::as_bytes).collect(),
                 ),
                 (
-                    VAULT_DEPOSITOR_ATTR,
+                    SEAL_DEPOSITOR_ATTR,
                     depositors.iter().map(String::as_bytes).collect(),
                 ),
                 (
-                    VAULT_APPROVER_ATTR,
+                    SEAL_APPROVER_ATTR,
                     approvers.iter().map(String::as_bytes).collect(),
                 ),
                 (
-                    VAULT_DEVICE_ATTR,
+                    SEAL_DEVICE_ATTR,
                     devices.iter().map(String::as_bytes).collect(),
                 ),
-                (VAULT_STATE_ATTR, vec![state.as_bytes()]),
+                (SEAL_STATE_ATTR, vec![state.as_bytes()]),
                 (
-                    VAULT_SESSION_KEY_ATTR,
+                    SEAL_SESSION_KEY_ATTR,
                     keys.iter().map(String::as_bytes).collect(),
                 ),
             ]
@@ -1090,21 +1089,18 @@ impl Directory for LdapDirectory {
             .filter(|(_, v)| !v.is_empty())
             .collect::<Vec<_>>(),
         )?;
-        eprintln!(
-            "kuipad: {} created vault {id} ({})",
-            vault.owner, vault.name
-        );
+        eprintln!("kuipad: {} created seal {id} ({})", seal.owner, seal.name);
         Ok(())
     }
 
-    fn vault_get(&self, id: &VaultId) -> Result<Option<Vault>, DirectoryError> {
+    fn seal_get(&self, id: &SealId) -> Result<Option<Seal>, DirectoryError> {
         match self.service_conn()?.search(
-            &self.vault_dn(id),
+            &self.seal_dn(id),
             Scope::Base,
-            &format!("(objectClass={VAULT_CLASS})"),
-            VAULT_ATTRS,
+            &format!("(objectClass={SEAL_CLASS})"),
+            SEAL_ATTRS,
         ) {
-            Ok(entries) => entries.first().map(Self::vault_from).transpose(),
+            Ok(entries) => entries.first().map(Self::seal_from).transpose(),
             Err(kuipa_ldap::LdapError::Protocol {
                 code: NO_SUCH_OBJECT,
                 ..
@@ -1113,96 +1109,96 @@ impl Directory for LdapDirectory {
         }
     }
 
-    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        let (policy, devices, state, keys) = Self::vault_attrs(vault)?;
-        let (managers, members) = (vault.managers.entries(), vault.members.entries());
-        let approvers = Self::approvers(vault);
-        let depositors = vault.depositors.entries();
+    fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        let (policy, devices, state, keys) = Self::seal_attrs(seal)?;
+        let (managers, members) = (seal.managers.entries(), seal.members.entries());
+        let approvers = Self::approvers(seal);
+        let depositors = seal.depositors.entries();
         self.service_conn()?.modify_s(
-            &self.vault_dn(&vault.id),
+            &self.seal_dn(&seal.id),
             &[
-                (ModOp::Replace, VAULT_POLICY_ATTR, vec![policy.as_bytes()]),
+                (ModOp::Replace, SEAL_POLICY_ATTR, vec![policy.as_bytes()]),
                 (
                     ModOp::Replace,
-                    VAULT_MANAGER_ATTR,
+                    SEAL_MANAGER_ATTR,
                     managers.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     ModOp::Replace,
-                    VAULT_MEMBER_ATTR,
+                    SEAL_MEMBER_ATTR,
                     members.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     ModOp::Replace,
-                    VAULT_DEPOSITOR_ATTR,
+                    SEAL_DEPOSITOR_ATTR,
                     depositors.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     ModOp::Replace,
-                    VAULT_APPROVER_ATTR,
+                    SEAL_APPROVER_ATTR,
                     approvers.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     ModOp::Replace,
-                    VAULT_DEVICE_ATTR,
+                    SEAL_DEVICE_ATTR,
                     devices.iter().map(String::as_bytes).collect(),
                 ),
-                (ModOp::Replace, VAULT_STATE_ATTR, vec![state.as_bytes()]),
+                (ModOp::Replace, SEAL_STATE_ATTR, vec![state.as_bytes()]),
                 (
                     ModOp::Replace,
-                    VAULT_SESSION_KEY_ATTR,
+                    SEAL_SESSION_KEY_ATTR,
                     keys.iter().map(String::as_bytes).collect(),
                 ),
                 (
                     ModOp::Replace,
-                    VAULT_BINDING_ATTR,
-                    vault.bindings.iter().map(String::as_bytes).collect(),
+                    SEAL_BINDING_ATTR,
+                    seal.bindings.iter().map(String::as_bytes).collect(),
                 ),
             ],
         )?;
         eprintln!(
-            "kuipad: {} updated vault {} ({}): {state}, {} device(s)",
-            vault.owner,
-            vault.id,
-            vault.name,
+            "kuipad: {} updated seal {} ({}): {state}, {} device(s)",
+            seal.owner,
+            seal.id,
+            seal.name,
             devices.len()
         );
         Ok(())
     }
 
-    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
-        self.vaults_matching(&format!(
-            "({VAULT_OWNER_ATTR}={})",
+    fn seals_of(&self, owner: &Principal) -> Result<Vec<Seal>, DirectoryError> {
+        self.seals_matching(&format!(
+            "({SEAL_OWNER_ATTR}={})",
             filter_escape(&owner.to_string())
         ))
     }
 
-    fn vaults_shared_with(
+    fn seals_shared_with(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
+    ) -> Result<Vec<Seal>, DirectoryError> {
         let any: String = Members::matching_entries(principal, groups)
             .iter()
             .flat_map(|e| {
                 let e = filter_escape(e);
                 [
-                    format!("({VAULT_MANAGER_ATTR}={e})"),
-                    format!("({VAULT_MEMBER_ATTR}={e})"),
-                    format!("({VAULT_DEPOSITOR_ATTR}={e})"),
+                    format!("({SEAL_MANAGER_ATTR}={e})"),
+                    format!("({SEAL_MEMBER_ATTR}={e})"),
+                    format!("({SEAL_DEPOSITOR_ATTR}={e})"),
                 ]
             })
             .collect();
         if any.is_empty() {
             return Ok(Vec::new());
         }
-        self.vaults_matching(&format!("(|{any})"))
+        self.seals_matching(&format!("(|{any})"))
     }
 
     fn deposit_add(&self, deposit: &Deposit) -> Result<(), DirectoryError> {
         let data = serde_json::to_string(deposit)?;
         self.service_conn()?.add_s(
-            &format!("cn={},{}", deposit.id, self.vault_dn(&deposit.vault)),
+            &format!("cn={},{}", deposit.id, self.seal_dn(&deposit.seal)),
             &[
                 (
                     "objectClass",
@@ -1215,9 +1211,9 @@ impl Directory for LdapDirectory {
         Ok(())
     }
 
-    fn deposits(&self, id: &VaultId) -> Result<Vec<Deposit>, DirectoryError> {
+    fn deposits(&self, id: &SealId) -> Result<Vec<Deposit>, DirectoryError> {
         let entries = match self.service_conn()?.search(
-            &self.vault_dn(id),
+            &self.seal_dn(id),
             Scope::OneLevel,
             &format!("(objectClass={DEPOSIT_CLASS})"),
             &[DEPOSIT_ATTR],
@@ -1236,9 +1232,9 @@ impl Directory for LdapDirectory {
             .collect()
     }
 
-    fn deposit_remove(&self, id: &VaultId, deposit: &str) -> Result<(), DirectoryError> {
+    fn deposit_remove(&self, id: &SealId, deposit: &str) -> Result<(), DirectoryError> {
         self.service_conn()?
-            .delete_s(&format!("cn={deposit},{}", self.vault_dn(id)))?;
+            .delete_s(&format!("cn={deposit},{}", self.seal_dn(id)))?;
         Ok(())
     }
 
@@ -1290,23 +1286,23 @@ impl Directory for LdapDirectory {
             .collect())
     }
 
-    fn vaults_approved_by(
+    fn seals_approved_by(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
+    ) -> Result<Vec<Seal>, DirectoryError> {
         let any = Members::matching_entries(principal, groups).iter().fold(
             String::new(),
             |mut any, e| {
                 use std::fmt::Write as _;
-                let _ = write!(any, "({VAULT_APPROVER_ATTR}={})", filter_escape(e));
+                let _ = write!(any, "({SEAL_APPROVER_ATTR}={})", filter_escape(e));
                 any
             },
         );
         if any.is_empty() {
             return Ok(Vec::new());
         }
-        self.vaults_matching(&format!("(|{any})"))
+        self.seals_matching(&format!("(|{any})"))
     }
 
     fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
@@ -1318,7 +1314,7 @@ impl Directory for LdapDirectory {
             ..request.clone()
         })?;
         self.service_conn()?.add_s(
-            &self.release_dn(&request.vault, &request.id),
+            &self.release_dn(&request.seal, &request.id),
             &[
                 (
                     "objectClass",
@@ -1331,9 +1327,9 @@ impl Directory for LdapDirectory {
         Ok(())
     }
 
-    fn releases(&self, id: &VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+    fn releases(&self, id: &SealId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
         let entries = match self.service_conn()?.search(
-            &self.vault_dn(id),
+            &self.seal_dn(id),
             Scope::OneLevel,
             &format!("(objectClass={RELEASE_CLASS})"),
             &[
@@ -1355,7 +1351,7 @@ impl Directory for LdapDirectory {
 
     fn release_mark(
         &self,
-        id: &VaultId,
+        id: &SealId,
         request: &str,
         approval: &Approval,
         deny: bool,
@@ -1376,7 +1372,7 @@ impl Directory for LdapDirectory {
 
     fn release_use(
         &self,
-        id: &VaultId,
+        id: &SealId,
         request: &str,
         server: &str,
         limit: u64,
@@ -1416,21 +1412,21 @@ impl Directory for LdapDirectory {
         Ok(true)
     }
 
-    fn vault_unlock(
+    fn seal_unlock(
         &self,
-        id: &VaultId,
+        id: &SealId,
         server: &str,
         limit: Option<u64>,
     ) -> Result<bool, DirectoryError> {
         let mut svc = self.service_conn()?;
-        let dn = self.vault_dn(id);
+        let dn = self.seal_dn(id);
         let entries = svc.search(
             &dn,
             Scope::Base,
-            &format!("(objectClass={VAULT_CLASS})"),
-            &[VAULT_UNLOCKS_ATTR],
+            &format!("(objectClass={SEAL_CLASS})"),
+            &[SEAL_UNLOCKS_ATTR],
         )?;
-        let entry = entries.first().ok_or("no such vault")?;
+        let entry = entries.first().ok_or("no such seal")?;
         let counts = Self::unlock_counts(entry);
         if limit.is_some_and(|l| counts.iter().map(|(_, n)| n).sum::<u64>() >= l) {
             return Ok(false);
@@ -1442,9 +1438,9 @@ impl Directory for LdapDirectory {
         let new = format!("{server} {}", own.unwrap_or(0) + 1);
         let mut mods = Vec::new();
         if let Some(old) = &old {
-            mods.push((ModOp::Delete, VAULT_UNLOCKS_ATTR, vec![old.as_bytes()]));
+            mods.push((ModOp::Delete, SEAL_UNLOCKS_ATTR, vec![old.as_bytes()]));
         }
-        mods.push((ModOp::Add, VAULT_UNLOCKS_ATTR, vec![new.as_bytes()]));
+        mods.push((ModOp::Add, SEAL_UNLOCKS_ATTR, vec![new.as_bytes()]));
         svc.modify_s(&dn, &mods)?;
         Ok(true)
     }

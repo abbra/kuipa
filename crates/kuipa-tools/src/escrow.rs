@@ -1,14 +1,14 @@
 //! `kuipa escrow luks` and `kuipa escrow file` (`DESIGN-recovery.md` §5):
 //! a host, or a service or user whose keytab is on it, deposits LUKS and
-//! backup recovery keys into a vault whose depositor it is, with a ticket
+//! backup recovery keys into a seal whose depositor it is, with a ticket
 //! from that keytab.  It seals them there and cannot open them again; the
-//! vault's members can, under its policy.
+//! seal's members can, under its policy.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use kuipa_enroll::vault::DepositKind;
+use kuipa_enroll::seal::DepositKind;
 use serde_json::Value;
 
 use crate::paths::{Error, Paths};
@@ -26,7 +26,7 @@ pub struct Depositor<'a> {
     pub keytab: Option<&'a Path>,
 }
 
-/// `kuipa escrow file NAME FILE --vault VAULT`: deposit `contents` as the
+/// `kuipa escrow file NAME FILE --seal SEAL`: deposit `contents` as the
 /// depositor's secret `name`, in place of its earlier one of that name.
 ///
 /// # Errors
@@ -35,21 +35,21 @@ pub struct Depositor<'a> {
 /// depositor), or any other error.
 pub fn escrow_file(
     by: &Depositor<'_>,
-    vault: &str,
+    seal: &str,
     name: &str,
     contents: &[u8],
 ) -> Result<Value, Error> {
     let user = host_dir(by.paths);
     let subject = BTreeMap::from([("name".to_owned(), name.to_owned())]);
     SealClient::for_keytab(by.paths, &user, by.keytab).deposit(
-        vault,
+        seal,
         contents,
         DepositKind::File,
         subject,
     )
 }
 
-/// `kuipa escrow luks DEVICE --vault VAULT`: deposit the recovery key in
+/// `kuipa escrow luks DEVICE --seal SEAL`: deposit the recovery key in
 /// `input` (as `systemd-cryptenroll --recovery-key DEVICE` prints it) for
 /// the LUKS volume `device`, whose UUID is `uuid` or else what
 /// `cryptsetup luksUUID` says, in place of the depositor's earlier deposit
@@ -61,7 +61,7 @@ pub fn escrow_file(
 /// other error.
 pub fn escrow_luks(
     by: &Depositor<'_>,
-    vault: &str,
+    seal: &str,
     device: &str,
     input: &[u8],
     uuid: Option<&str>,
@@ -77,7 +77,7 @@ pub fn escrow_luks(
     let user = host_dir(by.paths);
     let subject = BTreeMap::from([("uuid".to_owned(), uuid.to_ascii_lowercase())]);
     SealClient::for_keytab(by.paths, &user, by.keytab).deposit(
-        vault,
+        seal,
         key.as_bytes(),
         DepositKind::Luks,
         subject,

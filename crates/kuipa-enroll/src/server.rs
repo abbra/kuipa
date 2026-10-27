@@ -25,13 +25,13 @@ use crate::merkle;
 use crate::passkey::{Assertion, PasskeyInfo, UserPasskeys};
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
-use crate::tlog::{Entry, Kind, LogId, Opening, Receipt, SignedHead, VaultAction, VaultEvent};
-use crate::trust::{self, TrustRequest, TrustResponse};
-use crate::vault::{
+use crate::seal::{
     Approval, DEFAULT_EPOCH, Deposit, Descriptor, DeviceEscrow, Limits, Members, Recovered,
-    RecoverySettings, ReleaseRequest, ReleasedKeys, Reply, Role, SessionFor, SessionKey,
-    SessionToken, State, Vault, VaultAnswer, VaultOp,
+    RecoverySettings, ReleaseRequest, ReleasedKeys, Reply, Role, Seal, SealAnswer, SealOp,
+    SessionFor, SessionKey, SessionToken, State,
 };
+use crate::tlog::{Entry, Kind, LogId, Opening, Receipt, SealAction, SealEvent, SignedHead};
+use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::voucher::Voucher;
 
 /// Errors from a [`Directory`], kept for the log.
@@ -203,22 +203,22 @@ pub trait Directory {
     fn servers(&self) -> Result<Vec<String>, DirectoryError>;
 
     /// Accept a user's (or any principal's) GSS-API token bound to `cb`,
-    /// for vault operations and the ticket factor (§7.6).
+    /// for seal operations and the ticket factor (§7.6).
     ///
     /// # Errors
     ///
-    /// Any refusal; by default vaults are not supported.
+    /// Any refusal; by default seals are not supported.
     fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
         let _ = (token, cb);
-        Err("vaults are not supported by this directory".into())
+        Err("seals are not supported by this directory".into())
     }
 
-    /// The realm's vault limits.
+    /// The realm's seal limits.
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn vault_limits(&self) -> Result<Limits, DirectoryError> {
+    fn seal_limits(&self) -> Result<Limits, DirectoryError> {
         Ok(Limits::default())
     }
 
@@ -255,74 +255,74 @@ pub trait Directory {
         Err("groups are not supported by this directory".into())
     }
 
-    /// Store a new vault; refuse a name its owner already uses.
+    /// Store a new seal; refuse a name its owner already uses.
     ///
     /// # Errors
     ///
-    /// Any failure; by default vaults are not supported.
-    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        let _ = vault;
-        Err("vaults are not supported by this directory".into())
+    /// Any failure; by default seals are not supported.
+    fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        let _ = seal;
+        Err("seals are not supported by this directory".into())
     }
 
-    /// The vault `id`, if it exists.
+    /// The seal `id`, if it exists.
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn vault_get(&self, id: &escrow::VaultId) -> Result<Option<Vault>, DirectoryError> {
+    fn seal_get(&self, id: &escrow::SealId) -> Result<Option<Seal>, DirectoryError> {
         let _ = id;
         Ok(None)
     }
 
-    /// Replace a stored vault (policy, devices, state).
+    /// Replace a stored seal (policy, devices, state).
     ///
     /// # Errors
     ///
-    /// Any failure; by default vaults are not supported.
-    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        let _ = vault;
-        Err("vaults are not supported by this directory".into())
+    /// Any failure; by default seals are not supported.
+    fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        let _ = seal;
+        Err("seals are not supported by this directory".into())
     }
 
-    /// The vaults `owner` owns.
+    /// The seals `owner` owns.
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+    fn seals_of(&self, owner: &Principal) -> Result<Vec<Seal>, DirectoryError> {
         let _ = owner;
         Ok(Vec::new())
     }
 
-    /// The vaults shared with `principal`, a member of `groups`: those
+    /// The seals shared with `principal`, a member of `groups`: those
     /// whose managers or members hold any of
-    /// [`Members::matching_entries`](crate::vault::Members::matching_entries).
+    /// [`Members::matching_entries`](crate::seal::Members::matching_entries).
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn vaults_shared_with(
+    fn seals_shared_with(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
+    ) -> Result<Vec<Seal>, DirectoryError> {
         let _ = (principal, groups);
         Ok(Vec::new())
     }
 
-    /// The vaults whose approvals admit `principal`, a member of `groups`
+    /// The seals whose approvals admit `principal`, a member of `groups`
     /// (`DESIGN-approvals.md` §2): those whose policy's `approvals.from`
     /// holds any of [`Members::matching_entries`].
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn vaults_approved_by(
+    fn seals_approved_by(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
+    ) -> Result<Vec<Seal>, DirectoryError> {
         let _ = (principal, groups);
         Ok(Vec::new())
     }
@@ -337,18 +337,18 @@ pub trait Directory {
         Err("approvals are not supported by this directory".into())
     }
 
-    /// The release requests of vault `id`, with their approvals, denial and
+    /// The release requests of seal `id`, with their approvals, denial and
     /// uses summed over the servers.
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn releases(&self, id: &escrow::VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+    fn releases(&self, id: &escrow::SealId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
         let _ = id;
         Ok(Vec::new())
     }
 
-    /// Add `approval` to request `request` of vault `id`, or with `deny`
+    /// Add `approval` to request `request` of seal `id`, or with `deny`
     /// record it as the request's denial.  Values are only ever added, so
     /// replicas merge them.
     ///
@@ -357,7 +357,7 @@ pub trait Directory {
     /// Any failure; by default approvals are not supported.
     fn release_mark(
         &self,
-        id: &escrow::VaultId,
+        id: &escrow::SealId,
         request: &str,
         approval: &Approval,
         deny: bool,
@@ -366,16 +366,16 @@ pub trait Directory {
         Err("approvals are not supported by this directory".into())
     }
 
-    /// Count one use of request `request` of vault `id` by `server`, unless
+    /// Count one use of request `request` of seal `id` by `server`, unless
     /// its uses, summed over all servers, have reached `limit`: then count
-    /// nothing and answer `false` (as [`vault_unlock`](Self::vault_unlock)).
+    /// nothing and answer `false` (as [`seal_unlock`](Self::seal_unlock)).
     ///
     /// # Errors
     ///
     /// Any failure; by default approvals are not supported.
     fn release_use(
         &self,
-        id: &escrow::VaultId,
+        id: &escrow::SealId,
         request: &str,
         server: &str,
         limit: u64,
@@ -438,36 +438,36 @@ pub trait Directory {
         Err("deposits are not supported by this directory".into())
     }
 
-    /// The deposits of vault `id`, with their files.
+    /// The deposits of seal `id`, with their files.
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn deposits(&self, id: &escrow::VaultId) -> Result<Vec<Deposit>, DirectoryError> {
+    fn deposits(&self, id: &escrow::SealId) -> Result<Vec<Deposit>, DirectoryError> {
         let _ = id;
         Ok(Vec::new())
     }
 
-    /// Remove deposit `deposit` of vault `id`.
+    /// Remove deposit `deposit` of seal `id`.
     ///
     /// # Errors
     ///
     /// Any failure; by default deposits are not supported.
-    fn deposit_remove(&self, id: &escrow::VaultId, deposit: &str) -> Result<(), DirectoryError> {
+    fn deposit_remove(&self, id: &escrow::SealId, deposit: &str) -> Result<(), DirectoryError> {
         let _ = (id, deposit);
         Err("deposits are not supported by this directory".into())
     }
 
-    /// Count one release of vault `id` by `server` (§7.6.7), unless the
-    /// vault's releases, summed over all servers, have reached `limit`:
+    /// Count one release of seal `id` by `server` (§7.6.7), unless the
+    /// seal's releases, summed over all servers, have reached `limit`:
     /// then count nothing and answer `false`.
     ///
     /// # Errors
     ///
-    /// Any failure; by default only vaults without a limit are supported.
-    fn vault_unlock(
+    /// Any failure; by default only seals without a limit are supported.
+    fn seal_unlock(
         &self,
-        id: &escrow::VaultId,
+        id: &escrow::SealId,
         server: &str,
         limit: Option<u64>,
     ) -> Result<bool, DirectoryError> {
@@ -479,7 +479,7 @@ pub trait Directory {
     }
 
     /// Every server's current escrow key, as each published it, for
-    /// sealing vault session keys to all of them (§7.6.6).
+    /// sealing the seal's session keys to all of them (§7.6.6).
     ///
     /// # Errors
     ///
@@ -707,8 +707,8 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
         (**self).accept_user(token, cb)
     }
-    fn vault_limits(&self) -> Result<Limits, DirectoryError> {
-        (**self).vault_limits()
+    fn seal_limits(&self) -> Result<Limits, DirectoryError> {
+        (**self).seal_limits()
     }
     fn passkeys(&self, principal: &Principal) -> Result<UserPasskeys, DirectoryError> {
         (**self).passkeys(principal)
@@ -719,31 +719,31 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
         (**self).principal_groups(principal)
     }
-    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        (**self).vault_add(vault)
+    fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        (**self).seal_add(seal)
     }
-    fn vault_get(&self, id: &escrow::VaultId) -> Result<Option<Vault>, DirectoryError> {
-        (**self).vault_get(id)
+    fn seal_get(&self, id: &escrow::SealId) -> Result<Option<Seal>, DirectoryError> {
+        (**self).seal_get(id)
     }
-    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        (**self).vault_update(vault)
+    fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        (**self).seal_update(seal)
     }
-    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
-        (**self).vaults_of(owner)
+    fn seals_of(&self, owner: &Principal) -> Result<Vec<Seal>, DirectoryError> {
+        (**self).seals_of(owner)
     }
-    fn vaults_shared_with(
+    fn seals_shared_with(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
-        (**self).vaults_shared_with(principal, groups)
+    ) -> Result<Vec<Seal>, DirectoryError> {
+        (**self).seals_shared_with(principal, groups)
     }
-    fn vaults_approved_by(
+    fn seals_approved_by(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
-        (**self).vaults_approved_by(principal, groups)
+    ) -> Result<Vec<Seal>, DirectoryError> {
+        (**self).seals_approved_by(principal, groups)
     }
     fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
         (**self).release_add(request)
@@ -767,18 +767,18 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn voucher_settings(&self) -> Result<Option<crate::voucher::VoucherSettings>, DirectoryError> {
         (**self).voucher_settings()
     }
-    fn deposits(&self, id: &escrow::VaultId) -> Result<Vec<Deposit>, DirectoryError> {
+    fn deposits(&self, id: &escrow::SealId) -> Result<Vec<Deposit>, DirectoryError> {
         (**self).deposits(id)
     }
-    fn deposit_remove(&self, id: &escrow::VaultId, deposit: &str) -> Result<(), DirectoryError> {
+    fn deposit_remove(&self, id: &escrow::SealId, deposit: &str) -> Result<(), DirectoryError> {
         (**self).deposit_remove(id, deposit)
     }
-    fn releases(&self, id: &escrow::VaultId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
+    fn releases(&self, id: &escrow::SealId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
         (**self).releases(id)
     }
     fn release_mark(
         &self,
-        id: &escrow::VaultId,
+        id: &escrow::SealId,
         request: &str,
         approval: &Approval,
         deny: bool,
@@ -787,7 +787,7 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn release_use(
         &self,
-        id: &escrow::VaultId,
+        id: &escrow::SealId,
         request: &str,
         server: &str,
         limit: u64,
@@ -797,13 +797,13 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
         (**self).principal_locked(principal)
     }
-    fn vault_unlock(
+    fn seal_unlock(
         &self,
-        id: &escrow::VaultId,
+        id: &escrow::SealId,
         server: &str,
         limit: Option<u64>,
     ) -> Result<bool, DirectoryError> {
-        (**self).vault_unlock(id, server, limit)
+        (**self).seal_unlock(id, server, limit)
     }
     fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
         (**self).escrow_servers()
@@ -1069,15 +1069,15 @@ struct Published {
     advertisements: HashMap<AdvKey, (SignedAdvertisement, u64)>,
 }
 
-/// A session an unlock started (§7.6), on the vault as it was settled
+/// A session an unlock started (§7.6), on the seal as it was settled
 /// first.
 struct StartedSession {
-    vault: Vault,
+    seal: Seal,
     token: SessionToken,
-    /// The vault's session keys, sealed to the device, for an offline
+    /// The seal's session keys, sealed to the device, for an offline
     /// session.
     released: Option<ReleasedKeys>,
-    /// The receipts of settling the vault before the session started.
+    /// The receipts of settling the seal before the session started.
     receipts: Vec<Receipt>,
 }
 
@@ -1123,7 +1123,7 @@ impl EnrollServer {
         self
     }
 
-    /// Record vault, escrow and Keys events in `ledger`; the default
+    /// Record seal, escrow and Keys events in `ledger`; the default
     /// records nothing ([`NoLedger`]).
     #[must_use]
     pub fn with_ledger(mut self, ledger: Arc<dyn Ledger>) -> Self {
@@ -1154,27 +1154,27 @@ impl EnrollServer {
         )?))
     }
 
-    /// Record `action` on `vault` as it is about to be stored: the device
+    /// Record `action` on `seal` as it is about to be stored: the device
     /// added is its newest, and a policy set is recorded by its digest.
     fn record_change(
         &self,
-        vault: &Vault,
-        action: VaultAction,
+        seal: &Seal,
+        action: SealAction,
         device: Option<String>,
     ) -> Result<Option<Receipt>, Refusal> {
         let device = match action {
-            VaultAction::AddDevice => vault.devices.last().map(|d| d.id.clone()),
+            SealAction::AddDevice => seal.devices.last().map(|d| d.id.clone()),
             _ => device,
         };
         let digest = match action {
-            VaultAction::Create
-            | VaultAction::SetPolicy
-            | VaultAction::Share
-            | VaultAction::Unshare => {
-                // A policy, or who shares the vault after the change.
+            SealAction::Create
+            | SealAction::SetPolicy
+            | SealAction::Share
+            | SealAction::Unshare => {
+                // A policy, or who shares the seal after the change.
                 let what = match action {
-                    VaultAction::Share | VaultAction::Unshare => vault.sharing_bytes(),
-                    _ => serde_json::to_vec(&vault.policy)
+                    SealAction::Share | SealAction::Unshare => seal.sharing_bytes(),
+                    _ => serde_json::to_vec(&seal.policy)
                         .map_err(|e| Refusal::because(e.to_string()))?,
                 };
                 let alg = self.tree_hash();
@@ -1185,37 +1185,37 @@ impl EnrollServer {
             }
             _ => merkle::Hash::zero(self.tree_hash()),
         };
-        self.record_vault(&vault.id, action, device.as_deref(), digest)
+        self.record_seal(&seal.id, action, device.as_deref(), digest)
     }
 
     /// Record the release of a sealed file's server share, by its binding.
     fn record_release(
         &self,
         request: &EscrowRequest,
-        device: Option<&crate::vault::Device>,
+        device: Option<&crate::seal::Device>,
         opened: &tang_pqc::OpenedRequest<'_>,
     ) -> Result<Option<Receipt>, Refusal> {
         // The release is logged by the escrow binding: the KEM suite's
         // hash, as the log's own is the signer's.
         let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
         let device = device.map(|d| d.id.as_str());
-        self.record_vault(request.vault(), VaultAction::Release, device, binding)
+        self.record_seal(request.seal(), SealAction::Release, device, binding)
     }
 
-    /// Record a vault event about `vault`.
-    fn record_vault(
+    /// Record a seal event about `seal`.
+    fn record_seal(
         &self,
-        vault: &escrow::VaultId,
-        action: VaultAction,
+        seal: &escrow::SealId,
+        action: SealAction,
         device: Option<&str>,
         digest: merkle::Hash,
     ) -> Result<Option<Receipt>, Refusal> {
-        let event = VaultEvent {
+        let event = SealEvent {
             action,
             device: device.map(str::to_owned),
             digest,
         };
-        self.record(action.kind(), vault.as_bytes(), &event.to_bytes())
+        self.record(action.kind(), seal.as_bytes(), &event.to_bytes())
     }
 
     /// Replace the delegation and the trusted anchors, as decided by the
@@ -1572,8 +1572,8 @@ impl EnrollServer {
             (Operation::Register, AuthType::Kerberos) => {
                 return self.register(request, ss.as_ref(), &t, &body, directory);
             }
-            (Operation::Vault, AuthType::Kerberos) => {
-                return self.vault_op(request, ss.as_ref(), &t, &body, directory);
+            (Operation::Seal, AuthType::Kerberos) => {
+                return self.seal_op(request, ss.as_ref(), &t, &body, directory);
             }
             (Operation::Keys, AuthType::Kerberos) => {
                 return self.keys_op(request, ss.as_ref(), &t, &body, directory);
@@ -1668,10 +1668,10 @@ impl EnrollServer {
         Ok(request.respond(ss, t, Some(&binding), &params.acknowledgement())?)
     }
 
-    /// Answer a vault operation (§7.6): authenticate the caller by their
-    /// ticket, check their role in the vault, apply the owner's limits,
+    /// Answer a seal operation (§7.6): authenticate the caller by their
+    /// ticket, check their role in the seal, apply the owner's limits,
     /// store, and answer with signed descriptors.
-    fn vault_op(
+    fn seal_op(
         &self,
         request: &Request,
         ss: &[u8],
@@ -1687,60 +1687,60 @@ impl EnrollServer {
         if caller.realm() != self.info.realm {
             return Err(Refusal::because("wrong realm"));
         }
-        let op = VaultOp::from_bytes(&body.extra)?;
+        let op = SealOp::from_bytes(&body.extra)?;
         let now = unix_seconds(SystemTime::now());
-        let mut event = vault_event(&op);
+        let mut event = seal_event(&op);
         // Whoever loses a device or their membership must not open files
         // sealed for offline sessions from now on: a new epoch starts.
-        let rotate = matches!(op, VaultOp::RemoveDevice { .. } | VaultOp::Unshare { .. });
+        let rotate = matches!(op, SealOp::RemoveDevice { .. } | SealOp::Unshare { .. });
         let mut receipts = Vec::new();
         // What the operations that concern no descriptor answer.
         let mut side = Reply::default();
-        let (vaults, session, released) = match op {
-            op @ (VaultOp::Request { .. }
-            | VaultOp::Pending { .. }
-            | VaultOp::Approve { .. }
-            | VaultOp::Deny { .. }
-            | VaultOp::EscrowCode { .. }
-            | VaultOp::RecoverCode
-            | VaultOp::Deposit { .. }
-            | VaultOp::Deposits { .. }
-            | VaultOp::FetchDeposit { .. }
-            | VaultOp::RetireDeposit { .. }
-            | VaultOp::RecoverySettings
-            | VaultOp::DeviceKey { .. }
-            | VaultOp::Deliver { .. }
-            | VaultOp::Passkeys) => {
+        let (seals, session, released) = match op {
+            op @ (SealOp::Request { .. }
+            | SealOp::Pending { .. }
+            | SealOp::Approve { .. }
+            | SealOp::Deny { .. }
+            | SealOp::EscrowCode { .. }
+            | SealOp::RecoverCode
+            | SealOp::Deposit { .. }
+            | SealOp::Deposits { .. }
+            | SealOp::FetchDeposit { .. }
+            | SealOp::RetireDeposit { .. }
+            | SealOp::RecoverySettings
+            | SealOp::DeviceKey { .. }
+            | SealOp::Deliver { .. }
+            | SealOp::Passkeys) => {
                 side = self.side_op(&caller, op, now, directory)?;
                 (Vec::new(), None, None)
             }
-            op @ VaultOp::Unlock { .. } => {
+            op @ SealOp::Unlock { .. } => {
                 let started = self.start_session(&caller, &op, &cb, now, directory)?;
                 receipts.extend(started.receipts);
                 // Nothing is released before the answer, which waits for
                 // the record.
                 if let Some((action, device)) = event.take() {
-                    receipts.extend(self.record_change(&started.vault, action, device)?);
+                    receipts.extend(self.record_change(&started.seal, action, device)?);
                 }
-                (vec![started.vault], Some(started.token), started.released)
+                (vec![started.seal], Some(started.token), started.released)
             }
             op => {
                 // A change is recorded before the directory stores it, so a
-                // failed append leaves the vault as it was.
-                let mut record = |vault: &Vault| {
+                // failed append leaves the seal as it was.
+                let mut record = |seal: &Seal| {
                     if let Some((action, device)) = event.take() {
-                        receipts.extend(self.record_change(vault, action, device)?);
+                        receipts.extend(self.record_change(seal, action, device)?);
                     }
                     Ok(())
                 };
-                let mut vaults = self.apply_vault_op(&caller, op, now, directory, &mut record)?;
-                for v in &mut vaults {
-                    receipts.extend(self.settle_vault(v, now, rotate, directory)?);
+                let mut seals = self.apply_seal_op(&caller, op, now, directory, &mut record)?;
+                for v in &mut seals {
+                    receipts.extend(self.settle_seal(v, now, rotate, directory)?);
                 }
-                (vaults, None, None)
+                (seals, None, None)
             }
         };
-        let descriptors = self.public_descriptors(&vaults, now, directory)?;
+        let descriptors = self.public_descriptors(&seals, now, directory)?;
         receipts.append(&mut side.receipts);
         if receipts.len() > 255 {
             // The wire counts receipts in a `u8`; the committed change
@@ -1762,45 +1762,45 @@ impl EnrollServer {
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes()?)?)
     }
 
-    /// Settle a vault a vault operation touched: whoever has no part in it
+    /// Settle a seal a seal operation touched: whoever has no part in it
     /// any more (out of the group in IPA, or unshared) loses their
     /// devices, as a removal would, and its epochs move on — at once when
-    /// `rotate` or someone left. Stores the vault if it changed and
+    /// `rotate` or someone left. Stores the seal if it changed and
     /// answers the receipts of the removals.
-    fn settle_vault(
+    fn settle_seal(
         &self,
-        vault: &mut Vault,
+        seal: &mut Seal,
         now: u64,
         rotate: bool,
         directory: &dyn Directory,
     ) -> Result<Vec<Receipt>, Refusal> {
-        let gone = prune_departed(vault, directory)?;
+        let gone = prune_departed(seal, directory)?;
         let mut receipts = Vec::new();
         for id in &gone {
             receipts.extend(self.record_change(
-                vault,
-                VaultAction::RemoveDevice,
+                seal,
+                SealAction::RemoveDevice,
                 Some(id.clone()),
             )?);
         }
-        let rotated = self.maintain_epochs(vault, now, rotate || !gone.is_empty(), directory)?;
+        let rotated = self.maintain_epochs(seal, now, rotate || !gone.is_empty(), directory)?;
         if rotated || !gone.is_empty() {
-            directory.vault_update(vault).map_err(Refusal)?;
+            directory.seal_update(seal).map_err(Refusal)?;
         }
         Ok(receipts)
     }
 
-    /// Sign the descriptors of `vaults`, each for as long as its owner's
+    /// Sign the descriptors of `seals`, each for as long as its owner's
     /// limits allow. Descriptors carry each epoch's public key, never its
     /// slots.
     fn public_descriptors(
         &self,
-        vaults: &[Vault],
+        seals: &[Seal],
         now: u64,
         directory: &dyn Directory,
     ) -> Result<Vec<Descriptor>, Refusal> {
         let delegation = self.delegation();
-        vaults
+        seals
             .iter()
             .map(|v| {
                 let max_age = limits_for(&v.owner, directory)?.descriptor_age;
@@ -1956,7 +1956,7 @@ impl EnrollServer {
     }
 
     /// Answer a `tlog` lookup (`DESIGN-tlog.md` §6): the caller's own
-    /// entries — about a vault they own, or about their principal — with
+    /// entries — about a seal they own, or about their principal — with
     /// proofs against the log's current signed head.
     fn tlog_op(
         &self,
@@ -1975,17 +1975,15 @@ impl EnrollServer {
             return Err(Refusal::because("wrong realm"));
         }
         let query = crate::tlog::Query::from_bytes(&body.extra)?;
-        let subject = if query.vault.is_empty() {
+        let subject = if query.seal.is_empty() {
             caller.to_string().into_bytes()
         } else {
             directory
-                .vaults_of(&caller)
+                .seals_of(&caller)
                 .map_err(Refusal)?
                 .into_iter()
-                .find(|v| v.name == query.vault)
-                .ok_or_else(|| {
-                    Refusal::because(format!("{caller} has no vault {:?}", query.vault))
-                })?
+                .find(|v| v.name == query.seal)
+                .ok_or_else(|| Refusal::because(format!("{caller} has no seal {:?}", query.seal)))?
                 .id
                 .as_bytes()
                 .to_vec()
@@ -2034,59 +2032,58 @@ impl EnrollServer {
         Ok(servers)
     }
 
-    /// For a vault with offline sessions: start the next epoch when the
+    /// For a seal with offline sessions: start the next epoch when the
     /// current one has run its length, and seal every key this server can
     /// open to servers that have no slot yet.  Returns whether it changed.
     fn maintain_epochs(
         &self,
-        vault: &mut Vault,
+        seal: &mut Seal,
         now: u64,
         rotate: bool,
         directory: &dyn Directory,
     ) -> Result<bool, Refusal> {
-        if vault.state != State::Enabled || vault.policy.sessions.offline.is_none() {
+        if seal.state != State::Enabled || seal.policy.sessions.offline.is_none() {
             return Ok(false);
         }
         let servers = self.escrow_servers(directory)?;
         let mut changed = false;
-        for key in &mut vault.session_keys {
-            if let Ok(pair) = key.open(&vault.id, &self.keys.escrow) {
-                changed |= key.add_slots(&vault.id, &pair, &servers)?;
+        for key in &mut seal.session_keys {
+            if let Ok(pair) = key.open(&seal.id, &self.keys.escrow) {
+                changed |= key.add_slots(&seal.id, &pair, &servers)?;
             }
         }
-        let length = vault.policy.sessions.epoch.unwrap_or(DEFAULT_EPOCH);
+        let length = seal.policy.sessions.epoch.unwrap_or(DEFAULT_EPOCH);
         let due = rotate
-            || vault
+            || seal
                 .session_keys
                 .last()
                 .is_none_or(|k| now >= k.started.saturating_add(length));
         if due {
-            let epoch = vault.session_keys.last().map_or(1, |k| k.epoch + 1);
-            vault
-                .session_keys
-                .push(SessionKey::generate(&vault.id, epoch, now, &servers)?);
-            eprintln!("kuipad: vault {} starts session epoch {epoch}", vault.id);
+            let epoch = seal.session_keys.last().map_or(1, |k| k.epoch + 1);
+            seal.session_keys
+                .push(SessionKey::generate(&seal.id, epoch, now, &servers)?);
+            eprintln!("kuipad: seal {} starts session epoch {epoch}", seal.id);
             changed = true;
         }
         Ok(changed)
     }
 
-    /// Start a session for `caller`'s `device` in the vault `name` refers
-    /// to, as long as its policy allows (and no longer than the vault): a
-    /// re-authentication token, or offline the vault's session keys
-    /// released to the device. The vault is settled ([`Self::settle_vault`])
+    /// Start a session for `caller`'s `device` in the seal `name` refers
+    /// to, as long as its policy allows (and no longer than the seal): a
+    /// re-authentication token, or offline the seal's session keys
+    /// released to the device. The seal is settled ([`Self::settle_seal`])
     /// once the caller may start the session and before anything is
     /// released, so departed members' devices are gone and the keys come
     /// from the epochs that follow.
     fn start_session(
         &self,
         caller: &Principal,
-        op: &VaultOp,
+        op: &SealOp,
         cb: &[u8; 32],
         now: u64,
         directory: &dyn Directory,
     ) -> Result<StartedSession, Refusal> {
-        let VaultOp::Unlock {
+        let SealOp::Unlock {
             name,
             device,
             offline,
@@ -2096,28 +2093,28 @@ impl EnrollServer {
             unreachable!("only unlock starts a session");
         };
         let offline = *offline;
-        let (mut vault, role) = self.resolve_vault(caller, name, directory)?;
+        let (mut seal, role) = self.resolve_seal(caller, name, directory)?;
         need_member(role)?;
-        if vault.state != State::Enabled {
-            return Err(Refusal::because("the vault is revoked"));
+        if seal.state != State::Enabled {
+            return Err(Refusal::because("the seal is revoked"));
         }
         // A session stands in for the passkey factor, so starting one
         // needs an assertion, bound to this exchange.
-        if vault.policy.factors.passkey {
+        if seal.policy.factors.passkey {
             let assertion = passkey
                 .as_deref()
-                .ok_or_else(|| Refusal::because("the vault needs the caller's passkey"))?;
+                .ok_or_else(|| Refusal::because("the seal needs the caller's passkey"))?;
             let assertion = tang_pqc::b64::decode(assertion).map_err(Error::from)?;
             self.check_passkey(
                 caller,
                 &assertion,
-                &crate::vault::session_passkey_challenge(cb)?,
+                &crate::seal::session_passkey_challenge(cb)?,
                 directory,
             )?;
         }
-        let sessions = &vault.policy.sessions;
+        let sessions = &seal.policy.sessions;
         let length = if offline {
-            if !limits_for(&vault.owner, directory)?.offline_sessions {
+            if !limits_for(&seal.owner, directory)?.offline_sessions {
                 return Err(Refusal::because(
                     "the realm does not allow offline sessions",
                 ));
@@ -2126,111 +2123,111 @@ impl EnrollServer {
         } else {
             sessions.reauth
         }
-        .ok_or_else(|| Refusal::because("the vault's policy allows no such session"))?;
-        let receipts = self.settle_vault(&mut vault, now, false, directory)?;
-        let registered = vault
+        .ok_or_else(|| Refusal::because("the seal's policy allows no such session"))?;
+        let receipts = self.settle_seal(&mut seal, now, false, directory)?;
+        let registered = seal
             .devices
             .iter()
             .find(|d| d.id == *device)
             .ok_or_else(|| Refusal::because("the device is not registered"))?;
-        if vault.holder(registered) != caller.to_string() {
+        if seal.holder(registered) != caller.to_string() {
             return Err(Refusal::because("the device is another member's"));
         }
         let device = registered.thumbprint()?;
         let released = if offline {
             if !directory
-                .vault_unlock(&vault.id, &self.info.server, vault.policy.max_unlocks)
+                .seal_unlock(&seal.id, &self.info.server, seal.policy.max_unlocks)
                 .map_err(Refusal)?
             {
-                return Err(Refusal::because("the vault's unlock limit is reached"));
+                return Err(Refusal::because("the seal's unlock limit is reached"));
             }
-            let keys = vault
+            let keys = seal
                 .session_keys
                 .iter()
-                .map(|k| Ok((k.epoch, k.open(&vault.id, &self.keys.escrow)?)))
+                .map(|k| Ok((k.epoch, k.open(&seal.id, &self.keys.escrow)?)))
                 .collect::<crate::Result<Vec<_>>>()?;
-            Some(ReleasedKeys::seal(&registered.public()?, &vault.id, &keys)?)
+            Some(ReleasedKeys::seal(&registered.public()?, &seal.id, &keys)?)
         } else {
             None
         };
-        let not_after = vault
+        let not_after = seal
             .policy
             .not_after
             .map_or(now + length, |end| end.min(now + length));
         let token = SessionToken::sign(
             &self.keys.signing,
             &self.delegation(),
-            vault.id,
+            seal.id,
             &caller.to_string(),
             device,
             not_after,
         )?;
         eprintln!(
-            "kuipad: {caller} started {} session for vault {} until {not_after}",
+            "kuipad: {caller} started {} session for seal {} until {not_after}",
             if offline { "an offline" } else { "a" },
-            vault.id
+            seal.id
         );
         Ok(StartedSession {
-            vault,
+            seal,
             token,
             released,
             receipts,
         })
     }
 
-    /// The vault `reference` names for `caller` (`NAME`, the caller's
+    /// The seal `reference` names for `caller` (`NAME`, the caller's
     /// own, or `OWNER/NAME`, one shared with them), with the caller's role.
-    fn resolve_vault(
+    fn resolve_seal(
         &self,
         caller: &Principal,
         reference: &str,
         directory: &dyn Directory,
-    ) -> Result<(Vault, Role), Refusal> {
-        let vault = self.find_vault(caller, reference, directory)?;
-        let groups = groups_for(&vault, caller, directory)?;
-        // A vault the caller has no part in is not told apart from none.
-        let role = vault
+    ) -> Result<(Seal, Role), Refusal> {
+        let seal = self.find_seal(caller, reference, directory)?;
+        let groups = groups_for(&seal, caller, directory)?;
+        // A seal the caller has no part in is not told apart from none.
+        let role = seal
             .role(caller, &groups)
-            .ok_or_else(|| missing_vault(caller, reference))?;
-        Ok((vault, role))
+            .ok_or_else(|| missing_seal(caller, reference))?;
+        Ok((seal, role))
     }
 
-    /// The vault `reference` names for `caller`, whatever the caller's part
+    /// The seal `reference` names for `caller`, whatever the caller's part
     /// in it.
-    fn find_vault(
+    fn find_seal(
         &self,
         caller: &Principal,
         reference: &str,
         directory: &dyn Directory,
-    ) -> Result<Vault, Refusal> {
-        let (owner, name) = crate::vault::split_ref(reference);
+    ) -> Result<Seal, Refusal> {
+        let (owner, name) = crate::seal::split_ref(reference);
         let owner: Principal = match owner {
             None => caller.clone(),
             Some(o) if o.contains('@') => o.parse()?,
             Some(o) => format!("{o}@{}", self.info.realm).parse()?,
         };
         directory
-            .vaults_of(&owner)
+            .seals_of(&owner)
             .map_err(Refusal)?
             .into_iter()
             .find(|v| v.name == name)
-            .ok_or_else(|| missing_vault(caller, reference))
+            .ok_or_else(|| missing_seal(caller, reference))
     }
 
-    /// The vault `reference` names, for someone who approves its releases
+    /// The seal `reference` names, for someone who approves its releases
     /// or has a part in it; and whether they approve.
-    fn vault_for_release(
+    fn seal_for_release(
         &self,
         caller: &Principal,
         reference: &str,
         directory: &dyn Directory,
-    ) -> Result<(Vault, bool), Refusal> {
-        let vault = self.find_vault(caller, reference, directory)?;
-        let approves = approves(&vault, caller, directory)?;
-        if approves || vault.opens(caller, &groups_for(&vault, caller, directory)?) {
-            Ok((vault, approves))
+    ) -> Result<(Seal, bool), Refusal> {
+        let seal = self.find_seal(caller, reference, directory)?;
+        let approves = approves(&seal, caller, directory)?;
+        if approves || seal.opens(caller, &groups_for(&seal, caller, directory)?) {
+            Ok((seal, approves))
         } else {
-            Err(missing_vault(caller, reference))
+            Err(missing_seal(caller, reference))
         }
     }
 
@@ -2240,24 +2237,24 @@ impl EnrollServer {
     fn release_op(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
         match op {
-            VaultOp::Request {
+            SealOp::Request {
                 name,
                 bindings,
                 reason,
             } => self.make_request(caller, &name, bindings, reason, now, directory),
-            VaultOp::Pending { name } => Ok((
+            SealOp::Pending { name } => Ok((
                 self.pending_requests(caller, name.as_deref(), now, directory)?,
                 Vec::new(),
             )),
-            VaultOp::Approve { name, id } => {
+            SealOp::Approve { name, id } => {
                 self.mark_request(caller, &name, &id, false, now, directory)
             }
-            VaultOp::Deny { name, id } => {
+            SealOp::Deny { name, id } => {
                 self.mark_request(caller, &name, &id, true, now, directory)
             }
             _ => unreachable!("only release-request operations"),
@@ -2276,28 +2273,28 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
         let mut receipts = Vec::new();
-        let (vault, role) = self.resolve_vault(caller, name, directory)?;
+        let (seal, role) = self.resolve_seal(caller, name, directory)?;
         need_member(role)?;
-        let approvals = vault
+        let approvals = seal
             .policy
             .approvals
             .as_ref()
-            .ok_or_else(|| Refusal::because("the vault needs no approvals"))?;
-        if vault.state != State::Enabled {
-            return Err(Refusal::because("the vault is revoked"));
+            .ok_or_else(|| Refusal::because("the seal needs no approvals"))?;
+        if seal.state != State::Enabled {
+            return Err(Refusal::because("the seal is revoked"));
         }
         let valid = |h: &String| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
         if bindings.is_empty() || bindings.len() > 64 || !bindings.iter().all(valid) {
             return Err(Refusal::because("malformed binding hashes"));
         }
-        if reason.len() > crate::vault::MAX_REASON {
+        if reason.len() > crate::seal::MAX_REASON {
             return Err(Refusal::because("the reason is too long"));
         }
         let mut id = [0u8; 16];
         native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
         let request = ReleaseRequest {
             id: hex(&id),
-            vault: vault.id,
+            seal: seal.id,
             requester: caller.to_string(),
             bindings,
             reason,
@@ -2308,16 +2305,16 @@ impl EnrollServer {
             uses: 0,
         };
         let digest = self.log_digest(&[&request.log_bytes()])?;
-        receipts.extend(self.record_vault(&vault.id, VaultAction::Request, None, digest)?);
+        receipts.extend(self.record_seal(&seal.id, SealAction::Request, None, digest)?);
         directory.release_add(&request).map_err(Refusal)?;
         eprintln!(
-            "kuipad: {caller} asked for release {} of vault {}",
-            request.id, vault.id
+            "kuipad: {caller} asked for release {} of seal {}",
+            request.id, seal.id
         );
         Ok((vec![request], receipts))
     }
 
-    /// `pending`: the open requests of vault `name`, or of every vault the
+    /// `pending`: the open requests of seal `name`, or of every seal the
     /// caller approves for or has a part in.
     fn pending_requests(
         &self,
@@ -2326,13 +2323,13 @@ impl EnrollServer {
         now: u64,
         directory: &dyn Directory,
     ) -> Result<Vec<ReleaseRequest>, Refusal> {
-        let vaults = if let Some(name) = name {
-            vec![self.vault_for_release(caller, name, directory)?.0]
+        let seals = if let Some(name) = name {
+            vec![self.seal_for_release(caller, name, directory)?.0]
         } else {
-            let mut all = list_vaults(caller, directory)?;
+            let mut all = list_seals(caller, directory)?;
             let groups = directory.principal_groups(caller).unwrap_or_default();
             for v in directory
-                .vaults_approved_by(caller, &groups)
+                .seals_approved_by(caller, &groups)
                 .map_err(Refusal)?
             {
                 if !all.iter().any(|a| a.id == v.id) && approves(&v, caller, directory)? {
@@ -2342,7 +2339,7 @@ impl EnrollServer {
             all
         };
         let mut open = Vec::new();
-        for v in vaults.iter().filter(|v| v.policy.approvals.is_some()) {
+        for v in seals.iter().filter(|v| v.policy.approvals.is_some()) {
             open.extend(
                 directory
                     .releases(&v.id)
@@ -2354,7 +2351,7 @@ impl EnrollServer {
         Ok(open)
     }
 
-    /// `approve` (or with `deny`, `deny`) request `id` of vault `name`.
+    /// `approve` (or with `deny`, `deny`) request `id` of seal `name`.
     fn mark_request(
         &self,
         caller: &Principal,
@@ -2365,17 +2362,17 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
         let mut receipts = Vec::new();
-        let (vault, approves) = self.vault_for_release(caller, name, directory)?;
+        let (seal, approves) = self.seal_for_release(caller, name, directory)?;
         if !approves {
             return Err(Refusal::because(format!(
-                "{caller} does not approve releases of the vault"
+                "{caller} does not approve releases of the seal"
             )));
         }
         if directory.principal_locked(caller).map_err(Refusal)? {
             return Err(Refusal::because(format!("{caller} is locked or gone")));
         }
         let mut request = directory
-            .releases(&vault.id)
+            .releases(&seal.id)
             .map_err(Refusal)?
             .into_iter()
             .find(|r| r.id == id)
@@ -2395,20 +2392,20 @@ impl EnrollServer {
             at: now,
         };
         let action = if deny {
-            VaultAction::Deny
+            SealAction::Deny
         } else {
-            VaultAction::Approve
+            SealAction::Approve
         };
         let digest = self.log_digest(&[request.id.as_bytes(), b" ", me.as_bytes()])?;
-        receipts.extend(self.record_vault(&vault.id, action, None, digest)?);
+        receipts.extend(self.record_seal(&seal.id, action, None, digest)?);
         directory
-            .release_mark(&vault.id, &request.id, &approval, deny)
+            .release_mark(&seal.id, &request.id, &approval, deny)
             .map_err(Refusal)?;
         eprintln!(
-            "kuipad: {caller} {} release {} of vault {}",
+            "kuipad: {caller} {} release {} of seal {}",
             if deny { "denied" } else { "approved" },
             request.id,
-            vault.id
+            seal.id
         );
         if deny {
             request.denied = Some(approval);
@@ -2420,20 +2417,20 @@ impl EnrollServer {
 
     /// Answer `escrow-code` and `recover-code` (`DESIGN-recovery.md` §2):
     /// keep or return the caller's device keys under recovery codes.  Each
-    /// is logged in every vault where the caller holds the device, so a
-    /// vault's watchers see that its device can be recovered, and when it
+    /// is logged in every seal where the caller holds the device, so a
+    /// seal's watchers see that its device can be recovered, and when it
     /// was fetched.
     fn escrow_op(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vec<DeviceEscrow>, Vec<Receipt>), Refusal> {
         let me = caller.to_string();
-        let vaults = list_vaults(caller, directory)?;
-        let held = |device: &str| -> Vec<escrow::VaultId> {
-            vaults
+        let seals = list_seals(caller, directory)?;
+        let held = |device: &str| -> Vec<escrow::SealId> {
+            seals
                 .iter()
                 .filter(|v| {
                     v.devices
@@ -2444,22 +2441,22 @@ impl EnrollServer {
                 .collect()
         };
         let mut receipts = Vec::new();
-        let mut log = |device: &str, action: VaultAction| -> Result<(), Refusal> {
+        let mut log = |device: &str, action: SealAction| -> Result<(), Refusal> {
             for id in held(device) {
                 let zero = merkle::Hash::zero(self.tree_hash());
-                receipts.extend(self.record_vault(&id, action, Some(device), zero)?);
+                receipts.extend(self.record_seal(&id, action, Some(device), zero)?);
             }
             Ok(())
         };
         match op {
-            VaultOp::EscrowCode { device, blob } => {
+            SealOp::EscrowCode { device, blob } => {
                 if held(&device).is_empty() {
                     return Err(Refusal::because(
-                        "register the device in a vault before escrowing it",
+                        "register the device in a seal before escrowing it",
                     ));
                 }
                 let bytes = tang_pqc::b64::decode(&blob).map_err(Error::from)?;
-                if bytes.is_empty() || bytes.len() > crate::vault::MAX_ESCROW_BLOB {
+                if bytes.is_empty() || bytes.len() > crate::seal::MAX_ESCROW_BLOB {
                     return Err(Refusal::because(
                         "an escrowed key of no or too great a size",
                     ));
@@ -2470,18 +2467,18 @@ impl EnrollServer {
                     blob,
                     added: now,
                 };
-                log(&escrow.device, VaultAction::EscrowCode)?;
+                log(&escrow.device, SealAction::EscrowCode)?;
                 directory
                     .device_escrow_set(caller, &escrow)
                     .map_err(Refusal)?;
                 eprintln!("kuipad: {caller} escrowed device {}", escrow.device);
                 Ok((vec![escrow], receipts))
             }
-            VaultOp::RecoverCode => {
+            SealOp::RecoverCode => {
                 let escrows = directory.device_escrows(caller).map_err(Refusal)?;
                 // Logged before anything is answered.
                 for e in &escrows {
-                    log(&e.device, VaultAction::RecoverCode)?;
+                    log(&e.device, SealAction::RecoverCode)?;
                 }
                 eprintln!(
                     "kuipad: {caller} fetched {} escrowed device key(s)",
@@ -2498,15 +2495,15 @@ impl EnrollServer {
     fn side_op(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<Reply, Refusal> {
         Ok(match op {
-            op @ (VaultOp::Request { .. }
-            | VaultOp::Pending { .. }
-            | VaultOp::Approve { .. }
-            | VaultOp::Deny { .. }) => {
+            op @ (SealOp::Request { .. }
+            | SealOp::Pending { .. }
+            | SealOp::Approve { .. }
+            | SealOp::Deny { .. }) => {
                 let (requests, receipts) = self.release_op(caller, op, now, directory)?;
                 Reply {
                     receipts,
@@ -2514,17 +2511,17 @@ impl EnrollServer {
                     ..Reply::default()
                 }
             }
-            op @ (VaultOp::RecoverySettings
-            | VaultOp::DeviceKey { .. }
-            | VaultOp::Deliver { .. }) => self.recovery_op(caller, op, now, directory)?,
-            VaultOp::Passkeys => Reply {
+            op @ (SealOp::RecoverySettings | SealOp::DeviceKey { .. } | SealOp::Deliver { .. }) => {
+                self.recovery_op(caller, op, now, directory)?
+            }
+            SealOp::Passkeys => Reply {
                 passkeys: Some(PasskeyInfo::of(
                     &self.info.domain,
                     &directory.passkeys(caller).map_err(Refusal)?,
                 )),
                 ..Reply::default()
             },
-            op @ (VaultOp::EscrowCode { .. } | VaultOp::RecoverCode) => {
+            op @ (SealOp::EscrowCode { .. } | SealOp::RecoverCode) => {
                 let (escrows, receipts) = self.escrow_op(caller, op, now, directory)?;
                 Reply {
                     receipts,
@@ -2545,25 +2542,25 @@ impl EnrollServer {
 
     /// Answer the recovery operations (`DESIGN-recovery.md` §4): the
     /// realm's settings, a user's device's public key, and a delivery to
-    /// it.  The last two are for members of the realm's device vault: the
+    /// it.  The last two are for members of the realm's device seal: the
     /// helpdesk.
     fn recovery_op(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<Reply, Refusal> {
         let settings = directory.recovery_settings().map_err(Refusal)?;
         let (user, device) = match &op {
-            VaultOp::RecoverySettings => {
+            SealOp::RecoverySettings => {
                 return Ok(Reply {
                     recovery: settings,
                     ..Reply::default()
                 });
             }
-            VaultOp::DeviceKey { user, device } | VaultOp::Deliver { user, device, .. } => {
-                // A bare name is a user of this realm, as a vault's owner is.
+            SealOp::DeviceKey { user, device } | SealOp::Deliver { user, device, .. } => {
+                // A bare name is a user of this realm, as a seal's owner is.
                 let user: Principal = if user.contains('@') {
                     user.parse()?
                 } else {
@@ -2575,14 +2572,14 @@ impl EnrollServer {
         };
         let settings =
             settings.ok_or_else(|| Refusal::because("the realm has no device recovery"))?;
-        let helpdesk = self.find_vault(caller, &settings.device_vault, directory)?;
+        let helpdesk = self.find_seal(caller, &settings.device_seal, directory)?;
         if !helpdesk.opens(caller, &groups_for(&helpdesk, caller, directory)?) {
             return Err(Refusal::because(
                 "only the realm's helpdesk delivers device keys",
             ));
         }
         let me = user.to_string();
-        let vaults: Vec<Vault> = list_vaults(&user, directory)?
+        let seals: Vec<Seal> = list_seals(&user, directory)?
             .into_iter()
             .filter(|v| {
                 v.devices
@@ -2590,26 +2587,26 @@ impl EnrollServer {
                     .any(|d| d.id == device && v.holder(d) == me)
             })
             .collect();
-        let registered = vaults
+        let registered = seals
             .iter()
             .flat_map(|v| v.devices.iter())
             .find(|d| d.id == device)
             .cloned()
             .ok_or_else(|| Refusal::because(format!("{user} has registered no device {device}")))?;
-        let VaultOp::Deliver { blob, .. } = op else {
+        let SealOp::Deliver { blob, .. } = op else {
             return Ok(Reply {
                 devices: vec![registered.held_by(&me)],
                 ..Reply::default()
             });
         };
         let bytes = tang_pqc::b64::decode(&blob).map_err(Error::from)?;
-        if !bytes.starts_with(b"IPDD") || bytes.len() > crate::vault::MAX_ESCROW_BLOB {
+        if !bytes.starts_with(b"IPDD") || bytes.len() > crate::seal::MAX_ESCROW_BLOB {
             return Err(Refusal::because("not a device delivery"));
         }
         let mut receipts = Vec::new();
-        for v in &vaults {
+        for v in &seals {
             let zero = merkle::Hash::zero(self.tree_hash());
-            receipts.extend(self.record_vault(&v.id, VaultAction::Deliver, Some(&device), zero)?);
+            receipts.extend(self.record_seal(&v.id, SealAction::Deliver, Some(&device), zero)?);
         }
         let escrow = DeviceEscrow {
             device,
@@ -2636,17 +2633,17 @@ impl EnrollServer {
     fn deposit_op(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vec<Deposit>, Vec<Receipt>), Refusal> {
         let me = caller.to_string();
         match op {
-            op @ VaultOp::Deposit { .. } => self.make_deposit(caller, op, now, directory),
-            VaultOp::Deposits { name } => {
-                let (vault, role) = self.resolve_vault(caller, &name, directory)?;
+            op @ SealOp::Deposit { .. } => self.make_deposit(caller, op, now, directory),
+            SealOp::Deposits { name } => {
+                let (seal, role) = self.resolve_seal(caller, &name, directory)?;
                 let listed = directory
-                    .deposits(&vault.id)
+                    .deposits(&seal.id)
                     .map_err(Refusal)?
                     .into_iter()
                     .filter(|d| role >= Role::Member || d.depositor == me)
@@ -2657,34 +2654,34 @@ impl EnrollServer {
                     .collect();
                 Ok((listed, Vec::new()))
             }
-            VaultOp::FetchDeposit { name, id } => {
-                let (vault, role) = self.resolve_vault(caller, &name, directory)?;
+            SealOp::FetchDeposit { name, id } => {
+                let (seal, role) = self.resolve_seal(caller, &name, directory)?;
                 need_member(role)?;
-                Ok((vec![find_deposit(&vault, &id, directory)?], Vec::new()))
+                Ok((vec![find_deposit(&seal, &id, directory)?], Vec::new()))
             }
-            VaultOp::RetireDeposit { name, id } => {
-                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
-                let deposit = find_deposit(&vault, &id, directory)?;
+            SealOp::RetireDeposit { name, id } => {
+                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
+                let deposit = find_deposit(&seal, &id, directory)?;
                 if deposit.depositor != me {
                     need(role, Role::Manager, "retire another's deposit")?;
                 }
-                let receipts = self.retire_deposits(&mut vault, &[deposit], directory)?;
+                let receipts = self.retire_deposits(&mut seal, &[deposit], directory)?;
                 Ok((Vec::new(), receipts))
             }
             _ => unreachable!("only deposit operations"),
         }
     }
 
-    /// `deposit`: keep a file sealed to the vault, in place of the
+    /// `deposit`: keep a file sealed to the seal, in place of the
     /// depositor's earlier one of the same kind and subject.
     fn make_deposit(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vec<Deposit>, Vec<Receipt>), Refusal> {
-        let VaultOp::Deposit {
+        let SealOp::Deposit {
             name,
             kind,
             subject,
@@ -2694,17 +2691,17 @@ impl EnrollServer {
             unreachable!("only deposit");
         };
         // Any role deposits, a depositor's included.
-        let (mut vault, _) = self.resolve_vault(caller, &name, directory)?;
-        if vault.state != State::Enabled {
-            return Err(Refusal::because("the vault is revoked"));
+        let (mut seal, _) = self.resolve_seal(caller, &name, directory)?;
+        if seal.state != State::Enabled {
+            return Err(Refusal::because("the seal is revoked"));
         }
         let bytes = tang_pqc::b64::decode(&sealed).map_err(Error::from)?;
-        if bytes.len() > crate::vault::MAX_DEPOSIT {
+        if bytes.len() > crate::seal::MAX_DEPOSIT {
             return Err(Refusal::because("the deposit is too large"));
         }
-        let file = crate::vault::SealedVaultFile::from_bytes(&bytes)?;
-        if *file.vault() != vault.id || file.principal().to_string() != vault.owner {
-            return Err(Refusal::because("a file sealed to another vault"));
+        let file = crate::seal::SealedFile::from_bytes(&bytes)?;
+        if *file.seal_id() != seal.id || file.principal().to_string() != seal.owner {
+            return Err(Refusal::because("a file sealed to another seal"));
         }
         if subject.len() > 8
             || subject
@@ -2714,19 +2711,19 @@ impl EnrollServer {
             return Err(Refusal::because("a malformed deposit subject"));
         }
         let me = caller.to_string();
-        let existing = directory.deposits(&vault.id).map_err(Refusal)?;
+        let existing = directory.deposits(&seal.id).map_err(Refusal)?;
         let (replaced, others): (Vec<Deposit>, Vec<Deposit>) = existing
             .into_iter()
             .filter(|d| d.depositor == me)
             .partition(|d| d.kind == kind && d.subject == subject);
-        if others.len() >= limits_for(&vault.owner, directory)?.max_deposits {
+        if others.len() >= limits_for(&seal.owner, directory)?.max_deposits {
             return Err(Refusal::because("too many deposits"));
         }
         let mut id = [0u8; 16];
         native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
         let deposit = Deposit {
             id: hex(&id),
-            vault: vault.id,
+            seal: seal.id,
             depositor: me,
             kind,
             subject,
@@ -2735,34 +2732,34 @@ impl EnrollServer {
         };
         let digest = self.log_digest(&[&bytes])?;
         let mut receipts = self
-            .record_vault(&vault.id, VaultAction::Deposit, None, digest)?
+            .record_seal(&seal.id, SealAction::Deposit, None, digest)?
             .into_iter()
             .collect::<Vec<_>>();
-        if vault.policy.sealing == crate::vault::Sealing::Registered {
+        if seal.policy.sealing == crate::seal::Sealing::Registered {
             let add = file
                 .bindings()?
                 .iter()
-                .map(crate::vault::binding_hex)
+                .map(crate::seal::binding_hex)
                 .collect();
-            register_bindings(&mut vault, add, &[])?;
-            directory.vault_update(&vault).map_err(Refusal)?;
+            register_bindings(&mut seal, add, &[])?;
+            directory.seal_update(&seal).map_err(Refusal)?;
         }
         directory.deposit_add(&deposit).map_err(Refusal)?;
-        receipts.extend(self.retire_deposits(&mut vault, &replaced, directory)?);
+        receipts.extend(self.retire_deposits(&mut seal, &replaced, directory)?);
         eprintln!(
-            "kuipad: {caller} deposited {} in vault {}",
-            deposit.id, vault.id
+            "kuipad: {caller} deposited {} in seal {}",
+            deposit.id, seal.id
         );
         let mut listed = deposit;
         listed.sealed.clear();
         Ok((vec![listed], receipts))
     }
 
-    /// Remove `deposits` of `vault`, and with registered sealing retire
+    /// Remove `deposits` of `seal`, and with registered sealing retire
     /// their files' bindings, so no copy of them opens any more.
     fn retire_deposits(
         &self,
-        vault: &mut Vault,
+        seal: &mut Seal,
         deposits: &[Deposit],
         directory: &dyn Directory,
     ) -> Result<Vec<Receipt>, Refusal> {
@@ -2770,25 +2767,18 @@ impl EnrollServer {
         let mut retired = Vec::new();
         for d in deposits {
             let digest = self.log_digest(&[d.id.as_bytes()])?;
-            receipts.extend(self.record_vault(
-                &vault.id,
-                VaultAction::RetireDeposit,
-                None,
-                digest,
-            )?);
-            directory
-                .deposit_remove(&vault.id, &d.id)
-                .map_err(Refusal)?;
+            receipts.extend(self.record_seal(&seal.id, SealAction::RetireDeposit, None, digest)?);
+            directory.deposit_remove(&seal.id, &d.id).map_err(Refusal)?;
             let file = tang_pqc::b64::decode(&d.sealed)
                 .ok()
-                .and_then(|b| crate::vault::SealedVaultFile::from_bytes(&b).ok());
+                .and_then(|b| crate::seal::SealedFile::from_bytes(&b).ok());
             if let Some(file) = file {
-                retired.extend(file.bindings()?.iter().map(crate::vault::binding_hex));
+                retired.extend(file.bindings()?.iter().map(crate::seal::binding_hex));
             }
         }
-        if vault.policy.sealing == crate::vault::Sealing::Registered && !retired.is_empty() {
-            register_bindings(vault, Vec::new(), &retired)?;
-            directory.vault_update(vault).map_err(Refusal)?;
+        if seal.policy.sealing == crate::seal::Sealing::Registered && !retired.is_empty() {
+            register_bindings(seal, Vec::new(), &retired)?;
+            directory.seal_update(seal).map_err(Refusal)?;
         }
         Ok(receipts)
     }
@@ -2802,27 +2792,27 @@ impl EnrollServer {
         )?)?)
     }
 
-    /// For a vault with approvals: check that `request` names an approved
+    /// For a seal with approvals: check that `request` names an approved
     /// release request of `who`'s for the file whose binding is `binding`
     /// (`DESIGN-approvals.md` §4), and count one use of it.
     fn check_release(
         &self,
-        vault: &Vault,
+        seal: &Seal,
         request: &EscrowRequest,
         who: &Principal,
         binding: &str,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(), Refusal> {
-        let Some(approvals) = &vault.policy.approvals else {
+        let Some(approvals) = &seal.policy.approvals else {
             return Ok(());
         };
         let id = request
             .release()
             .map(|id| hex(id))
-            .ok_or_else(|| Refusal::because("the vault needs an approved release request"))?;
+            .ok_or_else(|| Refusal::because("the seal needs an approved release request"))?;
         let release = directory
-            .releases(&vault.id)
+            .releases(&seal.id)
             .map_err(Refusal)?
             .into_iter()
             .find(|r| r.id == id)
@@ -2846,7 +2836,7 @@ impl EnrollServer {
             )));
         }
         if !directory
-            .release_use(&vault.id, &release.id, &self.info.server, approvals.uses())
+            .release_use(&seal.id, &release.id, &self.info.server, approvals.uses())
             .map_err(Refusal)?
         {
             return Err(Refusal::because("the release request is used up"));
@@ -2854,24 +2844,24 @@ impl EnrollServer {
         Ok(())
     }
 
-    /// Add `who` (managers, members, depositors) to `vault`, within
+    /// Add `who` (managers, members, depositors) to `seal`, within
     /// `limits`.
-    fn share(&self, vault: &mut Vault, who: [&Members; 3], limits: &Limits) -> Result<(), Refusal> {
+    fn share(&self, seal: &mut Seal, who: [&Members; 3], limits: &Limits) -> Result<(), Refusal> {
         let realm = &self.info.realm;
         let [managers, members, depositors] = who.map(|m| m.normalized(realm));
         let (managers, members, depositors) = (managers?, members?, depositors?);
         if managers.is_empty() && members.is_empty() && depositors.is_empty() {
             return Err(Refusal::because("no one to share with"));
         }
-        vault.managers = union(&vault.managers, &managers).normalized(realm)?;
-        vault.members = union(&vault.members, &members).normalized(realm)?;
-        vault.depositors = union(&vault.depositors, &depositors).normalized(realm)?;
-        let size = vault.managers.entries().len()
-            + vault.members.entries().len()
-            + vault.depositors.entries().len();
+        seal.managers = union(&seal.managers, &managers).normalized(realm)?;
+        seal.members = union(&seal.members, &members).normalized(realm)?;
+        seal.depositors = union(&seal.depositors, &depositors).normalized(realm)?;
+        let size = seal.managers.entries().len()
+            + seal.members.entries().len()
+            + seal.depositors.entries().len();
         if size > limits.max_members {
             return Err(Refusal::because(if limits.max_members == 0 {
-                "the realm does not allow shared vaults".to_owned()
+                "the realm does not allow shared seals".to_owned()
             } else {
                 format!(
                     "the realm allows at most {} managers, members and depositors",
@@ -2882,13 +2872,13 @@ impl EnrollServer {
         Ok(())
     }
 
-    /// Remove `who` (managers, members, depositors) from `vault` for
+    /// Remove `who` (managers, members, depositors) from `seal` for
     /// `caller`, whose role is `role` (anyone else may remove only
     /// themselves); their devices go after the operation
     /// ([`prune_departed`]).
     fn unshare(
         &self,
-        vault: &mut Vault,
+        seal: &mut Seal,
         caller: &Principal,
         role: Role,
         who: [&Members; 3],
@@ -2906,44 +2896,44 @@ impl EnrollServer {
                     .any(|e| !own.contains(e))
             {
                 return Err(Refusal::because(
-                    "only the vault's managers may remove others",
+                    "only the seal's managers may remove others",
                 ));
             }
         }
-        vault.managers = difference(&vault.managers, &managers);
-        vault.members = difference(&vault.members, &members);
-        vault.depositors = difference(&vault.depositors, &depositors);
+        seal.managers = difference(&seal.managers, &managers);
+        seal.members = difference(&seal.members, &members);
+        seal.depositors = difference(&seal.depositors, &depositors);
         Ok(())
     }
 
-    /// Create `caller`'s vault `name` under `policy`, within the realm's
+    /// Create `caller`'s seal `name` under `policy`, within the realm's
     /// limits.
-    fn create_vault(
+    fn create_seal(
         caller: &Principal,
         name: String,
-        mut policy: crate::vault::Policy,
+        mut policy: crate::seal::Policy,
         now: u64,
         directory: &dyn Directory,
-        record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
-    ) -> Result<Vec<Vault>, Refusal> {
+        record: &mut dyn FnMut(&Seal) -> Result<(), Refusal>,
+    ) -> Result<Vec<Seal>, Refusal> {
         let limits = limits_for(&caller.to_string(), directory)?;
-        let mine = directory.vaults_of(caller).map_err(Refusal)?;
+        let mine = directory.seals_of(caller).map_err(Refusal)?;
         if name.is_empty() || name.contains('/') {
-            return Err(Refusal::because(format!("{name:?} is not a vault name")));
+            return Err(Refusal::because(format!("{name:?} is not a seal name")));
         }
         if mine.iter().any(|v| v.name == name) {
-            return Err(Refusal::because(format!("vault {name:?} exists")));
+            return Err(Refusal::because(format!("seal {name:?} exists")));
         }
-        if mine.len() >= limits.max_vaults {
-            return Err(Refusal::because("too many vaults"));
+        if mine.len() >= limits.max_seals {
+            return Err(Refusal::because("too many seals"));
         }
         limits.apply(&mut policy, now)?;
         // The caller was checked to be of this realm.
         normalize_approvers(&mut policy, caller.realm())?;
         let mut id = [0u8; 16];
         native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
-        let vault = Vault {
-            id: escrow::VaultId::from_bytes(id),
+        let seal = Seal {
+            id: escrow::SealId::from_bytes(id),
             owner: caller.to_string(),
             name,
             policy,
@@ -2956,21 +2946,21 @@ impl EnrollServer {
             session_keys: Vec::new(),
             bindings: Vec::new(),
         };
-        record(&vault)?;
-        directory.vault_add(&vault).map_err(Refusal)?;
-        Ok(vec![vault])
+        record(&seal)?;
+        directory.seal_add(&seal).map_err(Refusal)?;
+        Ok(vec![seal])
     }
 
-    /// `add-device`: register a device key of the caller's in a vault,
+    /// `add-device`: register a device key of the caller's in a seal,
     /// held by them.
     fn add_device(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
-    ) -> Result<Vault, Refusal> {
-        let VaultOp::AddDevice {
+    ) -> Result<Seal, Refusal> {
+        let SealOp::AddDevice {
             name,
             label,
             kind,
@@ -2980,18 +2970,14 @@ impl EnrollServer {
         else {
             unreachable!("only add-device");
         };
-        let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+        let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
         need_member(role)?;
         let me = caller.to_string();
-        if vault.devices.len() >= 255 {
+        if seal.devices.len() >= 255 {
             return Err(Refusal::because("too many devices"));
         }
-        if vault
-            .devices
-            .iter()
-            .filter(|d| vault.holder(d) == me)
-            .count()
-            >= limits_for(&vault.owner, directory)?.max_devices
+        if seal.devices.iter().filter(|d| seal.holder(d) == me).count()
+            >= limits_for(&seal.owner, directory)?.max_devices
         {
             return Err(Refusal::because("too many devices"));
         }
@@ -3001,24 +2987,24 @@ impl EnrollServer {
         )
         .map_err(Error::from)?;
         // No attestation is verified yet: every device is `any`.
-        let device = crate::vault::Device::new(&public, &label, kind, now).held_by(&me);
+        let device = crate::seal::Device::new(&public, &label, kind, now).held_by(&me);
         self.check_device_deposit(caller, &device, directory)?;
-        if vault.devices.iter().any(|d| d.id == device.id) {
+        if seal.devices.iter().any(|d| d.id == device.id) {
             return Err(Refusal::because("device already registered"));
         }
-        vault.devices.push(device);
-        Ok(vault)
+        seal.devices.push(device);
+        Ok(seal)
     }
 
     /// With `required` recovery, refuse an extractable device whose key
-    /// its holder has not deposited in the realm's device vault
+    /// its holder has not deposited in the realm's device seal
     /// (`DESIGN-recovery.md` §4).  The deposit's existence is checked, not
     /// its contents: a holder who deposits something else loses only their
     /// own recovery.
     fn check_device_deposit(
         &self,
         caller: &Principal,
-        device: &crate::vault::Device,
+        device: &crate::seal::Device,
         directory: &dyn Directory,
     ) -> Result<(), Refusal> {
         let Some(settings) = directory.recovery_settings().map_err(Refusal)? else {
@@ -3026,19 +3012,19 @@ impl EnrollServer {
         };
         let extractable = matches!(
             device.kind,
-            crate::vault::DeviceType::File | crate::vault::DeviceType::Pkcs11Wrapped
+            crate::seal::DeviceType::File | crate::seal::DeviceType::Pkcs11Wrapped
         );
         if !settings.required || !extractable {
             return Ok(());
         }
-        let helpdesk = self.find_vault(caller, &settings.device_vault, directory)?;
+        let helpdesk = self.find_seal(caller, &settings.device_seal, directory)?;
         let me = caller.to_string();
         let deposited = directory
             .deposits(&helpdesk.id)
             .map_err(Refusal)?
             .iter()
             .any(|d| {
-                d.kind == crate::vault::DepositKind::Device
+                d.kind == crate::seal::DepositKind::Device
                     && d.depositor == me
                     && d.subject.get("device") == Some(&device.id)
             });
@@ -3051,98 +3037,98 @@ impl EnrollServer {
         }
     }
 
-    fn apply_vault_op(
+    fn apply_seal_op(
         &self,
         caller: &Principal,
-        op: VaultOp,
+        op: SealOp,
         now: u64,
         directory: &dyn Directory,
-        record: &mut dyn FnMut(&Vault) -> Result<(), Refusal>,
-    ) -> Result<Vec<Vault>, Refusal> {
-        let vault = match op {
-            VaultOp::List => return list_vaults(caller, directory),
-            VaultOp::Unlock { .. }
-            | VaultOp::Passkeys
-            | VaultOp::Request { .. }
-            | VaultOp::Pending { .. }
-            | VaultOp::Approve { .. }
-            | VaultOp::Deny { .. }
-            | VaultOp::EscrowCode { .. }
-            | VaultOp::RecoverCode
-            | VaultOp::Deposit { .. }
-            | VaultOp::Deposits { .. }
-            | VaultOp::FetchDeposit { .. }
-            | VaultOp::RetireDeposit { .. }
-            | VaultOp::RecoverySettings
-            | VaultOp::DeviceKey { .. }
-            | VaultOp::Deliver { .. } => unreachable!("answered by vault_op"),
-            VaultOp::Create { name, policy } => {
-                return Self::create_vault(caller, name, policy, now, directory, record);
+        record: &mut dyn FnMut(&Seal) -> Result<(), Refusal>,
+    ) -> Result<Vec<Seal>, Refusal> {
+        let seal = match op {
+            SealOp::List => return list_seals(caller, directory),
+            SealOp::Unlock { .. }
+            | SealOp::Passkeys
+            | SealOp::Request { .. }
+            | SealOp::Pending { .. }
+            | SealOp::Approve { .. }
+            | SealOp::Deny { .. }
+            | SealOp::EscrowCode { .. }
+            | SealOp::RecoverCode
+            | SealOp::Deposit { .. }
+            | SealOp::Deposits { .. }
+            | SealOp::FetchDeposit { .. }
+            | SealOp::RetireDeposit { .. }
+            | SealOp::RecoverySettings
+            | SealOp::DeviceKey { .. }
+            | SealOp::Deliver { .. } => unreachable!("answered by seal_op"),
+            SealOp::Create { name, policy } => {
+                return Self::create_seal(caller, name, policy, now, directory, record);
             }
-            VaultOp::Show { name } => {
-                return Ok(vec![self.resolve_vault(caller, &name, directory)?.0]);
+            SealOp::Show { name } => {
+                return Ok(vec![self.resolve_seal(caller, &name, directory)?.0]);
             }
-            VaultOp::Register { name, add, retire } => {
-                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+            SealOp::Register { name, add, retire } => {
+                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
                 need_member(role)?;
-                register_bindings(&mut vault, add, &retire)?;
-                vault
+                register_bindings(&mut seal, add, &retire)?;
+                seal
             }
-            VaultOp::SetPolicy { name, mut policy } => {
-                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+            SealOp::SetPolicy { name, mut policy } => {
+                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
                 need(role, Role::Manager, "change its policy")?;
-                limits_for(&vault.owner, directory)?.apply(&mut policy, now)?;
+                limits_for(&seal.owner, directory)?.apply(&mut policy, now)?;
                 normalize_approvers(&mut policy, &self.info.realm)?;
-                vault.policy = policy;
-                vault
+                seal.policy = policy;
+                seal
             }
-            VaultOp::Share {
+            SealOp::Share {
                 name,
                 managers,
                 members,
                 depositors,
             } => {
-                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
                 need(role, Role::Manager, "share it")?;
-                let limits = limits_for(&vault.owner, directory)?;
-                self.share(&mut vault, [&managers, &members, &depositors], &limits)?;
-                vault
+                let limits = limits_for(&seal.owner, directory)?;
+                self.share(&mut seal, [&managers, &members, &depositors], &limits)?;
+                seal
             }
-            VaultOp::Unshare {
+            SealOp::Unshare {
                 name,
                 managers,
                 members,
                 depositors,
             } => {
-                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
-                self.unshare(&mut vault, caller, role, [&managers, &members, &depositors])?;
-                vault
+                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
+                self.unshare(&mut seal, caller, role, [&managers, &members, &depositors])?;
+                seal
             }
-            op @ VaultOp::AddDevice { .. } => self.add_device(caller, op, now, directory)?,
-            VaultOp::RemoveDevice { name, id } => {
-                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+            op @ SealOp::AddDevice { .. } => self.add_device(caller, op, now, directory)?,
+            SealOp::RemoveDevice { name, id } => {
+                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
                 let me = caller.to_string();
-                let device = vault
+                let device = seal
                     .devices
                     .iter()
                     .find(|d| d.id == id)
                     .ok_or_else(|| Refusal::because("no such device"))?;
-                if vault.holder(device) != me {
+                if seal.holder(device) != me {
                     need(role, Role::Manager, "remove another member's device")?;
                 }
-                vault.devices.retain(|d| d.id != id);
-                vault
+                seal.devices.retain(|d| d.id != id);
+                seal
             }
-            VaultOp::Revoke { name } => {
-                let (mut vault, role) = self.resolve_vault(caller, &name, directory)?;
+            SealOp::Revoke { name } => {
+                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
                 need(role, Role::Manager, "revoke it")?;
-                vault.state = State::Revoked;
-                vault
+                seal.state = State::Revoked;
+                seal
             }
         };
-        record(&vault)?;
-        directory.vault_update(&vault).map_err(Refusal)?;
-        Ok(vec![vault])
+        record(&seal)?;
+        directory.seal_update(&seal).map_err(Refusal)?;
+        Ok(vec![seal])
     }
 
     /// The trusted anchors, and each one's current vouch head where it
@@ -3264,7 +3250,7 @@ impl EnrollServer {
         self.recover_admitted(request, directory, &|_| true)
     }
 
-    /// Whether `request` is for a machine vault (§7.6.8), whose principal
+    /// Whether `request` is for a machine seal (§7.6.8), whose principal
     /// is the one that opens it: told from the request alone, before
     /// anything is decapsulated.
     #[must_use]
@@ -3273,7 +3259,7 @@ impl EnrollServer {
             .escrow_key(request.recovery().kid())
             .and_then(|key| {
                 request
-                    .vault()
+                    .seal()
                     .machine_kind(request.principal(), key.public().alg())
                     .ok()
             })
@@ -3281,8 +3267,8 @@ impl EnrollServer {
     }
 
     /// As [`recover`](Self::recover), with `admit` asked once the opener of
-    /// a user vault is known, before anything is counted or released: a
-    /// rate limit per opener, so the members of a shared vault do not
+    /// a user seal is known, before anything is counted or released: a
+    /// rate limit per opener, so the members of a shared seal do not
     /// share its owner's allowance (§7.6.12).
     ///
     /// # Errors
@@ -3308,15 +3294,15 @@ impl EnrollServer {
             .map_err(|_| Refusal::because("request does not open"))?;
         opened
             .verify_commitment(
-                &escrow::commitment_data(request.principal(), request.vault()),
+                &escrow::commitment_data(request.principal(), request.seal()),
                 request.commitment(),
             )
-            .map_err(|_| Refusal::because("the binding is not committed to this vault"))?;
+            .map_err(|_| Refusal::because("the binding is not committed to this seal"))?;
         let Some(kind) = request
-            .vault()
+            .seal()
             .machine_kind(request.principal(), key.public().alg())?
         else {
-            return self.recover_vault(request, opened, directory, admit);
+            return self.recover_seal(request, opened, directory, admit);
         };
         let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
         if !directory
@@ -3330,30 +3316,30 @@ impl EnrollServer {
         Ok(Recovered::Plain(opened.respond().map_err(Error::from)?))
     }
 
-    /// Who opens `vault` with `request`: whose session or ticket it is,
+    /// Who opens `seal` with `request`: whose session or ticket it is,
     /// checked, else whose `device`.
     fn opener(
         &self,
-        vault: &Vault,
+        seal: &Seal,
         request: &EscrowRequest,
-        device: Option<&crate::vault::Device>,
+        device: Option<&crate::seal::Device>,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<String, Refusal> {
         Ok(if !request.session().is_empty() {
             // A session stands in for the ticket, for its holder's device.
-            if vault.policy.sessions.reauth.is_none() {
-                return Err(Refusal::because("the vault's policy allows no sessions"));
+            if seal.policy.sessions.reauth.is_none() {
+                return Err(Refusal::because("the seal's policy allows no sessions"));
             }
             let device = device.ok_or_else(|| Refusal::because("a session needs its device"))?;
-            let holder = vault.holder(device);
+            let holder = seal.holder(device);
             SessionToken::from_bytes(request.session())?
                 .check(
                     &self.info.realm,
                     &self.anchors(),
                     &self.policy,
                     SessionFor {
-                        vault: request.vault(),
+                        seal: request.seal(),
                         holder,
                         device: &device.thumbprint()?,
                     },
@@ -3361,15 +3347,15 @@ impl EnrollServer {
                 )
                 .map_err(|e| Refusal::because(format!("session: {e}")))?;
             holder.to_owned()
-        } else if vault.policy.factors.ticket {
+        } else if seal.policy.factors.ticket {
             if request.ticket().is_empty() {
-                return Err(Refusal::because("the vault needs the opener's ticket"));
+                return Err(Refusal::because("the seal needs the opener's ticket"));
             }
             let cb = request.ticket_binding()?;
             let accepted = directory
                 .accept_user(request.ticket(), &cb)
                 .map_err(Refusal)?;
-            if !vault
+            if !seal
                 .policy
                 .ticket_delegation
                 .accepts(accepted.transited.as_deref())
@@ -3380,18 +3366,18 @@ impl EnrollServer {
                 }));
             }
             if let Some(d) = device
-                && vault.holder(d) != accepted.principal
+                && seal.holder(d) != accepted.principal
             {
                 return Err(Refusal::because("the device is not the ticket holder's"));
             }
             accepted.principal
         } else if let Some(device) = device {
-            vault.holder(device).to_owned()
-        } else if vault.policy.factors.passkey {
+            seal.holder(device).to_owned()
+        } else if seal.policy.factors.passkey {
             // Without a ticket or a device, the passkey is the owner's.
-            vault.owner.clone()
+            seal.owner.clone()
         } else {
-            return Err(Refusal::because("the vault needs a device"));
+            return Err(Refusal::because("the seal needs a device"));
         })
     }
 
@@ -3416,52 +3402,51 @@ impl EnrollServer {
         Ok(())
     }
 
-    /// The vault half of [`recover`](Self::recover): check the vault and
+    /// The seal half of [`recover`](Self::recover): check the seal and
     /// its owner, then the policy's factors, record the release, and
     /// answer to the device.  The recovery answer has no place for a
     /// receipt: the owner finds the release in the log.
-    fn recover_vault(
+    fn recover_seal(
         &self,
         request: &EscrowRequest,
         opened: tang_pqc::OpenedRequest<'_>,
         directory: &dyn Directory,
         admit: &dyn Fn(&Principal) -> bool,
     ) -> Result<Recovered, Refusal> {
-        let vault = directory
-            .vault_get(request.vault())
+        let seal = directory
+            .seal_get(request.seal())
             .map_err(Refusal)?
-            .ok_or_else(|| Refusal::because(format!("unknown vault {}", request.vault())))?;
-        // `P` names the vault's owner, whoever opens it.
-        if vault.owner != request.principal().to_string() {
-            return Err(Refusal::because("the vault has another owner"));
+            .ok_or_else(|| Refusal::because(format!("unknown seal {}", request.seal())))?;
+        // `P` names the seal's owner, whoever opens it.
+        if seal.owner != request.principal().to_string() {
+            return Err(Refusal::because("the seal has another owner"));
         }
-        if vault.state != State::Enabled {
-            return Err(Refusal::because("the vault is revoked"));
+        if seal.state != State::Enabled {
+            return Err(Refusal::because("the seal is revoked"));
         }
         let now = unix_seconds(SystemTime::now());
-        if vault.policy.not_after.is_some_and(|t| now > t) {
-            return Err(Refusal::because("the vault has expired"));
+        if seal.policy.not_after.is_some_and(|t| now > t) {
+            return Err(Refusal::because("the seal has expired"));
         }
-        let factors = &vault.policy.factors;
+        let factors = &seal.policy.factors;
         let device = match request.device() {
             Some(id) => Some(
-                vault
-                    .device(id)
+                seal.device(id)
                     .ok_or_else(|| Refusal::because("the device is not registered"))?,
             ),
             None => None,
         };
         let who: Principal = self
-            .opener(&vault, request, device, now, directory)?
+            .opener(&seal, request, device, now, directory)?
             .parse()?;
-        let groups = groups_for(&vault, &who, directory)?;
-        if !vault.opens(&who, &groups) {
-            return Err(Refusal::because(format!("{who} has no part in the vault")));
+        let groups = groups_for(&seal, &who, directory)?;
+        if !seal.opens(&who, &groups) {
+            return Err(Refusal::because(format!("{who} has no part in the seal")));
         }
         if directory.principal_locked(&who).map_err(Refusal)? {
             return Err(Refusal::because(format!("{who} is locked or gone")));
         }
-        if vault.policy.ticket_leased
+        if seal.policy.ticket_leased
             && directory
                 .principal_lease(&who)
                 .map_err(Refusal)?
@@ -3477,7 +3462,7 @@ impl EnrollServer {
         // A session stands in for the passkey, as for the ticket.
         if factors.passkey && request.session().is_empty() {
             if request.passkey().is_empty() {
-                return Err(Refusal::because("the vault needs the opener's passkey"));
+                return Err(Refusal::because("the seal needs the opener's passkey"));
             }
             self.check_passkey(
                 &who,
@@ -3487,94 +3472,94 @@ impl EnrollServer {
             )?;
         }
         if let Some(level) = factors.device {
-            let device = device.ok_or_else(|| Refusal::because("the vault needs a device"))?;
+            let device = device.ok_or_else(|| Refusal::because("the seal needs a device"))?;
             if device.level < level {
                 return Err(Refusal::because("the device's level is too low"));
             }
         }
-        let binding = crate::vault::binding_hex(&BindingHash::from_slice(
+        let binding = crate::seal::binding_hex(&BindingHash::from_slice(
             &opened.ciphertext_hash().map_err(Error::from)?,
         )?);
-        if vault.policy.sealing == crate::vault::Sealing::Registered
-            && !vault.bindings.contains(&binding)
+        if seal.policy.sealing == crate::seal::Sealing::Registered
+            && !seal.bindings.contains(&binding)
         {
             return Err(Refusal::because(
                 "the file's binding is not registered (retired or never registered)",
             ));
         }
-        self.check_release(&vault, request, &who, &binding, now, directory)?;
+        self.check_release(&seal, request, &who, &binding, now, directory)?;
         if !directory
-            .vault_unlock(request.vault(), &self.info.server, vault.policy.max_unlocks)
+            .seal_unlock(request.seal(), &self.info.server, seal.policy.max_unlocks)
             .map_err(Refusal)?
         {
-            return Err(Refusal::because("the vault's unlock limit is reached"));
+            return Err(Refusal::because("the seal's unlock limit is reached"));
         }
         self.record_release(request, device, &opened)?;
         let response = opened.respond().map_err(Error::from)?;
         Ok(match device {
-            Some(d) => Recovered::Device(VaultAnswer::seal(&d.public()?, request, &response)?),
+            Some(d) => Recovered::Device(SealAnswer::seal(&d.public()?, request, &response)?),
             None => Recovered::Plain(response),
         })
     }
 }
 
-/// What a vault operation records in the ledger, with the device it names
+/// What a seal operation records in the ledger, with the device it names
 /// when the operation itself names one; reads change nothing and record
 /// nothing.
-fn vault_event(op: &VaultOp) -> Option<(VaultAction, Option<String>)> {
+fn seal_event(op: &SealOp) -> Option<(SealAction, Option<String>)> {
     Some(match op {
-        VaultOp::Create { .. } => (VaultAction::Create, None),
-        VaultOp::SetPolicy { .. } => (VaultAction::SetPolicy, None),
-        VaultOp::Revoke { .. } => (VaultAction::Revoke, None),
-        VaultOp::AddDevice { .. } => (VaultAction::AddDevice, None),
-        VaultOp::RemoveDevice { id, .. } => (VaultAction::RemoveDevice, Some(id.clone())),
-        VaultOp::Share { .. } => (VaultAction::Share, None),
-        VaultOp::Unshare { .. } => (VaultAction::Unshare, None),
-        VaultOp::Unlock {
+        SealOp::Create { .. } => (SealAction::Create, None),
+        SealOp::SetPolicy { .. } => (SealAction::SetPolicy, None),
+        SealOp::Revoke { .. } => (SealAction::Revoke, None),
+        SealOp::AddDevice { .. } => (SealAction::AddDevice, None),
+        SealOp::RemoveDevice { id, .. } => (SealAction::RemoveDevice, Some(id.clone())),
+        SealOp::Share { .. } => (SealAction::Share, None),
+        SealOp::Unshare { .. } => (SealAction::Unshare, None),
+        SealOp::Unlock {
             device, offline, ..
         } => (
             if *offline {
-                VaultAction::OfflineSession
+                SealAction::OfflineSession
             } else {
-                VaultAction::Session
+                SealAction::Session
             },
             Some(device.clone()),
         ),
-        VaultOp::Show { .. }
-        | VaultOp::List
-        | VaultOp::Passkeys
-        | VaultOp::Register { .. }
-        | VaultOp::Request { .. }
-        | VaultOp::Pending { .. }
-        | VaultOp::Approve { .. }
-        | VaultOp::Deny { .. }
-        | VaultOp::EscrowCode { .. }
-        | VaultOp::RecoverCode
-        | VaultOp::Deposit { .. }
-        | VaultOp::Deposits { .. }
-        | VaultOp::FetchDeposit { .. }
-        | VaultOp::RetireDeposit { .. }
-        | VaultOp::RecoverySettings
-        | VaultOp::DeviceKey { .. }
-        | VaultOp::Deliver { .. } => return None,
+        SealOp::Show { .. }
+        | SealOp::List
+        | SealOp::Passkeys
+        | SealOp::Register { .. }
+        | SealOp::Request { .. }
+        | SealOp::Pending { .. }
+        | SealOp::Approve { .. }
+        | SealOp::Deny { .. }
+        | SealOp::EscrowCode { .. }
+        | SealOp::RecoverCode
+        | SealOp::Deposit { .. }
+        | SealOp::Deposits { .. }
+        | SealOp::FetchDeposit { .. }
+        | SealOp::RetireDeposit { .. }
+        | SealOp::RecoverySettings
+        | SealOp::DeviceKey { .. }
+        | SealOp::Deliver { .. } => return None,
     })
 }
 
-/// Drop the devices of `vault` whose holders have no part in it any more,
+/// Drop the devices of `seal` whose holders have no part in it any more,
 /// and answer their ids.  The owner's are kept; a locked holder keeps
 /// theirs too (a lock can be lifted; the release checks it).
-fn prune_departed(vault: &mut Vault, directory: &dyn Directory) -> Result<Vec<String>, Refusal> {
+fn prune_departed(seal: &mut Seal, directory: &dyn Directory) -> Result<Vec<String>, Refusal> {
     let mut roles: HashMap<String, bool> = HashMap::new();
     let mut gone = Vec::new();
-    let mut kept = Vec::with_capacity(vault.devices.len());
-    for d in std::mem::take(&mut vault.devices) {
-        let holder = vault.holder(&d).to_owned();
+    let mut kept = Vec::with_capacity(seal.devices.len());
+    for d in std::mem::take(&mut seal.devices) {
+        let holder = seal.holder(&d).to_owned();
         let stays = if let Some(&stays) = roles.get(&holder) {
             stays
         } else {
             let principal: Principal = holder.parse()?;
-            let groups = groups_for(vault, &principal, directory)?;
-            let stays = vault.opens(&principal, &groups);
+            let groups = groups_for(seal, &principal, directory)?;
+            let stays = seal.opens(&principal, &groups);
             roles.insert(holder, stays);
             stays
         };
@@ -3584,15 +3569,15 @@ fn prune_departed(vault: &mut Vault, directory: &dyn Directory) -> Result<Vec<St
             gone.push(d.id.clone());
         }
     }
-    vault.devices = kept;
+    seal.devices = kept;
     Ok(gone)
 }
 
-/// The limits for vaults of `owner`: the realm's, with those of the group
+/// The limits for seals of `owner`: the realm's, with those of the group
 /// the realm gives them by (§7.6.2).  The owner's groups are looked up only
 /// when the realm sets limits for any.
 fn limits_for(owner: &str, directory: &dyn Directory) -> Result<Limits, Refusal> {
-    let realm = directory.vault_limits().map_err(Refusal)?;
+    let realm = directory.seal_limits().map_err(Refusal)?;
     if realm.groups.is_empty() {
         return Ok(realm);
     }
@@ -3601,15 +3586,15 @@ fn limits_for(owner: &str, directory: &dyn Directory) -> Result<Limits, Refusal>
     Ok(realm.for_groups(&groups))
 }
 
-/// The refusal for a vault that does not exist or that `caller` has no
+/// The refusal for a seal that does not exist or that `caller` has no
 /// part in: the two are not told apart.
-fn missing_vault(caller: &Principal, reference: &str) -> Refusal {
-    Refusal::because(format!("no vault {reference:?} for {caller}"))
+fn missing_seal(caller: &Principal, reference: &str) -> Refusal {
+    Refusal::because(format!("no seal {reference:?} for {caller}"))
 }
 
 /// Name `policy`'s approvers in one spelling each, as members are named,
 /// so a directory can search for them.
-fn normalize_approvers(policy: &mut crate::vault::Policy, realm: &str) -> Result<(), Refusal> {
+fn normalize_approvers(policy: &mut crate::seal::Policy, realm: &str) -> Result<(), Refusal> {
     if let Some(approvals) = &mut policy.approvals {
         approvals.from = approvals.from.normalized(realm)?;
     }
@@ -3625,13 +3610,13 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// Whether `vault`'s approvals admit `principal` as an approver.
+/// Whether `seal`'s approvals admit `principal` as an approver.
 fn approves(
-    vault: &Vault,
+    seal: &Seal,
     principal: &Principal,
     directory: &dyn Directory,
 ) -> Result<bool, Refusal> {
-    let Some(approvals) = &vault.policy.approvals else {
+    let Some(approvals) = &seal.policy.approvals else {
         return Ok(false);
     };
     let groups = if approvals.from.groups.is_empty() {
@@ -3646,7 +3631,7 @@ fn approves(
 /// per approver, not the requester's, from approvers still admitted and
 /// not locked.
 fn approvals_counted(
-    approvals: &crate::vault::Approvals,
+    approvals: &crate::seal::Approvals,
     release: &ReleaseRequest,
     directory: &dyn Directory,
 ) -> Result<u64, Refusal> {
@@ -3670,10 +3655,10 @@ fn approvals_counted(
     Ok(counted.len() as u64)
 }
 
-/// Deposit `id` of `vault`, with its file.
-fn find_deposit(vault: &Vault, id: &str, directory: &dyn Directory) -> Result<Deposit, Refusal> {
+/// Deposit `id` of `seal`, with its file.
+fn find_deposit(seal: &Seal, id: &str, directory: &dyn Directory) -> Result<Deposit, Refusal> {
     directory
-        .deposits(&vault.id)
+        .deposits(&seal.id)
         .map_err(Refusal)?
         .into_iter()
         .find(|d| d.id == id)
@@ -3685,7 +3670,7 @@ fn need_member(role: Role) -> Result<(), Refusal> {
     if role >= Role::Member {
         Ok(())
     } else {
-        Err(Refusal::because("a depositor does not open the vault"))
+        Err(Refusal::because("a depositor does not open the seal"))
     }
 }
 
@@ -3695,18 +3680,18 @@ fn need(role: Role, least: Role, what: &str) -> Result<(), Refusal> {
         Ok(())
     } else {
         Err(Refusal::because(format!(
-            "only the vault's managers may {what}"
+            "only the seal's managers may {what}"
         )))
     }
 }
 
-/// `caller`'s own vaults, and those shared with them.
-fn list_vaults(caller: &Principal, directory: &dyn Directory) -> Result<Vec<Vault>, Refusal> {
-    let mut all = directory.vaults_of(caller).map_err(Refusal)?;
+/// `caller`'s own seals, and those shared with them.
+fn list_seals(caller: &Principal, directory: &dyn Directory) -> Result<Vec<Seal>, Refusal> {
+    let mut all = directory.seals_of(caller).map_err(Refusal)?;
     // A directory without groups shares by name alone.
     let groups = directory.principal_groups(caller).unwrap_or_default();
     for v in directory
-        .vaults_shared_with(caller, &groups)
+        .seals_shared_with(caller, &groups)
         .map_err(Refusal)?
     {
         if v.role(caller, &groups).is_some() && !all.iter().any(|a| a.id == v.id) {
@@ -3716,14 +3701,14 @@ fn list_vaults(caller: &Principal, directory: &dyn Directory) -> Result<Vec<Vaul
     Ok(all)
 }
 
-/// The groups of `principal` that matter to `vault`: none unless the vault
-/// names a group, so a vault without groups needs no directory lookup.
+/// The groups of `principal` that matter to `seal`: none unless the seal
+/// names a group, so a seal without groups needs no directory lookup.
 fn groups_for(
-    vault: &Vault,
+    seal: &Seal,
     principal: &Principal,
     directory: &dyn Directory,
 ) -> Result<Vec<String>, Refusal> {
-    if vault.managers.groups.is_empty() && vault.members.groups.is_empty() {
+    if seal.managers.groups.is_empty() && seal.members.groups.is_empty() {
         return Ok(Vec::new());
     }
     directory.principal_groups(principal).map_err(Refusal)
@@ -3752,26 +3737,22 @@ fn difference(a: &Members, b: &Members) -> Members {
     }
 }
 
-/// With registered sealing: retire `retire` and register `add` on `vault`.
-fn register_bindings(
-    vault: &mut Vault,
-    add: Vec<String>,
-    retire: &[String],
-) -> Result<(), Refusal> {
-    if vault.policy.sealing != crate::vault::Sealing::Registered {
-        return Err(Refusal::because("the vault does not register its files"));
+/// With registered sealing: retire `retire` and register `add` on `seal`.
+fn register_bindings(seal: &mut Seal, add: Vec<String>, retire: &[String]) -> Result<(), Refusal> {
+    if seal.policy.sealing != crate::seal::Sealing::Registered {
+        return Err(Refusal::because("the seal does not register its files"));
     }
     let valid = |h: &String| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
     if !add.iter().chain(retire).all(valid) {
         return Err(Refusal::because("malformed binding hash"));
     }
-    vault.bindings.retain(|b| !retire.contains(b));
+    seal.bindings.retain(|b| !retire.contains(b));
     for h in add {
-        if !vault.bindings.contains(&h) {
-            vault.bindings.push(h);
+        if !seal.bindings.contains(&h) {
+            seal.bindings.push(h);
         }
     }
-    if vault.bindings.len() > crate::vault::MAX_BINDINGS {
+    if seal.bindings.len() > crate::seal::MAX_BINDINGS {
         return Err(Refusal::because("too many registered files"));
     }
     Ok(())
