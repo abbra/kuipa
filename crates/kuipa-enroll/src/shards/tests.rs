@@ -283,6 +283,26 @@ fn the_whole_way_a_passphrase_then_shares_then_the_seed_back() {
         .unwrap(),
         SEED
     );
+    // and the seed, with the KEM the header names, is the key whose id the page checks
+    let made = recovery_key(
+        &mask(
+            &combined.hidden,
+            passphrase,
+            &combined.salt,
+            combined.iterations,
+        )
+        .unwrap(),
+        combined.kem_1024,
+    )
+    .unwrap();
+    assert_eq!(
+        made.public().kid(),
+        recovery_key(&SEED, true).unwrap().public().kid()
+    );
+    assert_ne!(
+        made.public().kid(),
+        recovery_key(&SEED, false).unwrap().public().kid()
+    );
 }
 
 #[test]
@@ -337,4 +357,35 @@ fn a_share_has_these_words_for_these_parameters() {
         429, 712, 71, 985, 351, 899, 709, 309, 181, 881, 226, 837,
     ];
     assert_eq!(share.symbols(), expected);
+}
+
+/// The key a seed makes, fixed so the label and the hash cannot drift: an independent
+/// implementation of the labelled HKDF (Extract-Expand with the label as salt and `label ‖
+/// " seed"` as info, SHA-256 for ML-KEM-768 and SHA-384 for ML-KEM-1024) produced the same
+/// 64 bytes, which is what the private JWK carries as `priv`.
+#[test]
+fn a_seed_makes_this_key_for_each_kem() {
+    for (kem_1024, expected) in [
+        (
+            false,
+            "oH38v8DHgrwhol2UA808M0GRbGHpdXI0BKPviWGRroq5pnJ2cYItxYtWV0_NghWNx21T6jx5Nd06WpDJIXjtrw",
+        ),
+        (
+            true,
+            "VgAP8VBp5am-M8lTFAgAUIUjBk-eeAauzd1HjYNYI1P828uLZbsS3PHJPSNvHF-E_PpG0Fz1dULDlXVEm99gGQ",
+        ),
+    ] {
+        let key = recovery_key(&SEED, kem_1024).unwrap();
+        assert_eq!(
+            key.public().alg().jose_name(),
+            if kem_1024 {
+                "ML-KEM-1024"
+            } else {
+                "ML-KEM-768"
+            }
+        );
+        let jwk: serde_json::Value =
+            serde_json::from_slice(key.to_jwk().unwrap().as_ref()).unwrap();
+        assert_eq!(jwk["priv"].as_str().unwrap(), expected);
+    }
 }

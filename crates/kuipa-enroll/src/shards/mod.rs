@@ -1,9 +1,9 @@
 //! Recovery shards: a recovery key hidden under a passphrase, split into N-of-M paper shares, each
 //! written as words with Reed-Solomon check words (`docs/DESIGN-recovery.md` §2.1).
 //!
-//! This module is the pure part: Shamir's scheme over GF(256), the word code, the share format and
-//! the passphrase mask. It does no I/O and knows nothing of ML-KEM or the server; the seed it
-//! protects is 32 bytes.
+//! This module is the pure part: Shamir's scheme over GF(256), the word code, the share format,
+//! the passphrase mask and the recovery key a seed makes. It does no I/O and knows nothing of the
+//! server; the seed it protects is 32 bytes.
 //!
 //! A share is `HEADER_WORDS + SALT_WORDS + SECRET_WORDS` data words and `parity` check words:
 //!
@@ -29,6 +29,10 @@ use unicode_normalization::UnicodeNormalization;
 
 pub use rs::Repair;
 pub use wordlist::{lookup, word};
+
+/// The label of the recovery key's seed derivation ([`recovery_key`]).
+const RECOVERY_DOMAIN: tang_pqc::primitives::Domain =
+    tang_pqc::primitives::Domain::new("ipa-ku recovery key v1");
 
 /// The format version a share's header carries.
 pub const VERSION: u8 = 1;
@@ -577,6 +581,27 @@ pub fn mask(
         *o ^= p;
     }
     Ok(out)
+}
+
+/// The recovery key a seed makes: the ML-KEM key pair FIPS 203 key generation makes from
+/// `d ‖ z = HKDF(ikm = s, salt = label, info = label ‖ " seed")` by the KEM's hash, the label
+/// `ipa-ku recovery key v1`. A share's header says which KEM, so a page decodes to its key with
+/// nothing but the passphrase ([`mask`]) and this.
+///
+/// # Errors
+///
+/// [`Error::Crypto`] if OpenSSL fails or the system crypto policy disables the KEM.
+pub fn recovery_key(seed: &[u8; 32], kem_1024: bool) -> Result<tang_pqc::ExchangeKeyPair, Error> {
+    let alg = if kem_1024 {
+        tang_pqc::KemAlg::MlKem1024
+    } else {
+        tang_pqc::KemAlg::MlKem768
+    };
+    let mut dz = [0u8; 64];
+    RECOVERY_DOMAIN
+        .hkdf(alg.hash(), &[seed], "seed", &[], &mut dz)
+        .map_err(crypto)?;
+    tang_pqc::ExchangeKeyPair::from_seed_bytes(alg, &dz).map_err(crypto)
 }
 
 /// The words of a share as printed: numbered lines of [`WORDS_PER_LINE`], `01  word word ...`.

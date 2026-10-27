@@ -111,7 +111,10 @@ both, per device.
 
 **The key.** A recovery key is an ML-KEM key pair (ML-KEM-1024 under
 CNSA 2.0, as the KEM suite, §5.1 of DESIGN.md) made from a 32-byte seed
-`s`: `(d, z) = HKDF(s, "ipa-ku recovery key v1")`. Only the seed is secret.
+`s`: `(d, z) = HKDF(s, "ipa-ku recovery key v1")` — the labelled HKDF kuipa
+uses throughout, that section's form: the label as salt, `label ‖ " seed"`
+as info, SHA-256 for ML-KEM-768 and SHA-384 for ML-KEM-1024, 64 bytes out.
+Only the seed is secret.
 The public key and its thumbprint (the **key id**) are public and the
 server keeps them (below).
 
