@@ -36,7 +36,7 @@ use kuipa_tools::flows::{self, Auth, Outcome, Target};
 use kuipa_tools::net::{Endpoint, Trust};
 use kuipa_tools::passkey::soft::SoftFido2;
 use kuipa_tools::paths::{self, Paths};
-use kuipa_tools::seal::{Seal, UserPaths};
+use kuipa_tools::seal::{SealClient, UserPaths};
 use kuipad::http::{App, router};
 use kuipad::keystore::KeyStore;
 use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
@@ -634,7 +634,7 @@ fn personal_vault(world: &Scenario) -> Alice {
     realm.kinit("alice@EXAMPLE.TEST", "Alice123", &alice_cc, None, None);
     let alice_cc = format!("FILE:{}", alice_cc.display());
     let home = UserPaths::new(realm.dir.join("alice-home"));
-    let seal = Seal::new(a, &home, Some(&alice_cc));
+    let client = SealClient::new(a, &home, Some(&alice_cc));
     let policy = vault::Policy {
         factors: vault::Factors {
             device: Some(vault::Level::Any),
@@ -643,12 +643,12 @@ fn personal_vault(world: &Scenario) -> Alice {
         },
         ..vault::Policy::default()
     };
-    let created = seal.create("personal", policy).unwrap();
+    let created = client.create("personal", policy).unwrap();
     assert_eq!(
         created["vaults"][0]["owner"], "alice@EXAMPLE.TEST",
         "{created}"
     );
-    seal.add_device("personal", b"correct horse").unwrap();
+    client.add_device("personal", b"correct horse").unwrap();
     assert_eq!(
         std::fs::metadata(home.device_key())
             .unwrap()
@@ -657,17 +657,23 @@ fn personal_vault(world: &Scenario) -> Alice {
             & 0o777,
         0o600
     );
-    let sealed = seal.seal("personal", b"token=alice\n").unwrap();
+    let sealed = client.seal("personal", b"token=alice\n").unwrap();
     assert_eq!(
-        seal.open(&sealed, Some(b"correct horse")).unwrap().as_ref(),
+        client
+            .open(&sealed, Some(b"correct horse"))
+            .unwrap()
+            .as_ref(),
         b"token=alice\n"
     );
-    assert!(seal.open(&sealed, Some(b"wrong")).is_err());
-    assert!(seal.open(&sealed, None).is_err());
+    assert!(client.open(&sealed, Some(b"wrong")).is_err());
+    assert!(client.open(&sealed, None).is_err());
     // Sealing again uses the stored descriptor and advertisements.
-    let again = seal.seal("personal", b"second").unwrap();
+    let again = client.seal("personal", b"second").unwrap();
     assert_eq!(
-        seal.open(&again, Some(b"correct horse")).unwrap().as_ref(),
+        client
+            .open(&again, Some(b"correct horse"))
+            .unwrap()
+            .as_ref(),
         b"second"
     );
     // Bob's ticket is not Alice's, even with her device and passphrase.
@@ -675,7 +681,7 @@ fn personal_vault(world: &Scenario) -> Alice {
     let bob_cc = realm.dir.join("bob.ccache");
     realm.kinit("bob@EXAMPLE.TEST", "Bob12345", &bob_cc, None, None);
     let bob_cc = format!("FILE:{}", bob_cc.display());
-    let as_bob = Seal::new(a, &home, Some(&bob_cc));
+    let as_bob = SealClient::new(a, &home, Some(&bob_cc));
     assert!(as_bob.open(&sealed, Some(b"correct horse")).is_err());
     Alice {
         cc: alice_cc,
@@ -688,11 +694,11 @@ fn personal_vault(world: &Scenario) -> Alice {
 fn tlog_watch(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
     let alice_cc = alice.cc.as_str();
     // ── Her vault's transparency logs (DESIGN-tlog.md §7) ──
     // The first watch sets the baseline: history listed, nothing flagged.
-    let first = seal.watch("personal").unwrap();
+    let first = client.watch("personal").unwrap();
     assert_eq!(first["ok"], true, "{first}");
     assert!(!first["baseline"].as_array().unwrap().is_empty(), "{first}");
     let actions: Vec<_> = first["events"]
@@ -705,23 +711,23 @@ fn tlog_watch(world: &Scenario, alice: &Alice) {
         assert!(actions.iter().any(|x| x == a), "{a} in {first}");
     }
     // Nothing new, nothing listed.
-    let quiet = seal.watch("personal").unwrap();
+    let quiet = client.watch("personal").unwrap();
     assert_eq!(quiet["ok"], true, "{quiet}");
     assert!(quiet["events"].as_array().unwrap().is_empty(), "{quiet}");
     // A device added elsewhere — her laptop, or someone holding her
     // ticket — is not in this host's descriptor: flagged.
     let laptop = UserPaths::new(realm.dir.join("alice-laptop"));
-    Seal::new(a, &laptop, Some(alice_cc))
+    SealClient::new(a, &laptop, Some(alice_cc))
         .add_device("personal", b"battery staple")
         .unwrap();
-    let flagged = seal.watch("personal").unwrap();
+    let flagged = client.watch("personal").unwrap();
     assert_eq!(flagged["ok"], false, "{flagged}");
     assert_eq!(flagged["unexpected"], 1, "{flagged}");
     assert_eq!(flagged["events"][0]["action"], "add-device", "{flagged}");
     // Once she has looked (`show` stores the current descriptor), the
     // next watch is clean: the entry was reported once.
-    seal.show("personal").unwrap();
-    let accepted = seal.watch("personal").unwrap();
+    client.show("personal").unwrap();
+    let accepted = client.watch("personal").unwrap();
     assert_eq!(accepted["ok"], true, "{accepted}");
     // A server whose key changed category (a crypto policy change) keeps
     // a new log under a new id: reported as such, read from its start, not
@@ -733,7 +739,7 @@ fn tlog_watch(world: &Scenario, alice: &Alice) {
         w["log"] = "0".repeat(96).into();
     }
     std::fs::write(&state_path, serde_json::to_vec(&watched).unwrap()).unwrap();
-    let moved = seal.watch("personal").unwrap();
+    let moved = client.watch("personal").unwrap();
     assert!(moved["forked"].as_array().unwrap().is_empty(), "{moved}");
     assert!(!moved["relogged"].as_array().unwrap().is_empty(), "{moved}");
     assert!(moved["baseline"].as_array().unwrap().is_empty(), "{moved}");
@@ -743,8 +749,8 @@ fn tlog_watch(world: &Scenario, alice: &Alice) {
 fn tlog_diverged(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
-    let as_bob = Seal::new(a, &alice.home, Some(&alice.bob_cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
+    let as_bob = SealClient::new(a, &alice.home, Some(&alice.bob_cc));
     let sealed = &alice.sealed;
     let state_path = home_dir_of(realm).join("vaults/personal.tlog");
     // A log that does not extend what was seen is reported as forked.
@@ -754,7 +760,7 @@ fn tlog_diverged(world: &Scenario, alice: &Alice) {
         w["root"] = tang_pqc::b64::encode(&[9; 32]).into();
     }
     std::fs::write(&state_path, serde_json::to_vec(&watched).unwrap()).unwrap();
-    let diverged = seal.watch("personal").unwrap();
+    let diverged = client.watch("personal").unwrap();
     assert_eq!(diverged["ok"], false, "{diverged}");
     assert!(
         !diverged["forked"].as_array().unwrap().is_empty(),
@@ -764,16 +770,16 @@ fn tlog_diverged(world: &Scenario, alice: &Alice) {
     let by_bob = as_bob.watch("personal").unwrap();
     assert_eq!(by_bob["ok"], false, "{by_bob}");
     assert!(by_bob["events"].as_array().unwrap().is_empty(), "{by_bob}");
-    let listed = seal.list().unwrap();
+    let listed = client.list().unwrap();
     assert_eq!(listed["vaults"].as_array().unwrap().len(), 1);
-    seal.revoke("personal").unwrap();
-    assert!(seal.open(sealed, Some(b"correct horse")).is_err());
+    client.revoke("personal").unwrap();
+    assert!(client.open(sealed, Some(b"correct horse")).is_err());
 }
 
 fn daily_session(world: &Scenario, alice: &Alice) {
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
-    let as_bob = Seal::new(a, &alice.home, Some(&alice.bob_cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
+    let as_bob = SealClient::new(a, &alice.home, Some(&alice.bob_cc));
     // A session: one passphrase and ticket, then files open without either;
     // the servers count every release against the limit.
     let daily = vault::Policy {
@@ -790,28 +796,28 @@ fn daily_session(world: &Scenario, alice: &Alice) {
         },
         ..vault::Policy::default()
     };
-    seal.create("daily", daily).unwrap();
-    seal.add_device("daily", b"correct horse").unwrap();
-    let note = seal.seal("daily", b"daily note").unwrap();
-    assert!(seal.open(&note, None).is_err(), "no session yet");
-    let started = seal.unlock("daily", b"correct horse", false).unwrap();
+    client.create("daily", daily).unwrap();
+    client.add_device("daily", b"correct horse").unwrap();
+    let note = client.seal("daily", b"daily note").unwrap();
+    assert!(client.open(&note, None).is_err(), "no session yet");
+    let started = client.unlock("daily", b"correct horse", false).unwrap();
     assert!(started["session_until"].as_u64().is_some(), "{started}");
-    assert!(Seal::in_session(&note));
+    assert!(SealClient::in_session(&note));
     // In the session neither the passphrase nor Alice's ticket is used:
     // Bob's ticket next to it changes nothing.
-    assert_eq!(seal.open(&note, None).unwrap().as_ref(), b"daily note");
+    assert_eq!(client.open(&note, None).unwrap().as_ref(), b"daily note");
     assert_eq!(as_bob.open(&note, None).unwrap().as_ref(), b"daily note");
-    seal.lock("daily").unwrap();
-    assert!(!Seal::in_session(&note));
-    assert!(seal.open(&note, None).is_err(), "locked");
+    client.lock("daily").unwrap();
+    assert!(!SealClient::in_session(&note));
+    assert!(client.open(&note, None).is_err(), "locked");
     assert_eq!(
-        seal.open(&note, Some(b"correct horse")).unwrap().as_ref(),
+        client.open(&note, Some(b"correct horse")).unwrap().as_ref(),
         b"daily note"
     );
-    assert_eq!(seal.show("daily").unwrap()["vaults"][0]["unlocks"], 3);
-    seal.open(&note, Some(b"correct horse")).unwrap();
+    assert_eq!(client.show("daily").unwrap()["vaults"][0]["unlocks"], 3);
+    client.open(&note, Some(b"correct horse")).unwrap();
     assert!(
-        seal.open(&note, Some(b"correct horse")).is_err(),
+        client.open(&note, Some(b"correct horse")).is_err(),
         "the fifth unlock is over the limit"
     );
 }
@@ -819,7 +825,7 @@ fn daily_session(world: &Scenario, alice: &Alice) {
 fn offline_session(world: &Scenario, alice: &Alice) {
     let directory = &world.directory;
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
     // An offline session, once the realm allows them: files sealed with
     // --session open from the released key and the device, on this host.
     directory.limits.lock().unwrap().offline_sessions = true;
@@ -836,24 +842,24 @@ fn offline_session(world: &Scenario, alice: &Alice) {
         },
         ..vault::Policy::default()
     };
-    seal.create("travel", travel).unwrap();
-    seal.add_device("travel", b"correct horse").unwrap();
-    let pass = seal.seal_session("travel", b"boarding pass").unwrap();
+    client.create("travel", travel).unwrap();
+    client.add_device("travel", b"correct horse").unwrap();
+    let pass = client.seal_session("travel", b"boarding pass").unwrap();
     assert!(
-        seal.open(&pass, Some(b"correct horse")).is_err(),
+        client.open(&pass, Some(b"correct horse")).is_err(),
         "no session yet"
     );
-    let started = seal.unlock("travel", b"correct horse", true).unwrap();
+    let started = client.unlock("travel", b"correct horse", true).unwrap();
     assert_eq!(started["offline"], true);
-    assert!(Seal::in_session(&pass));
-    assert_eq!(seal.open(&pass, None).unwrap().as_ref(), b"boarding pass");
-    seal.lock("travel").unwrap();
-    assert!(seal.open(&pass, None).is_err(), "locked");
+    assert!(SealClient::in_session(&pass));
+    assert_eq!(client.open(&pass, None).unwrap().as_ref(), b"boarding pass");
+    client.lock("travel").unwrap();
+    assert!(client.open(&pass, None).is_err(), "locked");
 }
 
 fn registered_sealing(world: &Scenario, alice: &Alice) {
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
     // Registered sealing: a reseal or a retire makes old copies unopenable.
     let kept = vault::Policy {
         factors: vault::Factors {
@@ -864,25 +870,33 @@ fn registered_sealing(world: &Scenario, alice: &Alice) {
         sealing: vault::Sealing::Registered,
         ..vault::Policy::default()
     };
-    seal.create("kept", kept).unwrap();
-    seal.add_device("kept", b"correct horse").unwrap();
-    let first = seal.seal("kept", b"v1").unwrap();
+    client.create("kept", kept).unwrap();
+    client.add_device("kept", b"correct horse").unwrap();
+    let first = client.seal("kept", b"v1").unwrap();
     assert_eq!(
-        seal.open(&first, Some(b"correct horse")).unwrap().as_ref(),
+        client
+            .open(&first, Some(b"correct horse"))
+            .unwrap()
+            .as_ref(),
         b"v1"
     );
-    let second = seal.reseal("kept", &first, Some(b"correct horse")).unwrap();
+    let second = client
+        .reseal("kept", &first, Some(b"correct horse"))
+        .unwrap();
     assert!(
-        seal.open(&first, Some(b"correct horse")).is_err(),
+        client.open(&first, Some(b"correct horse")).is_err(),
         "the old copy"
     );
     assert_eq!(
-        seal.open(&second, Some(b"correct horse")).unwrap().as_ref(),
+        client
+            .open(&second, Some(b"correct horse"))
+            .unwrap()
+            .as_ref(),
         b"v1"
     );
-    seal.retire("kept", &second).unwrap();
+    client.retire("kept", &second).unwrap();
     assert!(
-        seal.open(&second, Some(b"correct horse")).is_err(),
+        client.open(&second, Some(b"correct horse")).is_err(),
         "retired"
     );
 }
@@ -890,7 +904,7 @@ fn registered_sealing(world: &Scenario, alice: &Alice) {
 fn shared_vault(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
     let bob_cc = alice.bob_cc.as_str();
     // ── A vault shared with a teammate (§7.6.12) ──
     // Bob names it alice/team, registers his own device from his own
@@ -903,14 +917,14 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
         },
         ..vault::Policy::default()
     };
-    seal.create("team", team).unwrap();
-    seal.add_device("team", b"correct horse").unwrap();
-    let before = seal.seal("team", b"before bob").unwrap();
+    client.create("team", team).unwrap();
+    client.add_device("team", b"correct horse").unwrap();
+    let before = client.seal("team", b"before bob").unwrap();
     let bob_only = vault::Members {
         users: vec!["bob".into()],
         ..vault::Members::default()
     };
-    let shared = seal
+    let shared = client
         .share(
             "team",
             [
@@ -925,7 +939,7 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
         "{shared}"
     );
     let bob_home = UserPaths::new(realm.dir.join("bob-home"));
-    let bob = Seal::new(a, &bob_home, Some(bob_cc));
+    let bob = SealClient::new(a, &bob_home, Some(bob_cc));
     assert!(bob.show("team").is_err(), "a bare name is Bob's own");
     bob.add_device("alice/team", b"bob's phrase").unwrap();
     let listed = bob.list().unwrap();
@@ -946,13 +960,13 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
         b"from bob"
     );
     assert_eq!(
-        seal.open(&note, Some(b"correct horse")).unwrap().as_ref(),
+        client.open(&note, Some(b"correct horse")).unwrap().as_ref(),
         b"from bob"
     );
     // A file sealed before his device was registered has no share for it
     // until Alice reseals it.
     assert!(bob.open(&before, Some(b"bob's phrase")).is_err());
-    let before = seal
+    let before = client
         .reseal("team", &before, Some(b"correct horse"))
         .unwrap();
     assert_eq!(
@@ -960,7 +974,7 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
         b"before bob"
     );
     // Unshared, his device goes and nothing opens for him.
-    let unshared = seal
+    let unshared = client
         .unshare(
             "team",
             [
@@ -976,13 +990,13 @@ fn shared_vault(world: &Scenario, alice: &Alice) {
         "{unshared}"
     );
     assert!(bob.open(&note, Some(b"bob's phrase")).is_err());
-    assert!(seal.open(&note, Some(b"correct horse")).is_ok());
+    assert!(client.open(&note, Some(b"correct horse")).is_ok());
 }
 
 fn break_glass(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
     // ── A break-glass vault: two others approve each release
     // (DESIGN-approvals.md) ──
     realm.add_user("carol@EXAMPLE.TEST", "Carol123");
@@ -1006,34 +1020,37 @@ fn break_glass(world: &Scenario, alice: &Alice) {
         }),
         ..vault::Policy::default()
     };
-    seal.create("glass", glass).unwrap();
-    seal.add_device("glass", b"correct horse").unwrap();
-    let sealed = seal.seal("glass", b"root password").unwrap();
+    client.create("glass", glass).unwrap();
+    client.add_device("glass", b"correct horse").unwrap();
+    let sealed = client.seal("glass", b"root password").unwrap();
     let pass: &[u8] = b"correct horse";
-    assert!(seal.open(&sealed, Some(pass)).is_err(), "no request");
-    let asked = seal.request("glass", &sealed, "INC-7: locked out").unwrap();
+    assert!(client.open(&sealed, Some(pass)).is_err(), "no request");
+    let asked = client
+        .request("glass", &sealed, "INC-7: locked out")
+        .unwrap();
     let id = asked["requests"][0]["id"].as_str().unwrap().to_owned();
     // Bob and Carol approve from their own tickets; neither is a member.
     let bob_home = UserPaths::new(realm.dir.join("bob-approver"));
     let carol_home = UserPaths::new(realm.dir.join("carol-home"));
-    let bob = Seal::new(a, &bob_home, Some(&alice.bob_cc));
-    let carol = Seal::new(a, &carol_home, Some(&carol_cc));
+    let bob = SealClient::new(a, &bob_home, Some(&alice.bob_cc));
+    let carol = SealClient::new(a, &carol_home, Some(&carol_cc));
     let pending = bob.pending(None).unwrap();
     assert_eq!(pending["requests"][0]["id"], id.as_str(), "{pending}");
     bob.decide("alice/glass", &id, false).unwrap();
     assert!(
-        seal.open_with(&sealed, Some(pass), Some(&id)).is_err(),
+        client.open_with(&sealed, Some(pass), Some(&id)).is_err(),
         "one of two"
     );
     carol.decide("alice/glass", &id, false).unwrap();
     assert_eq!(
-        seal.open_with(&sealed, Some(pass), Some(&id))
+        client
+            .open_with(&sealed, Some(pass), Some(&id))
             .unwrap()
             .as_ref(),
         b"root password"
     );
     assert!(
-        seal.open_with(&sealed, Some(pass), Some(&id)).is_err(),
+        client.open_with(&sealed, Some(pass), Some(&id)).is_err(),
         "used up"
     );
 }
@@ -1043,7 +1060,7 @@ fn lost_laptop(world: &Scenario, alice: &Alice) {
     let a = &world.web1;
     // ── A lost laptop, back with a recovery code (DESIGN-recovery.md §2) ──
     let laptop = UserPaths::new(realm.dir.join("alice-lost-laptop"));
-    let on_laptop = Seal::new(a, &laptop, Some(&alice.cc));
+    let on_laptop = SealClient::new(a, &laptop, Some(&alice.cc));
     let notes = vault::Policy {
         factors: vault::Factors {
             device: Some(vault::Level::Any),
@@ -1060,7 +1077,7 @@ fn lost_laptop(world: &Scenario, alice: &Alice) {
 
     // The laptop is gone; on a new one, the code brings its key back.
     let fresh = UserPaths::new(realm.dir.join("alice-new-laptop"));
-    let on_new = Seal::new(a, &fresh, Some(&alice.cc));
+    let on_new = SealClient::new(a, &fresh, Some(&alice.cc));
     let pass: &[u8] = b"new pass";
     assert!(
         on_new
@@ -1092,7 +1109,7 @@ fn lost_laptop(world: &Scenario, alice: &Alice) {
 fn deposits(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
     // ── A drop box: Bob deposits, only Alice opens (DESIGN-recovery.md §3) ──
     let drop = vault::Policy {
         factors: vault::Factors {
@@ -1103,23 +1120,24 @@ fn deposits(world: &Scenario, alice: &Alice) {
         sealing: vault::Sealing::Registered,
         ..vault::Policy::default()
     };
-    seal.create("drop", drop).unwrap();
-    seal.add_device("drop", b"correct horse").unwrap();
+    client.create("drop", drop).unwrap();
+    client.add_device("drop", b"correct horse").unwrap();
     let bob_only = vault::Members {
         users: vec!["bob".into()],
         ..vault::Members::default()
     };
-    seal.share(
-        "drop",
-        [
-            vault::Members::default(),
-            vault::Members::default(),
-            bob_only,
-        ],
-    )
-    .unwrap();
+    client
+        .share(
+            "drop",
+            [
+                vault::Members::default(),
+                vault::Members::default(),
+                bob_only,
+            ],
+        )
+        .unwrap();
     let bob_home = UserPaths::new(realm.dir.join("bob-depositor"));
-    let bob = Seal::new(a, &bob_home, Some(&alice.bob_cc));
+    let bob = SealClient::new(a, &bob_home, Some(&alice.bob_cc));
     let subject = std::collections::BTreeMap::from([("name".to_owned(), "restic".to_owned())]);
     let made = bob
         .deposit(
@@ -1134,14 +1152,17 @@ fn deposits(world: &Scenario, alice: &Alice) {
         bob.deposit_file("alice/drop", &id).is_err(),
         "Bob only deposits"
     );
-    let listed = seal.deposits("drop").unwrap();
+    let listed = client.deposits("drop").unwrap();
     assert_eq!(
         listed["deposits"][0]["depositor"], "bob@EXAMPLE.TEST",
         "{listed}"
     );
-    let sealed = seal.deposit_file("drop", &id).unwrap();
+    let sealed = client.deposit_file("drop", &id).unwrap();
     assert_eq!(
-        seal.open(&sealed, Some(b"correct horse")).unwrap().as_ref(),
+        client
+            .open(&sealed, Some(b"correct horse"))
+            .unwrap()
+            .as_ref(),
         b"restic password"
     );
 }
@@ -1149,7 +1170,7 @@ fn deposits(world: &Scenario, alice: &Alice) {
 fn escrows(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
-    let seal = Seal::new(a, &alice.home, Some(&alice.cc));
+    let client = SealClient::new(a, &alice.home, Some(&alice.cc));
     // Hosts deposit too, with their own keytab (DESIGN-recovery.md §5):
     // web1's LUKS recovery key, as systemd-cryptenroll prints it.
     let host = kuipa_tools::escrow::Depositor {
@@ -1174,11 +1195,12 @@ fn escrows(world: &Scenario, alice: &Alice) {
         hosts: vec!["web1.example.test".into()],
         ..vault::Members::default()
     };
-    seal.share(
-        "drop",
-        [vault::Members::default(), vault::Members::default(), web1],
-    )
-    .unwrap();
+    client
+        .share(
+            "drop",
+            [vault::Members::default(), vault::Members::default(), web1],
+        )
+        .unwrap();
     let made = kuipa_tools::escrow::escrow_luks(
         &host,
         "alice/drop",
@@ -1210,22 +1232,26 @@ fn escrows(world: &Scenario, alice: &Alice) {
         services: vec!["backup/web1.example.test".into()],
         ..vault::Members::default()
     };
-    seal.share(
-        "drop",
-        [
-            vault::Members::default(),
-            vault::Members::default(),
-            services,
-        ],
-    )
-    .unwrap();
+    client
+        .share(
+            "drop",
+            [
+                vault::Members::default(),
+                vault::Members::default(),
+                services,
+            ],
+        )
+        .unwrap();
     let made = kuipa_tools::escrow::escrow_file(&service, "alice/drop", "restic", restic).unwrap();
     assert_eq!(made["deposits"][0]["depositor"], backup, "{made}");
-    let listed = seal.deposits("drop").unwrap();
+    let listed = client.deposits("drop").unwrap();
     assert_eq!(listed["deposits"].as_array().unwrap().len(), 4, "{listed}");
-    let sealed = seal.deposit_file("drop", &luks).unwrap();
+    let sealed = client.deposit_file("drop", &luks).unwrap();
     assert_eq!(
-        seal.open(&sealed, Some(b"correct horse")).unwrap().as_ref(),
+        client
+            .open(&sealed, Some(b"correct horse"))
+            .unwrap()
+            .as_ref(),
         key.as_bytes()
     );
 }
@@ -1239,7 +1265,7 @@ fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
     // each release from it. ──
     let carol_cc = format!("FILE:{}", realm.dir.join("carol.ccache").display());
     let carol_home = UserPaths::new(realm.dir.join("carol-helpdesk"));
-    let carol = Seal::new(a, &carol_home, Some(&carol_cc));
+    let carol = SealClient::new(a, &carol_home, Some(&carol_cc));
     let escrow = vault::Policy {
         factors: vault::Factors {
             device: Some(vault::Level::Any),
@@ -1280,7 +1306,7 @@ fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
 
     // Alice's laptop registers its device: its key is deposited first.
     let old_home = UserPaths::new(realm.dir.join("alice-old-desk"));
-    let old = Seal::new(a, &old_home, Some(&alice.cc));
+    let old = SealClient::new(a, &old_home, Some(&alice.cc));
     let pins = vault::Policy {
         factors: vault::Factors {
             device: Some(vault::Level::Any),
@@ -1297,7 +1323,7 @@ fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
 
     // On a new one she registers a device and tells the helpdesk which.
     let new_home = UserPaths::new(realm.dir.join("alice-new-desk"));
-    let new = Seal::new(a, &new_home, Some(&alice.cc));
+    let new = SealClient::new(a, &new_home, Some(&alice.cc));
     new.add_device("pins", b"new pass").unwrap();
     let shown = new.recover_helpdesk(b"new pass").unwrap();
     let device = shown["helpdesk_device"].as_str().unwrap().to_owned();
@@ -1308,7 +1334,7 @@ fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
         .unwrap();
     let rq = asked["requests"][0]["id"].as_str().unwrap().to_owned();
     let bob_home = UserPaths::new(realm.dir.join("bob-helpdesk"));
-    Seal::new(a, &bob_home, Some(&alice.bob_cc))
+    SealClient::new(a, &bob_home, Some(&alice.bob_cc))
         .decide("carol/escrow", &rq, false)
         .unwrap();
     let pass: &[u8] = b"carol pass";
@@ -1344,7 +1370,7 @@ fn token_device(world: &Scenario, alice: &Alice) {
     // pkcs11-provider; the PIN takes the passphrase's place.
     if let Some(module) = token_with_ml_kem_key() {
         let home = UserPaths::new(realm.dir.join("alice-token-home"));
-        let seal = Seal::new(a, &home, Some(alice_cc));
+        let client = SealClient::new(a, &home, Some(alice_cc));
         let policy = vault::Policy {
             factors: vault::Factors {
                 device: Some(vault::Level::Any),
@@ -1353,8 +1379,8 @@ fn token_device(world: &Scenario, alice: &Alice) {
             },
             ..vault::Policy::default()
         };
-        seal.create("token", policy).unwrap();
-        let added = seal
+        client.create("token", policy).unwrap();
+        let added = client
             .add_token_device("token", &module, "pkcs11:token=kuipa;object=dev", b"1234")
             .unwrap();
         assert_eq!(
@@ -1365,10 +1391,10 @@ fn token_device(world: &Scenario, alice: &Alice) {
             !home.device_key().exists(),
             "no key file: the key stays on the token"
         );
-        let sealed = seal.seal("token", b"on the token").unwrap();
-        assert!(Seal::needs_secret(&sealed));
+        let sealed = client.seal("token", b"on the token").unwrap();
+        assert!(SealClient::needs_secret(&sealed));
         assert_eq!(
-            seal.open(&sealed, Some(b"1234")).unwrap().as_ref(),
+            client.open(&sealed, Some(b"1234")).unwrap().as_ref(),
             b"on the token"
         );
     }
@@ -1392,7 +1418,7 @@ fn passkeys(world: &Scenario, alice: &Alice) {
         .unwrap()
         .insert(me.clone(), vec![ml_dsa.clone()]);
     let home = UserPaths::new(realm.dir.join("alice-passkey-home"));
-    let seal = Seal::new(a, &home, Some(&alice.cc)).with_authenticator(&key);
+    let client = SealClient::new(a, &home, Some(&alice.cc)).with_authenticator(&key);
     let policy = vault::Policy {
         factors: vault::Factors {
             device: Some(vault::Level::Any),
@@ -1406,27 +1432,27 @@ fn passkeys(world: &Scenario, alice: &Alice) {
         },
         ..vault::Policy::default()
     };
-    seal.create("pk", policy).unwrap();
+    client.create("pk", policy).unwrap();
     // The device key is wrapped by a passkey of its own on the same key:
     // one touch makes it, one wraps the key.
-    let added = seal.add_passkey_device("pk", b"4321").unwrap();
+    let added = client.add_passkey_device("pk", b"4321").unwrap();
     assert_eq!(
         added["vaults"][0]["devices"][0]["type"], "passkey",
         "{added}"
     );
     assert_eq!(key.touches(), 2);
     assert!(home.passkey_device());
-    let note = seal.seal("pk", b"behind a passkey").unwrap();
-    assert!(Seal::needs_secret(&note));
-    assert!(seal.needs_passkey(&note));
+    let note = client.seal("pk", b"behind a passkey").unwrap();
+    assert!(SealClient::needs_secret(&note));
+    assert!(client.needs_passkey(&note));
     // Opening takes two touches, the device key's and the factor's, and
     // the device's PIN serves for both.
     assert_eq!(
-        seal.open(&note, Some(b"4321")).unwrap().as_ref(),
+        client.open(&note, Some(b"4321")).unwrap().as_ref(),
         b"behind a passkey"
     );
     assert_eq!(key.touches(), 4);
-    assert!(seal.open(&note, Some(b"0000")).is_err(), "a wrong PIN");
+    assert!(client.open(&note, Some(b"0000")).is_err(), "a wrong PIN");
     // The server checks the passkey is Alice's in IPA now, not as the
     // host last listed them.
     directory
@@ -1434,7 +1460,7 @@ fn passkeys(world: &Scenario, alice: &Alice) {
         .lock()
         .unwrap()
         .insert(me.clone(), Vec::new());
-    assert!(seal.open(&note, Some(b"4321")).is_err(), "no IPA passkey");
+    assert!(client.open(&note, Some(b"4321")).is_err(), "no IPA passkey");
     directory
         .passkeys
         .lock()
@@ -1442,15 +1468,15 @@ fn passkeys(world: &Scenario, alice: &Alice) {
         .insert(me.clone(), vec![ml_dsa.clone()]);
     // A session starts with the passkey, then stands in for it: only the
     // session's own start touches the key.
-    seal.unlock("pk", b"4321", false).unwrap();
+    client.unlock("pk", b"4321", false).unwrap();
     let touched = key.touches();
-    assert!(!seal.needs_passkey(&note));
+    assert!(!client.needs_passkey(&note));
     assert_eq!(
-        seal.open(&note, None).unwrap().as_ref(),
+        client.open(&note, None).unwrap().as_ref(),
         b"behind a passkey"
     );
     assert_eq!(key.touches(), touched, "no touch in a session");
-    seal.lock("pk").unwrap();
+    client.lock("pk").unwrap();
 
     // A classical passkey on a key without a PIN, in a realm that does not
     // require user verification: with Alice's ticket, no device.
@@ -1465,7 +1491,7 @@ fn passkeys(world: &Scenario, alice: &Alice) {
         .unwrap()
         .insert(me.clone(), vec![ml_dsa, es256]);
     let laptop = UserPaths::new(realm.dir.join("alice-classic-home"));
-    let seal = Seal::new(a, &laptop, Some(&alice.cc)).with_authenticator(&classic);
+    let client = SealClient::new(a, &laptop, Some(&alice.cc)).with_authenticator(&classic);
     let policy = vault::Policy {
         factors: vault::Factors {
             device: None,
@@ -1474,14 +1500,14 @@ fn passkeys(world: &Scenario, alice: &Alice) {
         },
         ..vault::Policy::default()
     };
-    seal.create("pk-classic", policy).unwrap();
-    let note = seal.seal("pk-classic", b"classic").unwrap();
-    assert!(!Seal::needs_secret(&note));
-    assert_eq!(seal.open(&note, None).unwrap().as_ref(), b"classic");
+    client.create("pk-classic", policy).unwrap();
+    let note = client.seal("pk-classic", b"classic").unwrap();
+    assert!(!SealClient::needs_secret(&note));
+    assert_eq!(client.open(&note, None).unwrap().as_ref(), b"classic");
     assert_eq!(classic.touches(), 1);
     // Bob's ticket with Alice's passkey: the passkey must be the ticket
     // holder's.
-    let as_bob = Seal::new(a, &laptop, Some(&alice.bob_cc)).with_authenticator(&classic);
+    let as_bob = SealClient::new(a, &laptop, Some(&alice.bob_cc)).with_authenticator(&classic);
     assert!(as_bob.open(&note, None).is_err());
     *directory.passkey_uv.lock().unwrap() = true;
 }

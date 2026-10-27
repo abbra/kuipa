@@ -270,7 +270,7 @@ enum Command {
     /// Kerberos ticket.
     Seal {
         #[command(subcommand)]
-        action: SealAction,
+        action: SealCommand,
     },
     /// Deposit recovery keys into a vault the depositor cannot open, with a
     /// ticket from the host's keytab or a service's (run as root).
@@ -372,7 +372,7 @@ enum KeysAction {
 /// `kuipa seal` subcommands.  A vault is named by its name when it is the
 /// user's own, and as `OWNER/NAME` when it is shared with them.
 #[derive(Subcommand)]
-enum SealAction {
+enum SealCommand {
     /// Create a vault, owned by you.
     Create {
         /// The vault's name.
@@ -2314,20 +2314,20 @@ fn security_key_pin(file: Option<&str>, what: &str) -> Result<SecretBuf, Error> 
 /// unless this host's device key is itself wrapped by a passkey, whose
 /// PIN serves.
 fn with_passkey_pin<'a>(
-    seal: kuipa_tools::seal::Seal<'a>,
+    client: kuipa_tools::seal::SealClient<'a>,
     user: &kuipa_tools::seal::UserPaths,
     needed: bool,
     file: Option<&str>,
-) -> Result<kuipa_tools::seal::Seal<'a>, Error> {
+) -> Result<kuipa_tools::seal::SealClient<'a>, Error> {
     if !needed
         || (file.is_none()
             && (user.passkey_device()
-                || !seal.passkey_verifies_user()
+                || !client.passkey_verifies_user()
                 || !std::io::stdin().is_terminal()))
     {
-        return Ok(seal);
+        return Ok(client);
     }
-    Ok(seal.with_passkey_pin(security_key_pin(file, "passkey PIN (empty if none)")?))
+    Ok(client.with_passkey_pin(security_key_pin(file, "passkey PIN (empty if none)")?))
 }
 
 /// `kuipa keys fetch` (§18.4): the value on standard output, or in a
@@ -2357,7 +2357,7 @@ fn run_tlog(paths: &Paths, action: &TlogAction) -> Result<Value, Error> {
     match action {
         TlogAction::Watch { vault } => {
             let user = kuipa_tools::seal::UserPaths::from_env()?;
-            kuipa_tools::seal::Seal::new(paths, &user, None).watch(vault)
+            kuipa_tools::seal::SealClient::new(paths, &user, None).watch(vault)
         }
         TlogAction::Witnesses {
             add,
@@ -2386,11 +2386,11 @@ fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
 
 /// `kuipa seal open`.
 fn run_open(
-    seal: kuipa_tools::seal::Seal<'_>,
+    client: kuipa_tools::seal::SealClient<'_>,
     user: &kuipa_tools::seal::UserPaths,
-    action: &SealAction,
+    action: &SealCommand,
 ) -> Result<Value, Error> {
-    let SealAction::Open {
+    let SealCommand::Open {
         sealed,
         out,
         force,
@@ -2403,12 +2403,12 @@ fn run_open(
     };
     let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
     let bytes = std::fs::read(sealed)?;
-    let pass = kuipa_tools::seal::Seal::needs_secret(&bytes)
+    let pass = kuipa_tools::seal::SealClient::needs_secret(&bytes)
         .then(|| passphrase(passphrase_file.as_deref(), false))
         .transpose()?;
-    let needs_passkey = seal.needs_passkey(&bytes);
-    let seal = with_passkey_pin(seal, user, needs_passkey, passkey_pin_file.as_deref())?;
-    let plain = seal.open_with(&bytes, pass.as_ref().map(AsRef::as_ref), request.as_deref())?;
+    let needs_passkey = client.needs_passkey(&bytes);
+    let client = with_passkey_pin(client, user, needs_passkey, passkey_pin_file.as_deref())?;
+    let plain = client.open_with(&bytes, pass.as_ref().map(AsRef::as_ref), request.as_deref())?;
     target.write(plain.as_ref())?;
     Ok(serde_json::json!({
         "sealed": sealed,
@@ -2419,7 +2419,10 @@ fn run_open(
 }
 
 /// `kuipa seal deposit …`.
-fn run_deposit(seal: &kuipa_tools::seal::Seal<'_>, action: &DepositAction) -> Result<Value, Error> {
+fn run_deposit(
+    client: &kuipa_tools::seal::SealClient<'_>,
+    action: &DepositAction,
+) -> Result<Value, Error> {
     match action {
         DepositAction::Put { vault, file, name } => {
             let name = name.clone().unwrap_or_else(|| {
@@ -2428,26 +2431,26 @@ fn run_deposit(seal: &kuipa_tools::seal::Seal<'_>, action: &DepositAction) -> Re
                     .map_or_else(|| file.clone(), |n| n.to_string_lossy().into_owned())
             });
             let subject = std::collections::BTreeMap::from([("name".to_owned(), name)]);
-            seal.deposit(
+            client.deposit(
                 vault,
                 &std::fs::read(file)?,
                 kuipa_enroll::vault::DepositKind::File,
                 subject,
             )
         }
-        DepositAction::List { vault } => seal.deposits(vault),
+        DepositAction::List { vault } => client.deposits(vault),
         DepositAction::Fetch { vault, id, out } => {
-            let sealed = seal.deposit_file(vault, id)?;
+            let sealed = client.deposit_file(vault, id)?;
             paths::write_file(std::path::Path::new(out), &sealed, 0o600)?;
             Ok(serde_json::json!({ "vault": vault, "file": id, "sealed": out }))
         }
-        DepositAction::Retire { vault, id } => seal.retire_deposit(vault, id),
+        DepositAction::Retire { vault, id } => client.retire_deposit(vault, id),
     }
 }
 
 /// `kuipa seal recover …`.
 fn run_recover(
-    seal: &kuipa_tools::seal::Seal<'_>,
+    client: &kuipa_tools::seal::SealClient<'_>,
     user: &kuipa_tools::seal::UserPaths,
     action: &RecoverAction,
 ) -> Result<Value, Error> {
@@ -2466,10 +2469,10 @@ fn run_recover(
             let code = std::str::from_utf8(code.as_ref()).map_err(|_| "not a recovery code")?;
             let first = !user.device_key().exists();
             let pass = passphrase(passphrase_file.as_deref(), first)?;
-            seal.recover_code(code, pass.as_ref())
+            client.recover_code(code, pass.as_ref())
         }
         RecoverAction::Helpdesk { passphrase_file } => {
-            seal.recover_helpdesk(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+            client.recover_helpdesk(passphrase(passphrase_file.as_deref(), false)?.as_ref())
         }
         RecoverAction::Deliver {
             deposit,
@@ -2479,7 +2482,7 @@ fn run_recover(
             passphrase_file,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
-            seal.deliver(
+            client.deliver(
                 deposit,
                 (user, device),
                 Some(pass.as_ref()),
@@ -2487,7 +2490,7 @@ fn run_recover(
             )
         }
         RecoverAction::Fetch { passphrase_file } => {
-            seal.recover_fetch(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+            client.recover_fetch(passphrase(passphrase_file.as_deref(), false)?.as_ref())
         }
         RecoverAction::Finish {
             sealed,
@@ -2499,7 +2502,7 @@ fn run_recover(
                 .iter()
                 .map(std::fs::read)
                 .collect::<Result<Vec<_>, _>>()?;
-            let (value, again) = seal.recover_finish(pass.as_ref(), &files, *retire_old)?;
+            let (value, again) = client.recover_finish(pass.as_ref(), &files, *retire_old)?;
             for (path, bytes) in sealed.iter().zip(again) {
                 paths::write_file(std::path::Path::new(path), &bytes, 0o600)?;
             }
@@ -2510,7 +2513,7 @@ fn run_recover(
 
 /// `kuipa seal device …`.
 fn run_seal_device(
-    seal: &kuipa_tools::seal::Seal<'_>,
+    client: &kuipa_tools::seal::SealClient<'_>,
     user: &kuipa_tools::seal::UserPaths,
     action: &DeviceAction,
 ) -> Result<Value, Error> {
@@ -2527,35 +2530,35 @@ fn run_seal_device(
                     passphrase_file.as_deref(),
                     "security key PIN (empty if none)",
                 )?;
-                seal.add_passkey_device(vault, pin.as_ref())
+                client.add_passkey_device(vault, pin.as_ref())
             } else if let Some(uri) = pkcs11 {
                 let pin = passphrase(passphrase_file.as_deref(), false)?;
-                seal.add_token_device(vault, std::path::Path::new(module), uri, pin.as_ref())
+                client.add_token_device(vault, std::path::Path::new(module), uri, pin.as_ref())
             } else {
                 let first = !user.device_key().exists() && !user.token_device().exists();
                 let pass = passphrase(passphrase_file.as_deref(), first)?;
-                seal.add_device(vault, pass.as_ref())
+                client.add_device(vault, pass.as_ref())
             }
         }
-        DeviceAction::Remove { vault, id } => seal.remove_device(vault, id),
+        DeviceAction::Remove { vault, id } => client.remove_device(vault, id),
     }
 }
 
 /// `kuipa seal …`: as the user, with their ticket.
-fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
+fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
     let user = kuipa_tools::seal::UserPaths::from_env()?;
     // The attached security keys, or the playground's software one.
     let authenticator = kuipa_tools::passkey::from_env()?;
-    let seal =
-        kuipa_tools::seal::Seal::new(paths, &user, None).with_authenticator(authenticator.as_ref());
+    let client = kuipa_tools::seal::SealClient::new(paths, &user, None)
+        .with_authenticator(authenticator.as_ref());
     match action {
-        SealAction::Create { vault, policy } => seal.create(vault, policy.policy()?),
-        SealAction::Policy { vault, policy } => seal.set_policy(vault, policy.policy()?),
-        SealAction::Share { vault, who } => seal.share(vault, who.sets()),
-        SealAction::Unshare { vault, who } => seal.unshare(vault, who.sets()),
-        SealAction::Deposit { action } => run_deposit(&seal, action),
-        SealAction::Device { action } => run_seal_device(&seal, &user, action),
-        SealAction::File {
+        SealCommand::Create { vault, policy } => client.create(vault, policy.policy()?),
+        SealCommand::Policy { vault, policy } => client.set_policy(vault, policy.policy()?),
+        SealCommand::Share { vault, who } => client.share(vault, who.sets()),
+        SealCommand::Unshare { vault, who } => client.unshare(vault, who.sets()),
+        SealCommand::Deposit { action } => run_deposit(&client, action),
+        SealCommand::Device { action } => run_seal_device(&client, &user, action),
+        SealCommand::File {
             vault,
             file,
             out,
@@ -2564,62 +2567,62 @@ fn run_seal(paths: &Paths, action: &SealAction) -> Result<Value, Error> {
             let out = out.clone().unwrap_or_else(|| format!("{file}.sealed"));
             let contents = std::fs::read(file)?;
             let sealed = if *session {
-                seal.seal_session(vault, &contents)?
+                client.seal_session(vault, &contents)?
             } else {
-                seal.seal(vault, &contents)?
+                client.seal(vault, &contents)?
             };
             paths::write_file(std::path::Path::new(&out), &sealed, 0o600)?;
             Ok(serde_json::json!({ "vault": vault, "file": file, "sealed": out }))
         }
-        open @ SealAction::Open { .. } => run_open(seal, &user, open),
-        SealAction::Reseal {
+        open @ SealCommand::Open { .. } => run_open(client, &user, open),
+        SealCommand::Reseal {
             vault,
             sealed,
             passphrase_file,
             passkey_pin_file,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
-            let needed = seal.vault_needs_passkey(vault);
-            let seal = with_passkey_pin(seal, &user, needed, passkey_pin_file.as_deref())?;
+            let needed = client.vault_needs_passkey(vault);
+            let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
             for path in sealed {
-                let again = seal.reseal(vault, &std::fs::read(path)?, Some(pass.as_ref()))?;
+                let again = client.reseal(vault, &std::fs::read(path)?, Some(pass.as_ref()))?;
                 paths::write_file(std::path::Path::new(path), &again, 0o600)?;
             }
             Ok(serde_json::json!({ "vault": vault, "resealed": sealed }))
         }
-        SealAction::Unlock {
+        SealCommand::Unlock {
             vault,
             passphrase_file,
             passkey_pin_file,
             offline,
         } => {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
-            let needed = seal.vault_needs_passkey(vault);
-            let seal = with_passkey_pin(seal, &user, needed, passkey_pin_file.as_deref())?;
-            seal.unlock(vault, pass.as_ref(), *offline)
+            let needed = client.vault_needs_passkey(vault);
+            let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
+            client.unlock(vault, pass.as_ref(), *offline)
         }
-        SealAction::Lock { vault } => seal.lock(vault),
-        SealAction::Retire { vault, sealed } => {
+        SealCommand::Lock { vault } => client.lock(vault),
+        SealCommand::Retire { vault, sealed } => {
             for path in sealed {
-                seal.retire(vault, &std::fs::read(path)?)?;
+                client.retire(vault, &std::fs::read(path)?)?;
             }
             Ok(serde_json::json!({ "vault": vault, "retired": sealed }))
         }
-        SealAction::Request {
+        SealCommand::Request {
             vault,
             sealed,
             reason,
-        } => seal.request(vault, &std::fs::read(sealed)?, reason),
-        SealAction::Pending { vault } => seal.pending(vault.as_deref()),
-        SealAction::RecoveryCode { passphrase_file } => {
-            seal.recovery_code(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        } => client.request(vault, &std::fs::read(sealed)?, reason),
+        SealCommand::Pending { vault } => client.pending(vault.as_deref()),
+        SealCommand::RecoveryCode { passphrase_file } => {
+            client.recovery_code(passphrase(passphrase_file.as_deref(), false)?.as_ref())
         }
-        SealAction::Recover { action } => run_recover(&seal, &user, action),
-        SealAction::Approve { vault, id } => seal.decide(vault, id, false),
-        SealAction::Deny { vault, id } => seal.decide(vault, id, true),
-        SealAction::Show { vault } => seal.show(vault),
-        SealAction::List => seal.list(),
-        SealAction::Revoke { vault } => seal.revoke(vault),
+        SealCommand::Recover { action } => run_recover(&client, &user, action),
+        SealCommand::Approve { vault, id } => client.decide(vault, id, false),
+        SealCommand::Deny { vault, id } => client.decide(vault, id, true),
+        SealCommand::Show { vault } => client.show(vault),
+        SealCommand::List => client.list(),
+        SealCommand::Revoke { vault } => client.revoke(vault),
     }
 }
 
