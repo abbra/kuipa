@@ -23,9 +23,11 @@ synta-certificate = { version = "0.5.1", default-features = false, features = ["
 tang-pqc.workspace = true
 # Voucher issuing and blinding (§9).
 ml-dsa-blind.workspace = true
-# DNS SRV discovery, as in akamu; default features only (no DNSSEC or
-# DNS-over-TLS backends, so no ring).
-hickory-resolver = "0.26"
+# DNS SRV discovery over plain UDP/TCP, DoT and DoH (§4.6), as in akamu;
+# no DNSSEC.  The TLS provider is OpenSSL through the ring shim, not
+# ring's BoringSSL; server certificates are verified against the system
+# roots or `KUIPA_DNS_CA` (dns.rs).
+hickory-resolver = { version = "0.26", features = ["tls-ring", "https-ring", "rustls-platform-verifier"] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
