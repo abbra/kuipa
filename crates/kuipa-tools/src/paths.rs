@@ -100,7 +100,7 @@ impl Paths {
         self.at("var/lib/ipa-client/ku")
     }
 
-    /// The host's own kuipa data directory for `kuipa escrow`: the vault
+    /// The host's own kuipa data directory for `kuipa escrow`: the seal
     /// descriptors it seals deposits with, root-only.
     #[must_use]
     pub fn escrow_dir(&self) -> PathBuf {

@@ -1,4 +1,4 @@
-//! Passkeys as a vault factor (§7.6.5): CTAP assertions verified against a
+//! Passkeys as a seal factor (§7.6.5): CTAP assertions verified against a
 //! user's IPA passkeys (`ipaPassKey`), with kuipad as the relying party.
 //!
 //! Borrowed from ahdapa's WebAuthn verifier (`src/auth/passkey.rs`) and
@@ -395,7 +395,7 @@ impl UserPasskeys {
 
 /// What a client needs to ask its authenticator for an assertion: the RP
 /// ID, whether to verify the user, and the credential IDs to allow
-/// (base64url), its user's passkeys.  The answer to the vault operation
+/// (base64url), its user's passkeys.  The answer to the seal operation
 /// `passkeys`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasskeyInfo {

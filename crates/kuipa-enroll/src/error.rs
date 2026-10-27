@@ -36,7 +36,7 @@ pub enum Error {
     /// The advertisement verifies but describes another deployment than
     /// the client was told to join (§4.6): the message names both.
     Deployment(String),
-    /// A vault policy or operation is refused (§7.6).
+    /// A seal policy or operation is refused (§7.6).
     Policy(String),
     /// A passkey assertion does not satisfy the passkey factor (§7.6.5).
     Passkey(&'static str),

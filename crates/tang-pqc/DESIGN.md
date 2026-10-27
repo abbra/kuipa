@@ -582,7 +582,7 @@ derivations are the `Domain::TANG` case, byte for byte.
   data)`, and `OpenedRequest::verify_commitment(data, tag)` checks it after
   opening (`Error::CommitmentMismatch` otherwise). A server that authorises
   by application data the binding context carries (kuipa: a principal and a
-  vault) cannot see that context, since it is mixed in on the client only;
+  seal) cannot see that context, since it is mixed in on the client only;
   the commitment lets it check that the binding really was made for the
   data the request claims, which only the binding's creator and the
   exchange key's holder can compute. The Tang wire format is unchanged.

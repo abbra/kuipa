@@ -8,7 +8,7 @@
 //! beyond a fixed number of entries, never growing past that however many
 //! distinct names or addresses a client sends.
 //!
-//! Requests that name no host (registration, vault operations, Tang
+//! Requests that name no host (registration, seal operations, Tang
 //! recovery) and arrive without a resolvable source share one bucket of
 //! their own, so they are always limited: nothing reaches the handlers
 //! unthrottled.
@@ -169,7 +169,7 @@ impl Limiter {
     }
 
     /// Take a token from `source`'s bucket only: for requests that name no
-    /// host (Tang recovery, registration, vault operations).  `None`
+    /// host (Tang recovery, registration, seal operations).  `None`
     /// limits through the shared unsourced bucket rather than not at all.
     ///
     /// # Errors

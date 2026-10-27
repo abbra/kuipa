@@ -1,9 +1,9 @@
-//! User vaults (§7.6): policies, devices, the signed vault descriptor, the
-//! operations that manage a vault, and files sealed to one.
+//! User seals (§7.6): policies, devices, the signed seal descriptor, the
+//! operations that manage a seal, and files sealed to one.
 //!
 //! ```text
 //! A, B ←$ 32 bytes                                server share, device share
-//! DEK  = HKDF(A ‖ B, "vault dek", IPCV(P, V))     (B empty without factors.device)
+//! DEK  = HKDF(A ‖ B, "seal dek", IPCV(P, V))     (B empty without factors.device)
 //! for each server i:  (B_i, K_i, t_i) = tang-pqc provision to ek_i, committed to IPCV(P, V)
 //!                     W_i = GCM_{K_i}(A)
 //! for each device j:  (c_j, s_j) = ML-KEM.Encaps(dpk_j)
@@ -12,9 +12,9 @@
 //! ```
 //!
 //! An unlock is the unified recovery request ([`EscrowRequest`]) naming the
-//! vault, with the device to answer to and, when the policy asks for it,
+//! seal, with the device to answer to and, when the policy asks for it,
 //! the owner's GSS-API token bound to the request.  With a device, the
-//! server's answer is encrypted to that device's key ([`VaultAnswer`]).
+//! server's answer is encrypted to that device's key ([`SealAnswer`]).
 
 use std::fmt;
 use std::str::FromStr;
@@ -31,19 +31,19 @@ use tang_pqc::{
 
 use crate::delegation::{Delegation, VerifiedDelegation};
 use crate::error::{Error, Result};
-use crate::escrow::{self, BindingHash, EscrowRequest, VaultId, commitment_data};
+use crate::escrow::{self, BindingHash, EscrowRequest, SealId, commitment_data};
 use crate::keytab::Principal;
 use crate::realm::VerifiedRealm;
 use crate::tlog::Receipt;
 
-/// Domain of vault derivations: the data key, device shares, answers.
-pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 vault");
+/// Domain of seal derivations: the data key, device shares, answers.
+pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 seal");
 
 /// ML-DSA context of descriptor signatures.
-pub const DESCRIPTOR_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault descriptor";
+pub const DESCRIPTOR_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 seal descriptor";
 
 /// ML-DSA context of session token signatures.
-pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 vault session";
+pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 seal session";
 
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
@@ -159,12 +159,12 @@ pub struct Factors {
     /// A registered device of at least this level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<Level>,
-    /// The opener's Kerberos ticket: the owner's, or in a shared vault a
+    /// The opener's Kerberos ticket: the owner's, or in a shared seal a
     /// manager's or member's.
     #[serde(default)]
     pub ticket: bool,
     /// A passkey assertion from one of the opener's IPA passkeys: the
-    /// owner's, or in a shared vault the holder's of the device or ticket
+    /// owner's, or in a shared seal the holder's of the device or ticket
     /// it opens with.
     #[serde(default)]
     pub passkey: bool,
@@ -209,7 +209,7 @@ impl fmt::Display for Factors {
     }
 }
 
-/// How bindings of the vault's files are authorised.
+/// How bindings of the seal's files are authorised.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Sealing {
@@ -220,7 +220,7 @@ pub enum Sealing {
     Registered,
 }
 
-/// Session kinds the vault allows (§7.6.6).
+/// Session kinds the seal allows (§7.6.6).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sessions {
     /// The longest re-authentication session, in seconds.
@@ -235,7 +235,7 @@ pub struct Sessions {
     pub epoch: Option<u64>,
 }
 
-/// A vault's policy (§7.6.2).
+/// A seal's policy (§7.6.2).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     /// The factors an unlock needs.
@@ -251,7 +251,7 @@ pub struct Policy {
     /// from the realm limits when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_after: Option<u64>,
-    /// Releases over the vault's life.
+    /// Releases over the seal's life.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_unlocks: Option<u64>,
     /// Sessions.
@@ -275,13 +275,13 @@ pub const MAX_APPROVAL_WINDOW: u64 = 7 * 86_400;
 /// The longest reason a release request may give, in bytes.
 pub const MAX_REASON: usize = 512;
 
-/// A vault's approvals (`DESIGN-approvals.md` §1): `m` people of `from`,
+/// A seal's approvals (`DESIGN-approvals.md` §1): `m` people of `from`,
 /// other than the requester, approve a release before a server answers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approvals {
     /// Approvals needed.
     pub m: u32,
-    /// Who may approve, named as a shared vault's members are.
+    /// Who may approve, named as a shared seal's members are.
     pub from: Members,
     /// How long a request may wait for approvals and then be used, in
     /// seconds (default [`DEFAULT_APPROVAL_WINDOW`]).
@@ -348,15 +348,15 @@ impl Policy {
         let f = &self.factors;
         if f.device.is_none() && !f.ticket && !f.passkey {
             return Err(Self::refuse(
-                "a vault needs a factor besides the server: device, ticket or passkey",
+                "a seal needs a factor besides the server: device, ticket or passkey",
             ));
         }
         if self.max_unlocks == Some(0) {
-            return Err(Self::refuse("a vault that never unlocks"));
+            return Err(Self::refuse("a seal that never unlocks"));
         }
         if self.sessions.reauth.is_some() && f.device.is_none() {
             return Err(Self::refuse(
-                "re-authentication sessions need the device factor: a session token alone would open the vault",
+                "re-authentication sessions need the device factor: a session token alone would open the seal",
             ));
         }
         if self.sessions.offline.is_some() && f.device.is_none() {
@@ -392,21 +392,21 @@ impl Policy {
 /// What a realm lets its users choose (§7.6.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
-    /// The longest a vault may live, in seconds.
+    /// The longest a seal may live, in seconds.
     pub max_lifetime: u64,
     /// The largest `max_unlocks`; `None` for no cap.
     #[serde(default)]
     pub max_unlocks: Option<u64>,
-    /// Vaults per user.
-    pub max_vaults: usize,
-    /// Devices per vault and holder: each member of a shared vault
+    /// Seals per user.
+    pub max_seals: usize,
+    /// Devices per seal and holder: each member of a shared seal
     /// registers up to this many.
     pub max_devices: usize,
-    /// Entries in a vault's managers and members together (§7.6.12);
-    /// 0 keeps every vault to its owner.
+    /// Entries in a seal's managers and members together (§7.6.12);
+    /// 0 keeps every seal to its owner.
     #[serde(default = "default_max_members")]
     pub max_members: usize,
-    /// Deposits per depositor and vault (`DESIGN-recovery.md` §3).
+    /// Deposits per depositor and seal (`DESIGN-recovery.md` §3).
     #[serde(default = "default_max_deposits")]
     pub max_deposits: usize,
     /// The longest re-authentication session, in seconds.
@@ -414,7 +414,7 @@ pub struct Limits {
     /// Whether offline sessions are allowed at all.
     #[serde(default)]
     pub offline_sessions: bool,
-    /// Whether a vault may do without the device factor.
+    /// Whether a seal may do without the device factor.
     pub without_device: bool,
     /// How old a descriptor may be when a client seals with it, in seconds.
     pub descriptor_age: u64,
@@ -434,7 +434,7 @@ pub struct Limits {
 pub struct GroupLimits {
     /// The group, by name.
     pub group: String,
-    /// Of the groups a vault's owner is in, the one with the lowest
+    /// Of the groups a seal's owner is in, the one with the lowest
     /// priority applies (ties go to the group named first in byte order),
     /// as FreeIPA's password policies are chosen.
     pub priority: u32,
@@ -456,9 +456,9 @@ pub struct LimitOverrides {
         deserialize_with = "present"
     )]
     pub max_unlocks: Option<Option<u64>>,
-    /// [`Limits::max_vaults`].
+    /// [`Limits::max_seals`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_vaults: Option<usize>,
+    pub max_seals: Option<usize>,
     /// [`Limits::max_devices`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_devices: Option<usize>,
@@ -507,7 +507,7 @@ impl Default for Limits {
         Self {
             max_lifetime: 400 * 86_400,
             max_unlocks: None,
-            max_vaults: 16,
+            max_seals: 16,
             max_devices: 8,
             max_members: default_max_members(),
             max_deposits: default_max_deposits(),
@@ -522,7 +522,7 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// The limits for a vault whose owner is a member of `groups`: those
+    /// The limits for a seal whose owner is a member of `groups`: those
     /// of the matching group with the lowest priority over the realm's,
     /// or the realm's.  The result names no groups.
     #[must_use]
@@ -542,7 +542,7 @@ impl Limits {
         let o = chosen.set.clone();
         out.max_lifetime = o.max_lifetime.unwrap_or(out.max_lifetime);
         out.max_unlocks = o.max_unlocks.unwrap_or(out.max_unlocks);
-        out.max_vaults = o.max_vaults.unwrap_or(out.max_vaults);
+        out.max_seals = o.max_seals.unwrap_or(out.max_seals);
         out.max_devices = o.max_devices.unwrap_or(out.max_devices);
         out.max_members = o.max_members.unwrap_or(out.max_members);
         out.max_deposits = o.max_deposits.unwrap_or(out.max_deposits);
@@ -565,11 +565,11 @@ impl Limits {
         let latest = now.saturating_add(self.max_lifetime);
         let not_after = *policy.not_after.get_or_insert(latest);
         if not_after <= now {
-            return Err(Policy::refuse("the vault would already be expired"));
+            return Err(Policy::refuse("the seal would already be expired"));
         }
         if not_after > latest {
             return Err(Policy::refuse(format!(
-                "the realm allows vaults for at most {} days",
+                "the realm allows seals for at most {} days",
                 self.max_lifetime / 86_400
             )));
         }
@@ -600,7 +600,7 @@ impl Limits {
     }
 }
 
-/// A device key registered in a vault.
+/// A device key registered in a seal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     /// Thumbprint of the public key.
@@ -619,7 +619,7 @@ pub struct Device {
     /// When it was registered.
     pub added: u64,
     /// The principal who registered it, and who alone opens with it;
-    /// absent on devices registered before shared vaults, which are the
+    /// absent on devices registered before shared seals, which are the
     /// owner's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<String>,
@@ -672,7 +672,7 @@ impl Device {
     }
 }
 
-/// Whether a vault still answers.
+/// Whether a seal still answers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
@@ -683,18 +683,18 @@ pub enum State {
     Revoked,
 }
 
-/// A vault as the directory stores it.
+/// A seal as the directory stores it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Vault {
+pub struct Seal {
     /// The id.
-    pub id: VaultId,
+    pub id: SealId,
     /// The owner's principal.
     pub owner: String,
     /// The owner's label, unique per owner.
     pub name: String,
     /// The policy.
     pub policy: Policy,
-    /// Who manages the vault besides its owner: its policy, members and
+    /// Who manages the seal besides its owner: its policy, members and
     /// state (§7.6.12).
     #[serde(default, skip_serializing_if = "Members::is_empty")]
     pub managers: Members,
@@ -723,11 +723,11 @@ pub struct Vault {
     pub bindings: Vec<String>,
 }
 
-/// Who shares a vault: users, user and host groups (by the directory's
+/// Who shares a seal: users, user and host groups (by the directory's
 /// `memberOf`), hosts and services, as the signing policy names signers.
 pub type Members = crate::sign::Signers;
 
-/// What a principal may do with a vault (§7.6.12).
+/// What a principal may do with a seal (§7.6.12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     /// Seal to it and deposit, but never open (`DESIGN-recovery.md` §3).
@@ -736,11 +736,11 @@ pub enum Role {
     Member,
     /// Also change the policy, the managers and members, and revoke.
     Manager,
-    /// The vault's owner: a manager, and the `P` its files are sealed to.
+    /// The seal's owner: a manager, and the `P` its files are sealed to.
     Owner,
 }
 
-/// Split a vault reference, `NAME` (the caller's own) or `OWNER/NAME`
+/// Split a seal reference, `NAME` (the caller's own) or `OWNER/NAME`
 /// (one shared with the caller), at its last `/`.
 #[must_use]
 pub fn split_ref(reference: &str) -> (Option<&str>, &str) {
@@ -750,10 +750,10 @@ pub fn split_ref(reference: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// The most bindings a vault keeps registered.
+/// The most bindings a seal keeps registered.
 pub const MAX_BINDINGS: usize = 4096;
 
-/// A binding hash as the vault stores it.
+/// A binding hash as the seal stores it.
 #[must_use]
 pub fn binding_hex(hash: &BindingHash) -> String {
     use std::fmt::Write as _;
@@ -777,7 +777,7 @@ pub struct SessionKeySlot {
     pub wrapped: String,
 }
 
-/// A vault's offline-session key for one epoch: the public half for
+/// A seal's offline-session key for one epoch: the public half for
 /// sealing, the private half sealed to each server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionKey {
@@ -796,7 +796,7 @@ pub struct SessionKey {
 
 fn session_slot_key(
     secret: &[u8],
-    vault: &VaultId,
+    seal: &SealId,
     epoch: u64,
     server: &str,
     ct: &[u8],
@@ -807,7 +807,7 @@ fn session_slot_key(
         &[secret],
         "session key",
         &[
-            vault.as_bytes(),
+            seal.as_bytes(),
             &epoch.to_be_bytes(),
             server.as_bytes(),
             &primitives::digest(hash, &[ct])?,
@@ -816,13 +816,13 @@ fn session_slot_key(
 }
 
 impl SessionKey {
-    /// A new epoch's key for `vault`, sealed to each `(server, escrow key)`.
+    /// A new epoch's key for `seal`, sealed to each `(server, escrow key)`.
     ///
     /// # Errors
     ///
     /// A crypto error.
     pub fn generate(
-        vault: &VaultId,
+        seal: &SealId,
         epoch: u64,
         started: u64,
         servers: &[(String, ExchangeKey)],
@@ -835,7 +835,7 @@ impl SessionKey {
             key: b64::encode(pair.public().as_bytes()),
             slots: Vec::new(),
         };
-        key.add_slots(vault, &pair, servers)?;
+        key.add_slots(seal, &pair, servers)?;
         Ok(key)
     }
 
@@ -847,7 +847,7 @@ impl SessionKey {
     /// A crypto error.
     pub fn add_slots(
         &mut self,
-        vault: &VaultId,
+        seal: &SealId,
         pair: &ExchangeKeyPair,
         servers: &[(String, ExchangeKey)],
     ) -> Result<bool> {
@@ -859,7 +859,7 @@ impl SessionKey {
                 continue;
             }
             let (ct, secret) = ek.encapsulate()?;
-            let k = session_slot_key(secret.as_ref(), vault, self.epoch, server, &ct)?;
+            let k = session_slot_key(secret.as_ref(), seal, self.epoch, server, &ct)?;
             self.slots.push(SessionKeySlot {
                 server: server.clone(),
                 kid,
@@ -877,7 +877,7 @@ impl SessionKey {
     ///
     /// [`Error::Missing`] when no slot is for any of them, or a crypto
     /// error.
-    pub fn open(&self, vault: &VaultId, escrow: &[ExchangeKeyPair]) -> Result<ExchangeKeyPair> {
+    pub fn open(&self, seal: &SealId, escrow: &[ExchangeKeyPair]) -> Result<ExchangeKeyPair> {
         for slot in &self.slots {
             let Some(own) = escrow
                 .iter()
@@ -887,7 +887,7 @@ impl SessionKey {
             };
             let ct = b64::decode(&slot.ct)?;
             let secret = own.decapsulate(&ct)?;
-            let k = session_slot_key(secret.as_ref(), vault, self.epoch, &slot.server, &ct)?;
+            let k = session_slot_key(secret.as_ref(), seal, self.epoch, &slot.server, &ct)?;
             let jwk = primitives::open(k.as_ref(), &b64::decode(&slot.wrapped)?)
                 .map_err(|_| Error::Malformed("session key slot"))?;
             return Ok(ExchangeKeyPair::from_jwk(jwk.as_ref())?);
@@ -917,18 +917,18 @@ pub struct ReleasedKeys {
     sealed: Box<[u8]>,
 }
 
-fn released_key(secret: &[u8], vault: &VaultId, ct: &[u8]) -> Result<SecretBuf> {
+fn released_key(secret: &[u8], seal: &SealId, ct: &[u8]) -> Result<SecretBuf> {
     let hash = suite(ct)?;
     Ok(DOMAIN.derive_key(
         hash,
         &[secret],
         "released keys",
-        &[vault.as_bytes(), &primitives::digest(hash, &[ct])?],
+        &[seal.as_bytes(), &primitives::digest(hash, &[ct])?],
     )?)
 }
 
 impl ReleasedKeys {
-    /// Encrypt `keys` (epoch, key) of `vault` to `device`.
+    /// Encrypt `keys` (epoch, key) of `seal` to `device`.
     ///
     /// # Errors
     ///
@@ -939,7 +939,7 @@ impl ReleasedKeys {
     /// Never for fewer than 2⁶⁴ keys.
     pub fn seal(
         device: &ExchangeKey,
-        vault: &VaultId,
+        seal: &SealId,
         keys: &[(u64, ExchangeKeyPair)],
     ) -> Result<Self> {
         let mut plain = Writer::new(EPOCH_KEYS_MAGIC);
@@ -949,7 +949,7 @@ impl ReleasedKeys {
         }
         let plain = SecretBuf::new(plain.finish());
         let (ct, secret) = device.encapsulate()?;
-        let k = released_key(secret.as_ref(), vault, &ct)?;
+        let k = released_key(secret.as_ref(), seal, &ct)?;
         Ok(Self {
             sealed: primitives::seal(k.as_ref(), plain.as_ref())?.into(),
             ciphertext: ct.into(),
@@ -964,10 +964,10 @@ impl ReleasedKeys {
     pub fn open(
         &self,
         device: &dyn DeviceKey,
-        vault: &VaultId,
+        seal: &SealId,
     ) -> Result<Vec<(u64, ExchangeKeyPair)>> {
         let secret = device.decapsulate(&self.ciphertext)?;
-        let k = released_key(secret.as_ref(), vault, &self.ciphertext)?;
+        let k = released_key(secret.as_ref(), seal, &self.ciphertext)?;
         let plain = primitives::open(k.as_ref(), &self.sealed).map_err(|_| Error::BadResponse)?;
         let mut r = Reader::new(plain.as_ref(), EPOCH_KEYS_MAGIC, "released keys")?;
         let n = r.u64()?;
@@ -1006,7 +1006,7 @@ impl ReleasedKeys {
 }
 
 /// A file sealed for offline sessions (§7.6.6): the server share sealed to
-/// the vault's epoch key instead of through the servers' escrow keys.
+/// the seal's epoch key instead of through the servers' escrow keys.
 ///
 /// ```text
 /// IPUS = P ‖ V ‖ epoch ‖ c_e ‖ GCM_{HKDF(Decaps(dk_e, c_e))}(A) ‖ [(id_j, c_j, U_j)] ‖ GCM_DEK(file)
@@ -1014,7 +1014,7 @@ impl ReleasedKeys {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionSealedFile {
     principal: Principal,
-    vault: VaultId,
+    seal: SealId,
     epoch: u64,
     ciphertext_e: Box<[u8]>,
     wrapped_a: Box<[u8]>,
@@ -1025,7 +1025,7 @@ pub struct SessionSealedFile {
 impl fmt::Debug for SessionSealedFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionSealedFile")
-            .field("vault", &self.vault)
+            .field("seal", &self.seal)
             .field("epoch", &self.epoch)
             .finish_non_exhaustive()
     }
@@ -1046,45 +1046,45 @@ fn epoch_share_key(secret: &[u8], committed: &[u8], epoch: u64, ct: &[u8]) -> Re
 }
 
 impl SessionSealedFile {
-    /// Seal `contents` to the vault's current epoch key and its devices.
+    /// Seal `contents` to the seal's current epoch key and its devices.
     ///
     /// # Errors
     ///
-    /// [`Error::Policy`] for a revoked vault or one without offline
+    /// [`Error::Policy`] for a revoked seal or one without offline
     /// sessions, [`Error::Missing`] without devices, or a crypto error.
     pub fn seal(descriptor: &VerifiedDescriptor, contents: &[u8]) -> Result<Self> {
-        let vault = descriptor.vault();
-        if vault.state != State::Enabled {
-            return Err(Error::Policy("the vault is revoked".into()));
+        let seal = descriptor.seal();
+        if seal.state != State::Enabled {
+            return Err(Error::Policy("the seal is revoked".into()));
         }
-        let current = vault
+        let current = seal
             .session_keys
             .last()
-            .filter(|_| vault.policy.sessions.offline.is_some())
-            .ok_or_else(|| Error::Policy("the vault has no offline sessions".into()))?;
+            .filter(|_| seal.policy.sessions.offline.is_some())
+            .ok_or_else(|| Error::Policy("the seal has no offline sessions".into()))?;
         let principal = descriptor.owner().clone();
-        let committed = commitment_data(&principal, &vault.id);
+        let committed = commitment_data(&principal, &seal.id);
         let mut a = SecretBuf::with_len(32);
         Rand::fill_private(a.as_mut_slice())?;
         let (ct_e, secret_e) = current.public()?.encapsulate()?;
         let k_e = epoch_share_key(secret_e.as_ref(), &committed, current.epoch, &ct_e)?;
-        let (devices, b) = device_slots(vault, &committed)?;
+        let (devices, b) = device_slots(seal, &committed)?;
         let dek = data_key(suite(&ct_e)?, a.as_ref(), b.as_ref(), &committed)?;
         Ok(Self {
             wrapped_a: primitives::seal(k_e.as_ref(), a.as_ref())?.into(),
             ciphertext_e: ct_e.into(),
             principal,
-            vault: vault.id,
+            seal: seal.id,
             epoch: current.epoch,
             devices,
             ciphertext: primitives::seal(dek.as_ref(), contents)?.into(),
         })
     }
 
-    /// The vault.
+    /// The seal.
     #[must_use]
-    pub fn vault(&self) -> &VaultId {
-        &self.vault
+    pub fn seal_id(&self) -> &SealId {
+        &self.seal
     }
 
     /// The epoch whose key opens the server share.
@@ -1099,7 +1099,7 @@ impl SessionSealedFile {
     ///
     /// [`Error::BadResponse`] for the wrong keys, or a crypto error.
     pub fn open(&self, epoch_key: &ExchangeKeyPair, device: &dyn DeviceKey) -> Result<SecretBuf> {
-        let committed = commitment_data(&self.principal, &self.vault);
+        let committed = commitment_data(&self.principal, &self.seal);
         let secret_e = epoch_key.decapsulate(&self.ciphertext_e)?;
         let k_e = epoch_share_key(
             secret_e.as_ref(),
@@ -1128,7 +1128,7 @@ impl SessionSealedFile {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(SESSION_FILE_MAGIC);
         w.str(&self.principal.to_string())
-            .fixed(self.vault.as_bytes())
+            .fixed(self.seal.as_bytes())
             .u64(self.epoch)
             .bytes(&self.ciphertext_e)
             .bytes(&self.wrapped_a)
@@ -1149,7 +1149,7 @@ impl SessionSealedFile {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, SESSION_FILE_MAGIC, "session-sealed file")?;
         let principal = r.str()?.parse()?;
-        let vault = VaultId::from_bytes(r.fixed()?);
+        let seal = SealId::from_bytes(r.fixed()?);
         let epoch = r.u64()?;
         let ciphertext_e = r.bytes()?.into();
         let wrapped_a = r.bytes()?.into();
@@ -1166,7 +1166,7 @@ impl SessionSealedFile {
         r.finish()?;
         Ok(Self {
             principal,
-            vault,
+            seal,
             epoch,
             ciphertext_e,
             wrapped_a,
@@ -1178,21 +1178,21 @@ impl SessionSealedFile {
 
 /// The device share `B` and a slot per registered device, or nothing
 /// without the device factor.
-fn device_slots(vault: &Vault, committed: &[u8]) -> Result<(Vec<DeviceSlot>, SecretBuf)> {
-    if vault.policy.factors.device.is_none() {
+fn device_slots(seal: &Seal, committed: &[u8]) -> Result<(Vec<DeviceSlot>, SecretBuf)> {
+    if seal.policy.factors.device.is_none() {
         return Ok((Vec::new(), SecretBuf::with_len(0)));
     }
-    if vault.devices.is_empty() {
+    if seal.devices.is_empty() {
         return Err(Error::Missing("registered devices"));
     }
-    if vault.devices.len() > 255 {
+    if seal.devices.len() > 255 {
         return Err(Error::Malformed("too many devices to seal"));
     }
 
     let mut b = SecretBuf::with_len(32);
     Rand::fill_private(b.as_mut_slice())?;
     let mut devices = Vec::new();
-    for d in &vault.devices {
+    for d in &seal.devices {
         let public = d.public()?;
         let (ct, secret) = public.encapsulate()?;
         let key = device_key(secret.as_ref(), committed, public.kid(), &ct)?;
@@ -1226,8 +1226,8 @@ fn open_device_share(
     primitives::open(key.as_ref(), &slot.wrapped).map_err(|_| Error::BadResponse)
 }
 
-impl Vault {
-    /// What `principal`, a member of `groups`, may do with this vault, if
+impl Seal {
+    /// What `principal`, a member of `groups`, may do with this seal, if
     /// anything.
     #[must_use]
     pub fn role(&self, principal: &Principal, groups: &[String]) -> Option<Role> {
@@ -1244,7 +1244,7 @@ impl Vault {
         }
     }
 
-    /// Whether `principal`, a member of `groups`, may open the vault's
+    /// Whether `principal`, a member of `groups`, may open the seal's
     /// files: any role but depositor.
     #[must_use]
     pub fn opens(&self, principal: &Principal, groups: &[String]) -> bool {
@@ -1290,14 +1290,14 @@ impl Vault {
 #[derive(Serialize, Deserialize)]
 struct DescriptorBody {
     realm: String,
-    vault: Vault,
+    seal: Seal,
     iat: u64,
     /// The realm's `descriptor_age` limit: how long a client may seal with
     /// this descriptor.
     max_age: u64,
 }
 
-/// A vault as a server describes it, signed under its delegation, so a
+/// A seal as a server describes it, signed under its delegation, so a
 /// client can seal offline with it and re-check it later (§7.6.3).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Descriptor {
@@ -1314,7 +1314,7 @@ impl fmt::Debug for Descriptor {
 }
 
 impl Descriptor {
-    /// Sign `vault` of `realm` as of `iat`.
+    /// Sign `seal` of `realm` as of `iat`.
     ///
     /// # Errors
     ///
@@ -1323,17 +1323,17 @@ impl Descriptor {
         signing: &SigningKey,
         delegation: &Delegation,
         realm: &str,
-        vault: &Vault,
+        seal: &Seal,
         iat: u64,
         max_age: u64,
     ) -> Result<Self> {
         let body = serde_json::to_vec(&DescriptorBody {
             realm: realm.to_owned(),
-            vault: vault.clone(),
+            seal: seal.clone(),
             iat,
             max_age,
         })
-        .map_err(|_| Error::Malformed("vault descriptor"))?;
+        .map_err(|_| Error::Malformed("seal descriptor"))?;
         let mut d = Self {
             body: body.into(),
             delegation: delegation.to_json().into_bytes().into(),
@@ -1368,7 +1368,7 @@ impl Descriptor {
         policy: &CryptoPolicy,
     ) -> Result<VerifiedDescriptor> {
         let body: DescriptorBody =
-            serde_json::from_slice(&self.body).map_err(|_| Error::Malformed("vault descriptor"))?;
+            serde_json::from_slice(&self.body).map_err(|_| Error::Malformed("seal descriptor"))?;
         let delegation =
             Delegation::from_json(&self.delegation)?.verify_at(anchors, policy, body.iat)?;
         if delegation.realm != realm || body.realm != realm {
@@ -1379,12 +1379,12 @@ impl Descriptor {
             return Err(Error::Mismatch("descriptor signer"));
         }
         key.verify_with_context(&self.signed_part(), DESCRIPTOR_CONTEXT, &self.signature)?;
-        let owner: Principal = body.vault.owner.parse()?;
+        let owner: Principal = body.seal.owner.parse()?;
         if owner.realm() != realm {
             return Err(Error::WrongRealm);
         }
         Ok(VerifiedDescriptor {
-            vault: body.vault,
+            seal: body.seal,
             owner,
             iat: body.iat,
             max_age: body.max_age,
@@ -1409,7 +1409,7 @@ impl Descriptor {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, DESCRIPTOR_MAGIC, "vault descriptor")?;
+        let mut r = Reader::new(bytes, DESCRIPTOR_MAGIC, "seal descriptor")?;
         let d = Self {
             body: r.bytes()?.into(),
             delegation: r.bytes()?.into(),
@@ -1424,7 +1424,7 @@ impl Descriptor {
 /// A descriptor whose signature chain verified.
 #[derive(Debug)]
 pub struct VerifiedDescriptor {
-    vault: Vault,
+    seal: Seal,
     owner: Principal,
     iat: u64,
     max_age: u64,
@@ -1432,10 +1432,10 @@ pub struct VerifiedDescriptor {
 }
 
 impl VerifiedDescriptor {
-    /// The vault.
+    /// The seal.
     #[must_use]
-    pub fn vault(&self) -> &Vault {
-        &self.vault
+    pub fn seal(&self) -> &Seal {
+        &self.seal
     }
 
     /// Its owner.
@@ -1480,14 +1480,14 @@ pub struct Approval {
     pub at: u64,
 }
 
-/// A request for the release of a file of a vault with approvals
+/// A request for the release of a file of a seal with approvals
 /// (`DESIGN-approvals.md` §2), as the directory keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseRequest {
     /// The id: 16 random bytes, hex.
     pub id: String,
-    /// The vault.
-    pub vault: VaultId,
+    /// The seal.
+    pub seal: SealId,
     /// Who asked, and alone may use it.
     pub requester: String,
     /// The binding hashes `H(ct)` (hex) of the file or files it is for.
@@ -1562,14 +1562,14 @@ pub enum DepositKind {
     File,
 }
 
-/// A file sealed to a vault that its servers keep for the members: its
+/// A file sealed to a seal that its servers keep for the members: its
 /// depositor may be gone when anyone needs it (`DESIGN-recovery.md` §3).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deposit {
     /// The id: 16 random bytes, hex.
     pub id: String,
-    /// The vault.
-    pub vault: VaultId,
+    /// The seal.
+    pub seal: SealId,
     /// Who deposited it.
     pub depositor: String,
     /// What it holds.
@@ -1588,8 +1588,8 @@ pub struct Deposit {
 /// `cn=recovery,cn=kuipa,cn=etc` (`ipaKURecovery`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoverySettings {
-    /// The helpdesk vault device keys are deposited to, `OWNER/NAME`.
-    pub device_vault: String,
+    /// The helpdesk seal device keys are deposited to, `OWNER/NAME`.
+    pub device_seal: String,
     /// Whether an extractable device is registered only once its key is
     /// deposited there.
     #[serde(default)]
@@ -1657,30 +1657,30 @@ pub struct DeviceEscrow {
     pub added: u64,
 }
 
-/// What a user asks of their vaults, sent as the operation data of a
-/// `POST /ipa/ku/vault/{kid}` exchange authenticated by their ticket.
-/// Every `name` is a vault reference: `NAME` for the caller's own vault,
+/// What a user asks of their seals, sent as the operation data of a
+/// `POST /ipa/ku/seal/{kid}` exchange authenticated by their ticket.
+/// Every `name` is a seal reference: `NAME` for the caller's own seal,
 /// `OWNER/NAME` for one shared with them ([`split_ref`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
-pub enum VaultOp {
-    /// Create a vault.
+pub enum SealOp {
+    /// Create a seal.
     Create {
         /// Its label.
         name: String,
         /// Its policy; the server fills in `not_after` and checks limits.
         policy: Policy,
     },
-    /// Replace a vault's policy.
+    /// Replace a seal's policy.
     SetPolicy {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The new policy.
         policy: Policy,
     },
     /// Register a device.
     AddDevice {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The device's label.
         label: String,
@@ -1694,27 +1694,27 @@ pub enum VaultOp {
     },
     /// Remove a device.
     RemoveDevice {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The device's id.
         id: String,
     },
-    /// Revoke a vault: nothing is answered for it any more.
+    /// Revoke a seal: nothing is answered for it any more.
     Revoke {
-        /// The vault.
+        /// The seal.
         name: String,
     },
-    /// Describe one vault.
+    /// Describe one seal.
     Show {
-        /// The vault.
+        /// The seal.
         name: String,
     },
-    /// Describe every vault of the caller, and those shared with them.
+    /// Describe every seal of the caller, and those shared with them.
     List,
     /// With `sealing = registered`: register the bindings of a newly sealed
     /// file, and retire those of files it replaces or that are given up.
     Register {
-        /// The vault.
+        /// The seal.
         name: String,
         /// Binding hashes (hex) to register.
         add: Vec<String>,
@@ -1723,7 +1723,7 @@ pub enum VaultOp {
     },
     /// Add managers or members (§7.6.12); managers only.
     Share {
-        /// The vault.
+        /// The seal.
         name: String,
         /// New managers.
         #[serde(default)]
@@ -1738,7 +1738,7 @@ pub enum VaultOp {
     /// Remove managers or members, and the devices they hold; managers
     /// only, but anyone may leave.
     Unshare {
-        /// The vault.
+        /// The seal.
         name: String,
         /// Managers to remove.
         #[serde(default)]
@@ -1751,32 +1751,32 @@ pub enum VaultOp {
         depositors: Members,
     },
     /// Ask for the release of the file whose bindings these are, from a
-    /// vault with approvals (`DESIGN-approvals.md` §2).
+    /// seal with approvals (`DESIGN-approvals.md` §2).
     Request {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The file's binding hashes (hex).
         bindings: Vec<String>,
         /// Why, for the approvers.
         reason: String,
     },
-    /// The open release requests of the vault, or of every vault whose
+    /// The open release requests of the seal, or of every seal whose
     /// approvers or members include the caller.
     Pending {
-        /// The vault, if just one.
+        /// The seal, if just one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
     /// Approve a release request.
     Approve {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The request.
         id: String,
     },
     /// Deny a release request: it ends on every server.
     Deny {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The request.
         id: String,
@@ -1784,17 +1784,17 @@ pub enum VaultOp {
     /// Keep `blob`, device `device`'s key under a recovery code, on the
     /// caller's entry, in place of any earlier one for that device.
     EscrowCode {
-        /// The device's id; the caller must hold it in one of their vaults.
+        /// The device's id; the caller must hold it in one of their seals.
         device: String,
         /// The protected key, base64url.
         blob: String,
     },
     /// The caller's device keys kept under recovery codes.
     RecoverCode,
-    /// Keep `sealed`, a file sealed to the vault, as a deposit, in place
+    /// Keep `sealed`, a file sealed to the seal, as a deposit, in place
     /// of the depositor's earlier one of the same kind and subject.
     Deposit {
-        /// The vault.
+        /// The seal.
         name: String,
         /// What it holds.
         kind: DepositKind,
@@ -1803,22 +1803,22 @@ pub enum VaultOp {
         /// The sealed file, base64url.
         sealed: String,
     },
-    /// The vault's deposits, without their files: all of them for its
+    /// The seal's deposits, without their files: all of them for its
     /// members, their own for a depositor.
     Deposits {
-        /// The vault.
+        /// The seal.
         name: String,
     },
     /// One deposit, with its file; members only.
     FetchDeposit {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The deposit.
         id: String,
     },
     /// Remove a deposit: a depositor's own, or any for a manager.
     RetireDeposit {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The deposit.
         id: String,
@@ -1826,7 +1826,7 @@ pub enum VaultOp {
     /// The realm's recovery settings.
     RecoverySettings,
     /// The public key of `user`'s device `device`, to deliver to; members
-    /// of the realm's device vault only.
+    /// of the realm's device seal only.
     DeviceKey {
         /// Whose.
         user: String,
@@ -1835,7 +1835,7 @@ pub enum VaultOp {
     },
     /// Keep `blob`, a recovered key sealed to `user`'s device `device`
     /// (`IPDD`), on `user`'s entry until they fetch it; members of the
-    /// realm's device vault only.
+    /// realm's device seal only.
     Deliver {
         /// Whose.
         user: String,
@@ -1844,17 +1844,17 @@ pub enum VaultOp {
         /// The delivery, base64url.
         blob: String,
     },
-    /// Start a session for one of the vault's devices: re-authentication,
-    /// or with `offline`, the release of the vault's session keys.
+    /// Start a session for one of the seal's devices: re-authentication,
+    /// or with `offline`, the release of the seal's session keys.
     Unlock {
-        /// The vault.
+        /// The seal.
         name: String,
         /// The device's id.
         device: String,
         /// An offline session (§7.6.6).
         #[serde(default)]
         offline: bool,
-        /// For a vault with the passkey factor: the caller's passkey
+        /// For a seal with the passkey factor: the caller's passkey
         /// assertion (an encoded [`Assertion`](crate::passkey::Assertion),
         /// base64url) over [`session_passkey_challenge`] of the exchange.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1864,8 +1864,8 @@ pub enum VaultOp {
     Passkeys,
 }
 
-/// The challenge a passkey signs to start a session (`VaultOp::Unlock`):
-/// `H("ipa-ku-enroll/v1 vault session passkey" ‖ cb)`, `cb` the channel
+/// The challenge a passkey signs to start a session (`SealOp::Unlock`):
+/// `H("ipa-ku-enroll/v1 seal session passkey" ‖ cb)`, `cb` the channel
 /// binding of the operation's exchange, so an assertion serves that
 /// exchange alone.
 ///
@@ -1874,12 +1874,12 @@ pub enum VaultOp {
 /// An OpenSSL error.
 pub fn session_passkey_challenge(cb: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(primitives::sha256(&[
-        b"ipa-ku-enroll/v1 vault session passkey",
+        b"ipa-ku-enroll/v1 seal session passkey",
         cb,
     ])?)
 }
 
-impl VaultOp {
+impl SealOp {
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1892,19 +1892,19 @@ impl VaultOp {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(|_| Error::Malformed("vault operation"))
+        serde_json::from_slice(bytes).map_err(|_| Error::Malformed("seal operation"))
     }
 }
 
-/// What a vault operation answers with: descriptors, and for
-/// [`VaultOp::Unlock`] a session token and, offline, the session keys.
+/// What a seal operation answers with: descriptors, and for
+/// [`SealOp::Unlock`] a session token and, offline, the session keys.
 #[derive(Clone, Debug, Default)]
 pub struct Reply {
-    /// The vaults the operation concerned.
+    /// The seals the operation concerned.
     pub descriptors: Vec<Descriptor>,
     /// A new session.
     pub session: Option<SessionToken>,
-    /// The vault's session keys, released to the device.
+    /// The seal's session keys, released to the device.
     pub released: Option<ReleasedKeys>,
     /// Receipts for the events the operation logged (`DESIGN-tlog.md`).
     pub receipts: Vec<Receipt>,
@@ -1986,7 +1986,7 @@ impl Reply {
         } else {
             REPLY_VERSION
         };
-        let mut r = Reader::with_version(bytes, REPLY_MAGIC, version, "vault reply")?;
+        let mut r = Reader::with_version(bytes, REPLY_MAGIC, version, "seal reply")?;
         let n = r.u64()?;
         let mut descriptors = Vec::new();
         for _ in 0..n {
@@ -2034,14 +2034,14 @@ impl Reply {
     }
 }
 
-/// A re-authentication session (§7.6.6): for `device` of a vault and its
-/// `holder` (the owner, or the member of a shared vault who registered it),
+/// A re-authentication session (§7.6.6): for `device` of a seal and its
+/// `holder` (the owner, or the member of a shared seal who registered it),
 /// until `not_after`, signed by a server under its delegation so any
 /// server can check it.  It stands in for the ticket and passkey factors;
 /// the answer is still encrypted to the device.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionToken {
-    vault: VaultId,
+    seal: SealId,
     holder: String,
     device: Thumbprint,
     not_after: u64,
@@ -2050,11 +2050,11 @@ pub struct SessionToken {
     signature: Box<[u8]>,
 }
 
-/// The vault, holder and device a session must be for.
+/// The seal, holder and device a session must be for.
 #[derive(Clone, Copy)]
 pub struct SessionFor<'a> {
-    /// The vault the session opens.
-    pub vault: &'a VaultId,
+    /// The seal the session opens.
+    pub seal: &'a SealId,
     /// The holder whose device presents the session.
     pub holder: &'a str,
     /// That device.
@@ -2064,7 +2064,7 @@ pub struct SessionFor<'a> {
 impl fmt::Debug for SessionToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionToken")
-            .field("vault", &self.vault)
+            .field("seal", &self.seal)
             .field("not_after", &self.not_after)
             .finish_non_exhaustive()
     }
@@ -2079,13 +2079,13 @@ impl SessionToken {
     pub fn sign(
         signing: &SigningKey,
         delegation: &Delegation,
-        vault: VaultId,
+        seal: SealId,
         holder: &str,
         device: Thumbprint,
         not_after: u64,
     ) -> Result<Self> {
         let mut t = Self {
-            vault,
+            seal,
             holder: holder.to_owned(),
             device,
             not_after,
@@ -2101,7 +2101,7 @@ impl SessionToken {
 
     fn signed_part(&self) -> Vec<u8> {
         Writer::new(SESSION_MAGIC)
-            .fixed(self.vault.as_bytes())
+            .fixed(self.seal.as_bytes())
             .str(&self.holder)
             .fixed(self.device.as_bytes())
             .u64(self.not_after)
@@ -2125,7 +2125,7 @@ impl SessionToken {
         expected: SessionFor<'_>,
         now: u64,
     ) -> Result<()> {
-        if &self.vault != expected.vault
+        if &self.seal != expected.seal
             || self.holder != expected.holder
             || &self.device != expected.device
         {
@@ -2147,10 +2147,10 @@ impl SessionToken {
         Ok(())
     }
 
-    /// The vault.
+    /// The seal.
     #[must_use]
-    pub fn vault(&self) -> &VaultId {
-        &self.vault
+    pub fn seal_id(&self) -> &SealId {
+        &self.seal
     }
 
     /// When the session ends.
@@ -2173,13 +2173,13 @@ impl SessionToken {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut outer = Reader::new(bytes, SESSION_MAGIC, "vault session")?;
+        let mut outer = Reader::new(bytes, SESSION_MAGIC, "seal session")?;
         let signed = outer.bytes()?;
         let signature = outer.bytes()?.into();
         outer.finish()?;
-        let mut r = Reader::new(signed, SESSION_MAGIC, "vault session")?;
+        let mut r = Reader::new(signed, SESSION_MAGIC, "seal session")?;
         let t = Self {
-            vault: VaultId::from_bytes(r.fixed()?),
+            seal: SealId::from_bytes(r.fixed()?),
             holder: r.str()?.to_owned(),
             device: Thumbprint::from_bytes(r.fixed()?),
             not_after: r.u64()?,
@@ -2218,7 +2218,7 @@ impl DeviceKey for ExchangeKeyPair {
 /// The server's share, encrypted to a registered device: `IPVA(ct, sealed)`
 /// with `k = HKDF(Decaps(ct), "answer", H(request))`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VaultAnswer {
+pub struct SealAnswer {
     ciphertext: Box<[u8]>,
     sealed: Box<[u8]>,
 }
@@ -2233,7 +2233,7 @@ fn answer_key(secret: &[u8], ct: &[u8], request: &EscrowRequest) -> Result<Secre
     )?)
 }
 
-impl VaultAnswer {
+impl SealAnswer {
     /// Encrypt `response` to `device` for `request`.
     ///
     /// # Errors
@@ -2283,7 +2283,7 @@ impl VaultAnswer {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, ANSWER_MAGIC, "vault answer")?;
+        let mut r = Reader::new(bytes, ANSWER_MAGIC, "seal answer")?;
         let a = Self {
             ciphertext: r.bytes()?.into(),
             sealed: r.bytes()?.into(),
@@ -2296,15 +2296,15 @@ impl VaultAnswer {
 /// What the server answers a recovery request with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recovered {
-    /// Under the tang-pqc transport key only (machine vaults, and vaults
+    /// Under the tang-pqc transport key only (machine seals, and seals
     /// answered without a device).
     Plain(RecoveryResponse),
     /// Encrypted to the device the request named.
-    Device(VaultAnswer),
+    Device(SealAnswer),
 }
 
 impl Recovered {
-    /// The plain response, for a machine vault.
+    /// The plain response, for a machine seal.
     #[must_use]
     pub fn into_plain(self) -> Option<RecoveryResponse> {
         match self {
@@ -2339,21 +2339,21 @@ struct DeviceSlot {
     wrapped: Box<[u8]>,
 }
 
-/// A file sealed to a user vault.
+/// A file sealed to a user seal.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SealedVaultFile {
+pub struct SealedFile {
     principal: Principal,
-    vault: VaultId,
+    seal: SealId,
     servers: Vec<ServerSlot>,
     devices: Vec<DeviceSlot>,
     ciphertext: Box<[u8]>,
 }
 
-impl fmt::Debug for SealedVaultFile {
+impl fmt::Debug for SealedFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SealedVaultFile")
+        f.debug_struct("SealedFile")
             .field("principal", &self.principal)
-            .field("vault", &self.vault)
+            .field("seal", &self.seal)
             .field("servers", &self.servers())
             .finish_non_exhaustive()
     }
@@ -2389,22 +2389,22 @@ pub struct Unlock<'a> {
     /// A re-authentication session, in place of the ticket.
     pub session: Option<&'a SessionToken>,
     /// A GSS-API token for `ipa-ku@<server>` bound to the request's
-    /// [`EscrowRequest::ticket_binding`], when the vault needs a ticket.
+    /// [`EscrowRequest::ticket_binding`], when the seal needs a ticket.
     pub ticket: Option<TicketSource<'a>>,
-    /// The approved release request, for a vault with approvals.
+    /// The approved release request, for a seal with approvals.
     pub release: Option<[u8; 16]>,
     /// A passkey assertion over the request's
-    /// [`EscrowRequest::passkey_challenge`], when the vault needs one.
+    /// [`EscrowRequest::passkey_challenge`], when the seal needs one.
     pub passkey: Option<PasskeySource<'a>>,
 }
 
-impl SealedVaultFile {
-    /// Seal `contents` to the vault `descriptor` describes, through the
+impl SealedFile {
+    /// Seal `contents` to the seal `descriptor` describes, through the
     /// escrow keys of `servers`.  Works offline.
     ///
     /// # Errors
     ///
-    /// [`Error::Policy`] for a revoked vault, [`Error::Missing`] without
+    /// [`Error::Policy`] for a revoked seal, [`Error::Missing`] without
     /// servers or, when the policy needs a device, without registered
     /// devices; [`Error::WrongRealm`], [`Error::Malformed`] for more than
     /// 255 servers, or a crypto error.
@@ -2413,9 +2413,9 @@ impl SealedVaultFile {
         servers: &[&VerifiedRealm],
         contents: &[u8],
     ) -> Result<Self> {
-        let vault = descriptor.vault();
-        if vault.state != State::Enabled {
-            return Err(Error::Policy("the vault is revoked".into()));
+        let seal = descriptor.seal();
+        if seal.state != State::Enabled {
+            return Err(Error::Policy("the seal is revoked".into()));
         }
         if servers.is_empty() {
             return Err(Error::Missing("escrow servers"));
@@ -2425,7 +2425,7 @@ impl SealedVaultFile {
         }
 
         let principal = descriptor.owner().clone();
-        let committed = commitment_data(&principal, &vault.id);
+        let committed = commitment_data(&principal, &seal.id);
         let ctx = BindingContext::new(escrow::DOMAIN, &committed);
         let mut a = SecretBuf::with_len(32);
         Rand::fill_private(a.as_mut_slice())?;
@@ -2448,12 +2448,12 @@ impl SealedVaultFile {
                 commitment,
             });
         }
-        let (devices, b) = device_slots(vault, &committed)?;
+        let (devices, b) = device_slots(seal, &committed)?;
         let hash = strongest(slots.iter().map(|s| s.escrow_key.alg()));
         let dek = data_key(hash, a.as_ref(), b.as_ref(), &committed)?;
         Ok(Self {
             principal,
-            vault: vault.id,
+            seal: seal.id,
             servers: slots,
             devices,
             ciphertext: primitives::seal(dek.as_ref(), contents)?.into(),
@@ -2466,10 +2466,10 @@ impl SealedVaultFile {
         &self.principal
     }
 
-    /// The vault.
+    /// The seal.
     #[must_use]
-    pub fn vault(&self) -> &VaultId {
-        &self.vault
+    pub fn seal_id(&self) -> &SealId {
+        &self.seal
     }
 
     /// `H(ct)` of each server slot's binding: what registered sealing
@@ -2510,7 +2510,7 @@ impl SealedVaultFile {
         mut unlock: Unlock<'_>,
         mut recover: impl FnMut(&str, &EscrowRequest) -> Option<Vec<u8>>,
     ) -> Result<SecretBuf> {
-        let committed = commitment_data(&self.principal, &self.vault);
+        let committed = commitment_data(&self.principal, &self.seal);
         let b = match unlock.device {
             Some(device) => open_device_share(&self.devices, device, &committed)?,
             None if self.devices.is_empty() => SecretBuf::with_len(0),
@@ -2522,9 +2522,9 @@ impl SealedVaultFile {
         };
         for slot in &self.servers {
             let (recovery, pending) = slot.binding.recovery_request(&slot.escrow_key)?;
-            let mut request = EscrowRequest::for_vault(
+            let mut request = EscrowRequest::for_seal(
                 self.principal.clone(),
-                self.vault,
+                self.seal,
                 slot.commitment,
                 recovery,
                 unlock.device.map(DeviceKey::id),
@@ -2552,7 +2552,7 @@ impl SealedVaultFile {
             };
             let response = match unlock.device {
                 Some(device) => {
-                    VaultAnswer::from_bytes(&answer).and_then(|a| a.open(device, &request))
+                    SealAnswer::from_bytes(&answer).and_then(|a| a.open(device, &request))
                 }
                 None => RecoveryResponse::from_bytes(&answer).map_err(Error::from),
             };
@@ -2580,7 +2580,7 @@ impl SealedVaultFile {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(FILE_MAGIC);
         w.str(&self.principal.to_string())
-            .fixed(self.vault.as_bytes())
+            .fixed(self.seal.as_bytes())
             .u8(u8::try_from(self.servers.len()).expect("at most 255 servers"));
         for s in &self.servers {
             w.str(&s.server)
@@ -2604,10 +2604,10 @@ impl SealedVaultFile {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, FILE_MAGIC, "sealed vault file")?;
+        let mut r = Reader::new(bytes, FILE_MAGIC, "sealed file")?;
         let principal: Principal = r.str()?.parse()?;
-        let vault = VaultId::from_bytes(r.fixed()?);
-        let ctx = BindingContext::new(escrow::DOMAIN, &commitment_data(&principal, &vault));
+        let seal = SealId::from_bytes(r.fixed()?);
+        let ctx = BindingContext::new(escrow::DOMAIN, &commitment_data(&principal, &seal));
         let servers = (0..r.u8()?)
             .map(|_| {
                 let server = r.str()?.to_owned();
@@ -2641,7 +2641,7 @@ impl SealedVaultFile {
         r.finish()?;
         Ok(Self {
             principal,
-            vault,
+            seal,
             servers,
             devices,
             ciphertext,
@@ -2733,15 +2733,15 @@ mod tests {
     #[test]
     fn the_owners_group_with_the_lowest_priority_sets_the_limits() {
         let limits: Limits = serde_json::from_value(serde_json::json!({
-            "max_lifetime": 86_400, "max_unlocks": 10, "max_vaults": 2,
+            "max_lifetime": 86_400, "max_unlocks": 10, "max_seals": 2,
             "max_devices": 8, "max_reauth": 3600, "without_device": true,
             "descriptor_age": 86_400,
             "groups": [
-                { "group": "ops", "priority": 20, "max_vaults": 50,
+                { "group": "ops", "priority": 20, "max_seals": 50,
                   "max_unlocks": null, "offline_sessions": true },
-                { "group": "contractors", "priority": 10, "max_vaults": 1,
+                { "group": "contractors", "priority": 10, "max_seals": 1,
                   "factors": [{ "device": "hardware-bound" }] },
-                { "group": "auditors", "priority": 10, "max_vaults": 3 },
+                { "group": "auditors", "priority": 10, "max_seals": 3 },
             ],
         }))
         .unwrap();
@@ -2750,19 +2750,19 @@ mod tests {
         };
         // No group: the realm's, and the result names no groups.
         let plain = of(&["staff"]);
-        assert_eq!((plain.max_vaults, plain.max_unlocks), (2, Some(10)));
+        assert_eq!((plain.max_seals, plain.max_unlocks), (2, Some(10)));
         assert_eq!(plain.groups, Vec::new());
         // One group: its fields, the realm's for the rest; null lifts a cap.
         let ops = of(&["ops"]);
-        assert_eq!((ops.max_vaults, ops.max_unlocks), (50, None));
+        assert_eq!((ops.max_seals, ops.max_unlocks), (50, None));
         assert!(ops.offline_sessions);
         assert_eq!(ops.max_lifetime, 86_400);
         // Several: the lowest priority wins whole, ties by name.
         let both = of(&["ops", "contractors"]);
-        assert_eq!(both.max_vaults, 1);
+        assert_eq!(both.max_seals, 1);
         assert!(!both.offline_sessions, "nothing merged from ops");
         assert_eq!(both.factors, [factors(Some(Level::HardwareBound), false)]);
-        assert_eq!(of(&["contractors", "auditors"]).max_vaults, 3);
+        assert_eq!(of(&["contractors", "auditors"]).max_seals, 3);
         // What a realm stores reads back the same.
         let again: Limits = serde_json::from_slice(&serde_json::to_vec(&limits).unwrap()).unwrap();
         assert_eq!(again, limits);
@@ -2777,9 +2777,9 @@ mod tests {
             .collect()
     }
 
-    fn vault_with(devices: Vec<Device>) -> Vault {
-        Vault {
-            id: VaultId::machine(
+    fn seal_with(devices: Vec<Device>) -> Seal {
+        Seal {
+            id: SealId::machine(
                 &"alice@EXAMPLE.TEST".parse().unwrap(),
                 escrow::Kind::File,
                 KemAlg::MlKem768,
@@ -2803,8 +2803,8 @@ mod tests {
     fn sealing_stops_at_the_slot_count_and_errors_beyond_it() {
         // The `u8` slot count: 255 devices seal, 256 error instead of
         // panicking at encode time.
-        assert!(device_slots(&vault_with(devices(255)), b"committed").is_ok());
-        let err = device_slots(&vault_with(devices(256)), b"committed");
+        assert!(device_slots(&seal_with(devices(255)), b"committed").is_ok());
+        let err = device_slots(&seal_with(devices(256)), b"committed");
         assert!(matches!(err, Err(Error::Malformed(_))));
     }
 

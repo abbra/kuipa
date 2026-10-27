@@ -703,8 +703,8 @@ fn kind_counts(leaves: &[kuipa_enroll::tlog::Leaf]) -> BTreeMap<String, u64> {
     for l in leaves {
         let name = match l.kind {
             Kind::CLAIM => "claim".into(),
-            Kind::VAULT_DEVICE => "vault-device".into(),
-            Kind::VAULT_POLICY => "vault-policy".into(),
+            Kind::SEAL_DEVICE => "seal-device".into(),
+            Kind::SEAL_POLICY => "seal-policy".into(),
             Kind::ESCROW_RELEASE => "escrow-release".into(),
             Kind::STATEMENT => "statement".into(),
             Kind::KEYS_FETCH => "keys-fetch".into(),

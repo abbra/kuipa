@@ -48,9 +48,9 @@ pub enum Operation {
     /// `POST /ipa/ku/register/{kid}`: escrow bindings outside a rekey
     /// (§7.5).
     Register,
-    /// `POST /ipa/ku/vault/{kid}`: an owner's operation on their vaults
+    /// `POST /ipa/ku/seal/{kid}`: an owner's operation on their seals
     /// (§7.6).
-    Vault,
+    Seal,
     /// `POST /ipa/ku/keys/{kid}`: a Kerberos-authenticated fetch of a
     /// named secret (§18.2).
     Keys,
@@ -72,7 +72,7 @@ impl Operation {
             Self::Rekey => "rekey",
             Self::Stage => "stage",
             Self::Register => "register",
-            Self::Vault => "vault",
+            Self::Seal => "seal",
             Self::Keys => "keys",
             Self::Tlog => "tlog",
             Self::Sign => "sign",
@@ -91,7 +91,7 @@ impl Operation {
             Self::Join
             | Self::Rekey
             | Self::Register
-            | Self::Vault
+            | Self::Seal
             | Self::Keys
             | Self::Tlog
             | Self::Sign
@@ -684,22 +684,22 @@ impl PendingJoin {
         params.check_acknowledgement(self.open(response)?.as_ref())
     }
 
-    /// Finish a vault operation (§7.6): decrypt the descriptors the server
-    /// answered with.  Each still needs [`Descriptor::verify`](crate::vault::Descriptor::verify).
+    /// Finish a seal operation (§7.6): decrypt the descriptors the server
+    /// answered with.  Each still needs [`Descriptor::verify`](crate::seal::Descriptor::verify).
     ///
     /// # Errors
     ///
     /// [`Error::BadResponse`], [`Error::Malformed`], or [`Error::Mismatch`]
     /// for another server.
-    pub fn finish_vault(
+    pub fn finish_seal(
         self,
         response: &Response,
         realm: &VerifiedRealm,
-    ) -> Result<crate::vault::Reply> {
+    ) -> Result<crate::seal::Reply> {
         if realm.signer() != &self.signer {
             return Err(Error::Mismatch("server"));
         }
-        crate::vault::Reply::from_bytes(self.open(response)?.as_ref())
+        crate::seal::Reply::from_bytes(self.open(response)?.as_ref())
     }
 
     /// Finish a `keys` fetch (§18.2): decrypt the answer's value.

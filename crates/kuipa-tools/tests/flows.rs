@@ -3992,12 +3992,12 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     // Nothing logged yet: no head to serve.
     assert_eq!(get("head").status(), 404);
     for i in 0..2u8 {
-        log_event(&ledger, Kind::VAULT_DEVICE, b"vault", &[i]);
+        log_event(&ledger, Kind::SEAL_DEVICE, b"seal", &[i]);
     }
     let old = SignedHead::from_bytes(&get("head").bytes().unwrap()).unwrap();
     old.verify(&signer, &tang_pqc::Policy::default()).unwrap();
     for i in 0..3u8 {
-        log_event(&ledger, Kind::ESCROW_RELEASE, b"vault", &[i]);
+        log_event(&ledger, Kind::ESCROW_RELEASE, b"seal", &[i]);
     }
     let new = SignedHead::from_bytes(&get("head").bytes().unwrap()).unwrap();
     assert_eq!((old.head.size, new.head.size), (2, 5));
@@ -4093,13 +4093,13 @@ fn audit_replays_a_servers_transparency_log() {
     let ledger = tlog_server(&anchor, fqdn, &base.join("one"), &[]);
     assert_eq!(audit()["state"], "empty");
     for i in 0..3u8 {
-        log_event(&ledger, Kind::VAULT_DEVICE, b"v", &[i]);
+        log_event(&ledger, Kind::SEAL_DEVICE, b"v", &[i]);
     }
     log_event(&ledger, Kind::KEYS_FETCH, b"host", b"x");
     let first = audit();
     assert_eq!(first["state"], "verified", "{first}");
     assert_eq!(first["size"], 4, "{first}");
-    assert_eq!(first["kinds"]["vault-device"], 3, "{first}");
+    assert_eq!(first["kinds"]["seal-device"], 3, "{first}");
     assert_eq!(first["kinds"]["keys-fetch"], 1, "{first}");
 
     // The log grew: still verified, and it extends what was recorded.
@@ -4116,7 +4116,7 @@ fn audit_replays_a_servers_transparency_log() {
     // rewritten — is forked against the recorded head.
     let rewritten = tlog_server(&anchor, fqdn, &base.join("two"), &[]);
     for i in 0..6u8 {
-        log_event(&rewritten, Kind::VAULT_POLICY, b"v", &[i]);
+        log_event(&rewritten, Kind::SEAL_POLICY, b"v", &[i]);
     }
     let forked = audit();
     assert!(
@@ -4163,7 +4163,7 @@ fn a_witness_cosigns_only_heads_that_extend() {
     let ledger = tlog_server(&anchor, fqdn, &base.join("one"), &[&witness]);
     assert_eq!(pass(&witness, &state), "empty");
     for i in 0..3u8 {
-        log_event(&ledger, Kind::VAULT_DEVICE, b"v", &[i]);
+        log_event(&ledger, Kind::SEAL_DEVICE, b"v", &[i]);
     }
     assert_eq!(pass(&witness, &state), "cosigned");
     assert_eq!(cosigners(), 1);
@@ -4181,7 +4181,7 @@ fn a_witness_cosigns_only_heads_that_extend() {
     // refusing.
     let rewritten = tlog_server(&anchor, fqdn, &base.join("two"), &[&witness]);
     for i in 0..6u8 {
-        log_event(&rewritten, Kind::VAULT_POLICY, b"v", &[i]);
+        log_event(&rewritten, Kind::SEAL_POLICY, b"v", &[i]);
     }
     assert_eq!(pass(&witness, &state), "forked");
     assert_eq!(pass(&witness, &state), "forked");

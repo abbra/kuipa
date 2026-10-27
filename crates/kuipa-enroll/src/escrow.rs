@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! DEK ←$ 32 bytes                         (fresh on every seal)
-//! V = machine vault of (principal, kind)  (§7.6.8)
+//! V = machine seal of (principal, kind)  (§7.6.8)
 //! for each server i:  (B_i, K_i, t_i) = tang-pqc provision to its escrow key,
 //!                     domain "ipa-ku-enroll/v1 escrow", info = principal,
 //!                     committed to (principal, V)
@@ -13,9 +13,9 @@
 //! ```
 //!
 //! Any one server can unseal.  A recovery request names the principal and
-//! the vault and carries the slot's commitment `t_i`, which the server
+//! the seal and carries the slot's commitment `t_i`, which the server
 //! checks after opening the request, so a binding cannot be presented under
-//! another principal or vault than it was made for.  For a machine vault
+//! another principal or seal than it was made for.  For a machine seal
 //! the server then answers only for bindings registered in that kind's set
 //! on the enabled directory entry of the principal (`H(ct_i)`, see
 //! [`Binding::ciphertext_hash`]).  Each slot keeps the server's public escrow key, so
@@ -86,12 +86,12 @@ impl Kind {
     }
 }
 
-/// A vault: a user vault's random id, or the id a machine vault derives
+/// A seal: a user seal's random id, or the id a machine seal derives
 /// from its principal and kind (§7.6.8).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VaultId([u8; 16]);
+pub struct SealId([u8; 16]);
 
-impl VaultId {
+impl SealId {
     /// From its bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
@@ -104,8 +104,8 @@ impl VaultId {
         &self.0
     }
 
-    /// The machine vault of `principal`'s `kind` set, as escrowed to an
-    /// `alg` key: `H("ipa-ku-enroll/v1 machine vault" ‖ kind ‖ principal)`,
+    /// The machine seal of `principal`'s `kind` set, as escrowed to an
+    /// `alg` key: `H("ipa-ku-enroll/v1 machine seal" ‖ kind ‖ principal)`,
     /// truncated, `H` the KEM's suite hash (SHA-256 for ML-KEM-768,
     /// SHA-384 for ML-KEM-1024).
     ///
@@ -116,7 +116,7 @@ impl VaultId {
         let digest = primitives::digest(
             alg.hash(),
             &[
-                b"ipa-ku-enroll/v1 machine vault",
+                b"ipa-ku-enroll/v1 machine seal",
                 &[kind.id()],
                 principal.to_string().as_bytes(),
             ],
@@ -126,7 +126,7 @@ impl VaultId {
         Ok(Self(id))
     }
 
-    /// Which machine vault of `principal` this is, if it is one, for a
+    /// Which machine seal of `principal` this is, if it is one, for a
     /// request to an `alg` key.
     ///
     /// # Errors
@@ -146,53 +146,53 @@ impl VaultId {
     }
 }
 
-impl std::fmt::Display for VaultId {
+impl std::fmt::Display for SealId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
     }
 }
 
-impl std::str::FromStr for VaultId {
+impl std::str::FromStr for SealId {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
         if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::Malformed("vault id"));
+            return Err(Error::Malformed("seal id"));
         }
         let mut id = [0u8; 16];
         for (i, byte) in id.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
-                .map_err(|_| Error::Malformed("vault id"))?;
+                .map_err(|_| Error::Malformed("seal id"))?;
         }
         Ok(Self(id))
     }
 }
 
-impl serde::Serialize for VaultId {
+impl serde::Serialize for SealId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_string())
     }
 }
 
-impl<'de> serde::Deserialize<'de> for VaultId {
+impl<'de> serde::Deserialize<'de> for SealId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         s.parse().map_err(serde::de::Error::custom)
     }
 }
 
-impl std::fmt::Debug for VaultId {
+impl std::fmt::Debug for SealId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "VaultId({self})")
+        write!(f, "SealId({self})")
     }
 }
 
-/// What a binding commits to: its principal and vault.
+/// What a binding commits to: its principal and seal.
 #[must_use]
-pub fn commitment_data(principal: &Principal, vault: &VaultId) -> Vec<u8> {
+pub fn commitment_data(principal: &Principal, seal: &SealId) -> Vec<u8> {
     Writer::new(COMMIT_MAGIC)
         .str(&principal.to_string())
-        .fixed(vault.as_bytes())
+        .fixed(seal.as_bytes())
         .finish()
 }
 
@@ -256,7 +256,7 @@ impl std::fmt::Debug for Sealer {
 impl Sealer {
     /// Bind a fresh data key to the escrow key of every server in
     /// `servers` (each verified for `principal`'s realm), committed to
-    /// `principal`'s machine vault for `kind`.
+    /// `principal`'s machine seal for `kind`.
     ///
     /// Returns the sealer and the registrations to send.
     ///
@@ -287,9 +287,9 @@ impl Sealer {
                 return Err(Error::WrongRealm);
             }
             let escrow_key = realm.escrow_key()?.clone();
-            // Each slot commits to the vault id of its own KEM's hash.
-            let vault = VaultId::machine(principal, kind, escrow_key.alg())?;
-            let committed = commitment_data(principal, &vault);
+            // Each slot commits to the seal id of its own KEM's hash.
+            let seal = SealId::machine(principal, kind, escrow_key.alg())?;
+            let committed = commitment_data(principal, &seal);
             let (binding, key, commitment) = realm.advertisement().provision_committed(
                 &ctx,
                 Some(escrow_key.kid()),
@@ -460,11 +460,11 @@ impl Sealed {
         mut recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
     ) -> Result<SecretBuf> {
         for slot in &self.slots {
-            let vault = VaultId::machine(&self.principal, self.kind, slot.escrow_key.alg())?;
+            let seal = SealId::machine(&self.principal, self.kind, slot.escrow_key.alg())?;
             let (request, pending) = slot.binding.recovery_request(&slot.escrow_key)?;
-            let request = EscrowRequest::for_vault(
+            let request = EscrowRequest::for_seal(
                 self.principal.clone(),
-                vault,
+                seal,
                 slot.commitment,
                 request,
                 None,
@@ -627,13 +627,13 @@ impl RegisterParams {
 }
 
 /// `POST /ipa/ku/rec/{kid}`: the unified recovery request (§7.6.5): a
-/// `tang-pqc` recovery request naming the principal and the vault, with the
-/// binding's commitment to both; for a user vault also the device to answer
+/// `tang-pqc` recovery request naming the principal and the seal, with the
+/// binding's commitment to both; for a user seal also the device to answer
 /// to, the owner's GSS-API token and a passkey assertion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscrowRequest {
     principal: Principal,
-    vault: VaultId,
+    seal: SealId,
     commitment: [u8; 32],
     request: RecoveryRequest,
     device: Option<tang_pqc::Thumbprint>,
@@ -650,18 +650,18 @@ const REQUEST_VERSION_RELEASE: u8 = 2;
 const REQUEST_VERSION_PASSKEY: u8 = 3;
 
 impl EscrowRequest {
-    /// A request for a user vault, answered to `device` if given.
+    /// A request for a user seal, answered to `device` if given.
     #[must_use]
-    pub fn for_vault(
+    pub fn for_seal(
         principal: Principal,
-        vault: VaultId,
+        seal: SealId,
         commitment: [u8; 32],
         request: RecoveryRequest,
         device: Option<tang_pqc::Thumbprint>,
     ) -> Self {
         Self {
             principal,
-            vault,
+            seal,
             commitment,
             request,
             device,
@@ -743,7 +743,7 @@ impl EscrowRequest {
         .to_bytes()
     }
 
-    /// The channel binding of the token: `H("ipa-ku-enroll/v1 vault
+    /// The channel binding of the token: `H("ipa-ku-enroll/v1 seal
     /// unlock" ‖ the request without its token and assertion)`, `H` the
     /// recovery KEM's suite hash (SHA-256 for ML-KEM-768, SHA-384 for
     /// ML-KEM-1024), taken to the 32 bytes every channel binding has.
@@ -754,14 +754,14 @@ impl EscrowRequest {
     pub fn ticket_binding(&self) -> Result<[u8; crate::join::CHANNEL_BINDING_LEN]> {
         let digest = primitives::digest(
             self.request.alg().hash(),
-            &[b"ipa-ku-enroll/v1 vault unlock", &self.bare()],
+            &[b"ipa-ku-enroll/v1 seal unlock", &self.bare()],
         )?;
         Ok(crate::join::channel_binding_of(&digest))
     }
 
     /// The challenge a passkey signs, as its CTAP `clientDataHash`: as
     /// [`ticket_binding`](Self::ticket_binding), under its own label
-    /// (`"ipa-ku-enroll/v1 vault passkey"`).  A fresh recovery request
+    /// (`"ipa-ku-enroll/v1 seal passkey"`).  A fresh recovery request
     /// makes every challenge new; a replayed one only releases to the
     /// requester's ephemeral key again.
     ///
@@ -771,7 +771,7 @@ impl EscrowRequest {
     pub fn passkey_challenge(&self) -> Result<[u8; 32]> {
         let digest = primitives::digest(
             self.request.alg().hash(),
-            &[b"ipa-ku-enroll/v1 vault passkey", &self.bare()],
+            &[b"ipa-ku-enroll/v1 seal passkey", &self.bare()],
         )?;
         Ok(crate::join::channel_binding_of(&digest))
     }
@@ -782,14 +782,14 @@ impl EscrowRequest {
         &self.principal
     }
 
-    /// The vault.
+    /// The seal.
     #[must_use]
-    pub fn vault(&self) -> &VaultId {
-        &self.vault
+    pub fn seal(&self) -> &SealId {
+        &self.seal
     }
 
     /// The binding's commitment to [`commitment_data`] of the principal and
-    /// vault.
+    /// seal.
     #[must_use]
     pub fn commitment(&self) -> &[u8; 32] {
         &self.commitment
@@ -819,7 +819,7 @@ impl EscrowRequest {
             Some(v) => Writer::with_version(REQUEST_MAGIC, v),
         };
         w.str(&self.principal.to_string())
-            .fixed(self.vault.as_bytes())
+            .fixed(self.seal.as_bytes())
             .fixed(&self.commitment)
             .bytes(&self.request.to_bytes())
             .bytes(self.device.as_ref().map_or(&[][..], |d| d.as_bytes()))
@@ -855,7 +855,7 @@ impl EscrowRequest {
             None => Reader::new(bytes, REQUEST_MAGIC, "escrow request")?,
         };
         let principal = r.str()?.parse()?;
-        let vault = VaultId::from_bytes(r.fixed()?);
+        let seal = SealId::from_bytes(r.fixed()?);
         let commitment = r.fixed()?;
         let request = RecoveryRequest::from_bytes(r.bytes()?)?;
         let device = match r.bytes()? {
@@ -880,7 +880,7 @@ impl EscrowRequest {
         r.finish()?;
         Ok(Self {
             principal,
-            vault,
+            seal,
             commitment,
             request,
             device,
@@ -900,19 +900,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn machine_vault_ids_follow_the_escrow_kem() {
+    fn machine_seal_ids_follow_the_escrow_kem() {
         // ML-KEM-768 keeps the SHA-256 ids already sealed to; ML-KEM-1024
         // (CNSA 2.0) gives a SHA-384 one, and each id names its own KEM.
         let host: Principal = "host/web1.example.test@EXAMPLE.TEST".parse().unwrap();
         let old = sha256(&[
-            b"ipa-ku-enroll/v1 machine vault",
+            b"ipa-ku-enroll/v1 machine seal",
             &[Kind::Keytab.id()],
             host.to_string().as_bytes(),
         ])
         .unwrap();
-        let v768 = VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap();
+        let v768 = SealId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap();
         assert_eq!(v768.as_bytes(), &old[..16]);
-        let v1024 = VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem1024).unwrap();
+        let v1024 = SealId::machine(&host, Kind::Keytab, KemAlg::MlKem1024).unwrap();
         assert_ne!(v768, v1024);
         assert_eq!(
             v1024.machine_kind(&host, KemAlg::MlKem1024).unwrap(),

@@ -60,7 +60,7 @@ const DOMAIN: &str = "example.test";
 const SERVERS: [&str; 2] = ["ipa1.example.test", "ipa2.example.test"];
 const ADMIN: &str = "admin@EXAMPLE.TEST";
 const ADMIN_PASSWORD: &str = "Secret123";
-/// The realm's other users, for shared vaults, approvals and deposits
+/// The realm's other users, for shared seals, approvals and deposits
 /// (`pq_as`); their password is the administrator's.
 const USERS: [&str; 2] = ["bob@EXAMPLE.TEST", "carol@EXAMPLE.TEST"];
 const TRUSTED_REALM: &str = "B.TEST";
@@ -229,16 +229,16 @@ fn watch_recovery(dir: &Path, directory: &Arc<KdcDirectory>) {
     });
 }
 
-/// `kuipa-playground recovery --vault OWNER/NAME [--required]`: name the
-/// realm's device escrow vault, as an administrator would on
+/// `kuipa-playground recovery --seal OWNER/NAME [--required]`: name the
+/// realm's device escrow seal, as an administrator would on
 /// `cn=recovery,cn=kuipa,cn=etc`.
 fn recovery(args: &[String]) -> Result<(), Error> {
     let pg =
         PathBuf::from(std::env::var("KUIPA_PLAYGROUND").map_err(|_| "run inside the playground")?);
-    let vault = option(args, "--vault")
-        .ok_or("usage: kuipa-playground recovery --vault OWNER/NAME [--required]")?;
-    let settings = kuipa_enroll::vault::RecoverySettings {
-        device_vault: vault,
+    let seal = option(args, "--seal")
+        .ok_or("usage: kuipa-playground recovery --seal OWNER/NAME [--required]")?;
+    let settings = kuipa_enroll::seal::RecoverySettings {
+        device_seal: seal,
         required: args.iter().any(|a| a == "--required"),
     };
     let text = serde_json::to_string_pretty(&Some(&settings))?;
@@ -248,7 +248,7 @@ fn recovery(args: &[String]) -> Result<(), Error> {
         if std::fs::read_to_string(pg.join("recovery.ack")).is_ok_and(|a| a == text) {
             println!(
                 "device keys are deposited in {}{}",
-                settings.device_vault,
+                settings.device_seal,
                 if settings.required { " (required)" } else { "" }
             );
             return Ok(());
@@ -406,40 +406,40 @@ fn publish_masters(dir: &Path, directory: &Arc<KdcDirectory>) -> Result<(), Erro
     Ok(())
 }
 
-/// The playground realm's policy: offline vault sessions, and the release
+/// The playground realm's policy: offline seal sessions, and the release
 /// group's signing, with the administrator in it.
 fn configure_policy(directory: &KdcDirectory) {
-    // The playground realm's limits: every vault needs a device, only
+    // The playground realm's limits: every seal needs a device, only
     // the travellers group, the administrator's, may have offline
-    // sessions, and the CI administrators, carol, may make vaults that
+    // sessions, and the CI administrators, carol, may make seals that
     // open with a ticket alone, for runners (DESIGN.md §7.6.2,
     // DESIGN-ci.md §2).
     {
         let mut limits = directory.limits.lock().unwrap();
-        limits.factors = vec![kuipa_enroll::vault::Factors {
-            device: Some(kuipa_enroll::vault::Level::Any),
-            ..kuipa_enroll::vault::Factors::default()
+        limits.factors = vec![kuipa_enroll::seal::Factors {
+            device: Some(kuipa_enroll::seal::Level::Any),
+            ..kuipa_enroll::seal::Factors::default()
         }];
         limits.offline_sessions = false;
         limits.groups = vec![
-            kuipa_enroll::vault::GroupLimits {
+            kuipa_enroll::seal::GroupLimits {
                 group: "travellers".into(),
                 priority: 10,
-                set: kuipa_enroll::vault::LimitOverrides {
+                set: kuipa_enroll::seal::LimitOverrides {
                     offline_sessions: Some(true),
-                    ..kuipa_enroll::vault::LimitOverrides::default()
+                    ..kuipa_enroll::seal::LimitOverrides::default()
                 },
             },
-            kuipa_enroll::vault::GroupLimits {
+            kuipa_enroll::seal::GroupLimits {
                 group: "ci-admins".into(),
                 priority: 20,
-                set: kuipa_enroll::vault::LimitOverrides {
+                set: kuipa_enroll::seal::LimitOverrides {
                     without_device: Some(true),
-                    factors: Some(vec![kuipa_enroll::vault::Factors {
+                    factors: Some(vec![kuipa_enroll::seal::Factors {
                         ticket: true,
-                        ..kuipa_enroll::vault::Factors::default()
+                        ..kuipa_enroll::seal::Factors::default()
                     }]),
-                    ..kuipa_enroll::vault::LimitOverrides::default()
+                    ..kuipa_enroll::seal::LimitOverrides::default()
                 },
             },
         ];
@@ -1152,7 +1152,7 @@ pq_passkey() {{
 }}
 # pq_token LABEL: make an ML-KEM-768 key LABEL on the playground's software
 # PKCS#11 token (kryoptic; label kuipa, PIN 1234) and print its URI, for
-# `kuipa seal device add VAULT --pkcs11 URI --module $PQ_TOKEN_MODULE`.
+# `kuipa seal device add SEAL --pkcs11 URI --module $PQ_TOKEN_MODULE`.
 pq_token() {{
     local label="${{1:?usage: pq_token LABEL}}"
     [ -f "$PQ_TOKEN_MODULE" ] || {{ echo "no software token: install kryoptic"; return 1; }}

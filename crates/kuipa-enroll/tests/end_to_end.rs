@@ -9,7 +9,7 @@ use agirru_crdt::GenerationClock;
 use kuipa_enroll::anchors::{AnchorState, Entry, Trust};
 use kuipa_enroll::bundle::{Bundle, Mode, Opener, StageParams};
 use kuipa_enroll::delegation::{Claim, Delegation, SignedVouch, VOUCH_VALIDITY};
-use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer, VaultId};
+use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, SealId, Sealed, Sealer};
 use kuipa_enroll::join::{
     AuthType, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
 };
@@ -18,14 +18,14 @@ use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::passkey::soft::SoftAuthenticator;
 use kuipa_enroll::passkey::{Algorithm, UserPasskeys};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
+use kuipa_enroll::seal::{
+    self, Descriptor, DeviceType, Factors, Level, Recovered, Seal, SealOp, SealedFile,
+    TicketDelegation, Unlock, VerifiedDescriptor,
+};
 use kuipa_enroll::server::{
     Accepted, Appended, Directory, DirectoryError, Ledger, Staged, parse_stage_result,
 };
-use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, SignedHead, VaultAction, VaultEvent};
-use kuipa_enroll::vault::{
-    self, Descriptor, DeviceType, Factors, Level, Recovered, SealedVaultFile, TicketDelegation,
-    Unlock, Vault, VaultOp, VerifiedDescriptor,
-};
+use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, SealAction, SealEvent, SignedHead};
 use kuipa_enroll::{EnrollServer, Error};
 use native_ossl::util::SecretBuf;
 use tang_pqc::{
@@ -58,10 +58,10 @@ struct MemoryDirectory {
     /// When each leased principal's lease ends.
     leases: RefCell<HashMap<String, u64>>,
     staged: RefCell<HashMap<String, Staged>>,
-    vaults: RefCell<HashMap<VaultId, Vault>>,
-    unlocks: RefCell<HashMap<(VaultId, String), u64>>,
+    seals: RefCell<HashMap<SealId, Seal>>,
+    unlocks: RefCell<HashMap<(SealId, String), u64>>,
     escrow_keys: RefCell<Vec<(String, tang_pqc::ExchangeKey)>>,
-    limits: RefCell<vault::Limits>,
+    limits: RefCell<seal::Limits>,
     /// The server list for the keys operation's policy (§18.2).
     masters: RefCell<Vec<String>>,
     /// The masters with the CA role.
@@ -72,16 +72,16 @@ struct MemoryDirectory {
     sign_policy: RefCell<kuipa_enroll::sign::SignPolicy>,
     /// Groups by principal, as `memberOf` would list them.
     groups: RefCell<HashMap<String, Vec<String>>>,
-    /// Release requests by vault and id (`DESIGN-approvals.md`).
-    releases: RefCell<HashMap<(VaultId, String), vault::ReleaseRequest>>,
-    /// Their uses, by vault, id and server.
-    release_uses: RefCell<HashMap<(VaultId, String, String), u64>>,
+    /// Release requests by seal and id (`DESIGN-approvals.md`).
+    releases: RefCell<HashMap<(SealId, String), seal::ReleaseRequest>>,
+    /// Their uses, by seal, id and server.
+    release_uses: RefCell<HashMap<(SealId, String, String), u64>>,
     /// Device keys kept under recovery codes, by holder.
-    escrows: RefCell<HashMap<String, Vec<vault::DeviceEscrow>>>,
-    /// Deposits by vault and id (`DESIGN-recovery.md` §3).
-    deposits: RefCell<HashMap<(VaultId, String), vault::Deposit>>,
+    escrows: RefCell<HashMap<String, Vec<seal::DeviceEscrow>>>,
+    /// Deposits by seal and id (`DESIGN-recovery.md` §3).
+    deposits: RefCell<HashMap<(SealId, String), seal::Deposit>>,
     /// The realm's device-key recovery settings (§4).
-    recovery: RefCell<Option<vault::RecoverySettings>>,
+    recovery: RefCell<Option<seal::RecoverySettings>>,
     /// IPA passkeys (`ipaPassKey` values) by principal.
     passkeys: RefCell<HashMap<String, Vec<String>>>,
     /// Whether the realm requires user verification.
@@ -285,25 +285,25 @@ impl Directory for MemoryDirectory {
             .ok_or_else(|| "no such key".into())
     }
 
-    fn vault_add(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        self.vaults.borrow_mut().insert(vault.id, vault.clone());
+    fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        self.seals.borrow_mut().insert(seal.id, seal.clone());
         Ok(())
     }
 
-    fn vault_get(&self, id: &VaultId) -> Result<Option<Vault>, DirectoryError> {
-        Ok(self.vaults.borrow().get(id).cloned())
+    fn seal_get(&self, id: &SealId) -> Result<Option<Seal>, DirectoryError> {
+        Ok(self.seals.borrow().get(id).cloned())
     }
 
-    fn vault_update(&self, vault: &Vault) -> Result<(), DirectoryError> {
-        self.vaults.borrow_mut().insert(vault.id, vault.clone());
+    fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
+        self.seals.borrow_mut().insert(seal.id, seal.clone());
         Ok(())
     }
 
-    fn vaults_of(&self, owner: &Principal) -> Result<Vec<Vault>, DirectoryError> {
+    fn seals_of(&self, owner: &Principal) -> Result<Vec<Seal>, DirectoryError> {
         let owner = owner.to_string();
         let unlocks = self.unlocks.borrow();
         Ok(self
-            .vaults
+            .seals
             .borrow()
             .values()
             .filter(|v| v.owner == owner)
@@ -319,14 +319,14 @@ impl Directory for MemoryDirectory {
             .collect())
     }
 
-    fn vaults_shared_with(
+    fn seals_shared_with(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
-        let wanted = vault::Members::matching_entries(principal, groups);
+    ) -> Result<Vec<Seal>, DirectoryError> {
+        let wanted = seal::Members::matching_entries(principal, groups);
         Ok(self
-            .vaults
+            .seals
             .borrow()
             .values()
             .filter(|v| {
@@ -348,14 +348,14 @@ impl Directory for MemoryDirectory {
         Ok(self.leases.borrow().get(&principal.to_string()).copied())
     }
 
-    fn vaults_approved_by(
+    fn seals_approved_by(
         &self,
         principal: &Principal,
         groups: &[String],
-    ) -> Result<Vec<Vault>, DirectoryError> {
-        let wanted = vault::Members::matching_entries(principal, groups);
+    ) -> Result<Vec<Seal>, DirectoryError> {
+        let wanted = seal::Members::matching_entries(principal, groups);
         Ok(self
-            .vaults
+            .seals
             .borrow()
             .values()
             .filter(|v| {
@@ -368,28 +368,28 @@ impl Directory for MemoryDirectory {
             .collect())
     }
 
-    fn recovery_settings(&self) -> Result<Option<vault::RecoverySettings>, DirectoryError> {
+    fn recovery_settings(&self) -> Result<Option<seal::RecoverySettings>, DirectoryError> {
         Ok(self.recovery.borrow().clone())
     }
 
-    fn deposit_add(&self, deposit: &vault::Deposit) -> Result<(), DirectoryError> {
+    fn deposit_add(&self, deposit: &seal::Deposit) -> Result<(), DirectoryError> {
         self.deposits
             .borrow_mut()
-            .insert((deposit.vault, deposit.id.clone()), deposit.clone());
+            .insert((deposit.seal, deposit.id.clone()), deposit.clone());
         Ok(())
     }
 
-    fn deposits(&self, id: &VaultId) -> Result<Vec<vault::Deposit>, DirectoryError> {
+    fn deposits(&self, id: &SealId) -> Result<Vec<seal::Deposit>, DirectoryError> {
         Ok(self
             .deposits
             .borrow()
             .values()
-            .filter(|d| d.vault == *id)
+            .filter(|d| d.seal == *id)
             .cloned()
             .collect())
     }
 
-    fn deposit_remove(&self, id: &VaultId, deposit: &str) -> Result<(), DirectoryError> {
+    fn deposit_remove(&self, id: &SealId, deposit: &str) -> Result<(), DirectoryError> {
         self.deposits
             .borrow_mut()
             .remove(&(*id, deposit.to_owned()));
@@ -399,7 +399,7 @@ impl Directory for MemoryDirectory {
     fn device_escrow_set(
         &self,
         principal: &Principal,
-        escrow: &vault::DeviceEscrow,
+        escrow: &seal::DeviceEscrow,
     ) -> Result<(), DirectoryError> {
         let mut all = self.escrows.borrow_mut();
         let mine = all.entry(principal.to_string()).or_default();
@@ -411,7 +411,7 @@ impl Directory for MemoryDirectory {
     fn device_escrows(
         &self,
         principal: &Principal,
-    ) -> Result<Vec<vault::DeviceEscrow>, DirectoryError> {
+    ) -> Result<Vec<seal::DeviceEscrow>, DirectoryError> {
         Ok(self
             .escrows
             .borrow()
@@ -420,20 +420,20 @@ impl Directory for MemoryDirectory {
             .unwrap_or_default())
     }
 
-    fn release_add(&self, request: &vault::ReleaseRequest) -> Result<(), DirectoryError> {
+    fn release_add(&self, request: &seal::ReleaseRequest) -> Result<(), DirectoryError> {
         self.releases
             .borrow_mut()
-            .insert((request.vault, request.id.clone()), request.clone());
+            .insert((request.seal, request.id.clone()), request.clone());
         Ok(())
     }
 
-    fn releases(&self, id: &VaultId) -> Result<Vec<vault::ReleaseRequest>, DirectoryError> {
+    fn releases(&self, id: &SealId) -> Result<Vec<seal::ReleaseRequest>, DirectoryError> {
         let uses = self.release_uses.borrow();
         Ok(self
             .releases
             .borrow()
             .values()
-            .filter(|r| r.vault == *id)
+            .filter(|r| r.seal == *id)
             .cloned()
             .map(|mut r| {
                 r.uses = uses
@@ -448,9 +448,9 @@ impl Directory for MemoryDirectory {
 
     fn release_mark(
         &self,
-        id: &VaultId,
+        id: &SealId,
         request: &str,
-        approval: &vault::Approval,
+        approval: &seal::Approval,
         deny: bool,
     ) -> Result<(), DirectoryError> {
         let mut releases = self.releases.borrow_mut();
@@ -467,7 +467,7 @@ impl Directory for MemoryDirectory {
 
     fn release_use(
         &self,
-        id: &VaultId,
+        id: &SealId,
         request: &str,
         server: &str,
         limit: u64,
@@ -487,7 +487,7 @@ impl Directory for MemoryDirectory {
         Ok(true)
     }
 
-    fn vault_limits(&self) -> Result<vault::Limits, DirectoryError> {
+    fn seal_limits(&self) -> Result<seal::Limits, DirectoryError> {
         Ok(self.limits.borrow().clone())
     }
 
@@ -531,9 +531,9 @@ impl Directory for MemoryDirectory {
         Ok(())
     }
 
-    fn vault_unlock(
+    fn seal_unlock(
         &self,
-        id: &VaultId,
+        id: &SealId,
         server: &str,
         limit: Option<u64>,
     ) -> Result<bool, DirectoryError> {
@@ -1260,12 +1260,12 @@ fn sealed_file_registered_by_its_principal() {
     assert!(r.send(0, Operation::Rekey, &request).is_err());
 }
 
-/// `req` presented under another principal and vault, with its own
+/// `req` presented under another principal and seal, with its own
 /// commitment.
-fn renamed(req: &EscrowRequest, principal: &Principal, vault: &VaultId) -> EscrowRequest {
+fn renamed(req: &EscrowRequest, principal: &Principal, seal: &SealId) -> EscrowRequest {
     let bytes = tang_pqc::wire::Writer::new(*b"IPEQ")
         .str(&principal.to_string())
-        .fixed(vault.as_bytes())
+        .fixed(seal.as_bytes())
         .fixed(req.commitment())
         .bytes(&req.recovery().to_bytes())
         .bytes(req.device().map_or(&[][..], |d| d.as_bytes()))
@@ -1318,28 +1318,28 @@ fn bindings_open_only_under_what_they_commit_to() {
         .unwrap();
     let req = &seen[0];
     assert_eq!(
-        req.vault(),
-        &VaultId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap()
+        req.seal(),
+        &SealId::machine(&host, Kind::Keytab, KemAlg::MlKem768).unwrap()
     );
     // Opened by its own principal: rate limited by it before decapsulation.
     assert!(r.servers[0].is_machine_request(req));
 
-    // Eve's own principal and machine vault, where the binding is registered.
+    // Eve's own principal and machine seal, where the binding is registered.
     let eves = renamed(
         req,
         &eve,
-        &VaultId::machine(&eve, Kind::Keytab, KemAlg::MlKem768).unwrap(),
+        &SealId::machine(&eve, Kind::Keytab, KemAlg::MlKem768).unwrap(),
     );
     assert!(answer(&eves).is_err());
-    // The host's file vault, where the binding is registered too.
+    // The host's file seal, where the binding is registered too.
     let file = renamed(
         req,
         &host,
-        &VaultId::machine(&host, Kind::File, KemAlg::MlKem768).unwrap(),
+        &SealId::machine(&host, Kind::File, KemAlg::MlKem768).unwrap(),
     );
     assert!(answer(&file).is_err());
-    // A vault that does not exist.
-    let none = renamed(req, &host, &VaultId::from_bytes([9; 16]));
+    // A seal that does not exist.
+    let none = renamed(req, &host, &SealId::from_bytes([9; 16]));
     assert!(answer(&none).is_err());
 }
 
@@ -1347,16 +1347,16 @@ const ALICE: &str = "alice@EXAMPLE.TEST";
 const BOB: &str = "bob@EXAMPLE.TEST";
 const CAROL: &str = "carol@EXAMPLE.TEST";
 
-/// Run a vault operation as `caller` against server 0.
-fn vault_op(
+/// Run a seal operation as `caller` against server 0.
+fn seal_op(
     r: &Realm,
     adv: &VerifiedRealm,
     caller: &str,
-    op: &VaultOp,
+    op: &SealOp,
 ) -> Result<Vec<Descriptor>, ()> {
     let p = Prepared::new(
         adv,
-        Operation::Vault,
+        Operation::Seal,
         HOST,
         AuthType::Kerberos,
         &Enctype::DEFAULT,
@@ -1367,16 +1367,16 @@ fn vault_op(
         .with_kerberos(fake_binding(caller, &cb))
         .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
         .unwrap();
-    let response = r.send(0, Operation::Vault, &request)?;
+    let response = r.send(0, Operation::Seal, &request)?;
     let payload = pending.open(&response).map_err(|_| ())?;
-    vault::Reply::from_bytes(payload.as_ref())
+    seal::Reply::from_bytes(payload.as_ref())
         .map(|r| r.descriptors)
         .map_err(|_| ())
 }
 
 /// The operation that adds a device named `name`, with `key`.
-fn add_device_op(name: &str, key: &ExchangeKeyPair) -> VaultOp {
-    VaultOp::AddDevice {
+fn add_device_op(name: &str, key: &ExchangeKeyPair) -> SealOp {
+    SealOp::AddDevice {
         name: name.into(),
         label: "laptop".into(),
         kind: DeviceType::File,
@@ -1394,20 +1394,20 @@ fn ask_server(r: &Realm, s: &str, req: &EscrowRequest) -> Option<Vec<u8>> {
         .map(|a| a.to_bytes())
 }
 
-/// The fixture of the vault test: the realm, Alice's device, her
+/// The fixture of the seal test: the realm, Alice's device, her
 /// policy and the file she sealed.
-struct VaultCase {
+struct SealCase {
     r: Realm,
     advs: [VerifiedRealm; 2],
     anchors: Vec<Thumbprint>,
     device: ExchangeKeyPair,
     other_device: ExchangeKeyPair,
-    policy: vault::Policy,
-    sealed: SealedVaultFile,
-    id: VaultId,
+    policy: seal::Policy,
+    sealed: SealedFile,
+    id: SealId,
 }
 
-impl VaultCase {
+impl SealCase {
     /// The advertisement of the first server.
     fn adv(&self) -> &VerifiedRealm {
         &self.advs[0]
@@ -1418,7 +1418,7 @@ impl VaultCase {
         let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(who, cb));
         self.sealed.open(
             Unlock {
-                device: key.map(|k| k as &dyn vault::DeviceKey),
+                device: key.map(|k| k as &dyn seal::DeviceKey),
                 session: None,
                 ticket: Some(&mut ticket),
                 release: None,
@@ -1429,28 +1429,28 @@ impl VaultCase {
     }
 }
 
-/// The vault test's fixture, with Alice's file sealed to her device.
-fn vault_case() -> VaultCase {
+/// The seal test's fixture, with Alice's file sealed to her device.
+fn seal_case() -> SealCase {
     let r = realm();
     let advs = [r.verify(0), r.verify(1)];
     let adv = &advs[0];
     let anchors = r.all_anchors();
     let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
     let other_device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-    let policy = vault::Policy {
+    let policy = seal::Policy {
         factors: Factors {
             device: Some(Level::Any),
             ticket: true,
             passkey: false,
         },
-        ..vault::Policy::default()
+        ..seal::Policy::default()
     };
 
     // Policies the server refuses: no factor, unsupported features.
     for bad in [
-        vault::Policy::default(),
-        vault::Policy {
-            sessions: vault::Sessions {
+        seal::Policy::default(),
+        seal::Policy {
+            sessions: seal::Sessions {
                 reauth: None,
                 offline: Some(600),
                 epoch: None,
@@ -1458,18 +1458,18 @@ fn vault_case() -> VaultCase {
             ..policy.clone()
         },
     ] {
-        let op = VaultOp::Create {
+        let op = SealOp::Create {
             name: "bad".into(),
             policy: bad,
         };
-        assert!(vault_op(&r, adv, ALICE, &op).is_err());
+        assert!(seal_op(&r, adv, ALICE, &op).is_err());
     }
 
-    let created = vault_op(
+    let created = seal_op(
         &r,
         adv,
         ALICE,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "personal".into(),
             policy: policy.clone(),
         },
@@ -1479,16 +1479,16 @@ fn vault_case() -> VaultCase {
         .verify(REALM, &anchors, &Policy::default())
         .unwrap();
     assert!(
-        v.vault().policy.not_after.is_some(),
+        v.seal().policy.not_after.is_some(),
         "filled in from the limits"
     );
     // Sealing needs a registered device when the policy asks for one.
-    assert!(SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"x").is_err());
+    assert!(SealedFile::seal(&v, &[&advs[0], &advs[1]], b"x").is_err());
 
-    let described = vault_op(&r, adv, ALICE, &add_device_op("personal", &device)).unwrap();
+    let described = seal_op(&r, adv, ALICE, &add_device_op("personal", &device)).unwrap();
     let desc = Descriptor::from_bytes(&described[0].to_bytes()).unwrap();
     let v = desc.verify(REALM, &anchors, &Policy::default()).unwrap();
-    assert_eq!(v.vault().devices.len(), 1);
+    assert_eq!(v.seal().devices.len(), 1);
     // A descriptor checked against unrelated anchors does not verify.
     let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     assert!(
@@ -1500,10 +1500,10 @@ fn vault_case() -> VaultCase {
         .is_err()
     );
 
-    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"token=secret\n").unwrap();
-    let sealed = SealedVaultFile::from_bytes(&sealed.to_bytes()).unwrap();
-    let id = *sealed.vault();
-    VaultCase {
+    let sealed = SealedFile::seal(&v, &[&advs[0], &advs[1]], b"token=secret\n").unwrap();
+    let sealed = SealedFile::from_bytes(&sealed.to_bytes()).unwrap();
+    let id = *sealed.seal_id();
+    SealCase {
         r,
         advs,
         anchors,
@@ -1515,13 +1515,13 @@ fn vault_case() -> VaultCase {
     }
 }
 
-/// Replace Alice's policy on the personal vault with `p`.
-fn set_policy(c: &VaultCase, p: vault::Policy) {
-    vault_op(
+/// Replace Alice's policy on the personal seal with `p`.
+fn set_policy(c: &SealCase, p: seal::Policy) {
+    seal_op(
         &c.r,
         c.adv(),
         ALICE,
-        &VaultOp::SetPolicy {
+        &SealOp::SetPolicy {
             name: "personal".into(),
             policy: p,
         },
@@ -1529,7 +1529,7 @@ fn set_policy(c: &VaultCase, p: vault::Policy) {
     .unwrap();
 }
 
-fn alice_opens_her_file(c: &VaultCase) {
+fn alice_opens_her_file(c: &SealCase) {
     let device = &c.device;
     let other_device = &c.other_device;
     assert_eq!(
@@ -1555,7 +1555,7 @@ fn alice_opens_her_file(c: &VaultCase) {
     assert!(matches!(no_ticket, Err(Error::Refused)));
 }
 
-fn delegated_tickets(c: &VaultCase) {
+fn delegated_tickets(c: &SealCase) {
     let device = &c.device;
     let policy = &c.policy;
     // Delegated tickets: allowed by default, refused or limited by policy.
@@ -1563,7 +1563,7 @@ fn delegated_tickets(c: &VaultCase) {
     assert!(c.open(via, Some(device)).is_ok());
     set_policy(
         c,
-        vault::Policy {
+        seal::Policy {
             ticket_delegation: TicketDelegation::Refuse,
             ..policy.clone()
         },
@@ -1572,7 +1572,7 @@ fn delegated_tickets(c: &VaultCase) {
     assert!(c.open(ALICE, Some(device)).is_ok());
     set_policy(
         c,
-        vault::Policy {
+        seal::Policy {
             ticket_delegation: TicketDelegation::Via(vec![
                 "host/vm1.example.test@EXAMPLE.TEST".into(),
             ]),
@@ -1585,7 +1585,7 @@ fn delegated_tickets(c: &VaultCase) {
     // Only a principal whose lease is running, with ticket.leased.
     set_policy(
         c,
-        vault::Policy {
+        seal::Policy {
             ticket_leased: true,
             ..policy.clone()
         },
@@ -1600,7 +1600,7 @@ fn delegated_tickets(c: &VaultCase) {
     // A level the device does not have.
     set_policy(
         c,
-        vault::Policy {
+        seal::Policy {
             factors: Factors {
                 device: Some(Level::HardwareBound),
                 ..policy.factors.clone()
@@ -1612,7 +1612,7 @@ fn delegated_tickets(c: &VaultCase) {
     set_policy(c, policy.clone());
 }
 
-fn bobs_vault_cannot_release(c: &VaultCase) {
+fn bobs_seal_cannot_release(c: &SealCase) {
     let r = &c.r;
     let adv = c.adv();
     let anchors = &c.anchors;
@@ -1620,21 +1620,21 @@ fn bobs_vault_cannot_release(c: &VaultCase) {
     let policy = &c.policy;
     let sealed = &c.sealed;
     let id = c.id;
-    // Bob's vault cannot release Alice's binding, even under his policy.
-    let bobs = vault_op(
+    // Bob's seal cannot release Alice's binding, even under his policy.
+    let bobs = seal_op(
         r,
         adv,
         BOB,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "personal".into(),
             policy: policy.clone(),
         },
     )
     .unwrap();
-    let bob_vault = bobs[0]
+    let bob_seal = bobs[0]
         .verify(REALM, anchors, &Policy::default())
         .unwrap()
-        .vault()
+        .seal()
         .id;
     let mut seen = Vec::new();
     sealed
@@ -1652,69 +1652,69 @@ fn bobs_vault_cannot_release(c: &VaultCase) {
             },
         )
         .unwrap();
-    let theirs = renamed(&seen[0], &BOB.parse().unwrap(), &bob_vault);
+    let theirs = renamed(&seen[0], &BOB.parse().unwrap(), &bob_seal);
     assert!(r.servers[0].recover(&theirs, &r.dir).is_err());
-    // "personal" names Bob's own vault when Bob asks: Alice's is not his.
-    let shown = vault_op(
+    // "personal" names Bob's own seal when Bob asks: Alice's is not his.
+    let shown = seal_op(
         r,
         adv,
         BOB,
-        &VaultOp::Show {
+        &SealOp::Show {
             name: "personal".into(),
         },
     )
     .unwrap();
     let shown = shown[0].verify(REALM, anchors, &Policy::default()).unwrap();
-    assert_ne!(shown.vault().id, id);
+    assert_ne!(shown.seal().id, id);
 }
 
-fn devices_and_revocation(c: &VaultCase) {
+fn devices_and_revocation(c: &SealCase) {
     let r = &c.r;
     let adv = c.adv();
     let device = &c.device;
-    // Removing the device, locking the owner and revoking the vault each
+    // Removing the device, locking the owner and revoking the seal each
     // stop unlocks.
     let device_id = device.public().kid().to_string();
-    vault_op(
+    seal_op(
         r,
         adv,
         ALICE,
-        &VaultOp::RemoveDevice {
+        &SealOp::RemoveDevice {
             name: "personal".into(),
             id: device_id,
         },
     )
     .unwrap();
     assert!(c.open(ALICE, Some(device)).is_err());
-    vault_op(r, adv, ALICE, &add_device_op("personal", device)).unwrap();
+    seal_op(r, adv, ALICE, &add_device_op("personal", device)).unwrap();
     assert!(c.open(ALICE, Some(device)).is_ok());
     r.dir.disabled.borrow_mut().insert(ALICE.into());
     assert!(c.open(ALICE, Some(device)).is_err());
     r.dir.disabled.borrow_mut().clear();
-    vault_op(
+    seal_op(
         r,
         adv,
         ALICE,
-        &VaultOp::Revoke {
+        &SealOp::Revoke {
             name: "personal".into(),
         },
     )
     .unwrap();
     assert!(c.open(ALICE, Some(device)).is_err());
-    let listed = vault_op(r, adv, ALICE, &VaultOp::List).unwrap();
+    let listed = seal_op(r, adv, ALICE, &SealOp::List).unwrap();
     assert_eq!(listed.len(), 1);
 }
 
 #[test]
-fn user_vault_seals_and_opens_under_its_policy() {
-    let c = vault_case();
+fn user_seal_seals_and_opens_under_its_policy() {
+    let c = seal_case();
     alice_opens_her_file(&c);
     delegated_tickets(&c);
-    bobs_vault_cannot_release(&c);
+    bobs_seal_cannot_release(&c);
     devices_and_revocation(&c);
 }
 
-/// Run a vault operation as `caller` and keep the whole reply.
+/// Run a seal operation as `caller` and keep the whole reply.
 /// A ledger over an in-memory log, as the daemon keeps one on disk.
 #[derive(Debug)]
 struct MemoryLedger {
@@ -1835,12 +1835,12 @@ impl Ledger for BrokenLedger {
     }
 }
 
-/// Look `vault`'s entries up from `from` as `who`, with proofs.
+/// Look `seal`'s entries up from `from` as `who`, with proofs.
 fn lookup_entries(
     r: &Realm,
     adv: &VerifiedRealm,
     who: &str,
-    vault: &str,
+    seal: &str,
     from: u64,
 ) -> Result<tlog::Answer, ()> {
     tlog_lookup(
@@ -1848,42 +1848,42 @@ fn lookup_entries(
         adv,
         who,
         &tlog::Query {
-            vault: vault.into(),
+            seal: seal.into(),
             from,
         },
     )
 }
 
-/// A server whose ledger fails refuses a change, and makes none: the vault
+/// A server whose ledger fails refuses a change, and makes none: the seal
 /// stays enabled.
 fn ledger_failure_refuses_the_change(r: &mut Realm, adv: &VerifiedRealm, anchors: &[Thumbprint]) {
     // A server whose ledger fails refuses the change, and does not make
-    // it: the vault is still enabled.
+    // it: the seal is still enabled.
     let first = r.servers.remove(0).with_ledger(Arc::new(BrokenLedger));
     r.servers.insert(0, first);
     assert!(
-        vault_op(
+        seal_op(
             r,
             adv,
             ALICE,
-            &VaultOp::Revoke {
+            &SealOp::Revoke {
                 name: "personal".into()
             }
         )
         .is_err()
     );
-    let shown = vault_reply(
+    let shown = seal_reply(
         r,
         adv,
         ALICE,
-        &VaultOp::Show {
+        &SealOp::Show {
             name: "personal".into(),
         },
     );
     let v = shown.descriptors[0]
         .verify(REALM, anchors, &Policy::default())
         .unwrap();
-    assert_eq!(v.vault().state, vault::State::Enabled);
+    assert_eq!(v.seal().state, seal::State::Enabled);
 }
 
 /// Opening a sealed file logs the release on the server that answered.
@@ -1892,10 +1892,10 @@ fn opened_file_logs_release(
     advs: &[VerifiedRealm; 2],
     ledger: &MemoryLedger,
     device: &ExchangeKeyPair,
-    v: &kuipa_enroll::vault::VerifiedDescriptor,
+    v: &kuipa_enroll::seal::VerifiedDescriptor,
 ) {
     // Opening a sealed file logs the release on the server that answered.
-    let sealed = SealedVaultFile::seal(v, &[&advs[0], &advs[1]], b"x").unwrap();
+    let sealed = SealedFile::seal(v, &[&advs[0], &advs[1]], b"x").unwrap();
     let ask = |s: &str, req: &EscrowRequest| {
         r.servers[usize::from(s == SERVERS[1])]
             .recover(req, &r.dir)
@@ -1918,23 +1918,23 @@ fn opened_file_logs_release(
     let (leaves, openings) = (ledger.leaves(), ledger.openings());
     let release = openings.last().unwrap();
     assert_eq!(release.kind, tlog::Kind::ESCROW_RELEASE);
-    let event = VaultEvent::from_bytes(&release.event).unwrap();
-    assert_eq!(event.action, VaultAction::Release);
-    let device_id = v.vault().devices[0].id.as_str();
+    let event = SealEvent::from_bytes(&release.event).unwrap();
+    assert_eq!(event.action, SealAction::Release);
+    let device_id = v.seal().devices[0].id.as_str();
     assert_eq!(event.device.as_deref(), Some(device_id));
 
-    // Every opening is about the vault and opens its leaf; no public leaf
-    // names the vault, its owner, the device or the binding released, or
+    // Every opening is about the seal and opens its leaf; no public leaf
+    // names the seal, its owner, the device or the binding released, or
     // says more than the day it was logged.
     for (leaf, opening) in leaves.iter().zip(&openings) {
-        assert_eq!(opening.subject, sealed.vault().as_bytes());
+        assert_eq!(opening.subject, sealed.seal_id().as_bytes());
         assert!(opening.opens(leaf).unwrap());
         assert_eq!(leaf.time, tlog::public_time(opening.time));
         let bytes = leaf.to_bytes();
         for secret in [
             &b"personal"[..],
             b"alice",
-            sealed.vault().as_bytes(),
+            sealed.seal_id().as_bytes(),
             device_id.as_bytes(),
             &event.digest,
         ] {
@@ -1953,36 +1953,36 @@ fn logged_realm() -> (Realm, Arc<MemoryLedger>) {
 }
 
 #[test]
-fn vault_events_are_logged_with_receipts() {
+fn seal_events_are_logged_with_receipts() {
     let (mut r, ledger) = logged_realm();
     let advs = [r.verify(0), r.verify(1)];
     let adv = &advs[0];
     let anchors = r.all_anchors();
     let log_key = r.servers[0].keys().signing.public().clone();
-    let policy = vault::Policy {
+    let policy = seal::Policy {
         factors: Factors {
             device: Some(Level::Any),
             ticket: true,
             passkey: false,
         },
-        ..vault::Policy::default()
+        ..seal::Policy::default()
     };
     let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
 
-    let created = vault_reply(
+    let created = seal_reply(
         &r,
         adv,
         ALICE,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "personal".into(),
             policy,
         },
     );
-    let added = vault_reply(
+    let added = seal_reply(
         &r,
         adv,
         ALICE,
-        &VaultOp::AddDevice {
+        &SealOp::AddDevice {
             name: "personal".into(),
             label: "laptop".into(),
             kind: DeviceType::File,
@@ -1991,11 +1991,11 @@ fn vault_events_are_logged_with_receipts() {
         },
     );
     // Reads log nothing.
-    let shown = vault_reply(
+    let shown = seal_reply(
         &r,
         adv,
         ALICE,
-        &VaultOp::Show {
+        &SealOp::Show {
             name: "personal".into(),
         },
     );
@@ -2020,13 +2020,13 @@ fn vault_events_are_logged_with_receipts() {
         .verify(REALM, &anchors, &Policy::default())
         .unwrap();
     let leaves = ledger.leaves();
-    assert_eq!(leaves[0].kind, tlog::Kind::VAULT_POLICY);
-    assert_eq!(leaves[1].kind, tlog::Kind::VAULT_DEVICE);
-    let event = VaultEvent::from_bytes(&ledger.openings()[1].event).unwrap();
-    assert_eq!(event.action, VaultAction::AddDevice);
+    assert_eq!(leaves[0].kind, tlog::Kind::SEAL_POLICY);
+    assert_eq!(leaves[1].kind, tlog::Kind::SEAL_DEVICE);
+    let event = SealEvent::from_bytes(&ledger.openings()[1].event).unwrap();
+    assert_eq!(event.action, SealAction::AddDevice);
     assert_eq!(
         event.device.as_deref(),
-        Some(v.vault().devices[0].id.as_str())
+        Some(v.seal().devices[0].id.as_str())
     );
 
     opened_file_logs_release(&r, &advs, &ledger, &device, &v);
@@ -2034,14 +2034,14 @@ fn vault_events_are_logged_with_receipts() {
     ledger_failure_refuses_the_change(&mut r, adv, &anchors);
 }
 
-/// The owner looks their vault's entries up, with proofs the client
+/// The owner looks their seal's entries up, with proofs the client
 /// checks against the head and the openings of their leaves; nobody else
 /// can, and a lying answer does not verify.
 fn owner_looks_up_and_checks_the_openings(
     r: &Realm,
     adv: &VerifiedRealm,
     ledger: &MemoryLedger,
-    event: VaultEvent,
+    event: SealEvent,
 ) {
     let leaves = ledger.leaves();
     // Pages on with `from`.
@@ -2059,7 +2059,7 @@ fn owner_looks_up_and_checks_the_openings(
             .len(),
         1
     );
-    // Nothing is about Alice's principal; Bob cannot look up her vault.
+    // Nothing is about Alice's principal; Bob cannot look up her seal.
     assert_eq!(
         lookup_entries(r, adv, ALICE, "", 0).unwrap().entries,
         [] as [kuipa_enroll::tlog::Entry; 0]
@@ -2072,8 +2072,8 @@ fn owner_looks_up_and_checks_the_openings(
     assert!(forged.verify(adv.signer(), &Policy::default()).is_err());
     let mut lying = answer.clone();
     if let Some(o) = lying.entries[1].opening.as_mut() {
-        o.event = VaultEvent {
-            action: VaultAction::RemoveDevice,
+        o.event = SealEvent {
+            action: SealAction::RemoveDevice,
             ..event
         }
         .to_bytes();
@@ -2081,10 +2081,10 @@ fn owner_looks_up_and_checks_the_openings(
     assert!(lying.verify(adv.signer(), &Policy::default()).is_err());
 }
 
-fn vault_reply(r: &Realm, adv: &VerifiedRealm, caller: &str, op: &VaultOp) -> vault::Reply {
+fn seal_reply(r: &Realm, adv: &VerifiedRealm, caller: &str, op: &SealOp) -> seal::Reply {
     let p = Prepared::new(
         adv,
-        Operation::Vault,
+        Operation::Seal,
         HOST,
         AuthType::Kerberos,
         &Enctype::DEFAULT,
@@ -2095,8 +2095,8 @@ fn vault_reply(r: &Realm, adv: &VerifiedRealm, caller: &str, op: &VaultOp) -> va
         .with_kerberos(fake_binding(caller, &cb))
         .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
         .unwrap();
-    let response = r.send(0, Operation::Vault, &request).unwrap();
-    vault::Reply::from_bytes(pending.open(&response).unwrap().as_ref()).unwrap()
+    let response = r.send(0, Operation::Seal, &request).unwrap();
+    seal::Reply::from_bytes(pending.open(&response).unwrap().as_ref()).unwrap()
 }
 
 /// A policy without sessions accepts none, and starting one is refused.
@@ -2104,19 +2104,19 @@ fn sessions_stop_without_policy(
     r: &Realm,
     adv: &VerifiedRealm,
     device: &ExchangeKeyPair,
-    policy: &vault::Policy,
+    policy: &seal::Policy,
     with_session: impl Fn(&ExchangeKeyPair) -> Result<SecretBuf, Error>,
 ) {
     // A policy without sessions stops accepting them, and starting one.
-    vault_op(
+    seal_op(
         r,
         adv,
         ALICE,
-        &VaultOp::SetPolicy {
+        &SealOp::SetPolicy {
             name: "s".into(),
-            policy: vault::Policy {
+            policy: seal::Policy {
                 max_unlocks: None,
-                sessions: vault::Sessions::default(),
+                sessions: seal::Sessions::default(),
                 ..policy.clone()
             },
         },
@@ -2125,14 +2125,14 @@ fn sessions_stop_without_policy(
     assert!(with_session(device).is_err());
     let p = Prepared::new(
         adv,
-        Operation::Vault,
+        Operation::Seal,
         HOST,
         AuthType::Kerberos,
         &Enctype::DEFAULT,
     )
     .unwrap();
     let cb = p.channel_binding().unwrap();
-    let op = VaultOp::Unlock {
+    let op = SealOp::Unlock {
         name: "s".into(),
         device: device.public().kid().to_string(),
         offline: false,
@@ -2142,11 +2142,11 @@ fn sessions_stop_without_policy(
         .with_kerberos(fake_binding(ALICE, &cb))
         .seal(&gss_token(ALICE, &cb), &[], &op.to_bytes())
         .unwrap();
-    assert!(r.send(0, Operation::Vault, &request).is_err());
+    assert!(r.send(0, Operation::Seal, &request).is_err());
 }
 
 /// A session stands in for the ticket, for its own device only, and the
-/// vault counts its releases against the limit.
+/// seal counts its releases against the limit.
 fn session_limit_counts_releases(
     r: &Realm,
     adv: &VerifiedRealm,
@@ -2159,16 +2159,16 @@ fn session_limit_counts_releases(
     assert_eq!(with_session(device).unwrap().as_ref(), b"s");
     assert!(with_session(other).is_err());
     // Two more releases reach the limit; the third is refused, and the
-    // vault reports what was counted.
+    // seal reports what was counted.
     assert!(with_session(device).is_ok());
     assert!(with_session(device).is_ok());
     assert!(matches!(with_session(device), Err(Error::Refused)));
-    let shown = vault_op(r, adv, ALICE, &VaultOp::Show { name: "s".into() }).unwrap();
+    let shown = seal_op(r, adv, ALICE, &SealOp::Show { name: "s".into() }).unwrap();
     assert_eq!(
         shown[0]
             .verify(REALM, anchors, &Policy::default())
             .unwrap()
-            .vault()
+            .seal()
             .unlocks,
         3
     );
@@ -2177,25 +2177,25 @@ fn session_limit_counts_releases(
 /// A session without the device factor would be a bearer token: refused.
 fn bearer_sessions_are_refused(r: &Realm, adv: &VerifiedRealm) {
     // A session without the device factor would be a bearer token.
-    let bearer = vault::Policy {
+    let bearer = seal::Policy {
         factors: Factors {
             device: None,
             ticket: true,
             passkey: false,
         },
-        sessions: vault::Sessions {
+        sessions: seal::Sessions {
             reauth: Some(600),
             offline: None,
             epoch: None,
         },
-        ..vault::Policy::default()
+        ..seal::Policy::default()
     };
     assert!(
-        vault_op(
+        seal_op(
             r,
             adv,
             ALICE,
-            &VaultOp::Create {
+            &SealOp::Create {
                 name: "b".into(),
                 policy: bearer
             }
@@ -2205,7 +2205,7 @@ fn bearer_sessions_are_refused(r: &Realm, adv: &VerifiedRealm) {
 }
 
 #[test]
-fn vault_sessions_and_unlock_limits() {
+fn seal_sessions_and_unlock_limits() {
     let r = realm();
     let advs = [r.verify(0), r.verify(1)];
     let adv = &advs[0];
@@ -2220,32 +2220,32 @@ fn vault_sessions_and_unlock_limits() {
 
     bearer_sessions_are_refused(&r, adv);
 
-    let policy = vault::Policy {
+    let policy = seal::Policy {
         factors,
         max_unlocks: Some(3),
-        sessions: vault::Sessions {
+        sessions: seal::Sessions {
             reauth: Some(600),
             offline: None,
             epoch: None,
         },
-        ..vault::Policy::default()
+        ..seal::Policy::default()
     };
-    vault_op(
+    seal_op(
         &r,
         adv,
         ALICE,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "s".into(),
             policy: policy.clone(),
         },
     )
     .unwrap();
     for key in [&device, &other] {
-        vault_op(
+        seal_op(
             &r,
             adv,
             ALICE,
-            &VaultOp::AddDevice {
+            &SealOp::AddDevice {
                 name: "s".into(),
                 label: "d".into(),
                 kind: DeviceType::File,
@@ -2255,11 +2255,11 @@ fn vault_sessions_and_unlock_limits() {
         )
         .unwrap();
     }
-    let reply = vault_reply(
+    let reply = seal_reply(
         &r,
         adv,
         ALICE,
-        &VaultOp::Unlock {
+        &SealOp::Unlock {
             name: "s".into(),
             device: device.public().kid().to_string(),
             offline: false,
@@ -2270,7 +2270,7 @@ fn vault_sessions_and_unlock_limits() {
     let v = reply.descriptors[0]
         .verify(REALM, &anchors, &Policy::default())
         .unwrap();
-    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"s").unwrap();
+    let sealed = SealedFile::seal(&v, &[&advs[0], &advs[1]], b"s").unwrap();
     let ask = |s: &str, req: &EscrowRequest| {
         let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
         r.servers[usize::from(s == "ipa2.example.test")]
@@ -2296,7 +2296,7 @@ fn vault_sessions_and_unlock_limits() {
     sessions_stop_without_policy(&r, adv, &device, &policy, with_session);
 }
 
-/// The shared vault test's state, as its sections use it.
+/// The shared seal test's state, as its sections use it.
 struct Shared {
     r: Realm,
     advs: [VerifiedRealm; 2],
@@ -2304,8 +2304,8 @@ struct Shared {
     alice_key: ExchangeKeyPair,
     bob_key: ExchangeKeyPair,
     carol_key: ExchangeKeyPair,
-    v: kuipa_enroll::vault::VerifiedDescriptor,
-    sealed: SealedVaultFile,
+    v: kuipa_enroll::seal::VerifiedDescriptor,
+    sealed: SealedFile,
 }
 
 impl Shared {
@@ -2316,38 +2316,38 @@ impl Shared {
 }
 
 /// The members of `names`, as a share's members.
-fn member_users(names: &[&str]) -> vault::Members {
-    vault::Members {
+fn member_users(names: &[&str]) -> seal::Members {
+    seal::Members {
         users: names.iter().map(|&n| n.to_owned()).collect(),
-        ..vault::Members::default()
+        ..seal::Members::default()
     }
 }
 
 /// The members of the group `g`.
-fn member_group(g: &str) -> vault::Members {
-    vault::Members {
+fn member_group(g: &str) -> seal::Members {
+    seal::Members {
         groups: vec![g.to_owned()],
-        ..vault::Members::default()
+        ..seal::Members::default()
     }
 }
 
 /// Share `name` with `managers` and `members`.
-fn share_op(name: &str, managers: vault::Members, members: vault::Members) -> VaultOp {
-    VaultOp::Share {
+fn share_op(name: &str, managers: seal::Members, members: seal::Members) -> SealOp {
+    SealOp::Share {
         name: name.into(),
         managers,
         members,
-        depositors: vault::Members::default(),
+        depositors: seal::Members::default(),
     }
 }
 
 /// Unshare `name` from `managers` and `members`.
-fn unshare_op(name: &str, managers: vault::Members, members: vault::Members) -> VaultOp {
-    VaultOp::Unshare {
+fn unshare_op(name: &str, managers: seal::Members, members: seal::Members) -> SealOp {
+    SealOp::Unshare {
         name: name.into(),
         managers,
         members,
-        depositors: vault::Members::default(),
+        depositors: seal::Members::default(),
     }
 }
 
@@ -2355,21 +2355,21 @@ fn unshare_op(name: &str, managers: vault::Members, members: vault::Members) -> 
 fn verified_descriptor(
     anchors: &[Thumbprint],
     d: &[Descriptor],
-) -> kuipa_enroll::vault::VerifiedDescriptor {
+) -> kuipa_enroll::seal::VerifiedDescriptor {
     d[0].verify(REALM, anchors, &Policy::default()).unwrap()
 }
 
 /// Open `sealed` as `who` with `key`, with the servers' escrow.
 fn open_as(
     r: &Realm,
-    sealed: &SealedVaultFile,
+    sealed: &SealedFile,
     who: &'static str,
     key: &ExchangeKeyPair,
 ) -> Result<SecretBuf, Error> {
     let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(who, cb));
     sealed.open(
         Unlock {
-            device: Some(key as &dyn vault::DeviceKey),
+            device: Some(key as &dyn seal::DeviceKey),
             session: None,
             ticket: Some(&mut ticket),
             release: None,
@@ -2379,7 +2379,7 @@ fn open_as(
     )
 }
 
-/// The shared vault test's fixture: Alice's vault, shared with the dba group
+/// The shared seal test's fixture: Alice's seal, shared with the dba group
 /// and with Carol, and the file she sealed to its members.
 fn shared_fixture() -> Shared {
     // Server 0 keeps a log, so removals are seen to be logged.
@@ -2394,42 +2394,42 @@ fn shared_fixture() -> Shared {
         .borrow_mut()
         .insert(BOB.into(), vec!["dba".into()]);
 
-    vault_op(
+    seal_op(
         &r,
         &advs[0],
         ALICE,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "db".into(),
-            policy: vault::Policy {
+            policy: seal::Policy {
                 factors: Factors {
                     device: Some(Level::Any),
                     ticket: true,
                     passkey: false,
                 },
-                sessions: vault::Sessions {
+                sessions: seal::Sessions {
                     reauth: Some(600),
                     offline: None,
                     epoch: None,
                 },
-                ..vault::Policy::default()
+                ..seal::Policy::default()
             },
         },
     )
     .unwrap();
-    vault_op(&r, &advs[0], ALICE, &add_device_op("db", &alice_key)).unwrap();
-    // A slash names an owner: no vault is created under one.
-    let slashed = VaultOp::Create {
+    seal_op(&r, &advs[0], ALICE, &add_device_op("db", &alice_key)).unwrap();
+    // A slash names an owner: no seal is created under one.
+    let slashed = SealOp::Create {
         name: "a/b".into(),
-        policy: vault::Policy::default(),
+        policy: seal::Policy::default(),
     };
-    assert!(vault_op(&r, &advs[0], ALICE, &slashed).is_err());
+    assert!(seal_op(&r, &advs[0], ALICE, &slashed).is_err());
 
     // Before it is shared, Bob cannot see it, by either spelling.
     for name in ["alice/db", "alice@EXAMPLE.TEST/db", "db"] {
-        assert!(vault_op(&r, &advs[0], BOB, &VaultOp::Show { name: name.into() }).is_err());
+        assert!(seal_op(&r, &advs[0], BOB, &SealOp::Show { name: name.into() }).is_err());
     }
     assert!(
-        vault_op(
+        seal_op(
             &r,
             &advs[0],
             BOB,
@@ -2439,11 +2439,11 @@ fn shared_fixture() -> Shared {
     );
 
     // Alice shares it with the dba group and with Carol by name.
-    let shared = vault_op(
+    let shared = seal_op(
         &r,
         &advs[0],
         ALICE,
-        &share_op("db", vault::Members::default(), {
+        &share_op("db", seal::Members::default(), {
             let mut m = member_group("dba");
             m.users.push("carol".into());
             m
@@ -2451,16 +2451,16 @@ fn shared_fixture() -> Shared {
     )
     .unwrap();
     let v = verified_descriptor(&anchors, &shared);
-    assert_eq!(v.vault().members.users, [CAROL], "normalized to the realm");
-    assert_eq!(v.vault().members.groups, ["dba"]);
+    assert_eq!(v.seal().members.users, [CAROL], "normalized to the realm");
+    assert_eq!(v.seal().members.groups, ["dba"]);
 
     // Bob sees it in his list and registers his own device in it.
-    let listed = vault_op(&r, &advs[0], BOB, &VaultOp::List).unwrap();
+    let listed = seal_op(&r, &advs[0], BOB, &SealOp::List).unwrap();
     assert_eq!(listed.len(), 1);
-    vault_op(&r, &advs[0], BOB, &add_device_op("alice/db", &bob_key)).unwrap();
+    seal_op(&r, &advs[0], BOB, &add_device_op("alice/db", &bob_key)).unwrap();
     let v = verified_descriptor(
         &anchors,
-        &vault_op(
+        &seal_op(
             &r,
             &advs[0],
             CAROL,
@@ -2469,14 +2469,14 @@ fn shared_fixture() -> Shared {
         .unwrap(),
     );
     let holders: Vec<_> = v
-        .vault()
+        .seal()
         .devices
         .iter()
-        .map(|d| v.vault().holder(d).to_owned())
+        .map(|d| v.seal().holder(d).to_owned())
         .collect();
     assert_eq!(holders, [ALICE, BOB, CAROL]);
-    let sealed = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], b"db=hunter2\n").unwrap();
-    let sealed = SealedVaultFile::from_bytes(&sealed.to_bytes()).unwrap();
+    let sealed = SealedFile::seal(&v, &[&advs[0], &advs[1]], b"db=hunter2\n").unwrap();
+    let sealed = SealedFile::from_bytes(&sealed.to_bytes()).unwrap();
     Shared {
         r,
         advs,
@@ -2498,29 +2498,25 @@ fn members_not_managers(c: &Shared) {
     // members' devices.
     let alices_device = alice_key.public().kid().to_string();
     for op in [
-        VaultOp::SetPolicy {
+        SealOp::SetPolicy {
             name: "alice/db".into(),
-            policy: v.vault().policy.clone(),
+            policy: v.seal().policy.clone(),
         },
-        share_op(
-            "alice/db",
-            vault::Members::default(),
-            member_users(&["eve"]),
-        ),
+        share_op("alice/db", seal::Members::default(), member_users(&["eve"])),
         unshare_op(
             "alice/db",
-            vault::Members::default(),
+            seal::Members::default(),
             member_users(&["carol"]),
         ),
-        VaultOp::Revoke {
+        SealOp::Revoke {
             name: "alice/db".into(),
         },
-        VaultOp::RemoveDevice {
+        SealOp::RemoveDevice {
             name: "alice/db".into(),
             id: alices_device.clone(),
         },
     ] {
-        assert!(vault_op(r, adv, BOB, &op).is_err(), "{op:?}");
+        assert!(seal_op(r, adv, BOB, &op).is_err(), "{op:?}");
     }
 }
 
@@ -2562,13 +2558,13 @@ fn members_open_and_membership(c: &Shared) {
     let sealed = &c.sealed;
     // A session is the member's own, for their own device.
     let bob_device = bob_key.public().kid().to_string();
-    let unlock = |device: &str| VaultOp::Unlock {
+    let unlock = |device: &str| SealOp::Unlock {
         name: "alice/db".into(),
         device: device.into(),
         offline: false,
         passkey: None,
     };
-    let reply = vault_reply(r, adv, BOB, &unlock(&bob_device));
+    let reply = seal_reply(r, adv, BOB, &unlock(&bob_device));
     let session = reply.session.unwrap();
     let in_session = |key: &ExchangeKeyPair| {
         sealed.open(
@@ -2584,23 +2580,23 @@ fn members_open_and_membership(c: &Shared) {
     };
     assert!(in_session(bob_key).is_ok());
     assert!(in_session(alice_key).is_err());
-    assert!(vault_op(r, adv, BOB, &unlock(&alices_device)).is_err());
+    assert!(seal_op(r, adv, BOB, &unlock(&alices_device)).is_err());
 
     // Membership is the directory's: out of the group, Bob opens nothing,
     // in or out of his session; back in, he does again.
     r.dir.groups.borrow_mut().remove(BOB);
     assert!(open_as(r, sealed, BOB, bob_key).is_err());
     assert!(in_session(bob_key).is_err());
-    assert_eq!(vault_op(r, adv, BOB, &VaultOp::List).unwrap(), Vec::new());
-    // His device goes at the next vault operation anyone makes, even a
+    assert_eq!(seal_op(r, adv, BOB, &SealOp::List).unwrap(), Vec::new());
+    // His device goes at the next seal operation anyone makes, even a
     // read, and is logged as a removal.
-    let shown = vault_reply(r, adv, ALICE, &VaultOp::Show { name: "db".into() });
+    let shown = seal_reply(r, adv, ALICE, &SealOp::Show { name: "db".into() });
     let v = verified_descriptor(&c.anchors, &shown.descriptors);
     let holders: Vec<_> = v
-        .vault()
+        .seal()
         .devices
         .iter()
-        .map(|d| v.vault().holder(d))
+        .map(|d| v.seal().holder(d))
         .collect();
     assert_eq!(holders, [ALICE, CAROL]);
     assert_eq!(shown.receipts.len(), 1, "one device removal logged");
@@ -2613,7 +2609,7 @@ fn members_open_and_membership(c: &Shared) {
         "no device any more"
     );
     // Back in the group, he registers it again; the file has its slot.
-    vault_op(r, adv, BOB, &add_device_op("alice/db", bob_key)).unwrap();
+    seal_op(r, adv, BOB, &add_device_op("alice/db", bob_key)).unwrap();
     assert!(open_as(r, sealed, BOB, bob_key).is_ok());
     // A disabled member is refused; the others are not.
     r.dir.disabled.borrow_mut().insert(BOB.into());
@@ -2623,30 +2619,30 @@ fn members_open_and_membership(c: &Shared) {
 
     // Carol may leave, but not remove anyone else.
     assert!(
-        vault_op(
+        seal_op(
             r,
             adv,
             CAROL,
-            &unshare_op("alice/db", vault::Members::default(), member_group("dba"))
+            &unshare_op("alice/db", seal::Members::default(), member_group("dba"))
         )
         .is_err()
     );
     let left = verified_descriptor(
         &c.anchors,
-        &vault_op(
+        &seal_op(
             r,
             adv,
             CAROL,
             &unshare_op(
                 "alice/db",
-                vault::Members::default(),
+                seal::Members::default(),
                 member_users(&["carol"]),
             ),
         )
         .unwrap(),
     );
-    assert_eq!(left.vault().members.users, Vec::<String>::new());
-    assert_eq!(left.vault().devices.len(), 2, "her device went with her");
+    assert_eq!(left.seal().members.users, Vec::<String>::new());
+    assert_eq!(left.seal().devices.len(), 2, "her device went with her");
     assert!(open_as(r, sealed, CAROL, carol_key).is_err());
 }
 
@@ -2658,51 +2654,51 @@ fn managers_share_and_unshare(c: &Shared) {
     let sealed = &c.sealed;
     // Bob made a manager can share and unshare; dropping the group drops
     // his membership but not his management, so his device stays.
-    vault_op(
+    seal_op(
         r,
         adv,
         ALICE,
-        &share_op("db", member_users(&["bob"]), vault::Members::default()),
+        &share_op("db", member_users(&["bob"]), seal::Members::default()),
     )
     .unwrap();
-    vault_op(
+    seal_op(
         r,
         adv,
         BOB,
         &share_op(
             "alice/db",
-            vault::Members::default(),
+            seal::Members::default(),
             member_users(&["carol"]),
         ),
     )
     .unwrap();
     let v = verified_descriptor(
         &c.anchors,
-        &vault_op(
+        &seal_op(
             r,
             adv,
             BOB,
-            &unshare_op("alice/db", vault::Members::default(), member_group("dba")),
+            &unshare_op("alice/db", seal::Members::default(), member_group("dba")),
         )
         .unwrap(),
     );
-    assert_eq!(v.vault().managers.users, [BOB]);
-    assert_eq!(v.vault().members.users, [CAROL]);
-    assert_eq!(v.vault().devices.len(), 2);
+    assert_eq!(v.seal().managers.users, [BOB]);
+    assert_eq!(v.seal().members.users, [CAROL]);
+    assert_eq!(v.seal().devices.len(), 2);
     assert!(open_as(r, sealed, BOB, bob_key).is_ok());
     // Removed as manager, his device goes, and with it his files.
     let v = verified_descriptor(
         &c.anchors,
-        &vault_op(
+        &seal_op(
             r,
             adv,
             ALICE,
-            &unshare_op("db", member_users(&["bob"]), vault::Members::default()),
+            &unshare_op("db", member_users(&["bob"]), seal::Members::default()),
         )
         .unwrap(),
     );
-    assert!(v.vault().managers.is_empty());
-    assert_eq!(v.vault().devices.len(), 1);
+    assert!(v.seal().managers.is_empty());
+    assert_eq!(v.seal().devices.len(), 1);
     assert!(open_as(r, sealed, BOB, bob_key).is_err());
     assert!(open_as(r, sealed, ALICE, alice_key).is_ok());
 }
@@ -2711,35 +2707,35 @@ fn realm_caps_sharing(c: &Shared) {
     let v = &c.v;
     let r = &c.r;
     let adv = c.adv();
-    // The realm caps who may share a vault; 0 keeps vaults to their owners.
+    // The realm caps who may share a seal; 0 keeps seals to their owners.
     r.dir.limits.borrow_mut().max_members = 1;
     assert!(
-        vault_op(
+        seal_op(
             r,
             adv,
             ALICE,
-            &share_op("db", vault::Members::default(), member_users(&["dave"]))
+            &share_op("db", seal::Members::default(), member_users(&["dave"]))
         )
         .is_err()
     );
     r.dir.limits.borrow_mut().max_members = 0;
-    let lonely = VaultOp::Create {
+    let lonely = SealOp::Create {
         name: "lonely".into(),
-        policy: v.vault().policy.clone(),
+        policy: v.seal().policy.clone(),
     };
-    vault_op(r, adv, ALICE, &lonely).unwrap();
+    seal_op(r, adv, ALICE, &lonely).unwrap();
     assert!(
-        vault_op(
+        seal_op(
             r,
             adv,
             ALICE,
-            &share_op("lonely", vault::Members::default(), member_users(&["bob"]))
+            &share_op("lonely", seal::Members::default(), member_users(&["bob"]))
         )
         .is_err()
     );
 }
 
-/// Releases of a user vault are limited by opener, not by `P`: a member
+/// Releases of a user seal are limited by opener, not by `P`: a member
 /// out of allowance does not stop the owner.
 fn openers_have_their_own_allowance(c: &Shared) {
     let r = &c.r;
@@ -2747,7 +2743,7 @@ fn openers_have_their_own_allowance(c: &Shared) {
         let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(who, cb));
         c.sealed.open(
             Unlock {
-                device: Some(key as &dyn vault::DeviceKey),
+                device: Some(key as &dyn seal::DeviceKey),
                 session: None,
                 ticket: Some(&mut ticket),
                 release: None,
@@ -2769,7 +2765,7 @@ fn openers_have_their_own_allowance(c: &Shared) {
 }
 
 #[test]
-fn shared_vaults_open_for_their_members_with_their_own_devices() {
+fn shared_seals_open_for_their_members_with_their_own_devices() {
     let c = shared_fixture();
     members_not_managers(&c);
     members_open_with_their_own_devices(&c);
@@ -2789,54 +2785,54 @@ fn removing_a_member_starts_a_new_offline_epoch() {
     let epochs = |d: &[Descriptor]| {
         d[0].verify(REALM, &anchors, &Policy::default())
             .unwrap()
-            .vault()
+            .seal()
             .session_keys
             .len()
     };
-    let created = vault_op(
+    let created = seal_op(
         &r,
         adv,
         ALICE,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "travel".into(),
-            policy: vault::Policy {
+            policy: seal::Policy {
                 factors: Factors {
                     device: Some(Level::Any),
                     ticket: true,
                     passkey: false,
                 },
-                sessions: vault::Sessions {
+                sessions: seal::Sessions {
                     reauth: None,
                     offline: Some(3600),
                     epoch: None,
                 },
-                ..vault::Policy::default()
+                ..seal::Policy::default()
             },
         },
     )
     .unwrap();
-    let members = vault::Members {
+    let members = seal::Members {
         users: vec!["bob".into()],
-        ..vault::Members::default()
+        ..seal::Members::default()
     };
-    let shared = vault_op(
+    let shared = seal_op(
         &r,
         adv,
         ALICE,
-        &VaultOp::Share {
+        &SealOp::Share {
             name: "travel".into(),
-            managers: vault::Members::default(),
+            managers: seal::Members::default(),
             members: members.clone(),
-            depositors: vault::Members::default(),
+            depositors: seal::Members::default(),
         },
     )
     .unwrap();
     assert_eq!(epochs(&shared), epochs(&created), "sharing keeps the epoch");
-    vault_op(
+    seal_op(
         &r,
         adv,
         BOB,
-        &VaultOp::AddDevice {
+        &SealOp::AddDevice {
             name: "alice/travel".into(),
             label: "bob".into(),
             kind: DeviceType::File,
@@ -2845,15 +2841,15 @@ fn removing_a_member_starts_a_new_offline_epoch() {
         },
     )
     .unwrap();
-    let removed = vault_op(
+    let removed = seal_op(
         &r,
         adv,
         ALICE,
-        &VaultOp::Unshare {
+        &SealOp::Unshare {
             name: "travel".into(),
-            managers: vault::Members::default(),
+            managers: seal::Members::default(),
             members,
-            depositors: vault::Members::default(),
+            depositors: seal::Members::default(),
         },
     )
     .unwrap();
@@ -2861,42 +2857,42 @@ fn removing_a_member_starts_a_new_offline_epoch() {
 }
 
 #[test]
-fn a_vaults_limits_are_its_owners_by_their_groups() {
+fn a_seals_limits_are_its_owners_by_their_groups() {
     let r = realm();
     let adv = &r.verify(0);
-    // The realm: one vault each, and always a device.  Travellers: three
-    // vaults, and offline sessions.
+    // The realm: one seal each, and always a device.  Travellers: three
+    // seals, and offline sessions.
     *r.dir.limits.borrow_mut() = serde_json::from_value(serde_json::json!({
-        "max_lifetime": 400 * 86_400, "max_vaults": 1, "max_devices": 8,
+        "max_lifetime": 400 * 86_400, "max_seals": 1, "max_devices": 8,
         "max_reauth": 3600, "without_device": true, "descriptor_age": 86_400,
         "factors": [{ "device": "any" }],
         "groups": [{ "group": "travellers", "priority": 10,
-                     "max_vaults": 3, "offline_sessions": true }],
+                     "max_seals": 3, "offline_sessions": true }],
     }))
     .unwrap();
     r.dir
         .groups
         .borrow_mut()
         .insert(BOB.into(), vec!["travellers".into()]);
-    let with = |device: bool, offline: bool| vault::Policy {
+    let with = |device: bool, offline: bool| seal::Policy {
         factors: Factors {
             device: device.then_some(Level::Any),
             ticket: true,
             passkey: false,
         },
-        sessions: vault::Sessions {
+        sessions: seal::Sessions {
             reauth: None,
             offline: offline.then_some(3600),
             epoch: None,
         },
-        ..vault::Policy::default()
+        ..seal::Policy::default()
     };
-    let create = |who: &str, name: &str, policy: vault::Policy| {
-        vault_op(
+    let create = |who: &str, name: &str, policy: seal::Policy| {
+        seal_op(
             &r,
             adv,
             who,
-            &VaultOp::Create {
+            &SealOp::Create {
                 name: name.into(),
                 policy,
             },
@@ -2905,13 +2901,13 @@ fn a_vaults_limits_are_its_owners_by_their_groups() {
 
     // Alice has the realm's limits.
     create(ALICE, "a1", with(true, false)).unwrap();
-    assert!(create(ALICE, "a2", with(true, false)).is_err(), "one vault");
-    let offline = VaultOp::SetPolicy {
+    assert!(create(ALICE, "a2", with(true, false)).is_err(), "one seal");
+    let offline = SealOp::SetPolicy {
         name: "a1".into(),
         policy: with(true, true),
     };
     assert!(
-        vault_op(&r, adv, ALICE, &offline).is_err(),
+        seal_op(&r, adv, ALICE, &offline).is_err(),
         "no offline sessions"
     );
 
@@ -2923,50 +2919,47 @@ fn a_vaults_limits_are_its_owners_by_their_groups() {
     for name in ["b1", "b2", "b3"] {
         create(BOB, name, with(true, true)).unwrap();
     }
-    assert!(
-        create(BOB, "b4", with(true, false)).is_err(),
-        "three vaults"
-    );
+    assert!(create(BOB, "b4", with(true, false)).is_err(), "three seals");
 
-    // As a manager of Alice's vault, Bob still gets her limits, not his.
-    vault_op(
+    // As a manager of Alice's seal, Bob still gets her limits, not his.
+    seal_op(
         &r,
         adv,
         ALICE,
-        &VaultOp::Share {
+        &SealOp::Share {
             name: "a1".into(),
-            managers: vault::Members {
+            managers: seal::Members {
                 users: vec!["bob".into()],
-                ..vault::Members::default()
+                ..seal::Members::default()
             },
-            members: vault::Members::default(),
-            depositors: vault::Members::default(),
+            members: seal::Members::default(),
+            depositors: seal::Members::default(),
         },
     )
     .unwrap();
-    let offline = VaultOp::SetPolicy {
+    let offline = SealOp::SetPolicy {
         name: "alice/a1".into(),
         policy: with(true, true),
     };
-    assert!(vault_op(&r, adv, BOB, &offline).is_err());
-    let within = VaultOp::SetPolicy {
+    assert!(seal_op(&r, adv, BOB, &offline).is_err());
+    let within = SealOp::SetPolicy {
         name: "alice/a1".into(),
         policy: with(true, false),
     };
-    vault_op(&r, adv, BOB, &within).unwrap();
+    seal_op(&r, adv, BOB, &within).unwrap();
 }
 
 const DAVE: &str = "dave@EXAMPLE.TEST";
 
-/// Alice's break-glass vault, whose releases two of the on-call group
+/// Alice's break-glass seal, whose releases two of the on-call group
 /// approve, with two files sealed to it.  Bob, Carol, Dave and Alice
 /// herself are on call.
 struct BreakGlass {
     r: Realm,
-    vault: VaultId,
+    seal: SealId,
     key: ExchangeKeyPair,
-    password: SealedVaultFile,
-    recovery: SealedVaultFile,
+    password: SealedFile,
+    recovery: SealedFile,
 }
 
 impl BreakGlass {
@@ -2979,50 +2972,50 @@ impl BreakGlass {
                 .borrow_mut()
                 .insert(who.into(), vec!["oncall".into()]);
         }
-        let policy = vault::Policy {
+        let policy = seal::Policy {
             factors: Factors {
                 device: Some(Level::Any),
                 ticket: true,
                 passkey: false,
             },
-            approvals: Some(vault::Approvals {
+            approvals: Some(seal::Approvals {
                 m: 2,
-                from: vault::Members {
+                from: seal::Members {
                     groups: vec!["oncall".into()],
-                    ..vault::Members::default()
+                    ..seal::Members::default()
                 },
                 window: None,
                 uses: None,
             }),
-            ..vault::Policy::default()
+            ..seal::Policy::default()
         };
         // Offline sessions open without a server, hence without approvals.
-        let offline = vault::Policy {
-            sessions: vault::Sessions {
+        let offline = seal::Policy {
+            sessions: seal::Sessions {
                 reauth: None,
                 offline: Some(600),
                 epoch: None,
             },
             ..policy.clone()
         };
-        let create = |name: &str, policy| VaultOp::Create {
+        let create = |name: &str, policy| SealOp::Create {
             name: name.into(),
             policy,
         };
-        assert!(vault_op(&r, adv, ALICE, &create("bad", offline)).is_err());
-        vault_op(&r, adv, ALICE, &create("break-glass", policy)).unwrap();
+        assert!(seal_op(&r, adv, ALICE, &create("bad", offline)).is_err());
+        seal_op(&r, adv, ALICE, &create("break-glass", policy)).unwrap();
         let key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-        let added = vault_op(&r, adv, ALICE, &add_device_op("break-glass", &key)).unwrap();
+        let added = seal_op(&r, adv, ALICE, &add_device_op("break-glass", &key)).unwrap();
         let v = added[0]
             .verify(REALM, &r.all_anchors(), &Policy::default())
             .unwrap();
         let advs = [r.verify(0), r.verify(1)];
         let seal = |text: &[u8]| {
-            let f = SealedVaultFile::seal(&v, &[&advs[0], &advs[1]], text).unwrap();
-            SealedVaultFile::from_bytes(&f.to_bytes()).unwrap()
+            let f = SealedFile::seal(&v, &[&advs[0], &advs[1]], text).unwrap();
+            SealedFile::from_bytes(&f.to_bytes()).unwrap()
         };
         Self {
-            vault: v.vault().id,
+            seal: v.seal().id,
             password: seal(b"root password"),
             recovery: seal(b"recovery key"),
             r,
@@ -3031,37 +3024,37 @@ impl BreakGlass {
     }
 
     /// Open `file` as Alice, with her device and ticket, naming request `id`.
-    fn open(&self, file: &SealedVaultFile, id: Option<&str>) -> Result<SecretBuf, Error> {
+    fn open(&self, file: &SealedFile, id: Option<&str>) -> Result<SecretBuf, Error> {
         let mut ticket = move |_: &str, cb: &[u8; 32]| Some(gss_token(ALICE, cb));
         file.open(
             Unlock {
-                device: Some(&self.key as &dyn vault::DeviceKey),
+                device: Some(&self.key as &dyn seal::DeviceKey),
                 session: None,
                 ticket: Some(&mut ticket),
-                release: id.map(|i| vault::ReleaseRequest::id_bytes(i).unwrap()),
+                release: id.map(|i| seal::ReleaseRequest::id_bytes(i).unwrap()),
                 passkey: None,
             },
             |s, req| ask_server(&self.r, s, req),
         )
     }
 
-    /// The request op for `file`, as `name` names the vault.
-    fn request_op(name: &str, file: &SealedVaultFile) -> VaultOp {
-        VaultOp::Request {
+    /// The request op for `file`, as `name` names the seal.
+    fn request_op(name: &str, file: &SealedFile) -> SealOp {
+        SealOp::Request {
             name: name.into(),
             bindings: file
                 .bindings()
                 .unwrap()
                 .iter()
-                .map(vault::binding_hex)
+                .map(seal::binding_hex)
                 .collect(),
             reason: "INC-1: the database is down".into(),
         }
     }
 
     /// Alice asks for the release of `file`; the request's id.
-    fn request(&self, file: &SealedVaultFile) -> String {
-        let reply = vault_reply(
+    fn request(&self, file: &SealedFile) -> String {
+        let reply = seal_reply(
             &self.r,
             &self.r.verify(0),
             ALICE,
@@ -3074,11 +3067,11 @@ impl BreakGlass {
     fn decide(&self, who: &str, id: &str, deny: bool) -> Result<Vec<Descriptor>, ()> {
         let (name, id) = ("alice/break-glass".to_owned(), id.to_owned());
         let op = if deny {
-            VaultOp::Deny { name, id }
+            SealOp::Deny { name, id }
         } else {
-            VaultOp::Approve { name, id }
+            SealOp::Approve { name, id }
         };
-        vault_op(&self.r, &self.r.verify(0), who, &op)
+        seal_op(&self.r, &self.r.verify(0), who, &op)
     }
 }
 
@@ -3103,9 +3096,9 @@ fn approvals_count_others_once(c: &BreakGlass) {
     );
     assert!(c.open(password, Some(&id)).is_err(), "used up");
     assert!(c.open(recovery, Some(&id)).is_err(), "another file");
-    // Dave approves for the vault without being its member: he sees the
+    // Dave approves for the seal without being its member: he sees the
     // request pending.
-    let pending = vault_reply(&c.r, &c.r.verify(0), DAVE, &VaultOp::Pending { name: None });
+    let pending = seal_reply(&c.r, &c.r.verify(0), DAVE, &SealOp::Pending { name: None });
     assert_eq!(pending.requests.len(), 1);
     assert_eq!(pending.requests[0].approvals.len(), 2);
 }
@@ -3128,7 +3121,7 @@ fn approvers_count_while_admitted(c: &BreakGlass) {
 }
 
 /// A denial, or the end of its window, ends a request; and only those with
-/// a part in the vault ask.
+/// a part in the seal ask.
 fn requests_end(c: &BreakGlass) {
     let id = c.request(&c.recovery);
     c.decide(BOB, &id, true).unwrap();
@@ -3140,12 +3133,12 @@ fn requests_end(c: &BreakGlass) {
     c.r.dir
         .releases
         .borrow_mut()
-        .get_mut(&(c.vault, id.clone()))
+        .get_mut(&(c.seal, id.clone()))
         .unwrap()
         .not_after = 1;
     assert!(c.open(&c.recovery, Some(&id)).is_err(), "expired");
     let by_bob = BreakGlass::request_op("alice/break-glass", &c.recovery);
-    assert!(vault_op(&c.r, &c.r.verify(0), BOB, &by_bob).is_err());
+    assert!(seal_op(&c.r, &c.r.verify(0), BOB, &by_bob).is_err());
 }
 
 #[test]
@@ -3163,48 +3156,48 @@ fn device_keys_are_escrowed_for_their_holders_and_logged() {
     let key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
     let device = key.public().kid().to_string();
     let escrow = |who: &str, device: &str, blob: &[u8]| {
-        vault_reply_at(
+        seal_reply_at(
             &r,
             0,
             adv,
             who,
-            &VaultOp::EscrowCode {
+            &SealOp::EscrowCode {
                 device: device.into(),
                 blob: tang_pqc::b64::encode(blob),
             },
         )
     };
-    // Only a device the caller holds in a vault.
+    // Only a device the caller holds in a seal.
     assert!(escrow(ALICE, &device, b"blob").is_err());
-    vault_op(
+    seal_op(
         &r,
         adv,
         ALICE,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "notes".into(),
-            policy: vault::Policy {
+            policy: seal::Policy {
                 factors: Factors {
                     device: Some(Level::Any),
                     ticket: true,
                     passkey: false,
                 },
-                ..vault::Policy::default()
+                ..seal::Policy::default()
             },
         },
     )
     .unwrap();
-    vault_op(&r, adv, ALICE, &add_device_op("notes", &key)).unwrap();
+    seal_op(&r, adv, ALICE, &add_device_op("notes", &key)).unwrap();
     assert!(escrow(BOB, &device, b"blob").is_err(), "not Bob's device");
     assert!(escrow(ALICE, &device, b"").is_err(), "empty");
-    let big = vec![7u8; vault::MAX_ESCROW_BLOB + 1];
+    let big = vec![7u8; seal::MAX_ESCROW_BLOB + 1];
     assert!(escrow(ALICE, &device, &big).is_err(), "too large");
 
-    // Kept, replaced by the next, and logged in the vault of the device.
+    // Kept, replaced by the next, and logged in the seal of the device.
     let first = escrow(ALICE, &device, b"first").unwrap();
     assert_eq!(first.escrows.len(), 1);
     assert_eq!(first.receipts.len(), 1, "logged");
     escrow(ALICE, &device, b"second").unwrap();
-    let fetched = vault_reply_at(&r, 0, adv, ALICE, &VaultOp::RecoverCode).unwrap();
+    let fetched = seal_reply_at(&r, 0, adv, ALICE, &SealOp::RecoverCode).unwrap();
     assert_eq!(fetched.escrows.len(), 1);
     assert_eq!(
         tang_pqc::b64::decode(&fetched.escrows[0].blob).unwrap(),
@@ -3212,11 +3205,11 @@ fn device_keys_are_escrowed_for_their_holders_and_logged() {
     );
     assert_eq!(fetched.receipts.len(), 1, "the fetch is logged too");
     // Bob fetches only his own: none.
-    let bobs = vault_reply_at(&r, 0, adv, BOB, &VaultOp::RecoverCode).unwrap();
+    let bobs = seal_reply_at(&r, 0, adv, BOB, &SealOp::RecoverCode).unwrap();
     assert_eq!(bobs.escrows, Vec::new());
 }
 
-/// Alice's helpdesk vault for disks: Carol a member, Bob a depositor.
+/// Alice's helpdesk seal for disks: Carol a member, Bob a depositor.
 struct Disks {
     r: Realm,
     carol_key: ExchangeKeyPair,
@@ -3227,37 +3220,37 @@ impl Disks {
     fn new() -> Self {
         let (r, _) = logged_realm();
         let adv = &r.verify(0);
-        let policy = vault::Policy {
+        let policy = seal::Policy {
             factors: Factors {
                 device: Some(Level::Any),
                 ticket: true,
                 passkey: false,
             },
-            sealing: vault::Sealing::Registered,
-            ..vault::Policy::default()
+            sealing: seal::Sealing::Registered,
+            ..seal::Policy::default()
         };
         for name in ["disks", "other"] {
-            let op = VaultOp::Create {
+            let op = SealOp::Create {
                 name: name.into(),
                 policy: policy.clone(),
             };
-            vault_op(&r, adv, ALICE, &op).unwrap();
+            seal_op(&r, adv, ALICE, &op).unwrap();
         }
         let alice_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-        vault_op(&r, adv, ALICE, &add_device_op("disks", &alice_key)).unwrap();
-        let other = vault_op(&r, adv, ALICE, &add_device_op("other", &alice_key)).unwrap();
+        seal_op(&r, adv, ALICE, &add_device_op("disks", &alice_key)).unwrap();
+        let other = seal_op(&r, adv, ALICE, &add_device_op("other", &alice_key)).unwrap();
         let other = other[0]
             .verify(REALM, &r.all_anchors(), &Policy::default())
             .unwrap();
-        let shared = VaultOp::Share {
+        let shared = SealOp::Share {
             name: "disks".into(),
-            managers: vault::Members::default(),
+            managers: seal::Members::default(),
             members: member_users(&["carol"]),
             depositors: member_users(&["bob"]),
         };
-        vault_op(&r, adv, ALICE, &shared).unwrap();
+        seal_op(&r, adv, ALICE, &shared).unwrap();
         let carol_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-        vault_op(&r, adv, CAROL, &add_device_op("alice/disks", &carol_key)).unwrap();
+        seal_op(&r, adv, CAROL, &add_device_op("alice/disks", &carol_key)).unwrap();
         Self {
             r,
             carol_key,
@@ -3265,13 +3258,13 @@ impl Disks {
         }
     }
 
-    /// `who`'s view of the vault, to seal with.
+    /// `who`'s view of the seal, to seal with.
     fn descriptor(&self, who: &str) -> VerifiedDescriptor {
-        let shown = vault_op(
+        let shown = seal_op(
             &self.r,
             &self.r.verify(0),
             who,
-            &VaultOp::Show {
+            &SealOp::Show {
                 name: "alice/disks".into(),
             },
         )
@@ -3281,22 +3274,22 @@ impl Disks {
             .unwrap()
     }
 
-    fn seal(&self, d: &VerifiedDescriptor, text: &[u8]) -> SealedVaultFile {
+    fn seal(&self, d: &VerifiedDescriptor, text: &[u8]) -> SealedFile {
         let advs = [self.r.verify(0), self.r.verify(1)];
-        SealedVaultFile::seal(d, &[&advs[0], &advs[1]], text).unwrap()
+        SealedFile::seal(d, &[&advs[0], &advs[1]], text).unwrap()
     }
 
-    fn op(&self, who: &str, op: &VaultOp) -> Result<vault::Reply, ()> {
-        vault_reply_at(&self.r, 0, &self.r.verify(0), who, op)
+    fn op(&self, who: &str, op: &SealOp) -> Result<seal::Reply, ()> {
+        seal_reply_at(&self.r, 0, &self.r.verify(0), who, op)
     }
 
     /// Bob deposits `file` as the LUKS key of volume `uuid`.
-    fn deposit(&self, file: &SealedVaultFile, uuid: &str) -> Result<vault::Reply, ()> {
+    fn deposit(&self, file: &SealedFile, uuid: &str) -> Result<seal::Reply, ()> {
         self.op(
             BOB,
-            &VaultOp::Deposit {
+            &SealOp::Deposit {
                 name: "alice/disks".into(),
-                kind: vault::DepositKind::Luks,
+                kind: seal::DepositKind::Luks,
                 subject: [("uuid".to_owned(), uuid.to_owned())].into(),
                 sealed: tang_pqc::b64::encode(&file.to_bytes()),
             },
@@ -3304,20 +3297,19 @@ impl Disks {
     }
 
     /// The deposits `who` lists.
-    fn listed(&self, who: &str) -> Vec<vault::Deposit> {
+    fn listed(&self, who: &str) -> Vec<seal::Deposit> {
         let name = "alice/disks".into();
-        self.op(who, &VaultOp::Deposits { name }).unwrap().deposits
+        self.op(who, &SealOp::Deposits { name }).unwrap().deposits
     }
 
     /// Deposit `id`'s file, as Carol fetches it.
-    fn fetched(&self, id: &str) -> SealedVaultFile {
-        let fetch = VaultOp::FetchDeposit {
+    fn fetched(&self, id: &str) -> SealedFile {
+        let fetch = SealOp::FetchDeposit {
             name: "alice/disks".into(),
             id: id.into(),
         };
         let reply = self.op(CAROL, &fetch).unwrap();
-        SealedVaultFile::from_bytes(&tang_pqc::b64::decode(&reply.deposits[0].sealed).unwrap())
-            .unwrap()
+        SealedFile::from_bytes(&tang_pqc::b64::decode(&reply.deposits[0].sealed).unwrap()).unwrap()
     }
 }
 
@@ -3332,7 +3324,7 @@ fn depositors_deposit_members_open(d: &Disks) {
     // Bob may not open: no device, no registering, no fetching.
     let bob_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
     assert!(d.op(BOB, &add_device_op("alice/disks", &bob_key)).is_err());
-    let fetch = VaultOp::FetchDeposit {
+    let fetch = SealOp::FetchDeposit {
         name: "alice/disks".into(),
         id: id.clone(),
     };
@@ -3351,7 +3343,7 @@ fn depositors_deposit_members_open(d: &Disks) {
 
 /// A deposit of the same kind and subject replaces the last, whose file
 /// stops opening; others count against the limit; files sealed to other
-/// vaults are refused.
+/// seals are refused.
 fn deposits_replace_and_are_limited(d: &Disks) {
     let bobs = d.descriptor(BOB);
     let old = d.fetched(&d.listed(CAROL)[0].id);
@@ -3368,7 +3360,7 @@ fn deposits_replace_and_are_limited(d: &Disks) {
     let elsewhere = d.seal(&d.other, b"x");
     assert!(
         d.deposit(&elsewhere, "5678").is_err(),
-        "another vault's file"
+        "another seal's file"
     );
     d.r.dir.limits.borrow_mut().max_deposits = 1;
     assert!(d.deposit(&new, "5678").is_err(), "one deposit each");
@@ -3379,7 +3371,7 @@ fn deposits_replace_and_are_limited(d: &Disks) {
 fn deposits_retire(d: &Disks) {
     let id = d.listed(BOB)[0].id.clone();
     let retire = |who: &str| {
-        let op = VaultOp::RetireDeposit {
+        let op = SealOp::RetireDeposit {
             name: "alice/disks".into(),
             id: id.clone(),
         };
@@ -3388,10 +3380,10 @@ fn deposits_retire(d: &Disks) {
     assert!(retire(CAROL).is_err(), "not hers, and not a manager");
     retire(BOB).unwrap();
     assert_eq!(d.listed(CAROL), Vec::new());
-    let leave = VaultOp::Unshare {
+    let leave = SealOp::Unshare {
         name: "alice/disks".into(),
-        managers: vault::Members::default(),
-        members: vault::Members::default(),
+        managers: seal::Members::default(),
+        members: seal::Members::default(),
         depositors: member_users(&["bob"]),
     };
     d.op(BOB, &leave).unwrap();
@@ -3406,37 +3398,37 @@ fn depositors_deposit_and_never_open() {
     deposits_retire(&d);
 }
 
-/// Carol's escrow vault, which the realm names for device keys and whose
-/// depositor Alice is, with deposits required; Alice's vault `notes`.
+/// Carol's escrow seal, which the realm names for device keys and whose
+/// depositor Alice is, with deposits required; Alice's seal `notes`.
 fn helpdesk_realm() -> Realm {
     let (r, _) = logged_realm();
     let adv = &r.verify(0);
-    let policy = vault::Policy {
+    let policy = seal::Policy {
         factors: Factors {
             device: Some(Level::Any),
             ticket: true,
             passkey: false,
         },
-        ..vault::Policy::default()
+        ..seal::Policy::default()
     };
     for (who, name) in [(CAROL, "escrow"), (ALICE, "notes")] {
-        let create = VaultOp::Create {
+        let create = SealOp::Create {
             name: name.into(),
             policy: policy.clone(),
         };
-        vault_op(&r, adv, who, &create).unwrap();
+        seal_op(&r, adv, who, &create).unwrap();
     }
     let carol_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-    vault_op(&r, adv, CAROL, &add_device_op("escrow", &carol_key)).unwrap();
-    let shared = VaultOp::Share {
+    seal_op(&r, adv, CAROL, &add_device_op("escrow", &carol_key)).unwrap();
+    let shared = SealOp::Share {
         name: "escrow".into(),
-        managers: vault::Members::default(),
-        members: vault::Members::default(),
+        managers: seal::Members::default(),
+        members: seal::Members::default(),
         depositors: member_users(&["alice"]),
     };
-    vault_op(&r, adv, CAROL, &shared).unwrap();
-    *r.dir.recovery.borrow_mut() = Some(vault::RecoverySettings {
-        device_vault: "carol/escrow".into(),
+    seal_op(&r, adv, CAROL, &shared).unwrap();
+    *r.dir.recovery.borrow_mut() = Some(seal::RecoverySettings {
+        device_seal: "carol/escrow".into(),
         required: true,
     });
     r
@@ -3445,16 +3437,16 @@ fn helpdesk_realm() -> Realm {
 /// Alice's device is registered only once its key is deposited.
 fn device_keys_are_deposited_first(r: &Realm, laptop: &ExchangeKeyPair) {
     let adv = &r.verify(0);
-    let op = |who: &str, op: &VaultOp| vault_reply_at(r, 0, adv, who, op);
-    let settings = op(BOB, &VaultOp::RecoverySettings).unwrap().recovery;
-    assert_eq!(settings.unwrap().device_vault, "carol/escrow");
+    let op = |who: &str, op: &SealOp| seal_reply_at(r, 0, adv, who, op);
+    let settings = op(BOB, &SealOp::RecoverySettings).unwrap().recovery;
+    assert_eq!(settings.unwrap().device_seal, "carol/escrow");
     assert!(
         op(ALICE, &add_device_op("notes", laptop)).is_err(),
         "not deposited"
     );
     let escrow = op(
         ALICE,
-        &VaultOp::Show {
+        &SealOp::Show {
             name: "carol/escrow".into(),
         },
     )
@@ -3464,10 +3456,10 @@ fn device_keys_are_deposited_first(r: &Realm, laptop: &ExchangeKeyPair) {
         .unwrap();
     let advs = [r.verify(0), r.verify(1)];
     let jwk = laptop.to_jwk().unwrap();
-    let sealed = SealedVaultFile::seal(&escrow, &[&advs[0], &advs[1]], jwk.as_ref()).unwrap();
-    let deposit = VaultOp::Deposit {
+    let sealed = SealedFile::seal(&escrow, &[&advs[0], &advs[1]], jwk.as_ref()).unwrap();
+    let deposit = SealOp::Deposit {
         name: "carol/escrow".into(),
-        kind: vault::DepositKind::Device,
+        kind: seal::DepositKind::Device,
         subject: [("device".to_owned(), laptop.public().kid().to_string())].into(),
         sealed: tang_pqc::b64::encode(&sealed.to_bytes()),
     };
@@ -3479,10 +3471,10 @@ fn device_keys_are_deposited_first(r: &Realm, laptop: &ExchangeKeyPair) {
 /// only to a device the user registered; only that device opens it.
 fn the_helpdesk_delivers(r: &Realm, laptop: &ExchangeKeyPair) {
     let adv = &r.verify(0);
-    let op = |who: &str, op: &VaultOp| vault_reply_at(r, 0, adv, who, op);
+    let op = |who: &str, op: &SealOp| seal_reply_at(r, 0, adv, who, op);
     let id = laptop.public().kid().to_string();
     let key_of = |who: &str, device: &str| {
-        let lookup = VaultOp::DeviceKey {
+        let lookup = SealOp::DeviceKey {
             user: ALICE.into(),
             device: device.into(),
         };
@@ -3493,9 +3485,9 @@ fn the_helpdesk_delivers(r: &Realm, laptop: &ExchangeKeyPair) {
     let found = key_of(CAROL, &id).unwrap().devices;
     assert_eq!(found[0].public().unwrap().kid(), laptop.public().kid());
     let lost = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-    let blob = vault::seal_delivery(laptop.public(), &lost).unwrap();
+    let blob = seal::seal_delivery(laptop.public(), &lost).unwrap();
     let deliver = |who: &str, blob: &[u8]| {
-        let delivery = VaultOp::Deliver {
+        let delivery = SealOp::Deliver {
             user: ALICE.into(),
             device: id.clone(),
             blob: tang_pqc::b64::encode(blob),
@@ -3505,11 +3497,11 @@ fn the_helpdesk_delivers(r: &Realm, laptop: &ExchangeKeyPair) {
     assert!(deliver(BOB, &blob).is_err(), "not the helpdesk");
     assert!(deliver(CAROL, b"not a delivery").is_err());
     let delivered = deliver(CAROL, &blob).unwrap();
-    assert_eq!(delivered.receipts.len(), 1, "logged in Alice's vault");
-    let escrows = op(ALICE, &VaultOp::RecoverCode).unwrap().escrows;
+    assert_eq!(delivered.receipts.len(), 1, "logged in Alice's seal");
+    let escrows = op(ALICE, &SealOp::RecoverCode).unwrap().escrows;
     let delivery = escrows.iter().find(|e| e.kind == "delivery").unwrap();
     let opened =
-        vault::open_delivery(&tang_pqc::b64::decode(&delivery.blob).unwrap(), laptop).unwrap();
+        seal::open_delivery(&tang_pqc::b64::decode(&delivery.blob).unwrap(), laptop).unwrap();
     assert_eq!(opened.public().kid(), lost.public().kid());
 }
 
@@ -3521,17 +3513,17 @@ fn the_helpdesk_delivers_deposited_device_keys() {
     the_helpdesk_delivers(&r, &laptop);
 }
 
-/// Run a vault operation as `caller` against server `i`.
-fn vault_reply_at(
+/// Run a seal operation as `caller` against server `i`.
+fn seal_reply_at(
     r: &Realm,
     i: usize,
     adv: &VerifiedRealm,
     caller: &str,
-    op: &VaultOp,
-) -> Result<vault::Reply, ()> {
+    op: &SealOp,
+) -> Result<seal::Reply, ()> {
     let p = Prepared::new(
         adv,
-        Operation::Vault,
+        Operation::Seal,
         HOST,
         AuthType::Kerberos,
         &Enctype::DEFAULT,
@@ -3542,23 +3534,23 @@ fn vault_reply_at(
         .with_kerberos(fake_binding(caller, &cb))
         .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
         .unwrap();
-    let response = r.send(i, Operation::Vault, &request)?;
-    vault::Reply::from_bytes(pending.open(&response).map_err(|_| ())?.as_ref()).map_err(|_| ())
+    let response = r.send(i, Operation::Seal, &request)?;
+    seal::Reply::from_bytes(pending.open(&response).map_err(|_| ())?.as_ref()).map_err(|_| ())
 }
 
-/// Unlock the travel vault as Alice from server `i`, offline, with `device`.
+/// Unlock the travel seal as Alice from server `i`, offline, with `device`.
 fn unlock_travel(
     r: &Realm,
     advs: &[VerifiedRealm; 2],
     i: usize,
     device: &ExchangeKeyPair,
-) -> Result<vault::Reply, ()> {
-    vault_reply_at(
+) -> Result<seal::Reply, ()> {
+    seal_reply_at(
         r,
         i,
         &advs[i],
         ALICE,
-        &VaultOp::Unlock {
+        &SealOp::Unlock {
             name: "travel".into(),
             device: device.public().kid().to_string(),
             offline: true,
@@ -3573,29 +3565,24 @@ fn the_epoch_turns(
     r: &Realm,
     advs: &[VerifiedRealm; 2],
     anchors: &[Thumbprint],
-    show: &VaultOp,
+    show: &SealOp,
     device: &ExchangeKeyPair,
-    vault: &VaultId,
+    seal: &SealId,
     keys: &[(u64, ExchangeKeyPair)],
 ) {
     // The epoch turns: new files use epoch 2, which the old release lacks.
-    r.dir
-        .vaults
-        .borrow_mut()
-        .get_mut(vault)
-        .unwrap()
-        .session_keys[0]
-        .started -= vault::DEFAULT_EPOCH + 1;
-    let turned = vault_reply_at(r, 0, &advs[0], ALICE, show).unwrap();
+    r.dir.seals.borrow_mut().get_mut(seal).unwrap().session_keys[0].started -=
+        seal::DEFAULT_EPOCH + 1;
+    let turned = seal_reply_at(r, 0, &advs[0], ALICE, show).unwrap();
     let d2 = turned.descriptors[0]
         .verify(REALM, anchors, &Policy::default())
         .unwrap();
-    assert_eq!(d2.vault().session_keys.len(), 2);
-    let newer = vault::SessionSealedFile::seal(&d2, b"later").unwrap();
+    assert_eq!(d2.seal().session_keys.len(), 2);
+    let newer = seal::SessionSealedFile::seal(&d2, b"later").unwrap();
     assert_eq!(newer.epoch(), 2);
     assert!(!keys.iter().any(|(e, _)| *e == 2));
     let again = unlock_travel(r, advs, 0, device).unwrap().released.unwrap();
-    let keys = again.open(device, vault).unwrap();
+    let keys = again.open(device, seal).unwrap();
     let (_, k2) = keys.iter().find(|(e, _)| *e == 2).unwrap();
     assert_eq!(newer.open(k2, device).unwrap().as_ref(), b"later");
 
@@ -3611,33 +3598,33 @@ fn offline_sessions_release_epoch_keys_to_the_device() {
     let anchors = r.all_anchors();
     let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
     let other = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-    let policy = vault::Policy {
+    let policy = seal::Policy {
         factors: Factors {
             device: Some(Level::Any),
             ticket: true,
             passkey: false,
         },
-        sessions: vault::Sessions {
+        sessions: seal::Sessions {
             reauth: None,
             offline: Some(3600),
             epoch: None,
         },
-        ..vault::Policy::default()
+        ..seal::Policy::default()
     };
-    let create = VaultOp::Create {
+    let create = SealOp::Create {
         name: "travel".into(),
         policy,
     };
     // The realm allows no offline sessions until an administrator says so.
-    assert!(vault_reply_at(&r, 0, &advs[0], ALICE, &create).is_err());
+    assert!(seal_reply_at(&r, 0, &advs[0], ALICE, &create).is_err());
     r.dir.limits.borrow_mut().offline_sessions = true;
-    vault_reply_at(&r, 0, &advs[0], ALICE, &create).unwrap();
-    vault_reply_at(
+    seal_reply_at(&r, 0, &advs[0], ALICE, &create).unwrap();
+    seal_reply_at(
         &r,
         0,
         &advs[0],
         ALICE,
-        &VaultOp::AddDevice {
+        &SealOp::AddDevice {
             name: "travel".into(),
             label: "laptop".into(),
             kind: DeviceType::File,
@@ -3649,25 +3636,25 @@ fn offline_sessions_release_epoch_keys_to_the_device() {
 
     // ipa2 publishes its escrow key on its first operation; ipa1 then seals
     // the epoch key to it too, so ipa2 can release it.
-    let show = VaultOp::Show {
+    let show = SealOp::Show {
         name: "travel".into(),
     };
-    vault_reply_at(&r, 1, &advs[1], ALICE, &show).unwrap();
-    let shown = vault_reply_at(&r, 0, &advs[0], ALICE, &show).unwrap();
+    seal_reply_at(&r, 1, &advs[1], ALICE, &show).unwrap();
+    let shown = seal_reply_at(&r, 0, &advs[0], ALICE, &show).unwrap();
     let d = shown.descriptors[0]
         .verify(REALM, &anchors, &Policy::default())
         .unwrap();
-    assert_eq!(d.vault().session_keys.len(), 1);
-    assert!(d.vault().session_keys[0].slots.is_empty(), "public only");
-    let stored = r.dir.vaults.borrow()[&d.vault().id].clone();
+    assert_eq!(d.seal().session_keys.len(), 1);
+    assert!(d.seal().session_keys[0].slots.is_empty(), "public only");
+    let stored = r.dir.seals.borrow()[&d.seal().id].clone();
     assert_eq!(
         stored.session_keys[0].slots.len(),
         2,
         "sealed to both servers"
     );
 
-    let sealed = vault::SessionSealedFile::seal(&d, b"boarding pass").unwrap();
-    let sealed = vault::SessionSealedFile::from_bytes(&sealed.to_bytes()).unwrap();
+    let sealed = seal::SessionSealedFile::seal(&d, b"boarding pass").unwrap();
+    let sealed = seal::SessionSealedFile::from_bytes(&sealed.to_bytes()).unwrap();
     assert_eq!(sealed.epoch(), 1);
 
     let released = unlock_travel(&r, &advs, 1, &device)
@@ -3675,10 +3662,10 @@ fn offline_sessions_release_epoch_keys_to_the_device() {
         .released
         .unwrap();
     assert!(
-        released.open(&other, &d.vault().id).is_err(),
+        released.open(&other, &d.seal().id).is_err(),
         "only the device opens it"
     );
-    let keys = released.open(&device, &d.vault().id).unwrap();
+    let keys = released.open(&device, &d.seal().id).unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(
         sealed.open(&keys[0].1, &device).unwrap().as_ref(),
@@ -3688,44 +3675,44 @@ fn offline_sessions_release_epoch_keys_to_the_device() {
         sealed.open(&keys[0].1, &other).is_err(),
         "the device share too"
     );
-    let counted = vault_reply_at(&r, 0, &advs[0], ALICE, &show).unwrap();
+    let counted = seal_reply_at(&r, 0, &advs[0], ALICE, &show).unwrap();
     assert_eq!(
         counted.descriptors[0]
             .verify(REALM, &anchors, &Policy::default())
             .unwrap()
-            .vault()
+            .seal()
             .unlocks,
         1
     );
 
-    the_epoch_turns(&r, &advs, &anchors, &show, &device, &d.vault().id, &keys);
+    the_epoch_turns(&r, &advs, &anchors, &show, &device, &d.seal().id, &keys);
 }
 
 #[test]
-fn an_offline_unlock_settles_the_vault_first() {
+fn an_offline_unlock_settles_the_seal_first() {
     let (r, _) = logged_realm();
     let adv = &r.verify(0);
     let anchors = r.all_anchors();
-    let op = |who: &str, o: &VaultOp| vault_reply_at(&r, 0, adv, who, o);
+    let op = |who: &str, o: &SealOp| seal_reply_at(&r, 0, adv, who, o);
     let alice_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
     let bob_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
     r.dir.limits.borrow_mut().offline_sessions = true;
     op(
         ALICE,
-        &VaultOp::Create {
+        &SealOp::Create {
             name: "travel".into(),
-            policy: vault::Policy {
+            policy: seal::Policy {
                 factors: Factors {
                     device: Some(Level::Any),
                     ticket: true,
                     passkey: false,
                 },
-                sessions: vault::Sessions {
+                sessions: seal::Sessions {
                     reauth: None,
                     offline: Some(3600),
                     epoch: None,
                 },
-                ..vault::Policy::default()
+                ..seal::Policy::default()
             },
         },
     )
@@ -3737,7 +3724,7 @@ fn an_offline_unlock_settles_the_vault_first() {
         .insert(BOB.into(), vec!["dba".into()]);
     op(
         ALICE,
-        &share_op("travel", vault::Members::default(), member_group("dba")),
+        &share_op("travel", seal::Members::default(), member_group("dba")),
     )
     .unwrap();
     op(BOB, &add_device_op("alice/travel", &bob_key)).unwrap();
@@ -3748,7 +3735,7 @@ fn an_offline_unlock_settles_the_vault_first() {
     r.dir.groups.borrow_mut().remove(BOB);
     let unlocked = op(
         ALICE,
-        &VaultOp::Unlock {
+        &SealOp::Unlock {
             name: "travel".into(),
             device: alice_key.public().kid().to_string(),
             offline: true,
@@ -3758,18 +3745,18 @@ fn an_offline_unlock_settles_the_vault_first() {
     .unwrap();
     let v = verified_descriptor(&anchors, &unlocked.descriptors);
     let holders: Vec<_> = v
-        .vault()
+        .seal()
         .devices
         .iter()
-        .map(|d| v.vault().holder(d))
+        .map(|d| v.seal().holder(d))
         .collect();
     assert_eq!(holders, [ALICE]);
-    assert_eq!(v.vault().session_keys.len(), 2, "a new epoch started");
+    assert_eq!(v.seal().session_keys.len(), 2, "a new epoch started");
     assert_eq!(unlocked.receipts.len(), 2, "the removal and the unlock");
     let keys = unlocked
         .released
         .unwrap()
-        .open(&alice_key, &v.vault().id)
+        .open(&alice_key, &v.seal().id)
         .unwrap();
     assert!(keys.iter().any(|(e, _)| *e == 2), "the new epoch's key");
 }
@@ -3780,22 +3767,22 @@ fn registered_sealing_opens_only_registered_files() {
     let advs = [r.verify(0), r.verify(1)];
     let anchors = r.all_anchors();
     let device = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
-    let registered = vault::Policy {
+    let registered = seal::Policy {
         factors: Factors {
             device: Some(Level::Any),
             ticket: false,
             passkey: false,
         },
-        sealing: vault::Sealing::Registered,
-        ..vault::Policy::default()
+        sealing: seal::Sealing::Registered,
+        ..seal::Policy::default()
     };
-    let op = |o: &VaultOp| vault_reply_at(&r, 0, &advs[0], ALICE, o);
-    op(&VaultOp::Create {
+    let op = |o: &SealOp| seal_reply_at(&r, 0, &advs[0], ALICE, o);
+    op(&SealOp::Create {
         name: "r".into(),
         policy: registered.clone(),
     })
     .unwrap();
-    let reply = op(&VaultOp::AddDevice {
+    let reply = op(&SealOp::AddDevice {
         name: "r".into(),
         label: "d".into(),
         kind: DeviceType::File,
@@ -3806,12 +3793,12 @@ fn registered_sealing_opens_only_registered_files() {
     let d = reply.descriptors[0]
         .verify(REALM, &anchors, &Policy::default())
         .unwrap();
-    let sealed = SealedVaultFile::seal(&d, &[&advs[0], &advs[1]], b"r").unwrap();
+    let sealed = SealedFile::seal(&d, &[&advs[0], &advs[1]], b"r").unwrap();
     let hashes: Vec<String> = sealed
         .bindings()
         .unwrap()
         .iter()
-        .map(vault::binding_hex)
+        .map(seal::binding_hex)
         .collect();
     let ask = |s: &str, req: &EscrowRequest| {
         let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
@@ -3835,7 +3822,7 @@ fn registered_sealing_opens_only_registered_files() {
     // Not registered yet: no server opens it.
     assert!(open().is_err());
     let register = |add: &[String], retire: &[String]| {
-        op(&VaultOp::Register {
+        op(&SealOp::Register {
             name: "r".into(),
             add: add.to_vec(),
             retire: retire.to_vec(),
@@ -3846,7 +3833,7 @@ fn registered_sealing_opens_only_registered_files() {
         shown.descriptors[0]
             .verify(REALM, &anchors, &Policy::default())
             .unwrap()
-            .vault()
+            .seal()
             .bindings
             .is_empty(),
         "descriptors leave the registered bindings out"
@@ -3857,17 +3844,17 @@ fn registered_sealing_opens_only_registered_files() {
     assert!(open().is_err());
     assert!(register(&["not hex".into()], &[]).is_err());
 
-    // A vault that seals offline does not register.
-    op(&VaultOp::Create {
+    // A seal that seals offline does not register.
+    op(&SealOp::Create {
         name: "o".into(),
-        policy: vault::Policy {
-            sealing: vault::Sealing::Offline,
+        policy: seal::Policy {
+            sealing: seal::Sealing::Offline,
             ..registered
         },
     })
     .unwrap();
     assert!(
-        op(&VaultOp::Register {
+        op(&SealOp::Register {
             name: "o".into(),
             add: hashes,
             retire: Vec::new(),
@@ -4103,7 +4090,7 @@ fn signing_is_stated_logged_and_bound_by_policy() {
         &adv,
         ALICE,
         &tlog::Query {
-            vault: String::new(),
+            seal: String::new(),
             from: 0,
         },
     )
@@ -4159,7 +4146,7 @@ impl PasskeyCase {
         c
     }
 
-    /// Create Alice's vault `name` with `factors` (and sessions when it
+    /// Create Alice's seal `name` with `factors` (and sessions when it
     /// has a device), register `device` if given, and seal `contents`.
     fn seal(
         &self,
@@ -4167,50 +4154,50 @@ impl PasskeyCase {
         factors: Factors,
         device: Option<&ExchangeKeyPair>,
         contents: &[u8],
-    ) -> SealedVaultFile {
+    ) -> SealedFile {
         let adv = &self.advs[0];
-        let policy = vault::Policy {
-            sessions: vault::Sessions {
+        let policy = seal::Policy {
+            sessions: seal::Sessions {
                 reauth: factors.device.map(|_| 600),
                 offline: None,
                 epoch: None,
             },
             factors,
-            ..vault::Policy::default()
+            ..seal::Policy::default()
         };
-        vault_op(
+        seal_op(
             &self.r,
             adv,
             ALICE,
-            &VaultOp::Create {
+            &SealOp::Create {
                 name: name.into(),
                 policy,
             },
         )
         .unwrap();
         let described = match device {
-            Some(d) => vault_op(&self.r, adv, ALICE, &add_device_op(name, d)),
-            None => vault_op(&self.r, adv, ALICE, &VaultOp::Show { name: name.into() }),
+            Some(d) => seal_op(&self.r, adv, ALICE, &add_device_op(name, d)),
+            None => seal_op(&self.r, adv, ALICE, &SealOp::Show { name: name.into() }),
         }
         .unwrap();
         let v = described[0]
             .verify(REALM, &self.anchors, &Policy::default())
             .unwrap();
-        SealedVaultFile::seal(&v, &[&self.advs[0], &self.advs[1]], contents).unwrap()
+        SealedFile::seal(&v, &[&self.advs[0], &self.advs[1]], contents).unwrap()
     }
 
     /// Open `sealed` with `device` and whatever `sign` makes of each
     /// request's challenge.
     fn open(
         &self,
-        sealed: &SealedVaultFile,
+        sealed: &SealedFile,
         device: Option<&ExchangeKeyPair>,
         sign: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
     ) -> Result<SecretBuf, Error> {
         let mut passkey = |_: &str, challenge: &[u8; 32]| sign(challenge);
         sealed.open(
             Unlock {
-                device: device.map(|d| d as &dyn vault::DeviceKey),
+                device: device.map(|d| d as &dyn seal::DeviceKey),
                 session: None,
                 ticket: None,
                 release: None,
@@ -4231,7 +4218,7 @@ fn assert_by(a: &SoftAuthenticator, flags: u8) -> impl Fn(&[u8; 32]) -> Option<V
     move |c| Some(a.assert_with("example.test", c, flags).to_bytes())
 }
 
-/// Start a session on Alice's vault `keys` for `device` as `caller`, with
+/// Start a session on Alice's seal `keys` for `device` as `caller`, with
 /// `auth`'s assertion over the exchange's challenge when given.
 fn session_with_passkey(
     r: &Realm,
@@ -4239,18 +4226,18 @@ fn session_with_passkey(
     caller: &str,
     device: &ExchangeKeyPair,
     auth: Option<&SoftAuthenticator>,
-) -> Result<vault::Reply, ()> {
+) -> Result<seal::Reply, ()> {
     let p = Prepared::new(
         adv,
-        Operation::Vault,
+        Operation::Seal,
         HOST,
         AuthType::Kerberos,
         &Enctype::DEFAULT,
     )
     .unwrap();
     let cb = p.channel_binding().unwrap();
-    let challenge = vault::session_passkey_challenge(&cb).unwrap();
-    let op = VaultOp::Unlock {
+    let challenge = seal::session_passkey_challenge(&cb).unwrap();
+    let op = SealOp::Unlock {
         name: "keys".into(),
         device: device.public().kid().to_string(),
         offline: false,
@@ -4261,8 +4248,8 @@ fn session_with_passkey(
         .with_kerberos(fake_binding(caller, &cb))
         .seal(&gss_token(caller, &cb), &[], &op.to_bytes())
         .unwrap();
-    let response = r.send(0, Operation::Vault, &request)?;
-    vault::Reply::from_bytes(pending.open(&response).map_err(|_| ())?.as_ref()).map_err(|_| ())
+    let response = r.send(0, Operation::Seal, &request)?;
+    seal::Reply::from_bytes(pending.open(&response).map_err(|_| ())?.as_ref()).map_err(|_| ())
 }
 
 /// The passkey factor (§7.6.5): an assertion from one of the opener's IPA
@@ -4275,7 +4262,7 @@ fn passkey_factor() {
     let adv = &c.advs[0];
 
     // What the client allows its authenticator to answer with.
-    let info = vault_reply(&c.r, adv, ALICE, &VaultOp::Passkeys)
+    let info = seal_reply(&c.r, adv, ALICE, &SealOp::Passkeys)
         .passkeys
         .unwrap();
     assert_eq!(info.rp_id, "example.test");
@@ -4338,7 +4325,7 @@ fn passkey_factor() {
 
 /// A session needs the caller's own assertion to start, and then stands
 /// in for it.
-fn passkey_sessions(c: &PasskeyCase, sealed: &SealedVaultFile, device: &ExchangeKeyPair) {
+fn passkey_sessions(c: &PasskeyCase, sealed: &SealedFile, device: &ExchangeKeyPair) {
     let adv = &c.advs[0];
     assert!(session_with_passkey(&c.r, adv, ALICE, device, None).is_err());
     assert!(session_with_passkey(&c.r, adv, ALICE, device, Some(&c.bobs)).is_err());

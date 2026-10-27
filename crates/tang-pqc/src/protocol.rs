@@ -297,7 +297,7 @@ impl OpenedRequest<'_> {
     /// Check that `tag` commits this binding to `data`: the tag
     /// [`Advertisement::provision_committed`](crate::Advertisement::provision_committed)
     /// returned for the same data.  Without it a server that authorises by
-    /// application data (a vault, a principal) sees only the ciphertext, and
+    /// application data (a seal, a principal) sees only the ciphertext, and
     /// a client could present someone else's binding under data it is
     /// authorised for.
     ///

@@ -1,4 +1,4 @@
-//! `kuipa seal`: a user's own vaults (§7.6.9).  Runs as the user, with
+//! `kuipa seal`: a user's own seals (§7.6.9).  Runs as the user, with
 //! their Kerberos ticket; nothing here needs root.
 //!
 //! The realm comes from the host's world-readable files (`realm.json`,
@@ -9,19 +9,19 @@
 //! ```text
 //! device.key            the device's ML-KEM key, under the passphrase or
 //!                       a passkey's hmac-secret (IPDK)
-//! vaults/<name>.vault   the last signed descriptor of each vault (IPVD)
+//! seals/<name>.seal   the last signed descriptor of each seal (IPVD)
 //! servers.json          the servers' signed advertisements, with when they
 //!                       were fetched, for sealing offline
 //! passkeys.json         the user's IPA passkeys, as the realm last listed
 //!                       them, for the passkey factor's allow list
 //! ```
 //!
-//! `vaults/<name>.tlog` holds what `kuipa tlog watch` last verified of
-//! each server's transparency log for that vault (DESIGN-tlog.md §7).
+//! `seals/<name>.tlog` holds what `kuipa tlog watch` last verified of
+//! each server's transparency log for that seal (DESIGN-tlog.md §7).
 //!
 //! A re-authentication session (`kuipa seal unlock`) lives in the runtime
 //! directory (`$KUIPA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/kuipa`: tmpfs,
-//! the user's own, gone at logout): `sessions/<vault id>` holds the
+//! the user's own, gone at logout): `sessions/<seal id>` holds the
 //! server's session token and the unwrapped device key until the session
 //! ends or `kuipa seal lock`.
 
@@ -34,9 +34,9 @@ use kuipa_enroll::join::{AuthType, Operation, Prepared};
 use kuipa_enroll::keytab::Enctype;
 use kuipa_enroll::passkey::PasskeyInfo;
 use kuipa_enroll::realm::{Deployment, VerifiedRealm};
-use kuipa_enroll::vault::{
-    Descriptor, DeviceKey, DeviceType, Policy, SealedVaultFile, SessionSealedFile, SessionToken,
-    TicketSource, Unlock, VaultOp, VerifiedDescriptor,
+use kuipa_enroll::seal::{
+    Descriptor, DeviceKey, DeviceType, Policy, SealOp, SealedFile, SessionSealedFile, SessionToken,
+    TicketSource, Unlock, VerifiedDescriptor,
 };
 use kuipa_gssapi::GssClientCred;
 use native_ossl::digest::DigestAlg;
@@ -174,15 +174,15 @@ impl UserPaths {
         self.dir.join("passkeys.json")
     }
 
-    fn vaults(&self) -> PathBuf {
-        self.dir.join("vaults")
+    fn seals(&self) -> PathBuf {
+        self.dir.join("seals")
     }
 
-    /// The stored descriptor of the vault `reference` names in `realm`.
-    fn vault(&self, reference: &str, realm: &str) -> Result<PathBuf, Error> {
+    /// The stored descriptor of the seal `reference` names in `realm`.
+    fn seal(&self, reference: &str, realm: &str) -> Result<PathBuf, Error> {
         Ok(self
-            .vaults()
-            .join(format!("{}.vault", local_name(reference, realm)?)))
+            .seals()
+            .join(format!("{}.seal", local_name(reference, realm)?)))
     }
 
     fn servers(&self) -> PathBuf {
@@ -211,7 +211,7 @@ impl UserPaths {
             )?));
         }
         let bytes = fs::read(self.device_key())
-            .map_err(|_| "this host has no device key: run `kuipa seal device add VAULT` first")?;
+            .map_err(|_| "this host has no device key: run `kuipa seal device add SEAL` first")?;
         Ok(HostDevice::File(unprotect_any(&bytes, secret, auth)?))
     }
 
@@ -226,13 +226,13 @@ impl UserPaths {
         Ok(PathBuf::from(d).join("kuipa"))
     }
 
-    fn session(id: &kuipa_enroll::escrow::VaultId) -> Result<PathBuf, Error> {
+    fn session(id: &kuipa_enroll::escrow::SealId) -> Result<PathBuf, Error> {
         Ok(Self::runtime()?.join("sessions").join(id.to_string()))
     }
 
     /// Write `data` (0600) in the directory, kept at 0700.
     fn write(&self, path: &Path, data: &[u8]) -> Result<(), Error> {
-        for dir in [&self.dir, &self.vaults()] {
+        for dir in [&self.dir, &self.seals()] {
             fs::create_dir_all(dir)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
         }
@@ -281,7 +281,7 @@ fn write_device_key(
 /// No device key, a wrong passphrase, or a malformed file.
 pub fn read_device_key(user: &UserPaths, passphrase: &[u8]) -> Result<ExchangeKeyPair, Error> {
     let bytes = fs::read(user.device_key())
-        .map_err(|_| "this host has no device key: run `kuipa seal device add VAULT` first")?;
+        .map_err(|_| "this host has no device key: run `kuipa seal device add SEAL` first")?;
     unprotect_key(&bytes, passphrase)
 }
 
@@ -350,7 +350,7 @@ impl PasskeyWrap {
         let secret = answer
             .hmac_secret
             .ok_or("the security key gave no hmac-secret")?;
-        Ok(kuipa_enroll::vault::DOMAIN.derive_key(
+        Ok(kuipa_enroll::seal::DOMAIN.derive_key(
             primitives::SHA256,
             &[secret.as_ref()],
             "passkey device key",
@@ -443,14 +443,14 @@ fn recovery_secret(code: &str) -> Result<SecretBuf, Error> {
 
 /// A live session on this host: the server's token, the unwrapped device
 /// key (a file device's; a token's never leaves the token), and for an
-/// offline session the vault's released epoch keys.
+/// offline session the seal's released epoch keys.
 struct LiveSession {
     token: SessionToken,
     key: Option<ExchangeKeyPair>,
     epochs: Vec<(u64, ExchangeKeyPair)>,
 }
 
-/// Makes a vault operation, encoded, for the exchange whose channel
+/// Makes a seal operation, encoded, for the exchange whose channel
 /// binding it is given.
 type MakeOp<'a> = &'a mut dyn FnMut(&[u8; 32]) -> Result<Vec<u8>, Error>;
 
@@ -490,12 +490,12 @@ impl HostDevice {
     }
 }
 
-/// The file name, without extension, of what the user keeps of the vault
-/// `reference` names: `NAME` for their own vault, `NAME@OWNER` (the
+/// The file name, without extension, of what the user keeps of the seal
+/// `reference` names: `NAME` for their own seal, `NAME@OWNER` (the
 /// owner's principal, `/` written `+`) for `OWNER/NAME`, one shared with
 /// them.
 fn local_name(reference: &str, realm: &str) -> Result<String, Error> {
-    let (owner, name) = kuipa_enroll::vault::split_ref(reference);
+    let (owner, name) = kuipa_enroll::seal::split_ref(reference);
     if name.is_empty()
         || name.starts_with('.')
         || !name
@@ -503,7 +503,7 @@ fn local_name(reference: &str, realm: &str) -> Result<String, Error> {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
         return Err(
-            format!("{name:?} is not a vault name: letters, digits, '.', '_' and '-'").into(),
+            format!("{name:?} is not a seal name: letters, digits, '.', '_' and '-'").into(),
         );
     }
     let Some(owner) = owner else {
@@ -519,29 +519,29 @@ fn local_name(reference: &str, realm: &str) -> Result<String, Error> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-@+".contains(&b))
     {
-        return Err(format!("{owner:?} is not a vault owner").into());
+        return Err(format!("{owner:?} is not a seal owner").into());
     }
     Ok(format!("{name}@{owner}"))
 }
 
-/// The reference `me` uses for `vault`: its name if `me` owns it (or is
+/// The reference `me` uses for `seal`: its name if `me` owns it (or is
 /// not known), else `OWNER/NAME`.
-fn reference_for(vault: &kuipa_enroll::vault::Vault, me: Option<&str>) -> String {
-    if me.is_none_or(|me| me == vault.owner) {
-        vault.name.clone()
+fn reference_for(seal: &kuipa_enroll::seal::Seal, me: Option<&str>) -> String {
+    if me.is_none_or(|me| me == seal.owner) {
+        seal.name.clone()
     } else {
-        format!("{}/{}", vault.owner, vault.name)
+        format!("{}/{}", seal.owner, seal.name)
     }
 }
 
-/// The vault a sealed file (either format) belongs to.
-fn vault_of(sealed: &[u8]) -> Option<kuipa_enroll::escrow::VaultId> {
+/// The seal a sealed file (either format) belongs to.
+fn seal_of(sealed: &[u8]) -> Option<kuipa_enroll::escrow::SealId> {
     if sealed.starts_with(b"IPUS") {
         SessionSealedFile::from_bytes(sealed)
             .ok()
-            .map(|f| *f.vault())
+            .map(|f| *f.seal_id())
     } else {
-        SealedVaultFile::from_bytes(sealed).ok().map(|f| *f.vault())
+        SealedFile::from_bytes(sealed).ok().map(|f| *f.seal_id())
     }
 }
 
@@ -553,7 +553,7 @@ struct CachedAdvertisement {
     advertisement: String,
 }
 
-/// A user's view of the host's realm and their own vaults.
+/// A user's view of the host's realm and their own seals.
 pub struct SealClient<'a> {
     host: &'a Paths,
     user: &'a UserPaths,
@@ -562,7 +562,7 @@ pub struct SealClient<'a> {
     passkey_pin: Option<SecretBuf>,
 }
 
-/// Whose ticket a vault operation carries.
+/// Whose ticket a seal operation carries.
 #[derive(Clone, Copy)]
 enum Credential<'a> {
     /// The user's: the ticket in this ccache, else the default one.
@@ -574,8 +574,8 @@ enum Credential<'a> {
 /// What `op_with_session` answers: the descriptors, verified, and the rest
 /// of the server's reply (its own descriptors moved out).
 struct OpAnswer {
-    vaults: Vec<VerifiedDescriptor>,
-    reply: kuipa_enroll::vault::Reply,
+    seals: Vec<VerifiedDescriptor>,
+    reply: kuipa_enroll::seal::Reply,
 }
 
 impl<'a> SealClient<'a> {
@@ -637,11 +637,11 @@ impl<'a> SealClient<'a> {
 
     /// Run `op` against the realm, authenticated by the user's ticket, and
     /// keep the descriptors it answers with.
-    fn op(&self, op: &VaultOp) -> Result<Vec<VerifiedDescriptor>, Error> {
-        Ok(self.op_with_session(op)?.vaults)
+    fn op(&self, op: &SealOp) -> Result<Vec<VerifiedDescriptor>, Error> {
+        Ok(self.op_with_session(op)?.seals)
     }
 
-    fn op_with_session(&self, op: &VaultOp) -> Result<OpAnswer, Error> {
+    fn op_with_session(&self, op: &SealOp) -> Result<OpAnswer, Error> {
         let extra = op.to_bytes();
         self.op_bound(&mut |_| Ok(extra.clone()))
     }
@@ -652,7 +652,7 @@ impl<'a> SealClient<'a> {
     fn op_bound(&self, make: MakeOp<'_>) -> Result<OpAnswer, Error> {
         let public = self.public()?;
         // This host's pins, windows and freezes included (§1.4, §2): a
-        // vault descriptor is fetched through a verified advertisement,
+        // seal descriptor is fetched through a verified advertisement,
         // and a frozen pin must not fall back to a signature here.
         let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
@@ -670,11 +670,11 @@ impl<'a> SealClient<'a> {
                 frozen: &frozen,
             },
             known,
-            Operation::Vault,
+            Operation::Seal,
             |adv| {
                 let p = Prepared::new(
                     adv,
-                    Operation::Vault,
+                    Operation::Seal,
                     &public.fqdn,
                     AuthType::Kerberos,
                     &Enctype::DEFAULT,
@@ -685,25 +685,25 @@ impl<'a> SealClient<'a> {
                 let (token, binding) = flows::gss_token(&cred, &target, &cb)?;
                 Ok(p.with_kerberos(binding).seal(&token, &[], &extra)?)
             },
-            |pending, response, adv| Ok(pending.finish_vault(response, adv)?),
+            |pending, response, adv| Ok(pending.finish_seal(response, adv)?),
         )?;
         let mut reply = reply;
         let mut verified = Vec::with_capacity(reply.descriptors.len());
         for d in std::mem::take(&mut reply.descriptors) {
             let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::from_system()?)?;
-            let reference = reference_for(v.vault(), me.as_deref());
+            let reference = reference_for(v.seal(), me.as_deref());
             self.user
-                .write(&self.user.vault(&reference, &public.realm)?, &d.to_bytes())?;
+                .write(&self.user.seal(&reference, &public.realm)?, &d.to_bytes())?;
             verified.push(v);
         }
         Ok(OpAnswer {
-            vaults: verified,
+            seals: verified,
             reply,
         })
     }
 
     /// `kuipa seal unlock`: start a re-authentication session for this
-    /// host's device in vault `name`: until it ends, files open without
+    /// host's device in seal `name`: until it ends, files open without
     /// the passphrase or a ticket.
     ///
     /// # Errors
@@ -714,23 +714,23 @@ impl<'a> SealClient<'a> {
         let key = self.user.device(passphrase, self.authenticator)?;
         // A session stands in for the passkey: starting one takes it, over
         // this exchange's challenge.
-        let info = if self.vault_needs_passkey(name) {
+        let info = if self.seal_needs_passkey(name) {
             Some(self.passkey_info()?)
         } else {
             None
         };
         let pin = self.factor_pin(Some(passphrase))?;
         let device = key.public().kid().to_string();
-        let OpAnswer { vaults, reply } = self.op_bound(&mut |cb| {
+        let OpAnswer { seals, reply } = self.op_bound(&mut |cb| {
             let passkey = match &info {
                 Some(info) => Some(tang_pqc::b64::encode(&self.passkey_assertion(
                     info,
-                    &kuipa_enroll::vault::session_passkey_challenge(cb)?,
+                    &kuipa_enroll::seal::session_passkey_challenge(cb)?,
                     pin,
                 )?)),
                 None => None,
             };
-            Ok(VaultOp::Unlock {
+            Ok(SealOp::Unlock {
                 name: name.into(),
                 device: device.clone(),
                 offline,
@@ -742,10 +742,10 @@ impl<'a> SealClient<'a> {
         let session = session.ok_or("the server started no session")?;
         let epochs = match (offline, released) {
             (false, _) => Vec::new(),
-            (true, Some(r)) => r.open(key.as_device(), session.vault())?,
+            (true, Some(r)) => r.open(key.as_device(), session.seal_id())?,
             (true, None) => return Err("the server released no session keys".into()),
         };
-        let path = UserPaths::session(session.vault())?;
+        let path = UserPaths::session(session.seal_id())?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
             for d in [dir, dir.parent().unwrap_or(dir)] {
@@ -766,22 +766,22 @@ impl<'a> SealClient<'a> {
         let bytes = SecretBuf::new(w.finish());
         paths::write_file(&path, bytes.as_ref(), 0o600)?;
         Ok(json!({
-            "vaults": vaults.iter().map(describe).collect::<Vec<_>>(),
+            "seals": seals.iter().map(describe).collect::<Vec<_>>(),
             "session_until": session.not_after(),
             "offline": offline,
         }))
     }
 
-    /// `kuipa seal lock`: end vault `name`'s session on this host.
+    /// `kuipa seal lock`: end seal `name`'s session on this host.
     ///
     /// # Errors
     ///
-    /// No stored descriptor of the vault, or I/O errors.
+    /// No stored descriptor of the seal, or I/O errors.
     pub fn lock(&self, name: &str) -> Result<Value, Error> {
         let id = self
             .stored(name)?
-            .ok_or_else(|| format!("no vault {name:?} known here"))?
-            .vault()
+            .ok_or_else(|| format!("no seal {name:?} known here"))?
+            .seal()
             .id;
         paths::remove(&UserPaths::session(&id)?)?;
         Ok(json!({ "locked": name }))
@@ -799,7 +799,7 @@ impl<'a> SealClient<'a> {
         {
             return Ok(c.info.clone());
         }
-        let listed = self.op_with_session(&VaultOp::Passkeys).and_then(|a| {
+        let listed = self.op_with_session(&SealOp::Passkeys).and_then(|a| {
             a.reply
                 .passkeys
                 .ok_or_else(|| "the server listed no passkeys".into())
@@ -861,15 +861,15 @@ impl<'a> SealClient<'a> {
         .to_bytes())
     }
 
-    /// The stored descriptor of the vault `id`, verified.
-    fn stored_by_id(&self, id: &kuipa_enroll::escrow::VaultId) -> Option<VerifiedDescriptor> {
+    /// The stored descriptor of the seal `id`, verified.
+    fn stored_by_id(&self, id: &kuipa_enroll::escrow::SealId) -> Option<VerifiedDescriptor> {
         let public = self.public().ok()?;
         let anchors = paths::read_anchors(self.host).ok()?;
         let policy = tang_pqc::Policy::from_system().ok()?;
-        fs::read_dir(self.user.vaults())
+        fs::read_dir(self.user.seals())
             .ok()?
             .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|x| x == "vault"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "seal"))
             .filter_map(|e| fs::read(e.path()).ok())
             .filter_map(|b| {
                 Descriptor::from_bytes(&b)
@@ -877,41 +877,41 @@ impl<'a> SealClient<'a> {
                     .verify(&public.realm, &anchors, &policy)
                     .ok()
             })
-            .find(|d| d.vault().id == *id)
+            .find(|d| d.seal().id == *id)
     }
 
-    /// Whether opening `sealed` takes a passkey assertion: its vault's
+    /// Whether opening `sealed` takes a passkey assertion: its seal's
     /// policy has the passkey factor, and no session stands in for it.
-    /// A vault not described here yet is listed first, with a ticket.
+    /// A seal not described here yet is listed first, with a ticket.
     #[must_use]
     pub fn needs_passkey(&self, sealed: &[u8]) -> bool {
         if sealed.starts_with(b"IPUS") {
             return false;
         }
-        let Some(id) = vault_of(sealed) else {
+        let Some(id) = seal_of(sealed) else {
             return false;
         };
         if Self::session_for(&id).is_some() {
             return false;
         }
         let stored = self.stored_by_id(&id).or_else(|| {
-            self.op(&VaultOp::List).ok()?;
+            self.op(&SealOp::List).ok()?;
             self.stored_by_id(&id)
         });
-        stored.is_some_and(|d| d.vault().policy.factors.passkey)
+        stored.is_some_and(|d| d.seal().policy.factors.passkey)
     }
 
-    /// Whether vault `name`'s policy has the passkey factor, as its
+    /// Whether seal `name`'s policy has the passkey factor, as its
     /// stored descriptor (else a fresh one) says.
     #[must_use]
-    pub fn vault_needs_passkey(&self, name: &str) -> bool {
+    pub fn seal_needs_passkey(&self, name: &str) -> bool {
         let stored = self.stored(name).ok().flatten().or_else(|| {
-            self.op(&VaultOp::Show { name: name.into() })
+            self.op(&SealOp::Show { name: name.into() })
                 .ok()?
                 .into_iter()
                 .next()
         });
-        stored.is_some_and(|d| d.vault().policy.factors.passkey)
+        stored.is_some_and(|d| d.seal().policy.factors.passkey)
     }
 
     /// Whether the passkey factor would verify the user: the realm
@@ -924,8 +924,8 @@ impl<'a> SealClient<'a> {
             .is_none_or(|c| c.info.user_verification)
     }
 
-    /// The live session of vault `id`, if any; an ended one is removed.
-    fn session_for(id: &kuipa_enroll::escrow::VaultId) -> Option<LiveSession> {
+    /// The live session of seal `id`, if any; an ended one is removed.
+    fn session_for(id: &kuipa_enroll::escrow::SealId) -> Option<LiveSession> {
         let path = UserPaths::session(id).ok()?;
         let bytes = SecretBuf::new(fs::read(&path).ok()?);
         let parsed = (|| -> Result<_, Error> {
@@ -960,10 +960,10 @@ impl<'a> SealClient<'a> {
         let has_devices = if sealed.starts_with(b"IPUS") {
             true
         } else {
-            SealedVaultFile::from_bytes(sealed).is_ok_and(|f| !f.devices().is_empty())
+            SealedFile::from_bytes(sealed).is_ok_and(|f| !f.devices().is_empty())
         };
         has_devices
-            && vault_of(sealed)
+            && seal_of(sealed)
                 .and_then(|v| Self::session_for(&v))
                 .is_none_or(|l| l.key.is_none())
     }
@@ -971,7 +971,7 @@ impl<'a> SealClient<'a> {
     /// Whether `sealed` can open in a live session, without a passphrase.
     #[must_use]
     pub fn in_session(sealed: &[u8]) -> bool {
-        let Some(live) = vault_of(sealed).and_then(|v| Self::session_for(&v)) else {
+        let Some(live) = seal_of(sealed).and_then(|v| Self::session_for(&v)) else {
             return false;
         };
         if sealed.starts_with(b"IPUS") {
@@ -982,19 +982,19 @@ impl<'a> SealClient<'a> {
         }
     }
 
-    /// `kuipa seal file --session`: seal `contents` to vault `name`'s
+    /// `kuipa seal file --session`: seal `contents` to seal `name`'s
     /// current epoch key, for opening in offline sessions.
     ///
     /// # Errors
     ///
-    /// A vault without offline sessions, or as for [`seal`](Self::seal).
+    /// A seal without offline sessions, or as for [`seal`](Self::seal).
     pub fn seal_session(&self, name: &str, contents: &[u8]) -> Result<Vec<u8>, Error> {
         let descriptor = self.descriptor(name)?;
         Ok(SessionSealedFile::seal(&descriptor, contents)?.to_bytes())
     }
 
     /// `kuipa tlog watch`: check every server's transparency log for
-    /// vault `name` (DESIGN-tlog.md §7).  Each server's answer must come
+    /// seal `name` (DESIGN-tlog.md §7).  Each server's answer must come
     /// from its advertised key and prove its entries, and its head must
     /// extend the one the last watch verified; then every entry since is
     /// listed, and flagged when the descriptor this host stored does not
@@ -1014,20 +1014,20 @@ impl<'a> SealClient<'a> {
     /// watch state, or any other error outside one server's answer.
     pub fn watch(&self, name: &str) -> Result<Value, Error> {
         let stored = self.stored(name)?.ok_or_else(|| {
-            format!("no descriptor of vault {name:?} here: run `kuipa seal show {name}` first")
+            format!("no descriptor of seal {name:?} here: run `kuipa seal show {name}` first")
         })?;
-        let vault = stored.vault();
+        let seal = stored.seal();
         let expected = Expected {
-            subject: vault.id.as_bytes().to_vec(),
-            devices: vault.devices.iter().map(|d| d.id.clone()).collect(),
-            policy: serde_json::to_vec(&vault.policy)?,
-            sharing: vault.sharing_bytes(),
-            revoked: vault.state == kuipa_enroll::vault::State::Revoked,
+            subject: seal.id.as_bytes().to_vec(),
+            devices: seal.devices.iter().map(|d| d.id.clone()).collect(),
+            policy: serde_json::to_vec(&seal.policy)?,
+            sharing: seal.sharing_bytes(),
+            revoked: seal.state == kuipa_enroll::seal::State::Revoked,
         };
         let public = self.public()?;
         let state_path = self
             .user
-            .vaults()
+            .seals()
             .join(format!("{}.tlog", local_name(name, &self.public()?.realm)?));
         let mut state: BTreeMap<String, Watched> = match fs::read(&state_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -1105,7 +1105,7 @@ impl<'a> SealClient<'a> {
         Ok(json!({
             "ok": flagged == 0 && forked.is_empty() && unreachable.is_empty()
                 && unwitnessed.is_empty(),
-            "vault": name,
+            "seal": name,
             "events": events,
             "unexpected": flagged,
             "forked": forked,
@@ -1116,7 +1116,7 @@ impl<'a> SealClient<'a> {
         }))
     }
 
-    /// One server's part of [`watch`](Self::watch): its entries for vault
+    /// One server's part of [`watch`](Self::watch): its entries for seal
     /// `name` past what `before` saw, and its head; none for an empty log.
     fn watch_server(
         &self,
@@ -1144,7 +1144,7 @@ impl<'a> SealClient<'a> {
         let mut last = None;
         loop {
             let extra = Query {
-                vault: name.into(),
+                seal: name.into(),
                 from,
             }
             .to_bytes();
@@ -1227,10 +1227,10 @@ impl<'a> SealClient<'a> {
         Ok(Some((entries, signed)))
     }
 
-    /// The stored descriptor of vault `name`, verified.
+    /// The stored descriptor of seal `name`, verified.
     fn stored(&self, name: &str) -> Result<Option<VerifiedDescriptor>, Error> {
         let public = self.public()?;
-        let Ok(bytes) = fs::read(self.user.vault(name, &public.realm)?) else {
+        let Ok(bytes) = fs::read(self.user.seal(name, &public.realm)?) else {
             return Ok(None);
         };
         let anchors = paths::read_anchors(self.host)?;
@@ -1241,7 +1241,7 @@ impl<'a> SealClient<'a> {
         )?))
     }
 
-    /// Vault `name`'s descriptor, fresh enough to seal with: the stored
+    /// Seal `name`'s descriptor, fresh enough to seal with: the stored
     /// one, else one fetched now.
     fn descriptor(&self, name: &str) -> Result<VerifiedDescriptor, Error> {
         let now = unix_seconds(flows::now());
@@ -1250,13 +1250,13 @@ impl<'a> SealClient<'a> {
         {
             return Ok(d);
         }
-        let fetched = self.op(&VaultOp::Show { name: name.into() }).map_err(|e| {
-            format!("vault {name:?}: no descriptor recent enough to seal with, and fetching one failed: {e}")
+        let fetched = self.op(&SealOp::Show { name: name.into() }).map_err(|e| {
+            format!("seal {name:?}: no descriptor recent enough to seal with, and fetching one failed: {e}")
         })?;
         fetched
             .into_iter()
             .next()
-            .ok_or_else(|| format!("no vault {name:?}").into())
+            .ok_or_else(|| format!("no seal {name:?}").into())
     }
 
     /// Fetch and verify every server's advertisement, and cache them.
@@ -1336,10 +1336,10 @@ impl<'a> SealClient<'a> {
     /// A refusal or any other error.
     pub fn create(&self, name: &str, policy: Policy) -> Result<Value, Error> {
         if name.contains('/') {
-            return Err(format!("{name:?}: a vault is created as one's own, by its name").into());
+            return Err(format!("{name:?}: a seal is created as one's own, by its name").into());
         }
         local_name(name, "")?;
-        let v = self.op(&VaultOp::Create {
+        let v = self.op(&SealOp::Create {
             name: name.into(),
             policy,
         })?;
@@ -1352,7 +1352,7 @@ impl<'a> SealClient<'a> {
     ///
     /// A refusal or any other error.
     pub fn set_policy(&self, name: &str, policy: Policy) -> Result<Value, Error> {
-        let v = self.op(&VaultOp::SetPolicy {
+        let v = self.op(&SealOp::SetPolicy {
             name: name.into(),
             policy,
         })?;
@@ -1360,7 +1360,7 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal device add`: register this host's device key (made now
-    /// under `passphrase` if there is none) in vault `name`.
+    /// under `passphrase` if there is none) in seal `name`.
     ///
     /// # Errors
     ///
@@ -1390,7 +1390,7 @@ impl<'a> SealClient<'a> {
     /// `kuipa seal device add --passkey`: make this host's device key
     /// now, wrapped by the `hmac-secret` output of a new credential on the
     /// security key (two touches: the credential, then the wrap), and
-    /// register it in vault `name`.  `pin` (empty for none) verifies the
+    /// register it in seal `name`.  `pin` (empty for none) verifies the
     /// user, and must then be given at every use.  The credential is the
     /// device's own, under the relying party `kuipa:<realm>`, not one of
     /// the user's IPA passkeys.  No attestation is verified yet, so the
@@ -1435,7 +1435,7 @@ impl<'a> SealClient<'a> {
         self.register_device(name, &HostDevice::File(key), DeviceType::Passkey)
     }
 
-    /// Register this host's device `key`, of type `kind`, in vault `name`,
+    /// Register this host's device `key`, of type `kind`, in seal `name`,
     /// depositing it first where the realm keeps device keys for recovery.
     /// A refused registration retires that deposit again, so a rejected
     /// device leaves no orphaned escrow behind.
@@ -1450,15 +1450,15 @@ impl<'a> SealClient<'a> {
             HostDevice::Token(_) => None,
         };
         let public = self.public()?;
-        let registered = self.op(&VaultOp::AddDevice {
+        let registered = self.op(&SealOp::AddDevice {
             name: name.into(),
             label: public.fqdn,
             kind,
             alg: key.public().alg().id(),
             key: tang_pqc::b64::encode(key.public().as_bytes()),
         });
-        if let Some((vault, id)) = deposit.filter(|_| registered.is_err()) {
-            self.retire_deposit(&vault, &id)
+        if let Some((seal, id)) = deposit.filter(|_| registered.is_err()) {
+            self.retire_deposit(&seal, &id)
                 .map_err(|e| format!("the refused device's deposit was not retired: {e}"))?;
         }
         Ok(describe_all(&registered?))
@@ -1466,7 +1466,7 @@ impl<'a> SealClient<'a> {
 
     /// `kuipa seal device add --pkcs11 URI`: make the ML-KEM key at `uri`
     /// on a token (through PKCS#11 `module`) this host's device, and
-    /// register it in vault `name`.  `pin` logs in to the token.
+    /// register it in seal `name`.  `pin` logs in to the token.
     ///
     /// # Errors
     ///
@@ -1507,7 +1507,7 @@ impl<'a> SealClient<'a> {
     ///
     /// A refusal or any other error.
     pub fn remove_device(&self, name: &str, id: &str) -> Result<Value, Error> {
-        let v = self.op(&VaultOp::RemoveDevice {
+        let v = self.op(&SealOp::RemoveDevice {
             name: name.into(),
             id: id.into(),
         })?;
@@ -1515,18 +1515,14 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal share`: add `who` (managers, members, depositors) to
-    /// vault `name`.
+    /// seal `name`.
     ///
     /// # Errors
     ///
     /// A refusal or any other error.
-    pub fn share(
-        &self,
-        name: &str,
-        who: [kuipa_enroll::vault::Members; 3],
-    ) -> Result<Value, Error> {
+    pub fn share(&self, name: &str, who: [kuipa_enroll::seal::Members; 3]) -> Result<Value, Error> {
         let [managers, members, depositors] = who;
-        let v = self.op(&VaultOp::Share {
+        let v = self.op(&SealOp::Share {
             name: name.into(),
             managers,
             members,
@@ -1536,7 +1532,7 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal unshare`: remove `who` (managers, members, depositors)
-    /// from vault `name`, with the devices they hold.
+    /// from seal `name`, with the devices they hold.
     ///
     /// # Errors
     ///
@@ -1544,10 +1540,10 @@ impl<'a> SealClient<'a> {
     pub fn unshare(
         &self,
         name: &str,
-        who: [kuipa_enroll::vault::Members; 3],
+        who: [kuipa_enroll::seal::Members; 3],
     ) -> Result<Value, Error> {
         let [managers, members, depositors] = who;
-        let v = self.op(&VaultOp::Unshare {
+        let v = self.op(&SealOp::Unshare {
             name: name.into(),
             managers,
             members,
@@ -1556,7 +1552,7 @@ impl<'a> SealClient<'a> {
         Ok(describe_all(&v))
     }
 
-    /// `kuipa seal deposit put`: seal `contents` to vault `name` and leave
+    /// `kuipa seal deposit put`: seal `contents` to seal `name` and leave
     /// it with the servers as a deposit of `kind` for `subject`, in place of
     /// any earlier one of the same kind and subject (`DESIGN-recovery.md`
     /// §3).  A depositor seals without being able to open.
@@ -1568,12 +1564,12 @@ impl<'a> SealClient<'a> {
         &self,
         name: &str,
         contents: &[u8],
-        kind: kuipa_enroll::vault::DepositKind,
+        kind: kuipa_enroll::seal::DepositKind,
         subject: std::collections::BTreeMap<String, String>,
     ) -> Result<Value, Error> {
         // The server registers a deposit's bindings itself.
         let sealed = self.seal_file(name, contents)?;
-        let answer = self.op_with_session(&VaultOp::Deposit {
+        let answer = self.op_with_session(&SealOp::Deposit {
             name: name.into(),
             kind,
             subject,
@@ -1582,25 +1578,25 @@ impl<'a> SealClient<'a> {
         Ok(describe_deposits(name, &answer.reply.deposits))
     }
 
-    /// `kuipa seal deposit list`: vault `name`'s deposits (a depositor's
+    /// `kuipa seal deposit list`: seal `name`'s deposits (a depositor's
     /// own, for a depositor).
     ///
     /// # Errors
     ///
     /// A refusal or any other error.
     pub fn deposits(&self, name: &str) -> Result<Value, Error> {
-        let answer = self.op_with_session(&VaultOp::Deposits { name: name.into() })?;
+        let answer = self.op_with_session(&SealOp::Deposits { name: name.into() })?;
         Ok(describe_deposits(name, &answer.reply.deposits))
     }
 
     /// `kuipa seal deposit fetch`: deposit `id`'s sealed file, to open as
-    /// any other file of the vault.
+    /// any other file of the seal.
     ///
     /// # Errors
     ///
     /// A depositor, no such deposit, a refusal.
     pub fn deposit_file(&self, name: &str, id: &str) -> Result<Vec<u8>, Error> {
-        let answer = self.op_with_session(&VaultOp::FetchDeposit {
+        let answer = self.op_with_session(&SealOp::FetchDeposit {
             name: name.into(),
             id: id.into(),
         })?;
@@ -1619,28 +1615,28 @@ impl<'a> SealClient<'a> {
     ///
     /// A refusal or any other error.
     pub fn retire_deposit(&self, name: &str, id: &str) -> Result<Value, Error> {
-        self.op_with_session(&VaultOp::RetireDeposit {
+        self.op_with_session(&SealOp::RetireDeposit {
             name: name.into(),
             id: id.into(),
         })?;
-        Ok(json!({ "vault": name, "retired_deposit": id }))
+        Ok(json!({ "seal": name, "retired_deposit": id }))
     }
 
-    /// `kuipa seal request`: ask the approvers of vault `name` to approve
+    /// `kuipa seal request`: ask the approvers of seal `name` to approve
     /// the release of `sealed`, for `reason`.
     ///
     /// # Errors
     ///
-    /// A file of another kind, a vault without approvals, a refusal.
+    /// A file of another kind, a seal without approvals, a refusal.
     pub fn request(&self, name: &str, sealed: &[u8], reason: &str) -> Result<Value, Error> {
-        let file = SealedVaultFile::from_bytes(sealed)?;
+        let file = SealedFile::from_bytes(sealed)?;
         let bindings = file
             .bindings()?
             .iter()
-            .map(kuipa_enroll::vault::binding_hex)
+            .map(kuipa_enroll::seal::binding_hex)
             .collect();
         let requests = self
-            .op_with_session(&VaultOp::Request {
+            .op_with_session(&SealOp::Request {
                 name: name.into(),
                 bindings,
                 reason: reason.into(),
@@ -1650,15 +1646,15 @@ impl<'a> SealClient<'a> {
         Ok(describe_requests(name, &requests))
     }
 
-    /// `kuipa seal pending`: the open release requests of vault `name`, or
-    /// of every vault the user approves for or has a part in.
+    /// `kuipa seal pending`: the open release requests of seal `name`, or
+    /// of every seal the user approves for or has a part in.
     ///
     /// # Errors
     ///
     /// A refusal or any other error.
     pub fn pending(&self, name: Option<&str>) -> Result<Value, Error> {
         let requests = self
-            .op_with_session(&VaultOp::Pending {
+            .op_with_session(&SealOp::Pending {
                 name: name.map(str::to_owned),
             })?
             .reply
@@ -1667,19 +1663,19 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal approve` (or with `deny`, `kuipa seal deny`): approve or
-    /// deny release request `id` of vault `name`.
+    /// deny release request `id` of seal `name`.
     ///
     /// # Errors
     ///
     /// A refusal or any other error.
     pub fn decide(&self, name: &str, id: &str, deny: bool) -> Result<Value, Error> {
         let op = if deny {
-            VaultOp::Deny {
+            SealOp::Deny {
                 name: name.into(),
                 id: id.into(),
             }
         } else {
-            VaultOp::Approve {
+            SealOp::Approve {
                 name: name.into(),
                 id: id.into(),
             }
@@ -1692,7 +1688,7 @@ impl<'a> SealClient<'a> {
 
     /// `kuipa seal recovery-code`: escrow this host's device key under a
     /// new recovery code, which only the answer shows (`DESIGN-recovery.md`
-    /// §2).  The device must be registered in one of the user's vaults.
+    /// §2).  The device must be registered in one of the user's seals.
     ///
     /// # Errors
     ///
@@ -1708,7 +1704,7 @@ impl<'a> SealClient<'a> {
         let code = new_recovery_code()?;
         let blob = protect_key(&key, recovery_secret(&code)?.as_ref())?;
         let device = key.public().kid().to_string();
-        self.op_with_session(&VaultOp::EscrowCode {
+        self.op_with_session(&SealOp::EscrowCode {
             device: device.clone(),
             blob: tang_pqc::b64::encode(&blob),
         })?;
@@ -1735,7 +1731,7 @@ impl<'a> SealClient<'a> {
             self.user.device(passphrase, self.authenticator)?;
         }
         let secret = recovery_secret(code)?;
-        let escrows = self.op_with_session(&VaultOp::RecoverCode)?.reply.escrows;
+        let escrows = self.op_with_session(&SealOp::RecoverCode)?.reply.escrows;
         let key = escrows
             .iter()
             .find_map(|e| {
@@ -1751,15 +1747,15 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal recover finish`: register this host's device (made now
-    /// under `passphrase` if there is none) in every vault where the
+    /// under `passphrase` if there is none) in every seal where the
     /// recovered device is the user's, and reseal `sealed` to it.  With
-    /// `retire_old`, also remove the recovered device from those vaults and
+    /// `retire_old`, also remove the recovered device from those seals and
     /// forget it here: files not resealed then no longer open.  Answers the
     /// resealed files, in order.
     ///
     /// # Errors
     ///
-    /// Nothing recovered here, a file of a vault the recovered device is
+    /// Nothing recovered here, a file of a seal the recovered device is
     /// not in, a wrong passphrase, a refusal.
     pub fn recover_finish(
         &self,
@@ -1776,11 +1772,11 @@ impl<'a> SealClient<'a> {
             .cred()?
             .principal_name()
             .ok_or("cannot tell whose ticket this is")?;
-        let held: Vec<(String, kuipa_enroll::escrow::VaultId)> = self
-            .op(&VaultOp::List)?
+        let held: Vec<(String, kuipa_enroll::escrow::SealId)> = self
+            .op(&SealOp::List)?
             .iter()
             .filter_map(|d| {
-                let v = d.vault();
+                let v = d.seal();
                 v.devices
                     .iter()
                     .any(|x| x.id == old_id && v.holder(x) == me)
@@ -1801,20 +1797,21 @@ impl<'a> SealClient<'a> {
             .kid()
             .to_string();
         for (name, _) in &held {
-            let current = self.op(&VaultOp::Show { name: name.clone() })?;
+            let current = self.op(&SealOp::Show { name: name.clone() })?;
             if !current
                 .iter()
-                .any(|d| d.vault().devices.iter().any(|x| x.id == new_id))
+                .any(|d| d.seal().devices.iter().any(|x| x.id == new_id))
             {
                 self.add_device(name, passphrase)?;
             }
         }
         let mut resealed = Vec::with_capacity(sealed.len());
         for file in sealed {
-            let id = vault_of(file).ok_or("not a sealed vault file")?;
-            let (name, _) = held.iter().find(|(_, v)| *v == id).ok_or_else(|| {
-                format!("a file of vault {id}, where the recovered device is not")
-            })?;
+            let id = seal_of(file).ok_or("not a sealed file")?;
+            let (name, _) = held
+                .iter()
+                .find(|(_, v)| *v == id)
+                .ok_or_else(|| format!("a file of seal {id}, where the recovered device is not"))?;
             resealed.push(self.reseal(name, file, Some(passphrase))?);
         }
         if retire_old {
@@ -1825,7 +1822,7 @@ impl<'a> SealClient<'a> {
         }
         Ok((
             json!({
-                "vaults": held.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "seals": held.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                 "device": new_id,
                 "resealed": resealed.len(),
                 "retired": if retire_old { Some(old_id) } else { None },
@@ -1835,9 +1832,9 @@ impl<'a> SealClient<'a> {
     }
 
     /// The realm's device-key recovery settings, if it has any.
-    fn recovery(&self) -> Result<Option<kuipa_enroll::vault::RecoverySettings>, Error> {
+    fn recovery(&self) -> Result<Option<kuipa_enroll::seal::RecoverySettings>, Error> {
         Ok(self
-            .op_with_session(&VaultOp::RecoverySettings)?
+            .op_with_session(&SealOp::RecoverySettings)?
             .reply
             .recovery)
     }
@@ -1850,36 +1847,36 @@ impl<'a> SealClient<'a> {
         let Some(settings) = self.recovery()? else {
             return Ok(None);
         };
-        match self.deposit_device_key_to(&settings.device_vault, key) {
+        match self.deposit_device_key_to(&settings.device_seal, key) {
             Err(e) if !settings.required => {
                 tracing::warn!("the device key was not deposited for recovery: {e}");
                 Ok(None)
             }
-            done => done.map(|id| id.map(|id| (settings.device_vault.clone(), id))),
+            done => done.map(|id| id.map(|id| (settings.device_seal.clone(), id))),
         }
     }
 
     fn deposit_device_key_to(
         &self,
-        vault: &str,
+        seal: &str,
         key: &ExchangeKeyPair,
     ) -> Result<Option<String>, Error> {
         let id = key.public().kid().to_string();
         let mine = self
-            .op_with_session(&VaultOp::Deposits { name: vault.into() })?
+            .op_with_session(&SealOp::Deposits { name: seal.into() })?
             .reply
             .deposits;
         if mine.iter().any(|d| {
-            d.kind == kuipa_enroll::vault::DepositKind::Device
+            d.kind == kuipa_enroll::seal::DepositKind::Device
                 && d.subject.get("device") == Some(&id)
         }) {
             return Ok(None);
         }
         let subject = std::collections::BTreeMap::from([("device".to_owned(), id)]);
         let answer = self.deposit(
-            vault,
+            seal,
             key.to_jwk()?.as_ref(),
-            kuipa_enroll::vault::DepositKind::Device,
+            kuipa_enroll::seal::DepositKind::Device,
             subject,
         )?;
         Ok(answer["deposits"]
@@ -1901,8 +1898,8 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal recover deliver`: as the helpdesk, open deposit `id` of
-    /// the realm's device vault (with this host's device under `passphrase`
-    /// and, for a vault with approvals, the approved request `release`) and
+    /// the realm's device seal (with this host's device under `passphrase`
+    /// and, for a seal with approvals, the approved request `release`) and
     /// deliver the key it holds to `user`'s device `device`, encrypted to
     /// that device's registered public key.
     ///
@@ -1920,11 +1917,11 @@ impl<'a> SealClient<'a> {
     ) -> Result<Value, Error> {
         let (user, device) = to;
         let settings = self.recovery()?.ok_or("the realm has no device recovery")?;
-        let sealed = self.deposit_file(&settings.device_vault, id)?;
+        let sealed = self.deposit_file(&settings.device_seal, id)?;
         let jwk = self.open_with(&sealed, passphrase, release)?;
         let old = ExchangeKeyPair::from_jwk(jwk.as_ref())?;
         let found = self
-            .op_with_session(&VaultOp::DeviceKey {
+            .op_with_session(&SealOp::DeviceKey {
                 user: user.into(),
                 device: device.into(),
             })?
@@ -1937,8 +1934,8 @@ impl<'a> SealClient<'a> {
         if new.kid().to_string() != device {
             return Err("the server named another device".into());
         }
-        let blob = kuipa_enroll::vault::seal_delivery(&new, &old)?;
-        self.op_with_session(&VaultOp::Deliver {
+        let blob = kuipa_enroll::seal::seal_delivery(&new, &old)?;
+        self.op_with_session(&SealOp::Deliver {
             user: user.into(),
             device: device.into(),
             blob: tang_pqc::b64::encode(&blob),
@@ -1965,13 +1962,13 @@ impl<'a> SealClient<'a> {
         }
         let device = self.user.device(passphrase, self.authenticator)?;
         let mine = device.public().kid().to_string();
-        let escrows = self.op_with_session(&VaultOp::RecoverCode)?.reply.escrows;
+        let escrows = self.op_with_session(&SealOp::RecoverCode)?.reply.escrows;
         let key = escrows
             .iter()
             .filter(|e| e.kind == "delivery" && e.device == mine)
             .find_map(|e| {
                 let blob = tang_pqc::b64::decode(&e.blob).ok()?;
-                kuipa_enroll::vault::open_delivery(&blob, device.as_device()).ok()
+                kuipa_enroll::seal::open_delivery(&blob, device.as_device()).ok()
             })
             .ok_or("nothing was delivered to this host's device")?;
         self.user.write(
@@ -1987,7 +1984,7 @@ impl<'a> SealClient<'a> {
     ///
     /// A refusal or any other error.
     pub fn revoke(&self, name: &str) -> Result<Value, Error> {
-        let v = self.op(&VaultOp::Revoke { name: name.into() })?;
+        let v = self.op(&SealOp::Revoke { name: name.into() })?;
         Ok(describe_all(&v))
     }
 
@@ -1997,7 +1994,7 @@ impl<'a> SealClient<'a> {
     ///
     /// A refusal or any other error.
     pub fn show(&self, name: &str) -> Result<Value, Error> {
-        let v = self.op(&VaultOp::Show { name: name.into() })?;
+        let v = self.op(&SealOp::Show { name: name.into() })?;
         Ok(describe_all(&v))
     }
 
@@ -2007,29 +2004,28 @@ impl<'a> SealClient<'a> {
     ///
     /// A refusal or any other error.
     pub fn list(&self) -> Result<Value, Error> {
-        let v = self.op(&VaultOp::List)?;
+        let v = self.op(&SealOp::List)?;
         Ok(describe_all(&v))
     }
 
-    /// `kuipa seal file`: seal `contents` to vault `name`, offline when the
+    /// `kuipa seal file`: seal `contents` to seal `name`, offline when the
     /// stored descriptor and advertisements are recent enough.
     ///
     /// # Errors
     ///
-    /// A revoked vault, no device registered when the policy needs one, no
+    /// A revoked seal, no device registered when the policy needs one, no
     /// server known, or any other error.
     pub fn seal(&self, name: &str, contents: &[u8]) -> Result<Vec<u8>, Error> {
         let sealed = self.seal_file(name, contents)?;
-        if self.descriptor(name)?.vault().policy.sealing == kuipa_enroll::vault::Sealing::Registered
-        {
+        if self.descriptor(name)?.seal().policy.sealing == kuipa_enroll::seal::Sealing::Registered {
             // Until registered, no server opens it.
             self.register(name, &sealed.bindings()?, &[])?;
         }
         Ok(sealed.to_bytes())
     }
 
-    /// Seal `contents` to vault `name`, without registering it.
-    fn seal_file(&self, name: &str, contents: &[u8]) -> Result<SealedVaultFile, Error> {
+    /// Seal `contents` to seal `name`, without registering it.
+    fn seal_file(&self, name: &str, contents: &[u8]) -> Result<SealedFile, Error> {
         let descriptor = self.descriptor(name)?;
         // The realm's descriptor age bounds the advertisements too.
         let mut servers = self.cached_servers(descriptor.max_age())?;
@@ -2037,10 +2033,10 @@ impl<'a> SealClient<'a> {
             servers = self.refresh_servers()?;
         }
         let refs: Vec<_> = servers.iter().collect();
-        Ok(SealedVaultFile::seal(&descriptor, &refs, contents)?)
+        Ok(SealedFile::seal(&descriptor, &refs, contents)?)
     }
 
-    /// Register `add` and retire `retire` on vault `name` (registered
+    /// Register `add` and retire `retire` on seal `name` (registered
     /// sealing).
     fn register(
         &self,
@@ -2049,9 +2045,9 @@ impl<'a> SealClient<'a> {
         retire: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), Error> {
         let hex = |v: &[kuipa_enroll::escrow::BindingHash]| {
-            v.iter().map(kuipa_enroll::vault::binding_hex).collect()
+            v.iter().map(kuipa_enroll::seal::binding_hex).collect()
         };
-        self.op(&VaultOp::Register {
+        self.op(&SealOp::Register {
             name: name.into(),
             add: hex(add),
             retire: hex(retire),
@@ -2064,10 +2060,10 @@ impl<'a> SealClient<'a> {
     ///
     /// # Errors
     ///
-    /// A file of another kind, a vault without registered sealing, or a
+    /// A file of another kind, a seal without registered sealing, or a
     /// refusal.
     pub fn retire(&self, name: &str, sealed: &[u8]) -> Result<(), Error> {
-        let file = SealedVaultFile::from_bytes(sealed)?;
+        let file = SealedFile::from_bytes(sealed)?;
         self.register(name, &[], &file.bindings()?)
     }
 
@@ -2084,7 +2080,7 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal open --request ID`: as [`open`](Self::open), naming the
-    /// approved release request `release` for a vault with approvals.
+    /// approved release request `release` for a seal with approvals.
     ///
     /// # Errors
     ///
@@ -2096,13 +2092,13 @@ impl<'a> SealClient<'a> {
         release: Option<&str>,
     ) -> Result<SecretBuf, Error> {
         let release = release
-            .map(kuipa_enroll::vault::ReleaseRequest::id_bytes)
+            .map(kuipa_enroll::seal::ReleaseRequest::id_bytes)
             .transpose()?;
         if sealed.starts_with(b"IPUS") {
             return self.open_offline(sealed, passphrase);
         }
-        let file = SealedVaultFile::from_bytes(sealed)?;
-        let session = Self::session_for(file.vault());
+        let file = SealedFile::from_bytes(sealed)?;
+        let session = Self::session_for(file.seal_id());
         let unwrapped;
         let device: Option<&dyn DeviceKey> =
             if let Some(k) = session.as_ref().and_then(|l| l.key.as_ref()) {
@@ -2118,7 +2114,7 @@ impl<'a> SealClient<'a> {
                 Some(unwrapped.as_device())
             };
         let trust = flows::ca_trust(self.host)?;
-        // A passkey only when the vault asks for one: each takes a touch.
+        // A passkey only when the seal asks for one: each takes a touch.
         let passkey_info = if session.is_none() && self.needs_passkey(sealed) {
             Some(self.passkey_info()?)
         } else {
@@ -2135,12 +2131,12 @@ impl<'a> SealClient<'a> {
                 .map_err(|e| *failure.borrow_mut() = Some(e))
                 .ok()
         };
-        let passkey: Option<kuipa_enroll::vault::PasskeySource<'_>> = if passkey_info.is_some() {
+        let passkey: Option<kuipa_enroll::seal::PasskeySource<'_>> = if passkey_info.is_some() {
             Some(&mut make_assertion)
         } else {
             None
         };
-        // A ticket is sent whenever one is available: vaults that do not
+        // A ticket is sent whenever one is available: seals that do not
         // ask for it ignore it.
         let cred = self.cred().ok();
         let mut make_token = |server: &str, cb: &[u8; 32]| {
@@ -2165,9 +2161,9 @@ impl<'a> SealClient<'a> {
             |server, request| {
                 tracing::debug!(
                     server = %server,
-                    "vault unlock for {} in vault {}",
+                    "seal unlock for {} in seal {}",
                     request.principal(),
-                    request.vault()
+                    request.seal()
                 );
                 Endpoint::new(server, &trust)
                     .ok()?
@@ -2182,7 +2178,7 @@ impl<'a> SealClient<'a> {
             // The passkey failed before any server could answer.
             (kuipa_enroll::Error::Refused, Some(passkey)) => passkey,
             (kuipa_enroll::Error::Refused, None) => Outcome::RetryLater(
-                "no server would open it: the vault's policy refused, or no server answered".into(),
+                "no server would open it: the seal's policy refused, or no server answered".into(),
             )
             .into(),
             (e, _) => e.into(),
@@ -2192,8 +2188,8 @@ impl<'a> SealClient<'a> {
     /// Open a file sealed for offline sessions, here, without a server.
     fn open_offline(&self, sealed: &[u8], passphrase: Option<&[u8]>) -> Result<SecretBuf, Error> {
         let file = SessionSealedFile::from_bytes(sealed)?;
-        let live = Self::session_for(file.vault()).ok_or(
-            "this file opens in an offline session: run `kuipa seal unlock VAULT --offline`",
+        let live = Self::session_for(file.seal_id()).ok_or(
+            "this file opens in an offline session: run `kuipa seal unlock SEAL --offline`",
         )?;
         let (_, epoch_key) = live
             .epochs
@@ -2212,7 +2208,7 @@ impl<'a> SealClient<'a> {
     }
 
     /// `kuipa seal reseal`: open each file and seal it again to the
-    /// vault's current devices, every member's.
+    /// seal's current devices, every member's.
     ///
     /// # Errors
     ///
@@ -2226,11 +2222,11 @@ impl<'a> SealClient<'a> {
         let plain = self.open(sealed, passphrase)?;
         // The devices registered now, not those of the stored descriptor:
         // a reseal is what gives a new device or member the file.
-        self.op(&VaultOp::Show { name: name.into() })?;
+        self.op(&SealOp::Show { name: name.into() })?;
         let again = self.seal(name, plain.as_ref())?;
         if self
             .stored(name)?
-            .is_some_and(|d| d.vault().policy.sealing == kuipa_enroll::vault::Sealing::Registered)
+            .is_some_and(|d| d.seal().policy.sealing == kuipa_enroll::seal::Sealing::Registered)
         {
             // The old copy, wherever it is, stops opening.
             self.retire(name, sealed)?;
@@ -2239,33 +2235,33 @@ impl<'a> SealClient<'a> {
     }
 }
 
-/// The JSON form of a vault, for `--json` and the renderer.
+/// The JSON form of a seal, for `--json` and the renderer.
 #[must_use]
 pub fn describe(v: &VerifiedDescriptor) -> Value {
-    let vault = v.vault();
+    let seal = v.seal();
     json!({
-        "name": vault.name,
-        "id": vault.id.to_string(),
-        "owner": vault.owner,
-        "state": vault.state,
-        "policy": vault.policy,
-        "managers": vault.managers.entries(),
-        "members": vault.members.entries(),
-        "depositors": vault.depositors.entries(),
-        "devices": vault.devices.iter().map(|d| json!({
+        "name": seal.name,
+        "id": seal.id.to_string(),
+        "owner": seal.owner,
+        "state": seal.state,
+        "policy": seal.policy,
+        "managers": seal.managers.entries(),
+        "members": seal.members.entries(),
+        "depositors": seal.depositors.entries(),
+        "devices": seal.devices.iter().map(|d| json!({
             "id": d.id, "label": d.label, "type": d.kind, "level": d.level,
-            "holder": vault.holder(d),
+            "holder": seal.holder(d),
         })).collect::<Vec<_>>(),
-        "unlocks": vault.unlocks,
+        "unlocks": seal.unlocks,
         "signed_by": v.server(),
         "signed_at": v.iat(),
     })
 }
 
 /// The JSON form of deposits, for `--json` and the renderer.
-fn describe_deposits(vault: &str, deposits: &[kuipa_enroll::vault::Deposit]) -> Value {
+fn describe_deposits(seal: &str, deposits: &[kuipa_enroll::seal::Deposit]) -> Value {
     json!({
-        "vault": vault,
+        "seal": seal,
         "deposits": deposits.iter().map(|d| json!({
             "id": d.id,
             "depositor": d.depositor,
@@ -2277,12 +2273,12 @@ fn describe_deposits(vault: &str, deposits: &[kuipa_enroll::vault::Deposit]) -> 
 }
 
 /// The JSON form of release requests, for `--json` and the renderer.
-fn describe_requests(vault: &str, requests: &[kuipa_enroll::vault::ReleaseRequest]) -> Value {
+fn describe_requests(seal: &str, requests: &[kuipa_enroll::seal::ReleaseRequest]) -> Value {
     json!({
-        "vault": vault,
+        "seal": seal,
         "requests": requests.iter().map(|r| json!({
             "id": r.id,
-            "vault": r.vault.to_string(),
+            "seal": r.seal.to_string(),
             "requester": r.requester,
             "reason": r.reason,
             "bindings": r.bindings,
@@ -2296,7 +2292,7 @@ fn describe_requests(vault: &str, requests: &[kuipa_enroll::vault::ReleaseReques
 }
 
 fn describe_all(v: &[VerifiedDescriptor]) -> Value {
-    json!({ "vaults": v.iter().map(describe).collect::<Vec<_>>() })
+    json!({ "seals": v.iter().map(describe).collect::<Vec<_>>() })
 }
 
 /// What `kuipa tlog watch` last verified of one server's log.
@@ -2329,12 +2325,12 @@ impl<E: Into<Error>> From<E> for WatchError {
 
 /// What the stored descriptor accounts for.
 struct Expected {
-    /// The vault's id: every entry's opening must name it.
+    /// The seal's id: every entry's opening must name it.
     subject: Vec<u8>,
     devices: BTreeSet<String>,
     /// The policy's JSON, digested with each log's hash to compare.
     policy: Vec<u8>,
-    /// Who shares the vault, digested the same way.
+    /// Who shares the seal, digested the same way.
     sharing: Vec<u8>,
     revoked: bool,
 }
@@ -2347,11 +2343,11 @@ fn describe_event(
     expected: &Expected,
     flag: bool,
 ) -> Value {
-    use kuipa_enroll::tlog::{VaultAction as A, VaultEvent};
+    use kuipa_enroll::tlog::{SealAction as A, SealEvent};
 
     // The answer's check made sure an opening opens its leaf; that it is
-    // about this vault is this watch's to check.  A server that will not
-    // open an entry, or opens it to another vault's event, hides what it
+    // about this seal is this watch's to check.  A server that will not
+    // open an entry, or opens it to another seal's event, hides what it
     // did: flagged, whatever the watch's state.
     let refused = |why: &str| {
         json!({
@@ -2364,9 +2360,9 @@ fn describe_event(
         return refused("the server would not open this entry");
     };
     if opening.subject != expected.subject {
-        return refused("the server opened this entry to another vault's event");
+        return refused("the server opened this entry to another seal's event");
     }
-    let Ok(event) = VaultEvent::from_bytes(&opening.event) else {
+    let Ok(event) = SealEvent::from_bytes(&opening.event) else {
         return json!({
             "server": server, "index": e.index, "time": opening.time,
             "action": format!("kind {}", e.leaf.kind.0), "unexpected": false,
@@ -2409,7 +2405,7 @@ fn describe_event(
         A::Deny => ("deny", None),
         A::Revoke => (
             "revoke",
-            (!expected.revoked).then_some("the stored descriptor shows the vault enabled"),
+            (!expected.revoked).then_some("the stored descriptor shows the seal enabled"),
         ),
         A::AddDevice => (
             "add-device",
@@ -2456,18 +2452,18 @@ mod tests {
 
     #[test]
     fn the_watch_reads_openings_and_flags_what_the_server_will_not_open() {
-        use kuipa_enroll::tlog::{Kind, Opening, VaultAction, VaultEvent};
+        use kuipa_enroll::tlog::{Kind, Opening, SealAction, SealEvent};
 
         let expected = Expected {
-            subject: b"vault-1".to_vec(),
+            subject: b"seal-1".to_vec(),
             devices: BTreeSet::from(["dev-1".to_owned()]),
             policy: Vec::new(),
             sharing: Vec::new(),
             revoked: false,
         };
         let event = |device: &str| {
-            VaultEvent {
-                action: VaultAction::Release,
+            SealEvent {
+                action: SealAction::Release,
                 device: Some(device.into()),
                 digest: kuipa_enroll::merkle::Hash::zero(kuipa_enroll::merkle::TreeHash::Sha256),
             }
@@ -2476,7 +2472,7 @@ mod tests {
         let mine = Opening::new(
             Kind::ESCROW_RELEASE,
             1_800_000_123,
-            b"vault-1",
+            b"seal-1",
             event("dev-1"),
         )
         .unwrap();
@@ -2489,7 +2485,7 @@ mod tests {
         let other_device = Opening::new(
             Kind::ESCROW_RELEASE,
             1_800_000_200,
-            b"vault-1",
+            b"seal-1",
             event("dev-2"),
         )
         .unwrap();
@@ -2501,14 +2497,14 @@ mod tests {
         );
         assert_eq!(flagged["unexpected"], true, "{flagged}");
 
-        // An entry the server will not open, or opens to another vault's
+        // An entry the server will not open, or opens to another seal's
         // event, is flagged even on a baseline watch.
         let unopened = describe_event("ipa1", &entry(None, &mine), &expected, false);
         assert_eq!(unopened["unexpected"], true, "{unopened}");
         let theirs = Opening::new(
             Kind::ESCROW_RELEASE,
             1_800_000_123,
-            b"vault-2",
+            b"seal-2",
             event("dev-1"),
         )
         .unwrap();
