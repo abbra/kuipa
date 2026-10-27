@@ -971,6 +971,13 @@ pub enum SealAction {
     /// A recovered key was delivered to the device (`DESIGN-recovery.md`
     /// §4).
     Deliver = 18,
+    /// A recovery shard set was registered and device keys blobbed to it
+    /// (`DESIGN-recovery.md` §2.1), replacing any earlier set.
+    EscrowShards = 19,
+    /// Blobs were added to the current shard set for devices seen late.
+    EnrollShards = 20,
+    /// The shard registrations and blobs were fetched for recovery.
+    RecoverShards = 21,
 }
 
 impl SealAction {
@@ -989,6 +996,9 @@ impl SealAction {
             | Self::RemoveDevice
             | Self::EscrowCode
             | Self::RecoverCode
+            | Self::EscrowShards
+            | Self::EnrollShards
+            | Self::RecoverShards
             | Self::Deliver => Kind::SEAL_DEVICE,
             Self::Session
             | Self::OfflineSession
@@ -1019,6 +1029,9 @@ impl SealAction {
             16 => Self::Deposit,
             17 => Self::RetireDeposit,
             18 => Self::Deliver,
+            19 => Self::EscrowShards,
+            20 => Self::EnrollShards,
+            21 => Self::RecoverShards,
             _ => return Err(Error::Malformed("seal event action")),
         })
     }

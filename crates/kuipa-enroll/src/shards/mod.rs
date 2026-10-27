@@ -46,6 +46,8 @@ pub const SECRET_WORDS: usize = 26;
 pub const DATA_WORDS: usize = HEADER_WORDS + SALT_WORDS + SECRET_WORDS;
 /// The fewest and most check words a share may have.
 pub const PARITY_RANGE: std::ops::RangeInclusive<u8> = 4..=200;
+/// The largest set id a share header carries (19 bits).
+pub const MAX_SET_ID: u32 = 0x7_FFFF;
 /// Check words unless asked otherwise.
 pub const DEFAULT_PARITY: u8 = 24;
 /// The most shares in a set.
