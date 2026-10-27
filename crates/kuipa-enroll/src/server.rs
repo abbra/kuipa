@@ -28,7 +28,7 @@ use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::seal::{
     Approval, DEFAULT_EPOCH, Deposit, Descriptor, DeviceEscrow, Limits, Members, Recovered,
     RecoverySettings, ReleaseRequest, ReleasedKeys, Reply, Role, Seal, SealAnswer, SealOp,
-    SessionFor, SessionKey, SessionToken, State,
+    SessionFor, SessionKey, SessionToken, ShardsRegistration, State,
 };
 use crate::tlog::{Entry, Kind, LogId, Opening, Receipt, SealAction, SealEvent, SignedHead};
 use crate::trust::{self, TrustRequest, TrustResponse};
@@ -409,6 +409,22 @@ pub trait Directory {
         Ok(Vec::new())
     }
 
+    /// Replace `principal`'s whole recovery shard set with `rows`
+    /// (registration and blobs, `DESIGN-recovery.md` §2.1): a set is
+    /// replaced, not edited, and the old set's rows must go with it.
+    ///
+    /// # Errors
+    ///
+    /// Any failure; by default shard sets are not supported.
+    fn shards_replace(
+        &self,
+        principal: &Principal,
+        rows: &[DeviceEscrow],
+    ) -> Result<(), DirectoryError> {
+        let _ = (principal, rows);
+        Err("recovery shards are not supported by this directory".into())
+    }
+
     /// The realm's device-key recovery settings (`DESIGN-recovery.md` §4),
     /// if it has any.
     ///
@@ -757,6 +773,13 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn device_escrows(&self, principal: &Principal) -> Result<Vec<DeviceEscrow>, DirectoryError> {
         (**self).device_escrows(principal)
+    }
+    fn shards_replace(
+        &self,
+        principal: &Principal,
+        rows: &[DeviceEscrow],
+    ) -> Result<(), DirectoryError> {
+        (**self).shards_replace(principal, rows)
     }
     fn deposit_add(&self, deposit: &Deposit) -> Result<(), DirectoryError> {
         (**self).deposit_add(deposit)
@@ -1703,6 +1726,9 @@ impl EnrollServer {
             | SealOp::Deny { .. }
             | SealOp::EscrowCode { .. }
             | SealOp::RecoverCode
+            | SealOp::EscrowShards { .. }
+            | SealOp::EnrollShards { .. }
+            | SealOp::RecoverShards
             | SealOp::Deposit { .. }
             | SealOp::Deposits { .. }
             | SealOp::FetchDeposit { .. }
@@ -2416,10 +2442,10 @@ impl EnrollServer {
     }
 
     /// Answer `escrow-code` and `recover-code` (`DESIGN-recovery.md` §2):
-    /// keep or return the caller's device keys under recovery codes.  Each
-    /// is logged in every seal where the caller holds the device, so a
-    /// seal's watchers see that its device can be recovered, and when it
-    /// was fetched.
+    /// keep or return the caller's device keys under recovery codes; shard
+    /// sets are answered by `shards_op`.  Each is logged in every seal
+    /// where the caller holds the device, so a seal's watchers see that its
+    /// device can be recovered, and when it was fetched.
     fn escrow_op(
         &self,
         caller: &Principal,
@@ -2429,17 +2455,7 @@ impl EnrollServer {
     ) -> Result<(Vec<DeviceEscrow>, Vec<Receipt>), Refusal> {
         let me = caller.to_string();
         let seals = list_seals(caller, directory)?;
-        let held = |device: &str| -> Vec<escrow::SealId> {
-            seals
-                .iter()
-                .filter(|v| {
-                    v.devices
-                        .iter()
-                        .any(|d| d.id == device && v.holder(d) == me)
-                })
-                .map(|v| v.id)
-                .collect()
-        };
+        let held = |device: &str| holders_of(&seals, &me, device);
         let mut receipts = Vec::new();
         let mut log = |device: &str, action: SealAction| -> Result<(), Refusal> {
             for id in held(device) {
@@ -2486,7 +2502,103 @@ impl EnrollServer {
                 );
                 Ok((escrows, receipts))
             }
+            op @ (SealOp::EscrowShards { .. }
+            | SealOp::EnrollShards { .. }
+            | SealOp::RecoverShards) => self.shards_op(caller, op, now, directory),
             _ => unreachable!("only escrow operations"),
+        }
+    }
+
+    /// Answer the operations on recovery shard sets
+    /// (`DESIGN-recovery.md` §2.1): replace, join and fetch a set.  Like
+    /// the code operations, each device action is logged in every seal
+    /// where the caller holds the device.
+    fn shards_op(
+        &self,
+        caller: &Principal,
+        op: SealOp,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<(Vec<DeviceEscrow>, Vec<Receipt>), Refusal> {
+        let me = caller.to_string();
+        let seals = list_seals(caller, directory)?;
+        let held = |device: &str| holders_of(&seals, &me, device);
+        let mut receipts = Vec::new();
+        let mut log = |device: &str, action: SealAction| -> Result<(), Refusal> {
+            for id in held(device) {
+                let zero = merkle::Hash::zero(self.tree_hash());
+                receipts.extend(self.record_seal(&id, action, Some(device), zero)?);
+            }
+            Ok(())
+        };
+        match op {
+            SealOp::EscrowShards {
+                registration,
+                blobs,
+            } => {
+                let rows = shard_rows(&registration, &seals, &me, now, &blobs)?;
+                for row in &rows[1..] {
+                    log(&row.device, SealAction::EscrowShards)?;
+                }
+                directory.shards_replace(caller, &rows).map_err(Refusal)?;
+                eprintln!(
+                    "kuipad: {caller} registered recovery shard set {:05x} with {} device key(s)",
+                    registration.set,
+                    rows.len() - 1
+                );
+                Ok((rows, receipts))
+            }
+            SealOp::EnrollShards { blobs } => {
+                if !directory
+                    .device_escrows(caller)
+                    .map_err(Refusal)?
+                    .iter()
+                    .any(|e| e.kind == "shards-key")
+                {
+                    return Err(Refusal::because("no recovery shard set to join"));
+                }
+                let mut rows = Vec::new();
+                for (device, blob) in blobs {
+                    if held(&device).is_empty() {
+                        return Err(Refusal::because(
+                            "register the device in a seal before blobbing its key",
+                        ));
+                    }
+                    delivery_ok(&blob)?;
+                    let row = DeviceEscrow {
+                        device,
+                        kind: "shards".into(),
+                        blob,
+                        added: now,
+                    };
+                    log(&row.device, SealAction::EnrollShards)?;
+                    directory.device_escrow_set(caller, &row).map_err(Refusal)?;
+                    rows.push(row);
+                }
+                eprintln!(
+                    "kuipad: {caller} blobbed {} device key(s) to their shard set",
+                    rows.len()
+                );
+                Ok((rows, receipts))
+            }
+            SealOp::RecoverShards => {
+                let rows: Vec<DeviceEscrow> = directory
+                    .device_escrows(caller)
+                    .map_err(Refusal)?
+                    .into_iter()
+                    .filter(|e| e.kind == "shards-key" || e.kind == "shards")
+                    .collect();
+                // Logged before anything is answered.
+                for e in rows.iter().filter(|e| e.kind == "shards") {
+                    log(&e.device, SealAction::RecoverShards)?;
+                }
+                eprintln!(
+                    "kuipad: {caller} fetched their shard set and {} device key(s)",
+                    rows.iter().filter(|e| e.kind == "shards").count()
+                );
+                Ok((rows, receipts))
+            }
+            _ => unreachable!("only shard operations"),
         }
     }
 
@@ -2521,7 +2633,11 @@ impl EnrollServer {
                 )),
                 ..Reply::default()
             },
-            op @ (SealOp::EscrowCode { .. } | SealOp::RecoverCode) => {
+            op @ (SealOp::EscrowCode { .. }
+            | SealOp::RecoverCode
+            | SealOp::EscrowShards { .. }
+            | SealOp::EnrollShards { .. }
+            | SealOp::RecoverShards) => {
                 let (escrows, receipts) = self.escrow_op(caller, op, now, directory)?;
                 Reply {
                     receipts,
@@ -3055,6 +3171,9 @@ impl EnrollServer {
             | SealOp::Deny { .. }
             | SealOp::EscrowCode { .. }
             | SealOp::RecoverCode
+            | SealOp::EscrowShards { .. }
+            | SealOp::EnrollShards { .. }
+            | SealOp::RecoverShards
             | SealOp::Deposit { .. }
             | SealOp::Deposits { .. }
             | SealOp::FetchDeposit { .. }
@@ -3535,6 +3654,9 @@ fn seal_event(op: &SealOp) -> Option<(SealAction, Option<String>)> {
         | SealOp::Deny { .. }
         | SealOp::EscrowCode { .. }
         | SealOp::RecoverCode
+        | SealOp::EscrowShards { .. }
+        | SealOp::EnrollShards { .. }
+        | SealOp::RecoverShards
         | SealOp::Deposit { .. }
         | SealOp::Deposits { .. }
         | SealOp::FetchDeposit { .. }
@@ -3699,6 +3821,73 @@ fn list_seals(caller: &Principal, directory: &dyn Directory) -> Result<Vec<Seal>
         }
     }
     Ok(all)
+}
+
+/// The seals of `seals` in which `me` holds `device`: every one of them is
+/// where an action on the device belongs in the ledger.
+fn holders_of(seals: &[Seal], me: &str, device: &str) -> Vec<escrow::SealId> {
+    seals
+        .iter()
+        .filter(|v| {
+            v.devices
+                .iter()
+                .any(|d| d.id == device && v.holder(d) == me)
+        })
+        .map(|v| v.id)
+        .collect()
+}
+
+/// A stored device key must be a sealed delivery, so that what the server
+/// keeps can only be a key some seal already vouched for.
+fn delivery_ok(blob: &str) -> Result<(), Refusal> {
+    let bytes = tang_pqc::b64::decode(blob).map_err(Error::from)?;
+    if !bytes.starts_with(b"IPDD") || bytes.len() > crate::seal::MAX_ESCROW_BLOB {
+        return Err(Refusal::because(
+            "a delivery blob that is oversized or not a delivery",
+        ));
+    }
+    Ok(())
+}
+
+/// The rows of the new shard set: the registration first, then one blob
+/// per named device.  The registration is checked before anything is
+/// stored, because a page printed years from now is read against this id.
+fn shard_rows(
+    registration: &ShardsRegistration,
+    seals: &[Seal],
+    me: &str,
+    now: u64,
+    blobs: &[(String, String)],
+) -> Result<Vec<DeviceEscrow>, Refusal> {
+    let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())
+        .map_err(Error::from)?;
+    if public.kid().to_string() != registration.key || registration.set > crate::shards::MAX_SET_ID
+    {
+        return Err(Refusal::because(
+            "the recovery key id is not that key's, or the set id is out of range",
+        ));
+    }
+    let mut rows = vec![DeviceEscrow {
+        device: registration.key.clone(),
+        kind: "shards-key".into(),
+        blob: tang_pqc::b64::encode(&serde_json::to_vec(registration).unwrap_or_default()),
+        added: now,
+    }];
+    for (device, blob) in blobs {
+        if holders_of(seals, me, device).is_empty() {
+            return Err(Refusal::because(
+                "register the device in a seal before blobbing its key",
+            ));
+        }
+        delivery_ok(blob)?;
+        rows.push(DeviceEscrow {
+            device: device.clone(),
+            kind: "shards".into(),
+            blob: blob.clone(),
+            added: now,
+        });
+    }
+    Ok(rows)
 }
 
 /// The groups of `principal` that matter to `seal`: none unless the seal
