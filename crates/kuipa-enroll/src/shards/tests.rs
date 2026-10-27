@@ -36,10 +36,13 @@ fn set(rng: &mut Lcg, threshold: u8, shares: u8, parity: u8) -> Vec<Share> {
     make_shares_with(
         &SEED,
         SALT,
-        threshold,
-        shares,
-        DEFAULT_ITERATIONS,
-        parity,
+        SetParams {
+            threshold,
+            shares,
+            iterations: DEFAULT_ITERATIONS,
+            parity,
+            kem_1024: false,
+        },
         &mut |b| {
             rng.fill(b);
             Ok(())
@@ -86,16 +89,33 @@ fn shares_of_two_sets_or_with_other_parameters_are_not_mixed() {
         combine(&[a[0].clone(), odd]),
         Err(Error::Mixed(_))
     ));
+    let mut other_kem = a[1].clone();
+    other_kem.header.kem_1024 = true;
+    assert!(matches!(
+        combine(&[a[0].clone(), other_kem]),
+        Err(Error::Mixed(_))
+    ));
 }
 
 #[test]
 fn parameters_outside_what_a_share_can_say_are_refused() {
     let mut rng = Lcg(1);
     let mut try_with = |t, m, it, p| {
-        make_shares_with(&SEED, SALT, t, m, it, p, &mut |b| {
-            rng.fill(b);
-            Ok(())
-        })
+        make_shares_with(
+            &SEED,
+            SALT,
+            SetParams {
+                threshold: t,
+                shares: m,
+                iterations: it,
+                parity: p,
+                kem_1024: false,
+            },
+            &mut |b| {
+                rng.fill(b);
+                Ok(())
+            },
+        )
     };
     assert!(try_with(1, 3, 20, 24).is_err());
     assert!(try_with(4, 3, 20, 24).is_err());
@@ -196,10 +216,18 @@ fn the_whole_way_a_passphrase_then_shares_then_the_seed_back() {
     let passphrase = "correct horse battery staple extra";
     let hidden = mask(&SEED, passphrase, &SALT, 1).unwrap();
     assert_ne!(hidden, SEED);
-    let shares = make_shares_with(&hidden, SALT, 3, 5, 1, DEFAULT_PARITY, &mut |b| {
-        rng.fill(b);
-        Ok(())
-    })
+    let shares = make_shares_with(
+        &hidden,
+        SALT,
+        SetParams {
+            iterations: 1,
+            ..SetParams::new(3, 5, true)
+        },
+        &mut |b| {
+            rng.fill(b);
+            Ok(())
+        },
+    )
     .unwrap();
 
     // three shares, each damaged, typed back as lines
@@ -291,7 +319,8 @@ fn lines_are_read_by_their_numbers_and_unknown_words_are_lost() {
 fn a_share_has_these_words_for_these_parameters() {
     let share = Share {
         header: Header {
-            set_id: 0x8_F3A1,
+            set_id: 0x1_F3A1,
+            kem_1024: true,
             threshold: 3,
             shares: 5,
             index: 2,
@@ -302,10 +331,10 @@ fn a_share_has_these_words_for_these_parameters() {
         secret: SEED,
     };
     let expected: [u16; 68] = [
-        99, 826, 73, 21, 24, 461, 663, 541, 101, 405, 738, 24, 633, 465, 594, 28, 865, 432, 192,
+        79, 628, 201, 21, 24, 461, 663, 541, 101, 405, 738, 24, 633, 465, 594, 28, 865, 432, 192,
         787, 140, 820, 212, 867, 462, 57, 389, 550, 217, 101, 408, 771, 76, 563, 208, 851, 397,
-        824, 229, 20, 144, 836, 277, 96, 681, 644, 133, 438, 773, 359, 472, 27, 543, 771, 544, 462,
-        961, 253, 773, 990, 1004, 283, 752, 71, 489, 729, 225, 928,
+        824, 229, 20, 144, 836, 277, 96, 94, 440, 747, 466, 455, 976, 237, 173, 951, 824, 316, 517,
+        429, 712, 71, 985, 351, 899, 709, 309, 181, 881, 226, 837,
     ];
     assert_eq!(share.symbols(), expected);
 }

@@ -170,7 +170,7 @@ shares are enough while N of them are intact. The words are printed in
 numbered lines of five, so a lost word is a known place:
 
 ```text
-kuipa recovery shard 2 of 5 (any 3 are needed)           set 8F3A1
+kuipa recovery shard 2 of 5 (any 3 are needed)           set 1F3A1
 for alice, realm EXAMPLE.TEST      recovery key id  Zr9Q…k2w
 made 2026-10-27 by kuipa 0.4      the passphrase you chose is also needed
 
@@ -179,8 +179,9 @@ made 2026-10-27 by kuipa 0.4      the passphrase you chose is also needed
 ```
 
 **The header.** The first data words say, protected by the same
-code: the format version, a 20-bit **set id** that every share of one set
-carries (so shares of two sets are never mixed), N, M, this share's index,
+code: the format version, a 19-bit **set id** that every share of one set
+carries (so shares of two sets are never mixed), a bit saying whether the recovery key is
+ML-KEM-1024 (CNSA 2.0) or ML-KEM-768, N, M, this share's index,
 the PBKDF2 iteration count, `P`, and the 16-byte salt. Beside the words the page says the same in
 English, and how to decode a share with nothing but the page: the word
 list, the code (the field polynomial and generator), Shamir's scheme, the
