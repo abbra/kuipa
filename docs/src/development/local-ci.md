@@ -54,7 +54,7 @@ KUIPA_KRB5_VENDOR=heimdal ./contrib/ci/local-ci.sh build clippy test
 | `lint-workflows` | `actionlint` (or `yamllint`) on `.github/workflows/*.yml` | |
 | `deps` | fails if any RustCrypto algorithm or primitive crate (`sha2`, `aes-gcm`, `hmac`, `ml-kem`, …) is in the dependency tree: cryptography comes from OpenSSL through native-ossl | |
 | `clippy` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` (includes the denied `incompatible_msrv` lint) | `build` |
-| `doc` | `cargo doc --workspace --no-deps --all-features`, with `RUSTDOCFLAGS=-D warnings` | `build` |
+| `doc` | `cargo doc --workspace --no-deps --all-features`, with `RUSTDOCFLAGS=-D warnings`, then every man page in `docs/man/` compiled with `scdoc` and rendered with `man -l` (skipped, with a warning, when `scdoc` is not installed) | `build` |
 | `test` | `cargo test --workspace --all-features`, without the real-KDC tests | `build` |
 | `kdc-test` | `cargo test -p kuipa-tools --test kdc --test trust --test voucher` with `KUIPA_REQUIRE_KDC=1`, so missing KDC tools fail the job instead of skipping the tests; `SKIP` (not `FAIL`) under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
 | `playground-test` | starts the interactive playground, runs a scripted session in it with tracing on (`contrib/ci/playground/session.sh`), and renders it as `kuipa-playground-report/` (see below); `SKIP` under `KUIPA_KRB5_VENDOR=heimdal` | `build` |
