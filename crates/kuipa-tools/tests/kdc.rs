@@ -1350,6 +1350,155 @@ fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
     *directory.recovery.lock().unwrap() = None;
 }
 
+/// The pages of a `recovery_shards` answer, each as the words its user
+/// would read back.
+fn pages_of(made: &serde_json::Value) -> Vec<String> {
+    made["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            p["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
+}
+/// Paper backup (DESIGN-recovery.md §2.1): an N-of-M shard set whose
+/// recovery key stands for the device keys, checked, then used to bring a
+/// lost device's key back on another host.
+fn paper_keys(world: &Scenario, alice: &Alice) {
+    let realm = &world.realm;
+    let a = &world.web1;
+    let phrase: &[u8] = b"six honest words to open the papers";
+    let pass: &[u8] = b"papers pass";
+    let desk = UserPaths::new(realm.dir.join("alice-paper-desk"));
+    let old = SealClient::new(a, &desk, Some(&alice.cc));
+    let notes = seal::Policy {
+        factors: seal::Factors {
+            device: Some(seal::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..seal::Policy::default()
+    };
+    old.create("papers", notes).unwrap();
+    old.add_device("papers", pass).unwrap();
+    let note = old.seal("papers", b"door=4711").unwrap();
+    let made = old.recovery_shards(phrase, pass, 3, 5).unwrap();
+    let key = made["recovery_key"].as_str().unwrap().to_owned();
+    let pages = pages_of(&made);
+    assert_eq!(pages.len(), 5, "{made}");
+
+    // Checking reads any three papers without recovering anything.
+    assert_eq!(
+        old.recovery_shards_check(&pages[..3], phrase).unwrap()["recovery_key"],
+        key
+    );
+    // A wrong passphrase makes another key, and the id says so.
+    assert!(
+        old.recovery_shards_check(&pages[..3], b"six wrong words but long enough")
+            .is_err(),
+        "the passphrase is part of the key"
+    );
+
+    // The desk is gone.  On a new one, three papers and the passphrase
+    // bring its key back; a word typed `?` is repaired from the check
+    // words.
+    let lines = pages[0].lines().collect::<Vec<_>>();
+    let damaged = lines[..lines.len() - 2].join("\n");
+    let fresh = UserPaths::new(realm.dir.join("alice-paper-fresh"));
+    let on_new = SealClient::new(a, &fresh, Some(&alice.cc));
+    assert!(
+        on_new
+            .recover_shards(&pages[..2], phrase, pass, None)
+            .is_err(),
+        "two papers are under the threshold"
+    );
+    let back = on_new
+        .recover_shards(
+            &[damaged, pages[1].clone(), pages[2].clone()],
+            phrase,
+            pass,
+            None,
+        )
+        .unwrap();
+    assert_eq!(back["recovered"], made["devices"][0], "{back}");
+    assert!(
+        back["repaired"][0]["erased"].as_u64().unwrap() > 0,
+        "{back}"
+    );
+    assert_eq!(
+        on_new.open(&note, Some(pass)).unwrap().as_ref(),
+        b"door=4711"
+    );
+    // Finishing moves the files to the new desk's own device and retires
+    // the old one.
+    let (done, again) = on_new
+        .recover_finish(pass, std::slice::from_ref(&note), true)
+        .unwrap();
+    assert_eq!(done["resealed"], 1, "{done}");
+    assert_eq!(
+        on_new.open(&again[0], Some(pass)).unwrap().as_ref(),
+        b"door=4711"
+    );
+
+    // Finishing registered the new desk's device, which covers it under
+    // the same papers with no new paper and no extra command: the client
+    // blobs a key whenever the user has a set (DESIGN-recovery.md §2.1).
+    // A third host reading the papers is asked which device: the set
+    // holds the retired old key and this one.
+    let third = UserPaths::new(realm.dir.join("alice-paper-third"));
+    let other = SealClient::new(a, &third, Some(&alice.cc));
+    let which = other
+        .recover_shards(&pages[..3], phrase, pass, None)
+        .unwrap();
+    assert_eq!(which["devices"].as_array().unwrap().len(), 2, "{which}");
+    // `recovery-shards enroll` is the same blob, for a host that has a
+    // registered device and no blob: here, the new desk re-covering its
+    // own key under the set that is still registered.
+    let joined = on_new.recovery_shards_enroll(pass).unwrap();
+    assert_eq!(joined["recovery_key"], key, "{joined}");
+    // A device no seal holds cannot join: the server only takes keys of
+    // devices the caller has, and the retired one is in no seal.
+    assert!(old.recovery_shards_enroll(pass).is_err(), "retired");
+    let chosen = other
+        .recover_shards(
+            &pages[..3],
+            phrase,
+            pass,
+            Some(done["device"].as_str().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(chosen["recovered"], done["device"], "{chosen}");
+    // The device added after the papers were printed opens the file the
+    // papers were never printed for.
+    assert_eq!(
+        other.open(&again[0], Some(pass)).unwrap().as_ref(),
+        b"door=4711"
+    );
+
+    // A new set replaces the old one whole (a host whose device is still
+    // registered makes it; the retired one is in no seal).  Papers with
+    // no phrase at all are made with an empty one: they are the key.
+    let remade = on_new.recovery_shards(b"", pass, 2, 3).unwrap();
+    assert_ne!(remade["recovery_key"], key, "{remade}");
+    assert!(
+        old.recovery_shards_check(&pages[..3], phrase).is_err(),
+        "the old papers are not the registered set"
+    );
+    let bare = pages_of(&remade);
+    assert_eq!(
+        on_new.recovery_shards_check(&bare[..2], b"").unwrap()["recovery_key"],
+        remade["recovery_key"],
+        "{remade}"
+    );
+}
+
 fn token_device(world: &Scenario, alice: &Alice) {
     let realm = &world.realm;
     let a = &world.web1;
@@ -1904,6 +2053,7 @@ fn against_a_real_kdc() {
     lost_laptop(&world, &alice);
     deposits(&world, &alice);
     escrows(&world, &alice);
+    paper_keys(&world, &alice);
     helpdesk_recovery(&world, &alice);
     token_device(&world, &alice);
     passkeys(&world, &alice);
