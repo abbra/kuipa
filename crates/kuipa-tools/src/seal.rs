@@ -554,7 +554,7 @@ struct CachedAdvertisement {
 }
 
 /// A user's view of the host's realm and their own vaults.
-pub struct Seal<'a> {
+pub struct SealClient<'a> {
     host: &'a Paths,
     user: &'a UserPaths,
     credential: Credential<'a>,
@@ -578,7 +578,7 @@ struct OpAnswer {
     reply: kuipa_enroll::vault::Reply,
 }
 
-impl<'a> Seal<'a> {
+impl<'a> SealClient<'a> {
     /// Use the host's realm files under `host`, the user's directory, and
     /// the ticket in `ccache` (else the default ccache, `KRB5CCNAME`).
     #[must_use]

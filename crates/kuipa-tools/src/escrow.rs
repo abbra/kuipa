@@ -12,7 +12,7 @@ use kuipa_enroll::vault::DepositKind;
 use serde_json::Value;
 
 use crate::paths::{Error, Paths};
-use crate::seal::{Seal, UserPaths};
+use crate::seal::{SealClient, UserPaths};
 
 fn host_dir(paths: &Paths) -> UserPaths {
     UserPaths::new(paths.escrow_dir())
@@ -41,7 +41,7 @@ pub fn escrow_file(
 ) -> Result<Value, Error> {
     let user = host_dir(by.paths);
     let subject = BTreeMap::from([("name".to_owned(), name.to_owned())]);
-    Seal::for_keytab(by.paths, &user, by.keytab).deposit(
+    SealClient::for_keytab(by.paths, &user, by.keytab).deposit(
         vault,
         contents,
         DepositKind::File,
@@ -76,7 +76,7 @@ pub fn escrow_luks(
     }
     let user = host_dir(by.paths);
     let subject = BTreeMap::from([("uuid".to_owned(), uuid.to_ascii_lowercase())]);
-    Seal::for_keytab(by.paths, &user, by.keytab).deposit(
+    SealClient::for_keytab(by.paths, &user, by.keytab).deposit(
         vault,
         key.as_bytes(),
         DepositKind::Luks,
