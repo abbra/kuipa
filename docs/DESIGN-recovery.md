@@ -119,17 +119,30 @@ server keeps them (below).
 is; it is first hidden under the passphrase:
 
 ```text
-pad  = scrypt(passphrase, salt, N = 2^17, r = 8, p = 1)[0..32]   (the cost is in the header)
+salt = 16 random bytes, made with the set and carried by every share
+pad  = PBKDF2-HMAC-SHA-512(NFKC(passphrase), salt, iterations)[0..32]
 w    = s XOR pad
 ```
+
+PBKDF2 is the only password-based KDF that FIPS approves (SP 800-132), and
+kuipa keeps to FIPS-approved algorithms, so this is the KDF, as in §2. The
+salt is 128 random bits, which SP 800-132 asks for, and the iteration
+count is in units of 100 000 (default 20, so 2 million; 1 to 63): the
+cost of one try on the user's host, at the order of a second. PBKDF2
+needs no memory, so a graphics card tries passphrases far faster than a
+host, and the passphrase has to make up for it.
 
 `w` has no authentication tag on purpose, so that a wrong passphrase gives
 a wrong seed and nothing says so: the only check is that the public key
 derived from a candidate seed has the key id. An attacker who has N shares
 learns `w`, and then tries passphrases against the public key id at the
-cost of one scrypt each. The passphrase therefore needs the strength of a
-password protecting a key file, and the command refuses an empty one
-unless asked with `--no-passphrase`.
+cost of one PBKDF2 each. The passphrase therefore has to resist an offline
+search by someone who can use specialized hardware, not just a login
+prompt: kuipa asks for at least 16 characters (a phrase of five or six
+random words is the advice it prints), refuses a shorter one unless asked
+with `--weak-passphrase`, and an empty one unless asked with
+`--no-passphrase`. Characters are normalized (NFKC) before use, so the
+passphrase types the same on any keyboard.
 
 **Splitting.** `w` is split bytewise with **Shamir's scheme over GF(256)**
 into M shares of 32 bytes, any N of which give `w` back (N from 2, M at
@@ -143,12 +156,13 @@ four letters, so four letters identify one). The share's bytes, with a
 header, are the words' **data symbols**, and a Reed-Solomon code over
 GF(2^10) adds `P` **parity words** (24 by default; `--parity` allows 4 to
 200). A word is one symbol, so a damaged word costs one symbol and not a
-whole byte or two:
+whole byte or two. A share is 68 words by default: 5 of header, 13 of
+salt, 26 of secret and 24 of parity.
 
 | the reader | the code corrects |
 |---|---|
-| marks a word as unreadable (`?`), so its place is known (an erasure) | up to `P` of them: 24 of 55 words |
-| types a wrong word without knowing (an error) | up to `P/2`: 12 of 55 words |
+| marks a word as unreadable (`?`), so its place is known (an erasure) | up to `P` of them: 24 of 68 words |
+| types a wrong word without knowing (an error) | up to `P/2`: 12 of 68 words |
 | both | `e` erasures and `r` errors while `e + 2r <= P` |
 
 A share the code cannot repair is reported as such, and the other
@@ -167,10 +181,10 @@ made 2026-10-27 by kuipa 0.4      the passphrase you chose is also needed
 **The header.** The first data words say, protected by the same
 code: the format version, a 20-bit **set id** that every share of one set
 carries (so shares of two sets are never mixed), N, M, this share's index,
-the scrypt cost, and `P`. Beside the words the page says the same in
+the PBKDF2 iteration count, `P`, and the 16-byte salt. Beside the words the page says the same in
 English, and how to decode a share with nothing but the page: the word
 list, the code (the field polynomial and generator), Shamir's scheme, the
-scrypt parameters, the seed's HKDF label and ML-KEM's key generation. The
+PBKDF2 parameters, the seed's HKDF label and ML-KEM's key generation. The
 English is for the person; nothing reads it back, and the words do not
 depend on it.
 
@@ -218,7 +232,7 @@ accepts.
 |---|---|---|
 | the directory, the blobs | nothing (128-bit code) | nothing (they open only with the recovery key) |
 | one or a few shards (fewer than N) | — | nothing |
-| N shards, not the passphrase | — | a passphrase search against the key id, at one scrypt each |
+| N shards, not the passphrase | — | a passphrase search against the key id, at one PBKDF2 each |
 | N shards and the passphrase | — | the old device keys, then with the user's ticket their files |
 | the paper of the code | the old device key, and with the ticket their files | — |
 
@@ -238,6 +252,10 @@ Decisions:
 * **Not SLIP-39.** SLIP-39 splits a symmetric secret and its checksum finds
   errors without correcting them; neither is what this wants, so shares
   are not interchangeable with its tools. Its word list is reused.
+* **PBKDF2, with the passphrase doing the work.** FIPS allows no
+  memory-hard KDF, so the cost of a guess is only time. The design spends
+  it (2 million iterations), asks for a long passphrase, and keeps the
+  salt in the shares so that nothing else has to be kept.
 * **No verifiable sharing.** The client that makes the shares is the
   user's, so a share set the user's own client got wrong is found by
   `check`, not by commitments in the shares.
