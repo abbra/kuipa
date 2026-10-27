@@ -3702,6 +3702,79 @@ fn offline_sessions_release_epoch_keys_to_the_device() {
 }
 
 #[test]
+fn an_offline_unlock_settles_the_vault_first() {
+    let (r, _) = logged_realm();
+    let adv = &r.verify(0);
+    let anchors = r.all_anchors();
+    let op = |who: &str, o: &VaultOp| vault_reply_at(&r, 0, adv, who, o);
+    let alice_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    let bob_key = ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap();
+    r.dir.limits.borrow_mut().offline_sessions = true;
+    op(
+        ALICE,
+        &VaultOp::Create {
+            name: "travel".into(),
+            policy: vault::Policy {
+                factors: Factors {
+                    device: Some(Level::Any),
+                    ticket: true,
+                    passkey: false,
+                },
+                sessions: vault::Sessions {
+                    reauth: None,
+                    offline: Some(3600),
+                    epoch: None,
+                },
+                ..vault::Policy::default()
+            },
+        },
+    )
+    .unwrap();
+    op(ALICE, &add_device_op("travel", &alice_key)).unwrap();
+    r.dir
+        .groups
+        .borrow_mut()
+        .insert(BOB.into(), vec!["dba".into()]);
+    op(
+        ALICE,
+        &share_op("travel", vault::Members::default(), member_group("dba")),
+    )
+    .unwrap();
+    op(BOB, &add_device_op("alice/travel", &bob_key)).unwrap();
+
+    // Bob leaves the group, and the next operation is Alice's offline
+    // unlock: his device goes before anything is released, and the keys
+    // she gets come from the epoch that starts with his departure.
+    r.dir.groups.borrow_mut().remove(BOB);
+    let unlocked = op(
+        ALICE,
+        &VaultOp::Unlock {
+            name: "travel".into(),
+            device: alice_key.public().kid().to_string(),
+            offline: true,
+            passkey: None,
+        },
+    )
+    .unwrap();
+    let v = verified_descriptor(&anchors, &unlocked.descriptors);
+    let holders: Vec<_> = v
+        .vault()
+        .devices
+        .iter()
+        .map(|d| v.vault().holder(d))
+        .collect();
+    assert_eq!(holders, [ALICE]);
+    assert_eq!(v.vault().session_keys.len(), 2, "a new epoch started");
+    assert_eq!(unlocked.receipts.len(), 2, "the removal and the unlock");
+    let keys = unlocked
+        .released
+        .unwrap()
+        .open(&alice_key, &v.vault().id)
+        .unwrap();
+    assert!(keys.iter().any(|(e, _)| *e == 2), "the new epoch's key");
+}
+
+#[test]
 fn registered_sealing_opens_only_registered_files() {
     let r = realm();
     let advs = [r.verify(0), r.verify(1)];

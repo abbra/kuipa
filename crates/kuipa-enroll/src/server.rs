@@ -1069,6 +1069,18 @@ struct Published {
     advertisements: HashMap<AdvKey, (SignedAdvertisement, u64)>,
 }
 
+/// A session an unlock started (§7.6), on the vault as it was settled
+/// first.
+struct StartedSession {
+    vault: Vault,
+    token: SessionToken,
+    /// The vault's session keys, sealed to the device, for an offline
+    /// session.
+    released: Option<ReleasedKeys>,
+    /// The receipts of settling the vault before the session started.
+    receipts: Vec<Receipt>,
+}
+
 /// One IPA server.
 #[derive(Debug)]
 pub struct EnrollServer {
@@ -1684,7 +1696,7 @@ impl EnrollServer {
         let mut receipts = Vec::new();
         // What the operations that concern no descriptor answer.
         let mut side = Reply::default();
-        let (mut vaults, session, released) = match op {
+        let (vaults, session, released) = match op {
             op @ (VaultOp::Request { .. }
             | VaultOp::Pending { .. }
             | VaultOp::Approve { .. }
@@ -1703,14 +1715,14 @@ impl EnrollServer {
                 (Vec::new(), None, None)
             }
             op @ VaultOp::Unlock { .. } => {
-                let (vault, token, released) =
-                    self.start_session(&caller, &op, &cb, now, directory)?;
+                let started = self.start_session(&caller, &op, &cb, now, directory)?;
+                receipts.extend(started.receipts);
                 // Nothing is released before the answer, which waits for
                 // the record.
                 if let Some((action, device)) = event.take() {
-                    receipts.extend(self.record_change(&vault, action, device)?);
+                    receipts.extend(self.record_change(&started.vault, action, device)?);
                 }
-                (vec![vault], Some(token), released)
+                (vec![started.vault], Some(started.token), started.released)
             }
             op => {
                 // A change is recorded before the directory stores it, so a
@@ -1721,16 +1733,13 @@ impl EnrollServer {
                     }
                     Ok(())
                 };
-                (
-                    self.apply_vault_op(&caller, op, now, directory, &mut record)?,
-                    None,
-                    None,
-                )
+                let mut vaults = self.apply_vault_op(&caller, op, now, directory, &mut record)?;
+                for v in &mut vaults {
+                    receipts.extend(self.settle_vault(v, now, rotate, directory)?);
+                }
+                (vaults, None, None)
             }
         };
-        for v in &mut vaults {
-            receipts.extend(self.settle_vault(v, now, rotate, directory)?);
-        }
         let descriptors = self.public_descriptors(&vaults, now, directory)?;
         receipts.append(&mut side.receipts);
         if receipts.len() > 255 {
@@ -2065,7 +2074,10 @@ impl EnrollServer {
     /// Start a session for `caller`'s `device` in the vault `name` refers
     /// to, as long as its policy allows (and no longer than the vault): a
     /// re-authentication token, or offline the vault's session keys
-    /// released to the device.
+    /// released to the device. The vault is settled ([`Self::settle_vault`])
+    /// once the caller may start the session and before anything is
+    /// released, so departed members' devices are gone and the keys come
+    /// from the epochs that follow.
     fn start_session(
         &self,
         caller: &Principal,
@@ -2073,7 +2085,7 @@ impl EnrollServer {
         cb: &[u8; 32],
         now: u64,
         directory: &dyn Directory,
-    ) -> Result<(Vault, SessionToken, Option<ReleasedKeys>), Refusal> {
+    ) -> Result<StartedSession, Refusal> {
         let VaultOp::Unlock {
             name,
             device,
@@ -2115,9 +2127,7 @@ impl EnrollServer {
             sessions.reauth
         }
         .ok_or_else(|| Refusal::because("the vault's policy allows no such session"))?;
-        if offline && self.maintain_epochs(&mut vault, now, false, directory)? {
-            directory.vault_update(&vault).map_err(Refusal)?;
-        }
+        let receipts = self.settle_vault(&mut vault, now, false, directory)?;
         let registered = vault
             .devices
             .iter()
@@ -2160,7 +2170,12 @@ impl EnrollServer {
             if offline { "an offline" } else { "a" },
             vault.id
         );
-        Ok((vault, token, released))
+        Ok(StartedSession {
+            vault,
+            token,
+            released,
+            receipts,
+        })
     }
 
     /// The vault `reference` names for `caller` (`NAME`, the caller's
