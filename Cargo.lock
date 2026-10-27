@@ -1115,8 +1115,12 @@ version = "0.1.0"
 dependencies = [
  "anstream",
  "axum",
+ "bytes",
  "clap",
+ "futures-util",
+ "h2",
  "hickory-resolver",
+ "http",
  "kuipa-enroll",
  "kuipa-fido2",
  "kuipa-gssapi",
@@ -1127,6 +1131,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-native-ossl",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "synta",
@@ -1135,6 +1140,7 @@ dependencies = [
  "tang-pqc",
  "tang-pqc-clevis",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

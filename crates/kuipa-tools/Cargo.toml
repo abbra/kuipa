@@ -43,6 +43,13 @@ soft-fido2 = ["kuipa-enroll/testing"]
 [dev-dependencies]
 # The tests and the playground use the software security key.
 kuipa-tools = { path = ".", features = ["soft-fido2"] }
+# The DoT/DoH test server: HTTP/2 over rustls (as hickory's client).
+h2 = "0.4"
+http = "1"
+bytes = "1"
+futures-util = "0.3"
+tokio-rustls = { version = "0.26", default-features = false }
+rustls-pki-types = "1"
 # Test certificates (CA + PKINIT KDC chain), as in kurbu5-pkinit.
 synta = { version = "0.5.1", default-features = false, features = ["std"] }
 synta-certificate = "0.5.1"
