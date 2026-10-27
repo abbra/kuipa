@@ -50,7 +50,8 @@ All paths hang off `$KUIPA_ROOT` (default `/`).
 | `KUIPA_ROOT` | the root for every host path above |
 | `KUIPA_ENROLLMENT_FILE` | the default enrollment string file |
 | `KUIPA_ENDPOINTS` | `fqdn=url,…`: reach servers at other URLs (`unix:/path` too), for tests |
-| `KUIPA_DNS` | `address:port` of the one nameserver to ask for SRV records |
+| `KUIPA_DNS` | the one nameserver to ask for SRV records: `address:port` (plain), `dot://<host>[:853]` or `doh://<host>[:443][/path]` |
+| `KUIPA_DNS_CA` | PEM certificates to verify `dot://` and `doh://` nameservers with, instead of the system roots |
 | `KUIPA_KDC` | the one KDC for armoured exchanges, instead of the advertised ones |
 | `KUIPA_TRACE` | `tracing` filter directives, e.g. `kuipa_tools=trace` |
 | `KUIPA_USER_DIR`, `KUIPA_RUNTIME_DIR` | a user's kuipa directory and session directory |
