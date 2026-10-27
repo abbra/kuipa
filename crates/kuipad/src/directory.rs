@@ -1247,14 +1247,16 @@ impl Directory for LdapDirectory {
         let entry = self
             .principal_entry(&mut svc, principal, &[DEVICE_ESCROW_ATTR])?
             .ok_or_else(|| format!("no entry for {principal}"))?;
-        // The device's earlier escrow goes, the others stay.
+        // That device's escrow of this kind goes, the others stay: one
+        // device may hold a recovery code and a shard blob at once.
         let old: Vec<&String> = entry
             .attrs
             .get(&DEVICE_ESCROW_ATTR.to_lowercase())
             .into_iter()
             .flatten()
             .filter(|v| {
-                serde_json::from_str::<DeviceEscrow>(v).is_ok_and(|e| e.device == escrow.device)
+                serde_json::from_str::<DeviceEscrow>(v)
+                    .is_ok_and(|e| e.device == escrow.device && e.kind == escrow.kind)
             })
             .collect();
         let new = serde_json::to_string(escrow)?;
@@ -1284,6 +1286,46 @@ impl Directory for LdapDirectory {
             .flatten()
             .filter_map(|v| serde_json::from_str(v).ok())
             .collect())
+    }
+
+    fn shards_replace(
+        &self,
+        principal: &Principal,
+        rows: &[DeviceEscrow],
+    ) -> Result<(), DirectoryError> {
+        let mut svc = self.service_conn()?;
+        let entry = self
+            .principal_entry(&mut svc, principal, &[DEVICE_ESCROW_ATTR])?
+            .ok_or_else(|| format!("no entry for {principal}"))?;
+        // The whole old set goes, keyed rows and code escrows of other
+        // kinds stay.
+        let old: Vec<&String> = entry
+            .attrs
+            .get(&DEVICE_ESCROW_ATTR.to_lowercase())
+            .into_iter()
+            .flatten()
+            .filter(|v| {
+                serde_json::from_str::<DeviceEscrow>(v)
+                    .is_ok_and(|e| e.kind == "shards" || e.kind == "shards-key")
+            })
+            .collect();
+        let mut mods = Vec::new();
+        if !old.is_empty() {
+            mods.push((
+                ModOp::Delete,
+                DEVICE_ESCROW_ATTR,
+                old.iter().map(|v| v.as_bytes()).collect(),
+            ));
+        }
+        let new: Vec<String> = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
+        for value in &new {
+            mods.push((ModOp::Add, DEVICE_ESCROW_ATTR, vec![value.as_bytes()]));
+        }
+        svc.modify_s(&entry.dn, &mods)?;
+        Ok(())
     }
 
     fn seals_approved_by(

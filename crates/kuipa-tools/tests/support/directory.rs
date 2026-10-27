@@ -633,7 +633,7 @@ impl Directory for KdcDirectory {
     ) -> Result<(), DirectoryError> {
         let mut all = self.escrows.lock().unwrap();
         let mine = all.entry(principal.to_string()).or_default();
-        mine.retain(|e| e.device != escrow.device);
+        mine.retain(|e| !(e.device == escrow.device && e.kind == escrow.kind));
         mine.push(escrow.clone());
         Ok(())
     }
@@ -649,6 +649,18 @@ impl Directory for KdcDirectory {
             .get(&principal.to_string())
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn shards_replace(
+        &self,
+        principal: &Principal,
+        rows: &[kuipa_enroll::seal::DeviceEscrow],
+    ) -> Result<(), DirectoryError> {
+        let mut all = self.escrows.lock().unwrap();
+        let mine = all.entry(principal.to_string()).or_default();
+        mine.retain(|e| e.kind != "shards" && e.kind != "shards-key");
+        mine.extend(rows.iter().cloned());
+        Ok(())
     }
 
     fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
