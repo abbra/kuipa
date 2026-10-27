@@ -35,9 +35,10 @@ use kuipa_enroll::keytab::Enctype;
 use kuipa_enroll::passkey::PasskeyInfo;
 use kuipa_enroll::realm::{Deployment, VerifiedRealm};
 use kuipa_enroll::seal::{
-    Descriptor, DeviceKey, DeviceType, Policy, SealOp, SealedFile, SessionSealedFile, SessionToken,
-    TicketSource, Unlock, VerifiedDescriptor,
+    Descriptor, DeviceEscrow, DeviceKey, DeviceType, Policy, SealOp, SealedFile, SessionSealedFile,
+    SessionToken, ShardsRegistration, TicketSource, Unlock, VerifiedDescriptor,
 };
+use kuipa_enroll::shards::{self, Share};
 use kuipa_gssapi::GssClientCred;
 use native_ossl::digest::DigestAlg;
 use native_ossl::kdf::Pbkdf2Builder;
@@ -439,6 +440,14 @@ fn recovery_secret(code: &str) -> Result<SecretBuf, Error> {
         return Err("a recovery code is 26 letters and digits 2-7".into());
     }
     Ok(SecretBuf::new(bare))
+}
+
+/// The shard set's registration among the server's rows, if it has one.
+fn registration_of(rows: &[DeviceEscrow]) -> Option<ShardsRegistration> {
+    rows.iter().find(|e| e.kind == "shards-key").and_then(|e| {
+        let json = tang_pqc::b64::decode(&e.blob).ok()?;
+        serde_json::from_slice(&json).ok()
+    })
 }
 
 /// A live session on this host: the server's token, the unwrapped device
@@ -1461,7 +1470,34 @@ impl<'a> SealClient<'a> {
             self.retire_deposit(&seal, &id)
                 .map_err(|e| format!("the refused device's deposit was not retired: {e}"))?;
         }
+        // A user with a recovery shard set covers a new key without new
+        // paper; the blob needs the registration to stand first, since
+        // the server only takes keys of devices it holds (DESIGN-recovery.md
+        // §2.1).  A key left uncovered is said, not passed over.
+        if let (HostDevice::File(k), Ok(_)) = (key, &registered) {
+            self.blob_to_shards(k).map_err(|e| {
+                format!("the device is registered, but its key is not covered by your papers: {e}")
+            })?;
+        }
         Ok(describe_all(&registered?))
+    }
+    /// The registered shard set's recovery key, if any, with this device
+    /// key blobbed under it (`enroll-shards`).  `Ok(None)` says the user
+    /// has no papers, which is not an error for a caller that only covers
+    /// a key when they do.
+    fn blob_to_shards(&self, key: &ExchangeKeyPair) -> Result<Option<String>, Error> {
+        let rows = self.op_with_session(&SealOp::RecoverShards)?.reply.escrows;
+        let Some(registration) = registration_of(&rows) else {
+            return Ok(None);
+        };
+        let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let device = key.public().kid().to_string();
+        let blob = kuipa_enroll::seal::seal_delivery(&public, key).map_err(|e| e.to_string())?;
+        self.op_with_session(&SealOp::EnrollShards {
+            blobs: vec![(device, tang_pqc::b64::encode(&blob))],
+        })?;
+        Ok(Some(registration.key))
     }
 
     /// `kuipa seal device add --pkcs11 URI`: make the ML-KEM key at `uri`
@@ -1744,6 +1780,242 @@ impl<'a> SealClient<'a> {
             &self.user.protect(&key, passphrase, self.authenticator)?,
         )?;
         Ok(json!({ "recovered": key.public().kid().to_string() }))
+    }
+
+    /// `kuipa seal recovery-shards create`: make an N-of-M paper shard set
+    /// for this host's device key and register the recovery key the papers
+    /// stand for (`DESIGN-recovery.md` §2.1).  A set is replaced whole:
+    /// the server drops any older set's registration and blobs.  The
+    /// pages are returned for the caller to print.
+    ///
+    /// # Errors
+    ///
+    /// A token's key (it never leaves the token), a wrong passphrase, a
+    /// refusal.
+    pub fn recovery_shards(
+        &self,
+        recovery: &[u8],
+        device: &[u8],
+        threshold: u8,
+        shares: u8,
+    ) -> Result<Value, Error> {
+        let HostDevice::File(key) = self.user.device(device, self.authenticator)? else {
+            return Err("a token's key never leaves the token: it has no shards".into());
+        };
+        let mut seed = [0u8; 32];
+        Rand::fill(&mut seed)?;
+        let params = shards::SetParams::new(threshold, shares, false);
+        let salt = shards::new_salt().map_err(|e| e.to_string())?;
+        let hidden = shards::mask(
+            &seed,
+            &String::from_utf8_lossy(recovery),
+            &salt,
+            params.iterations,
+        )
+        .map_err(|e| e.to_string())?;
+        let made = shards::make_shares(&hidden, salt, params).map_err(|e| e.to_string())?;
+        let pair = shards::recovery_key(&seed, false).map_err(|e| e.to_string())?;
+        let registration = ShardsRegistration {
+            key: pair.public().kid().to_string(),
+            set: made[0].header.set_id,
+            public: pair.public().to_jwk_json(),
+        };
+        let device = key.public().kid().to_string();
+        let blob =
+            kuipa_enroll::seal::seal_delivery(pair.public(), &key).map_err(|e| e.to_string())?;
+        self.op_with_session(&SealOp::EscrowShards {
+            registration: registration.clone(),
+            blobs: vec![(device.clone(), tang_pqc::b64::encode(&blob))],
+        })?;
+        let pages: Vec<Value> = made
+            .iter()
+            .map(|s| {
+                json!({
+                    "index": s.header.index,
+                    "lines": shards::format_lines(&s.symbols()),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "recovery_key": registration.key,
+            "set": format!("{:05X}", registration.set),
+            "threshold": threshold,
+            "shares": shares,
+            "pages": pages,
+            "devices": [device],
+        }))
+    }
+    /// `kuipa seal recovery-shards enroll`: make this host's device key's
+    /// blob for the recovery set already registered, so a device added
+    /// after the papers were printed is covered without new paper
+    /// (`DESIGN-recovery.md` §2.1).
+    ///
+    /// # Errors
+    ///
+    /// A token's key, no registered set, a refusal.
+    pub fn recovery_shards_enroll(&self, passphrase: &[u8]) -> Result<Value, Error> {
+        let HostDevice::File(key) = self.user.device(passphrase, self.authenticator)? else {
+            return Err("a token's key never leaves the token: it has no shards".into());
+        };
+        let rows = self.op_with_session(&SealOp::RecoverShards)?.reply.escrows;
+        let registration = registration_of(&rows).ok_or("no recovery shard set is registered")?;
+        let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let device = key.public().kid().to_string();
+        let blob = kuipa_enroll::seal::seal_delivery(&public, &key).map_err(|e| e.to_string())?;
+        self.op_with_session(&SealOp::EnrollShards {
+            blobs: vec![(device.clone(), tang_pqc::b64::encode(&blob))],
+        })?;
+        Ok(json!({ "device": device, "recovery_key": registration.key }))
+    }
+
+    /// Reads the typed words of `shares` back into shares, repairing each
+    /// as the code allows, and reports what was repaired per page.  Stops
+    /// at the set's threshold: enough consistent papers, as the design
+    /// asks, so a user is never made to read a paper they do not need.
+    ///
+    /// # Errors
+    ///
+    /// A paper too damaged to read, papers of different sets, fewer than
+    /// the threshold readable.
+    fn gather_shares(words: &[String]) -> Result<(Vec<Share>, Vec<Value>), Error> {
+        let mut read: Vec<Share> = Vec::new();
+        let mut report = Vec::new();
+        for text in words {
+            // A page's check-word count is only known once read; the
+            // default is what `create` prints, and from_symbols checks
+            // the page's own header against the length.
+            let total = shards::DATA_WORDS + usize::from(shards::DEFAULT_PARITY);
+            let symbols = shards::parse_lines(text, total);
+            let (share, repair) = Share::from_symbols(&symbols).map_err(|e| e.to_string())?;
+            if let Some(first) = read.first()
+                && first.header.set_id != share.header.set_id
+            {
+                return Err("these papers are from different sets".into());
+            }
+            read.push(share);
+            report.push(json!({
+                "index": read.last().unwrap().header.index,
+                "erased": repair.erased,
+                "wrong": repair.wrong,
+            }));
+            if read.len() >= usize::from(read[0].header.threshold) {
+                break;
+            }
+        }
+        Ok((read, report))
+    }
+    /// `kuipa seal recover shards`: read the papers, make the recovery key
+    /// they and the passphrase stand for, and keep the opened key of
+    /// `device` on this host as the recovered key, under `passphrase`
+    /// (this host's device passphrase, if it has a device key) — as
+    /// `recover code` does.  The host keeps one recovered key: with the
+    /// set holding several devices and `device` not given, nothing is
+    /// written and the device ids are listed instead.
+    ///
+    /// # Errors
+    ///
+    /// Unreadable papers, a wrong passphrase or paper (the key id says),
+    /// a recovered key already here, a refusal.
+    pub fn recover_shards(
+        &self,
+        words: &[String],
+        recovery: &[u8],
+        passphrase: &[u8],
+        device: Option<&str>,
+    ) -> Result<Value, Error> {
+        if self.user.recovered_key().exists() {
+            return Err(
+                "a recovered key is already here: `kuipa seal recover finish` first".into(),
+            );
+        }
+        let (_, rows, pair, report) = self.recovery_key_of(words, recovery)?;
+        let opened: Vec<(String, ExchangeKeyPair)> = rows
+            .iter()
+            .filter(|e| e.kind == "shards" && device.is_none_or(|d| e.device == d))
+            .filter_map(|e| {
+                let blob = tang_pqc::b64::decode(&e.blob).ok()?;
+                kuipa_enroll::seal::open_delivery(&blob, &pair)
+                    .ok()
+                    .map(|k| (e.device.clone(), k))
+            })
+            .collect();
+        if opened.is_empty() {
+            return Err("the set holds no key for that device".into());
+        }
+        if opened.len() > 1 {
+            return Ok(json!({
+                "devices": opened.iter().map(|(d, _)| d).collect::<Vec<_>>(),
+                "hint": "which device: run again with --device",
+            }));
+        }
+        if self.user.device_key().exists() {
+            // One passphrase (or passkey) for both keys of this host.
+            self.user.device(passphrase, self.authenticator)?;
+        }
+        let (device, key) = &opened[0];
+        self.user.write(
+            &self.user.recovered_key(),
+            &self.user.protect(key, passphrase, self.authenticator)?,
+        )?;
+        Ok(json!({ "recovered": device, "repaired": report }))
+    }
+    /// `kuipa seal recovery-shards check`: read papers and report whether
+    /// the set would recover, against the registered key id, without
+    /// asking the server for any blob (`DESIGN-recovery.md` §2.1).
+    ///
+    /// # Errors
+    ///
+    /// Unreadable papers, no registered set, a wrong passphrase or paper.
+    pub fn recovery_shards_check(&self, words: &[String], recovery: &[u8]) -> Result<Value, Error> {
+        let (_, _, pair, report) = self.recovery_key_of(words, recovery)?;
+        Ok(json!({
+            "recovery_key": pair.public().kid().to_string(),
+            "repaired": report,
+        }))
+    }
+
+    /// The common half of recovery and checking: read the papers, unmask
+    /// the seed with the passphrase, make the key pair, and check its id
+    /// against the registered one — so a wrong passphrase or paper is
+    /// told apart from a damaged one.  One fetch of the server's rows.
+    ///
+    /// # Errors
+    ///
+    /// Unreadable or mixed papers, no registered set, a key that does not
+    /// match the registered id.
+    fn recovery_key_of(
+        &self,
+        words: &[String],
+        recovery: &[u8],
+    ) -> Result<
+        (
+            ShardsRegistration,
+            Vec<DeviceEscrow>,
+            ExchangeKeyPair,
+            Vec<Value>,
+        ),
+        Error,
+    > {
+        let (read, report) = Self::gather_shares(words)?;
+        let combined = shards::combine(&read).map_err(|e| e.to_string())?;
+        let seed = shards::mask(
+            &combined.hidden,
+            &String::from_utf8_lossy(recovery),
+            &combined.salt,
+            combined.iterations,
+        )
+        .map_err(|e| e.to_string())?;
+        let pair = shards::recovery_key(&seed, combined.kem_1024).map_err(|e| e.to_string())?;
+        let rows = self.op_with_session(&SealOp::RecoverShards)?.reply.escrows;
+        let registration = registration_of(&rows).ok_or("no recovery shard set is registered")?;
+        if pair.public().kid().to_string() != registration.key {
+            return Err(
+                "the passphrase or a paper is wrong: the key they make is not the one registered"
+                    .into(),
+            );
+        }
+        Ok((registration, rows, pair, report))
     }
 
     /// `kuipa seal recover finish`: register this host's device (made now
@@ -2393,6 +2665,12 @@ fn describe_event(
         A::RecoverCode => (
             "recover-code",
             Some("the device's escrowed key was fetched for recovery"),
+        ),
+        A::EscrowShards => ("escrow-shards", unlisted.then_some("an unlisted device")),
+        A::EnrollShards => ("enroll-shards", unlisted.then_some("an unlisted device")),
+        A::RecoverShards => (
+            "recover-shards",
+            Some("the device's sharded key was fetched for recovery"),
         ),
         A::Deposit => ("deposit", None),
         A::RetireDeposit => ("retire-deposit", None),
