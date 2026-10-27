@@ -12,6 +12,8 @@
 //! * [`bundle`]: offline enrollment bundles (§8).
 //! * [`escrow`]: sealed keytabs (§7).
 //! * [`seal`], [`passkey`]: user seals and the passkey factor (§7.6).
+//! * [`shards`]: recovery shards, an N-of-M paper key with error correction
+//!   (`docs/DESIGN-recovery.md` §2.1).
 //! * [`sign`]: Kerberos-bound signing statements (`docs/DESIGN-sign.md`).
 //! * [`tlog`]: typed transparency logs with tombstones and witness
 //!   cosignatures (`docs/DESIGN-tlog.md`).
@@ -33,6 +35,7 @@ pub mod payload;
 pub mod realm;
 pub mod seal;
 pub mod server;
+pub mod shards;
 pub mod sign;
 pub mod tlog;
 #[cfg(feature = "tls")]

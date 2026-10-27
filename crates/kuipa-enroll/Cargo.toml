@@ -23,6 +23,8 @@ native-ossl.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tang-pqc.workspace = true
+# NFKC for recovery-shard passphrases.
+unicode-normalization = "0.1"
 
 [features]
 # A rustls verifier for kuipad's TLS endpoints: ordinary CAs through
