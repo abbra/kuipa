@@ -8,7 +8,7 @@
 //! A share is `HEADER_WORDS + SALT_WORDS + SECRET_WORDS` data words and `parity` check words:
 //!
 //! ```text
-//! header  5 words   version(4) set id(20) threshold-1(4) shares-1(4) index-1(4) iterations(6) parity(8)
+//! header  5 words   version(4) set id(19) kem(1) threshold-1(4) shares-1(4) index-1(4) iterations(6) parity(8)
 //! salt   13 words   the 16-byte PBKDF2 salt, 2 zero bits of padding
 //! secret 26 words   this share's 32 bytes, 4 zero bits of padding
 //! parity  P words   Reed-Solomon over GF(2^10), roots alpha^1..alpha^P
@@ -111,8 +111,10 @@ fn crypto(e: impl fmt::Display) -> Error {
 /// What the header of a share says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    /// Identifies the set the share belongs to (20 bits), so shares of two sets are not mixed.
+    /// Identifies the set the share belongs to (19 bits), so shares of two sets are not mixed.
     pub set_id: u32,
+    /// Whether the recovery key is ML-KEM-1024 (CNSA 2.0) and not ML-KEM-768.
+    pub kem_1024: bool,
     /// How many shares recombine the seed.
     pub threshold: u8,
     /// How many shares the set has.
@@ -147,6 +149,8 @@ pub struct Combined {
     pub iterations: u8,
     /// The set the shares belong to.
     pub set_id: u32,
+    /// Whether the recovery key is ML-KEM-1024.
+    pub kem_1024: bool,
 }
 
 struct BitWriter {
@@ -227,7 +231,8 @@ impl Share {
         let h = &self.header;
         let mut w = BitWriter::new();
         w.put(u32::from(VERSION), 4);
-        w.put(h.set_id & 0xF_FFFF, 20);
+        w.put(h.set_id & 0x7_FFFF, 19);
+        w.put(u32::from(h.kem_1024), 1);
         w.put(u32::from(h.threshold.saturating_sub(1)), 4);
         w.put(u32::from(h.shares.saturating_sub(1)), 4);
         w.put(u32::from(h.index.saturating_sub(1)), 4);
@@ -288,7 +293,8 @@ impl Share {
         if r.take(4) != u32::from(VERSION) {
             return Err(Error::Malformed("unknown format version"));
         }
-        let set_id = r.take(20);
+        let set_id = r.take(19);
+        let kem_1024 = r.take(1) == 1;
         let threshold = small(r.take(4) + 1);
         let shares = small(r.take(4) + 1);
         let index = small(r.take(4) + 1);
@@ -310,6 +316,7 @@ impl Share {
         let secret = r.bytes::<32>()?;
         let header = Header {
             set_id,
+            kem_1024,
             threshold,
             shares,
             index,
@@ -372,6 +379,35 @@ fn random(buf: &mut [u8]) -> Result<(), Error> {
     Rand::fill_private(buf).map_err(crypto)
 }
 
+/// What a set of shares is to look like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetParams {
+    /// How many shares recombine the seed (2 to `shares`).
+    pub threshold: u8,
+    /// How many shares to make (at most [`MAX_SHARES`]).
+    pub shares: u8,
+    /// PBKDF2 iterations, in units of [`ITERATION_UNIT`].
+    pub iterations: u8,
+    /// Check words per share.
+    pub parity: u8,
+    /// Whether the recovery key is ML-KEM-1024 (CNSA 2.0) and not ML-KEM-768.
+    pub kem_1024: bool,
+}
+
+impl SetParams {
+    /// A threshold of `threshold` out of `shares`, with the default cost and check words.
+    #[must_use]
+    pub fn new(threshold: u8, shares: u8, kem_1024: bool) -> Self {
+        SetParams {
+            threshold,
+            shares,
+            iterations: DEFAULT_ITERATIONS,
+            parity: DEFAULT_PARITY,
+            kem_1024,
+        }
+    }
+}
+
 /// Makes a set of shares for a seed already hidden under the passphrase ([`mask`]).
 ///
 /// # Errors
@@ -382,31 +418,24 @@ fn random(buf: &mut [u8]) -> Result<(), Error> {
 pub fn make_shares(
     hidden: &[u8; 32],
     salt: [u8; 16],
-    threshold: u8,
-    shares: u8,
-    iterations: u8,
-    parity: u8,
+    params: SetParams,
 ) -> Result<Vec<Share>, Error> {
-    make_shares_with(
-        hidden,
-        salt,
-        threshold,
-        shares,
-        iterations,
-        parity,
-        &mut random,
-    )
+    make_shares_with(hidden, salt, params, &mut random)
 }
 
 fn make_shares_with(
     hidden: &[u8; 32],
     salt: [u8; 16],
-    threshold: u8,
-    shares: u8,
-    iterations: u8,
-    parity: u8,
+    params: SetParams,
     fill: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
 ) -> Result<Vec<Share>, Error> {
+    let SetParams {
+        threshold,
+        shares,
+        iterations,
+        parity,
+        kem_1024,
+    } = params;
     if threshold < 2 {
         return Err(Error::Parameters(
             "the threshold is at least 2: one share would be the whole key",
@@ -428,7 +457,7 @@ fn make_shares_with(
     let mut id = [0u8; 3];
     fill(&mut id)?;
     let set_id =
-        (u32::from(id[0]) << 12 | u32::from(id[1]) << 4 | u32::from(id[2]) >> 4) & 0xF_FFFF;
+        (u32::from(id[0]) << 11 | u32::from(id[1]) << 3 | u32::from(id[2]) >> 5) & 0x7_FFFF;
     let secrets = split(hidden, threshold, shares, fill)?;
     Ok(secrets
         .into_iter()
@@ -436,6 +465,7 @@ fn make_shares_with(
         .map(|(secret, index)| Share {
             header: Header {
                 set_id,
+                kem_1024,
                 threshold,
                 shares,
                 index,
@@ -466,6 +496,7 @@ pub fn combine(shares: &[Share]) -> Result<Combined, Error> {
         if s.header.threshold != h.threshold
             || s.header.shares != h.shares
             || s.header.iterations != h.iterations
+            || s.header.kem_1024 != h.kem_1024
             || s.salt != first.salt
         {
             return Err(Error::Mixed("they disagree about the set's parameters"));
@@ -494,6 +525,7 @@ pub fn combine(shares: &[Share]) -> Result<Combined, Error> {
         salt: first.salt,
         iterations: h.iterations,
         set_id: h.set_id,
+        kem_1024: h.kem_1024,
     })
 }
 
