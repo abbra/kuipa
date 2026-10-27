@@ -93,9 +93,9 @@ session uses the playground's helpers the way a person would, with
 
 * an OTP join, `status`, a rekey and `check`;
 * `protect`, `kuipa-unseal` and `unprotect`;
-* a user's vaults: devices, sealing, the transparency log and witnesses,
+* a user's seals: devices, sealing, the transparency log and witnesses,
   sessions, offline sessions;
-* realm limits, a vault shared with bob, a break-glass vault bob and
+* realm limits, a seal shared with bob, a break-glass seal bob and
   carol approve, bob's lost device recovered with a code and then
   through the helpdesk, and carol's and web1's deposits;
 * signing files and a git commit;
@@ -213,10 +213,10 @@ live in one shell; nothing touches the real system.
 | `pq_trusted_kinit [USER]` | log in a `B.TEST` user on the current host (default `alice@B.TEST`; a bare name means `USER@B.TEST`): anonymous PKINIT armour from B's KDC with the installed chain, then an armoured `kinit`; refuses before `pq_trust`. The ticket and the configuration (the realm's plus the installed snippet, B's KDC pointed at its socket) stay in `$KUIPA_ROOT/trusted-login` |
 | `pq_trusted CMD…` | run `CMD` with that user's ticket and configuration, e.g. `pq_trusted klist` or `pq_trusted kvno host/$PQ_HOST` (a ticket for this `EXAMPLE.TEST` host over the trust) |
 | `pq_admin_kinit` | log in as the administrator with a kuipa data directory and runtime directory of their own, for `kuipa seal` |
-| `pq_as USER CMD…` | run `CMD` as `bob` or `carol` (password `Secret123`), each with a ticket and a kuipa data directory of their own, for shared vaults, approvals and deposits: `pq_as bob kuipa seal list` |
+| `pq_as USER CMD…` | run `CMD` as `bob` or `carol` (password `Secret123`), each with a ticket and a kuipa data directory of their own, for shared seals, approvals and deposits: `pq_as bob kuipa seal list` |
 | `pq_passkey [ALG] [--pin PIN]` | register a new IPA passkey (`mldsa65` by default; `es256`, `es384`, `eddsa`, `rs256`, `mldsa44`, `mldsa87`) on the logged-in user's software security key, as `ipa user-add-passkey --register` does, setting the key's PIN first with `--pin`. `pq_admin_kinit` and `pq_as` give each user a key of their own (`$KUIPA_SOFT_FIDO2`): the playground's `kuipa` is built with the `soft-fido2` feature, so it uses that file instead of attached FIDO2 keys. `kuipa-playground passkey --user-verification on\|off` stands in for `ipa passkeyconfig-mod` |
-| `pq_token LABEL` | make an ML-KEM-768 key `LABEL` on the playground's software PKCS#11 token (kryoptic, token `kuipa`, PIN `1234`) and print its URI, for `kuipa seal device add VAULT --pkcs11 URI --module $PQ_TOKEN_MODULE` |
-| `kuipa-playground recovery --vault OWNER/NAME [--required]` | name the realm's device escrow vault, as an administrator sets `cn=recovery,cn=kuipa,cn=etc`: new device keys are deposited there (`DESIGN-recovery.md` §4) |
+| `pq_token LABEL` | make an ML-KEM-768 key `LABEL` on the playground's software PKCS#11 token (kryoptic, token `kuipa`, PIN `1234`) and print its URI, for `kuipa seal device add SEAL --pkcs11 URI --module $PQ_TOKEN_MODULE` |
+| `kuipa-playground recovery --seal OWNER/NAME [--required]` | name the realm's device escrow seal, as an administrator sets `cn=recovery,cn=kuipa,cn=etc`: new device keys are deposited there (`DESIGN-recovery.md` §4) |
 | `pq_down SERVER` / `pq_up` | make a server unreachable from this shell, and back (for failover) |
 | `pq_log [N]` | the servers' log |
 
@@ -232,7 +232,7 @@ when standard input is a terminal.
 
 [A traced session](../scenarios/walkthrough.md) follows the scripted
 session `playground-test` records — every section of it, from OTP
-enrollment through keytab and file protection, vaults, failover, offline
+enrollment through keytab and file protection, seals, failover, offline
 and voucher enrollment, auditing, mirroring, the trusted realm, Tang,
 replica promotion and reported failure — with `KUIPA_TRACE` on, and
 explains every traced step.

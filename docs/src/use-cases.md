@@ -41,10 +41,10 @@ source tree.
 | [Move secrets between IPA replicas](#move-secrets-between-ipa-replicas) | realm admins | works |
 | [Check what the realm vouched for](#check-what-the-realm-vouched-for) | auditors, realm admins | works |
 | [Seal your own files](#seal-your-own-files) | every user | partly |
-| [Share a vault with a team or a fleet](#share-a-vault-with-a-team-or-a-fleet) | teams, fleet owners | works |
+| [Share a seal with a team or a fleet](#share-a-seal-with-a-team-or-a-fleet) | teams, fleet owners | works |
 | [Require several people to approve a break-glass release](#require-several-people-to-approve-a-break-glass-release) | security teams | works |
-| [Recover a vault when every device is lost](#recover-a-vault-when-every-device-is-lost) | every user, helpdesk | works |
-| [See who touched your vault](#see-who-touched-your-vault) | every user | works |
+| [Recover a seal when every device is lost](#recover-a-seal-when-every-device-is-lost) | every user, helpdesk | works |
+| [See who touched your seal](#see-who-touched-your-seal) | every user | works |
 | [Work offline for a while](#work-offline-for-a-while) | every user | works where the realm allows it |
 | [Sign files and commits under your login](#sign-files-and-commits-under-your-login) | developers, release engineers, CI | works |
 | [Have independent witnesses watch the logs](#have-independent-witnesses-watch-the-logs) | auditors, partner sites | works |
@@ -188,7 +188,7 @@ long-lived secrets pasted into the CI system.
 (`kuipa-voucher request --lease-hours 4`) for each runner it starts. The
 KDC issues the runner no ticket after the lease, and the realm removes
 the host an hour later. Pipeline secrets are files sealed to a shared
-vault of the runners' host group with `--ticket-leased`: they open with
+seal of the runners' host group with `--ticket-leased`: they open with
 a runner's ticket only while its lease runs, so a copied keytab is worth
 at most the rest of the lease. See
 [CI runners](reference/design.md#kuipa-for-ci-runners-leased-identities-and-pipeline-secrets).
@@ -236,8 +236,8 @@ cannot reach the realm.
 someone else. A witness that checks the log only ever grows makes that
 detectable.
 
-**What kuipa does.** Each server keeps a public transparency log of vault
-changes, releases of vault keys, replica secret fetches and signatures. Witnesses (a
+**What kuipa does.** Each server keeps a public transparency log of seal
+changes, releases of seal keys, replica secret fetches and signatures. Witnesses (a
 partner site, an auditor's machine) cosign each new head after checking
 that it extends the last one. Hosts and users can require a number of
 witness cosignatures before they accept a head.
@@ -260,20 +260,20 @@ Your files never leave your machine.
 token, Kerberos, sessions and unlock limits work. Passkeys and attested
 hardware do not yet. See [Sealing your own files](user/sealing.md).
 
-### See who touched your vault
+### See who touched your seal
 
 **Why.** If someone with your ticket, or an administrator, adds a device
-to your vault or opens your files, you should find out.
+to your seal or opens your files, you should find out.
 
-**What kuipa does.** Every change to your vault and every key release is
+**What kuipa does.** Every change to your seal and every key release is
 recorded in the servers' transparency logs. `kuipa tlog watch` lists
-the entries about your vault and flags those that the vault description
+the entries about your seal and flags those that the seal description
 stored on your machine does not explain: a device it does not know, a
 policy or sharing it does not show, a revocation. A change you made from
 another machine is flagged too, until `kuipa seal show` updates the
 description here.
 
-**Status:** works. See [Sealing your own files](user/sealing.md#see-who-touched-your-vault).
+**Status:** works. See [Sealing your own files](user/sealing.md#see-who-touched-your-seal).
 
 ### Work offline for a while
 
@@ -285,14 +285,14 @@ lets your device open your files offline until a time the realm sets.
 **Status:** works where the realm allows it. See
 [Sealing your own files](user/sealing.md#work-offline-for-a-while-if-your-administrators-allow-it).
 
-### Share a vault with a team or a fleet
+### Share a seal with a team or a fleet
 
 **Why.** Teams and host groups need shared secrets, such as a database
 password or a fleet's API key, without a password everyone copies.
 
-**What kuipa does.** A vault's owner shares it with users, IPA groups,
+**What kuipa does.** A seal's owner shares it with users, IPA groups,
 hosts or host groups, as members or as managers. Each member opens with
-their own device and login, under the vault's one policy. Membership is
+their own device and login, under the seal's one policy. Membership is
 checked at every open, so removing someone from the group in IPA stops
 their opens on every machine.
 
@@ -303,7 +303,7 @@ their opens on every machine.
 **Why.** Emergency access to a team's or a person's sealed secrets
 should not rest on one person holding the factors.
 
-**What kuipa does.** A vault's policy names approvers and how many must
+**What kuipa does.** A seal's policy names approvers and how many must
 agree. Whoever asks gets nothing until enough others have approved that
 request, and each request, approval and denial is in the transparency
 log.
@@ -311,16 +311,16 @@ log.
 **Status:** works. See [Sealing your own files](user/sealing.md#a-break-glass-secret-several-people-approve)
 and [release approvals](reference/design.md#kuipa-release-approvals-m-of-n-before-a-break-glass-release).
 
-### Recover a vault when every device is lost
+### Recover a seal when every device is lost
 
-**Why.** If a vault requires your device and you lose all your devices,
+**Why.** If a seal requires your device and you lose all your devices,
 your files are gone.
 
 **What kuipa does.** A recovery code you print brings your device key
-back on a new machine. Without one, the helpdesk delivers it from a vault
+back on a new machine. Without one, the helpdesk delivers it from a seal
 it was deposited in when you registered the device, under several
 people's approval and recorded in the transparency log. Hosts and
-services deposit their LUKS and backup keys into a helpdesk vault the
+services deposit their LUKS and backup keys into a helpdesk seal the
 same way, and cannot read them back.
 
 **Status:** works. See [Sealing your own files](user/sealing.md#keep-a-recovery-code-in-case-it-was-your-only-device),
@@ -364,8 +364,8 @@ window. The disk holds nothing to guess against.
 **Why.** A device key on disk can be copied. One inside a TPM, a passkey
 or a security key cannot.
 
-**What kuipa would do.** Passkeys as a vault factor, a TPM factor for
-sealed keytabs and machine vaults, and checked hardware attestation, so
+**What kuipa would do.** Passkeys as a seal factor, a TPM factor for
+sealed keytabs and machine seals, and checked hardware attestation, so
 a policy can demand keys that cannot leave the hardware.
 
 ### Anonymous tokens: surveys, reports, access
@@ -382,7 +382,7 @@ which is research (`ml-dsa-zk` has its first building blocks).
 
 ### Recipes for tools you already use
 
-**Why.** Many secrets live in tools with their own formats: Ansible vault
+**Why.** Many secrets live in tools with their own formats: Ansible seal
 passwords, `systemd-creds`, container secrets.
 
 **What kuipa would do.** Short guides and scripts that keep those

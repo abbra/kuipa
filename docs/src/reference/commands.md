@@ -35,23 +35,23 @@ usage.
 
 | command | does |
 |---|---|
-| `create VAULT --require device,ticket [--expires DAYS] [--max-unlocks N] [--session-hours H] [--offline-hours H [--epoch-days D]] [--sealing registered] [--ticket-delegation allow\|refuse \| --ticket-via S…]` | create a vault |
-| `policy VAULT …` | replace a vault's policy (same options) |
-| `device add VAULT [--passphrase-file F]` | register this host's device key, made under a passphrase if there is none |
-| `device add VAULT --pkcs11 URI [--module PATH]` | register an ML-KEM key on a PKCS#11 token instead |
-| `device remove VAULT ID` | remove a device |
-| `file VAULT FILE [--out F] [--session]` | seal a file (offline while the vault's description is recent) |
+| `create SEAL --require device,ticket [--expires DAYS] [--max-unlocks N] [--session-hours H] [--offline-hours H [--epoch-days D]] [--sealing registered] [--ticket-delegation allow\|refuse \| --ticket-via S…]` | create a seal |
+| `policy SEAL …` | replace a seal's policy (same options) |
+| `device add SEAL [--passphrase-file F]` | register this host's device key, made under a passphrase if there is none |
+| `device add SEAL --pkcs11 URI [--module PATH]` | register an ML-KEM key on a PKCS#11 token instead |
+| `device remove SEAL ID` | remove a device |
+| `file SEAL FILE [--out F] [--session]` | seal a file (offline while the seal's description is recent) |
 | `open SEALED --out F\|- [--force] [--passphrase-file F]` | open a sealed file |
-| `reseal VAULT SEALED…` | seal files again to the vault's current devices |
-| `retire VAULT SEALED…` | with registered sealing: make every copy of these unopenable |
-| `unlock VAULT [--offline]` / `lock VAULT` | start or end a session on this host |
-| `show VAULT` / `list` / `revoke VAULT` | describe or revoke vaults |
+| `reseal SEAL SEALED…` | seal files again to the seal's current devices |
+| `retire SEAL SEALED…` | with registered sealing: make every copy of these unopenable |
+| `unlock SEAL [--offline]` / `lock SEAL` | start or end a session on this host |
+| `show SEAL` / `list` / `revoke SEAL` | describe or revoke seals |
 
 ## kuipa tlog and kuipa sign (users)
 
 | command | does |
 |---|---|
-| `tlog watch VAULT` | what every server logged about your vault since the last watch; flags what your stored description does not account for |
+| `tlog watch SEAL` | what every server logged about your seal since the last watch; flags what your stored description does not account for |
 | `sign blob [--purpose P] FILE…` | have a realm server state, under your ticket, that you signed the files; writes `FILE.kusig` |
 | `sign verify FILE [--signature S] [--signer U] [--purpose P]` | check a signature offline with this host's pinned anchors |
 

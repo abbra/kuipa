@@ -78,17 +78,17 @@ report.
 
 | action | requests | up | down |
 |---|---|---|---|
-| a vault operation (create, policy, add device, share, approve, list…) | adv, vault | 3.2–14 KB | about 26 KB: the reply carries the signed vault descriptor, about 23 KB |
-| seal a file (offline once the vault is described) | 2 adv (304), for the servers' escrow keys | — | 0 |
+| a seal operation (create, policy, add device, share, approve, list…) | adv, seal | 3.2–14 KB | about 26 KB: the reply carries the signed seal descriptor, about 23 KB |
+| seal a file (offline once the seal is described) | 2 adv (304), for the servers' escrow keys | — | 0 |
 | **open a sealed file** | recovery request only | 3.2 KB | 1.2 KB |
 | open within a session | recovery request with the session token | 23 KB | 1.2 KB |
-| start a session, or an offline one | adv, vault | 3.3 KB | 49 KB |
-| watch the vault (`kuipa tlog watch`), per server | adv (304), lookup | 3.3 KB | 5–6 KB |
+| start a session, or an offline one | adv, seal | 3.3 KB | 49 KB |
+| watch the seal (`kuipa tlog watch`), per server | adv (304), lookup | 3.3 KB | 5–6 KB |
 | sign files or a commit (`kuipa sign`) | adv (304), sign | 3.3 KB | 22 KB (the signature bundle) |
 
 Before these changes, the same session downloaded 11.5 MB in 389
 advertisement fetches; it now downloads 2.6 MB in 208, most of them
-`304`s. What remains is mostly the actions' own answers: vault
+`304`s. What remains is mostly the actions' own answers: seal
 descriptors, signature bundles, enrollments.
 
 ### Per host and per user, per day
@@ -167,7 +167,7 @@ replication agreement once.
 | `tlog/<log>/leaves`, the public log | **100 bytes per event**, kept for ever | measured |
 | `tlog/<log>/openings/YYYY-MM` | **about 150 bytes per event**, kept 13 months (`tlog_retention_months`) | measured |
 
-An event is a vault change, a key release, a signature or a Keys fetch,
+An event is a seal change, a key release, a signature or a Keys fetch,
 and it is logged only on the server that handled it. A realm of 1,000
 users who each open 5 sealed files a day logs 5,000 events a day: 0.5 MB
 of leaves and 0.75 MB of openings a day across the realm, so about
@@ -183,15 +183,15 @@ are not measured.
 | what | size |
 |---|---|
 | a sealed keytab or file's binding, per server | 43 bytes, on the principal's entry |
-| a vault: policy, state, owner, sharing | about 0.5–1 KB |
-| a device in a vault | about 1.8 KB, nearly all its ML-KEM public key |
+| a seal: policy, state, owner, sharing | about 0.5–1 KB |
+| a device in a seal | about 1.8 KB, nearly all its ML-KEM public key |
 | a deposit (`seal deposit put`, `escrow luks`) | the sealed file: about 6.3 KB for a small secret |
 | a device key escrowed under a recovery code, or with the helpdesk | about 8 KB |
 | a release request and its approvals | under 1 KB |
 | a spent voucher | 43 bytes on the host entry |
 | a staged host's keys (offline enrollment) | a few KB, until first contact |
 
-A realm with 1,000 users, each with 2 vaults of 2 devices, adds about
+A realm with 1,000 users, each with 2 seals of 2 devices, adds about
 1,000 × 2 × (0.75 + 2 × 1.8) KB ≈ **9 MB**; 10,000 hosts with a sealed
 keytab and one sealed file, against 4 servers, add 10,000 × 2 × 4 × 43
 bytes ≈ **3.4 MB**.
@@ -201,7 +201,7 @@ bytes ≈ **3.4 MB**.
 | file | size |
 |---|---|
 | `servers.json`, the cached advertisements | about 28 KB per server |
-| a vault's stored descriptor (`vaults/<name>.vault`) | 21 KB, plus 1.7 KB per device |
+| a seal's stored descriptor (`seals/<name>.seal`) | 21 KB, plus 1.7 KB per device |
 | a device key | 1.8 KB |
 | a sealed file | the plaintext plus about 6.3 KB for two servers (2.4 KB in session mode) |
 | a signature bundle (`.kusig`) | 21 KB |

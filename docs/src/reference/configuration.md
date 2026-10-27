@@ -31,10 +31,10 @@
 Unknown keys are refused, so a typo stops the daemon instead of being
 ignored.
 
-## Realm-wide vault limits
+## Realm-wide seal limits
 
-On `cn=vault-limits,cn=kuipa,cn=etc,<suffix>`, attribute
-`ipaKUVaultLimits`, as JSON; see [Limits and revocation](../realm/limits.md#limits-on-users-vaults).
+On `cn=seal-limits,cn=kuipa,cn=etc,<suffix>`, attribute
+`ipaKUSealLimits`, as JSON; see [Limits and revocation](../realm/limits.md#limits-on-users-seals).
 
 ## Units
 

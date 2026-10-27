@@ -304,7 +304,7 @@ kuipa-voucher request --public "$JWK" --realm EXAMPLE.TEST \
 The KDC issues the host no ticket after the 4 hours, and kuipad removes
 the entry an hour later. The realm caps leases at 7 days unless
 `ipaKUVouchers` on `cn=vouchers,cn=kuipa,cn=etc` sets another
-`max_lease` (seconds). A shared vault created with `--ticket-leased`
+`max_lease` (seconds). A shared seal created with `--ticket-leased`
 opens only for hosts whose lease is running: pipeline secrets sealed to
 it are worth nothing to a long-lived host added to the runners' group by
 mistake, or to a keytab copied off a runner after its lease
@@ -326,7 +326,7 @@ open it. This closes the gap described under snapshots above.
 
 Users of a shared development or bastion VM can seal their own files with
 `kuipa seal`, without root. On a cloud VM there is no USB, so a passkey on
-your desk cannot reach the VM. Use a vault that requires your **ticket**
+your desk cannot reach the VM. Use a seal that requires your **ticket**
 together with a **device** key file on the VM.
 
 The ticket comes from logging in to the VM, not from your laptop:
@@ -351,7 +351,7 @@ What you get, and what it rests on:
   file; neither opens without you;
 * a ticket obtained by protocol transition says *the VM* vouched that you
   logged in. Whoever controls the VM's host identity can obtain the same
-  tickets for the users its rules allow. A vault can narrow this: accept
+  tickets for the users its rules allow. A seal can narrow this: accept
   delegated tickets only through this VM (`--ticket-via
   host/devvm1.example.test`), or refuse them and accept only a ticket from
   your own password or passkey login. So protect the VM's host keytab

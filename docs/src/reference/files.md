@@ -28,10 +28,10 @@ All paths hang off `$KUIPA_ROOT` (default `/`).
 | `$KUIPA_USER_DIR`, else `$XDG_DATA_HOME/kuipa`, else `~/.local/share/kuipa` (0700) | the user's kuipa directory |
 | `…/device.key` | the device key under its passphrase |
 | `…/device.pkcs11` | where a token device is: its module and URI |
-| `…/vaults/<name>.vault` | each vault's last signed description |
+| `…/seals/<name>.seal` | each seal's last signed description |
 | `…/servers.json` | the servers' advertisements, for sealing offline |
 | `…/advertisements/` | the servers' advertisements, kept to fetch them conditionally when the host's own cannot be written |
-| `$KUIPA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/kuipa`, `sessions/<vault id>` | a live session: its token, the unwrapped device key, released offline keys (memory only) |
+| `$KUIPA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/kuipa`, `sessions/<seal id>` | a live session: its token, the unwrapped device key, released offline keys (memory only) |
 
 ## On an IPA server
 

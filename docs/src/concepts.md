@@ -91,7 +91,7 @@ entry in IPA.
 sequenceDiagram
     participant U as kuipa-unseal (boot)
     participant S as IPA server
-    U->>S: recovery request: principal, vault, commitment,<br/>binding (encrypted to the server's escrow key)
+    U->>S: recovery request: principal, seal, commitment,<br/>binding (encrypted to the server's escrow key)
     Note over S: check the commitment, the registered binding,<br/>and that the principal is not locked
     S-->>U: the share
     Note over U: open the keytab into /run (memory only)
@@ -103,14 +103,14 @@ sequenceDiagram
 * Removing the host (or locking it), or sealing again, makes old copies
   stop opening.
 
-## Vaults: users' own sealed files
+## Seals: users' own sealed files
 
-A **vault** is a set of rules a user keeps on the IPA servers: which
+A **seal** is a set of rules a user keeps on the IPA servers: which
 **factors** opening a file needs (a registered **device** key, the user's
 **ticket**), until when, how many times, whether **sessions** are allowed.
 A sealed file holds two shares:
 
-* a **server share**, released only under the vault's rules;
+* a **server share**, released only under the seal's rules;
 * a **device share**, which only one of the user's registered devices can
   open.
 

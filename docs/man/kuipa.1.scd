@@ -211,45 +211,45 @@ keys.  The value is written to standard output, or to *FILE*.  For
 or *aes-256-wrap*.  A host outside the realm's server list, or without
 the CA role for the wrapped CA keys, is refused.
 
-## escrow luks _DEVICE_ --vault _VAULT_ [--key-file _FILE_] [--uuid _UUID_] [--keytab _FILE_]
+## escrow luks _DEVICE_ --seal _SEAL_ [--key-file _FILE_] [--uuid _UUID_] [--keytab _FILE_]
 
 As root: deposit the LUKS volume's recovery key, read from standard
 input as *systemd-cryptenroll --recovery-key* _DEVICE_ prints it, into a
-vault this host is a depositor of, in place of its earlier deposit for
+seal this host is a depositor of, in place of its earlier deposit for
 that volume.  The UUID is *cryptsetup luksUUID*'s unless given.  The
 host authenticates with its keytab and cannot read the key back; with
 *--keytab* _FILE_, the principal of that keytab (a service's or a
 user's) deposits instead.
 
-## escrow file _NAME_ _FILE_ --vault _VAULT_ [--keytab _FILE_]
+## escrow file _NAME_ _FILE_ --seal _SEAL_ [--keytab _FILE_]
 
 As root: deposit a small secret, such as a backup repository's password,
 as this host's secret _NAME_, or with *--keytab* as that keytab's
 principal's.
 
-# VAULT COMMANDS
+# SEAL COMMANDS
 
-*kuipa seal* seals a user's own files to a vault of hers, or to one
+*kuipa seal* seals a user's own files to a seal of hers, or to one
 shared with her. It runs as the user, with her Kerberos ticket, and
 needs no root. The device key lives in the user's data directory (see
-*ENVIRONMENT*); vault sessions live in tmpfs under the runtime
+*ENVIRONMENT*); seal sessions live in tmpfs under the runtime
 directory.
 
-__VAULT__ is a vault's name for its owner, and *OWNER/NAME* (for
+__SEAL__ is a seal's name for its owner, and *OWNER/NAME* (for
 example *alice/db*) for everyone it is shared with.
 
-## seal create --require _FACTORS_ _VAULT_ [_policy-flags_]
+## seal create --require _FACTORS_ _SEAL_ [_policy-flags_]
 
-Create a vault __VAULT__. Specify the additional factors for an unlock with
+Create a seal __SEAL__. Specify the additional factors for an unlock with
 *--require* beside the IPA servers: *device* (or *device=hardware-wrapped*,
 *device=hardware-bound*), *ticket*; comma-separated or repeated. The policy
 flags:
 
 *--expires* _DAYS_
-	How many days the vault lives (default: the realm's limit).
+	How many days the seal lives (default: the realm's limit).
 
 *--max-unlocks* _N_
-	How many times, in all, the servers may open files of the vault.
+	How many times, in all, the servers may open files of the seal.
 
 *--session-hours* _HOURS_
 	Allow sessions of up to this many hours (*seal unlock*).
@@ -276,9 +276,9 @@ flags:
 	with *kuipa-voucher request --lease-hours*. Needs the *ticket*
 	factor.
 
-## seal policy --require _FACTORS_ _VAULT_ [_policy-flags_]
+## seal policy --require _FACTORS_ _SEAL_ [_policy-flags_]
 
-Replace a vault's policy; the same flags as *seal create*.
+Replace a seal's policy; the same flags as *seal create*.
 
 *--approvals* _M_ with *--approver-user* _USER_ and *--approver-group*
 _GROUP_ (each repeatable) makes every release wait for _M_ approvals
@@ -286,9 +286,9 @@ from them, other than the requester's (*seal request*, *seal approve*);
 *--approval-hours* _H_ (default 24, at most 168) and *--approval-uses*
 _N_ (default 1) bound what one request covers.
 
-## seal device add _VAULT_ [_flags_]
+## seal device add _SEAL_ [_flags_]
 
-Register this host's device key in a vault, making it (under a
+Register this host's device key in a seal, making it (under a
 passphrase) if this host has none:
 
 *--passphrase-file* _FILE_
@@ -301,15 +301,15 @@ passphrase) if this host has none:
 	The token's PKCS#11 module (default:
 	*/usr/lib64/p11-kit-proxy.so*).
 
-## seal device remove _VAULT_ _ID_
+## seal device remove _SEAL_ _ID_
 
-Remove a device from a vault.
+Remove a device from a seal.
 
-## seal file _VAULT_ _FILE_ [--out _PATH_] [--session]
+## seal file _SEAL_ _FILE_ [--out _PATH_] [--session]
 
-Seal _FILE_ to the vault; the sealed copy goes to *FILE.sealed* by
+Seal _FILE_ to the seal; the sealed copy goes to *FILE.sealed* by
 default.  Sealing works offline while this host has a recent
-description of the vault.  *--session* seals for offline sessions: the
+description of the seal.  *--session* seals for offline sessions: the
 file opens without a server while one lasts, and only then.
 
 ## seal open _SEALED_ --out _PATH_ [_flags_]
@@ -321,46 +321,46 @@ with *-* the command refuses a terminal unless *--force*.
 	Read the device key's passphrase from this file.
 
 *--request* _ID_
-	The approved release request, for a vault with approvals.
+	The approved release request, for a seal with approvals.
 
-## seal reseal _VAULT_ _SEALED_...
+## seal reseal _SEAL_ _SEALED_...
 
-Open sealed files and seal them again to the vault's current devices.
+Open sealed files and seal them again to the seal's current devices.
 
-## seal retire _VAULT_ _SEALED_...
+## seal retire _SEAL_ _SEALED_...
 
 With registered sealing: make these sealed files, and every copy of
 them, unopenable.
 
-## seal unlock _VAULT_ [--offline] [--passphrase-file _FILE_]
+## seal unlock _SEAL_ [--offline] [--passphrase-file _FILE_]
 
-Start a session: until it ends, files of the vault open on this host
+Start a session: until it ends, files of the seal open on this host
 without the passphrase or a ticket.  *--offline* starts an offline
 session: files sealed with *--session* open without a server until it
 ends.
 
-## seal lock _VAULT_
+## seal lock _SEAL_
 
-End the vault's session on this host.
+End the seal's session on this host.
 
-## seal show _VAULT_
+## seal show _SEAL_
 
-Describe a vault.  *seal list* describes all your vaults and those
-shared with you; *seal revoke VAULT* revokes it: no file sealed to it
+Describe a seal.  *seal list* describes all your seals and those
+shared with you; *seal revoke SEAL* revokes it: no file sealed to it
 opens any more.
 
-## seal deposit put _VAULT_ _FILE_ [--name _NAME_]
+## seal deposit put _SEAL_ _FILE_ [--name _NAME_]
 
-Seal _FILE_ to the vault and leave it with the servers as a deposit, in
+Seal _FILE_ to the seal and leave it with the servers as a deposit, in
 place of your earlier deposit of the same name.  Depositors (*seal share
---depositor*) do this without being able to open the vault.
+--depositor*) do this without being able to open the seal.
 
-## seal deposit list _VAULT_, seal deposit fetch _VAULT_ _ID_ --out _FILE_
+## seal deposit list _SEAL_, seal deposit fetch _SEAL_ _ID_ --out _FILE_
 
-List the vault's deposits (a depositor sees their own), or, as a member,
+List the seal's deposits (a depositor sees their own), or, as a member,
 fetch one's sealed file to open with *seal open*.
 
-## seal deposit retire _VAULT_ _ID_
+## seal deposit retire _SEAL_ _ID_
 
 Remove a deposit: your own, or any as a manager.
 
@@ -368,7 +368,7 @@ Remove a deposit: your own, or any as a manager.
 
 Escrow this host's device key under a new recovery code, which is
 printed once: write it down.  The servers keep the key encrypted under
-the code, on your own entry; every escrow is in your vaults' logs.
+the code, on your own entry; every escrow is in your seals' logs.
 
 ## seal recover code [--code-file _FILE_]
 
@@ -384,8 +384,8 @@ to it, fetch it and keep it beside this host's device key (*fetch*).
 
 ## seal recover deliver _DEPOSIT_ --user _USER_ --device _ID_ [--request _ID_]
 
-As the helpdesk, a member of the realm's device vault: open the device
-deposit _DEPOSIT_ (with the approved release request, for a vault with
+As the helpdesk, a member of the realm's device seal: open the device
+deposit _DEPOSIT_ (with the approved release request, for a seal with
 approvals) and deliver the key it holds to _USER_'s device _ID_,
 encrypted to it.
 
@@ -393,48 +393,48 @@ encrypted to it.
 
 Register this host's device wherever the recovered one is, and reseal
 _SEALED_ to it.  With *--retire-old*, also remove the recovered device
-from your vaults and forget it here: run it once every file is resealed,
+from your seals and forget it here: run it once every file is resealed,
 since files sealed only to the old device then stop opening.
 
-## seal request _VAULT_ _SEALED_ --reason _TEXT_
+## seal request _SEAL_ _SEALED_ --reason _TEXT_
 
-For a vault with approvals: ask its approvers to approve the release of
+For a seal with approvals: ask its approvers to approve the release of
 _SEALED_, saying why.  Prints the request's id.
 
-## seal pending [_VAULT_]
+## seal pending [_SEAL_]
 
-List the open release requests of _VAULT_, or of every vault you approve
+List the open release requests of _SEAL_, or of every seal you approve
 for or have a part in, with their approvals so far.
 
-## seal approve _VAULT_ _ID_, seal deny _VAULT_ _ID_
+## seal approve _SEAL_ _ID_, seal deny _SEAL_ _ID_
 
-Approve or deny a release request, as one of the vault's approvers.  Your
+Approve or deny a release request, as one of the seal's approvers.  Your
 own requests are not yours to approve.  One denial ends a request.
 
-## seal share _VAULT_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]
+## seal share _SEAL_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]
 
-Share a vault, as its owner or a manager.  Members open and seal its
+Share a seal, as its owner or a manager.  Members open and seal its
 files, start sessions, and register and remove their own devices;
 with *--manager*, they also change its policy, share and unshare it,
 and revoke it; with *--depositor*, they only seal to it and deposit,
 and never open it.  Groups are IPA user groups or host groups; membership
 is checked at every open.  Each option may be repeated.
 
-## seal unshare _VAULT_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]
+## seal unshare _SEAL_ [--manager] [--user _U_] [--group _G_] [--host _FQDN_] [--service _S_]
 
-Stop sharing a vault with those named (as managers with *--manager*),
+Stop sharing a seal with those named (as managers with *--manager*),
 and remove the devices of everyone left without a part in it.  A member
-may remove themselves.  Files sealed to the vault stop opening for them
+may remove themselves.  Files sealed to the seal stop opening for them
 at once; reseal and change the secret if they may have opened it.
 
-## tlog watch _VAULT_
+## tlog watch _SEAL_
 
-Check every server's transparency log for the vault, authenticated
+Check every server's transparency log for the seal, authenticated
 by your ticket, and list what happened since the last watch: devices
 added and removed, policy changes, sessions, and every release of a
 server's share of a sealed file.  Each server's answer must be signed
 by the key its verified advertisement names and prove every entry, and
-its log must extend the one the last watch saw.  An entry the vault
+its log must extend the one the last watch saw.  An entry the seal
 descriptor stored on this host does not account for — a device it
 does not list added or acting, a device it lists removed, a policy it
 does not show — is flagged *UNEXPECTED*.  Run *seal show* to accept
@@ -552,7 +552,7 @@ trusting one, or set _N_; _N_ cannot exceed the witnesses trusted.
 	keytab: the original path with *.sealed* appended.
 
 *~/.local/share/kuipa*
-	A user's device keys and vault state (*seal*); *vaults/VAULT.tlog*
+	A user's device keys and seal state (*seal*); *seals/SEAL.tlog*
 	holds what *tlog watch* last verified of each server's log.
 
 # EXIT STATUS
@@ -596,7 +596,7 @@ kuipa protect
 kuipa check
 ```
 
-Seal a file to a personal vault and open it again:
+Seal a file to a personal seal and open it again:
 
 ```
 kuipa seal create notes --require device,ticket

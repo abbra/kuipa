@@ -8,7 +8,7 @@ atomically). None of them leave the server.
 | anchor | `anchor.jwk` | vouches for the realm's servers; hosts pin its thumbprint |
 | signing key | `signing.jwk` | signs this server's advertisement |
 | join keys | `join-<kid>.jwk` | receive enrollments and rekeys (ML-KEM) |
-| escrow keys | `escrow-<kid>.jwk` | release the shares of sealed keytabs, files and vaults |
+| escrow keys | `escrow-<kid>.jwk` | release the shares of sealed keytabs, files and seals |
 | trust keys | `trust-<kid>.jwk` | receive trust requests from other realms |
 | voucher keys | `voucher-<thp>.jwk` | public keys of the voucher issuers this server accepts |
 | Tang keys | `tang/<thp>.jwk` | the post-quantum Tang service, if enabled |
@@ -41,7 +41,7 @@ systemctl restart kuipad
 Escrow keys must outlive every sealed keytab and file bound to them: a
 host unseals with the key that was current when it last sealed. Hosts
 reseal at every key rotation (monthly with `kuipa-rotate.timer`), but
-sealed *files* and users' vault files are only resealed when someone
+sealed *files* and users' seal files are only resealed when someone
 reseals them. Keep retired escrow keys at least as long as such files
 should keep opening.
 
