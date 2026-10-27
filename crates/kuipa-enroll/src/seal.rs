@@ -1649,12 +1649,28 @@ pub const MAX_ESCROW_BLOB: usize = 16 * 1024;
 pub struct DeviceEscrow {
     /// The device's id.
     pub device: String,
-    /// How it is protected: `code`.
+    /// How it is protected: `code`, `delivery`, or, for a recovery shard
+    /// set's device keys, `shards` (its registration row, not a protected
+    /// key but the public one, is `shards-key`; `device` is the key id).
     pub kind: String,
     /// The protected key, base64url.
     pub blob: String,
     /// When it was escrowed.
     pub added: u64,
+}
+
+/// A recovery shard set registered with the server (`DESIGN-recovery.md`
+/// §2.1), the payload of the `shards-key` row. Nothing here is secret: the
+/// `shards` blobs open only with the recovery private key the shares and
+/// the passphrase make.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardsRegistration {
+    /// The recovery key's id: the thumbprint of `public`.
+    pub key: String,
+    /// The set id every share's header carries.
+    pub set: u32,
+    /// The recovery public key, its JWK.
+    pub public: String,
 }
 
 /// What a user asks of their seals, sent as the operation data of a
@@ -1791,6 +1807,27 @@ pub enum SealOp {
     },
     /// The caller's device keys kept under recovery codes.
     RecoverCode,
+    /// Replace the caller's recovery shard set (`DESIGN-recovery.md` §2.1):
+    /// register `registration` and make the blob for each named device, all
+    /// in place of the old set's registration and blobs. The caller must
+    /// hold every device in one of their seals.
+    EscrowShards {
+        /// The new set's key id, set id and public key.
+        registration: ShardsRegistration,
+        /// Each device's id and its blob for the recovery key, base64url.
+        blobs: Vec<(String, String)>,
+    },
+    /// Add blobs for `blobs` to the caller's current shard set, leaving the
+    /// registration and the other devices' blobs: a host that saw a new set
+    /// late, or a key file made after it (`recovery-shards enroll`,
+    /// `device add`).
+    EnrollShards {
+        /// Each device's id and its blob, base64url.
+        blobs: Vec<(String, String)>,
+    },
+    /// The caller's shard rows: the registration (`shards-key`) and the
+    /// device-key blobs (`shards`). Opening them is the client's work.
+    RecoverShards,
     /// Keep `sealed`, a file sealed to the seal, as a deposit, in place
     /// of the depositor's earlier one of the same kind and subject.
     Deposit {
