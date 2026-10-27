@@ -19,7 +19,7 @@ the most managed:
 | piece | status |
 |---|---|
 | recovery codes (`kuipa seal recovery-code`, `recover code`, `recover finish`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
-| recovery shards (`kuipa seal recovery-shards`, `recover shards`): N of M paper shards | designed here (§2.1), **not implemented** |
+| recovery shards (`kuipa seal recovery-shards`, `recover shards`): N of M paper shards | designed here (§2.1); the share format, Shamir splitting, word code and passphrase mask are implemented and tested (`kuipa-enroll::shards`); the server operations and commands are **not** |
 | depositors, deposits, `kuipa seal deposit put`, `list`, `fetch`, `retire` | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | device-key deposits and delivery (`kuipa seal recover helpdesk`, `deliver`, `fetch`) | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | `kuipa escrow luks`, `kuipa escrow file` | implemented, tested against a real KDC (a LUKS key as `systemd-cryptenroll` prints it); **not yet run** against a real LUKS volume |
@@ -128,7 +128,7 @@ PBKDF2 is the only password-based KDF that FIPS approves (SP 800-132), and
 kuipa keeps to FIPS-approved algorithms, so this is the KDF, as in §2. The
 salt is 128 random bits, which SP 800-132 asks for, and the iteration
 count is in units of 100 000 (default 20, so 2 million; 1 to 63): the
-cost of one try on the user's host, at the order of a second. PBKDF2
+cost of one try on the user's host: 0.5 to 0.8 seconds for the default on a current laptop. PBKDF2
 needs no memory, so a graphics card tries passphrases far faster than a
 host, and the passphrase has to make up for it.
 
@@ -187,6 +187,10 @@ list, the code (the field polynomial and generator), Shamir's scheme, the
 PBKDF2 parameters, the seed's HKDF label and ML-KEM's key generation. The
 English is for the person; nothing reads it back, and the words do not
 depend on it.
+
+The format is defined by the module documentation of `kuipa-enroll`'s `shards`
+module (bit layout, field, generator, word order) and pinned by a test vector, which an
+independent implementation of the text above reproduces word for word.
 
 **What the server keeps.** The recovery key's public key, its id and the
 set id are registered with the seal operation `escrow-shards`, authenticated
