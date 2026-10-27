@@ -352,8 +352,8 @@ opens any more.
 ## seal deposit put _SEAL_ _FILE_ [--name _NAME_]
 
 Seal _FILE_ to the seal and leave it with the servers as a deposit, in
-place of your earlier deposit of the same name.  Depositors (*seal share
---depositor*) do this without being able to open the seal.
+place of your earlier deposit of the same name.  Depositors
+(*seal share --depositor*) do this without being able to open the seal.
 
 ## seal deposit list _SEAL_, seal deposit fetch _SEAL_ _ID_ --out _FILE_
 
