@@ -1,0 +1,145 @@
+# sardown stylesheet for the kuipa documentation book:
+#   sardown render-book docs --output kuipa-doc.pdf
+#
+# European printed-book conventions on A4: two-sided binding margins (the spine side wider),
+# justified text with dictionary hyphenation so the two flush edges stay even, a running
+# header naming the current chapter, page numbers in the outer bottom corners, and lowercase
+# roman numerals for the contents pages with arabic numbering restarting at the first chapter.
+# Red Hat Display for headings, Red Hat Text for body, Red Hat Mono for code -- the FreeIPA
+# family used in talks/kuipa/inception/style.toml, with the logo's blue for links and a
+# deepened version of it for headings.
+
+[document]
+title = "kuipa: post-quantum secrets for FreeIPA"
+author = "Alexander Bokovoy"
+
+[page]
+format = "a4"
+# margin_mm is the top/bottom margin on every page; inner/outer replace the left/right pair
+# per page parity (odd recto: inner left; even verso: inner right).
+margin_mm = 22.0
+inner_margin_mm = 26.0
+outer_margin_mm = 20.0
+
+[page.numbering]
+format = "roman_lower"
+
+# Arabic page 1 starts at the Introduction chapter's own heading. If that heading is renamed,
+# update this id (it is the heading's own link slug, e.g. "#introduction") -- a stale id only
+# means numbering never resets (a warning is printed, front matter keeps its roman numerals).
+[[page.numbering.resets]]
+at_heading = "introduction"
+format = "arabic"
+start_at = 1
+
+[typography]
+font_family = "Red Hat Text"
+body_size_pt = 10.5
+body_color = "#1f2a33"
+# Links must be recognizable on paper, not only clickable: every [text](url) run and internal
+# cross-reference is tinted with the logo's blue.
+link_color = "#00689e"
+alignment = "justify"
+hyphenation = true
+language = "en-us"
+
+[heading]
+font_family = "Red Hat Display"
+color = "#00527d"
+space_before_factor = 1.0
+
+[heading.levels.1]
+size_pt = 22.0
+
+[heading.levels.2]
+size_pt = 15.0
+color = "#00689e"
+
+[heading.levels.3]
+size_pt = 12.5
+
+[blockquote]
+border_color = "#73be42"
+border_width_pt = 3.0
+indent_pt = 14.0
+
+[list]
+indent_pt = 16.0
+
+[table]
+cell_padding_pt = 6.0
+text_size_pt = 9.5
+min_row_height_pt = 14.0
+row_padding_pt = 2.0
+border = "horizontal"
+border_color = "#c5d6e0"
+header_background = "#e3eef5"
+header_color = "#00527d"
+header_bold = true
+stripe_background = "#f3f8fb"
+space_after_pt = 8.0
+
+# base16-ocean.dark's own backdrop, mirrored here so the drawn code block matches the syntax
+# theme's text colors (see technical-guide.toml in sardown's style examples for why the
+# background must match the theme exactly).
+[code_block]
+syntax_theme = "base16-ocean.dark"
+label_style = "none"
+shrink_to_fit = true
+min_font_size_pt = 7.0
+
+[code_block.default]
+background = "#2b303b"
+font_family = "Red Hat Mono"
+font_size_pt = 9.0
+
+[mermaid]
+font_family = "Red Hat Text"
+text_color = "#1f2a33"
+border_color = "#609538"
+node_fill = "#e3f2d7"
+line_color = "#00689e"
+accent = "#00689e"
+surface_alt = "#e3eef5"
+
+# Running header: chapter name on the outer top corner, like a printed manual. Kept on chapter
+# opening pages too -- every chapter here starts its own page, and suppressing the header there
+# would leave those pages without any running text.
+[header]
+enabled = true
+font_family = "Red Hat Text"
+font_size_pt = 8.0
+color = "#7d8a94"
+mode = "two_sided"
+suppress_on_chapter_start = false
+
+[header.odd]
+right = "{h1}"
+
+[header.even]
+left = "{h1}"
+
+# Footer: page number in the outer bottom corner. Front matter carries roman numerals, body pages
+# arabic ones -- a printed book never prints "X of total" as a fraction, and sardown formats
+# {total_pages} in the base numbering format (roman here), so it would read "14 / ccxiv".
+[footer]
+enabled = true
+font_family = "Red Hat Text"
+font_size_pt = 9.0
+color = "#7d8a94"
+mode = "two_sided"
+suppress_on_chapter_start = false
+
+[footer.odd]
+left = "{page}"
+
+[footer.even]
+right = "{page}"
+
+# A printed contents page plus the PDF outline (bookmarks panel) -- the two main PDF navigation
+# features a book is expected to have.
+[toc]
+enabled = true
+depth = 2
+title = "Contents"
+page = true
