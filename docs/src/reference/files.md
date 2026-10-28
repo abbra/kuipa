@@ -29,7 +29,7 @@ All paths hang off `$KUIPA_ROOT` (default `/`).
 | `…/device.key` | the device key under its passphrase |
 | `…/device.pkcs11` | where a token device is: its module and URI |
 | `…/seals/<name>.seal` | each seal's last signed description |
-| `…/servers.json` | the servers' advertisements, for sealing offline |
+| `…/servers.json` | the servers' advertisements, kept from the verification `kuipa seal` just did — sealing reuses those bytes instead of fetching again — and re-verified, as of when they were fetched, when sealing offline |
 | `…/advertisements/` | the servers' advertisements, kept to fetch them conditionally when the host's own cannot be written |
 | `$KUIPA_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/kuipa`, `sessions/<seal id>` | a live session: its token, the unwrapped device key, released offline keys (memory only) |
 
