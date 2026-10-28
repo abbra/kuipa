@@ -28,6 +28,31 @@ must describe exactly that deployment: if a verified server names another
 realm, domain or server list, `kuipa` stops instead of trying the next
 one.
 
+```mermaid
+sequenceDiagram
+    participant H as kuipa
+    participant S as kuipad (a server named by --server or DNS)
+    participant K as the realm's KDC
+    H->>H: the deployment: realm, domain, the servers named
+    H->>S: GET /ipa/ku/adv with the pinned anchors
+    S-->>H: the signed advertisement
+    H->>H: verify it against the pins<br/>(see What every request is checked against)
+    alt it names another realm, domain or server list
+        H-->>H: stop with an error for the administrator:<br/>no request is built, no kinit runs,<br/>nothing is written, the next server is not tried
+    else it names this deployment
+        H->>K: armoured kinit, with KDCs narrowed to advertised<br/>servers that are also in the deployment
+        H->>S: join request, sealed to the advertised ML-KEM key
+        S-->>H: keys, CA chain, realm configuration
+    end
+```
+
+A mismatch is not a failed verification: the advertisement verified
+against the pins. It says the realm's own description of itself does not
+match what you asked for — a misconfigured server, or someone pointing your
+hosts at another deployment. Fix the server or the `--server`/DNS list;
+`kuipa` will not pick a different server for you (see
+[Troubleshooting](troubleshooting.md#the-advertisement-does-not-verify)).
+
 ## The ways to join
 
 **With a one-time password** from `ipa host-add --random`, appended to the
