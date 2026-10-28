@@ -53,6 +53,40 @@ Three things keep it from being paid on every exchange:
 So the advertisement costs about 19 KB at a host's first contact with a
 server, and almost nothing afterwards.
 
+```mermaid
+sequenceDiagram
+    participant K as kuipa
+    participant S as kuipad
+    K->>S: GET /ipa/ku/adv?anchor=…<br/>with If-None-Match: the tag kept earlier
+    alt unchanged since the last fetch
+        S-->>K: 304 Not Modified
+        K->>K: take the bytes kept under …/ku/advertisements/
+    else new, or not kept
+        S-->>K: 200 the advertisement, with an ETag
+        K->>K: keep the bytes and the tag
+    end
+    K->>K: verify them as of now, against the current pins
+```
+
+A `kuipa check` ends with one more small request, the **pins refresh**,
+so the heads the host pins stay fresh between monthly rekeys (DESIGN
+§4.5) — this is what keeps proofs head-shaped rather than 7.5 KB
+signatures:
+
+```mermaid
+sequenceDiagram
+    participant K as kuipa check
+    participant S as kuipad
+    participant D as Kerberos (the KDC and directory)
+    K->>S: GET /ipa/ku/adv?anchor=…&head=…<br/>(the anchors and heads pinned here)
+    S-->>K: the advertisement, proven through those pins
+    K->>S: POST /ipa/ku/pins/{kid},<br/>with a GSS token from the host keytab
+    S->>D: accept the caller's Kerberos session
+    D-->>S: the host principal, accepted
+    S-->>K: the answer, sealed to the host's session:<br/>the realm's anchors and their heads
+    K->>K: check it names this realm and this server,<br/>then rewrite /etc/ipa/ku-anchors
+```
+
 ## Client actions
 
 Downloaded and uploaded bytes per action, for a host that pins two
