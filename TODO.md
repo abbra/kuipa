@@ -29,113 +29,12 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
 - [ ] Check emitted log heads and cosignatures with a C2SP
       tlog-witness implementation, once the ML-DSA note format is
       settled (`DESIGN-tlog.md` §6).
-- [ ] Extend the Tamarin model (`contrib/tamarin/kuipa.spthy`) beyond
-      the core exchange. Done so far: pins and advertisement
-      verification, the join/rekey key schedule, OTP and Kerberos
-      authenticators, sealed-keytab escrow (§7.2), user seals and the
-      unified recovery request (§7.6.4–7.6.5), vouchers (§9). Each item
-      below adds rules and lemmas in the model's established idioms
-      (decryption-by-fact, shallow `In()` patterns, attack lemmas as
-      events carrying the compromised material); re-prove the whole file
-      after each item, since new rules can break old lemmas (the voucher
-      rules made `SealedNoOffline` harder). Encodings and hash choices
-      are abstracted and need no re-proof.
-  - [ ] 1. Trust establishment (§17.4, closes the last named TODO
-        item): the invitation, the trust request, the trust secret,
-        cross-realm `krbtgt` key creation, the partner refresh, and a
-        cross-realm ticket through them. Lemmas: an accepted trust maps
-        to an administrator-authenticated invitation on both sides
-        (agreement); a forged trust needs a stolen anchor or the trust
-        secret; the cross-realm ticket authenticates the partner realm
-        to the one that trusts it. Attack lemma: a leaked trust secret
-        lets the attacker mint the cross-realm keys.
-  - [ ] 2. Signing statements (`DESIGN-sign.md`): the `sign`
-        operation's policy check (user, group, host, service), the
-        signed statement, and offline verification of bundles as of
-        their time. Lemmas: a verified statement implies an authorized
-        signer under a policy the realm pinned at that time (no
-        retroactive policy tampering); offline bundle verification
-        binds the statement to its delegation window. Attack lemma:
-        a statement signed outside the policy verifies only with a
-        compromised signing key.
-  - [ ] 3. Offline enrollment bundles (§8): staging, modes A (machine
-        key), B (secret `S`) and C (signed only), opening, first
-        contact, re-staging key replacement. Lemmas: a mode A/B bundle
-        copied off the wire opens nothing without `dk_m`/`S`; tampering
-        needs a delegated server key (the signature covers the
-        ciphertext); a replayed bundle after re-staging is refused
-        (KDC keys replaced). Attack lemmas, §8's own table: mode C
-        copied yields the host identity until first contact or
-        `not_after`; a mode B bundle plus the enrollment string's `S`
-        yields the identity. `not_after` is a clock property -- model
-        it as the KDC's `!ValidHostKey` retiring staged keys, which is
-        how the design enforces it.
-  - [ ] 4. Secrets transport (§18): the `keys` operation, the
-        runas handler, the `cn=masters`/CA-role policy. Lemmas: a key
-        fetched by a host implies an authorized handler ran for a
-        caller the policy admits (no confused-deputy); sealing to the
-        request's key. Attack lemma: a fetch outside the policy
-        succeeds only with a compromised server.
-  - [ ] 5. Machine seals on the unified path (§7.6.8): migrate the
-        §7.2 model (`SealedFile`/`recover`) onto the IPEQ recovery
-        request with the fixed machine policy, so host and service
-        escrow share the seal lemmas. Mostly a refactor of the
-        existing rules; re-prove `SealedNoOffline` and
-        `Attack_EscrowKeyOpensDisk` on the new shape.
-  - [ ] 6. Sessions (§7.6.6–7.6.7): re-authentication sessions, the
-        unlock counter, offline sessions, and the session-key epoch of
-        session-mode files. Lemmas: a session token acts only within
-        its epoch; revoked users/devices stop new releases (the
-        `nsAccountLock`/unlock-count checks); a released
-        offline-session key opens only that epoch's session-mode
-        files. Attack lemma: the §7.6.10 row -- the released key plus
-        a copied session-mode file opens that epoch's files for as
-        long as the holder keeps the key; a resealed (new-epoch) file
-        stays closed.
-  - [ ] 7. Shared seals (§7.6.12): managers and members by user,
-        group, host or service. Lemma: a shared-seal release implies
-        the opener is a current member or manager (departed members'
-        devices pruned at every seal operation). Attack lemma: a
-        departed member with an old descriptor and a copied file gets
-        nothing without a current member's release.
-  - [ ] 8. Vouch heads and claim-log selection (§4.9,
-        `DESIGN-claim-logs.md`): `?head=` proofs, retirement, and
-        frozen-trust pins. This touches the core `!Server`/`!Adv`
-        abstraction (a vouch is currently a plain signature), so it is
-        the most invasive item: model heads as selectable vouch
-        versions and retirement as a tombstone. Lemmas: a claim
-        retired before the pin's head proves nothing for a host
-        pinning that head; a frozen pin never accepts a shorter log
-        (fork refusal). Attack lemma: a host pinning only an old head
-        accepts a server whose claim was later retired (the design
-        accepts this -- expiring pins bound it).
-  - [ ] 9. Anchor epochs and rotation (§4.7–4.8): epoch numbers, key
-        rotation, failover (§4.6). Model rotation as a chain of
-        `!Server` facts and the two-anchor refusal
-        (S13's "knows two anchors" row). Lemmas: a rotated-out anchor
-        cannot vouch new servers to hosts that learned the rotation;
-        a host with two pins skips a stolen-anchor server. Attack
-        lemma: a host knowing only the stolen anchor still accepts it
-        (the S13 row; `Attack_StolenAnchorLearnsOtp` is the join-side
-        instance of this -- generalize rather than duplicate).
-  - [ ] 10. Break-glass approvals (`DESIGN-approvals.md`): M-of-N
-        approvals recorded in the transparency log. Lemma: a
-        break-glass release implies M distinct approvals by
-        authorized approvers. Attack lemma: fewer than M approvals
-        (or one approver approving twice) never releases.
-  - [ ] 11. Recovery flows (`DESIGN-recovery.md`): recovery codes,
-        LUKS/file escrow deposits, helpdesk device-key delivery.
-        Lemmas: a recovery-code finish implies the code was issued to
-        that user and not yet used; helpdesk delivery hands the device
-        key only to a registered depositor's seal. Attack lemma: a
-        guessed recovery code fails (codes are server-generated
-        randomness, so this should verify as impossible -- the lemma
-        documents it).
-  - [ ] 12. CI identities (`DESIGN-ci.md`): voucher leases and
-        `ticket.leased`. Lemma: a leased host's tickets stop at lease
-        end (KDC-side enforcement, like item 3's `not_after`). Attack
-        lemma: after the lease the host is removed, so a recorded
-        ticket grants nothing new.
+- [ ] Extend the Tamarin model (`contrib/tamarin/kuipa.spthy`) beyond the
+      core exchange: user seals and the unified recovery request (§7.6)
+      and vouchers (§9) are done; trust establishment (§17.4) and signing
+      statements (`DESIGN-sign.md`) remain. Re-prove whenever a modelled
+      flow changes; encodings and hash choices are abstracted and need no
+      re-proof.
 
 ## Protocol and implementation
 
