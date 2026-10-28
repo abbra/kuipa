@@ -43,6 +43,37 @@ them at every key rotation.
 * **A host also keeps a watermark** of the realm's anchor history, and
   refuses a server that is behind it.
 
+### What every request is checked against
+
+The same checks run before a join, a rekey, a health check or an
+unsealing:
+
+```mermaid
+flowchart TD
+    A["a host with two pinned anchors,<br/>heads, and an epoch watermark"] --> B["GET /ipa/ku/adv?anchor=…&amp;head=…<br/>each pinned anchor and head named"]
+    B --> C["verify the delegation<br/>against the pins, as of now"]
+    C --> D{"two distinct pinned anchors<br/>prove this server's claim?"}
+    D -- "the second proof came with<br/>the same advertisement" --> E
+    D -- "otherwise: ask that anchor<br/>for its own proof" --> F["a second request naming<br/>only that anchor"]
+    F --> E
+    E{"still one proof only"} -- yes --> G["refuse this server:<br/>it may be built on a stolen anchor"]
+    E -- no --> H{"where is its anchor log,<br/>against the watermark?"}
+    H -- "behind it" --> I["refuse: the anchor was replaced<br/>and this server was left behind"]
+    H -- "the same sequence, a different head" --> L["refuse: the two have forked"]
+    H -- "ahead of it" --> J["GET /ipa/ku/anchor-log?from=…<br/>verify each page against the pins"]
+    J --> K{"it reaches the head<br/>the advertisement names?"}
+    K -- no --> L
+    K -- yes --> M["write the new watermark<br/>in /etc/ipa/ku-anchors"]
+    M --> N["the exchange runs: join, rekey,<br/>check, protect, seal"]
+```
+
+Two proofs count only for the *same* claim: the same server, the same
+signing key, the same delegation expiry. A rotated anchor and its
+successor count once, not twice; an anchor frozen to a pinned head
+counts head-wise only ([Frozen pins](realm/enrollment.md#frozen-pins)).
+A first contact with no watermark records one from a proved quorum, so
+from then on a server left behind fails.
+
 ## Enrollment: nothing on the wire a CRQC could open
 
 ```mermaid
