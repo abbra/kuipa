@@ -23,7 +23,8 @@
 | `anchor` | `true` | whether this server holds an anchor and vouches for others |
 | `vouch_interval` | `60` | least seconds between vouches that only add servers |
 | `rate_limit` | see [Limits](../realm/limits.md) | `{"per_host": {"burst", "per_minute"}, "per_source": {…}}` |
-| `trusts` | `[]` | trusted realms configured by hand: `{"realm", "domain", "servers", "anchors"}` |
+| `trusts` | `[]` | trusted realms configured by hand: `{"realm", "domain", "servers", "anchors"}`, and optionally `kdc_proxy` (see [Trusted realms](../realm/trusts.md#reaching-a-kdc-through-an-https-proxy)) |
+| `kdc_proxy` | none | this realm's KDC proxies, `{"urls": ["https://ipa1.example.test/KdcProxy"], "ca": "realm" \| "system"}`: advertised for realms that trust this one, when its KDCs are not reachable from their hosts |
 | `enctypes` | `[20, 19, 18, 17]` | Kerberos enctypes to issue keys for, strongest first |
 | `tlog_head_interval` | `3600` | seconds between published transparency-log heads: a head covers what was logged before its period began, so watching it says how many events a period had, not when each happened; `0` publishes every event at once (tests only) |
 | `tlog_retention_months` | `13` | months of transparency-log openings kept: older events stay in the log but can no longer be looked up or tied to anyone |

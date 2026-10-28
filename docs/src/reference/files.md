@@ -56,4 +56,5 @@ All paths hang off `$KUIPA_ROOT` (default `/`).
 | `KUIPA_TRACE` | `tracing` filter directives, e.g. `kuipa_tools=trace` |
 | `KUIPA_USER_DIR`, `KUIPA_RUNTIME_DIR` | a user's kuipa directory and session directory |
 | `KUIPA_PKCS11_PROVIDER` | OpenSSL's pkcs11-provider module, if not `/usr/lib64/ossl-modules/pkcs11.so` |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | the HTTP proxy `kuipa` and `kuipad` use for server requests (`NO_PROXY` lists hosts to reach directly); see [Reaching a KDC through an HTTPS proxy](../realm/trusts.md#reaching-a-kdc-through-an-https-proxy) |
 | `KRB5_CONFIG`, `KRB5CCNAME` | used as given; without `KRB5_CONFIG`, `kuipa` adds the enrollment's `krb5.conf` after the system's |
