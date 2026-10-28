@@ -91,6 +91,16 @@ The GitHub workflow does not run benchmarks: its runners are shared and
 unknown, and a run nothing is compared with measures nothing.  Its clippy
 job builds every bench target (`--all-targets`), so they keep compiling.
 
+```mermaid
+flowchart LR
+    PR["pull request"] --> CI["GitHub CI"]
+    CI --> Build["build and clippy --all-targets:<br/>bench targets still compile"]
+    CI -. "no benchmark job" .-> X["nothing measured in CI:<br/>shared runners, no baseline"]
+    Dev["developer"] --> Local["local-ci.sh bench:<br/>smoke profile, quick; a panicking<br/>fixture is a protocol self-check"]
+    Dev --> Save["scripts/bench.sh run:<br/>results.json + params.json,<br/>kept under ~/.cache/kuipa-bench/"]
+    Save --> Compare["scripts/bench.sh compare<br/>against a saved run, on your machine"]
+```
+
 ## Reading the numbers
 
 - Keygen and certificate building are *fixture setup*: they run outside timed
