@@ -274,6 +274,15 @@ string, a stolen anchor, a bearer voucher, a compromised escrow key
 and a stolen device key with an observed unlock. The model's header
 documents its abstractions.
 
+A second, standalone model of trust establishment between realms
+(the §17.4 invitation, the trust request/response exchange, the
+jointly derived trust secret and the cross-realm tickets) is in
+[`contrib/tamarin/trust.spthy`](contrib/tamarin/trust.spthy).
+`tamarin-prover --prove contrib/tamarin/trust.spthy` verifies
+agreement, responder authentication and trust-secret secrecy, and
+reproduces the §17.4 "Limits" attacks for a mis-delivered invitation
+and a leaked trust secret.
+
 ## Documentation
 
 The user documentation is an mdBook in [`docs/`](docs/src/SUMMARY.md):
