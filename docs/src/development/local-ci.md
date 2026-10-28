@@ -86,9 +86,24 @@ Set `KUIPA_KEEP_REALM=1` to keep the realm's files (configuration,
 
 ## The playground session report
 
-`playground-test` starts the same playground as `interactive` (below) and,
-instead of a shell, runs `contrib/ci/playground/session.sh` in it. The
-session uses the playground's helpers the way a person would, with
+`playground-test` starts the same playground as `interactive` (below)
+and, instead of a shell, runs `contrib/ci/playground/session.sh` in it:
+
+```mermaid
+flowchart TD
+    A["CI job build"] --> B["CI job playground-test<br/>Fedora container, python3 + node"]
+    B --> C["local-ci.sh playground-test"]
+    C --> D["pg_start: a KDC, two servers with their own anchors,<br/>a trusted realm, voucher keys, a pinned anchor"]
+    D --> E["session.sh runs the steps of 29 sections,<br/>KUIPA_TRACE on, each step checked against<br/>an expected exit status"]
+    E --> F["pg_stop"]
+    F --> G["report.py → kuipa-playground-report/<br/>index.html + an animated terminal per section"]
+    G --> H{"every step matched<br/>its expected status?"}
+    H -- yes --> I["the job passes"]
+    H -- no --> J["the job fails"]
+    G --> K["upload the report as an artifact (if: always())<br/>and put its step table on the run's Summary tab"]
+```
+
+The session uses the playground's helpers the way a person would, with
 `KUIPA_TRACE=kuipa_tools=trace,kuipa_gssapi=debug`:
 
 * an OTP join, `status`, a rekey and `check`;
