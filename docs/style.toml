@@ -79,17 +79,16 @@ header_bold = true
 stripe_background = "#f3f8fb"
 space_after_pt = 8.0
 
-# base16-ocean.dark's own backdrop, mirrored here so the drawn code block matches the syntax
+# base16-ocean.light's own backdrop, mirrored here so the drawn code block matches the syntax
 # theme's text colors (see technical-guide.toml in sardown's style examples for why the
 # background must match the theme exactly).
 [code_block]
-syntax_theme = "base16-ocean.dark"
+syntax_theme = "base16-ocean.light"
 label_style = "none"
 shrink_to_fit = true
 min_font_size_pt = 7.0
 
 [code_block.default]
-background = "#2b303b"
 font_family = "Red Hat Mono"
 font_size_pt = 9.0
 
