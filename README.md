@@ -12,6 +12,25 @@ creates keys.
 > still changing, and wire formats are not stable. Do not deploy it to
 > protect production realms.
 
+## What's in a Name?
+
+**kuipa** (pronounced *kwee-pah*) draws its name from two distinct linguistic
+roots that perfectly mirror its security mission:
+
+* **Quechua (*Khipu* / *Quipu*):** In the Inca Empire, a *quipu* was a
+  sophisticated system of knotted cords used to store, encode, and
+  cryptographically preserve vital records, identities, and state data without
+  written text. Similarly, **kuipa** binds host identities, enrollment workflows,
+  and post-quantum keys into FreeIPA's directory fabric.
+
+* **Bantu (*kuipa*):** In Shona and Chichewa, *kuipa* carries the meaning of
+  being formidable or difficult—a fitting subtext for hardening enterprise
+  identity systems against quantum adversaries attempting
+  *harvest-now-decrypt-later* attacks.
+
+In short: **Kuipa knots your FreeIPA realm with quantum-resistant security.**
+
+
 ## Features
 
 * **Enrollment:** the host authenticates the realm against a pinned
@@ -52,17 +71,21 @@ which algorithms are used.
 |---|---|
 | [`kuipa-enroll`](crates/kuipa-enroll) | The protocol, without I/O: delegations and the anchor exchange, realm advertisements, join, rekey and staging, vouchers, trusts, offline bundles, sealed keytabs |
 | [`kuipad`](crates/kuipad) | The server daemon, behind httpd, using 389-ds over LDAPI |
-| [`kuipa-tools`](crates/kuipa-tools) | Client programs: `kuipa`, `kuipa-unseal` and `kuipa-voucher` |
+| [`kuipa-tools`](crates/kuipa-tools) | Client programs: `kuipa`, `kuipa-unseal`, `kuipa-voucher`, `kuipa-witness`, `kuipa-audit`, `kuipa-mirror`, `kuipa-gitsign` |
 | [`kuipa-gssapi`](crates/kuipa-gssapi) | GSSAPI bindings |
 | [`kuipa-ldap`](crates/kuipa-ldap) | OpenLDAP bindings |
 | [`kuipa-fido2`](crates/kuipa-fido2) | libfido2 bindings: passkey assertions and `hmac-secret`, classical and ML-DSA |
 | [`tang-pqc`](crates/tang-pqc) | Post-quantum Tang/Clevis-style key escrow with ML-KEM and ML-DSA |
 | [`tang-pqc-clevis`](crates/tang-pqc-clevis) | A post-quantum Tang client and the Clevis pin `tang-pqc` |
 | [`ml-dsa-blind`](crates/ml-dsa-blind) | Blind signing with stock FIPS 204 ML-DSA |
-| [`shims/rand`](shims/rand) | A replacement for `rand`, backed by OpenSSL's random generator |
+| [`ml-dsa-zk`](crates/ml-dsa-zk) | VOLE-in-the-head zero-knowledge proofs over boolean circuits (a research prototype toward unlinkable blind signatures) |
+| [`kuipa-perf`](crates/kuipa-perf) | Benchmark and test fixtures: synthetic realms, keytabs and certificate authorities |
+| [`shims/rand`](shims/rand), [`shims/ring`](shims/ring) | Replacements for `rand` and `ring`, backed by OpenSSL's random generator and ciphers, so no BoringSSL is built |
 
-`tang-pqc`, `tang-pqc-clevis` and `ml-dsa-blind` don't depend on FreeIPA
-and can be used on their own.
+`tang-pqc`, `tang-pqc-clevis`, `ml-dsa-blind` and `ml-dsa-zk` don't depend on
+FreeIPA and can be used on their own.  Where a third-party crate insists on a
+RustCrypto implementation, these shims replace it: the `deps` CI job fails if
+any RustCrypto algorithm or primitive crate reaches the dependency tree.
 
 ## Requirements
 
@@ -70,23 +93,30 @@ and can be used on their own.
 * OpenSSL 3.5 or later (for ML-KEM and ML-DSA)
 * A Kerberos client library and headers — MIT Kerberos, or Heimdal with the
   limitations below — and OpenLDAP client libraries and headers
+* libfido2 and its development files, for the passkey (FIDO2) factor
 * A C compiler, libclang and pkg-config, used by the build scripts
-* For the real-KDC tests: `krb5kdc`, `kdb5_util` and `kadmin.local`
-  (the tests are skipped when these are missing)
+* For the real-KDC tests: `krb5kdc`, `kdb5_util`, `kadmin.local`, `kinit` and
+  MIT's `pkinit.so` (the tests are skipped when these are missing)
 
-On Fedora:
+On Fedora (CI runs `fedora:45`, and the PQC-enabled libfido2 comes from the
+`abbra/pqc` COPR):
 
 ```sh
+sudo dnf copr enable abbra/pqc
 sudo dnf install cargo gcc clang-devel pkgconf-pkg-config \
     openssl-devel krb5-devel openldap-devel libfido2-devel
 sudo dnf install krb5-server krb5-workstation krb5-pkinit   # real-KDC tests
 ```
+
+`CONTRIBUTING.md` lists the packages the other CI jobs need (a PKCS#11 token
+for the device tests, `scdoc` and `mdbook` for the documentation build).
 
 On macOS the build scripts find Homebrew's keg-only `krb5` and `openldap`
 themselves (`brew --prefix`), so no environment setup is needed:
 
 ```sh
 brew install krb5 openldap        # real-KDC tests: krb5 provides krb5kdc
+brew install libfido2             # passkeys
 brew install cyrus-sasl           # only for LDAP GSS-SPNEGO binds, see below
 ```
 
@@ -203,8 +233,8 @@ KUIPA_ROOT=/tmp/h kuipa prepare --hostname web1.example.test
 ## Testing
 
 ```sh
-cargo test --workspace            # unit, end-to-end, HTTP and real-KDC tests
-./contrib/ci/local-ci.sh all      # everything CI runs
+cargo test --workspace --all-features   # unit, end-to-end, HTTP and real-KDC tests
+./contrib/ci/local-ci.sh all             # everything CI runs
 ```
 
 When the KDC programs are installed, `crates/kuipa-tools/tests/kdc.rs`
@@ -253,9 +283,11 @@ for the diagrams); the HTML lands in `docs/book/`.
 
 ## Contributing
 
-Issues and pull requests are welcome. Before you submit a change, run
-`./contrib/ci/local-ci.sh all`. It runs the same checks as CI: build,
-formatting, workflow lint, dependency policy, clippy, documentation and
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md)
+covers the licence and DCO sign-off, commit-message conventions, the code
+style the lints enforce, and the packages each CI job needs. Before you submit
+a change, run `./contrib/ci/local-ci.sh all`: it runs the same checks as CI —
+build, formatting, workflow lint, dependency policy, clippy, documentation and
 tests.
 
 ## License
