@@ -1,0 +1,326 @@
+// kuipa -- Tamarin model of trust establishment between IPA realms
+// (docs/DESIGN.md S17.4)
+//
+// Scope: the trust invitation, the trust request/response exchange
+// sealed to B's trust key, the jointly derived trust secret, the
+// cross-realm krbtgt keys and tickets, and the advertisement-side
+// `trusts` publication a host verifies (S17.2-S17.3).
+//
+// This is a STANDALONE theory, split from kuipa.spthy like tang-pqc
+// is: realms are identified by their anchor keys (!Realm, created
+// with the trust and signing keys together), with no join-machinery
+// premises -- the whole-theory saturation of the combined model does
+// not terminate in memory.  A realm's anchor vouches for its signing
+// key exactly as a delegation does in the core model;  the
+// advertisement fetch of S17.4's first bullet is the !Realm lookup.
+//
+// Symbolic abstraction (as in kuipa.spthy):
+//   - ML-DSA -> sgn(m, sk) with verification key vk(sk);  the
+//     attacker cannot invert sgn.
+//   - ML-KEM -> kem_ct(ek, s) binds a fresh secret s under
+//     encapsulation key ek = kem_pk(seed);  only kem_dec(kem_sk(seed))
+//     recovers s.  In the rules, decapsulation is fact-driven
+//     (decryption-by-fact) so the proof search terminates.
+//   - HKDF/H -> h(.);  the transcript T is bound by the fact records
+//     rather than spelled out as a hash chain.
+//   - The invitation expiry and the ticket lifetimes are clock
+//     properties, unmodeled (DESIGN S13 "Clock").
+//
+// Running the model:
+//   tamarin-prover --prove trust.spthy --derivcheck-timeout=120
+//
+// Results with tamarin-prover 1.12.0 and Maude 3.5.1:
+//   TrustExec, TrustInvitationAuth, TrustResponderAuth,
+//   TrustSecretSecret, CrossRealmTicketSource: verified.
+//   Attack_RogueInviteLeaksTrustSecret,
+//   Attack_LeakedTrustSecretForgesTickets: falsified, the S17.4
+//     "Limits" rows -- a mis-delivered invitation names the
+//     attacker's realm and its responder derives the secret A
+//     derives, and a leaked trust secret mints the cross-realm
+//     krbtgt keys.
+
+theory trust
+begin
+
+functions: sgn/2, vk/1, kem_pk/1, kem_sk/1, kem_ct/2, kem_dec/2, senc/2, sdec/2, h/1
+equations: kem_dec(kem_sk(x), kem_ct(kem_pk(x), s)) = s,
+           sdec(senc(m, k), k) = m
+
+// ------------------------------------------------------------------
+// Trust establishment (S17.4): realm B invites, a server of realm A
+// answers, and both derive a trust secret neither chose alone, for
+// the cross-realm krbtgt keys.
+//
+//   invitation = <realm B, B's anchor, one-time secret tsec>
+//                 (out of band, like an enrollment string; B stores
+//                  its hash with an expiry -- abstracted as the
+//                  linear ValidInvite, usable once)
+//   request:  (ct, ss) = Encaps(ek_trust);  body under k=HKDF(ss):
+//             <tsec, realm A, A's delegation, A's server key,
+//              ML-DSA(A's server key, T)>;  T binds both realms, ct
+//             and the ephemeral ek_e (modeled by the fact records)
+//   response: (ct_e, ss_e) = Encaps(ek_e);  trust secret =
+//             h(<ss, ss_e, 'trust-secret'>) -- both encapsulations,
+//             so neither side chooses it alone
+//
+// This section is deliberately STANDALONE: realms are identified by
+// their anchor keys (!Realm, created with the trust and signing keys
+// together), with no !Server or !Adv premises -- coupling it to the
+// join machinery made the source saturation explode.  A realm's
+// anchor vouches for its signing key exactly as a delegation does in
+// the core model; the advertisement fetch of S17.4's first bullet is
+// the !Realm lookup.  The protocol has its own domain
+// "ipa-ku-trust/v1", so nothing here is taken for a join -- modeled
+// by distinct fact names.
+// ------------------------------------------------------------------
+
+rule realm_setup:
+  [ Fr(~ask), Fr(~ssk), Fr(~tseed) ]
+  --[ HonestRealm(vk(~ask)) ]->
+  [ !Realm($realm, ~ask, vk(~ask), ~ssk, vk(~ssk), ~tseed,
+           kem_pk(~tseed)) ]
+  // one fact binds a realm to its anchor, the server signing key its
+  // delegation names, and its trust key (ipa_use: "trust")
+
+rule rogue_realm_setup:
+  [ Fr(~ask), Fr(~ssk), Fr(~tseed) ]
+  -->
+  [ !Realm($realm, ~ask, vk(~ask), ~ssk, vk(~ssk), ~tseed,
+           kem_pk(~tseed)),
+    Out(~ask), Out(~ssk), Out(~tseed) ]
+  // the attacker's realm: all its keys are public, so it can play
+  // responder (it holds tseed) and impersonate its own servers
+
+rule trust_invitation:
+  [ !Realm(realmA, askA, avkA, sskA, svkA, tseedA, tekA),
+    !Realm(realmB, askB, avkB, sskB, svkB, tseedB, tekB), Fr(~tsec) ]
+  --[ Invite(avkA, avkB, realmA, realmB, ~tsec) ]->
+  [ ValidInvite(~tsec, avkB, realmA, realmB),
+    AInvite(avkA, avkB, realmA, realmB, ~tsec) ]
+  // B's administrator invites A: the one-time secret reaches A's
+  // administrator out of band (AInvite is that authentic channel;
+  // the rogue variant below is the mis-delivered invitation), and B
+  // stores its hash (ValidInvite, consumed at the response -- the
+  // expiry is a clock property, S13 "Clock")
+
+rule trust_invitation_rogue:
+  [ !Realm(realmA, askA, avkA, sskA, svkA, tseedA, tekA),
+    !Realm(realmR, askR, avkR, sskR, svkR, tseedR, tekR), Fr(~tsec) ]
+  --[ RogueInvite(avkA, avkR, realmA, realmR) ]->
+  [ ValidInvite(~tsec, avkR, realmA, realmR),
+    AInvite(avkA, avkR, realmA, realmR, ~tsec) ]
+  // an invitation naming the attacker's realm: A establishes a trust
+  // with it, the trust-side analogue of a mis-delivered enrollment
+  // string (S17.4 "Limits")
+
+rule trust_request:
+  [ AInvite(avkA, avkB, realmA, realmB, tsec),
+    !Realm(realmA, askA, avkA, sskA, svkA, tseedA, tekA),
+    !Realm(realmB, askB, avkB, sskB, svkB, tseedB, tekB),
+    Fr(~ss), Fr(~eseed) ]
+  --[ TrustReq(avkA, avkB, realmA, realmB, ~ss) ]->
+  [ TAwait(avkA, avkB, realmA, realmB, ~ss, ~eseed),
+    TEncap(realmA, avkA, kem_ct(tekB, ~ss), ~ss, kem_pk(~eseed)),
+    TSealedReq(realmA, avkA, kem_ct(tekB, ~ss), tsec, sskA),
+    Out( <'IPTQ', tekB, realmB, realmA, kem_ct(tekB, ~ss),
+          kem_pk(~eseed),
+          senc(<tsec, realmA, svkA, sgn(<realmB, realmA, svkA>, sskA)>,
+               h(~ss))> ) ]
+  // kuipad establish-trust: the request is sealed under k = HKDF(ss)
+  // (the fresh ss stands for it), carrying the invitation secret,
+  // A's description and A's server-key signature over T.  The linear
+  // TEncap/TSealedReq records are A's own -- the decryption-by-fact
+  // idiom for B's decapsulation and body check
+
+rule trust_respond:
+  [ !Realm(realmB, askB, avkB, sskB, svkB, tseedB, tekB),
+    In( <'IPTQ', tekB, realmB, realmA, ct, ek_e, sealed> ),
+    TEncap(realmA, avkA, ct, ss, ek_e),
+    TSealedReq(realmA, avkA, ct, tsec, sskA),
+    ValidInvite(tsec, avkB, realmA, realmB),
+    !Realm(realmA, askA, avkA, sskA, svkA, tseedA, tekA),
+    Fr(~sse) ]
+  --[ TrustAccept(avkB, avkA, realmB, realmA,
+                  h(<ss, ~sse, 'trust-secret'>)) ]->
+  [ !TrustEstablishedB(avkA, avkB, realmA, realmB,
+                        h(<ss, ~sse, 'trust-secret'>)),
+    TrustRsp(realmA, avkA, avkB, ek_e, ~sse, ss,
+             h(<ss, ~sse, 'trust-secret'>)),
+    Out( <'IPTS', kem_ct(ek_e, ~sse),
+          senc(realmB, h(<ss, ~sse, 'rsp'>))> ) ]
+  // B uses up the invitation (ValidInvite consumed), checks A's
+  // description and delegation (the !Realm premise: the body's
+  // signing key belongs to a realm whose anchor vouches for it) and
+  // the signature over T (ss, ek_e and both realms are bound by the
+  // fact records), then answers under ss || ss_e.  B records the
+  // trust on its side (!TrustEstablishedB) and both derive the same
+  // secret from both encapsulations
+
+// The attacker as the rogue realm's responder: it holds the rogue
+// realm's trust-key seed (rogue_realm_setup Out'd it), so it
+// decapsulates A's request itself, chooses its own ss_e and answers
+// -- and knows the trust secret A derives.  In(tseed) is the
+// attacker's knowledge of the rogue seed; the TEncap/TSealedReq
+// premises are A's own records of the request it sent to this key.
+rule rogue_trust_respond:
+  [ !Realm(realmR, askR, avkR, sskR, svkR, tseedR, tekR), In(tseedR),
+    TEncap(realmA, avkA, ct, ss, ek_e),
+    TSealedReq(realmA, avkA, ct, tsec, sskA),
+    Fr(~sse) ]
+  --[ RogueTrustEstablished(avkR, realmA,
+                            h(<ss, ~sse, 'trust-secret'>)) ]->
+  [ TrustRsp(realmA, avkA, avkR, ek_e, ~sse, ss,
+             h(<ss, ~sse, 'trust-secret'>)),
+    Out( <'IPTS', kem_ct(ek_e, ~sse),
+          senc(realmR, h(<ss, ~sse, 'rsp'>))> ) ]
+  // the attacker skips B's checks (no ValidInvite, no !Realm
+  // premise for the initiator): it is the responder, and every check
+  // it skips is one it would only run against itself.  A's
+  // trust_finish accepts the answer exactly as an honest one -- A
+  // cannot tell who answered;  the secret h(<ss, sse, ...>) is the
+  // attacker's own knowledge from the two ss it chose or decapsulated
+
+rule trust_finish:
+  [ TAwait(avkA, avkB, realmA, realmB, ss, eseed),
+    In( <'IPTS', ct_e, sealed> ),
+    TrustRsp(realmA, avkA, avkB, kem_pk(eseed), sse, ss, ts) ]
+  --[ TrustDone(avkA, avkB, realmA, realmB, ts) ]->
+  [ !TrustEstablished(avkA, avkB, realmA, realmB, ts) ]
+  // A opens the response under ss || ss_e (ss_e decapsulated with
+  // its own ephemeral key -- the TrustRsp fact's kem_pk(eseed) is
+  // the decryption-by-fact record) and records the trust with the
+  // shared secret, from which each side derives the cross-realm
+  // krbtgt keys
+
+// A compromised trust secret (leaked from either directory): the
+// thief mints the cross-realm krbtgt keys and forges the tickets
+// they authenticate.  This bounds TrustSecretSecret below.
+rule leak_trust_secret:
+  [ !TrustEstablished(avkA, avkB, realmA, realmB, ts) ]
+  --[ LeakTrustSecret(realmA, realmB, ts) ]->
+  [ Out(ts) ]
+
+rule attacker_mint_krbtgt:
+  [ !TrustEstablished(avkA, avkB, realmA, realmB, ts), In(ts) ]
+  --[ AttackerMintedKrbtgt(realmA, realmB, ts) ]->
+  [ XRealmTicket(realmA, realmB, ts),
+    Out( senc(<'ticket', realmB>, h(<ts, 'krbtgt'>)) ) ]
+  // with the trust secret the attacker derives the cross-realm keys
+  // (h(<ts, 'krbtgt'>)) and constructs tickets that verify under
+  // them -- the XRealmTicket fact is such a ticket, indistinguishable
+  // from an honest one at the accepting host
+
+// B's KDC issues a cross-realm ticket under the krbtgt keys from the
+// trust secret (the principal and the Kerberos exchange are
+// abstracted: what matters is the key the ticket is sealed under).
+rule b_kdc_cross_realm_ticket:
+  [ !TrustEstablishedB(avkA, avkB, realmA, realmB, ts) ]
+  --[ TicketIssued(realmB, realmA) ]->
+  [ XRealmTicket(realmA, realmB, ts),
+    Out( senc(<'ticket', realmB>, h(<ts, 'krbtgt'>)) ) ]
+
+// A's servers publish the trust in the advertisement's signed
+// `trusts` member (S17.2), once the trust is established;  a host of
+// A verifies it with A's anchors (S17.3) -- the host-side check is
+// the !TrustAdv premise of a_host_accepts_cross_realm.
+rule publish_trusts:
+  [ !TrustEstablished(avkA, avkB, realmA, realmB, ts) ]
+  --[ TrustsPublished(avkA, avkB, realmA, realmB) ]->
+  [ !TrustAdv(avkA, avkB, realmA, realmB, ts) ]
+
+// A host of A accepts a cross-realm principal of B: the ticket
+// verifies under the krbtgt keys, and the host knows B only through
+// the trust its own realm advertises (S17.3 -- per-realm anchor
+// separation keeps B's anchors from ever vouching for A's servers).
+rule a_host_accepts_cross_realm:
+  [ XRealmTicket(realmA, realmB, ts),
+    !TrustAdv(avkA, avkB, realmA, realmB, ts) ]
+  --[ CrossRealmAccepted(avkA, realmA, realmB, ts) ]->
+  [ ]
+
+// ------------------------------------------------------------------
+
+// ------------------------------------------------------------------
+// Trust establishment lemmas (S17.4)
+// ------------------------------------------------------------------
+
+// The flow runs end to end: B invites, A's server answers, both
+// sides record the trust and derive the same secret, and a host of A
+// accepts B's cross-realm principal through it.
+lemma TrustExec: exists-trace
+  "Ex avkA realmA realmB ts #i.
+    CrossRealmAccepted(avkA, realmA, realmB, ts) @i"
+
+// Agreement: whenever B records a trust with A, an invitation of B
+// naming A's anchor was issued and used up for exactly this pair --
+// a rogue invitation (the attacker's anchor) never produces a trust
+// between two honest realms.  This is B's check chain, symbolic:
+// the request's body was sealed under an ss only A's server's
+// encapsulation (TEncap/TSealedReq) and the invitation's secret
+// matched B's stored hash (ValidInvite).
+lemma TrustInvitationAuth:
+  "All avkA avkB realmA realmB ts #i.
+    ( TrustAccept(avkB, avkA, realmB, realmA, ts) @i
+      & HonestRealm(avkA) @i & HonestRealm(avkB) @i )
+    ==> Ex tsec #j.
+      ( Invite(avkA, avkB, realmA, realmB, tsec) @j )"
+
+// A's side authenticates B: whenever A records a trust with an
+// honest, unstolen B anchor, B's trust key answered the request --
+// only B holds tseed, so only B could decapsulate A's request and
+// produce the response under ss || ss_e.  The rogue responder needs
+// the rogue key's public seed.
+lemma TrustResponderAuth:
+  "All avkA avkB realmA realmB ts #i.
+    ( TrustDone(avkA, avkB, realmA, realmB, ts) @i
+      & HonestRealm(avkB) @i )
+    ==> Ex realmB2 askB sskB svkB tseedB tekB #j.
+      ( !Realm(realmB2, askB, avkB, sskB, svkB, tseedB, tekB) @j )"
+
+// The trust secret is derived from both encapsulations, so neither
+// side chose it alone: with both anchors honest, the attacker never
+// learns it.  It holds the request (ss) and the response (ss_e) to
+// itself, and A's ephemeral key keeps ss_e out of reach even when
+// the whole exchange is recorded.
+lemma TrustSecretSecret:
+  "All avkA avkB realmA realmB ts #i #j #k.
+    ( TrustDone(avkA, avkB, realmA, realmB, ts) @i
+      & HonestRealm(avkA) @j & HonestRealm(avkB) @k )
+    & not(Ex #m. LeakTrustSecret(realmA, realmB, ts) @m)
+    ==> not(Ex #l. K(ts) @l)"
+
+// A cross-realm ticket accepted by a host of A authenticates B:
+// either B's KDC issued it (TrustEstablishedB, the honest path), or
+// the trust secret leaked -- there is no third way to the krbtgt
+// keys.  The ticket itself carries no proof of its issuer, which is
+// exactly Kerberos's cross-realm model (S17.4 "Limits"): the trust
+// secret is what the ticket is worth.
+lemma CrossRealmTicketSource:
+  "All avkA avkB realmA realmB ts #i.
+    ( CrossRealmAccepted(avkA, realmA, realmB, ts) @i
+      & !TrustAdv(avkA, avkB, realmA, realmB, ts) @i
+      & HonestRealm(avkA) @i )
+    ==> ( Ex #j. !TrustEstablishedB(avkA, avkB, realmA, realmB, ts) @j )
+     | ( Ex #j. LeakTrustSecret(realmA, realmB, ts) @j )"
+
+// ------------------------------------------------------------------
+// Falsifiable sanity checks, trust rows (expected: falsified).
+// ------------------------------------------------------------------
+
+// A mis-delivered invitation (naming the attacker's anchor) makes A
+// establish the "trust" with the attacker's realm, and the attacker
+// -- holding the rogue trust key's seed -- derives the secret A
+// derives.  The trust-side analogue of Attack_RoguePinLearnsOtp.
+lemma Attack_RogueInviteLeaksTrustSecret:
+  "All avkA avkB realmA realmR #i.
+    RogueInvite(avkA, avkB, realmA, realmR) @i
+    ==> not(Ex ts #j. RogueTrustEstablished(avkB, realmA, ts) @j)"
+
+// A leaked trust secret lets the attacker mint the cross-realm
+// krbtgt keys and forge a ticket a host of A accepts: bounds
+// TrustSecretSecret and CrossRealmTicketSource from below.
+lemma Attack_LeakedTrustSecretForgesTickets:
+  "All realmA realmB ts #i.
+    LeakTrustSecret(realmA, realmB, ts) @i
+    ==> not(Ex #j. AttackerMintedKrbtgt(realmA, realmB, ts) @j)"
+end

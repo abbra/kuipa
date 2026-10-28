@@ -13,6 +13,8 @@
 //         the answer encrypted to the device key, device/escrow
 //         compromise (S7.6.10)
 //   S9    vouchers: blind issue, bound and bearer use, single use
+//         (trust establishment, S17.4, is modeled separately in
+//         trust.spthy, as tang-pqc is)
 //   S13   security analysis rows for the anchor-rooted flows
 //
 // Symbolic abstraction:
@@ -629,7 +631,7 @@ rule user_unseal:
   // opening it), opens its own slot for B (the fact carries it: only
   // the device's key holder acts here), and derives DEK = h(a, b)
 
-// ------------------------------------------------------------------
+
 // Lemmas
 // ------------------------------------------------------------------
 
@@ -842,5 +844,6 @@ lemma Attack_StolenDevicePlusReleaseOpensSeal:
   "All user dek #i.
     DeviceCompromised(user, dek) @i
     ==> not(Ex #l. K(dek) @l)"
+
 
 end
