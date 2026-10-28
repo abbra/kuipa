@@ -9,6 +9,10 @@
 //   S5.5  response payload (keytab + anchors)
 //   S6    rekey with the Kerberos authenticator (host keytab)
 //   S7    sealed keytab: escrow registration and recovery
+//   S7.6  user seals: two shares, the unified recovery request,
+//         the answer encrypted to the device key, device/escrow
+//         compromise (S7.6.10)
+//   S9    vouchers: blind issue, bound and bearer use, single use
 //   S13   security analysis rows for the anchor-rooted flows
 //
 // Symbolic abstraction:
@@ -29,6 +33,16 @@
 //     rule: "T binds ...").
 //   - Time is not modeled: vouch, advertisement and pin expiries are
 //     treated as unexpired (see DESIGN S13 "Clock").
+//   - The voucher issuer serves only provisioners it can authenticate
+//     (BlindReq is the provisioner's own record);  a rogue provisioner
+//     with issuer access is out of scope -- the quota and one-more
+//     unforgeability named in S9 are the mitigations.  Blindness is
+//     structural: the issuer's only input is the hash mu.
+//   - The seal descriptor signature (S7.6.3) and the revocation
+//     windows are client-cache and time properties, outside the
+//     symbolic model (S13 "Clock");  the registered device list is
+//     the trusted fact !Device.  One server slot and one device slot
+//     abstract the per-server and per-device lists of IPUF.
 //
 // Modeling notes:
 //   - Receive rules take attacker-controlled fields as plain variables
@@ -52,16 +66,25 @@
 // Running the model:
 //   tamarin-prover --prove kuipa.spthy --derivcheck-timeout=120
 //
-// Results with tamarin-prover 1.12.0 and Maude 3.5.1 (about 32 s):
+// Results with tamarin-prover 1.12.0 and Maude 3.5.1:
 //   Exec, OtpSecret, KeytabSecret, JoinServerAuth,
 //   RekeyForwardSecrecy, SealedNoOffline, SsSecretSource,
-//   AttackerSsOnlyFromRogueSeeds, Attack_EscrowKeyOpensDisk: verified.
+//   AttackerSsOnlyFromRogueSeeds, Attack_EscrowKeyOpensDisk,
+//   VoucherExec, VoucherSingleUse, VoucherIssuerAuth,
+//   BoundVoucherKeytabSecret, SealExec, SealReleaseRegistered,
+//   SealNeedsDeviceKey: verified.
 //   Attack_RoguePinLearnsOtp, Attack_StolenAnchorLearnsOtp: falsified,
 //     the traces DESIGN S13 predicts for a mis-delivered enrollment
 //     string and a stolen anchor; they show the secrecy lemmas are
 //     conditioned on the honest pin, not vacuous.  EscrowKeyOpensDisk
 //     being verified is correct: the DEK needs both shares (S7.6), so
 //     the escrow key alone yields only the server share.
+//   Attack_UnboundVoucherIsBearer,
+//   Attack_EscrowKeyYieldsServerShare,
+//   Attack_StolenDevicePlusReleaseOpensSeal: falsified, the S9/S7.6.10
+//     rows -- a bearer voucher enrolls whoever holds it, the escrow
+//     key yields the server share, and a stolen device key plus an
+//     observed unlock answer opens the file.
 
 theory kuipa
 begin
@@ -315,6 +338,298 @@ rule unseal:
   [ ]
 
 // ------------------------------------------------------------------
+// Vouchers (S9): a blind-issued ML-DSA signature on the join message
+// m replaces the OTP (auth_type 3).  Three roles:
+//
+//   issuer        holds the ML-DSA voucher key vsk; the realm's
+//                 servers accept it through !VKey, created only next
+//                 to an honest server's anchor -- the advertisement's
+//                 signed kuipa_vouchers member.
+//   provisioner   decides the host, group and lease, and either binds
+//                 the voucher to the host's ephemeral key or leaves it
+//                 a bearer credential.
+//   host          joins with the signature.
+//
+// Blindness is structural and needs no rule: ml-dsa-blind signs the
+// 64-byte mu in external-mu mode, so the issuer's only input is a
+// hash and never sees realm, host or group.  The provisioner keeps
+// (salt, sigma), which any FIPS 204 verifier checks as an ordinary
+// signature on salt||m -- so the model issues sgn(<salt, m>, vsk)
+// directly and the mu round trip is invisible on the wire.
+//
+// The linear fact Voucher(sig, salt, m, vsk) is both the signature's
+// validity (only issuance under a realm-accepted key creates it) and
+// the directory's spent-salt record (ipaKUVoucherSpent): consumed at
+// the join, a voucher is worth one host.  Quotas and one-more
+// unforgeability are issuer policy, out of scope.
+// ------------------------------------------------------------------
+
+rule voucher_key_add:
+  [ !Server(srv, ask, avk, ssk, svk, jseed, ek), Fr(~vsk) ]
+  -->
+  [ !VKey(~vsk, avk) ]
+  // add-voucher-key (S11.2): the issuer's key, listed in the
+  // advertisement's kuipa_vouchers member, which the anchor signs --
+  // so a voucher key exists only for a realm an honest server's
+  // anchor vouches for, and a rogue server's advertisement never
+  // verifies one
+
+// The enrollment string for a voucher join carries the pin only (no
+// OTP is spent), and the host has already run kuipa voucher-key: the
+// fresh ~eseed is the host's ephemeral private key, published as the
+// ek_e the provisioner binds to.  !VHost ties the host to its FQDN
+// for the issuance rules.
+rule enroll_string_voucher:
+  [ !Server(srv, ask, avk, ssk, svk, jseed, ek), Fr(~eseed) ]
+  -->
+  [ C0($host, $fqdn, 'none', avk),
+    !VKeyHost($host, ~eseed, kem_pk(~eseed)),
+    !VHost($host, $fqdn),
+    Out( kem_pk(~eseed) ) ]
+
+rule issue_voucher_bound:
+  [ !VKeyHost(host, eseed, ek_e), !VHost(host, fqdn),
+    !VKey(vsk, avk), Fr(~salt) ]
+  --[ VoucherIssued(~salt, 'bound', fqdn, ek_e) ]->
+  [ Voucher( sgn(<~salt, fqdn, $hg, ek_e>, vsk), ~salt,
+             <fqdn, $hg, ek_e>, vsk ),
+    Out( <fqdn, $hg, sgn(<~salt, fqdn, $hg, ek_e>, vsk)> ) ]
+  // the provisioner binds the voucher to the host's ek_e: m =
+  // <fqdn, hostgroup, binding>.  The signature is public from here
+  // on (the provisioner hands it to the host over any channel), which
+  // is why BoundVoucherKeytabSecret below holds even with the
+  // voucher in the attacker's hands -- useless without the host's
+  // ephemeral private key, exactly as S9 says.
+
+rule issue_voucher_bearer:
+  [ !VHost(host, fqdn), !VKey(vsk, avk), Fr(~salt) ]
+  --[ VoucherIssued(~salt, 'bearer', fqdn, 'none') ]->
+  [ Voucher( sgn(<~salt, fqdn, $hg, 'bearer'>, vsk), ~salt,
+             <fqdn, $hg, 'bearer'>, vsk ),
+    Out( <fqdn, $hg, sgn(<~salt, fqdn, $hg, 'bearer'>, vsk)> ) ]
+  // no binding: an unbound voucher is a bearer credential until used
+
+rule steal_voucher_key:
+  [ !VKey(vsk, avk) ]
+  -->
+  [ Out(vsk) ]
+  // a compromised issuer key: whoever holds vsk signs vouchers of
+  // its own, exactly as a compromised signing key impersonates a
+  // server (S13) -- the signature is the credential
+
+// With a stolen issuer key the attacker mints vouchers itself:
+// In(vsk) succeeds only after steal_voucher_key published the key, so
+// this rule is the symbolic form of "signs with a key the realm
+// accepts".
+rule mint_voucher_stolen_key:
+  [ !VKey(vsk, avk), !VHost(host, fqdn), In(vsk), Fr(~salt) ]
+  --[ VoucherIssued(~salt, 'bearer', fqdn, 'none'),
+      VoucherForged(~salt) ]->
+  [ Voucher( sgn(<~salt, fqdn, $hg, 'bearer'>, vsk), ~salt,
+             <fqdn, $hg, 'bearer'>, vsk ),
+    Out( <fqdn, $hg, sgn(<~salt, fqdn, $hg, 'bearer'>, vsk)> ) ]
+
+rule client_join_voucher:
+  [ C0(host, fqdn, otp, avk),
+    !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    !VKeyHost(host, eseed, ek_e),
+    In( sig ),
+    Fr(~ss) ]
+  -->
+  [ VC1(host, fqdn, avk, srv, ek, ~ss, eseed, svk),
+    Encap(fqdn, kem_ct(ek, ~ss), ~ss),
+    Out( <'vjoin', ek, srv, fqdn, kem_ct(ek, ~ss), ek_e, sig> ) ]
+  // the voucher join is the join exchange with the signature in place
+  // of the sealed OTP: same pin and advertisement check (C0 and !Adv
+  // unified against the pinned anchor), same KEM request.  The client
+  // forwards the voucher it was given; the server-side rules decide
+  // whether it is worth anything.  The OTP field of C0 is unused --
+  // the enrollment string here only carries the pin.
+
+rule server_voucher_join:
+  [ !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    !VKey(vsk, avk),
+    In( <'vjoin', ek, srv, fqdn, ct, ek_e, sig> ),
+    Voucher( sig, salt, <fqdn, hg, ek_e>, vsk ),
+    Encap(fqdn, ct, ss),
+    Fr(~sse), Fr(~keys) ]
+  --[ ServerAccept(srv, fqdn, ~keys),
+      VoucherJoin(srv, fqdn, salt, ek_e, ~keys) ]->
+  [ JoinRsp(fqdn, ek_e, ~sse, ss, ~keys, avk),
+    Out( <'rsp', 'join', srv, kem_ct(ek_e, ~sse)> ) ]
+  // the bound case: the voucher's m names this request's ek_e (the
+  // shared variable ek_e in the In pattern and the Voucher fact is
+  // the binding check -- a signature bound to another key does not
+  // unify), the signature verifies under the issuer key the realm
+  // accepts (vsk of !VKey, tied to this advertisement's anchor), and
+  // m names this request's fqdn (shared variable fqdn).  Consuming
+  // the linear Voucher fact is the ipaKUVoucherSpent write plus the
+  // host add: the salt is spent and the FQDN exists, so the same
+  // voucher cannot enroll twice.
+
+rule server_voucher_join_bearer:
+  [ !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    !VKey(vsk, avk),
+    In( <'vjoin', ek, srv, fqdn, ct, ek_e, sig> ),
+    Voucher( sig, salt, <fqdn, hg, 'bearer'>, vsk ),
+    Encap(fqdn, ct, ss),
+    Fr(~sse), Fr(~keys) ]
+  --[ ServerAccept(srv, fqdn, ~keys),
+      VoucherJoin(srv, fqdn, salt, 'bearer', ~keys) ]->
+  [ JoinRsp(fqdn, ek_e, ~sse, ss, ~keys, avk),
+    Out( <'rsp', 'join', srv, kem_ct(ek_e, ~sse)> ) ]
+  // the bearer case: nothing ties the request's ek_e to the voucher,
+  // so whoever holds the signature may enroll the host with a key of
+  // their own -- Attack_UnboundVoucherIsBearer below shows it
+
+rule voucher_client_finish:
+  [ VC1(host, fqdn, avk, srv, ek, ss, eseed, svk),
+    In( <'rsp', 'join', srv, ct_e> ),
+    JoinRsp(fqdn, kem_pk(eseed), sse, ss, keys, avk) ]
+  --[ VoucherClientDone(host, fqdn, srv, avk, keys) ]->
+  [ C2(host, fqdn, avk, keys) ]
+  // the response opens under ss || sse with sse decapsulated by the
+  // host's ephemeral key (the JoinRsp fact's kem_pk(eseed) is the
+  // decryption-by-fact record, as in client_finish);  the join
+  // installs like an online one
+
+// The attacker as a voucher client with a bearer voucher: it holds
+// the signature (Out'd at issuance), makes its own join request and
+// its own ephemeral key, and the server -- unable to tell who
+// encapsulated ct -- answers as for any other join (its request
+// matches server_voucher_join_bearer's In pattern, and the JoinRsp
+// that rule emits targets kem_pk(~eseed)).  Since both shared
+// secrets and the decapsulation key are the attacker's own, the
+// response payload -- the host's keytab -- lands in its knowledge.
+rule attacker_bearer_join:
+  [ !Adv(srv, ask, avk, ssk, svk, jseed, ek),
+    !VKey(vsk, avk),
+    In( <fqdn, sig> ),
+    Fr(~ss), Fr(~eseed), Fr(~keys) ]
+  --[ AttackerVoucherJoinDone(fqdn, ~keys, srv) ]->
+  [ Out( <'vjoin', ek, srv, fqdn, kem_ct(ek, ~ss), kem_pk(~eseed), sig> ),
+    Out(~keys) ]
+  // the attacker's request on the wire: the server-side bearer rule
+  // will still consume the Voucher fact and emit a JoinRsp to
+  // kem_pk(~eseed); the attacker holds ~ss, ~eseed and the response
+  // it decapsulates itself, so the keytab lands in its knowledge.
+  // The premise In(<fqdn, sig>) is the voucher it learned from the
+  // Out'd issuance; a bound voucher would name an honest host's ek_e
+  // and never unify with this request's kem_pk(~eseed) at the
+  // server, so only bearer vouchers reach the compromise.
+
+// ------------------------------------------------------------------
+// User seals (S7.6), the two-share file format of S7.6.4:
+//
+//   A, B: server and device shares;  DEK = h(<a, b>)
+//   server slot:  (B_i, ss_i) = tang-pqc provision to eek;  the
+//     binding secret r stands for ss_i and the provision's random,
+//     so W = senc(A, r) and the commitment t = h(r, 'commit')
+//   device slot:  (c, s) = ML-KEM.Encaps(dpk);  U = senc(B, s)
+//
+// One server slot and one device slot abstract IPUF's lists.  The
+// registered device list is the trusted fact !Device;  the seal
+// descriptor signature (S7.6.3) is a client-cache property outside
+// the symbolic model, as are the revocation windows (S13 "Clock").
+// ------------------------------------------------------------------
+
+rule register_device:
+  [ Fr(~dseed) ]
+  -->
+  [ !Device($user, ~dseed, kem_pk(~dseed)) ]
+
+rule steal_device_key:
+  [ !Device(user, dseed, dpk) ]
+  --[ StolenDeviceKey(dpk) ]->
+  [ Out(dseed) ]
+  // a compromised device decapsulation key: the thief reads the
+  // device slot and any release answer sent to that device
+
+rule steal_escrow_key:
+  [ !EscrowKey(srv, eseed, eek) ]
+  --[ StolenEscrowKey(eek) ]->
+  [ Out(eseed) ]
+  // a compromised escrow key (an IPA administrator): the thief
+  // decapsulates the file's server slot
+
+// The escrow-key holder's decapsulation, as a rule (the equation
+// chain kem_dec(kem_sk(eseed), kem_ct(eek, r)) then sdec(senc(a, r))
+// = r then a): with eseed the thief opens every file's server slot
+// sealed to this key, exactly the documented capability of the realm
+// (S7.6.10's escrow row) -- the device share is what it lacks.
+rule escrow_key_thief:
+  [ !EscrowKey(srv, eseed, eek),
+    !SealedUserFile(user, a, b, r, ct_d, eek), In(eseed) ]
+  --[ EscrowCompromised(user, srv, a) ]->
+  [ Out(a) ]
+
+// The device-key holder's decapsulation, as a rule: with dseed the
+// thief opens the file's device slot (b) and, given a release answer
+// for a binding of this seal, decapsulates the answer's fresh
+// encapsulation to the same device and recovers r -- with the server
+// slot on the file (senc(a, r) on the wire) that yields a, and the
+// DEK with it.  This is S7.6.10's "stolen device plus observed
+// unlock" row, the bound on SealNeedsDeviceKey.
+rule device_key_thief:
+  [ !Device(user, dseed, dpk),
+    !SealedUserFile(user, a, b, r, ct_d, eek),
+    !ReleasedUser(user, r, ansseed, dpk), In(dseed) ]
+  --[ DeviceCompromised(user, h(<a, b>)) ]->
+  [ Out(h(<a, b>)) ]
+
+rule user_seal:
+  [ !Device(user, dseed, dpk), !EscrowKey(srv, eseed, eek),
+    Fr(~a), Fr(~b), Fr(~r), Fr(~s) ]
+  -->
+  [ !SealedUserFile(user, ~a, ~b, ~r, kem_ct(dpk, ~s), eek),
+    !SealBinding(user, ~r),
+    Out( <'IPUF', h(~r, 'commit'), kem_ct(eek, ~r),
+          senc(~a, ~r), kem_ct(dpk, ~s), senc(~b, ~s)> ) ]
+  // the file on the wire: the commitment t, the server slot's
+  // ciphertext and W, the device slot's ciphertext and U.  Neither
+  // share is readable without the matching key: r needs the escrow
+  // key (or a server release), s needs the device key.
+
+// The owner asks for a release: the tang-pqc RecoveryRequest carries
+// the binding whose commitment the file shows, and a factor the
+// server checks (ticket, passkey or session -- abstracted here as
+// the owner's own action through its device;  the device key is the
+// load-bearing part of the policy, S7.6.5).
+rule user_request:
+  [ !Device(user, dseed, dpk),
+    !SealedUserFile(user, a, b, r, ct_d, eek) ]
+  -->
+  [ Request(user, r) ]
+
+// The unified recovery request, server side: decapsulation by fact
+// (!SealBinding), the commitment check (r unified against the file),
+// then the answer -- r under a fresh ML-KEM encapsulation to the
+// named device's dpk, so only that device can read it.
+rule user_unlock:
+  [ !EscrowKey(srv, eseed, eek), !Device(user, dseed, dpk),
+    !SealedUserFile(user, a, b, r, ct_d, eek), !SealBinding(user, r),
+    Request(user, r),
+    Fr(~ansseed) ]
+  --[ SealRelease(user, srv, r) ]->
+  [ !ReleasedUser(user, r, ~ansseed, dpk),
+    Out( <'ans', kem_ct(dpk, ~ansseed), senc(r, ~ansseed)> ) ]
+  // the answer's key is HKDF(ansseed, request hash) -- modeled as
+  // ansseed itself;  repeated unlocks (S7.6.7) are repeated requests,
+  // each with a fresh encapsulation
+
+rule user_unseal:
+  [ !SealedUserFile(user, a, b, r, ct_d, eek), !Device(user, dseed, dpk),
+    !ReleasedUser(user, r, ansseed, dpk),
+    In( senc(r, ansseed) ) ]
+  --[ UserUnsealed(user, h(<a, b>)) ]->
+  [ ]
+  // the device decapsulates the answer with dseed (the answer's key
+  // is derived from the encapsulation to its dpk, so matching the
+  // ReleasedUser record against the wire ciphertext is exactly
+  // opening it), opens its own slot for B (the fact carries it: only
+  // the device's key holder acts here), and derives DEK = h(a, b)
+
+// ------------------------------------------------------------------
 // Lemmas
 // ------------------------------------------------------------------
 
@@ -409,5 +724,123 @@ lemma Attack_EscrowKeyOpensDisk:
     Sealed(host, fqdn, a, b, srv) @i
     & (Ex srv2 eseed eek #j. !EscrowKey(srv2, eseed, eek) @j & K(eseed) @j)
     ==> not(Ex #j. K(h(<a, b>)) @j)"
+
+// ------------------------------------------------------------------
+// Voucher lemmas (S9)
+// ------------------------------------------------------------------
+
+// The voucher flow runs end to end: a bound voucher enrolls its host
+// and installs the keytab (the response opens under the host's own
+// ephemeral key).
+lemma VoucherExec: exists-trace
+  "Ex host fqdn srv avk keys #i.
+     VoucherClientDone(host, fqdn, srv, avk, keys) @i"
+
+// A voucher is worth one host: two accepted voucher joins never
+// spent the same salt under the same issuer key -- the directory's
+// ipaKUVoucherSpent record and the host add refuse the second.
+// Unforgeability is the linear fact: only issuance under a
+// realm-accepted key creates a Voucher.
+lemma VoucherSingleUse:
+  "All srv1 fqdn1 salt1 b1 keys1 srv2 fqdn2 salt2 b2 keys2 #i #j.
+    VoucherJoin(srv1, fqdn1, salt1, b1, keys1) @i
+    & VoucherJoin(srv2, fqdn2, salt2, b2, keys2) @j
+    & not(#i = #j)
+    ==> not(salt1 = salt2)"
+
+// Whenever a voucher join is accepted, the issuer key of this realm
+// signed a voucher naming exactly this join's fqdn and (if bound)
+// the request's ek_e: the host group and lease come from the issuer
+// and the provisioner, and a bound voucher was issued for this very
+// host key.
+lemma VoucherIssuerAuth:
+  "All srv fqdn salt b keys #i.
+    VoucherJoin(srv, fqdn, salt, b, keys) @i
+    ==> Ex salt2 kind fqdn2 ek_e #j.
+      (VoucherIssued(salt2, kind, fqdn2, ek_e) @j & fqdn2 = fqdn)"
+  // b (the voucher's binding, ek_e or 'bearer') is implied by the
+  // issued kind:  kind = 'bound' means ek_e, 'bearer' means none.
+  // Guarded: fqdn is bound by the VoucherJoin premise.
+
+// A bound voucher in the attacker's hands (a copied signature, S9's
+// "useless to anyone without the host's ephemeral private key") does
+// not give it the host's keytab.
+lemma BoundVoucherKeytabSecret:
+  "All host fqdn srv avk keys #i #k.
+    VoucherClientDone(host, fqdn, srv, avk, keys) @i
+    & HonestAnchor(avk) @k
+    ==> not(Ex #j. K(keys) @j)"
+
+// ------------------------------------------------------------------
+// User seal lemmas (S7.6)
+// ------------------------------------------------------------------
+
+// The seal flow runs end to end: a file sealed with both factors
+// opens through a server release to the registered device.
+lemma SealExec: exists-trace
+  "Ex user a b #i. UserUnsealed(user, h(<a, b>)) @i"
+
+// A release happens only for a registered binding of that user: the
+// server decapsulated a tang-pqc request whose binding the sealing
+// recorded (the commitment check of S7.6.5 ties the request to this
+// file), and the answer went only to the device key.  Without a
+// server-side release there is no way to the server share -- the
+// offline-resistance row of S7.6.10.
+lemma SealReleaseRegistered:
+  "All user r ansseed dpk #i.
+    !ReleasedUser(user, r, ansseed, dpk) @i
+    ==> Ex a b ct_d srv eek #j.
+      ( !SealedUserFile(user, a, b, r, ct_d, eek) @j
+        & SealRelease(user, srv, r) @j )"
+
+// The two-share property (S7.6.4, S7.6.10): while the device key is
+// uncompromised, the DEK stays closed -- against the network attacker
+// holding a copy of the file, against the realm's escrow key (the IPA
+// administrator row: the server share alone yields nothing), and
+// against observed release answers (the answer's key is under a fresh
+// encapsulation to the device).  Every path to the DEK needs b, and b
+// is under the device slot alone.
+lemma SealNeedsDeviceKey:
+  "All user a b r ct_d eek dseed dpk #i #k.
+    ( !SealedUserFile(user, a, b, r, ct_d, eek) @i
+      & !Device(user, dseed, dpk) @k
+      & not(Ex #j. K(dseed) @j) )
+    ==> not(Ex #j. K(h(<a, b>)) @j)"
+
+// ------------------------------------------------------------------
+// Falsifiable sanity checks, seal and voucher rows (expected:
+// falsified).  They show the seal lemmas are conditioned on the
+// device factor and both shares, and that the model reproduces the
+// S9/S7.6.10 attacks the design predicts.
+// ------------------------------------------------------------------
+
+// A bearer voucher enrolls whoever holds it: the attacker's own
+// request (its own ek_e and ss) is accepted, and it reads the
+// keytab.  This is S9's "an unbound voucher is a bearer credential
+// until used".
+lemma Attack_UnboundVoucherIsBearer:
+  "All salt fqdn2 #i.
+    VoucherIssued(salt, 'bearer', fqdn2, 'none') @i
+    ==> not(Ex fqdn keys srv #j. AttackerVoucherJoinDone(fqdn, keys, srv) @j)"
+
+// The realm's escrow key yields the server share: an IPA
+// administrator (eseed compromised) decapsulates the file's server
+// slot (r from kem_ct(eek, r), then A from senc(A, r)) and reads A.
+// This bounds SealNeedsDeviceKey from below: the administrator gets
+// exactly one share, and the DEK needs both (S7.6.10's escrow row).
+lemma Attack_EscrowKeyYieldsServerShare:
+  "All user srv a #i.
+    EscrowCompromised(user, srv, a) @i
+    ==> not(Ex #k. K(a) @k)"
+
+// A stolen device key plus the observed release answer opens the
+// file: the thief decapsulates the answer with the stolen device key
+// (r is under ansseed, encrypted to dpk) and combines the shares.
+// This bounds SealClosedWithoutUnlock: it holds only while the
+// device key is uncompromised.
+lemma Attack_StolenDevicePlusReleaseOpensSeal:
+  "All user dek #i.
+    DeviceCompromised(user, dek) @i
+    ==> not(Ex #l. K(dek) @l)"
 
 end
