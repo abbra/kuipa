@@ -61,7 +61,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         `Attack_LeakedTrustSecretForgesTickets` (the minted keys).
         The partner refresh is the advertisement fetch the `!Realm`
         lookup abstracts; heads arrive with it, as in the design.
-  - [ ] 2. Signing statements (`DESIGN-sign.md`): the `sign`
+  - [x] 2. Signing statements (`DESIGN-sign.md`): the `sign`
         operation's policy check (user, group, host, service), the
         signed statement, and offline verification of bundles as of
         their time. Lemmas: a verified statement implies an authorized
@@ -69,7 +69,21 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         retroactive policy tampering); offline bundle verification
         binds the statement to its delegation window. Attack lemma:
         a statement signed outside the policy verifies only with a
-        compromised signing key.
+        compromised signing key.  Done in
+        `contrib/tamarin/sign.spthy`, a standalone theory like
+        `trust.spthy`: the policy as the trusted `!Policy` fact
+        (groups as a membership key, memberOf), the kind-5 log leaf
+        and the statement, the client bundle, and offline
+        verification against the pinned realm.  `SignAuthorized`
+        (policy), `SignStatementAuth`/`BundleVerifies` (the
+        delegation-vouched key), `BundleBindsData` (the batch
+        inclusion), `NoPolicyNoStatement` (the check is
+        load-bearing), and the falsified
+        `Attack_MisPinnedVerifierAcceptsRogue` (the mis-pinned
+        verifier accepts the rogue realm's "state anything for
+        anyone", DESIGN-sign.md's "Not a server that cannot lie").
+        The delegation window is a clock property (S13), abstracted
+        as the anchor -> key binding of the realm fact.
   - [ ] 3. Offline enrollment bundles (§8): staging, modes A (machine
         key), B (secret `S`) and C (signed only), opening, first
         contact, re-staging key replacement. Lemmas: a mode A/B bundle
