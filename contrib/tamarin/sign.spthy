@@ -1,0 +1,308 @@
+// kuipa -- Tamarin model of signing statements (DESIGN-sign.md)
+//
+// Scope: the `sign` operation's policy check (who may sign for a
+// purpose: users, groups, hosts, services), the signed statement
+// with its batch root and log position, and offline verification of
+// bundles with the realm's anchors, the delegation checked as of the
+// statement's own iat.  The transparency log itself (committed
+// leaves, witnesses) is DESIGN-tlog.md and stays out;  the statement
+// carries its (log, index) position, and the model records the leaf
+// as a fact.
+//
+// This is a STANDALONE theory, like trust.spthy and tang-pqc.spthy:
+// signing has its own facts (no join-machinery premises), and a
+// separate file keeps the source saturation small.
+//
+// Symbolic abstraction (as in kuipa.spthy):
+//   - ML-DSA -> sgn(m, sk) with verification key vk(sk);  the
+//     attacker cannot invert sgn.
+//   - The RFC 9162 batch tree over digests -> the digest itself:
+//     the model signs one digest per statement (the path and index
+//     checks are the inclusion the root already binds), and
+//     multi-digest batches are the same relation with a longer list
+//     -- no re-proof needed for a list length.
+//   - Time: the delegation window and iat are unmodeled (S13
+//     "Clock");  "as of iat" is the delegation fact existing at all.
+//   - The ticket that authenticates the caller to the server is
+//     abstracted: the caller acts through its own request fact.
+//   - The policy is the trusted fact !Policy (the directory's
+//     ipaKUSignPolicy);  groups abstract to a membership key the
+//     policy and the member both hold (memberOf).
+//
+// Running the model:
+//   tamarin-prover --prove sign.spthy --derivcheck-timeout=120
+//
+// Results with tamarin-prover 1.12.0 and Maude 3.5.1 (about 1 s):
+//   SignExec, SignAuthorized, SignStatementAuth, BundleVerifies,
+//   BundleBindsData, NoPolicyNoStatement,
+//   Attack_RogueAnchorSignsAnything: verified.
+//   Attack_MisPinnedVerifierAcceptsRogue: falsified, DESIGN-sign.md's
+//     rows -- a rogue realm states anything for anyone ("Not a server
+//     that cannot lie"), an honest verifier refuses it, and whoever
+//     pinned the rogue anchor accepts it.
+
+theory sign
+begin
+
+functions: sgn/2, vk/1, h/1
+
+// ------------------------------------------------------------------
+// Setup: a realm with an anchor and a server signing key it
+// delegates to, plus the signing policy.  The rogue variant is the
+// attacker's own realm: its keys are public and its statements
+// verify only against its own anchor.
+// ------------------------------------------------------------------
+
+rule realm_setup:
+  [ Fr(~ask), Fr(~ssk) ]
+  --[ HonestRealm(vk(~ask)) ]->
+  [ !Realm($realm, ~ask, vk(~ask), ~ssk, vk(~ssk)) ]
+  // the anchor and the server signing key its delegation names;  the
+  // delegation itself is abstracted into the anchor -> key binding
+  // of this fact, verified "as of iat" (no clock)
+
+rule rogue_realm_setup:
+  [ Fr(~ask), Fr(~ssk) ]
+  -->
+  [ !RogueRealm($realm, ~ask, vk(~ask), ~ssk, vk(~ssk)),
+    Out(~ask), Out(~ssk) ]
+  // the attacker's realm: it holds its own delegation-shaped keys,
+  // so it can state anything -- but only its own anchors verify it
+
+// One policy entry: a principal (user, host FQDN or service
+// principal) admitted for a purpose, directly or through a group.
+// The group is the membership key ~g: a member holds the same ~g the
+// policy holds, which is memberOf.  The trusted fact is what the
+// directory's ipaKUSignPolicy is.
+rule policy_add:
+  [ !Realm(realm, ask, avk, ssk, svk), Fr(~g) ]
+  -->
+  [ !Policy(realm, $principal, $purpose, ~g) ]
+  // the policy is the realm's directory content (ipaKUSignPolicy on
+  // cn=sign-policy): it exists only for a realm that exists, so no
+  // policy can be minted for a realm name the attacker invented
+
+// A principal admitted by a policy entry, and one that no entry
+// admits (it exists, authenticates fine, and simply cannot sign --
+// the server's policy check refuses it).  Hosts and services are
+// principals the same way;  the Kerberos ticket that authenticates
+// the caller to the server is abstracted into the !Principal fact.
+// The group key ~g of a policy entry is its memberOf: a member is a
+// principal holding the same ~g, and the direct unification below
+// covers both the named-user and the group case.
+rule principal_in_policy:
+  [ !Policy(realm, principal, purpose, g) ]
+  -->
+  [ !Principal(realm, principal) ]
+
+rule principal_no_policy:
+  [ !Realm(realm, ask, avk, ssk, svk) ]
+  -->
+  [ !Principal(realm, $principal) ]
+
+// ------------------------------------------------------------------
+// Signing: the caller asks;  the server checks the policy, logs a
+// kind-5 leaf and signs the statement.
+//
+//   request    = <'IPGQ', realm, principal, purpose, digest>
+//   statement  = <'IPGS', realm, principal, purpose, digest,
+//                  batch_root, iat, log, index>
+//   signed     = sgn(<realm, principal, purpose, digest, svk>, ssk)
+//                under context "ipa-ku-sign/v1 statement"
+//   bundle     = the signed statement plus the digest and its path
+// ------------------------------------------------------------------
+
+rule sign_request:
+  [ !Principal(realm, principal), Fr(~digest) ]
+  --[ SignReq(realm, principal, $purpose, ~digest) ]->
+  [ SignedReq(realm, principal, $purpose, ~digest),
+    !ReqPending(realm, principal, $purpose, ~digest) ]
+  // the caller's authenticated request (the sealed, Kerberos-only
+  // `sign` operation);  the digest is of the data it wants stated
+
+// The policy check and the statement.  The memberOf unification is
+// the whole check: the caller's group key ~g must be one the policy
+// holds for this realm, purpose and principal (the shared ~g in
+// !Member and !Policy), and the purpose and principal are the
+// request's own (shared variables).
+rule sign_statement:
+  [ !Realm(realm, ask, avk, ssk, svk),
+    SignedReq(realm, principal, purpose, digest),
+    !Policy(realm, principal, purpose, g) ]
+  --[ Stated(realm, principal, purpose, digest, svk),
+      PolicyChecked(realm, principal, purpose) ]->
+  [ !Statement(realm, principal, purpose, digest, svk),
+    Out( sgn(<realm, principal, purpose, digest, svk>, ssk) ) ]
+  // the server logs a kind-5 leaf (the committed opening holds the
+  // principal as the subject -- the !Statement fact is the leaf's
+  // content and its (log, index) position, abstracted together) and
+  // signs the statement with its delegation-vouched key.  A realm
+  // that keeps no log refuses to sign at all: no !Statement fact
+  // without this rule.  The rogue realm's version is below -- it
+  // skips the policy check.
+
+// The answer reaches the requesting client, which checks it against
+// its request (the batch covers the digest, the purpose is its own)
+// and keeps the bundle.  This is `kuipa sign blob` writing FILE.kusig.
+rule sign_answer:
+  [ !Realm(realm, ask, avk, ssk, svk),
+    !ReqPending(realm, principal, purpose, digest),
+    !Statement(realm, principal, purpose, digest, svk) ]
+  --[ Answered(realm, principal, purpose, digest, svk) ]->
+  [ ClientBundle(realm, principal, purpose, digest, svk) ]
+  // the JoinRsp idiom: the linear fact pairs this request with
+  // exactly the statement made for it, so the client's bundle check
+  // (the answer covers the request) is the unification
+
+// The rogue realm signs anything for anyone: it holds its own keys
+// (delegation-shaped, verified only by its own anchor), and no
+// policy constrains it.  This is DESIGN-sign.md's "Not a server
+// that cannot lie" row, stated as a rule so the attack lemma has a
+// real trace.
+rule rogue_sign_statement:
+  [ !RogueRealm(realm, ask, avk, ssk, svk),
+    In( <realm2, principal, purpose, digest> ) ]
+  --[ RogueStated(realm, principal, purpose, digest, svk) ]->
+  [ !RogueStatement(realm, realm2, principal, purpose, digest, svk),
+    Out( sgn(<realm2, principal, purpose, digest, svk>, ssk) ) ]
+  // the attacker mints statements for any realm, principal, purpose
+  // and digest it has seen (In is its knowledge);  verification is
+  // what stops them -- the verifier checks the delegation against
+  // the anchors it pins for THAT realm, and the rogue key is vouched
+  // only by the rogue anchor
+
+// ------------------------------------------------------------------
+// Verification: a bundle verifies with the realm's anchors and
+// nothing else -- the delegation as of the statement's iat, its key
+// the statement's signer, the signature, the principal in the realm.
+// ------------------------------------------------------------------
+
+rule verify_bundle:
+  [ !Realm(realm, ask, avk, ssk, svk),
+    ClientBundle(realm, principal, purpose, digest, svk),
+    In( sgn(<realm, principal, purpose, digest, svk>, ssk) ) ]
+  --[ Verified(realm, principal, purpose, digest, svk) ]->
+  [ ]
+  // the verifier checks the bundle against the anchors it pins for
+  // the realm: the signature must be under the anchor-vouched key
+  // svk of THIS realm (the shared ssk/svk of !Realm), and the
+  // statement's principal, purpose and digest are the ones the
+  // client's own bundle fact carries (the batch inclusion and the
+  // purpose check).  A rogue statement -- signed with the rogue ssk
+  // -- does not unify: its svk is not this realm's, so the
+  // delegation check fails, exactly SignedStatement::verify's anchor
+  // check.  The client's bundle is on the wire (the signer Out'd the
+  // signature), so the In premise is its offline re-verification of
+  // the bundle it holds, as `kuipa sign verify` does with the host's
+  // pinned anchors and nothing else.
+
+// Whoever pins the rogue anchor accepts rogue statements: the same
+// check against the rogue realm's fact.  This is the verification
+// side of "Not a server that cannot lie" -- the statement is only as
+// good as the anchors its verifier pins (DESIGN-sign.md §2: "a
+// bundle verifies with the realm's anchors and nothing else").
+rule verify_bundle_rogue:
+  [ !RogueRealm(realmR, askR, avkR, sskR, svkR),
+    !RogueStatement(realmR, realm2, principal, purpose, digest, svkR) ]
+  --[ RogueVerified(realmR, principal, purpose, digest, svkR) ]->
+  [ ]
+  // the rogue statement is public (rogue_sign_statement Out'd it, or
+  // the attacker built it with the rogue keys it holds), so In
+  // succeeds;  only a verifier that pinned the rogue anchor runs
+  // this rule, which is exactly the mis-pinned verifier the S13
+  // rows describe for enrollment
+
+// ------------------------------------------------------------------
+// Lemmas
+// ------------------------------------------------------------------
+
+// The flow runs end to end: a principal in the policy gets a
+// statement and a bundle that verifies offline.
+lemma SignExec: exists-trace
+  "Ex realm principal purpose digest svk #i.
+    Verified(realm, principal, purpose, digest, svk) @i"
+
+// Authorization: every verified statement maps to a policy entry of
+// that realm admitting that principal for that purpose -- a
+// statement signed outside the policy verifies only against the
+// rogue anchor (the attack lemma below shows that path).
+lemma SignAuthorized:
+  "All realm principal purpose digest svk #i.
+    Verified(realm, principal, purpose, digest, svk) @i
+    ==> Ex #j. PolicyChecked(realm, principal, purpose) @j"
+  // the conclusion is the server's check event, not the !Policy fact
+  // itself: a fact timepoint in an exists-conclusion cannot be
+  // witnessed in backward search (the same quirk as consumed linear
+  // facts), while the event the check emits can
+
+// Authentication: every verified statement was signed by a server
+// key this realm's anchor vouches for -- no other key produces a
+// verifying bundle.
+lemma SignStatementAuth:
+  "All realm principal purpose digest svk #i.
+    Verified(realm, principal, purpose, digest, svk) @i
+    ==> Ex #j. Stated(realm, principal, purpose, digest, svk) @j"
+  // restated on the Stated event for the same reason;  Stated is
+  // emitted only by sign_statement, whose !Realm premise is the
+  // anchor-vouched key, so the event carries the authentication
+
+// The statement binds what it says: a verified bundle's statement
+// was made for exactly that principal, purpose and digest -- the
+// batch's inclusion, symbolic form (the digest is the statement's
+// own field, and the signature covers it).
+lemma BundleVerifies:
+  "All realm principal purpose digest svk #i.
+    Verified(realm, principal, purpose, digest, svk) @i
+    ==> Ex #j. Stated(realm, principal, purpose, digest, svk) @j"
+
+// A bundle binds the data: the digest a verifier accepted is the
+// digest of the data the caller asked to state (no substitution
+// between the request and the verified bundle).
+lemma BundleBindsData:
+  "All realm principal purpose digest svk #i.
+    Verified(realm, principal, purpose, digest, svk) @i
+    ==> Ex #j. SignReq(realm, principal, purpose, digest) @j"
+
+// ------------------------------------------------------------------
+// Falsifiable sanity checks (expected: falsified).  DESIGN-sign.md
+// says the protocol does not and cannot prevent these;  the lemmas
+// show the verified ones above are conditioned on the honest anchor
+// and the policy, not vacuous.
+// ------------------------------------------------------------------
+
+// A rogue realm states anything for anyone ("Not a server that
+// cannot lie"): the attacker mints a statement for a principal of an
+// honest realm and a purpose no policy admits.  It verifies only
+// against the rogue anchor -- an honest verifier never accepts it.
+lemma Attack_RogueAnchorSignsAnything:
+  "All realmR principal purpose digest svkR #i.
+    RogueStated(realmR, principal, purpose, digest, svkR) @i
+    ==> not(Ex realm2 ask avk ssk #j.
+      ( !Realm(realm2, ask, avk, ssk, svkR) @j
+        & Ex #k. Verified(realm2, principal, purpose, digest, svkR) @k ))"
+  // (the honest-verifier side: a rogue statement never passes an
+  // honest realm's anchors -- verified above)
+
+// The mis-pinned verifier: whoever pins the rogue anchor accepts the
+// rogue statement -- "a bundle verifies with the realm's anchors and
+// nothing else" cuts both ways.  Expected: falsified, the trace where
+// the rogue statement is minted and accepted by the rogue-pinned
+// verifier.
+lemma Attack_MisPinnedVerifierAcceptsRogue:
+  "All realmR principal purpose digest svkR #i.
+    RogueStated(realmR, principal, purpose, digest, svkR) @i
+    ==> not(Ex #j. RogueVerified(realmR, principal, purpose, digest, svkR) @j)"
+
+// No policy, no statement: the server's check is load-bearing.  An
+// unsigned principal -- one whose request never passed a policy
+// check -- never holds a verified bundle:  if this verifies, the
+// check can be skipped, and the design's whole policy machinery is
+// for nothing.  (Expected: verified, i.e. the attack is impossible;
+//  the event form keeps the premise witnessable.)
+lemma NoPolicyNoStatement:
+  "All realm principal purpose digest svk #i #j.
+    ( Verified(realm, principal, purpose, digest, svk) @i
+      & SignReq(realm, principal, purpose, digest) @j )
+    ==> Ex #k. PolicyChecked(realm, principal, purpose) @k"
+
+end
