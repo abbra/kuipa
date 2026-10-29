@@ -319,6 +319,15 @@ hickory-resolver uses on top of OpenSSL.  Add a shim, don't add the crate.
 compile against (`auto`/unset prefers MIT).  The realm-based jobs always need
 MIT, so they report `SKIP` rather than `FAIL` under a Heimdal build.
 
+### RPM packages
+
+`contrib/packages/` builds the Fedora RPMs: `kuipa.spec.in` is the maintained
+spec (`kuipa.spec` is generated and never committed), `make sources` prepares
+the source and vendor tarballs, `make srpm` and `make mock` build them, and
+`make copr-build COPR=abbra/pqc` submits.  `contrib/packages/README.md` is the
+reference: subpackage layout, how `bundled(crate())` Provides are derived from
+the dependency graph, and which crates come from COPR `abbra/rust-deps`.
+
 ---
 
 ## Running CI Locally
