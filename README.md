@@ -283,6 +283,12 @@ agreement, responder authentication and trust-secret secrecy, and
 reproduces the §17.4 "Limits" attacks for a mis-delivered invitation
 and a leaked trust secret.
 
+A third models signing statements (`contrib/tamarin/sign.spthy`):
+the policy check, the signed statement and its log leaf, and offline
+bundle verification -- authorization, the delegation-vouched signer,
+and the "not a server that cannot lie" attack for a verifier that
+pinned the wrong anchor.
+
 ## Documentation
 
 The user documentation is an mdBook in [`docs/`](docs/src/SUMMARY.md):
