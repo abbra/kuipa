@@ -2355,9 +2355,17 @@ it like the `tang` pin.
 ### 11.1 Deployment
 
 The daemon is socket-activated on `/run/ipa/kuipad.sock` (`listenfd`;
-otherwise it binds its configured `listen` address) and reached through
+otherwise it binds its configured `listen` address`) and reached through
 httpd: `ProxyPass "/ipa/ku/" "unix:/run/ipa/kuipad.sock|http://localhost/ipa/ku/"`.
-`contrib/` has the units and the httpd snippet. Configuration is
+Both units are enabled, not the socket alone: the anchor exchange (§4.2), the
+lease purge and the log-head publishing run inside `serve`, so an idle realm
+would stop doing them if the daemon only started on a request.  The hostname
+after `|` is mod_proxy's worker-pool key, not a destination; a host that runs
+other Unix-socket proxies (FreeIPA does, for `/idp/` and `/akamu`) needs a
+distinct one per backend, which is what FreeIPA's own
+`conf.d/ipa-kuipa-proxy.conf` does.
+`contrib/` has the units and the httpd snippet for a stand-alone deployment.
+Configuration is
 `/etc/ipa/kuipad.json`: realm, domain, base DN, server FQDN, LDAPI URI,
 the daemon's principal (`ipa-ku/<fqdn>`), its GSS service name and keytab,
 the CA file, the PKINIT anchors file, the key directory and the allowed

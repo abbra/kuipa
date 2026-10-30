@@ -107,14 +107,16 @@ install -m 0755 target/release/kuipad /usr/libexec/kuipad
 install -m 0644 contrib/kuipa.conf /etc/httpd/conf.d/kuipa.conf
 install -m 0644 contrib/kuipad.socket contrib/kuipad.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now kuipad.socket
+systemctl enable --now kuipad.socket kuipad.service
 systemctl reload httpd
 ```
 
 httpd forwards `/ipa/ku/` to the daemon's socket and adds the
-`X-Forwarded-For` header the per-address rate limit uses. The daemon
-starts on the first request, with its own sandbox: its keys are read-only,
-core dumps are off.
+`X-Forwarded-For` header the per-address rate limit uses. Enable both units:
+the socket only starts the daemon on a request, while the anchor exchange,
+the voucher lease purge and the log-head publishing run inside it. The daemon
+starts on its own keys, with its own sandbox: `/etc/ipa` read-only, core
+dumps off.
 
 ## 5. Check it
 
