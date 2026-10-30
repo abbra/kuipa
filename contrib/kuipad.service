@@ -5,10 +5,16 @@ After=kuipad.socket dirsrv.target
 
 [Service]
 ExecStart=/usr/libexec/kuipad serve --config /etc/ipa/kuipad.json
-# Keys in /var/lib/ipa/ku; LDAPI and the daemon keytab only.
-ProtectSystem=strict
-ReadOnlyPaths=/etc/ipa /var/lib/ipa/ku
+# Config, the CA chain and the trust anchors under /etc/ipa are read-only;
+# the key directory is written at runtime: keys, delegation.json, log heads.
+ReadOnlyPaths=/etc/ipa
+ReadWritePaths=/var/lib/ipa/ku
 PrivateTmp=true
 NoNewPrivileges=true
 LimitCORE=0
 Restart=on-failure
+
+[Install]
+# A long-running unit, not on-demand: the anchor exchange and the lease purge
+# run inside 'serve'.  Enabled by ipa-server-install / ipa-replica-install.
+WantedBy=multi-user.target
