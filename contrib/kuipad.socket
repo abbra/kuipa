@@ -1,8 +1,17 @@
 [Unit]
 Description=kuipa post-quantum enrollment daemon socket
+# Stops and restarts with the service (as in ahdapa.socket): a listening
+# socket without the daemon behind it answers nothing.
+PartOf=kuipad.service
 
 [Socket]
+# Accept=no: a single listening socket, handed to kuipad.service.
+Accept=no
 ListenStream=/run/ipa/kuipad.sock
+# mode 0660 root:apache — mod_proxy connects (a Unix socket needs write
+# permission on its inode), the daemon runs as root.  RemoveOnStop and the
+# unlink kuipad does when it binds the path itself both keep a stale
+# socket from surviving a restart.
 SocketMode=0660
 SocketGroup=apache
 RemoveOnStop=true
