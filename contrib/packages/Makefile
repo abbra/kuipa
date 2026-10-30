@@ -47,12 +47,13 @@ FILTERVENDOR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))filter-vendor-fedo
 
 SYSTEM_CRATES := system-crates.txt
 
-# Systemd units, the httpd snippet and the daemon config template: plain files
-# in contrib/, copied into _sourcedir by 'make srpm' and referenced as
-# Source2..Source9 by the spec.
+# Systemd units and the daemon config template: plain files in contrib/,
+# copied into _sourcedir by 'make srpm' and referenced as Source2..Source8 by
+# the spec.  contrib/kuipa.conf stays out: it is a manual-install snippet
+# (docs/src/realm/deploy.md), and an IPA server ships its own /ipa/ku/ proxy.
 EXTRA_SOURCES := kuipad.service kuipad.socket kuipa-unseal.service \
                  ipa-client-complete.service kuipa-rotate.service \
-                 kuipa-rotate.timer kuipa.conf kuipad.json.example
+                 kuipa-rotate.timer kuipad.json.example
 
 # Git ref used for the tarball and the snapshot release identifiers.
 # Defaults to HEAD so snapshots reflect the current branch tip.
