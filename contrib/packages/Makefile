@@ -107,10 +107,11 @@ sources: tarball vendor
 # The whole tree at GIT_REF, including shims/rand and shims/ring: both
 # [patch.crates-io] entries are path dependencies, and cargo vendor does not
 # vendor path or workspace members.
-
 tarball: $(TARBALL)
-
-$(TARBALL):
+# FORCE: $(TARBALL) has no file prerequisite that a new commit touches, so a
+# leftover tarball from an earlier run would silently become Source0 of a
+# snapshot whose Release names a different commit.  git archive is cheap.
+$(TARBALL): FORCE
 	@echo "==> Creating $@ from $(GIT_REF)"
 	git -C "$(REPOROOT)" archive \
 	    --prefix=$(NAME)-$(VERSION)/ \
@@ -138,7 +139,9 @@ $(TARBALL):
 
 vendor: $(VENDOR_TARBALL)
 
-$(VENDOR_TARBALL):
+# Cargo.lock/Cargo.toml are the only inputs of the crate graph here: a lock
+# change is exactly when the vendor tarball must be regenerated.
+$(VENDOR_TARBALL): $(REPOROOT)/Cargo.lock $(REPOROOT)/Cargo.toml
 	@echo "==> Creating $@ — filtering and vendoring for Linux platforms"
 	@# A [patch.crates-io] entry pointing outside the repository is a
 	@# development override; the tarball has no such directory.
@@ -239,3 +242,5 @@ copr-build: srpm
 clean:
 	rm -f $(TARBALL) $(VENDOR_TARBALL) $(SPEC_OUT) $(SYSTEM_CRATES) $(EXTRA_SOURCES)
 	rm -rf $(NAME)-$(VERSION)
+
+FORCE:
