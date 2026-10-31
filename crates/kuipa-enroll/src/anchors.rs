@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 use agirru_crdt::{Delta, Generation, GenerationClock, Merge};
 use serde::de::{self, SeqAccess, Visitor};
@@ -157,6 +158,17 @@ impl Entry {
         }
     }
 
+    /// What orders replacements of one id: the signed `iat` of a vouch or
+    /// succession, as [`AnchorState`]'s merge compares first; 0 for
+    /// content-addressed entries.
+    fn order(&self) -> u64 {
+        match self {
+            Self::Vouch(v) => v.vouch().iat,
+            Self::Succession(s) => s.statement().map_or(0, |st| st.iat),
+            Self::Key(_) | Self::Claim(_) => 0,
+        }
+    }
+
     fn value(&self) -> Vec<u8> {
         match self {
             Self::Key(jwk) => jwk.as_bytes().to_vec(),
@@ -182,6 +194,40 @@ impl Entry {
     }
 }
 
+/// A fixed-size name for an entry id in reconciliation summaries.
+pub type EntryId = [u8; 16];
+
+/// The [`EntryId`] of an entry id: a truncated domain-separated SHA-256.
+///
+/// # Errors
+///
+/// A cryptographic hash operation failed.
+pub fn entry_id(id: &str) -> Result<EntryId> {
+    let hash = primitives::sha256(&[b"ipa-ku/anchor-entry-id/v1\0", id.as_bytes()])?;
+    let mut short = [0; 16];
+    short.copy_from_slice(&hash[..16]);
+    Ok(short)
+}
+
+/// One entry in a reconciliation summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryVersion {
+    /// Hash of the entry's tag and encoding.
+    pub hash: [u8; 32],
+    /// [`Entry`]'s replacement order.
+    pub order: u64,
+}
+
+impl EntryVersion {
+    /// Whether this version should be sent to a holder of `other`: the
+    /// holder lacks the id, or has different content that is not newer.
+    /// Equal orders are sent; the receiver's merge breaks the tie.
+    #[must_use]
+    pub fn replaces(&self, other: Option<&Self>) -> bool {
+        other.is_none_or(|o| o.hash != self.hash && o.order <= self.order)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Slot {
     entry: Entry,
@@ -197,7 +243,33 @@ struct Slot {
 /// vouch covers, and keys nothing refers to are dropped.
 #[derive(Clone, Debug, Default)]
 pub struct AnchorState {
-    slots: BTreeMap<String, Slot>,
+    /// Mutate only through [`Self::slots_mut`], which detaches the digest.
+    /// Shared by clones until one of them changes.
+    slots: Arc<BTreeMap<String, Slot>>,
+    /// The snapshot digest, shared by unmodified clones.
+    digest: Arc<OnceLock<[u8; 32]>>,
+    /// The reconciliation index, shared by unmodified clones.
+    index: Arc<OnceLock<EntryIndex>>,
+}
+
+/// Each entry's summary version and id, by [`EntryId`].
+#[derive(Debug)]
+struct EntryIndex {
+    summary: BTreeMap<EntryId, EntryVersion>,
+    names: BTreeMap<EntryId, String>,
+}
+
+/// Most bucket bits a summary may use: 4,096 buckets.
+pub const MAX_BUCKET_BITS: u32 = 12;
+
+/// The bucket of `id` among `2^bits`: its leading bits.
+#[must_use]
+pub fn bucket_of(id: &EntryId, bits: u32) -> usize {
+    if bits == 0 {
+        0
+    } else {
+        usize::from(u16::from_be_bytes([id[0], id[1]]) >> (16 - bits))
+    }
 }
 
 impl PartialEq for AnchorState {
@@ -206,14 +278,196 @@ impl PartialEq for AnchorState {
             && self
                 .slots
                 .iter()
-                .zip(&other.slots)
+                .zip(other.slots.iter())
                 .all(|((k, a), (l, b))| k == l && a.entry == b.entry)
     }
 }
 
 const STATE_MAGIC: [u8; 4] = *b"IPAS";
+const STATE_DIGEST_DOMAIN: &[u8] = b"ipa-ku/anchor-state/v1\0";
+
+/// The digest of an encoded [`AnchorState`], as [`AnchorState::digest`].
+///
+/// # Errors
+///
+/// A cryptographic hash operation failed.
+pub fn state_digest(encoded: &[u8]) -> Result<[u8; 32]> {
+    Ok(primitives::sha256(&[STATE_DIGEST_DOMAIN, encoded])?)
+}
 
 impl AnchorState {
+    /// Mutable entries, copied if shared; detaches the cached digest and
+    /// index.
+    fn slots_mut(&mut self) -> &mut BTreeMap<String, Slot> {
+        self.digest = Arc::default();
+        self.index = Arc::default();
+        Arc::make_mut(&mut self.slots)
+    }
+
+    fn index(&self) -> Result<&EntryIndex> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let mut index = EntryIndex {
+            summary: BTreeMap::new(),
+            names: BTreeMap::new(),
+        };
+        for (id, slot) in self.slots.iter() {
+            let hash = primitives::sha256(&[
+                b"ipa-ku/anchor-entry/v1\0",
+                &[slot.entry.tag()],
+                &slot.entry.value(),
+            ])?;
+            let short = entry_id(id)?;
+            index.summary.insert(
+                short,
+                EntryVersion {
+                    hash,
+                    order: slot.entry.order(),
+                },
+            );
+            index.names.insert(short, id.clone());
+        }
+        Ok(self.index.get_or_init(|| index))
+    }
+
+    /// The digest of [`Self::to_bytes`], computed once per state version.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn digest(&self) -> Result<[u8; 32]> {
+        if let Some(digest) = self.digest.get() {
+            return Ok(*digest);
+        }
+        let digest = state_digest(&self.to_bytes())?;
+        Ok(*self.digest.get_or_init(|| digest))
+    }
+
+    /// Hash and order each current entry, under its [`EntryId`], for
+    /// bounded, snapshot-specific reconciliation; computed once per state
+    /// version.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn entry_summary(&self) -> Result<&BTreeMap<EntryId, EntryVersion>> {
+        Ok(&self.index()?.summary)
+    }
+
+    /// One 16-byte hash per bucket of `2^bits` (`bits` at most
+    /// [`MAX_BUCKET_BITS`]) over the summary entries in it.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn bucket_hashes(&self, bits: u32) -> Result<Vec<[u8; 16]>> {
+        let bits = bits.min(MAX_BUCKET_BITS);
+        let mut leaves = vec![Vec::new(); 1 << bits];
+        for (id, v) in self.entry_summary()? {
+            let leaf = &mut leaves[bucket_of(id, bits)];
+            leaf.extend_from_slice(id);
+            leaf.extend_from_slice(&v.hash);
+            leaf.extend_from_slice(&v.order.to_be_bytes());
+        }
+        leaves
+            .iter()
+            .map(|leaf| {
+                let hash = primitives::sha256(&[b"ipa-ku/anchor-bucket/v1\0", leaf])?;
+                let mut short = [0; 16];
+                short.copy_from_slice(&hash[..16]);
+                Ok(short)
+            })
+            .collect()
+    }
+
+    /// The summary entries in `buckets` of `2^bits`.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn bucket_summary(
+        &self,
+        bits: u32,
+        buckets: &BTreeSet<usize>,
+    ) -> Result<BTreeMap<EntryId, EntryVersion>> {
+        Ok(self
+            .entry_summary()?
+            .iter()
+            .filter(|(id, _)| buckets.contains(&bucket_of(id, bits)))
+            .map(|(id, v)| (*id, *v))
+            .collect())
+    }
+
+    /// Select entries a peer with summary `peer` lacks or would replace
+    /// with them, including vouch keys.  An entry older than the peer's
+    /// version of it is left out: merging it would not change the peer.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn select_entries(&self, peer: &BTreeMap<EntryId, EntryVersion>) -> Result<Self> {
+        self.select_entries_where(peer, |_| true)
+    }
+
+    /// [`Self::select_entries`] among the ids `keep` accepts.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn select_entries_where(
+        &self,
+        peer: &BTreeMap<EntryId, EntryVersion>,
+        keep: impl Fn(&EntryId) -> bool,
+    ) -> Result<Self> {
+        let ids = self
+            .entry_summary()?
+            .iter()
+            .filter(|(id, own)| keep(id) && own.replaces(peer.get(*id)))
+            .map(|(id, _)| *id)
+            .collect();
+        self.entries(&ids)
+    }
+
+    /// The ids in a peer's summary whose entries this state lacks or would
+    /// replace with the peer's: what [`Self::select_entries`] would choose
+    /// on the peer's side for this state.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn wanted(&self, peer: &BTreeMap<EntryId, EntryVersion>) -> Result<BTreeSet<EntryId>> {
+        let own = self.entry_summary()?;
+        Ok(peer
+            .iter()
+            .filter(|(id, p)| p.replaces(own.get(*id)))
+            .map(|(id, _)| *id)
+            .collect())
+    }
+
+    /// The entries with these ids, including vouch keys.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn entries(&self, ids: &BTreeSet<EntryId>) -> Result<Self> {
+        let names = &self.index()?.names;
+        let mut selected = Self::default();
+        for name in ids.iter().filter_map(|id| names.get(id)) {
+            let Some(slot) = self.slots.get(name) else {
+                continue;
+            };
+            selected.slots_mut().insert(name.clone(), slot.clone());
+            if let Entry::Vouch(vouch) = &slot.entry {
+                let key = format!("k {}", vouch.vouch().anchor);
+                if let Some(slot) = self.slots.get(&key) {
+                    selected.slots_mut().insert(key, slot.clone());
+                }
+            }
+        }
+        Ok(selected)
+    }
+
     /// Encode: `IPAS ‖ 1 ‖ n(u64) ‖ n × (tag(1) ‖ value)`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -244,6 +498,15 @@ impl AnchorState {
         }
         r.finish()?;
         Ok(state)
+    }
+
+    /// Assign loaded entries generations from the clock used by the engine.
+    ///
+    /// Call before sharing the state with a newly bootstrapped gossip engine.
+    pub fn rebase_generations(&mut self, clock: &GenerationClock) {
+        for slot in self.slots_mut().values_mut() {
+            slot.generation = clock.bump();
+        }
     }
 
     /// Add `entry` after checking it ([`Self::check`]); returns whether the
@@ -336,7 +599,7 @@ impl AnchorState {
                 return Ok(false);
             }
         }
-        self.slots.insert(
+        self.slots_mut().insert(
             id,
             Slot {
                 entry,
@@ -361,7 +624,7 @@ impl AnchorState {
         now: u64,
     ) {
         let inbound = self.clone();
-        self.slots.retain(|_, s| match &s.entry {
+        self.slots_mut().retain(|_, s| match &s.entry {
             Entry::Claim(c) if !servers.contains(&c.server) => false,
             Entry::Vouch(v) if Some(&v.vouch().anchor) == own => false,
             e => inbound.check(e, Some(local), realm, policy, now).is_ok(),
@@ -374,7 +637,7 @@ impl AnchorState {
     /// names, and keys nothing refers to.
     pub fn retain(&mut self, servers: &BTreeSet<String>, realm: &str, policy: &Policy, now: u64) {
         let snapshot = self.clone();
-        self.slots.retain(|_, s| match &s.entry {
+        self.slots_mut().retain(|_, s| match &s.entry {
             Entry::Claim(c) => {
                 servers.contains(&c.server)
                     && snapshot.check(&s.entry, None, realm, policy, now).is_ok()
@@ -385,12 +648,12 @@ impl AnchorState {
             Entry::Key(_) => true,
         });
         let named: BTreeSet<Thumbprint> = self.claims().filter_map(|c| c.anchor).collect();
-        self.slots.retain(|_, s| match &s.entry {
+        self.slots_mut().retain(|_, s| match &s.entry {
             Entry::Vouch(v) => named.contains(&v.vouch().anchor),
             _ => true,
         });
         let vouches: Vec<SignedVouch> = self.vouches().cloned().collect();
-        self.slots.retain(|_, s| match &s.entry {
+        self.slots_mut().retain(|_, s| match &s.entry {
             Entry::Claim(c) => {
                 now < c.iat + UNVOUCHED_GRACE
                     || vouches.iter().any(|v| v.covers(c).unwrap_or(false))
@@ -402,7 +665,7 @@ impl AnchorState {
             .filter_map(|c| c.anchor)
             .chain(self.vouches().map(|v| v.vouch().anchor))
             .collect();
-        self.slots.retain(|_, s| match &s.entry {
+        self.slots_mut().retain(|_, s| match &s.entry {
             Entry::Key(jwk) => VerifyingKey::from_jwk_json(jwk.as_bytes())
                 .is_ok_and(|k| referenced.contains(k.thumbprint())),
             _ => true,
@@ -499,12 +762,15 @@ impl AnchorState {
 
     fn select(&self, keep: impl Fn(Generation) -> bool) -> Self {
         Self {
-            slots: self
-                .slots
-                .iter()
-                .filter(|(_, s)| keep(s.generation))
-                .map(|(k, s)| (k.clone(), s.clone()))
-                .collect(),
+            digest: Arc::default(),
+            index: Arc::default(),
+            slots: Arc::new(
+                self.slots
+                    .iter()
+                    .filter(|(_, s)| keep(s.generation))
+                    .map(|(k, s)| (k.clone(), s.clone()))
+                    .collect(),
+            ),
         }
     }
 }
@@ -742,33 +1008,72 @@ impl Trust {
     }
 }
 
-const SYNC_MAGIC: [u8; 4] = *b"IPPS";
-const SYNC_LABEL: &[u8] = b"ipa-ku-enroll/v1 peer";
+fn delegation_json_hash(json: &str) -> Result<[u8; 32]> {
+    Ok(primitives::sha256(&[
+        b"ipa-ku/peer-delegation/v1\0",
+        json.as_bytes(),
+    ])?)
+}
 
-/// A gossip request from one server to another (`POST /ipa/ku/peer/sync`):
-/// the agirru envelope, the sender's own delegation, the tail of the
-/// sender's anchor epoch log (§4.8), and a GSS-API token from the
-/// sender's `ipa-ku/<fqdn>` key whose channel binding covers everything
-/// else.
+const SYNC_MAGIC: [u8; 4] = *b"IPPS";
+const SYNC_VERSION: u8 = 4;
+const SYNC_LABEL: &[u8] = b"ipa-ku-enroll/v4 peer";
+
+/// An authenticated digest-first reconciliation request.
+/// The payload, the hashes of the delegation and epoch window, identities
+/// and version are bound to the GSS token.  The delegation and the window
+/// may be left out when the receiver already holds the content of that
+/// hash from an earlier authenticated sync by the same sender.
 #[derive(Clone, Debug)]
 pub struct PeerSync {
     /// The sending server.
     pub sender: String,
     /// The receiving server.
     pub receiver: String,
-    /// The sender's own claim with its own anchor's proof.
-    pub own: Delegation,
-    /// The agirru envelope.
-    pub envelope: Vec<u8>,
+    /// [`Self::delegation_hash`] of the sender's own delegation.
+    pub own_hash: [u8; 32],
+    /// The sender's own claim with its own anchor's proof, if sent.
+    pub own: Option<Delegation>,
+    /// The encoded reconciliation message.
+    pub payload: Vec<u8>,
     /// The GSS-API token.
     pub token: Vec<u8>,
+    /// [`Self::chain_hash`] of the sender's epoch window.
+    pub chain_hash: [u8; 32],
     /// The sender's chain entries, oldest first, each encoded by
-    /// [`crate::epoch::encode`].
-    pub chain: Vec<Vec<u8>>,
+    /// [`crate::epoch::encode`], if sent.
+    pub chain: Option<Vec<Vec<u8>>>,
 }
 
 impl PeerSync {
+    /// The hash identifying a delegation in a sync.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn delegation_hash(own: &Delegation) -> Result<[u8; 32]> {
+        delegation_json_hash(&own.to_json())
+    }
+
+    /// The hash identifying an epoch window in a sync.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL error.
+    pub fn chain_hash(chain: &[Vec<u8>]) -> Result<[u8; 32]> {
+        let mut w = Writer::new(*b"IPCW");
+        w.u64(chain.len() as u64);
+        for c in chain {
+            w.bytes(c);
+        }
+        Ok(primitives::sha256(&[
+            b"ipa-ku/peer-epochs/v1\0",
+            &w.finish(),
+        ])?)
+    }
+
     /// The channel binding for the token: a hash of every other field,
+    /// with the delegation and window represented by their hashes,
     /// SHA-384 under every policy (no single key decides it, and both
     /// servers must agree), taken to the 32 bytes every channel binding
     /// has.
@@ -779,19 +1084,16 @@ impl PeerSync {
     pub fn channel_binding(
         sender: &str,
         receiver: &str,
-        own: &Delegation,
-        envelope: &[u8],
-        chain: &[Vec<u8>],
+        own_hash: &[u8; 32],
+        payload: &[u8],
+        chain_hash: &[u8; 32],
     ) -> Result<[u8; 32]> {
-        let mut w = Writer::new(SYNC_MAGIC);
+        let mut w = Writer::with_version(SYNC_MAGIC, SYNC_VERSION);
         w.str(sender)
             .str(receiver)
-            .str(&own.to_json())
-            .bytes(envelope)
-            .u64(chain.len() as u64);
-        for c in chain {
-            w.bytes(c);
-        }
+            .fixed(own_hash)
+            .bytes(payload)
+            .fixed(chain_hash);
         let digest = primitives::sha384(&[SYNC_LABEL, &w.finish()])?;
         Ok(crate::join::channel_binding_of(&digest))
     }
@@ -799,64 +1101,109 @@ impl PeerSync {
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::with_version(SYNC_MAGIC, 2);
+        let mut w = Writer::with_version(SYNC_MAGIC, SYNC_VERSION);
         w.str(&self.sender)
             .str(&self.receiver)
-            .str(&self.own.to_json())
-            .bytes(&self.envelope)
+            .fixed(&self.own_hash)
+            .str(
+                &self
+                    .own
+                    .as_ref()
+                    .map(Delegation::to_json)
+                    .unwrap_or_default(),
+            )
+            .bytes(&self.payload)
             .bytes(&self.token)
-            .u64(self.chain.len() as u64);
-        for c in &self.chain {
-            w.bytes(c);
-        }
+            .fixed(&self.chain_hash);
+        match &self.chain {
+            None => w.u8(0),
+            Some(chain) => {
+                w.u8(1).u64(chain.len() as u64);
+                for c in chain {
+                    w.bytes(c);
+                }
+                &mut w
+            }
+        };
         w.finish()
     }
 
-    /// Decode.
+    /// Decode, checking that sent content matches its hash.
     ///
     /// # Errors
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        let mut r = Reader::with_version(buf, SYNC_MAGIC, 2, "peer sync")?;
+        let mut r = Reader::with_version(buf, SYNC_MAGIC, SYNC_VERSION, "peer sync")?;
         let sender = r.str()?.into();
         let receiver = r.str()?.into();
-        let own = Delegation::from_json(r.str()?.as_bytes())?;
-        let envelope = r.bytes()?.into();
+        let own_hash = r.fixed()?;
+        let own = match r.str()? {
+            "" => None,
+            json => {
+                if delegation_json_hash(json)? != own_hash {
+                    return Err(Error::Malformed("peer sync context hash"));
+                }
+                Some(Delegation::from_json(json.as_bytes())?)
+            }
+        };
+        let payload = r.bytes()?.into();
         let token = r.bytes()?.into();
-        let n = r.u64()?;
-        let mut chain = Vec::new();
-        for _ in 0..n.min(1024) {
-            chain.push(r.bytes()?.into());
-        }
+        let chain_hash = r.fixed()?;
+        let chain = match r.u8()? {
+            0 => None,
+            1 => {
+                let n = r.u64()?;
+                if n > 1024 {
+                    return Err(Error::Malformed("peer sync epoch count"));
+                }
+                let mut chain = Vec::new();
+                for _ in 0..n {
+                    chain.push(r.bytes()?.into());
+                }
+                Some(chain)
+            }
+            _ => return Err(Error::Malformed("peer sync epoch window")),
+        };
         r.finish()?;
+        if chain
+            .as_deref()
+            .map(Self::chain_hash)
+            .transpose()?
+            .is_some_and(|h| h != chain_hash)
+        {
+            return Err(Error::Malformed("peer sync context hash"));
+        }
         Ok(Self {
             sender,
             receiver,
+            own_hash,
             own,
-            envelope,
+            payload,
             token,
+            chain_hash,
             chain,
         })
     }
 
-    /// Check a sync received by `me` whose token authenticated `principal`,
-    /// and return the sender's own delegation, now attested by Kerberos.
+    /// Attest the sender's claim using the receiver's membership and policy.
     ///
     /// # Errors
     ///
-    /// [`Error::PeerSync`] for a sync for another server, a principal that
-    /// is not the sender's, a sender outside `servers`, or a delegation
-    /// that is not the sender's or not proven by its own anchor.
+    /// Returns an error if the sender or its delegation is invalid.
     pub fn attest(
         &self,
+        own: &Delegation,
         principal: &str,
-        me: &str,
-        servers: &BTreeSet<String>,
-        realm: &str,
-        policy: &Policy,
-        now: u64,
+        context: &PeerAttestation<'_>,
     ) -> Result<Delegation> {
+        let PeerAttestation {
+            me,
+            servers,
+            realm,
+            policy,
+            now,
+        } = *context;
         if self.receiver != me {
             return Err(Error::PeerSync("addressed to another server"));
         }
@@ -865,18 +1212,37 @@ impl PeerSync {
                 "the token does not authenticate the sender",
             ));
         }
-        let c = self.own.claim()?;
+        let c = own.claim()?;
         if c.server != self.sender
             || c.realm != realm
             || !c.valid_at(now)
             || c.anchor
-                .is_some_and(|a| self.own.verify_at(&[a], policy, now).is_err())
+                .is_some_and(|a| own.verify_at(&[a], policy, now).is_err())
         {
             return Err(Error::PeerSync("not the sender's own delegation"));
         }
-        Ok(self.own.clone())
+        Ok(own.clone())
     }
 }
+
+/// Receiver context for authenticating a peer's delegation.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerAttestation<'a> {
+    /// This receiver's FQDN.
+    pub me: &'a str,
+    /// Current member FQDNs.
+    pub servers: &'a BTreeSet<String>,
+    /// Kerberos realm.
+    pub realm: &'a str,
+    /// Accepted cryptographic policy.
+    pub policy: &'a Policy,
+    /// Current Unix time.
+    pub now: u64,
+}
+
+#[cfg(test)]
+#[path = "anchor_selective_comparison.rs"]
+mod selective_comparison;
 
 #[cfg(test)]
 mod tests {
@@ -1382,6 +1748,67 @@ mod tests {
     }
 
     #[test]
+    fn cached_digest_follows_every_mutation() {
+        let (a, b) = (Server::new("a"), Server::new("b"));
+        let all = servers(&["a", "b"]);
+        let p = Policy::default();
+        let clock = GenerationClock::new();
+        let encoded = |s: &AnchorState| state_digest(&s.to_bytes()).unwrap();
+        let mut one = AnchorState::default();
+        a.step(&mut one, NOW, &[], &all, &clock);
+        let base = one.digest().unwrap();
+        let base_summary = one.entry_summary().unwrap().clone();
+        // A decoded copy has no cache: its summary is computed afresh.
+        let fresh = |s: &AnchorState| {
+            AnchorState::from_bytes(&s.to_bytes())
+                .unwrap()
+                .entry_summary()
+                .unwrap()
+                .clone()
+        };
+
+        // Each mutation of a clone sharing a computed digest.
+        let mut two = one.clone();
+        b.step(&mut two, NOW, &[], &all, &clock);
+        assert_eq!(two.digest().unwrap(), encoded(&two));
+        assert_eq!(*two.entry_summary().unwrap(), fresh(&two));
+        assert_eq!(
+            *one.entry_summary().unwrap(),
+            base_summary,
+            "a mutated clone leaves the original's index"
+        );
+        assert_ne!(two.digest().unwrap(), base);
+        assert_eq!(
+            one.digest().unwrap(),
+            base,
+            "a mutated clone leaves the original's digest"
+        );
+        let mut merged = one.clone();
+        assert!(merged.merge(&two, &clock));
+        assert_eq!(merged.digest().unwrap(), encoded(&merged));
+        assert_eq!(*merged.entry_summary().unwrap(), fresh(&merged));
+        let mut admitted = two.clone();
+        admitted.admit(
+            &AnchorState::default(),
+            &all,
+            Some(&a.thp()),
+            REALM,
+            &p,
+            NOW,
+        );
+        assert_ne!(admitted, two);
+        assert_eq!(admitted.digest().unwrap(), encoded(&admitted));
+        assert_eq!(*admitted.entry_summary().unwrap(), fresh(&admitted));
+        let mut retained = two.clone();
+        retained.retain(&servers(&["a"]), REALM, &p, NOW);
+        assert_ne!(retained, two);
+        assert_eq!(retained.digest().unwrap(), encoded(&retained));
+        assert_eq!(*retained.entry_summary().unwrap(), fresh(&retained));
+        let decoded = AnchorState::from_bytes(&two.to_bytes()).unwrap();
+        assert_eq!(decoded.digest().unwrap(), two.digest().unwrap());
+    }
+
+    #[test]
     fn state_grows_linearly() {
         let n = 16;
         let names: Vec<&'static str> = (0..n)
@@ -1424,12 +1851,44 @@ mod tests {
         assert!(one < 8500, "{one} bytes");
     }
 
+    #[test]
+    fn loaded_state_uses_engine_generation_clock() {
+        let server = Server::new("a");
+        let clock = GenerationClock::new();
+        let mut original = AnchorState::default();
+        server.step(&mut original, NOW, &[], &servers(&["a"]), &clock);
+        let mut loaded = AnchorState::from_bytes(&original.to_bytes()).unwrap();
+        let engine_clock = GenerationClock::new();
+        loaded.rebase_generations(&engine_clock);
+        assert_eq!(
+            loaded.delta_range(Generation::from_u64(0), engine_clock.current()),
+            original,
+            "a bounded response must include loaded entries"
+        );
+        let mark = engine_clock.current();
+        server.step(&mut loaded, NOW + 1, &[], &servers(&["a"]), &engine_clock);
+        assert!(
+            !loaded.delta_since(mark).is_empty(),
+            "writes after loading must be newer than the loaded state"
+        );
+    }
+
     /// Sizes for DESIGN §4.2: `cargo test --release -p kuipa-enroll
     /// measure_exchange_sizes -- --ignored --nocapture`.
     #[test]
     #[ignore = "measurement"]
     fn measure_exchange_sizes() {
-        for (n, k) in [(10, 10), (60, 60), (60, 6)] {
+        for (n, k) in [
+            (10, 10),
+            (60, 60),
+            (60, 6),
+            (100, 6),
+            (100, 100),
+            (200, 6),
+            (200, 200),
+            (300, 6),
+            (300, 300),
+        ] {
             let names: Vec<&'static str> = (0..n)
                 .map(|i| &*Box::leak(format!("ipa{i}.example.test").into_boxed_str()))
                 .collect();
@@ -1486,6 +1945,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "wire and attestation checks share one constructed exchange"
+    )]
     #[test]
     fn sync_message_and_attestation() {
         let (a, b) = (Server::new("a"), Server::new("b"));
@@ -1495,44 +1958,78 @@ mod tests {
         a.step(&mut state, NOW, &[], &all, &clock);
         b.step(&mut state, NOW, &[], &all, &clock);
         let own = b.own(&state, NOW);
-        let cb = PeerSync::channel_binding("b", "a", &own, b"env", &[b"entry".to_vec()]).unwrap();
+        let own_hash = PeerSync::delegation_hash(&own).unwrap();
+        let chain = vec![b"entry".to_vec()];
+        let chain_hash = PeerSync::chain_hash(&chain).unwrap();
+        let cb = PeerSync::channel_binding("b", "a", &own_hash, b"env", &chain_hash).unwrap();
         let sync = PeerSync {
             sender: "b".into(),
             receiver: "a".into(),
-            own,
-            envelope: b"env".to_vec(),
+            own_hash,
+            own: Some(own.clone()),
+            payload: b"env".to_vec(),
             token: b"token".to_vec(),
-            chain: vec![b"entry".to_vec()],
+            chain_hash,
+            chain: Some(chain),
         };
         let back = PeerSync::from_bytes(&sync.to_bytes()).unwrap();
-        assert_eq!(
+        let bind = |s: &PeerSync| {
             PeerSync::channel_binding(
-                &back.sender,
-                &back.receiver,
-                &back.own,
-                &back.envelope,
-                &back.chain,
+                &s.sender,
+                &s.receiver,
+                &s.own_hash,
+                &s.payload,
+                &s.chain_hash,
             )
-            .unwrap(),
-            cb
-        );
+            .unwrap()
+        };
+        assert_eq!(bind(&back), cb);
+        // Left-out context keeps the same binding and decodes.
+        let elided = PeerSync {
+            own: None,
+            chain: None,
+            ..back.clone()
+        };
+        let elided = PeerSync::from_bytes(&elided.to_bytes()).unwrap();
+        assert!(elided.own.is_none() && elided.chain.is_none());
+        assert_eq!(bind(&elided), cb);
         let mut moved = back.clone();
-        moved.chain[0][0] ^= 1;
+        moved.chain_hash[0] ^= 1;
         assert_ne!(
-            PeerSync::channel_binding(
-                &moved.sender,
-                &moved.receiver,
-                &moved.own,
-                &moved.envelope,
-                &moved.chain,
-            )
-            .unwrap(),
+            bind(&moved),
             cb,
             "the chain is covered by the channel binding"
         );
+        let mut moved = back.clone();
+        moved.own_hash[0] ^= 1;
+        assert_ne!(
+            bind(&moved),
+            cb,
+            "the delegation is covered by the channel binding"
+        );
+        // Sent content must match the bound hash.
+        let mut swapped = back.clone();
+        swapped.chain = Some(vec![b"other".to_vec()]);
+        assert!(PeerSync::from_bytes(&swapped.to_bytes()).is_err());
+        let mut swapped = back.clone();
+        swapped.own = Some(a.own(&state, NOW));
+        assert!(PeerSync::from_bytes(&swapped.to_bytes()).is_err());
+        let mut moved = back.clone();
+        moved.payload[0] ^= 1;
+        assert_ne!(
+            bind(&moved),
+            cb,
+            "the repair nonce, digest and snapshot are bound through the payload"
+        );
         let policy = Policy::default();
-        back.attest("ipa-ku/b@R", "a", &all, REALM, &policy, NOW)
-            .unwrap();
+        let context = PeerAttestation {
+            me: "a",
+            servers: &all,
+            realm: REALM,
+            policy: &policy,
+            now: NOW,
+        };
+        back.attest(&own, "ipa-ku/b@R", &context).unwrap();
         for (principal, me, members) in [
             ("ipa-ku/a@R", "a", &all),
             ("host/b@R", "a", &all),
@@ -1540,19 +2037,24 @@ mod tests {
             ("ipa-ku/b@R", "a", &servers(&["a"])),
         ] {
             assert!(
-                back.attest(principal, me, members, REALM, &policy, NOW)
-                    .is_err()
+                back.attest(
+                    &own,
+                    principal,
+                    &PeerAttestation {
+                        me,
+                        servers: members,
+                        ..context
+                    }
+                )
+                .is_err()
             );
         }
         // Someone else's delegation, even if valid, is not the sender's.
-        let mut forged = back.clone();
-        forged.own = a.own(&state, NOW);
         assert!(
-            forged
-                .attest("ipa-ku/b@R", "a", &all, REALM, &policy, NOW)
+            back.attest(&a.own(&state, NOW), "ipa-ku/b@R", &context)
                 .is_err()
         );
-        // Only version 2 parses.
+        // Only version 4 parses.
         let mut tampered = sync.to_bytes();
         tampered[4] = 1;
         assert!(PeerSync::from_bytes(&tampered).is_err());
@@ -1566,24 +2068,19 @@ mod tests {
         let with_n = servers(&["a", "b", "n"]);
         let plain = PeerSync {
             sender: "n".into(),
-            own: n.own(&state, NOW),
             ..back.clone()
         };
-        plain
-            .attest("ipa-ku/n@R", "a", &with_n, REALM, &policy, NOW)
-            .unwrap();
-        let claiming_b = PeerSync {
-            sender: "n".into(),
-            own: Delegation::new(&Claim {
-                server: "b".into(),
-                ..n.claim(NOW)
-            }),
-            ..back
+        let context_n = PeerAttestation {
+            servers: &with_n,
+            ..context
         };
-        assert!(
-            claiming_b
-                .attest("ipa-ku/n@R", "a", &with_n, REALM, &policy, NOW)
-                .is_err()
-        );
+        plain
+            .attest(&n.own(&state, NOW), "ipa-ku/n@R", &context_n)
+            .unwrap();
+        let claiming_b = Delegation::new(&Claim {
+            server: "b".into(),
+            ..n.claim(NOW)
+        });
+        assert!(plain.attest(&claiming_b, "ipa-ku/n@R", &context_n).is_err());
     }
 }

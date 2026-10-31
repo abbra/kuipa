@@ -771,7 +771,7 @@ fn start_servers(
         rt.spawn(async move { axum::serve(listener, router(app)).await });
         servers.push(enroll);
     }
-    wait_for_exchange(&servers)?;
+    wait_for_exchange(&servers, &anchors)?;
     Ok(Started {
         anchor: anchors[0],
         endpoints,
@@ -953,20 +953,67 @@ fn start_tang(
     Ok(keys.server()?.map(Arc::new))
 }
 
-/// Wait until every server trusts every server's anchor.
-fn wait_for_exchange(servers: &[Arc<EnrollServer>]) -> Result<(), Error> {
+fn delegation_ready(
+    delegation: &Delegation,
+    anchors: &[Thumbprint],
+    policy: &Policy,
+    at: u64,
+) -> bool {
+    anchors.iter().all(|anchor| {
+        delegation
+            .verify_at(std::slice::from_ref(anchor), policy, at)
+            .is_ok()
+    })
+}
+
+/// Wait for every server to trust every anchor and advertise all its proofs.
+fn wait_for_exchange(servers: &[Arc<EnrollServer>], anchors: &[Thumbprint]) -> Result<(), Error> {
+    let policy = Policy::from_system()?;
     let start = Instant::now();
-    while !servers.iter().all(|s| s.anchors().len() == SERVERS.len()) {
+    while !servers.iter().all(|server| {
+        let trusted = server.anchors();
+        trusted.len() == anchors.len()
+            && anchors.iter().all(|anchor| trusted.contains(anchor))
+            && delegation_ready(&server.delegation(), anchors, &policy, now())
+    }) {
         if start.elapsed() > Duration::from_secs(60) {
-            return Err("the servers did not exchange their anchors".into());
+            return Err("the servers did not exchange their anchors and delegation proofs".into());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     println!(
-        "anchor exchange done: every server trusts {} anchors",
-        SERVERS.len()
+        "anchor exchange done: every server trusts {} anchors and advertises their proofs",
+        anchors.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod exchange_readiness_tests {
+    use super::*;
+    use kuipa_enroll::delegation::SignedVouch;
+    use kuipa_enroll::merkle::TreeHash;
+
+    #[test]
+    fn waits_for_a_valid_proof_from_each_anchor() {
+        let first = SigningKey::generate_preferred().unwrap();
+        let second = SigningKey::generate_preferred().unwrap();
+        let signing = SigningKey::generate_preferred().unwrap();
+        let at = now();
+        let anchors = [*first.public().thumbprint(), *second.public().thumbprint()];
+        let policy = Policy::default();
+        let mut delegation =
+            Delegation::issue(&first, REALM, SERVERS[0], signing.public(), at, at + 3600).unwrap();
+        assert!(!delegation_ready(&delegation, &anchors, &policy, at));
+        let claim = delegation.claim().unwrap();
+        let leaf = claim
+            .leaf(TreeHash::for_signer(second.public().alg()))
+            .unwrap();
+        let vouch = SignedVouch::issue(&second, REALM, [leaf], at, at + 3600, None).unwrap();
+        delegation.add(vouch.proof(&claim, second.public()).unwrap());
+        assert!(delegation_ready(&delegation, &anchors, &policy, at));
+        assert!(!delegation_ready(&delegation, &anchors, &policy, at + 7200));
+    }
 }
 
 /// What [`start_servers`] started.

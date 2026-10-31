@@ -1,8 +1,8 @@
 //! HTTP routes (§11).  The daemon sits behind httpd, which proxies
 //! `/ipa/ku/` to a Unix socket.
 //!
-//! Every refusal is an empty `403`; the reason goes to the log only.
-//! Requests over the rate limits are answered `429` before any work is done
+//! Refusals are empty `403` responses; peer persistence failures return `503`.
+//! The reason goes to the log only. Requests over the rate limits are answered `429` before any work is done
 //! (§5.1).  A request whose host name or principal is not even shaped like
 //! one is refused before that: nothing of it reaches the limiter's tables,
 //! the LDAP directory or the log.
@@ -762,6 +762,23 @@ async fn peer_sync<D: Directory + Send + Sync + 'static>(
     };
     match peers.handle(&body).await {
         Ok(state) => binary(state, "application/vnd.ipa-ku.peer-sync"),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<crate::peers::PeerError>(),
+                Some(crate::peers::PeerError::Busy)
+            ) =>
+        {
+            eprintln!("kuipad: peer sync: {e}");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(e)
+            if matches!(
+                e.downcast_ref::<crate::peers::PeerError>(),
+                Some(crate::peers::PeerError::NeedContext)
+            ) =>
+        {
+            StatusCode::CONFLICT.into_response()
+        }
         Err(e) => refused("peer sync", &e),
     }
 }

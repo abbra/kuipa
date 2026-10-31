@@ -1966,14 +1966,18 @@ fn refused_syncs(world: &Scenario) {
             .to_string(),
         format!("ipa-ku/{SERVER2}@{REALM}"),
     );
-    let cb = PeerSync::channel_binding(SERVER, SERVER2, &own, b"", &[]).unwrap();
+    let own_hash = PeerSync::delegation_hash(&own).unwrap();
+    let chain_hash = PeerSync::chain_hash(&[]).unwrap();
+    let cb = PeerSync::channel_binding(SERVER, SERVER2, &own_hash, b"", &chain_hash).unwrap();
     let forged = PeerSync {
         sender: SERVER.into(),
         receiver: SERVER2.into(),
-        own: own.clone(),
-        envelope: Vec::new(),
+        own_hash,
+        own: Some(own.clone()),
+        payload: Vec::new(),
         token: ipa2_key.token(SERVER2, &cb).unwrap(),
-        chain: vec![],
+        chain_hash,
+        chain: Some(vec![]),
     };
     assert_eq!(post(&forged), 403, "a token from another server's key");
     let garbage = PeerSync {
@@ -1981,6 +1985,16 @@ fn refused_syncs(world: &Scenario) {
         ..forged.clone()
     };
     assert_eq!(post(&garbage), 403, "no valid token");
+    let elided = PeerSync {
+        own: None,
+        chain: None,
+        ..forged.clone()
+    };
+    assert_eq!(
+        post(&elided),
+        403,
+        "left-out context is resolved only after authentication"
+    );
 }
 
 #[test]
