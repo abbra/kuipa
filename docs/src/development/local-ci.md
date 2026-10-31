@@ -199,7 +199,7 @@ the shell (`exit`, Ctrl-D) tears everything down: servers, KDC, files.
 | Piece | Details |
 | --- | --- |
 | KDC | MIT `krb5kdc`, realm `EXAMPLE.TEST`, on a Unix socket (`$PQ_KDC_SOCKET`), PKINIT with a generated test CA, so anonymous PKINIT works |
-| IPA servers | `ipa1.example.test` and `ipa2.example.test`: the daemon's real HTTP router (`kuipad::http`) and anchor exchange on local ports, each with its own anchor, ML-DSA signing key and ML-KEM join and escrow keys; they exchange anchors with their `ipa-ku/<fqdn>` keys before the shell starts, and the log shows each step; `KUIPA_ENDPOINTS` maps their names to the ports |
+| IPA servers | `ipa1.example.test` and `ipa2.example.test`: the daemon's real HTTP router (`kuipad::http`) and anchor exchange on local ports, each with its own anchor, ML-DSA signing key and ML-KEM join and escrow keys; they exchange anchors with their `ipa-ku/<fqdn>` keys before the shell starts, and the log shows each step. The shell waits until each server trusts both anchors and its published delegation verifies against each one; `KUIPA_ENDPOINTS` maps their names to the ports |
 | DNS | a stub nameserver (`KUIPA_DNS`) with `_ldap._tcp.example.test` and `_ldap._tcp.b.test` SRV records, as FreeIPA publishes them, so `kuipa` commands find the servers without `--server` ([Servers and failover](../reference/design.md#46-servers-and-failover)) |
 | Directory | shared by both servers: GSS-API tokens are accepted for real, passwords are checked against the KDC, keys come from the KDC (`kadmin.local ktadd`, standing in for `KEYTAB_GET`); OTPs, escrow registrations and staging are kept in memory |
 | Pinned anchor | `$PQ_ANCHOR`, ipa1's anchor; every enrollment string pins it, and it vouches for ipa2's claim |

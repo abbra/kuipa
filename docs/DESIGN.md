@@ -96,7 +96,7 @@ inherits the old key's protection without forward secrecy (§6).
  clevis (tang-pqc) ─── GET/POST /ipa/ku/tang/… ───────────▶        Tang keys only (§11.5)
 
  provisioner ◀── blinded μ / σ, out of band ──▶ voucher issuer (kuipa-voucher, §9)
- other IPA servers ◀── POST /ipa/ku/peer/sync (agirru gossip, Kerberos) ──▶ kuipad
+other IPA servers ◀── POST /ipa/ku/peer/sync (digest-first repair, Kerberos) ──▶ kuipad
 ```
 
 ### 3.1 Workspace
@@ -334,12 +334,14 @@ anchors to current ones (§4.7).
 Vouch signatures use a non-empty ML-DSA context, so they never verify as a
 JWS or bundle signature by the same key.
 
-Servers exchange anchor keys, claims and vouches with **agirru** (push-pull
-anti-entropy gossip, `agirru-engine` 0.1.2) over `POST /ipa/ku/peer/sync`:
+Servers exchange anchor keys, claims and vouches over `POST
+/ipa/ku/peer/sync`, by digest-first repair (§4.2.1). `agirru-engine`
+provides the durable snapshot, admission hook and merge; scheduling and the
+wire protocol are kuipa's.
 
 * **Members** are the IPA servers in `cn=masters,cn=ipa,cn=etc,<basedn>`
   (re-read every five rounds) plus the configured `peers`; only members are
-  gossiped with and trusted. A master without kuipa answers `404` and is
+  repaired with and trusted. A master without kuipa answers `404` and is
   retried with each round.
 * **Server identities.** Every IPA server holds the key of its own
   Kerberos service principal `ipa-ku/<fqdn>@REALM` in the daemon's keytab
@@ -353,17 +355,24 @@ anti-entropy gossip, `agirru-engine` 0.1.2) over `POST /ipa/ku/peer/sync`:
   the resulting token. Below, `<sender>` and `<receiver>` are the FQDNs of
   the two servers in a sync.
 * **Every sync request is Kerberos-authenticated.** It carries the
-  sender's own delegation (its claim with its own anchor's proof), the agirru
-  envelope, and a GSS-API token that the sender, initiating with its own
-  `ipa-ku/<sender>@REALM` key, creates for the service name
-  `ipa-ku@<receiver>`; the token's channel binding is
-  the first 32 bytes of `SHA-384("ipa-ku-enroll/v1 peer" ‖ sender ‖
-  receiver ‖ delegation ‖ envelope)` (§4.1.1, §14). The receiver accepts the token with its own
-  `ipa-ku/<receiver>@REALM` key, requires the initiator to be exactly
-  `ipa-ku/<sender>@REALM`, the sender to be a member, the request to be
-  addressed to itself, and the delegation to be the sender's own and proven
-  by the anchor it names; any failure is `403`. The sender's claim is then
-  **attested**: Kerberos proves that `<sender>` presented that anchor.
+  sender's own delegation, its epoch-log tail (§4.8), a repair message
+  (§4.2.1), and a GSS-API token created for `ipa-ku@<receiver>` using
+  `ipa-ku/<sender>@REALM`. The delegation and tail are named by hashes and
+  can be omitted when already accepted by the receiver.
+  The token's channel binding is the first 32 bytes of SHA-384 over
+  `"ipa-ku-enroll/v4 peer" ‖ IPPS ‖ 4 ‖ str(sender) ‖ str(receiver) ‖
+  H(delegation) ‖ bytes(repair) ‖ H(epoch tail)`. Here `str` and `bytes`
+  use a big-endian u32 length prefix; the two hashes are fixed 32-byte
+  domain-separated hashes (§4.1.1, §14).
+  The receiver accepts the token with its own service key, then resolves
+  omitted delegation and tail from the sender's last accepted context;
+  missing context returns `409` and the sender resends both. It requires
+  the authenticated principal to be `ipa-ku/<sender>@REALM`, the sender
+  to be a member, the request to address this receiver, and the claim to
+  name the sender and realm and be valid. If the claim names an anchor,
+  its delegation must verify against that anchor; an anchorless claim has
+  no such proof. Failed admission returns `403`. The sender's claim is
+  then **attested** by its Kerberos identity.
 * **State** (`AnchorState`): anchor keys (keyed by thumbprint), claims
   (keyed by leaf hash) and one vouch per anchor, with its leaves. Keys and
   claims never change; a vouch is replaced by the same anchor's newer one
@@ -393,24 +402,25 @@ anti-entropy gossip, `agirru-engine` 0.1.2) over `POST /ipa/ku/peer/sync`:
   quarter of a vouch's lifetime left.
 * **Size** (measured, ML-DSA-65; `measure_exchange_sizes`):
 
-  | servers | exchange state | delta after one claim renewal | advertised delegation |
-  |---|---|---|---|
-  | 10 | 65 KB | 38 KB | 7.6 KB |
-  | 60 | 489 KB | 321 KB | 7.7 KB |
+  | servers | exchange state | advertised delegation |
+  |---|---|---|
+  | 10 | 65 KB | 7.6 KB |
+  | 60 | 489 KB | 7.7 KB |
 
   Per server, the state holds an anchor key (2.7 KB as JWK), a claim
   (about 100 bytes) and a vouch (a 3.3 KB signature and 32 bytes per
   vouched claim): it grows with the number of servers, plus 32 bytes per
   pair. A renewal costs one new vouch per anchor, batched per round, so
-  short-lived claims stay cheap.
+  short-lived claims stay cheap. Repair moves only the changed entries
+  (§4.2.1); measured traffic is in the sizing reference.
 
 * **Anchor role.** A server configured with `"anchor": false` holds no
   anchor: it makes claims without one (its claim's anchor field is all
   zeros), never vouches, and is trusted through the Kerberos attestation of
   the servers it syncs with, whose anchors vouch for it. A realm needs at
   least one anchor server; clients pin anchor servers' thumbprints only.
-  With 6 anchors among 60 servers the state is 55 KB and a renewal's delta
-  32 KB (against 489 KB and 321 KB with 60 anchors).
+  With 6 anchors among 60 servers the state is 55 KB (against 489 KB with
+  60 anchors).
 * **Re-vouching.** A vouch that would only add claims waits until the
   previous one is `vouch_interval` seconds old (default 60), so a burst of
   new or renewed claims costs one vouch per anchor; a vouch that drops a
@@ -424,6 +434,49 @@ server lists its anchor. Removing a server (`ipa server-del`) removes it
 from `cn=masters`: every server stops trusting it, drops its claim from its
 next vouch, and drops its anchor from the anchor lists. Its existing proofs
 stop verifying when the vouches they come from expire, within 7 days.
+
+#### 4.2.1 Repair
+
+Each server repairs with up to four peers per round (`peer_interval`) or
+local change, rotating through the members, and with every member every
+ten rounds. Outgoing repairs run at most `max(1, 16 / (members − 1))` at a
+time, plus one slot for each repair running longer than a second, up to 16;
+a server handles at most 16 incoming repairs and answers `503` beyond
+that. Busy answers (`503`, `429`) get up to three delayed retries; a `409`
+for omitted context causes an immediate resend with that context (§4.2).
+Other failures wait until the peer is selected again.
+
+A repair with one peer (each step one authenticated sync):
+
+1. **Probe.** The sender sends the digest of its state: `SHA-256` of
+   `"ipa-ku/anchor-state/v1\0" ‖ IPAS`. Equal digests end the repair.
+2. **Buckets.** Each entry is summarised by a 16-byte id hash, its
+   32-byte entry hash and its replacement order (a vouch's or succession's
+   signed `iat`, 0 for keys and claims). Entries fall into `2^bits` buckets
+   by the leading bits of the id hash; the sender picks about eight
+   entries per bucket (at most 4,096 buckets) and sends one 16-byte hash
+   per bucket. The receiver answers with the buckets that differ from its
+   own and its summary entries in them.
+3. **Exchange.** From these, the sender pushes its entries the receiver
+   lacks or would replace with them, and names the receiver's entries it
+   lacks or whose versions would replace its own. Neither side sends a version older
+   than the other's: merging it would change nothing. The receiver admits
+   and persists the push and answers with the named entries (a vouch with
+   its anchor's key) and its digest; the sender admits and persists them
+   and compares that digest with its own.
+
+Admission and merge are the same as for a whole state, whatever changed in
+between. If the resulting digests differ, including after concurrent changes,
+the selective repair is attempted again, up to three attempts in total. If either state has more than
+4,096 entries, or a summary or selection exceeds its bound (4,096 summary
+entries, 256 KiB of summary data, or 128 KiB of selected state), repair
+sends the whole state instead, in authenticated chunks of at most 128 KiB,
+bound to its digest and merged only when complete. Requests and answers are
+limited to 1 MiB; a state, to 64 MiB. Entry hashes and the state digest are
+computed once per state version.
+
+An id-hash collision could only hide an entry from repair; it cannot let
+one past admission.
 
 ### 4.3 The realm advertisement
 
@@ -691,7 +744,7 @@ After a restart the server's next claim names the new anchor. Its peers
 admit that claim through the usual Kerberos attestation (§4.2), switch to
 the new anchor and drop the old one, its vouch and its key. The server puts
 its successions into the anchor exchange each round. They are
-self-authenticating, gossiped like vouches (one per old anchor, the newest
+self-authenticating, exchanged like vouches (one per old anchor, the newest
 wins) and dropped when they expire. Every server's delegation carries the
 successions it knows.
 
@@ -821,9 +874,9 @@ cost of one: measured (`measure_sizes`), the advertisement's delegation
 member is 7.5 KB with ML-DSA-65 and 10.1 KB with ML-DSA-87, of which
 the anchor JWK (2.7 KB) and the ML-DSA signature (3.3 KB raw, 4.4 KB
 base64url) are almost everything; the exchange state is 55 KB (60
-servers, 6 anchors) to 489 KB (60 anchors), and one claim renewal
-gossips 32–321 KB of deltas, most of it the same JWKs and signatures
-repeated per anchor and per round. A certificate whose proof can skip
+servers, 6 anchors) to 489 KB (60 anchors), and every changed vouch
+the repair moves carries its signature and, to a peer without it, its
+anchor's key. A certificate whose proof can skip
 the signature and the key would make the advertisement delegation a few
 hundred bytes and the exchange deltas mostly leaf lists. The Merkle
 Tree Certificates drafts call the mechanism that allows this a
@@ -901,10 +954,10 @@ the delegation member to a few hundred bytes, advertisement to about
 21 KB (ML-DSA-65) — with no signature to make, the proof needs no
 freshness of its own.
 
-#### 4.9.3 Servers: the gossip is leaves
+#### 4.9.3 Servers: the exchange is leaves
 
-On the servers nothing structural changes — `AnchorState`, agirru
-anti-entropy, the Kerberos-authenticated syncs and the trust
+On the servers nothing structural changes — `AnchorState`, the repair
+(§4.2.1), the Kerberos-authenticated syncs and the trust
 computation stay as they are. The `IPSV` entry keeps carrying the
 whole leaf list, in log order: a re-vouch that only appends keeps the
 previous log and adds to it, one that must drop a claim starts a new
@@ -978,7 +1031,7 @@ claim logs record what each anchor *vouched for*.
 
 * **No global log, no new quorum.** The claim log is per anchor, and
   trust still comes from the exchange (§4.2): a claim enters a tree
-  only through the anchor's own server or the gossip. There is no CT
+  only through the anchor's own server or the exchange. There is no CT
   monitor, no third-party witness, no new party to run.
 * **Threat model.** A head is a weaker pin than a key: it binds the
   tree, not the key that signs it. But a client that holds only a
@@ -2393,7 +2446,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/tlog/{kid}` | `IPJQ` (operation data `IPLQ`) → `IPJS` (payload `IPLR`): the caller's own transparency-log entries (DESIGN-tlog.md §6) |
 | POST | `/ipa/ku/seal/{kid}` | `IPJQ` (operation data: a JSON seal operation) → `IPJS` (payload `IPVR`) (§7.6) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
-| POST | `/ipa/ku/peer/sync` | `IPPS` → agirru envelope (CBOR); servers only (§4.2) |
+| POST | `/ipa/ku/peer/sync` | `IPPS` → `IPRD`; `409` asks for the left-out delegation and epoch tail; servers only (§4.2) |
 | GET | `/ipa/ku/anchor-log?from=n` | → epoch-log entries and the anchors' current vouch heads (§4.8, §4.9) |
 | GET | `/ipa/ku/claim-log/{anchor}?from=i` | → one anchor's claim-log page (§4.9.5) |
 | GET | `/ipa/ku/tlog/{id}/head`, `…/leaves?from=i`, `…/proof?index=i&size=n`, `…/consistency?from=m&size=n` | → the server's transparency log: `IPLS`, and JSON pages of leaves and proofs (DESIGN-tlog.md §5) |
@@ -2569,13 +2622,19 @@ IPKG  namespace(1) nickname alg_arg(1)                                          
       (namespace: 1 dm, 2 ra, 3 ca, 4 ca_wrapped, 5 lwca-store; alg_arg: a wrap
        algorithm selector for ca_wrapped, 0 none; nickname: a string)
 IPKR  value                                                                      keys answer (the handler's JSON)
-IPPS  version 2: sender receiver delegation(JSON) envelope token n(u64) [epoch entry]   peer sync request (the sender's epoch chain tail, §4.8)
+IPPS  version 4: sender receiver H(delegation)(32) delegation(JSON or empty) repair(IPRD) token H(tail)(32) has_tail(1) [n(u64) [epoch entry]]
+                                                                                 peer sync request (the sender's epoch chain tail, §4.8; H is SHA-256, domain-separated)
+IPRD  nonce(32) digest(32) kind(1) …                                           repair message (§4.2.1): 0 digest only, 1 whole state(IPAS), 2 fetch(offset), 3 data / 4 upload(offset total bytes),
+                                                                                 5 accepted(next), 6 bucket hashes(bits(1) 2^bits×16), 7 named entries(IPAS),
+                                                                                 8 push(IWNT, IPAS), 9 fall back to the whole state, 10 probe, 11 differing buckets(n(u64) [index(2)] ISUM)
+ISUM  n(u64) [id(16) hash(32) order(u64)]                                       repair summary entries
+IWNT  n(u64) [id(16)]                                                           entries a repair wants
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
 IPVH  version 2: realm anchor(32) iat(u64) exp(u64) size(u64) root(h) live_size(u64) live_root(h)
                                                                                  vouch (signed): the claim log's head and the live tree (§4.9.1)
 IPSV  version 2: vouch(IPVH) signature n(u64) [1 leaf(h) | 2 target(u64) time(u64)]       signed vouch with the whole claim log in order: claims and tombstones; nothing is removed
 IPAR  realm old(32) new(32) iat(u64) exp(u64)                                    anchor succession (signed by old)
-IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (gossip form)
+IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (exchange form)
 IPAE  realm seq(u64) prev(48) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-384` of them under a domain-separation context, in every profile; `prev` is the previous entry's head, `0…0` for the first)
 IEPS  entry(IPAE) signature n(u64) [key(JWK) signature]                    signed anchor epoch entry
 IPAS  n(u64) [tag(1) value]                                                      exchange state (1 key, 2 claim, 3 vouch, 4 succession)
@@ -2608,9 +2667,9 @@ IPLR  signer(JWK) head(IPLS or empty) n(u64) [index(u64) leaf(IPLF) m(1) [hash(h
 `ct` is empty in bundle modes B and C, `recipient` all zeros outside mode A,
 `secret` empty outside mode B. The bundle signature covers `IPOB` up to and
 including the signer key. The `IPPS` token's channel binding is
-the first 32 bytes of `SHA-384("ipa-ku-enroll/v1 peer" ‖ IPPS(sender,
-receiver, delegation, envelope))`, without version or token; the response is agirru's `Envelope`
-(CBOR) whose state is an `IPAS` byte string. `TQBD`, `TQRQ` and `TQRS` are `tang-pqc`'s binding,
+the first 32 bytes of `SHA-384("ipa-ku-enroll/v4 peer" ‖ IPPS(sender,
+receiver, H(delegation), repair, H(tail)))`, without the token or the
+delegation and tail themselves. `TQBD`, `TQRQ` and `TQRS` are `tang-pqc`'s binding,
 recovery request and response.
 
 ## 15. What kuipa uses from `tang-pqc`
@@ -3010,7 +3069,7 @@ a static table is the smallest surface to audit.
 | protocol library (`kuipa-enroll`): delegations, anchor exchange state and trust, advertisement, join/rekey/stage, OTP/password/Kerberos/voucher authenticators, payload, bundles A/B/C, sealed keytab, escrow, MIT keytab, trust establishment | implemented, tested |
 | client (`kuipa`, `kuipa-unseal`): every command of §10.1, failover, DNS SRV discovery, prompts, file mode | implemented, tested over HTTP, against a stub DNS server and against a real KDC |
 | daemon (`kuipad`): router, key store and rotation, rate limiting, commands, `KEYTAB_GET` codec | implemented, tested (router, limiter, key store, codec) |
-| anchor exchange (agirru gossip, Kerberos-authenticated syncs, claims, Merkle-tree vouches, anchor role, batched re-vouching, renewal, publishing) | implemented, tested with two servers against a real KDC |
+| anchor exchange (digest-first repair over bucketed summaries, Kerberos-authenticated syncs, claims, Merkle-tree vouches, anchor role, batched re-vouching, renewal, publishing) | implemented, tested with two servers against a real KDC and in loopback runs of up to 300 servers |
 | daemon `LdapDirectory` against 389-ds | implemented, **not yet run against a FreeIPA server** |
 | trusted realms: `trusts` member and its validation, `kuipa trusted-realms`, per-realm anchors, PKINIT anchors and `krb5.conf.d` snippets (§17.1–§17.3) | implemented, tested against two real KDCs |
 | establishing a trust: invitation, trust request, trust secret, cross-realm keys, partner refresh (§17.4) | implemented, tested against two real KDCs; the LDAP side **not yet run against FreeIPA** |

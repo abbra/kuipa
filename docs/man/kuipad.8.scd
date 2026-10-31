@@ -141,6 +141,14 @@ Print the Tang signing keys' thumbprints.
 	realm's own servers in *NO_PROXY* when only other realms are
 	behind the proxy.
 
+	Set *KUIPA_REPLICATION_SIZES* to log, for each successful outbound
+	peer sync, the peer name, the request size and the sizes of its
+	repair payload, delegation, Kerberos token and epoch log tail (0
+	when left out), the response size and the elapsed milliseconds.
+	Sizes are of message bodies, without HTTP headers or transport
+	overhead; failed exchanges are not included.  The logs can reveal
+	peer names and traffic patterns.
+
 */var/lib/ipa/ku/*
 	The key directory (*key_dir*): the anchor and signing JWKs, the
 	join, escrow, trust, voucher and succession keys, the Tang keys,
