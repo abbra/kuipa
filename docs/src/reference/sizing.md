@@ -22,7 +22,6 @@ advertisement (`GET /ipa/ku/adv`), and verifying it against the anchors it
 pins. The advertisement holds the server's keys, the realm's
 configuration and CA chain, and the delegation that proves the server
 belongs to the realm.
-
 | realm | advertisement | |
 |---|---|---|
 | 1 server | 24.8 KB | measured |
@@ -138,40 +137,74 @@ files and runs an hourly watch against two servers adds about
 
 ### The anchor exchange
 
-Servers gossip claims and vouches (DESIGN §4.2) over `POST
-/ipa/ku/peer/sync`, authenticated with their Kerberos keys.
+Servers repair their claims and vouches with each other (DESIGN §4.2.1)
+over `POST /ipa/ku/peer/sync`, authenticated with their Kerberos keys.
 
-- **A quiet round sends nothing.** A server sends a peer only what is new
-  since its last successful sync (computed, `agirru-engine`).
+- **Who talks to whom.** Every `peer_interval` (60 s by default) or local
+  change, a server repairs with four rotating peers; every ten intervals,
+  with all of them.
+- **A quiet repair is a probe.** Two servers in the same state compare
+  digests. With a real KDC and cached peer context, a probe request is about
+  1.1 KB, mostly the Kerberos token, and its answer about 70 bytes (measured,
+  playground). The delegation and epoch log tail also travel on first contact,
+  when changed, or when the receiver has forgotten them, such as after a restart.
+- **Selective repair moves changed entries.** Servers compare bucket hashes,
+  about one per eight entries, to find a renewal's claim and vouch. Large
+  states or selections instead trigger whole-state transfer (DESIGN §4.2.1).
 - **What changes.** A server's claim renews at two thirds of its 90-day
   validity, every 60 days, and every anchor then vouches again. Each
   anchor also vouches again at half of a vouch's 7-day validity, every
   3.5 days. A vouch is a 3.3 KB signature plus 32 bytes per claim it
   covers (computed).
-- **Where it goes.** Every server sends what it learns to every peer, so
-  a change crosses each of the N × (N − 1) peer links about once
-  (computed; an upper bound, since a peer that already has an entry merges
-  nothing).
 
-| realm | exchange state per server | delta after one claim renewal, per link | |
-|---|---|---|---|
-| 2 servers, both anchors | 12.7 KB | — | measured (playground) |
-| 10 servers, all anchors | 65 KB | 38 KB | measured (DESIGN §4.2) |
-| 60 servers, all anchors | 489 KB | 321 KB | measured (DESIGN §4.2) |
-| 60 servers, 6 anchors | 55 KB | 32 KB | measured (DESIGN §4.2) |
+| realm | exchange state per server | |
+|---|---|---|
+| 2 servers, both anchors | 12.7 KB | measured (playground) |
+| 10 servers, all anchors | 65 KB | measured (DESIGN §4.2) |
+| 60 servers, 6 anchors | 55 KB | measured (DESIGN §4.2) |
+| 60 servers, all anchors | 489 KB | measured (DESIGN §4.2) |
+| 300 servers, 6 anchors | 136 KB | measured (loopback benchmark) |
+| 300 servers, all anchors | 5.2 MB | measured (loopback benchmark) |
 
-Traffic per server per day, computed from the above:
+One claim renewal and its anchor's new vouch, until every server has them:
+a single-host loopback run with full-mesh configured peers, 20 routine rounds
+available, no injected busy responses, and synthetic channel-bound identity. The table sums
+request and response bodies in the routine rounds through convergence;
+it excludes the subsequent full sweep, Kerberos, TLS and HTTP headers.
+It also excludes maintenance and subsequent re-vouching by other anchors;
+it is not the total renewal cost. All final idle and update sweeps
+converged, with no failed repair attempts in this run.
 
-| realm | from vouches | from claim renewals | per server per day |
-|---|---|---|---|
-| 10 servers, all anchors | 0.9 MB realm-wide | 0.6 MB realm-wide | about 0.15 MB |
-| 60 servers, all anchors | 315 MB realm-wide | 1.1 GB realm-wide | about 24 MB |
-| 60 servers, 6 anchors | 31 MB realm-wide | 113 MB realm-wide | about 2.4 MB |
+| replicas | anchors | routine rounds | realm-wide bodies | per replica |
+|---|---|---|---|---|
+| 60 | 6 | 3 | 1.09 MB | 18.1 KB |
+| 100 | 6 | 4 | 2.18 MB | 21.8 KB |
+| 200 | 6 | 5 | 5.20 MB | 26.0 KB |
+| 300 | 6 | 6 | 9.59 MB | 32.0 KB |
+| 60 | all | 3 | 1.13 MB | 18.8 KB |
+| 100 | all | 3 | 1.89 MB | 18.9 KB |
+| 200 | all | 5 | 5.35 MB | 26.8 KB |
+| 300 | all | 6 | 9.59 MB | 32.0 KB |
 
-Large realms should give the anchor role to a few servers, as DESIGN
-§4.2 says: it cuts the exchange by an order of magnitude. Hosts are not
-affected either way: their advertisements carry two proofs whatever the
-number of anchors.
+For comparison, in the full-mesh workload with at least five servers, the
+routine timer selects four peers per minute, and the sweep selects every
+other server every ten minutes. At 1.1 KB a probe this is approximately
+6.3 MB a day sent per server for routine probes, plus 9.4 MB (60 servers) or
+47 MB (300 servers) for sweeps. Overlapping pending repairs are deduplicated, so actual traffic
+can be lower; retries and local changes add traffic. Each server also receives
+roughly as many requests (computed).
+The final 300-replica update sweep in this loopback run took 1.71 s
+with six anchors and 9.49 s with all anchors; this is not a WAN or
+production convergence measurement.
+
+The measured initial update has similar traffic with six or all anchors.
+Subsequent re-vouching by other anchors adds changes to propagate, so total
+renewal traffic still depends on the number of anchors. Anchors also make
+the state larger, and each re-vouch costs a signature. Large realms should
+still give the anchor role to a few servers (DESIGN §4.2).
+Advertisements select up to two anchors for signature proofs when available;
+matching pinned head proofs take precedence, and every matching head proof is
+served, so a client pinning several heads can receive more than two proofs.
 
 ### Witnesses and auditors
 
@@ -197,7 +230,7 @@ replication agreement once.
 | keys: signing, anchor, join, escrow, trust, Tang (each ML-DSA-65 key 2.7 KB, ML-KEM-768 key 1.7 KB as JWK) | about 15 KB, plus retired keys until pruned | measured |
 | `delegation.json` | 15 KB | measured |
 | `epoch.json`, the anchor epoch log | 7.3 KB, growing with each anchor rotation | measured |
-| `peers.state`, the exchange state | see the table above: 12.7 KB to 489 KB | measured |
+| `peers.state`, the exchange state | see the table above: 12.7 KB to 5.2 MB | measured |
 | `tlog/<log>/leaves`, the public log | **100 bytes per event**, kept for ever | measured |
 | `tlog/<log>/openings/YYYY-MM` | **about 150 bytes per event**, kept 13 months (`tlog_retention_months`) | measured |
 

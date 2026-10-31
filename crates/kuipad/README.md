@@ -9,11 +9,30 @@ Its jobs are to:
 * publish the realm advertisement,
 * handle join, rekey and stage requests,
 * unseal keytabs for protected hosts,
-* exchange anchors with the other IPA servers over agirru gossip,
+* exchange anchors with the other IPA servers by digest-first repair,
   authenticated with their `ipa-ku/<fqdn>` Kerberos keys.
 
 It works on the directory through 389-ds over LDAPI and GSSAPI. It can
 also act as a general post-quantum Tang server, under `/ipa/ku/tang`.
+
+Ordinary repair contacts up to four rotating peers per interval or local
+change; an independent timer schedules every known peer every ten intervals.
+The complete membership remains available for authentication and admission.
+The outgoing concurrency starts at `max(1, 16 / (members - 1))`. Each
+repair running longer than one second temporarily opens another slot, up to
+16 total, so a stalled peer cannot indefinitely block other work. Incoming
+repairs are limited to 16. Busy responses (HTTP 503 or source-rate-limit 429)
+receive up to three delayed retries; later rounds and sweeps retry failures.
+
+A repair compares state digests, then bucket hashes, and exchanges only
+the entries that differ (DESIGN §4.2.1). If either state exceeds 4,096
+entries or a summary or selection exceeds its bound, it transfers the whole
+snapshot in authenticated chunks of at most 128 KiB, subject to a 1 MiB
+per-message limit and a 64 MiB snapshot limit.
+Incomplete uploads reserve at most 64 MiB of declared snapshot size in
+total and expire after two minutes of inactivity. Only a complete
+digest-verified snapshot is admitted and durably merged. A repair that
+meets a concurrent change runs again, up to three times.
 
 ## Deployment
 
