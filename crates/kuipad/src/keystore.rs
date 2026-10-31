@@ -90,6 +90,11 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<(), Error> {
     f.write_all(data)?;
     f.sync_all()?;
     fs::rename(&tmp, path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
