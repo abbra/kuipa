@@ -78,6 +78,67 @@ Comparison reads the stored files, so a baseline survives `cargo clean`.
 `--baseline NAME` additionally saves a criterion baseline for per-benchmark
 `--baseline NAME` comparisons inside `target/criterion`.
 
+## Peer repair scheduler
+
+The ignored `kuipad` test runs real repair schedulers and receiver admission on
+loopback, backed by per-node persistent state. Choose the anchor topology with
+`KUIPA_ANCHORS`: a count (for example, 6), `all`, or 0 (the default, the
+historical synthetic-key workload). Each count must not exceed any requested
+replica count.
+
+For a small smoke run covering both topologies:
+
+```sh
+KUIPA_REPLICAS=8 KUIPA_ANCHORS=6 KUIPA_ROUNDS=20 cargo test --release -p kuipad measure_scheduler_repair -- --ignored --nocapture
+KUIPA_REPLICAS=8 KUIPA_ANCHORS=all KUIPA_ROUNDS=20 cargo test --release -p kuipad measure_scheduler_repair -- --ignored --nocapture
+```
+
+For the full sizing matrix, run each topology separately:
+
+```sh
+KUIPA_REPLICAS=60,100,200,300 KUIPA_ANCHORS=6 KUIPA_ROUNDS=20 KUIPA_PHASE_TIMEOUT_SECS=1800 cargo test --release -p kuipad measure_scheduler_repair -- --ignored --nocapture
+KUIPA_REPLICAS=60,100,200,300 KUIPA_ANCHORS=all KUIPA_ROUNDS=20 KUIPA_PHASE_TIMEOUT_SECS=1800 cargo test --release -p kuipad measure_scheduler_repair -- --ignored --nocapture
+```
+
+The anchor fixture creates a signing key and claim per replica, a separate
+anchor key for each anchor, and one signed vouch per anchor covering every
+claim. It admits these entries and persists the same initial state on each
+node. The update renews node 0's claim and its own anchor's signed vouch;
+other anchors' vouches are unchanged. Repair transfers go through the actual
+peer admission, merge, persistence and scheduler paths. Convergence compares
+live snapshots normalized with the production retention rules at the fixture
+time, ignoring generation metadata; a snapshot byte-identical to node 0's
+counts as converged without normalization. A final full-sweep mismatch fails
+the test. Maintenance, subsequent re-vouching by other anchors, claim expiry and
+epoch evolution are not simulated.
+
+The default replica sizes are 10, 20, 40, 60, 100, 200 and 300. The test
+drives explicit routine rounds until convergence or `KUIPA_ROUNDS` (default
+20), followed by an independent full sweep. JSON lines report topology,
+initial persistence, attempts, completions, failures, retries, chunk counts,
+body and plaintext HTTP stream bytes, elapsed time, state size and convergence.
+`KUIPA_PHASE_TIMEOUT_SECS` bounds each round; `KUIPA_BUSY_PER_NODE` injects
+authenticated busy responses. `kinds` counts messages and body bytes per
+request and response kind (probe, bucket hashes, pushed and returned
+entries, whole-snapshot chunks…), the way to see where repair bytes go.
+
+The separate `KUIPA_ANCHORS=0` workload uses non-anchor claims and adds one
+public key in its update. `KUIPA_EXTRA_KEYS` adds synthetic keys only to that
+workload to exercise chunking; it is rejected with anchors and must not be
+interpreted as an anchor count. Manual ticks disable automatic scheduling only
+inside the test.
+
+This single-host loopback experiment uses synthetic channel-bound identity,
+durable local stores, no TLS or Kerberos, empty epochs and no maintenance
+loop. HTTP stream bytes include HTTP framing but not TLS or TCP/IP overhead.
+Random keys and concurrent execution make timing and sizes nondeterministic;
+it does not establish WAN behavior or production convergence latency. The
+all-anchor case signs and verifies many large vouches and may require substantial
+time, memory and disk space; increase the per-round timeout as needed. On one
+24-thread development host, the 300-replica all-anchor case took about two
+and a quarter minutes and 13 GB of resident memory for all in-process
+replicas.
+
 ## CI
 
 `local-ci.sh bench` (opt-in, like `msrv`) runs the smoke profile in quick mode

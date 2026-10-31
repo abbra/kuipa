@@ -3731,3 +3731,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "peers_benchmark.rs"]
+mod benchmark;
