@@ -500,7 +500,7 @@ half life. The JWK Set carries two extension members:
          "pkinit_anchors":["<b64url DER>"],
          "anchors":["<b64url thumbprint>", …],
          "heads":[{"anchor":"<b64url thumbprint>","size":12,"root":"<b64url hash>"}, …]},
- "delegation": {"claim":"…","proofs":[<one or two proofs>]}}
+ "delegation": {"claim":"…","proofs":[…],"head_proofs":[…]}}
 ```
 
 `anchors` lists the trusted anchors, the server's own first. The
@@ -511,11 +511,11 @@ first of them that vouches for its claim, or else its own anchor's, and
 then the proofs of further pinned anchors until two distinct anchors prove
 it (`SERVED_PROOFS`). A client pinning two anchors so counts its quorum
 (§4.4) from one advertisement instead of fetching a second one for the
-other anchor's proof. A pinned head's proof (§4.9) replaces its anchor's
-signature, and costs a few hundred bytes instead of about 7.5 KB. The size
-of an advertisement therefore does not grow with the number of servers,
-only with the client's pins, by one proof at most. The server keeps one
-signed advertisement per choice of proofs, re-signed at half life and
+other anchor's proof. Matching pinned head proofs (§4.9) replace signature
+proofs for their anchors; every matching head proof is served, even when
+more than two match. Advertisement size therefore depends on the client's
+pins and matching heads as well as the realm information it carries.
+The server keeps one signed advertisement per choice of proofs, re-signed at half life and
 discarded when the exchange publishes.
 
 **Conditional fetches.** Since an advertisement stays the same until it is

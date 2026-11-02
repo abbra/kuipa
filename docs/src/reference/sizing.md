@@ -22,6 +22,11 @@ advertisement (`GET /ipa/ku/adv`), and verifying it against the anchors it
 pins. The advertisement holds the server's keys, the realm's
 configuration and CA chain, and the delegation that proves the server
 belongs to the realm.
+
+The first four rows measure fixture advertisements selected using anchor
+pins without pinned heads. They include a signature proof; they are not
+measurements of the smaller head-proof response described below.
+
 | realm | advertisement | |
 |---|---|---|
 | 1 server | 24.8 KB | measured |
@@ -40,17 +45,20 @@ Three things keep it from being paid on every exchange:
   advertisement carries both (§4.3), so one fetch is enough.
 - **Pinned heads instead of signatures.** A head proof is a few hundred
   bytes where a signature proof is about 7.5 KB (DESIGN §4.9). Hosts pin
-  heads at enrollment and refresh them at every `kuipa check` and key
-  rotation (§4.5), so most proofs are heads: a typical advertisement is
-  about **19 KB**, up to 38 KB with two signature proofs.
+  heads at enrollment when available and refresh them at `kuipa check` and
+  key rotation (§4.5). With matching pinned heads, a typical advertisement
+  is estimated at **19 KB**; a response using two signature proofs can be
+  about 38 KB. Actual sizes depend on the realm and requested proofs.
 - **Conditional fetches.** `kuipa` keeps each advertisement and asks again
   with `If-None-Match`; an unchanged one costs a `304 Not Modified`, a few
   hundred bytes of headers, and is verified again like fresh bytes (§4.3).
   An advertisement changes when it is re-signed or the anchor exchange
   publishes, every few days.
 
-So the advertisement costs about 19 KB at a host's first contact with a
-server, and almost nothing afterwards.
+First contact with a server transfers the full advertisement selected for
+the host's pins: the roughly 19 KB head-proof estimate applies only when
+matching heads are already pinned. Without them, signature-proof sizes such
+as those in the table apply. Later unchanged fetches transfer only the `304`.
 
 ```mermaid
 sequenceDiagram
@@ -285,8 +293,9 @@ bytes ≈ **3.4 MB**.
   step's totals.
 - **Advertisement against realm size**: `cargo test -p kuipa-perf --test
   sizes -- --ignored --nocapture`.
-- **Exchange state and deltas**: `cargo test --release -p kuipa-enroll
-  measure_exchange_sizes -- --ignored --nocapture` (DESIGN §4.2).
+- **Exchange state and local deltas**: `cargo test --release -p kuipa-enroll
+  measure_exchange_sizes -- --ignored --nocapture` (DESIGN §4.2). Its
+  serialized state delta is not a measurement of the peer repair wire protocol.
 - **Server and host files**: `KUIPA_KEEP_PLAYGROUND=1
   ./contrib/ci/local-ci.sh playground-test` keeps the playground's
   directory; its `keys-<server>/` and `users/` directories hold what a
