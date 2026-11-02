@@ -841,6 +841,45 @@ impl Directory for LdapDirectory {
             .collect())
     }
 
+    fn topology_peers(&self, hostname: &str) -> Result<Vec<String>, DirectoryError> {
+        let hostname = hostname.to_ascii_lowercase();
+        let escaped = filter_escape(&hostname);
+        let base = format!("cn=topology,cn=ipa,cn=etc,{}", self.cfg.basedn);
+        let filter = format!(
+            "(&(objectClass=ipaReplTopoSegment)(|(ipaReplTopoSegmentLeftNode={escaped})(ipaReplTopoSegmentRightNode={escaped})))"
+        );
+        let entries = self.service_conn()?.search(
+            &base,
+            Scope::Subtree,
+            &filter,
+            &["ipaReplTopoSegmentLeftNode", "ipaReplTopoSegmentRightNode"],
+        )?;
+        let mut peers = Vec::new();
+        for entry in entries {
+            let left = entry
+                .attrs
+                .get("iparepltoposegmentleftnode")
+                .and_then(|v| v.first());
+            let right = entry
+                .attrs
+                .get("iparepltoposegmentrightnode")
+                .and_then(|v| v.first());
+            let peer = match (left, right) {
+                (Some(left), Some(right)) if left.eq_ignore_ascii_case(&hostname) => Some(right),
+                (Some(left), Some(right)) if right.eq_ignore_ascii_case(&hostname) => Some(left),
+                _ => None,
+            };
+            if let Some(peer) =
+                peer.filter(|peer| !peer.is_empty() && !peer.eq_ignore_ascii_case(&hostname))
+            {
+                peers.push(peer.to_ascii_lowercase());
+            }
+        }
+        peers.sort();
+        peers.dedup();
+        Ok(peers)
+    }
+
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         self.accept(token, cb)
     }

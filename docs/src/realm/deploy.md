@@ -129,9 +129,10 @@ realm's configuration. The log shows each request's outcome. Refusals
 are logged with their reason, while clients only see an empty `403`.
 
 Within a minute, the log also shows the **anchor exchange**: the server
-finds the other IPA servers in LDAP (`cn=masters`), exchanges anchors with
-those running kuipad, and starts vouching for them. A server that does
-not run kuipa yet answers `404` and is retried every round.
+finds the IPA servers in LDAP (`cn=masters`) and repairs with its direct
+IPA topology neighbors and configured peers. Claims propagate through those
+neighbors. A peer that does not run kuipa yet answers `404` and is retried
+when selected in a later round or neighbor sweep.
 
 ## Restarting after key changes
 

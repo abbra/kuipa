@@ -16,8 +16,8 @@
 | `pkinit_anchors_file` | `/var/lib/ipa-client/pki/kdc-ca-bundle.pem` | the PKINIT anchors hosts need for armoured `kinit`: CA certificates only |
 | `key_dir` | `/var/lib/ipa/ku` | the key directory |
 | `listen` | `unix:/run/ipa/kuipad.sock` | where to listen when not socket-activated (`unix:/path` or `host:port`) |
-| `peers` | `[]` | servers to exchange anchors with, besides the IPA servers in LDAP |
-| `discover_peers` | `true` | find peers among the IPA servers (`cn=masters`) |
+| `peers` | `[]` | explicitly configured repair peers, in addition to discovered topology neighbors |
+| `discover_peers` | `true` | discover full membership from `cn=masters` and direct repair neighbors from IPA topology segments |
 | `peer_endpoints` | `{}` | base URLs of peers by FQDN, instead of `https://<fqdn>` |
 | `peer_interval` | `60` | seconds between anchor exchange rounds (at least 5) |
 | `anchor` | `true` | whether this server holds an anchor and vouches for others |

@@ -337,10 +337,14 @@ Servers exchange anchor keys, claims and vouches over `POST
 provides the durable snapshot, admission hook and merge; scheduling and the
 wire protocol are kuipa's.
 
-* **Members** are the IPA servers in `cn=masters,cn=ipa,cn=etc,<basedn>`
-  (re-read every five rounds) plus the configured `peers`; only members are
-  repaired with and trusted. A master without kuipa answers `404` and is
-  retried with each round.
+* **Members and neighbors.** Members are IPA servers in
+  `cn=masters,cn=ipa,cn=etc,<basedn>` plus configured `peers`; the full
+  list governs admission and trust. Outbound repair uses configured peers
+  and direct neighbors from `ipaReplTopoSegment` entries under
+  `cn=topology,cn=ipa,cn=etc,<basedn>`. Membership and topology are
+  refreshed every five intervals; a failed read retains its previous set.
+  An empty topology is not replaced with all masters. A neighbor without
+  kuipa answers `404` and is retried when selected again.
 * **Server identities.** Every IPA server holds the key of its own
   Kerberos service principal `ipa-ku/<fqdn>@REALM` in the daemon's keytab
   (`keytab` and `principal` in the configuration). The same key serves both
@@ -435,9 +439,9 @@ stop verifying when the vouches they come from expire, within 7 days.
 
 #### 4.2.1 Repair
 
-Each server repairs with up to four peers per round (`peer_interval`) or
-local change, rotating through the members, and with every member every
-ten rounds. Outgoing repairs run at most `max(1, 16 / (members − 1))` at a
+Each server repairs with up to four neighbors per round (`peer_interval`) or
+local change, rotating through them, and with every neighbor every ten
+intervals. Outgoing repairs run at most `max(1, 16 / (members − 1))` at a
 time, plus one slot for each repair running longer than a second, up to 16;
 a server handles at most 16 incoming repairs and answers `503` beyond
 that. Busy answers (`503`, `429`) get up to three delayed retries; a `409`

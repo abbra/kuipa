@@ -379,6 +379,10 @@ impl Directory for KdcDirectory {
         Ok(self.servers.clone())
     }
 
+    fn topology_peers(&self, _: &str) -> Result<Vec<String>, DirectoryError> {
+        self.servers()
+    }
+
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         self.accept(token, cb)
     }

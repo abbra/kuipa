@@ -46,7 +46,7 @@ pub struct Config {
     /// servers found in LDAP (§4.2).
     #[serde(default)]
     pub peers: Vec<String>,
-    /// Find peers among the IPA servers in LDAP (`cn=masters`).
+    /// Discover IPA members and their directly connected topology peers.
     #[serde(default = "default_true")]
     pub discover_peers: bool,
     /// Base URLs of peers by FQDN, instead of `https://<fqdn>`.
