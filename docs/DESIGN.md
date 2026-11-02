@@ -2626,7 +2626,7 @@ IPAR  realm old(32) new(32) iat(u64) exp(u64)                                   
 IPSR  old_key(JWK) succession(IPAR) signature                                    signed succession (exchange form)
 IPAE  realm seq(u64) prev(48) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-384` of them under a domain-separation context, in every profile; `prev` is the previous entry's head, `0…0` for the first)
 IEPS  entry(IPAE) signature n(u64) [key(JWK) signature]                    signed anchor epoch entry
-IPAS  n(u64) [tag(1) value]                                                      exchange state (1 key, 2 claim, 3 vouch, 4 succession)
+IPAS  version 1: n(u64) [tag(1) value]                                           exchange state (1 key, 2 claim, 3 vouch, 4 succession)
 IPVM  realm fqdn hostgroup not_before(u64) not_after(u64) binding             voucher message (no version; binding: empty, 32 or 48 bytes)
 IPVO  key(32) realm fqdn hostgroup not_before(u64) not_after(u64) binding
       salt(32) signature                                                         voucher
