@@ -51,11 +51,17 @@ per server, at install.
 
 Print this server's anchor thumbprint.
 
-## enrollment-string [--days _N_] [--config _FILE_]
+## enrollment-string [--days _N_] [--head] [--config _FILE_]
 
 Print the enrollment string *ipa-ku1:REALM:<anchor>:<expiry>*, to
 which a host appends *:OTP* to enroll (see *kuipa*(1)).  Default
 validity 7 days, at most 400.
+
+With *--head*, print the *ipa-ku2* form, which also pins this anchor's
+current vouch head: the host then checks a server's claim with an
+inclusion proof alone, with no signature (§4.9).  Fails when the stored
+delegation carries no vouch by this anchor; wait for the next exchange
+round.
 
 ## rotate-anchor [--days _N_] [--config _FILE_]
 
