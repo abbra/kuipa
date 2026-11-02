@@ -83,7 +83,7 @@ enum Command {
     },
     /// Blind a voucher for a host; print the request for `sign`.
     Request {
-        /// The issuer's public JWK (printed by `keygen`).
+        /// File holding the issuer's public JWK (what `keygen` printed).
         #[arg(long, value_name = "FILE")]
         public: String,
         /// The realm the voucher admits a host to.

@@ -74,11 +74,11 @@ honest:
 
 ```sh
 # issuer, once
-kuipa-voucher keygen --key voucher.key            # give the public JWK to the IPA admins
+kuipa-voucher keygen --key voucher.key > voucher.pub.jwk   # give the JWK file to the IPA admins
 kuipa-voucher quota --quota quota.json --limit 500
 
 # provisioner, per instance
-kuipa-voucher request --public "$JWK" --realm EXAMPLE.TEST \
+kuipa-voucher request --public voucher.pub.jwk --realm EXAMPLE.TEST \
     --fqdn web-17.example.test --hostgroup webservers --days 1 --state web-17.state > req
 #   … the issuer runs:  kuipa-voucher sign --key voucher.key --quota quota.json < req > rsp
 kuipa-voucher finish --state web-17.state < rsp > web-17.voucher
