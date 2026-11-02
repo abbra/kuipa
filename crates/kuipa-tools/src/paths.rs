@@ -705,11 +705,6 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
         let frozen = rest.last().is_some_and(|f| *f == "frozen");
         if frozen {
             rest.pop();
-            if rest.is_empty() {
-                // Frozen pins a head (DESIGN-claim-logs.md §2): what
-                // the head covers is what the pin accepts.
-                return Err(format!("{}: frozen without a head in {l:?}", path.display()).into());
-            }
         }
         let (exp, heads) = match rest.as_slice() {
             [] => (None, Vec::new()),
@@ -735,6 +730,13 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
             }
         };
         check_window(&heads, l, path)?;
+        if frozen && heads.is_empty() {
+            // Frozen pins a head (DESIGN-claim-logs.md §2): what the
+            // head covers is what the pin accepts, so a frozen pin with
+            // no head — even one with an expiry — must fail at parse,
+            // not refuse every server at runtime.
+            return Err(format!("{}: frozen without a head in {l:?}", path.display()).into());
+        }
         if heads.len() > MAX_HEAD_WINDOW {
             return Err(format!(
                 "{}: more than {MAX_HEAD_WINDOW} heads in {l:?}",
@@ -1110,8 +1112,9 @@ mod tests {
                 root(5)
             ),
             format!("{a} 1 {} 2\n", root(1)),
-            // Frozen needs heads.
+            // Frozen needs heads, with or without an expiry.
             format!("{a} frozen\n"),
+            format!("{a} {} frozen\n", now + 3600),
             // A number is digits only: `u64::from_str` accepts a leading
             // `+`, a pin file does not (§4.4).
             format!("{a} +5\n"),
