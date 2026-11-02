@@ -2,8 +2,8 @@
 //! `POST /ipa/ku/peer/sync`, each request authenticated with the sending
 //! server's `ipa-ku/<fqdn>` Kerberos key.
 //!
-//! Peers are the IPA servers found in LDAP (`cn=masters`) plus configured
-//! ones.
+//! Members are the IPA servers in LDAP (`cn=masters`) plus configured
+//! peers; outbound repair targets topology neighbors and configured peers.
 //! After every change the exchange renews this server's claim when
 //! due, has its anchor vouch for every claim it trusts (one signature over
 //! a Merkle tree), and publishes its claim, with every trusted anchor's
@@ -554,6 +554,8 @@ pub struct Exchange {
     /// Every member, this server included, and when the directory was last
     /// asked.
     members: Mutex<(BTreeSet<String>, Option<Instant>)>,
+    /// Outbound targets, independently refreshed from replication topology.
+    neighbors: Mutex<BTreeSet<String>>,
     /// Peers' own delegations from authenticated syncs.
     attested: Mutex<BTreeMap<String, Delegation>>,
     /// The anchor epoch log (§4.8).
@@ -690,7 +692,12 @@ impl Peers {
         loaded.rebase_generations(&clock);
         let state = Arc::new(RwLock::new(loaded));
         let chain = store.epoch()?;
-        let mut members: BTreeSet<String> = settings.peers.iter().cloned().collect();
+        let neighbors: BTreeSet<String> = settings
+            .peers
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let mut members = neighbors.clone();
         members.insert(settings.me.clone());
         let exchange = Arc::new(Exchange {
             client: http_client(&settings)?,
@@ -704,6 +711,7 @@ impl Peers {
             state: state.clone(),
             clock: clock.clone(),
             members: Mutex::new((members, None)),
+            neighbors: Mutex::new(neighbors),
             attested: Mutex::new(BTreeMap::new()),
             epoch: Mutex::new(chain.clone()),
             forked: AtomicBool::new(false),
@@ -846,10 +854,11 @@ impl Peers {
             lock(&self.exchange.uploads).retain(|peer, upload| {
                 members.contains(peer) && upload.updated.elapsed() < UPLOAD_LIFETIME
             });
-            pending.retain(|peer| members.contains(peer));
-            retries.retain(|peer, _| members.contains(peer));
+            let neighbors = self.exchange.neighbors();
+            pending.retain(|peer| neighbors.contains(peer));
+            retries.retain(|peer, _| neighbors.contains(peer));
             self.queue_repairs(
-                &members,
+                &neighbors,
                 &mut pending,
                 &active,
                 &retries,
@@ -1689,34 +1698,61 @@ impl Exchange {
         lock(&self.members).0.clone()
     }
 
-    /// Ask the directory for the server list at most every five rounds;
-    /// on failure keep the previous members.
+    fn neighbors(&self) -> BTreeSet<String> {
+        lock(&self.neighbors).clone()
+    }
+
+    /// Refresh membership and topology independently; retain either on failure.
     async fn refresh_members(&self) {
-        if !self.settings.discover
-            || lock(&self.members)
-                .1
-                .is_some_and(|t| t.elapsed() < self.settings.interval * 5)
-        {
+        if !self.settings.discover {
             return;
         }
-        let directory = self.directory.clone();
-        let servers = tokio::task::spawn_blocking(move || directory.servers()).await;
-        let mut members = lock(&self.members);
-        match servers {
-            Ok(Ok(servers)) => {
-                let mut set: BTreeSet<String> = servers
-                    .into_iter()
-                    .chain(self.settings.peers.iter().cloned())
-                    .map(|s| s.to_ascii_lowercase())
-                    .collect();
-                set.insert(self.settings.me.clone());
-                *members = (set, Some(Instant::now()));
+        {
+            let mut members = lock(&self.members);
+            if members
+                .1
+                .is_some_and(|t| t.elapsed() < self.settings.interval * 5)
+            {
+                return;
             }
-            Ok(Err(e)) => {
-                eprintln!("kuipad: anchor exchange: cannot list servers: {e}");
+            members.1 = Some(Instant::now());
+        }
+        let directory = self.directory.clone();
+        let hostname = self.settings.me.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            (directory.servers(), directory.topology_peers(&hostname))
+        })
+        .await;
+        let mut members = lock(&self.members);
+        match result {
+            Ok((servers, topology)) => {
+                if let Ok(servers) = servers {
+                    let mut set: BTreeSet<String> = servers
+                        .into_iter()
+                        .chain(self.settings.peers.iter().cloned())
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect();
+                    set.insert(self.settings.me.clone());
+                    members.0 = set;
+                } else if let Err(e) = servers {
+                    eprintln!("kuipad: anchor exchange: cannot list servers: {e}");
+                }
+                match topology {
+                    Ok(peers) => {
+                        *lock(&self.neighbors) = peers
+                            .into_iter()
+                            .chain(self.settings.peers.iter().cloned())
+                            .map(|s| s.to_ascii_lowercase())
+                            .collect();
+                    }
+                    Err(e) => eprintln!("kuipad: anchor exchange: cannot list topology peers: {e}"),
+                }
                 members.1 = Some(Instant::now());
             }
-            Err(e) => eprintln!("kuipad: anchor exchange: {e}"),
+            Err(e) => {
+                eprintln!("kuipad: anchor exchange: {e}");
+                members.1 = Some(Instant::now());
+            }
         }
     }
 
@@ -2263,6 +2299,55 @@ mod tests {
     }
 
     #[test]
+    fn topology_neighbors_propagate_state_across_multiple_hops() {
+        use agirru_crdt::Merge;
+
+        let clock = GenerationClock::new();
+        let key = SigningKey::generate_preferred().unwrap();
+        let mut states = [
+            AnchorState::default(),
+            AnchorState::default(),
+            AnchorState::default(),
+        ];
+        states[0]
+            .put(
+                Entry::Key(key.public().to_jwk_json()),
+                "R",
+                &Policy::default(),
+                now(),
+                &clock,
+            )
+            .unwrap();
+        let neighbors = [
+            BTreeSet::from(["b".to_string()]),
+            BTreeSet::from(["a".to_string(), "c".to_string()]),
+            BTreeSet::from(["b".to_string()]),
+        ];
+        let names = ["a", "b", "c"];
+        for source in 0..2 {
+            let mut cursor = None;
+            let targets = selected_peers(&neighbors[source], names[source], &mut cursor, true);
+            assert!(
+                targets
+                    .iter()
+                    .all(|target| target.as_str() != "c" || source == 1)
+            );
+            let snapshot = states[source].clone();
+            for target in targets {
+                let index = names
+                    .iter()
+                    .position(|name| *name == target.as_str())
+                    .unwrap();
+                states[index].merge(&snapshot, &clock);
+            }
+        }
+        assert_eq!(
+            states[0], states[2],
+            "the update must reach the non-neighbor through b"
+        );
+    }
+
+    #[test]
     fn repair_wire_rejects_tampered_snapshots_and_versions() {
         let state = AnchorState::default();
         let repair = repair_snapshot([7; 32], &state, true).unwrap();
@@ -2449,6 +2534,72 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TopologyDirectory {
+        servers: Mutex<Vec<String>>,
+        peers: Mutex<Option<Vec<String>>>,
+    }
+
+    impl Directory for TopologyDirectory {
+        fn join_with_otp(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &[Enctype],
+        ) -> Result<Keytab, DirectoryError> {
+            unreachable!()
+        }
+        fn join_with_gss(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &[u8; 32],
+            _: &[Enctype],
+        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
+            unreachable!()
+        }
+        fn rekey_with_gss(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &[u8; 32],
+            _: &[Enctype],
+        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
+            unreachable!()
+        }
+        fn stage_with_gss(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &[u8; 32],
+            _: &[Enctype],
+            _: &Staged,
+        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
+            unreachable!()
+        }
+        fn register_escrow(&self, _: &Principal, _: &[BindingHash]) -> Result<(), DirectoryError> {
+            unreachable!()
+        }
+        fn escrow_allowed(
+            &self,
+            _: &Principal,
+            _: escrow::Kind,
+            _: &BindingHash,
+        ) -> Result<bool, DirectoryError> {
+            unreachable!()
+        }
+        fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
+            unreachable!()
+        }
+        fn servers(&self) -> Result<Vec<String>, DirectoryError> {
+            Ok(lock(&self.servers).clone())
+        }
+        fn topology_peers(&self, _: &str) -> Result<Vec<String>, DirectoryError> {
+            lock(&self.peers)
+                .clone()
+                .ok_or_else(|| "topology unavailable".into())
+        }
+    }
     struct UnusedInitiator;
     impl Initiator for UnusedInitiator {
         fn token(&self, _: &str, cb: &[u8; 32]) -> Result<Vec<u8>, Error> {
@@ -3006,6 +3157,7 @@ mod tests {
             state: Arc::new(RwLock::new(AnchorState::default())),
             clock: GenerationClock::new(),
             members: Mutex::new((BTreeSet::new(), None)),
+            neighbors: Mutex::new(BTreeSet::new()),
             attested: Mutex::new(BTreeMap::new()),
             epoch: Mutex::new(Vec::new()),
             forked: AtomicBool::new(false),
@@ -3020,6 +3172,69 @@ mod tests {
             failures: Mutex::new(BTreeMap::new()),
         });
         (server, exchange)
+    }
+
+    #[tokio::test]
+    async fn topology_refresh_keeps_membership_and_preserves_failed_selection() {
+        let anchor = SigningKey::generate_preferred().unwrap();
+        let address = "127.0.0.1:1".parse().unwrap();
+        let (_, mut exchange) = bootstrap_exchange(&anchor, address, &std::env::temp_dir());
+        let directory = Arc::new(TopologyDirectory::default());
+        *lock(&directory.servers) = vec!["LOCAL".into(), "near".into(), "far".into()];
+        let x = Arc::get_mut(&mut exchange).unwrap();
+        x.settings.discover = true;
+        x.directory = directory.clone();
+        *lock(&x.members) = (BTreeSet::from(["local".into(), "peer".into()]), None);
+        *lock(&x.neighbors) = BTreeSet::from(["peer".into()]);
+
+        exchange.refresh_members().await;
+        assert_eq!(
+            exchange.members(),
+            BTreeSet::from(["local".into(), "near".into(), "far".into(), "peer".into()])
+        );
+        assert_eq!(
+            exchange.neighbors(),
+            BTreeSet::from(["peer".into()]),
+            "initial failure must not select all masters"
+        );
+
+        *lock(&directory.peers) = Some(vec!["NEAR".into()]);
+        lock(&exchange.members).1 = None;
+        exchange.refresh_members().await;
+        assert_eq!(
+            exchange.neighbors(),
+            BTreeSet::from(["near".into(), "peer".into()])
+        );
+        let mut cursor = None;
+        let neighbors = exchange.neighbors();
+        let selected = selected_peers(&neighbors, "local", &mut cursor, true)
+            .into_iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(selected, BTreeSet::from(["near".into(), "peer".into()]));
+        assert!(
+            exchange.members().contains("far"),
+            "non-neighbor remains admitted"
+        );
+
+        *lock(&directory.peers) = None;
+        lock(&exchange.members).1 = None;
+        exchange.refresh_members().await;
+        assert_eq!(
+            exchange.neighbors(),
+            selected,
+            "failure preserves the previous neighbors"
+        );
+
+        *lock(&directory.peers) = Some(vec![]);
+        lock(&exchange.members).1 = None;
+        exchange.refresh_members().await;
+        assert_eq!(
+            exchange.neighbors(),
+            BTreeSet::from(["peer".into()]),
+            "successful empty topology removes old neighbors"
+        );
+        assert!(exchange.members().contains("far"));
     }
 
     async fn check_epoch_catch_up(

@@ -140,9 +140,10 @@ files and runs an hourly watch against two servers adds about
 Servers repair their claims and vouches with each other (DESIGN §4.2.1)
 over `POST /ipa/ku/peer/sync`, authenticated with their Kerberos keys.
 
-- **Who talks to whom.** Every `peer_interval` (60 s by default) or local
-  change, a server repairs with four rotating peers; every ten intervals,
-  with all of them.
+- **Who talks to whom.** A server selects up to four rotating directly
+  connected IPA topology neighbors or configured peers every `peer_interval`
+  (60 s by default) or local change; an independent timer selects all of
+  those peers every ten intervals.
 - **A quiet repair is a probe.** Two servers in the same state compare
   digests. With a real KDC and cached peer context, a probe request is about
   1.1 KB, mostly the Kerberos token, and its answer about 70 bytes (measured,
@@ -190,7 +191,9 @@ For comparison, in the full-mesh workload with at least five servers, the
 routine timer selects four peers per minute, and the sweep selects every
 other server every ten minutes. At 1.1 KB a probe this is approximately
 6.3 MB a day sent per server for routine probes, plus 9.4 MB (60 servers) or
-47 MB (300 servers) for sweeps. Overlapping pending repairs are deduplicated, so actual traffic
+47 MB (300 servers) for sweeps. A sparse IPA topology selects only direct
+neighbors, so its sweep traffic and propagation time differ.
+Overlapping pending repairs are deduplicated, so actual traffic
 can be lower; retries and local changes add traffic. Each server also receives
 roughly as many requests (computed).
 The final 300-replica update sweep in this loopback run took 1.71 s

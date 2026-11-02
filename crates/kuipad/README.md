@@ -15,9 +15,10 @@ Its jobs are to:
 It works on the directory through 389-ds over LDAPI and GSSAPI. It can
 also act as a general post-quantum Tang server, under `/ipa/ku/tang`.
 
-Ordinary repair contacts up to four rotating peers per interval or local
-change; an independent timer schedules every known peer every ten intervals.
-The complete membership remains available for authentication and admission.
+Ordinary repair contacts up to four rotating IPA topology neighbors or
+configured peers per interval or local change; an independent timer selects
+all of those neighbors every ten intervals. Full IPA membership remains
+available for authentication and admission, including transitive claims.
 The outgoing concurrency starts at `max(1, 16 / (members - 1))`. Each
 repair running longer than one second temporarily opens another slot, up to
 16 total, so a stalled peer cannot indefinitely block other work. Incoming

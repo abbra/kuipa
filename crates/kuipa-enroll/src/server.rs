@@ -202,6 +202,16 @@ pub trait Directory {
     /// Any failure.
     fn servers(&self) -> Result<Vec<String>, DirectoryError>;
 
+    /// Direct replication topology neighbors of `hostname`.
+    ///
+    /// # Errors
+    ///
+    /// Any failure, including when topology discovery is unsupported.
+    fn topology_peers(&self, hostname: &str) -> Result<Vec<String>, DirectoryError> {
+        let _ = hostname;
+        Err("topology discovery is not supported by this directory".into())
+    }
+
     /// Accept a user's (or any principal's) GSS-API token bound to `cb`,
     /// for seal operations and the ticket factor (§7.6).
     ///
@@ -716,6 +726,9 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn servers(&self) -> Result<Vec<String>, DirectoryError> {
         (**self).servers()
+    }
+    fn topology_peers(&self, hostname: &str) -> Result<Vec<String>, DirectoryError> {
+        (**self).topology_peers(hostname)
     }
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         (**self).accept_peer(token, cb)
