@@ -40,13 +40,13 @@ struct Runtime {
 }
 
 fn should_drop(sender: usize, receiver: usize, round: u64) -> bool {
-    let mut x = 2119_u64
-        ^ (sender as u64).wrapping_mul(0x9e3779b97f4a7c15)
-        ^ (receiver as u64).wrapping_mul(0xbf58476d1ce4e5b9)
-        ^ round.wrapping_mul(0x94d049bb133111eb);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    (x ^ (x >> 31)) % 10 == 0
+    let mut x = 0x0847_u64
+        ^ (sender as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (receiver as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ round.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (x ^ (x >> 31)).is_multiple_of(10)
 }
 
 impl Transport<usize> for Runtime {
@@ -90,22 +90,24 @@ impl Transport<usize> for Runtime {
 }
 
 impl Membership<usize> for Runtime {
-    async fn peers(&self) -> Vec<usize> {
-        (0..self.nodes.lock().unwrap().len())
-            .filter(|id| *id != self.id)
-            .collect()
+    fn peers(&self) -> impl Future<Output = Vec<usize>> {
+        std::future::ready(
+            (0..self.nodes.lock().unwrap().len())
+                .filter(|id| *id != self.id)
+                .collect(),
+        )
     }
 }
 
 impl Storage<AnchorState> for Runtime {
     type Error = std::io::Error;
 
-    async fn load(&self) -> Result<AnchorState, Self::Error> {
-        Ok(AnchorState::default())
+    fn load(&self) -> impl Future<Output = Result<AnchorState, Self::Error>> {
+        std::future::ready(Ok(AnchorState::default()))
     }
 
-    async fn persist_full(&self, _: &AnchorState) -> Result<(), Self::Error> {
-        Ok(())
+    fn persist_full(&self, _: &AnchorState) -> impl Future<Output = Result<(), Self::Error>> {
+        std::future::ready(Ok(()))
     }
 }
 
@@ -229,6 +231,10 @@ async fn round(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "benchmark measures a complete replication lifecycle"
+)]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "measurement"]
 async fn measure_replication_baseline() {
@@ -293,7 +299,7 @@ async fn measure_replication_baseline() {
                 node.run_with(|_| {
                     let _ = tx.send(id);
                 })
-                .await
+                .await;
             }));
         }
         let startup = round(&nodes, &mut rx, &counts).await;
