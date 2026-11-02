@@ -29,12 +29,14 @@ channel you trust: it is what the host authenticates the realm with.
 The `--head` form also pins the anchor's **vouch head**: a checkpoint of
 the claims every server of the realm was vouched for at issue time. A
 host holding it checks a server's proof against that checkpoint with no
-signature at all — the advertisement it fetches carries no anchor key
-and no signature, only the claim's inclusion path. The head is pinned
-through the same channel as the thumbprint and is only as fresh: the
-realm keeps working past it (servers answer with a normal signed proof
-once the head is stale), so `--head` is a size and speed optimisation,
-not a stronger pin.
+signature at all — for that anchor the advertisement it fetches carries
+no anchor key and no signature, only the claim's inclusion path; a second
+pinned anchor's head replaces its signature the same way, and only an
+anchor whose head you do not hold answers by signature. The head is
+pinned through the same channel as the thumbprint and is only as fresh:
+the realm keeps working past it (servers answer with a normal signed
+proof once the head is stale), so `--head` is a size and speed
+optimisation, not a stronger pin.
 
 * **Keep strings short-lived.** `--days 1` is plenty for interactive
   installs; the most is 400. The expiry is what makes an old string (left
