@@ -79,24 +79,22 @@ inherits the old key's protection without forward secrecy (§6).
 
 ## 3. Architecture
 
-```
-          enrollment string: realm + anchor thumbprint (+ OTP or bundle secret)
-                                     │ out of band
-                                     ▼
- host                                                         IPA server
- kuipa enroll ─── GET  /ipa/ku/adv?anchor=… ─────────────▶ httpd ─▶ kuipad
-               ◀── realm advertisement (ML-DSA JWS) ──────           (Unix socket,
-               ─── POST /ipa/ku/join/{kid} ───────────────▶            socket-activated)
-               ◀── keytab + CA chain + config, sealed ────                 │ LDAPI, GSSAPI
-                                                                           ▼
- kuipa rotate-keys ── POST /ipa/ku/rekey/{kid} ──────────▶        389-ds: bind, join,
- kuipa-unseal ─────── POST /ipa/ku/rec/{kid} ────────────▶        KEYTAB_GET, attributes
- kuipa protect ────── POST /ipa/ku/register/{kid} ───────▶
- (administrator) ───── POST /ipa/ku/stage/{kid} ──────────▶
- clevis (tang-pqc) ─── GET/POST /ipa/ku/tang/… ───────────▶        Tang keys only (§11.5)
-
- provisioner ◀── blinded μ / σ, out of band ──▶ voucher issuer (kuipa-voucher, §9)
-other IPA servers ◀── POST /ipa/ku/peer/sync (digest-first repair, Kerberos) ──▶ kuipad
+```mermaid
+flowchart LR
+    enrollment["Enrollment string: realm, anchor thumbprint,<br/>optional OTP or bundle secret"] -. "out of band" .-> host["Host"]
+    host -- "enroll: GET /ipa/ku/adv?anchor=…" --> httpd["httpd"]
+    httpd -- "realm advertisement (ML-DSA JWS)" --> host
+    host -- "enroll: POST /ipa/ku/join/{kid}" --> httpd
+    httpd -- "sealed keytab, CA chain and config" --> host
+    host -- "rotate-keys: POST /ipa/ku/rekey/{kid}" --> httpd
+    host -- "kuipa-unseal: POST /ipa/ku/rec/{kid}" --> httpd
+    host -- "protect: POST /ipa/ku/register/{kid}" --> httpd
+    admin["Administrator"] -- "POST /ipa/ku/stage/{kid}" --> httpd
+    clevis["Clevis (tang-pqc)"] -- "GET/POST /ipa/ku/tang/… (Tang keys only, §11.5)" --> httpd
+    httpd -- "Unix socket; socket-activated" --> kuipad["kuipad"]
+    kuipad -- "LDAPI, GSSAPI: bind, join,<br/>KEYTAB_GET, attributes" --> ds["389-ds"]
+    provisioner["Provisioner"] <-- "blinded μ / σ, out of band" --> issuer["Voucher issuer (kuipa-voucher, §9)"]
+    peers["Other IPA servers"] <-- "POST /ipa/ku/peer/sync<br/>digest-first repair, Kerberos" --> kuipad
 ```
 
 ### 3.1 Workspace
@@ -1061,24 +1059,16 @@ ML-KEM-1024. Every derivation uses a protocol domain (`tang-pqc`
 parts`. The join domain is `ipa-ku-enroll/v1`. Every AES-256-GCM key
 encrypts exactly one message, so the nonce is fixed at zero.
 
-```
-Client (advertisement verified: kid, ek_kid, signer thumbprint thp)    Server (dk_kid)
-(ct, ss)     = ML-KEM.Encaps(ek_kid)
-(dk_e, ek_e) = ML-KEM.KeyGen()
-T  = H(op ‖ alg ‖ kid ‖ thp ‖ realm ‖ fqdn ‖ auth_type ‖ enctypes ‖ H(ct) ‖ H(ek_e))
-     op = "join" | "rekey" | "stage", fixed by the endpoint
-cb = HKDF(ss, "cb", T)                     GSS-API channel binding (32 bytes)
-k  = HKDF(ss, "req", T)
-     ── Request(alg, kid, realm, fqdn, auth_type, enctypes, ct, ek_e, GCM_k(body)) ──▶
-                                                ss = ML-KEM.Decaps(dk_kid, ct)
-                                                recompute T, k, cb; open body; authorise
-                                                (ct_e, ss_e) = ML-KEM.Encaps(ek_e)
-                                                k' = HKDF(ss ‖ ss_e [‖ kb], "rsp", H(T ‖ H(ct_e)))
-     ◀── Response(ct_e, GCM_k'(payload)) ──
-ss_e = ML-KEM.Decaps(dk_e, ct_e); open; check principal and CA chain
-
-kb = GSS_Pseudo_random(ctx, GSS_C_PRF_KEY_FULL, "ipa-ku-enroll/v1 rsp" ‖ cb, 32)
-     for auth_type Kerberos only; ctx is the authenticator's GSS-API context
+```mermaid
+sequenceDiagram
+    participant C as Client (verified kid, ek_kid, signer thumbprint thp)
+    participant S as Server (dk_kid)
+    Note over C: (ct, ss) = ML-KEM.Encaps(ek_kid)<br/>(dk_e, ek_e) = ML-KEM.KeyGen()<br/>T = H(op ‖ alg ‖ kid ‖ thp ‖ realm ‖ fqdn ‖ auth_type ‖ enctypes ‖ H(ct) ‖ H(ek_e))<br/>op = join, rekey or stage, fixed by endpoint<br/>cb = HKDF(ss, "cb", T), GSS-API channel binding (32 bytes)<br/>k = HKDF(ss, "req", T)
+    C->>S: Request(alg, kid, realm, fqdn, auth_type, enctypes, ct, ek_e, GCM_k(body))
+    Note over S: ss = ML-KEM.Decaps(dk_kid, ct)<br/>recompute T, k, cb and open body and authorise<br/>(ct_e, ss_e) = ML-KEM.Encaps(ek_e)<br/>k' = HKDF(ss ‖ ss_e [‖ kb], "rsp", H(T ‖ H(ct_e)))
+    S-->>C: Response(ct_e, GCM_k'(payload))
+    Note over C: ss_e = ML-KEM.Decaps(dk_e, ct_e)<br/>open and check principal and CA chain
+    Note over C,S: Kerberos auth_type only: kb = GSS_Pseudo_random(ctx, GSS_C_PRF_KEY_FULL, "ipa-ku-enroll/v1 rsp" ‖ cb, 32)<br/>ctx is the authenticator's GSS-API context
 ```
 
 * `ss` authenticates the server implicitly: only the holder of `dk_kid`, a
@@ -2841,19 +2831,16 @@ The trust itself — the cross-realm `krbtgt` keys from a shared secret, and
 each realm's anchors in the other's `trusts` — is set up with the same
 machinery, B inviting and a server of A answering:
 
-```text
-B: kuipad trust-invitation   →  ipa-ku-trust1:<REALM-B>:<B anchor>:<one-time secret>
-A: kuipad establish-trust --invitation-file F --server <B server>…
-
-(ct, ss)     = Encaps(ek_trust)            (dk_e, ek_e) = KeyGen()
-T  = H("IPTT" ‖ alg ‖ kid ‖ B signer ‖ realm B ‖ realm A ‖ H(ct) ‖ H(ek_e))
-k  = HKDF(ss, "req" ‖ T)
-     ── POST /ipa/ku/trust/{kid}: IPTQ(alg, kid, realm B, realm A, ct, ek_e,
-          GCM_k(secret, A's realm, A's delegation, A's server key,
-                ML-DSA(A's server key, T, "ipa-ku-trust/v1 request"))) ──▶
-(ct_e, ss_e) = Encaps(ek_e)                T' = H(T ‖ H(ct_e))
-k' = HKDF(ss ‖ ss_e, "rsp" ‖ T')           trust secret = HKDF(ss ‖ ss_e, "trust-secret" ‖ T')
-     ◀── IPTS(ct_e, GCM_k'(B's realm)) ──
+```mermaid
+sequenceDiagram
+    participant A as Realm A server
+    participant B as Realm B server
+    Note over B: kuipad trust-invitation<br/>ipa-ku-trust1:REALM-B:B anchor:one-time secret
+    B-->>A: Invitation, out of band
+    Note over A: kuipad establish-trust --invitation-file F --server B<br/>(ct, ss) = Encaps(ek_trust)<br/>(dk_e, ek_e) = KeyGen()<br/>T = H("IPTT" ‖ alg ‖ kid ‖ B signer ‖ realm B ‖ realm A ‖ H(ct) ‖ H(ek_e))<br/>k = HKDF(ss, "req" ‖ T)
+    A->>B: POST /ipa/ku/trust/{kid}: IPTQ(alg, kid, realm B, realm A, ct, ek_e, GCM_k(secret, A's realm, A's delegation, A's server key, ML-DSA(A's server key, T, "ipa-ku-trust/v1 request")))
+    Note over B: (ct_e, ss_e) = Encaps(ek_e)<br/>T' = H(T ‖ H(ct_e))<br/>k' = HKDF(ss ‖ ss_e, "rsp" ‖ T')<br/>trust secret = HKDF(ss ‖ ss_e, "trust-secret" ‖ T')
+    B-->>A: IPTS(ct_e, GCM_k'(B's realm))
 ```
 
 * **Invitation.** It carries B's realm, an anchor of B and a 256-bit
