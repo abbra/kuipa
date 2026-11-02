@@ -40,7 +40,9 @@ pub enum Mode {
     MachineKey,
     /// B: encrypted under a secret delivered by a second channel.
     Secret,
-    /// C: signed only; requires an explicit opt-in to create and open.
+    /// C: signed only; requires an explicit opt-in to open (DESIGN.md
+    /// §8.2: as safe as a copied keytab, so the lab choice is the
+    /// reader's to make).
     SignedOnly,
 }
 

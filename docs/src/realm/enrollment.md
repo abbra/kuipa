@@ -123,7 +123,9 @@ The host opens the bundle offline and finishes at first contact.
 * **mode A**: sealed to a key the host made (`kuipa prepare` prints it);
 * **mode B**: sealed under a secret carried in the enrollment string,
   so the bundle and the string can travel separately;
-* **mode C**: signed only, for labs.
+* **mode C**: signed only, for labs: the keys travel as safely as a copied
+  keytab, so `kuipa enroll --bundle` opens one only with
+  `--insecure-signed-only`.
 
 The staged keys expire at the time you choose, enforced by the KDC. The
 `ipa host-add --pq-stage` command that stages a host is part of the
