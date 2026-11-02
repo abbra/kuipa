@@ -98,13 +98,18 @@ what they did visible.
 
 ## 4. The release
 
-The recovery request gains an optional field, the release request id, in
-a new version of `IPEQ` (DESIGN.md §7.6.5):
+The recovery request carries the release request id in `IPEQ` version 2;
+version 3 also carries a passkey assertion (DESIGN.md §7.6.5). Variable
+fields are length-prefixed and may be empty where marked optional:
 
 ```text
-IPEQ v2 = P ‖ V ‖ t_i ‖ RecoveryRequest ‖ device id ‖ [GSS-API token]
-          ‖ [WebAuthn assertion] ‖ [session token] ‖ [release request id]
+IPEQ v1 = P ‖ V ‖ t_i ‖ RecoveryRequest ‖ device id ‖ session token ‖ GSS-API token
+IPEQ v2 = P ‖ V ‖ t_i ‖ RecoveryRequest ‖ device id ‖ session token ‖ GSS-API token ‖ release request id
+IPEQ v3 = P ‖ V ‖ t_i ‖ RecoveryRequest ‖ device id ‖ session token ‖ GSS-API token ‖ optional release request id ‖ WebAuthn assertion
 ```
+
+The device id, session token and GSS-API token may be empty. The v2 release
+id is fixed at 16 bytes; in v3 it is a length-prefixed field, empty or 16 bytes.
 
 For a seal with `approvals`, after its other checks (§7.6.5 step 3, the
 opener of §7.6.12), the server also requires:
