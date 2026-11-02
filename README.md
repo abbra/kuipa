@@ -48,9 +48,9 @@ In short: **Kuipa knots your FreeIPA realm with quantum-resistant security.**
 * **Offline enrollment:** an administrator stages a host and its keys in
   advance. The host enrolls from a sealed, signed bundle with no network
   access.
-* **No single point of trust:** each server holds its own anchor. The
-  servers vouch for each other through an exchange authenticated with
-  their Kerberos keys, and anchors can be rotated. A host that knows two
+* **No single point of trust:** anchor servers hold their own anchors and
+  vouch for trusted servers through an exchange authenticated with
+  their Kerberos keys. Anchors can be rotated. A host that knows two
   of a realm's anchors demands the claim proven by two distinct ones, so
   a server built on a single stolen anchor is refused. A host that has
   seen the realm once also keeps a watermark over the realm's anchor

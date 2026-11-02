@@ -8,11 +8,11 @@ may use classical cryptography and might be attacked by a cryptographically
 relevant quantum computer (CRQC), and a host joining for the first time
 has no CA yet.
 
-Instead, each IPA server holds an **anchor**: an ML-DSA key that stays on
-the server. Anchors vouch for servers: every minute (by default) the servers run
-an **anchor exchange**, authenticated with their own Kerberos keys, in
-which each anchor signs a statement that lists the servers it trusts. A
-server publishes its **advertisement** (`GET /ipa/ku/adv`): its keys, the
+Instead, an anchor server holds an **anchor**: an ML-DSA key that stays on
+the server. Servers run an **anchor exchange**, authenticated with their
+own Kerberos keys, every minute by default. Anchors sign statements listing
+the servers they trust and renew those statements as needed.
+A server publishes its **advertisement** (`GET /ipa/ku/adv`): its keys, the
 realm's configuration and CA, signed by the server and carrying the
 anchors' vouches for it.
 

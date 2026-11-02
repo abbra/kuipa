@@ -166,7 +166,7 @@ already uses one executable per confined domain, e.g. the Custodia helpers):
 
 | key | type | where | role |
 |---|---|---|---|
-| anchor | ML-DSA-65 (ML-DSA-87 under CNSA 2.0) | every server, its own | vouches for its own server's claim and every claim it trusts; clients pin anchor thumbprints |
+| anchor | ML-DSA-65 (ML-DSA-87 under CNSA 2.0) | each anchor server, its own | vouches for its own server's claim and every claim it trusts; clients pin anchor thumbprints |
 | server signing key | ML-DSA, same set | every server | signs that server's advertisement and bundles |
 | join keys | ML-KEM-768 (ML-KEM-1024 under CNSA 2.0) | every server | join, rekey and stage requests |
 | escrow keys | ML-KEM, same set | every server | sealed-keytab bindings |
@@ -175,9 +175,9 @@ already uses one executable per confined domain, e.g. the Custodia helpers):
 | Tang signing and exchange keys | ML-DSA and ML-KEM | any server that serves Tang | the general post-quantum Tang service (§11.5), nothing else |
 | `ipa-ku/<fqdn>` Kerberos key | the realm's enctypes | every server's keytab | the daemon's GSS-API identity: accepts client tokens, authenticates anchor exchange syncs |
 
-There is no realm-wide anchor and no anchor server: every server creates
-its own anchor at installation, and no private key ever leaves the server
-that made it. Join and escrow keys are distinct keys with distinct
+There is no realm-wide anchor: by default each server has its own, but
+servers can run without the anchor role (§4.2). No anchor private key
+leaves the server that made it. Join and escrow keys are distinct keys with distinct
 protocol domains, and never Tang keys; trust keys likewise. Private keys
 are seed-form JWKs in the daemon's key directory (§11.2); public keys need
 no confidentiality. Join, escrow and trust keys rotate with
