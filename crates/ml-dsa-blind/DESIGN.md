@@ -62,17 +62,15 @@ module signing μ directly. The protocol builds on this.
 **Public parameters:** signer public key `pk`, optional context string
 `ctx` (≤ 255 bytes).
 
-```
-Requester(pk, ctx, m)                               Signer(sk)
-salt ←$ {0,1}^256         (OpenSSL private DRBG)
-tr   = SHAKE256(pk, 64)
-μ    = SHAKE256(tr ‖ 0x00 ‖ |ctx| ‖ ctx ‖ salt ‖ m, 64)
-                       ───────── μ (64 B) ─────────▶
-                                                    authorise the request
-                                                    σ = ML-DSA.Sign(sk, μ)   [OpenSSL, mu=1]
-                       ◀──────── σ ────────────────
-require ML-DSA.Verify(pk, μ, σ)   [OpenSSL, mu=1]
-output  (salt, σ)
+```mermaid
+sequenceDiagram
+    participant R as Requester (pk, ctx, m)
+    participant S as Signer (sk)
+    Note over R: salt sampled from 256 bits (OpenSSL private DRBG)<br/>tr = SHAKE256(pk, 64)<br/>μ = SHAKE256(tr ‖ 0x00 ‖ |ctx| ‖ ctx ‖ salt ‖ m, 64)
+    R->>S: μ (64 B)
+    Note over S: authorise the request<br/>σ = ML-DSA.Sign(sk, μ) (OpenSSL, mu=1)
+    S-->>R: σ
+    Note over R: require ML-DSA.Verify(pk, μ, σ) (OpenSSL, mu=1)<br/>output (salt, σ)
 ```
 
 **Verification.** `(salt, σ)` is a valid blind signature on `m` iff

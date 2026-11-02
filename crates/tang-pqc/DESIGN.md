@@ -138,20 +138,17 @@ and a stateless server cannot tell the difference. Every property in §4 and
 
 ### 3.3 Recovery (Clevis `decrypt`)
 
-```
-Client                                              Server
-           ── GET /key/{kid} ──▶
-           ◀── ek_kid (public JWK) ──
-require thumbprint(ek_kid) == kid
-(ct_t, ss_t)  = ML-KEM.Encaps(ek_kid)
-k_req ‖ k_rsp = HKDF(ss_t, "tang-pqc/v1 transport" ‖ alg ‖ kid ‖ H(ct_t), L = 64)
-           ── RecoveryRequest(alg, kid, ct_t, AES-256-GCM_k_req(ct)) ──▶
-                                                    ss_t = ML-KEM.Decaps(dk_kid, ct_t)
-                                                    ct   = Open_k_req(...)   (else refuse)
-                                                    ss   = ML-KEM.Decaps(dk_kid, ct)
-           ◀── RecoveryResponse(AES-256-GCM_k_rsp(ss)) ──
-ss = Open_k_rsp(...)
-K ‖ confirm' = HKDF(ss ‖ r, ...);  require confirm' == confirm  (constant time)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: GET /key/{kid}
+    S-->>C: ek_kid (public JWK)
+    Note over C: require thumbprint(ek_kid) == kid<br/>(ct_t, ss_t) = ML-KEM.Encaps(ek_kid)<br/>k_req ‖ k_rsp = HKDF(ss_t, "tang-pqc/v1 transport" ‖ alg ‖ kid ‖ H(ct_t), L = 64)
+    C->>S: RecoveryRequest(alg, kid, ct_t, AES-256-GCM_k_req(ct))
+    Note over S: ss_t = ML-KEM.Decaps(dk_kid, ct_t)<br/>ct = Open_k_req(...) (else refuse)<br/>ss = ML-KEM.Decaps(dk_kid, ct)
+    S-->>C: RecoveryResponse(AES-256-GCM_k_rsp(ss))
+    Note over C: ss = Open_k_rsp(...)<br/>K ‖ confirm' = HKDF(ss ‖ r, ...)<br/>require confirm' == confirm (constant time)
 ```
 
 **Sealed request.** The binding's ciphertext `ct` never appears on the
