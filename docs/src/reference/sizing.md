@@ -155,8 +155,8 @@ over `POST /ipa/ku/peer/sync`, authenticated with their Kerberos keys.
 - **What changes.** A server's claim renews at two thirds of its 90-day
   validity, every 60 days, and every anchor then vouches again. Each
   anchor also vouches again at half of a vouch's 7-day validity, every
-  3.5 days. A vouch is a 3.3 KB signature plus 32 bytes per claim it
-  covers (computed).
+  3.5 days. A vouch has a 3.3 KB signature plus its claim log; the log
+  also retains earlier claims and tombstones, so it grows with history.
 
 | realm | exchange state per server | |
 |---|---|---|
