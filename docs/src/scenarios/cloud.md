@@ -93,7 +93,10 @@ What this buys you:
 * a compromised autoscaler can join at most the issuer's remaining quota of
   hosts, and every voucher names one hostname and expires (`--days`);
 * a voucher creates its host once: it cannot be replayed, and it cannot
-  take over a host that already exists;
+  take over a host that already exists. The spent record lives on the host
+  entry, so `ipa host-del` frees the voucher to create that host again —
+  delete the entry only once the voucher naming it has expired, or an
+  autoscaler holding that voucher could create it a second time;
 * the issuer's records reveal nothing about your fleet's names.
 
 **User-data is readable.** Anyone allowed to read the instance's metadata
