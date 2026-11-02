@@ -409,12 +409,14 @@ wire protocol are kuipa's.
   | 10 | 65 KB | 7.6 KB |
   | 60 | 489 KB | 7.7 KB |
 
-  Per server, the state holds an anchor key (2.7 KB as JWK), a claim
-  (about 100 bytes) and a vouch (a 3.3 KB signature and 32 bytes per
-  vouched claim): it grows with the number of servers, plus 32 bytes per
-  pair. A renewal costs one new vouch per anchor, batched per round, so
-  short-lived claims stay cheap. Repair moves only the changed entries
-  (§4.2.1); measured traffic is in the sizing reference.
+  With every server an anchor, the state holds an anchor key (2.7 KB as
+  JWK), a claim (about 100 bytes) and a vouch (a 3.3 KB signature plus
+  its claim log) per server. The measurements describe the fixture's log;
+  claim renewals and removals append entries and tombstones, so vouches can
+  grow over time even if the number of servers stays fixed (§4.9.1).
+  A renewal leads anchors to re-vouch, batched per round. Selective repair moves changed entries and
+  the keys needed to admit vouches; its size limits can instead trigger a
+  whole-state transfer (§4.2.1). Measured traffic is in the sizing reference.
 
 * **Anchor role.** A server configured with `"anchor": false` holds no
   anchor: it makes claims without one (its claim's anchor field is all
@@ -877,10 +879,9 @@ member is 7.5 KB with ML-DSA-65 and 10.1 KB with ML-DSA-87, of which
 the anchor JWK (2.7 KB) and the ML-DSA signature (3.3 KB raw, 4.4 KB
 base64url) are almost everything; the exchange state is 55 KB (60
 servers, 6 anchors) to 489 KB (60 anchors), and every changed vouch
-the repair moves carries its signature and, to a peer without it, its
-anchor's key. A certificate whose proof can skip
-the signature and the key would make the advertisement delegation a few
-hundred bytes and the exchange deltas mostly leaf lists. The Merkle
+the repair moves carries its signature and anchor key. A certificate whose proof can skip
+the signature and the key makes the client-facing delegation smaller;
+it does not remove those materials from peer repair. The Merkle
 Tree Certificates drafts call the mechanism that allows this a
 **landmark**: draft-ietf-plants-merkle-tree-certs §6.4 and §7.4 — a
 pre-distributed tree checkpoint a relying party holds, against which an
@@ -956,29 +957,22 @@ the delegation member to a few hundred bytes, advertisement to about
 21 KB (ML-DSA-65) — with no signature to make, the proof needs no
 freshness of its own.
 
-#### 4.9.3 Servers: the exchange is leaves
+#### 4.9.3 Servers: the exchange retains vouches
 
 On the servers nothing structural changes — `AnchorState`, the repair
 (§4.2.1), the Kerberos-authenticated syncs and the trust
-computation stay as they are. The `IPSV` entry keeps carrying the
-whole leaf list, in log order: a re-vouch that only appends keeps the
-previous log and adds to it, one that must drop a claim starts a new
-log, and the newest vouch of an anchor always carries its current
-log — so a peer that receives one can check and serve any prefix of
-it. A server that wants a leaf older than the vouch it holds fetches
-the pages it needs from the peer's public claim log (§4.9.5), as it
-fetches a missing anchor-log window today (§4.8). The anchor
-re-signs on the same schedule and cadence (§4.2).
+computation stay as they are. The `IPSV` entry carries the whole claim
+log in order. A re-vouch keeps the previous log, appends tombstones for
+dropped claims, and appends newly vouched claims; earlier heads remain
+prefixes (§4.9.1). The current vouch lets a peer check and serve those
+prefixes. The anchor re-signs on the same schedule and cadence (§4.2).
 
 A delegation served to a head-pinned client carries its head proof
 only, not the signature; the signature stays in the exchange and in
-delegations served to clients without heads. This is the size win on
-the wire between servers as well: per anchor per round the delta
-becomes the head (about 100 bytes) and the appended leaves (32 bytes
-per claim), with the 2.7 KB JWK and 3.3 KB signature sent only when
-the anchor itself changes — measured exchange sizes, minus the
-per-anchor signature cost per round: the state keeps one key, one
-current head and its signature per anchor, plus the claims.
+delegations served to clients without heads. Peer repair still transfers
+each selected changed vouch with its signature, complete current leaf list
+and anchor key (§4.2.1); head-pinned client proofs do not reduce that
+transfer to appended leaves.
 
 #### 4.9.4 How a head reaches a host
 
@@ -2692,10 +2686,10 @@ recovery request and response.
   SHA-256 under every policy (§4.1.1), as Clevis computes them. A CNSA
   thumbprint (SHA-384 of the JWK) would change every pin, kid and
   enrollment string, and Clevis metadata.
-* **Anchor exchange scale:** the state grows linearly with the number of
-  anchors; with every server an anchor, 60 servers make 489 KB of state and
-  321 KB of deltas per renewal round. Large realms should give the anchor
-  role to a few servers (6 of 60: 55 KB and 32 KB, §4.2).
+* **Anchor exchange scale:** state grows with the number of servers and
+  anchors, including the claims each vouch covers. With every server an
+  anchor, 60 servers hold 489 KB of state; with six anchors they hold
+  55 KB (§4.2). Repair traffic and benchmark limits are in the sizing reference.
 * **Merkle Tree Certificates:** vouches are tree heads over claims, with
   the same hashing and inclusion proofs as MTC. §4.9 designs the use of
   pre-distributed tree heads ("landmarks"): pins carry a vouch head, and
