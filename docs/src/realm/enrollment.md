@@ -83,8 +83,10 @@ pjLVUZeo5CYHWwNIxNTa1uAyFIRS9Z6NVW7X2h_qgOQ 1798761600 12 4hZ2…9kQ frozen
 
 This is for appliances and images whose trust must not move without an
 operator: the enrollment writes the host's keys as usual, but its pin
-file's frozen lines are preserved untouched beside them. Unfreeze by
-editing the pin file (removing the marker) or re-provisioning. `kuipa
+file's frozen lines are preserved untouched beside them. The freeze lasts
+as long as the pin: when a frozen line's own expiry passes, the pin is
+expired like any other. Unfreeze by editing the pin file (removing the
+marker) or re-provisioning. `kuipa
 status` marks frozen pins; `kuipa check` refuses a server whose claims
 the frozen head cannot prove.
 
