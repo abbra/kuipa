@@ -1119,7 +1119,7 @@ The sealed body is `auth_type ‖ registrations ‖ extra ‖ authenticator`:
 |---|---|---|---|
 | 1 OTP | the OTP | join | simple bind as the host entry over LDAPI with the OTP, then join and `KEYTAB_GET` on that connection |
 | 2 Kerberos | Kerberos V5 initial token for `ipa-ku@<server>` with channel binding `cb`; its context yields `kb` (§5.1) | join, rekey, stage | accept with the same `cb` and derive `kb`; act as the authenticated principal through S4U2Self + S4U2Proxy to LDAP |
-| 3 voucher | reserved for §9 | — | refused |
+| 3 voucher | signed voucher (§9), bearer or bound to the ephemeral key | join | verify the voucher key, realm, host, binding and validity; check the lease and join through the directory |
 | 4 | none: was a user's password sealed to the server | — | malformed |
 
 How the client gets its Kerberos ticket decides whether `kb` gives the
