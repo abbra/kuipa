@@ -106,7 +106,7 @@ fn parse_args() -> Result<Args, Error> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--config" => args.config = it.next().ok_or("--config needs a value")?,
-            "--join" | "--escrow" | "--trust" | "--signing" => {
+            "--join" | "--escrow" | "--trust" | "--signing" | "--head" => {
                 args.flags.push(arg[2..].to_owned());
             }
             "--join-days" | "--escrow-days" | "--days" | "--invitation-file" | "--server"
