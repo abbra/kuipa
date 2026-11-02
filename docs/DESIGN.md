@@ -2553,13 +2553,14 @@ Clock: advertisements and delegations expire, so online clients need a
 roughly correct clock (`ipa-client-install` syncs time before joining);
 offline bundles are checked at their `iat` and bounded by the KDC.
 
-The anchor exchange rests on the members' Kerberos keys. They are
-symmetric, so recorded syncs reveal nothing to a quantum attacker; an
-attacker who could forge them would already hold the realm's Kerberos
-keys, through which every host key in LDAP is exposed too. A removed
-server's claim drops out of every vouch at the next round, and its
-existing proofs stop verifying when the vouches they come from expire
-(7 days).
+The anchor exchange authenticates members with their Kerberos service keys;
+the channel binding protects each request's contents, not their confidentiality.
+An attacker with a member's `ipa-ku/<fqdn>` key can impersonate that member
+in the exchange (§4.2), without possessing every realm key. Once an anchor
+server learns that a server was removed, it drops that server's claim from
+its next vouch. Discovery and repair can be delayed by directory or network
+failures; existing signature proofs remain valid until their vouches expire
+(at most 7 days from issuance).
 
 Still classical: TLS server authentication (an RSA IPA CA, now reached
 authentically), PKINIT and its anonymous armour, DNSSEC. Custodia is
