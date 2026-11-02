@@ -1661,15 +1661,23 @@ impl Directory for LdapDirectory {
             }))
             .collect::<Vec<_>>(),
         )?;
-        if !hostgroup.is_empty() {
-            conn.modify_s(
+        // The voucher names a host group, so a host without it is not the
+        // join that was asked for: undo the host entry, and with it the
+        // spent salt, so a retry with a corrected group can work.
+        if !hostgroup.is_empty()
+            && let Err(e) = conn.modify_s(
                 &format!(
                     "cn={},cn=hostgroups,cn=accounts,{}",
                     dn_escape(hostgroup),
                     self.cfg.basedn
                 ),
                 &[(ModOp::Add, "member", vec![dn.as_bytes()])],
-            )?;
+            )
+        {
+            if let Err(de) = conn.delete_s(&dn) {
+                eprintln!("kuipad: voucher {fqdn}: undo host after group failure: {de}");
+            }
+            return Err(format!("hostgroup {hostgroup}: {e}").into());
         }
         match &lease {
             Some((expiration, _)) => {
