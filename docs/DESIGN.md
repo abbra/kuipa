@@ -2369,7 +2369,7 @@ it like the `tang` pin.
 ### 11.1 Deployment
 
 The daemon is socket-activated on `/run/ipa/kuipad.sock` (`listenfd`;
-otherwise it binds its configured `listen` address`) and reached through
+otherwise it binds its configured `listen` address) and reached through
 httpd: `ProxyPass "/ipa/ku/" "unix:/run/ipa/kuipad.sock|http://localhost/ipa/ku/"`.
 Both units are enabled, not the socket alone: the anchor exchange (§4.2), the
 lease purge and the log-head publishing run inside `serve`, so an idle realm
