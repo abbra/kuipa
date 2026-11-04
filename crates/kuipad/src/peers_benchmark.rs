@@ -93,20 +93,27 @@ struct Counts {
     kinds: Mutex<BTreeMap<String, (u64, u64)>>,
 }
 
-fn repair_kind(repair: &Repair) -> &'static str {
-    match (&repair.chunk, &repair.snapshot) {
-        (Some(Chunk::Probe), _) => "probe",
-        (Some(Chunk::Summary { .. }), _) => "summary",
-        (Some(Chunk::Selected { .. }), _) => "selected",
-        (Some(Chunk::Leaves { .. }), _) => "leaves",
-        (Some(Chunk::PushSelected { .. }), _) => "push_selected",
-        (Some(Chunk::Fallback), _) => "fallback",
-        (Some(Chunk::Fetch { .. }), _) => "fetch",
-        (Some(Chunk::Data { .. }), _) => "data",
-        (Some(Chunk::Upload { .. }), _) => "upload",
-        (Some(Chunk::Accepted { .. }), _) => "accepted",
-        (None, Some(_)) => "snapshot",
-        (None, None) => "digest",
+fn request_kind(request: &RequestBody) -> &'static str {
+    match request {
+        RequestBody::Repair(repair::Request::Probe { .. }) => "probe",
+        RequestBody::Repair(repair::Request::Buckets { .. }) => "buckets",
+        RequestBody::Repair(repair::Request::Exchange { .. }) => "exchange",
+        RequestBody::Snapshot(SnapshotRequest::Fetch { .. }) => "fetch",
+        RequestBody::Snapshot(SnapshotRequest::Upload { .. }) => "upload",
+    }
+}
+
+fn response_kind(response: &ResponseBody) -> &'static str {
+    match response {
+        ResponseBody::Repair(repair::Response::Probe { .. }) => "probe",
+        ResponseBody::Repair(repair::Response::Buckets { .. }) => "buckets",
+        ResponseBody::Repair(repair::Response::Exchange { .. }) => "exchange",
+        ResponseBody::Snapshot(SnapshotResponse::Equal) => "equal",
+        ResponseBody::Snapshot(SnapshotResponse::Data { .. }) => "data",
+        ResponseBody::Snapshot(SnapshotResponse::Changed) => "changed",
+        ResponseBody::Snapshot(SnapshotResponse::Accepted { .. }) => "accepted",
+        ResponseBody::Snapshot(SnapshotResponse::Merged { .. }) => "merged",
+        ResponseBody::Snapshot(SnapshotResponse::Busy) => "busy",
     }
 }
 
@@ -310,16 +317,16 @@ async fn measure_scheduler_repair() {
                             .request_bytes
                             .fetch_add(body.len() as u64, Ordering::Relaxed);
                         let sync = PeerSync::from_bytes(&body).ok();
-                        if let Some(repair) = sync
+                        if let Some(request) = sync
                             .as_ref()
-                            .and_then(|sync| Repair::decode(&sync.payload).ok())
+                            .and_then(|sync| decode::<Message<RequestBody>>(&sync.payload).ok())
                         {
-                            count_kind(&counts, "request", repair_kind(&repair), body.len());
-                            match repair.chunk {
-                                Some(Chunk::Fetch { .. }) => {
+                            count_kind(&counts, "request", request_kind(&request.body), body.len());
+                            match request.body {
+                                RequestBody::Snapshot(SnapshotRequest::Fetch { .. }) => {
                                     counts.fetch_chunks.fetch_add(1, Ordering::Relaxed);
                                 }
-                                Some(Chunk::Upload { .. }) => {
+                                RequestBody::Snapshot(SnapshotRequest::Upload { .. }) => {
                                     counts.upload_chunks.fetch_add(1, Ordering::Relaxed);
                                 }
                                 _ => {}
@@ -333,14 +340,17 @@ async fn measure_scheduler_repair() {
                         };
                         match result {
                             Ok(bytes) => {
-                                if let Ok(repair) = Repair::decode(&bytes) {
+                                if let Ok(response) = decode::<Message<ResponseBody>>(&bytes) {
                                     count_kind(
                                         &counts,
                                         "response",
-                                        repair_kind(&repair),
+                                        response_kind(&response.body),
                                         bytes.len(),
                                     );
-                                    if matches!(repair.chunk, Some(Chunk::Data { .. })) {
+                                    if matches!(
+                                        response.body,
+                                        ResponseBody::Snapshot(SnapshotResponse::Data { .. })
+                                    ) {
                                         counts.data_chunks.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
