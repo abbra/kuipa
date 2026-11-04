@@ -12,6 +12,7 @@ license = "GPL-3.0-or-later"
 native-ossl = "0.3.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+ciborium = "0.2"
 tang-pqc = { path = "crates/tang-pqc" }
 ml-dsa-blind = { path = "crates/ml-dsa-blind" }
 tang-pqc-clevis = { path = "crates/tang-pqc-clevis" }
