@@ -355,6 +355,29 @@ impl AnchorState {
         Ok(&self.index()?.summary)
     }
 
+    /// Each entry's [`EntryId`], [`EntryVersion`] and kind — its tag: keys
+    /// 1, claims 2, vouches 3, successions 4, so ascending kind puts the
+    /// keys others are checked against first.
+    ///
+    /// # Errors
+    ///
+    /// A cryptographic hash operation failed.
+    pub fn entry_versions(&self) -> Result<Vec<(EntryId, EntryVersion, u8)>> {
+        let index = self.index()?;
+        self.slots
+            .iter()
+            .map(|(name, slot)| {
+                let id = entry_id(name)?;
+                let version = index
+                    .summary
+                    .get(&id)
+                    .copied()
+                    .ok_or(Error::Malformed("entry index"))?;
+                Ok((id, version, slot.entry.tag()))
+            })
+            .collect()
+    }
+
     /// One 16-byte hash per bucket of `2^bits` (`bits` at most
     /// [`MAX_BUCKET_BITS`]) over the summary entries in it.
     ///
