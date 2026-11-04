@@ -1153,6 +1153,7 @@ dependencies = [
  "agirru-crdt",
  "agirru-engine",
  "axum",
+ "ciborium",
  "kuipa-enroll",
  "kuipa-gssapi",
  "kuipa-ldap",

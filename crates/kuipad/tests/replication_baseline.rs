@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use agirru_crdt::{GenerationClock, Merge};
 use agirru_engine::{
-    CborCodec, Codec, Envelope, GossipConfig, GossipEngine, GossipRuntime, Membership, NoopHooks,
-    Storage, Transport,
+    CborCodec, Codec, DurableState, Envelope, GossipConfig, GossipEngine, GossipRuntime,
+    Membership, NoopHooks, Storage, Transport,
 };
 use kuipa_enroll::anchors::{AnchorState, Entry};
 use kuipa_enroll::delegation::SignedVouch;
@@ -15,7 +15,7 @@ use kuipa_enroll::merkle::{Hash, TreeHash};
 use tang_pqc::{Policy, SigningKey};
 use tokio::sync::{RwLock, mpsc};
 
-type Node = GossipEngine<AnchorState, usize, Runtime>;
+type Node = GossipEngine<AnchorState, usize, Runtime, NoStorage>;
 
 #[derive(Default)]
 struct Counts {
@@ -99,7 +99,10 @@ impl Membership<usize> for Runtime {
     }
 }
 
-impl Storage<AnchorState> for Runtime {
+/// This baseline measures scheduling, not persistence.
+struct NoStorage;
+
+impl Storage<AnchorState> for NoStorage {
     type Error = std::io::Error;
 
     fn load(&self) -> impl Future<Output = Result<AnchorState, Self::Error>> {
@@ -114,7 +117,6 @@ impl Storage<AnchorState> for Runtime {
 impl GossipRuntime<AnchorState, usize> for Runtime {
     type Transport = Self;
     type Membership = Self;
-    type Storage = Self;
     type Hooks = NoopHooks;
     type Codec = CborCodec;
 
@@ -122,9 +124,6 @@ impl GossipRuntime<AnchorState, usize> for Runtime {
         self
     }
     fn membership(&self) -> &Self {
-        self
-    }
-    fn storage(&self) -> &Self {
         self
     }
     fn hooks(&self) -> &NoopHooks {
@@ -164,11 +163,14 @@ async fn reloaded_state_is_included_in_bounded_engine_response() {
         codec: CborCodec,
         hooks: NoopHooks,
     };
-    let engine = GossipEngine::bootstrap_with_state(
-        engine_clock,
+    let engine = GossipEngine::new(
+        Arc::new(DurableState::new(
+            Arc::new(RwLock::new(loaded)),
+            engine_clock,
+            NoStorage,
+        )),
         runtime,
         GossipConfig::default(),
-        Arc::new(RwLock::new(loaded)),
     );
     let incoming_key = SigningKey::generate_preferred().unwrap();
     let mut incoming = AnchorState::default();
@@ -282,11 +284,14 @@ async fn measure_replication_baseline() {
                 round_interval: Duration::from_secs(3600),
                 ..GossipConfig::default()
             };
-            let node = Arc::new(GossipEngine::bootstrap_with_state(
-                clock.clone(),
+            let node = Arc::new(GossipEngine::new(
+                Arc::new(DurableState::new(
+                    Arc::new(RwLock::new(initial.clone())),
+                    clock.clone(),
+                    NoStorage,
+                )),
                 runtime,
                 cfg,
-                Arc::new(RwLock::new(initial.clone())),
             ));
             nodes.push(node);
             clocks.push(clock);

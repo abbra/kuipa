@@ -16,9 +16,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use agirru_crdt::GenerationClock;
+use agirru_engine::context::{Attached, Context, ContextError, ContextReceiver, ContextSender};
+use agirru_engine::repair::{self, IndexCache, RepairError, Replica};
+use agirru_engine::snapshot::{
+    self, SnapshotLimits, SnapshotReplica, SnapshotRequest, SnapshotResponse, SnapshotServer,
+};
 use agirru_engine::{
-    CborCodec, GossipConfig, GossipEngine, GossipHooks, GossipRuntime, Membership, SendOutcome,
-    Storage, Transport,
+    CborCodec, DurableState, GossipConfig, GossipEngine, GossipHooks, GossipRuntime, Membership,
+    SendOutcome, Storage, Transport,
 };
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::anchors::{self, AnchorState, Entry, PeerSync, Trust};
@@ -28,7 +33,6 @@ use kuipa_enroll::delegation::{
 use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
 use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::server::Directory;
-use tang_pqc::wire::{Reader, Writer};
 use tang_pqc::{Policy, SigningKey, Thumbprint, unix_seconds};
 use tokio::sync::{Notify, RwLock};
 
@@ -150,87 +154,130 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 const MAX_SYNC_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT_REPAIRS: usize = 16;
-const REPAIR_MAGIC: [u8; 4] = *b"IPRD";
 
 const GOSSIP_FANOUT: usize = 4;
 const REPAIR_SWEEP_ROUNDS: u32 = 10;
 const MAX_BUSY_RETRIES: u8 = 3;
 const REPAIR_STALL_DELAY: Duration = Duration::from_secs(1);
+/// Bytes per snapshot chunk.
 const CHUNK_BYTES: usize = 128 * 1024;
-const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
-const UPLOAD_LIFETIME: Duration = Duration::from_secs(120);
-const MAX_SUMMARY_ENTRIES: usize = 4096;
-const MAX_SUMMARY_BYTES: usize = 256 * 1024;
+/// States differing by more than this many entries are transferred whole
+/// rather than entry by entry.
+const BULK_ABOVE: usize = 4096;
+/// Entry-wise repairs tried per peer before reporting a concurrent change.
+const MAX_SELECTIVE_ATTEMPTS: usize = 2;
+/// Domain of the repair index digest.
+const INDEX_DOMAIN: &[u8] = b"ipa-ku/anchor-repair/v1\0";
 
-type EntrySummary = BTreeMap<anchors::EntryId, anchors::EntryVersion>;
-
-fn encode_summary(summary: &EntrySummary) -> Option<Vec<u8>> {
-    if summary.len() > MAX_SUMMARY_ENTRIES {
-        return None;
+/// Entry-wise repair bounds, within [`MAX_SYNC_BYTES`] per message.
+fn repair_limits() -> repair::Limits {
+    repair::Limits {
+        message_budget: 256 * 1024,
+        max_want_per_request: 8192,
+        bulk_above: Some(BULK_ABOVE),
+        ..repair::Limits::default()
     }
-    let mut w = Writer::new(*b"ISUM");
-    w.u64(summary.len() as u64);
-    for (id, version) in summary {
-        w.fixed(id).fixed(&version.hash).u64(version.order);
-    }
-    let bytes = w.finish();
-    (bytes.len() <= MAX_SUMMARY_BYTES).then_some(bytes)
 }
 
-fn decode_summary(bytes: &[u8]) -> Result<EntrySummary, Error> {
-    if bytes.len() > MAX_SUMMARY_BYTES {
-        return Err("peer summary exceeds size limit".into());
+/// Whole-state transfer bounds.
+fn snapshot_limits() -> SnapshotLimits {
+    SnapshotLimits {
+        chunk_bytes: CHUNK_BYTES,
+        max_snapshot_bytes: 64 * 1024 * 1024,
+        max_uploading_bytes: 64 * 1024 * 1024,
+        upload_lifetime: Duration::from_secs(120),
+        ..SnapshotLimits::default()
     }
-    let mut r = Reader::new(bytes, *b"ISUM", "peer summary")?;
-    let count = r.u64()?;
-    if count > MAX_SUMMARY_ENTRIES as u64 {
-        return Err("peer summary has too many entries".into());
-    }
-    let mut summary = EntrySummary::new();
-    for _ in 0..count {
-        let id = r.fixed()?;
-        let version = anchors::EntryVersion {
-            hash: r.fixed()?,
-            order: r.u64()?,
-        };
-        if summary.insert(id, version).is_some() {
-            return Err("duplicate peer summary entry".into());
-        }
-    }
-    r.finish()?;
-    Ok(summary)
 }
 
-/// The ids a responder wants pushed, under the summary bounds.
-fn encode_wanted(ids: &BTreeSet<anchors::EntryId>) -> Option<Vec<u8>> {
-    if ids.len() > MAX_SUMMARY_ENTRIES {
-        return None;
+/// SHA-256 through native-ossl, for the repair index.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sha256;
+
+impl repair::Hasher for Sha256 {
+    fn hash(&self, parts: &[&[u8]]) -> Result<repair::Hash, Error> {
+        Ok(tang_pqc::primitives::sha256(parts)?)
     }
-    let mut w = Writer::new(*b"IWNT");
-    w.u64(ids.len() as u64);
-    for id in ids {
-        w.fixed(id);
-    }
-    Some(w.finish())
 }
 
-fn decode_wanted(bytes: &[u8]) -> Result<BTreeSet<anchors::EntryId>, Error> {
-    if bytes.len() > MAX_SUMMARY_BYTES {
-        return Err("peer wanted list exceeds size limit".into());
+/// One entry as it travels: an [`AnchorState`] encoding holding it (and,
+/// for a vouch, the anchor key it is checked against).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct WireEntry(#[serde(with = "repair::cbor_bytes")] Vec<u8>);
+
+/// The reconciliation message a sync carries, bound to the sync by its
+/// nonce: the answer echoes it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Message<B> {
+    #[serde(rename = "n", with = "repair::cbor_bytes::array")]
+    nonce: [u8; 32],
+    #[serde(rename = "b")]
+    body: B,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum RequestBody {
+    #[serde(rename = "r")]
+    Repair(repair::Request<WireEntry>),
+    #[serde(rename = "s")]
+    Snapshot(SnapshotRequest),
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum ResponseBody {
+    #[serde(rename = "r")]
+    Repair(repair::Response<WireEntry>),
+    #[serde(rename = "s")]
+    Snapshot(SnapshotResponse),
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    ciborium::into_writer(value, &mut out)?;
+    Ok(out)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
+    Ok(ciborium::from_reader(bytes)?)
+}
+
+/// A sender's own delegation, as sync context.
+#[derive(Clone, PartialEq)]
+struct OwnContext(Delegation);
+
+impl Context for OwnContext {
+    fn context_hash(&self) -> Result<repair::Hash, Error> {
+        Ok(PeerSync::delegation_hash(&self.0)?)
     }
-    let mut r = Reader::new(bytes, *b"IWNT", "peer wanted list")?;
-    let count = r.u64()?;
-    if count > MAX_SUMMARY_ENTRIES as u64 {
-        return Err("peer wanted list has too many entries".into());
+}
+
+/// A sender's epoch window, as sync context.
+#[derive(Clone, PartialEq)]
+struct ChainContext(Vec<Vec<u8>>);
+
+impl Context for ChainContext {
+    fn context_hash(&self) -> Result<repair::Hash, Error> {
+        Ok(PeerSync::chain_hash(&self.0)?)
     }
-    let mut ids = BTreeSet::new();
-    for _ in 0..count {
-        if !ids.insert(r.fixed()?) {
-            return Err("duplicate peer wanted entry".into());
-        }
+}
+
+/// A [`RepairError`] as an exchange error, keeping a transport
+/// [`PeerError`] downcastable.
+fn from_repair(e: RepairError) -> Error {
+    match e {
+        RepairError::Busy => PeerError::Busy.into(),
+        RepairError::Transport(inner) => inner,
+        other => other.into(),
     }
-    r.finish()?;
-    Ok(ids)
+}
+
+fn to_storage(e: impl Into<Error>) -> RepairError {
+    RepairError::Storage(e.into())
+}
+
+fn to_entry(e: impl Into<Error>) -> RepairError {
+    RepairError::Entry(e.into())
 }
 
 fn repair_concurrency(members: usize) -> usize {
@@ -255,287 +302,6 @@ fn selected_peers<'a>(
     }
     peers
 }
-
-enum Chunk {
-    Fetch {
-        offset: usize,
-    },
-    Data {
-        offset: usize,
-        total: usize,
-        bytes: Vec<u8>,
-    },
-    Upload {
-        offset: usize,
-        total: usize,
-        bytes: Vec<u8>,
-    },
-    Accepted {
-        next: usize,
-    },
-    /// The requester's bucket hashes, `2^bits` of them.
-    Summary {
-        bits: u32,
-        hashes: Vec<[u8; 16]>,
-    },
-    /// The responder's buckets that differ, and its summary entries in them.
-    Leaves {
-        buckets: Vec<u16>,
-        summary: Vec<u8>,
-    },
-    /// The entries the requester wanted, after merging its push.
-    Selected {
-        bytes: Vec<u8>,
-    },
-    /// The requester's entries for the responder, and the ids it wants.
-    PushSelected {
-        wanted: Vec<u8>,
-        bytes: Vec<u8>,
-    },
-    Fallback,
-    Probe,
-}
-
-/// How a selective repair ended.
-enum Selective {
-    /// Both sides reported the same snapshot.
-    Done,
-    /// A summary or selection exceeds its bound: send the whole state.
-    TooLarge,
-    /// A side changed during the exchange: repeat it.
-    Changed,
-}
-
-/// Selective repairs tried per peer before reporting a concurrent change.
-const MAX_SELECTIVE_ATTEMPTS: usize = 2;
-
-struct Upload {
-    digest: [u8; 32],
-    total: usize,
-    bytes: Vec<u8>,
-    updated: Instant,
-}
-
-struct Repair {
-    nonce: [u8; 32],
-    digest: [u8; 32],
-    snapshot: Option<Vec<u8>>,
-    chunk: Option<Chunk>,
-}
-
-impl Repair {
-    fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::new(REPAIR_MAGIC);
-        w.fixed(&self.nonce).fixed(&self.digest);
-        match (&self.snapshot, &self.chunk) {
-            (Some(snapshot), None) => {
-                w.u8(1).bytes(snapshot);
-            }
-            (None, None) => {
-                w.u8(0);
-            }
-            (None, Some(Chunk::Fetch { offset })) => {
-                w.u8(2).u64(*offset as u64);
-            }
-            (
-                None,
-                Some(Chunk::Data {
-                    offset,
-                    total,
-                    bytes,
-                }),
-            ) => {
-                w.u8(3).u64(*offset as u64).u64(*total as u64).bytes(bytes);
-            }
-            (
-                None,
-                Some(Chunk::Upload {
-                    offset,
-                    total,
-                    bytes,
-                }),
-            ) => {
-                w.u8(4).u64(*offset as u64).u64(*total as u64).bytes(bytes);
-            }
-            (None, Some(Chunk::Accepted { next })) => {
-                w.u8(5).u64(*next as u64);
-            }
-            (None, Some(Chunk::Summary { bits, hashes })) => {
-                w.u8(6).u8(u8::try_from(*bits).unwrap_or(u8::MAX));
-                for h in hashes {
-                    w.fixed(h);
-                }
-            }
-            (None, Some(Chunk::Selected { bytes })) => {
-                w.u8(7).bytes(bytes);
-            }
-            (None, Some(Chunk::PushSelected { wanted, bytes })) => {
-                w.u8(8).bytes(wanted).bytes(bytes);
-            }
-            (None, Some(Chunk::Leaves { buckets, summary })) => {
-                w.u8(11).u64(buckets.len() as u64);
-                for b in buckets {
-                    w.fixed(&b.to_be_bytes());
-                }
-                w.bytes(summary);
-            }
-            (None, Some(Chunk::Fallback)) => {
-                w.u8(9);
-            }
-            (None, Some(Chunk::Probe)) => {
-                w.u8(10);
-            }
-            (Some(_), Some(_)) => unreachable!("snapshot and chunk are mutually exclusive"),
-        }
-        w.finish()
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let mut r = Reader::new(bytes, REPAIR_MAGIC, "peer repair")?;
-        let nonce = r.fixed()?;
-        let digest = r.fixed()?;
-        let (snapshot, chunk) = match r.u8()? {
-            0 => (None, None),
-            1 => (Some(r.bytes()?.to_vec()), None),
-            2 => (
-                None,
-                Some(Chunk::Fetch {
-                    offset: usize::try_from(r.u64()?)?,
-                }),
-            ),
-            kind @ (3 | 4) => (None, Some(decode_transfer_chunk(&mut r, kind)?)),
-            5 => (
-                None,
-                Some(Chunk::Accepted {
-                    next: usize::try_from(r.u64()?)?,
-                }),
-            ),
-            6 => {
-                let bits = u32::from(r.u8()?);
-                if bits > anchors::MAX_BUCKET_BITS {
-                    return Err("too many peer summary buckets".into());
-                }
-                let hashes = (0..1usize << bits)
-                    .map(|_| r.fixed())
-                    .collect::<std::result::Result<_, _>>()?;
-                (None, Some(Chunk::Summary { bits, hashes }))
-            }
-            7 => {
-                let bytes = r.bytes()?;
-                if bytes.len() > CHUNK_BYTES {
-                    return Err("selected state exceeds size limit".into());
-                }
-                (
-                    None,
-                    Some(Chunk::Selected {
-                        bytes: bytes.to_vec(),
-                    }),
-                )
-            }
-            8 => {
-                let wanted = r.bytes()?;
-                decode_wanted(wanted)?;
-                let bytes = r.bytes()?;
-                if bytes.len() > CHUNK_BYTES {
-                    return Err("selected state exceeds size limit".into());
-                }
-                (
-                    None,
-                    Some(Chunk::PushSelected {
-                        wanted: wanted.to_vec(),
-                        bytes: bytes.to_vec(),
-                    }),
-                )
-            }
-            11 => {
-                let count = r.u64()?;
-                if count > 1 << anchors::MAX_BUCKET_BITS {
-                    return Err("too many peer buckets".into());
-                }
-                let buckets = (0..count)
-                    .map(|_| r.fixed().map(u16::from_be_bytes))
-                    .collect::<std::result::Result<_, _>>()?;
-                let summary = r.bytes()?;
-                decode_summary(summary)?;
-                (
-                    None,
-                    Some(Chunk::Leaves {
-                        buckets,
-                        summary: summary.to_vec(),
-                    }),
-                )
-            }
-            9 => (None, Some(Chunk::Fallback)),
-            10 => (None, Some(Chunk::Probe)),
-            _ => return Err("invalid peer repair payload".into()),
-        };
-        r.finish()?;
-        if let Some(snapshot) = &snapshot
-            && anchors::state_digest(snapshot)? != digest
-        {
-            return Err("peer repair snapshot digest mismatch".into());
-        }
-        Ok(Self {
-            nonce,
-            digest,
-            snapshot,
-            chunk,
-        })
-    }
-}
-
-fn decode_transfer_chunk(r: &mut Reader<'_>, kind: u8) -> Result<Chunk, Error> {
-    let offset = usize::try_from(r.u64()?)?;
-    let total = usize::try_from(r.u64()?)?;
-    let bytes = r.bytes()?.to_vec();
-    if total == 0
-        || total > MAX_SNAPSHOT_BYTES
-        || bytes.is_empty()
-        || bytes.len() > CHUNK_BYTES
-        || offset
-            .checked_add(bytes.len())
-            .is_none_or(|end| end > total)
-    {
-        return Err("invalid peer repair chunk".into());
-    }
-    Ok(if kind == 3 {
-        Chunk::Data {
-            offset,
-            total,
-            bytes,
-        }
-    } else {
-        Chunk::Upload {
-            offset,
-            total,
-            bytes,
-        }
-    })
-}
-
-fn repair_snapshot(nonce: [u8; 32], state: &AnchorState, include: bool) -> Result<Repair, Error> {
-    let snapshot = include.then(|| state.to_bytes());
-    if snapshot
-        .as_ref()
-        .is_some_and(|bytes| bytes.len() > MAX_SYNC_BYTES)
-    {
-        return Err("peer repair snapshot exceeds size limit".into());
-    }
-    Ok(Repair {
-        nonce,
-        digest: state.digest()?,
-        snapshot,
-        chunk: None,
-    })
-}
-
-/// A sender's delegation and epoch window, each with its sync hash.
-struct SyncContext {
-    own: ([u8; 32], Delegation),
-    chain: ([u8; 32], Vec<Vec<u8>>),
-}
-
-type DeliveredContexts = HashMap<String, ([u8; 32], [u8; 32])>;
 
 /// The state shared by the gossip engine, the maintenance task and the
 /// sync route.  Implements agirru's transport, membership, storage and
@@ -569,24 +335,29 @@ pub struct Exchange {
     changed: Notify,
     repair_trigger: Notify,
     repair_permits: tokio::sync::Semaphore,
-    uploads: Mutex<HashMap<String, Upload>>,
+    /// Snapshot downloads in progress and unfinished uploads.
+    snapshots: SnapshotServer<String>,
     /// Each member's last delegation and epoch window from an
-    /// authenticated sync, by hash, so its later syncs can leave them out.
-    contexts: Mutex<HashMap<String, SyncContext>>,
-    /// Per peer, the delegation and window hashes it last accepted from
-    /// this server.
-    delivered: Mutex<DeliveredContexts>,
+    /// authenticated sync, so its later syncs can leave them out.
+    own_seen: ContextReceiver<String, OwnContext>,
+    chain_seen: ContextReceiver<String, ChainContext>,
+    /// Per peer, the delegation and window it last accepted from this
+    /// server.
+    own_sent: ContextSender<String, OwnContext>,
+    chain_sent: ContextSender<String, ChainContext>,
     client: reqwest::Client,
     /// The last failure per peer, so each is logged once.
     failures: Mutex<BTreeMap<String, String>>,
 }
 
-type Engine = GossipEngine<AnchorState, String, Runtime>;
+type Engine = GossipEngine<AnchorState, String, Runtime, Arc<Exchange>>;
 
 /// The running exchange.
 pub struct Peers {
     exchange: Arc<Exchange>,
     engine: Arc<Engine>,
+    /// The repair index of the durable state, kept current incrementally.
+    index: IndexCache<anchors::EntryId, Sha256>,
     #[cfg(test)]
     repair_started: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -719,9 +490,11 @@ impl Peers {
             changed: Notify::new(),
             repair_trigger: Notify::new(),
             repair_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS),
-            uploads: Mutex::new(HashMap::new()),
-            contexts: Mutex::new(HashMap::new()),
-            delivered: Mutex::new(HashMap::new()),
+            snapshots: SnapshotServer::new(),
+            own_seen: ContextReceiver::new(),
+            chain_seen: ContextReceiver::new(),
+            own_sent: ContextSender::new(),
+            chain_sent: ContextSender::new(),
             failures: Mutex::new(BTreeMap::new()),
         });
         exchange.server.publish_epoch(chain);
@@ -729,15 +502,16 @@ impl Peers {
             round_interval: exchange.settings.interval,
             ..GossipConfig::default()
         };
-        let engine = Arc::new(GossipEngine::bootstrap_with_state(
-            clock,
+        let durable = DurableState::new(state, clock, exchange.clone());
+        let engine = Arc::new(GossipEngine::new(
+            Arc::new(durable),
             Runtime(exchange.clone(), CborCodec),
             config,
-            state,
         ));
         Ok(Arc::new(Self {
             exchange,
             engine,
+            index: IndexCache::new(),
             #[cfg(test)]
             repair_started: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -851,9 +625,9 @@ impl Peers {
             self.exchange.refresh_members().await;
             let members = self.exchange.members();
             base_concurrency = repair_concurrency(members.len());
-            lock(&self.exchange.uploads).retain(|peer, upload| {
-                members.contains(peer) && upload.updated.elapsed() < UPLOAD_LIFETIME
-            });
+            self.exchange
+                .snapshots
+                .retain(|peer| members.contains(peer));
             let neighbors = self.exchange.neighbors();
             pending.retain(|peer| neighbors.contains(peer));
             retries.retain(|peer, _| neighbors.contains(peer));
@@ -951,245 +725,83 @@ impl Peers {
         }
     }
 
-    async fn repair_selective(&self, peer: &str) -> Result<Selective, Error> {
-        let local = self.engine.durable_snapshot().await?;
-        let digest = local.digest()?;
-        let mut nonce = [0; 32];
-        native_ossl::rand::Rand::fill_private(&mut nonce)?;
-        let request = Repair {
-            nonce,
-            digest,
-            snapshot: None,
-            chunk: Some(Chunk::Probe),
-        };
-        let response = Repair::decode(&self.exchange.sync(peer, request.encode(), &local).await?)?;
-        if response.nonce != nonce || response.snapshot.is_some() || response.chunk.is_some() {
-            return Err("invalid peer digest response".into());
-        }
-        if response.digest == digest {
-            return Ok(
-                if self.engine.durable_snapshot().await?.digest()? == digest {
-                    Selective::Done
-                } else {
-                    Selective::Changed
-                },
-            );
-        }
-        if local.len() > MAX_SUMMARY_ENTRIES {
-            return Ok(Selective::TooLarge);
-        }
-        // About eight entries per bucket, so a few changes touch few buckets.
-        let bits = local
-            .len()
-            .div_ceil(8)
-            .max(1)
-            .next_power_of_two()
-            .trailing_zeros()
-            .min(anchors::MAX_BUCKET_BITS);
-        native_ossl::rand::Rand::fill_private(&mut nonce)?;
-        let request = Repair {
-            nonce,
-            digest,
-            snapshot: None,
-            chunk: Some(Chunk::Summary {
-                bits,
-                hashes: local.bucket_hashes(bits)?,
-            }),
-        };
-        let response = Repair::decode(&self.exchange.sync(peer, request.encode(), &local).await?)?;
-        if response.nonce != nonce || response.snapshot.is_some() {
-            return Err("invalid peer summary response".into());
-        }
-        let Chunk::Leaves { buckets, summary } = (match response.chunk {
-            Some(Chunk::Fallback) => return Ok(Selective::TooLarge),
-            Some(chunk) => chunk,
-            None => return Ok(Selective::Changed),
-        }) else {
-            return Err("invalid peer bucket response".into());
-        };
-        let differing: BTreeSet<usize> = buckets.iter().map(|b| usize::from(*b)).collect();
-        let theirs = decode_summary(&summary)?;
-        // Both directions are chosen here, from the peer's entries in the
-        // buckets that differ.
-        let local = self.engine.durable_snapshot().await?;
-        let Some(wanted) = encode_wanted(&local.wanted(&theirs)?) else {
-            return Ok(Selective::TooLarge);
-        };
-        let selected = local
-            .select_entries_where(&theirs, |id| {
-                differing.contains(&anchors::bucket_of(id, bits))
-            })?
-            .to_bytes();
-        if selected.len() > CHUNK_BYTES {
-            return Ok(Selective::TooLarge);
-        }
-        native_ossl::rand::Rand::fill_private(&mut nonce)?;
-        let request = Repair {
-            nonce,
-            digest: local.digest()?,
-            snapshot: None,
-            chunk: Some(Chunk::PushSelected {
-                wanted,
-                bytes: selected,
-            }),
-        };
-        let response = Repair::decode(&self.exchange.sync(peer, request.encode(), &local).await?)?;
-        if response.nonce != nonce || response.snapshot.is_some() {
-            return Err("invalid peer selection acknowledgement".into());
-        }
-        let bytes = match response.chunk {
-            Some(Chunk::Selected { bytes }) => bytes,
-            Some(Chunk::Fallback) => return Ok(Selective::TooLarge),
-            _ => return Err("invalid peer selection acknowledgement".into()),
-        };
-        self.engine
-            .merge_inbound(&peer.to_owned(), AnchorState::from_bytes(&bytes)?)
-            .await?;
-        Ok(
-            if self.engine.durable_snapshot().await?.digest()? == response.digest {
-                Selective::Done
-            } else {
-                Selective::Changed
-            },
-        )
-    }
-
+    /// Repair with `peer` entry by entry (`agirru_engine::repair`), or by
+    /// whole-state transfer (`agirru_engine::snapshot`) when the two states
+    /// differ by more than [`BULK_ABOVE`] entries. A concurrent write on
+    /// either side repeats the entry-wise repair.
     async fn repair_peer(&self, peer: &str) -> Result<(), Error> {
-        // A concurrent write on either side repeats the selective exchange;
-        // only size bounds justify sending the whole state.
-        let mut attempts = 0;
-        loop {
-            match self.repair_selective(peer).await? {
-                Selective::Done => return Ok(()),
-                Selective::TooLarge => break,
-                Selective::Changed if attempts < MAX_SELECTIVE_ATTEMPTS => attempts += 1,
-                Selective::Changed => return Err("peer repair state changed concurrently".into()),
+        let limits = repair_limits();
+        for _ in 0..MAX_SELECTIVE_ATTEMPTS {
+            let stats = repair::repair(self, peer, &limits, |request| async move {
+                match self.call(peer, RequestBody::Repair(request)).await? {
+                    ResponseBody::Repair(response) => Ok(response),
+                    ResponseBody::Snapshot(_) => {
+                        Err(RepairError::Protocol("unexpected peer snapshot answer"))
+                    }
+                }
+            })
+            .await
+            .map_err(from_repair)?;
+            if stats.converged {
+                return Ok(());
+            }
+            if stats.bulk {
+                return self.transfer_snapshot(peer).await;
             }
         }
-        self.repair_snapshot_peer(peer).await
+        Err("peer repair state changed concurrently".into())
     }
 
-    async fn repair_snapshot_peer(&self, peer: &str) -> Result<(), Error> {
-        let mut nonce = [0; 32];
-        native_ossl::rand::Rand::fill_private(&mut nonce)?;
-        let local = self.engine.durable_snapshot().await?;
-        let request = repair_snapshot(nonce, &local, false)?;
-        let response = Repair::decode(&self.exchange.sync(peer, request.encode(), &local).await?)?;
-        if response.nonce != nonce {
-            return Err("peer repair response nonce mismatch".into());
-        }
-        if response.digest == request.digest {
-            if response.snapshot.is_some() || response.chunk.is_some() {
-                return Err("unexpected peer repair snapshot".into());
+    async fn transfer_snapshot(&self, peer: &str) -> Result<(), Error> {
+        let stats = snapshot::transfer(self, peer, &snapshot_limits(), |request| async move {
+            match self.call(peer, RequestBody::Snapshot(request)).await? {
+                ResponseBody::Snapshot(response) => Ok(response),
+                ResponseBody::Repair(_) => {
+                    Err(RepairError::Protocol("unexpected peer repair answer"))
+                }
             }
-            if self.engine.durable_snapshot().await?.digest()? != request.digest {
-                return Err("local state changed during peer repair".into());
-            }
-            return Ok(());
-        }
-        let digest = response.digest;
-        let bytes = if let Some(snapshot) = response.snapshot {
-            snapshot
+        })
+        .await
+        .map_err(from_repair)?;
+        if stats.converged {
+            Ok(())
         } else {
-            let mut chunk = response.chunk;
-            let mut snapshot = Vec::new();
-            let mut expected_total = None;
-            loop {
-                let Some(Chunk::Data {
-                    offset,
-                    total,
-                    bytes,
-                }) = chunk
-                else {
-                    return Err("missing peer repair chunk".into());
-                };
-                if offset != snapshot.len() || expected_total.is_some_and(|size| size != total) {
-                    return Err("out of sequence peer repair chunk".into());
-                }
-                expected_total = Some(total);
-                snapshot.extend_from_slice(&bytes);
-                if snapshot.len() == total {
-                    break;
-                }
-                native_ossl::rand::Rand::fill_private(&mut nonce)?;
-                let request = Repair {
-                    nonce,
-                    digest,
-                    snapshot: None,
-                    chunk: Some(Chunk::Fetch {
-                        offset: snapshot.len(),
-                    }),
-                };
-                let response =
-                    Repair::decode(&self.exchange.sync(peer, request.encode(), &local).await?)?;
-                if response.nonce != nonce
-                    || response.digest != digest
-                    || response.snapshot.is_some()
-                {
-                    return Err("peer repair snapshot changed during transfer".into());
-                }
-                chunk = response.chunk;
-            }
-            if anchors::state_digest(&snapshot)? != digest {
-                return Err("peer repair snapshot digest mismatch".into());
-            }
-            snapshot
-        };
-        self.engine
-            .merge_inbound(&peer.to_owned(), AnchorState::from_bytes(&bytes)?)
-            .await?;
-        let local = self.engine.durable_snapshot().await?;
-        let merged_digest = local.digest()?;
-        if merged_digest == digest {
-            return Ok(());
+            Err("peer repair remains unreconciled".into())
         }
-        self.upload_snapshot(peer, &local, merged_digest).await
     }
 
-    async fn upload_snapshot(
-        &self,
-        peer: &str,
-        local: &AnchorState,
-        digest: [u8; 32],
-    ) -> Result<(), Error> {
+    /// One authenticated round trip with `peer`.
+    async fn call(&self, peer: &str, body: RequestBody) -> Result<ResponseBody, RepairError> {
         let mut nonce = [0; 32];
-        let snapshot = local.to_bytes();
-        if snapshot.len() > MAX_SNAPSHOT_BYTES {
-            return Err("peer repair snapshot exceeds size limit".into());
+        native_ossl::rand::Rand::fill_private(&mut nonce).map_err(to_storage)?;
+        let payload = encode(&Message { nonce, body }).map_err(to_entry)?;
+        let own = {
+            let state = self.exchange.state.read().await;
+            self.exchange.own_delegation(&state)
         }
+        .map_err(|e| RepairError::Transport(Box::new(e)))?;
+        let response = self
+            .exchange
+            .sync(peer, payload, own)
+            .await
+            .map_err(|e| RepairError::Transport(Box::new(e)))?;
+        let response: Message<ResponseBody> = decode(&response).map_err(to_entry)?;
+        if response.nonce != nonce {
+            return Err(RepairError::Protocol("peer repair response nonce mismatch"));
+        }
+        Ok(response.body)
+    }
 
-        for (index, bytes) in snapshot.chunks(CHUNK_BYTES).enumerate() {
-            let offset = index * CHUNK_BYTES;
-            native_ossl::rand::Rand::fill_private(&mut nonce)?;
-            let request = Repair {
-                nonce,
-                digest,
-                snapshot: None,
-                chunk: Some(Chunk::Upload {
-                    offset,
-                    total: snapshot.len(),
-                    bytes: bytes.to_vec(),
-                }),
-            };
-            let response =
-                Repair::decode(&self.exchange.sync(peer, request.encode(), local).await?)?;
-            let next = offset + bytes.len();
-            if response.nonce != nonce
-                || response.snapshot.is_some()
-                || if next == snapshot.len() {
-                    response.chunk.is_some() || response.digest != digest
-                } else {
-                    response.digest != digest
-                        || !matches!(response.chunk, Some(Chunk::Accepted { next: n }) if n == next)
-                }
-            {
-                return Err("peer repair remains unreconciled".into());
-            }
+    /// Drop expired entries and those of removed servers from `state`.
+    fn retain_live(&self, state: &mut AnchorState, members: &BTreeSet<String>, at: u64) {
+        let x = &self.exchange;
+        let before = state.len();
+        state.retain(members, &x.settings.realm, &x.policy, at);
+        if state.len() < before {
+            // Dropped without a new generation: the repair index must not
+            // keep listing them.
+            self.index.invalidate();
         }
-        if self.engine.durable_snapshot().await?.digest()? != digest {
-            return Err("local state changed during peer repair".into());
-        }
-        Ok(())
     }
 
     /// One maintenance pass: drop expired and removed entries, renew this
@@ -1215,7 +827,7 @@ impl Peers {
 
         let mut guard = x.state.write().await;
         let mut state = guard.clone();
-        state.retain(&members, realm, &x.policy, at);
+        self.retain_live(&mut state, &members, at);
         let mut wrote = false;
         if let Some(anchor) = &x.anchor {
             wrote |= put(&mut state, Entry::Key(anchor.public().to_jwk_json()))?;
@@ -1340,13 +952,33 @@ impl Peers {
         if busy {
             return Err(PeerError::Busy.into());
         }
-        let repair = Repair::decode(&sync.payload)?;
+        let message: Message<RequestBody> = decode(&sync.payload)?;
         let fresh = lock(&x.attested).insert(sync.sender.clone(), own.clone()) != Some(own);
         if fresh {
             x.changed.notify_one();
         }
         self.merge_peer_epoch(&sync, &sync_chain).await?;
-        self.answer_repair(&sync, repair).await
+        let body = match message.body {
+            RequestBody::Repair(request) => ResponseBody::Repair(
+                repair::respond(self, sync.sender.as_str(), request, &repair_limits())
+                    .await
+                    .map_err(from_repair)?,
+            ),
+            RequestBody::Snapshot(request) => ResponseBody::Snapshot(
+                x.snapshots
+                    .respond(self, sync.sender.as_str(), request, &snapshot_limits())
+                    .await
+                    .map_err(from_repair)?,
+            ),
+        };
+        let bytes = encode(&Message {
+            nonce: message.nonce,
+            body,
+        })?;
+        if bytes.len() > MAX_SYNC_BYTES {
+            return Err("peer repair response exceeds size limit".into());
+        }
+        Ok(bytes)
     }
 
     async fn authenticate_sync(
@@ -1369,28 +1001,35 @@ impl Peers {
         x.refresh_members().await;
         // Left-out content comes from this sender's earlier authenticated
         // syncs, and is then checked exactly as if it had been sent.
-        let (own, sync_chain) = {
-            let contexts = lock(&x.contexts);
-            let cached = contexts.get(&sync.sender);
-            let own = match &sync.own {
-                Some(own) => own.clone(),
-                None => cached
-                    .filter(|c| c.own.0 == sync.own_hash)
-                    .map(|c| c.own.1.clone())
-                    .ok_or(PeerError::NeedContext)?,
-            };
-            let chain = match &sync.chain {
-                Some(chain) => chain.clone(),
-                None => cached
-                    .filter(|c| c.chain.0 == sync.chain_hash)
-                    .map(|c| c.chain.1.clone())
-                    .ok_or(PeerError::NeedContext)?,
-            };
-            (own, chain)
+        let needed = |e: ContextError| -> Error {
+            match e {
+                ContextError::Needed => PeerError::NeedContext.into(),
+                other => other.into(),
+            }
         };
+        let own = x
+            .own_seen
+            .resolve(
+                &sync.sender,
+                Attached {
+                    hash: sync.own_hash,
+                    value: sync.own.clone().map(OwnContext),
+                },
+            )
+            .map_err(needed)?;
+        let sync_chain = x
+            .chain_seen
+            .resolve(
+                &sync.sender,
+                Attached {
+                    hash: sync.chain_hash,
+                    value: sync.chain.clone().map(ChainContext),
+                },
+            )
+            .map_err(needed)?;
         let members = x.members();
-        let own = sync.attest(
-            &own,
+        let own_attested = sync.attest(
+            &own.value().0,
             &principal,
             &anchors::PeerAttestation {
                 me: &x.settings.me,
@@ -1400,18 +1039,12 @@ impl Peers {
                 now: now(),
             },
         )?;
-        {
-            let mut contexts = lock(&x.contexts);
-            contexts.retain(|peer, _| members.contains(peer));
-            contexts.insert(
-                sync.sender.clone(),
-                SyncContext {
-                    own: (sync.own_hash, own.clone()),
-                    chain: (sync.chain_hash, sync_chain.clone()),
-                },
-            );
-        }
-        Ok((sync, own, sync_chain))
+        x.own_seen.retain(|peer| members.contains(peer));
+        x.chain_seen.retain(|peer| members.contains(peer));
+        let sync_chain_value = sync_chain.value().0.clone();
+        x.own_seen.accept(&sync.sender, own);
+        x.chain_seen.accept(&sync.sender, sync_chain);
+        Ok((sync, own_attested, sync_chain_value))
     }
 
     async fn merge_peer_epoch(&self, sync: &PeerSync, sync_chain: &[Vec<u8>]) -> Result<(), Error> {
@@ -1474,221 +1107,116 @@ impl Peers {
         }
         Ok(())
     }
+}
 
-    async fn answer_repair(&self, sync: &PeerSync, repair: Repair) -> Result<Vec<u8>, Error> {
-        match &repair.chunk {
-            Some(Chunk::Probe) => {
-                let state = self.engine.durable_snapshot().await?;
-                let digest = state.digest()?;
-                return Ok(Repair {
-                    nonce: repair.nonce,
-                    digest,
-                    snapshot: None,
-                    chunk: None,
-                }
-                .encode());
-            }
-            Some(Chunk::Summary { bits, hashes }) => {
-                let state = self.engine.durable_snapshot().await?;
-                let digest = state.digest()?;
-                let chunk = if digest == repair.digest {
-                    None
-                } else if state.len() > MAX_SUMMARY_ENTRIES {
-                    Some(Chunk::Fallback)
-                } else {
-                    let differing: BTreeSet<usize> = state
-                        .bucket_hashes(*bits)?
-                        .iter()
-                        .zip(hashes)
-                        .enumerate()
-                        .filter(|(_, (ours, theirs))| ours != theirs)
-                        .map(|(i, _)| i)
-                        .collect();
-                    match encode_summary(&state.bucket_summary(*bits, &differing)?) {
-                        Some(summary) => Some(Chunk::Leaves {
-                            buckets: differing
-                                .iter()
-                                .map(|b| u16::try_from(*b))
-                                .collect::<std::result::Result<_, _>>()?,
-                            summary,
-                        }),
-                        None => Some(Chunk::Fallback),
-                    }
-                };
-                return Ok(Repair {
-                    nonce: repair.nonce,
-                    digest,
-                    snapshot: None,
-                    chunk,
-                }
-                .encode());
-            }
-            Some(Chunk::PushSelected { wanted, bytes }) => {
-                self.engine
-                    .merge_inbound(&sync.sender, AnchorState::from_bytes(bytes)?)
-                    .await?;
-                let state = self.engine.durable_snapshot().await?;
-                let bytes = state.entries(&decode_wanted(wanted)?)?.to_bytes();
-                let chunk = if bytes.len() <= CHUNK_BYTES {
-                    Chunk::Selected { bytes }
-                } else {
-                    Chunk::Fallback
-                };
-                return Ok(Repair {
-                    nonce: repair.nonce,
-                    digest: state.digest()?,
-                    snapshot: None,
-                    chunk: Some(chunk),
-                }
-                .encode());
-            }
-            _ => {}
-        }
-        self.answer_snapshot_repair(sync, repair).await
-    }
-
-    async fn answer_snapshot_repair(
-        &self,
-        sync: &PeerSync,
-        repair: Repair,
-    ) -> Result<Vec<u8>, Error> {
-        let mut pushed = repair.snapshot.is_some();
-        let mut incoming = repair.snapshot;
-        let mut fetch = None;
-        match repair.chunk {
-            Some(Chunk::Fetch { offset }) => fetch = Some(offset),
-            Some(Chunk::Upload {
-                offset,
-                total,
-                bytes,
-            }) => {
-                let completed =
-                    self.accept_upload(&sync.sender, repair.digest, offset, total, &bytes)?;
-                if let Some(bytes) = completed {
-                    if anchors::state_digest(&bytes)? != repair.digest {
-                        return Err("peer repair snapshot digest mismatch".into());
-                    }
-                    incoming = Some(bytes);
-                    pushed = true;
-                } else {
-                    return Ok(Repair {
-                        nonce: repair.nonce,
-                        digest: repair.digest,
-                        snapshot: None,
-                        chunk: Some(Chunk::Accepted {
-                            next: offset + bytes.len(),
-                        }),
-                    }
-                    .encode());
-                }
-            }
-            Some(_) => return Err("unexpected peer repair chunk".into()),
-            None => {}
-        }
-        if let Some(bytes) = incoming {
-            self.engine
-                .merge_inbound(&sync.sender, AnchorState::from_bytes(&bytes)?)
-                .await?;
-        }
-        let state = self.engine.durable_snapshot().await?;
-        let digest = state.digest()?;
-        let include = !pushed && digest != repair.digest;
-        let (snapshot, chunk) = if let Some(offset) = fetch {
-            let snapshot = state.to_bytes();
-            if digest != repair.digest
-                || offset >= snapshot.len()
-                || snapshot.len() > MAX_SNAPSHOT_BYTES
-            {
-                return Err("peer repair snapshot changed during transfer".into());
-            }
-            let end = (offset + CHUNK_BYTES).min(snapshot.len());
+/// The repair summary of every entry of `state`.
+fn summaries(state: &AnchorState) -> Result<Vec<(repair::Summary, anchors::EntryId)>, RepairError> {
+    Ok(state
+        .entry_versions()
+        .map_err(to_entry)?
+        .into_iter()
+        .map(|(id, version, kind)| {
             (
-                None,
-                Some(Chunk::Data {
-                    offset,
-                    total: snapshot.len(),
-                    bytes: snapshot[offset..end].to_vec(),
-                }),
+                repair::Summary {
+                    id,
+                    hash: version.hash,
+                    // A vouch's or succession's signed `iat` (0 for keys and
+                    // claims): only a newer version is sent, and on equal
+                    // orders both, for the merge to break the tie.
+                    order: Some((i64::try_from(version.order).unwrap_or(i64::MAX), 0, [0; 16])),
+                    kind,
+                },
+                id,
             )
-        } else if include {
-            let snapshot = state.to_bytes();
-            if snapshot.len() <= CHUNK_BYTES {
-                (Some(snapshot), None)
-            } else if snapshot.len() > MAX_SNAPSHOT_BYTES {
-                return Err("peer repair snapshot exceeds size limit".into());
-            } else {
-                (
-                    None,
-                    Some(Chunk::Data {
-                        offset: 0,
-                        total: snapshot.len(),
-                        bytes: snapshot[..CHUNK_BYTES].to_vec(),
-                    }),
-                )
-            }
-        } else {
-            (None, None)
-        };
-        let response = Repair {
-            nonce: repair.nonce,
-            digest,
-            snapshot,
-            chunk,
-        };
-        let bytes = response.encode();
-        if bytes.len() > MAX_SYNC_BYTES {
-            return Err("peer repair response exceeds size limit".into());
-        }
-        Ok(bytes)
+        })
+        .collect())
+}
+
+/// This server as the local side of an entry-wise repair. Entries are
+/// [`AnchorState`] entries by [`anchors::EntryId`]; their kind is the entry
+/// tag, so keys arrive before the entries checked against them.
+impl Replica<str> for Peers {
+    type Entry = WireEntry;
+    type Location = anchors::EntryId;
+    type Hasher = Sha256;
+
+    async fn index(&self) -> Result<repair::SharedIndex<anchors::EntryId, Sha256>, RepairError> {
+        self.index
+            .get(
+                self.engine.durable(),
+                || repair::Index::new(Sha256, INDEX_DOMAIN),
+                |state: &AnchorState, since| match since {
+                    None => state.clone(),
+                    Some(since) => agirru_crdt::Delta::delta_since(state, since),
+                },
+                |part| summaries(&part),
+            )
+            .await
     }
 
-    fn accept_upload(
+    async fn admit(&self, peer: &str, entries: Vec<WireEntry>) -> Result<(), RepairError> {
+        let clock = GenerationClock::new();
+        let mut inbound = AnchorState::default();
+        for e in &entries {
+            let part = AnchorState::from_bytes(&e.0).map_err(to_entry)?;
+            agirru_crdt::Merge::merge(&mut inbound, &part, &clock);
+        }
+        self.engine
+            .merge_inbound(&peer.to_owned(), inbound)
+            .await
+            .map_err(to_storage)?;
+        Ok(())
+    }
+
+    async fn entries(
         &self,
-        peer: &str,
-        digest: [u8; 32],
-        offset: usize,
-        total: usize,
-        bytes: &[u8],
-    ) -> Result<Option<Vec<u8>>, Error> {
-        let x = &self.exchange;
-        let members = x.members();
-        let mut uploads = lock(&x.uploads);
-        uploads.retain(|peer, upload| {
-            members.contains(peer) && upload.updated.elapsed() < UPLOAD_LIFETIME
-        });
-        if offset == 0 {
-            uploads.remove(peer);
-            if uploads.values().map(|upload| upload.total).sum::<usize>() + total
-                > MAX_SNAPSHOT_BYTES
-            {
-                return Err(PeerError::Busy.into());
-            }
-            uploads.insert(
-                peer.to_owned(),
-                Upload {
-                    digest,
-                    total,
-                    bytes: Vec::new(),
-                    updated: Instant::now(),
-                },
-            );
-        }
-        let upload = uploads.get_mut(peer).ok_or("unknown peer repair upload")?;
-        if upload.digest != digest || upload.total != total || upload.bytes.len() != offset {
-            return Err("out of sequence peer repair upload".into());
-        }
-        upload.bytes.extend_from_slice(bytes);
-        upload.updated = Instant::now();
-        if upload.bytes.len() == total {
-            Ok(Some(
-                uploads
-                    .remove(peer)
-                    .ok_or("missing peer repair upload")?
-                    .bytes,
-            ))
-        } else {
-            Ok(None)
-        }
+        ids: Vec<anchors::EntryId>,
+    ) -> Result<Vec<Option<WireEntry>>, RepairError> {
+        self.engine
+            .durable()
+            .read(|state, _| {
+                ids.iter()
+                    .map(|id| {
+                        let one = state.entries(&BTreeSet::from([*id]))?;
+                        Ok((!one.is_empty()).then(|| WireEntry(one.to_bytes())))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()
+            })
+            .await
+            .map_err(to_storage)?
+            .map_err(to_entry)
+    }
+
+    fn entry_size(entry: &WireEntry) -> usize {
+        entry.0.len()
+    }
+}
+
+/// This server as the local side of a whole-state transfer: the encoded
+/// [`AnchorState`] with its own digest.
+impl SnapshotReplica<str> for Peers {
+    async fn snapshot(&self) -> Result<(repair::Hash, Arc<Vec<u8>>), RepairError> {
+        let bytes = self
+            .engine
+            .durable()
+            .read(|state, _| state.to_bytes())
+            .await
+            .map_err(to_storage)?;
+        let digest = anchors::state_digest(&bytes).map_err(to_entry)?;
+        Ok((digest, Arc::new(bytes)))
+    }
+
+    fn digest(&self, bytes: &[u8]) -> Result<repair::Hash, RepairError> {
+        anchors::state_digest(bytes).map_err(to_entry)
+    }
+
+    async fn admit_snapshot(&self, peer: &str, bytes: Vec<u8>) -> Result<(), RepairError> {
+        let inbound = AnchorState::from_bytes(&bytes).map_err(to_entry)?;
+        self.engine
+            .merge_inbound(&peer.to_owned(), inbound)
+            .await
+            .map_err(to_storage)?;
+        Ok(())
     }
 }
 
@@ -1789,11 +1317,26 @@ impl Exchange {
         }
     }
 
+    /// This server's own delegation in `state`, as it introduces itself
+    /// to peers.
+    fn own_delegation(&self, state: &AnchorState) -> Result<Delegation, PeerError> {
+        let me = &self.settings.me;
+        match &self.anchor {
+            Some(a) => state.own_delegation(me, a.public()).map_err(failed)?,
+            None => state.latest_claim(me, None).map(Delegation::new),
+        }
+        .ok_or_else(|| failed("no own claim yet"))
+    }
+
+    /// Send one reconciliation message to `peer`, with this server's
+    /// delegation `own` and epoch window as context: each left out while the
+    /// peer holds it, and sent again once if the peer answers that it needs
+    /// them.
     async fn sync(
         &self,
         peer: &str,
         payload: Vec<u8>,
-        state: &AnchorState,
+        own: Delegation,
     ) -> Result<Vec<u8>, PeerError> {
         static MEASURE: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("KUIPA_REPLICATION_SIZES").is_some());
@@ -1801,42 +1344,41 @@ impl Exchange {
         let started = measure.then(Instant::now);
         let payload_bytes = payload.len();
         let me = self.settings.me.clone();
-        let own = match &self.anchor {
-            Some(a) => state.own_delegation(&me, a.public()).map_err(failed)?,
-            None => state.latest_claim(&me, None).map(Delegation::new),
-        }
-        .ok_or_else(|| failed("no own claim yet"))?;
-        let chain = self.epoch_bytes().map_err(failed)?;
-        let own_hash = PeerSync::delegation_hash(&own).map_err(failed)?;
-        let chain_hash = PeerSync::chain_hash(&chain).map_err(failed)?;
-        let cb = PeerSync::channel_binding(&me, peer, &own_hash, &payload, &chain_hash)
-            .map_err(failed)?;
-        let mut known = lock(&self.delivered).get(peer).copied();
+        let target = peer.to_owned();
+        let own = OwnContext(own);
+        let chain = ChainContext(self.epoch_bytes().map_err(failed)?);
+        let mut resent = false;
         loop {
-            let send_own = known.is_none_or(|(o, _)| o != own_hash);
-            let send_chain = known.is_none_or(|(_, c)| c != chain_hash);
+            let own_attached = self.own_sent.attach(&target, &own).map_err(failed)?;
+            let chain_attached = self.chain_sent.attach(&target, &chain).map_err(failed)?;
+            let elided = own_attached.value.is_none() || chain_attached.value.is_none();
+            let (own_hash, chain_hash) = (own_attached.hash, chain_attached.hash);
+            let cb = PeerSync::channel_binding(&me, peer, &own_hash, &payload, &chain_hash)
+                .map_err(failed)?;
             let initiator = self.initiator.clone();
-            let target = peer.to_owned();
-            let token = tokio::task::spawn_blocking(move || initiator.token(&target, &cb))
+            let token_target = target.clone();
+            let token = tokio::task::spawn_blocking(move || initiator.token(&token_target, &cb))
                 .await
                 .map_err(failed)?
                 .map_err(failed)?;
-            let own_bytes = if send_own { own.to_json().len() } else { 0 };
-            let chain_bytes: usize = if send_chain {
-                chain.iter().map(Vec::len).sum()
-            } else {
-                0
-            };
+            let own_bytes = own_attached
+                .value
+                .as_ref()
+                .map_or(0, |o| o.0.to_json().len());
+            let chain_bytes: usize = chain_attached
+                .value
+                .as_ref()
+                .map_or(0, |c| c.0.iter().map(Vec::len).sum());
             let token_bytes = token.len();
             let body = PeerSync {
                 sender: me.clone(),
-                receiver: peer.to_owned(),
+                receiver: target.clone(),
                 own_hash,
-                own: send_own.then(|| own.clone()),
+                own: own_attached.value.map(|o| o.0),
                 payload: payload.clone(),
                 token,
                 chain_hash,
-                chain: send_chain.then(|| chain.clone()),
+                chain: chain_attached.value.map(|c| c.0),
             }
             .to_bytes();
             if body.len() > MAX_SYNC_BYTES {
@@ -1846,7 +1388,8 @@ impl Exchange {
             let result = self.post_sync(peer, body).await;
             match &result {
                 Ok(response) => {
-                    lock(&self.delivered).insert(peer.to_owned(), (own_hash, chain_hash));
+                    self.own_sent.delivered(&target, own_hash);
+                    self.chain_sent.delivered(&target, chain_hash);
                     if let Some(started) = started {
                         eprintln!(
                             "kuipad: peer sync size: peer={peer} request={request_bytes} payload={payload_bytes} delegation={own_bytes} token={token_bytes} epochs={chain_bytes} response={} elapsed_ms={}",
@@ -1856,9 +1399,10 @@ impl Exchange {
                     }
                 }
                 // The peer restarted or forgot this server: send everything once.
-                Err(PeerError::NeedContext) if known.is_some() => {
-                    lock(&self.delivered).remove(peer);
-                    known = None;
+                Err(PeerError::NeedContext) if elided && !resent => {
+                    self.own_sent.forget(&target);
+                    self.chain_sent.forget(&target);
+                    resent = true;
                     continue;
                 }
                 Err(_) => {}
@@ -1987,8 +1531,11 @@ impl Transport<String> for Exchange {
     type Error = PeerError;
 
     async fn send_recv(&self, peer: &String, envelope: Vec<u8>) -> Result<Vec<u8>, PeerError> {
-        let state = self.state.read().await.clone();
-        let result = self.sync(peer, envelope, &state).await;
+        let own = {
+            let state = self.state.read().await;
+            self.own_delegation(&state)?
+        };
+        let result = self.sync(peer, envelope, own).await;
         self.note(peer, &result);
         result
     }
@@ -2047,7 +1594,7 @@ impl GossipHooks<String, AnchorState> for Exchange {
         );
     }
 
-    async fn on_merged(&self, _peer: &String, _after: &AnchorState, _inbound: &AnchorState) {
+    async fn on_merged(&self, _peer: &String, _changes: &AnchorState) {
         self.changed.notify_one();
     }
 
@@ -2251,7 +1798,6 @@ pub struct Runtime(Arc<Exchange>, CborCodec);
 impl GossipRuntime<AnchorState, String> for Runtime {
     type Transport = Exchange;
     type Membership = Exchange;
-    type Storage = Exchange;
     type Hooks = Exchange;
     type Codec = CborCodec;
 
@@ -2259,9 +1805,6 @@ impl GossipRuntime<AnchorState, String> for Runtime {
         &self.0
     }
     fn membership(&self) -> &Exchange {
-        &self.0
-    }
-    fn storage(&self) -> &Exchange {
         &self.0
     }
     fn hooks(&self) -> &Exchange {
@@ -2347,70 +1890,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repair_wire_rejects_tampered_snapshots_and_versions() {
-        let state = AnchorState::default();
-        let repair = repair_snapshot([7; 32], &state, true).unwrap();
-        let mut bytes = repair.encode();
-        assert_eq!(Repair::decode(&bytes).unwrap().digest, repair.digest);
-        *bytes.last_mut().unwrap() ^= 1;
-        assert!(Repair::decode(&bytes).is_err());
-        let mut bytes = repair.encode();
-        bytes[4] ^= 1;
-        assert!(Repair::decode(&bytes).is_err());
+    /// The repair index of `state`, as a peer computes it.
+    fn index_of(state: &AnchorState) -> repair::Index<anchors::EntryId, Sha256> {
+        let mut index = repair::Index::new(Sha256, INDEX_DOMAIN).unwrap();
+        index.apply(summaries(state).unwrap()).unwrap();
+        index
     }
 
-    #[test]
-    fn summary_bounds_reject_malformed_and_duplicate_entries() {
-        let mut w = Writer::new(*b"ISUM");
-        w.u64(MAX_SUMMARY_ENTRIES as u64 + 1);
-        assert!(decode_summary(&w.finish()).is_err());
-        let mut w = Writer::new(*b"ISUM");
-        w.u64(2)
-            .fixed(&[7; 16])
-            .fixed(&[1; 32])
-            .u64(0)
-            .fixed(&[7; 16])
-            .fixed(&[2; 32])
-            .u64(0);
-        assert!(decode_summary(&w.finish()).is_err());
-        let mut w = Writer::new(*b"ISUM");
-        w.u64(1).fixed(&[7; 15]);
-        assert!(decode_summary(&w.finish()).is_err(), "truncated entry");
-        assert!(decode_summary(&vec![0; MAX_SUMMARY_BYTES + 1]).is_err());
-        let version = anchors::EntryVersion {
-            hash: [0; 32],
-            order: 0,
-        };
-        let id = |i: usize| {
-            let mut id = [0; 16];
-            id[..8].copy_from_slice(&i.to_be_bytes());
-            id
-        };
-        let too_many = (0..=MAX_SUMMARY_ENTRIES)
-            .map(|i| (id(i), version))
-            .collect();
-        assert!(encode_summary(&too_many).is_none());
-        let mut w = Writer::new(*b"IWNT");
-        w.u64(2).fixed(&[7; 16]).fixed(&[7; 16]);
-        assert!(decode_wanted(&w.finish()).is_err(), "duplicate wanted ids");
-        let too_many: BTreeSet<anchors::EntryId> = (0..=MAX_SUMMARY_ENTRIES).map(id).collect();
-        assert!(encode_wanted(&too_many).is_none());
-        let request = Repair {
-            nonce: [0; 32],
-            digest: [0; 32],
-            snapshot: None,
-            chunk: Some(Chunk::PushSelected {
-                wanted: encode_wanted(&BTreeSet::new()).unwrap(),
-                bytes: vec![0; CHUNK_BYTES + 1],
-            }),
-        };
-        assert!(Repair::decode(&request.encode()).is_err());
+    fn payload(body: RequestBody) -> Vec<u8> {
+        encode(&Message {
+            nonce: [7; 32],
+            body,
+        })
+        .unwrap()
     }
 
-    /// A full repair snapshot with entries larger than a streaming buffer.
-    #[test]
-    fn repair_snapshot_round_trips_large_entries() {
+    fn answer(bytes: &[u8]) -> ResponseBody {
+        let message: Message<ResponseBody> = decode(bytes).unwrap();
+        assert_eq!(message.nonce, [7; 32], "the answer echoes the nonce");
+        message.body
+    }
+
+    fn probe(state: &AnchorState) -> RequestBody {
+        RequestBody::Repair(repair::Request::Probe {
+            digest: index_of(state).digest(),
+        })
+    }
+
+    fn upload(digest: [u8; 32], offset: usize, total: usize, part: &[u8]) -> RequestBody {
+        RequestBody::Snapshot(SnapshotRequest::Upload {
+            digest,
+            offset: offset as u64,
+            total: total as u64,
+            bytes: part.to_vec(),
+        })
+    }
+
+    fn vouched_state() -> AnchorState {
         let anchor = SigningKey::generate_preferred().unwrap();
         let mut state = AnchorState::default();
         state
@@ -2445,10 +1961,57 @@ mod tests {
                 .put(e, "R", &Policy::default(), now(), &GenerationClock::new())
                 .unwrap();
         }
-        let message = repair_snapshot([7; 32], &state, true).unwrap().encode();
-        let decoded = Repair::decode(&message).unwrap();
-        let back = AnchorState::from_bytes(decoded.snapshot.as_deref().unwrap()).unwrap();
+        state
+    }
+
+    /// Entries larger than CBOR's 4 KiB scratch buffer travel intact, and a
+    /// vouch carries the key it is checked against.
+    #[test]
+    fn repair_messages_round_trip_large_entries() {
+        let state = vouched_state();
+        let entries: Vec<WireEntry> = summaries(&state)
+            .unwrap()
+            .into_iter()
+            .map(|(_, id)| WireEntry(state.entries(&BTreeSet::from([id])).unwrap().to_bytes()))
+            .collect();
+        assert!(entries.iter().any(|e| e.0.len() > 4096), "a large entry");
+        let bytes = payload(RequestBody::Repair(repair::Request::Exchange {
+            push: entries,
+            want: Vec::new(),
+        }));
+        let message: Message<RequestBody> = decode(&bytes).unwrap();
+        let RequestBody::Repair(repair::Request::Exchange { push, .. }) = message.body else {
+            panic!("expected an exchange")
+        };
+        let mut back = AnchorState::default();
+        for e in &push {
+            agirru_crdt::Merge::merge(
+                &mut back,
+                &AnchorState::from_bytes(&e.0).unwrap(),
+                &GenerationClock::new(),
+            );
+        }
         assert_eq!(back, state);
+    }
+
+    /// Keys are sent before the claims and vouches checked against them.
+    #[test]
+    fn entry_kinds_put_keys_first() {
+        let state = vouched_state();
+        let mut kinds: Vec<u8> = summaries(&state)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.kind)
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn malformed_repair_messages_are_rejected() {
+        let bytes = payload(probe(&AnchorState::default()));
+        assert!(decode::<Message<RequestBody>>(&bytes[..bytes.len() - 1]).is_err());
+        assert!(decode::<Message<RequestBody>>(&[0xff; 8]).is_err());
     }
 
     fn epoch_at(
@@ -2608,16 +2171,13 @@ mod tests {
     }
     async fn check_context(
         peers: &Peers,
-        sync_of: &impl Fn(Repair, bool) -> Vec<u8>,
-        message: &impl Fn(Repair) -> Vec<u8>,
+        sync_of: &impl Fn(RequestBody, bool) -> Vec<u8>,
+        message: &impl Fn(RequestBody) -> Vec<u8>,
         inbound: &AnchorState,
         saved: &AnchorState,
     ) {
         let need = peers
-            .handle(&sync_of(
-                repair_snapshot([1; 32], inbound, false).unwrap(),
-                false,
-            ))
+            .handle(&sync_of(probe(inbound), false))
             .await
             .unwrap_err();
         assert!(
@@ -2627,49 +2187,46 @@ mod tests {
             ),
             "left-out context needs an earlier authenticated sync"
         );
-        let probe = message(repair_snapshot([1; 32], inbound, false).unwrap());
+        let probe_sync = message(probe(inbound));
         let permits = peers
             .exchange
             .repair_permits
             .try_acquire_many(u32::try_from(MAX_CONCURRENT_REPAIRS).unwrap())
             .unwrap();
-        let busy = peers.handle(&probe).await.unwrap_err();
+        let busy = peers.handle(&probe_sync).await.unwrap_err();
         assert!(matches!(
             busy.downcast_ref::<PeerError>(),
             Some(PeerError::Busy)
         ));
         drop(permits);
-        let mut tampered = PeerSync::from_bytes(&probe).unwrap();
+        let mut tampered = PeerSync::from_bytes(&probe_sync).unwrap();
         tampered.payload[5] ^= 1;
         assert!(
             peers.handle(&tampered.to_bytes()).await.is_err(),
             "payload must be authenticated"
         );
         assert!(peers.handle(&vec![0; MAX_SYNC_BYTES + 1]).await.is_err());
-        let response = Repair::decode(&peers.handle(&probe).await.unwrap()).unwrap();
+        let ResponseBody::Repair(response) = answer(&peers.handle(&probe_sync).await.unwrap())
+        else {
+            panic!("expected a repair answer")
+        };
         assert_eq!(
-            AnchorState::from_bytes(response.snapshot.as_deref().unwrap()).unwrap(),
-            *saved
+            response,
+            repair::Response::Probe {
+                equal: false,
+                entries: Some(index_of(saved).len() as u64),
+            }
         );
-        let elided = Repair::decode(
-            &peers
-                .handle(&sync_of(
-                    repair_snapshot([1; 32], inbound, false).unwrap(),
-                    false,
-                ))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let ResponseBody::Repair(elided) =
+            answer(&peers.handle(&sync_of(probe(inbound), false)).await.unwrap())
+        else {
+            panic!("expected a repair answer")
+        };
         assert_eq!(
-            elided.digest, response.digest,
+            elided, response,
             "left-out context resolves from the sender's last sync"
         );
-        let mut other = PeerSync::from_bytes(&sync_of(
-            repair_snapshot([1; 32], inbound, false).unwrap(),
-            false,
-        ))
-        .unwrap();
+        let mut other = PeerSync::from_bytes(&sync_of(probe(inbound), false)).unwrap();
         other.own_hash[0] ^= 1;
         other.token = PeerSync::channel_binding(
             "peer",
@@ -2689,88 +2246,94 @@ mod tests {
             "a different delegation hash is not resolved from the old one"
         );
     }
+
+    /// The first-nibble bucket request for `state`.
+    fn root_buckets(state: &AnchorState) -> RequestBody {
+        let index = index_of(state);
+        RequestBody::Repair(repair::Request::Buckets {
+            buckets: (0..16u8)
+                .map(|n| repair::Bucket {
+                    prefix: vec![n],
+                    hash: index.bucket_hash(&[n]).unwrap(),
+                })
+                .collect(),
+        })
+    }
+
+    /// The receiver's summaries in each differing bucket of a bucket answer.
+    fn differing(response: ResponseBody) -> BTreeMap<Vec<u8>, Vec<repair::Summary>> {
+        let ResponseBody::Repair(repair::Response::Buckets {
+            differing, descend, ..
+        }) = response
+        else {
+            panic!("expected bucket summaries")
+        };
+        assert!(descend.is_empty(), "small buckets are summarised");
+        differing
+            .into_iter()
+            .map(|b| (b.prefix, b.summaries))
+            .collect()
+    }
+
     async fn check_summary(
         peers: &Peers,
-        message: &impl Fn(Repair) -> Vec<u8>,
+        message: &impl Fn(RequestBody) -> Vec<u8>,
         inbound: &AnchorState,
         saved: &AnchorState,
     ) -> Vec<u8> {
-        let digest_probe = message(Repair {
-            nonce: [7; 32],
-            digest: inbound.digest().unwrap(),
-            snapshot: None,
-            chunk: Some(Chunk::Probe),
-        });
-        let response = Repair::decode(&peers.handle(&digest_probe).await.unwrap()).unwrap();
-        assert!(
-            response.snapshot.is_none() && response.chunk.is_none(),
-            "probe must only return a digest"
-        );
-        assert_eq!(response.digest, saved.digest().unwrap());
-        let bits = 2;
-        let selective_probe = message(Repair {
-            nonce: [8; 32],
-            digest: inbound.digest().unwrap(),
-            snapshot: None,
-            chunk: Some(Chunk::Summary {
-                bits,
-                hashes: inbound.bucket_hashes(bits).unwrap(),
-            }),
-        });
-        let leaves = Repair::decode(&peers.handle(&selective_probe).await.unwrap()).unwrap();
-        let Some(Chunk::Leaves { buckets, summary }) = leaves.chunk else {
-            panic!("expected bucket entries")
+        let ResponseBody::Repair(response) =
+            answer(&peers.handle(&message(probe(saved))).await.unwrap())
+        else {
+            panic!("expected a repair answer")
         };
-        let differing: BTreeSet<usize> = buckets.iter().map(|b| usize::from(*b)).collect();
-        let expected: BTreeSet<usize> = saved
-            .entry_summary()
-            .unwrap()
-            .keys()
-            .chain(inbound.entry_summary().unwrap().keys())
-            .map(|id| anchors::bucket_of(id, bits))
+        assert!(
+            matches!(response, repair::Response::Probe { equal: true, .. }),
+            "a probe compares digests only"
+        );
+        let buckets_sync = message(root_buckets(inbound));
+        let got = differing(answer(&peers.handle(&buckets_sync).await.unwrap()));
+        let first_nibble = |id: &anchors::EntryId| vec![id[0] >> 4];
+        let expected: BTreeSet<Vec<u8>> = index_of(saved)
+            .bucket_summaries(&[])
+            .iter()
+            .chain(index_of(inbound).bucket_summaries(&[]).iter())
+            .map(|s| first_nibble(&s.id))
             .collect();
         assert_eq!(
-            differing, expected,
+            got.keys().cloned().collect::<BTreeSet<_>>(),
+            expected,
             "exactly the buckets holding entries one side lacks differ"
         );
-        assert_eq!(
-            decode_summary(&summary).unwrap(),
-            saved.bucket_summary(bits, &differing).unwrap()
-        );
-        let mut tampered = PeerSync::from_bytes(&selective_probe).unwrap();
+        for (prefix, summaries) in &got {
+            assert_eq!(*summaries, index_of(saved).bucket_summaries(prefix));
+        }
+        let mut tampered = PeerSync::from_bytes(&buckets_sync).unwrap();
         *tampered.payload.last_mut().unwrap() ^= 1;
         assert!(
             peers.handle(&tampered.to_bytes()).await.is_err(),
             "summaries must be authenticated"
         );
-        selective_probe
+        buckets_sync
     }
+
     async fn check_upload(
         peers: &Peers,
-        message: &impl Fn(Repair) -> Vec<u8>,
+        message: &impl Fn(RequestBody) -> Vec<u8>,
         inbound: &AnchorState,
         mut saved: AnchorState,
         dir: &std::path::Path,
-        selective_probe: &[u8],
+        buckets_sync: &[u8],
     ) -> AnchorState {
         let bytes = inbound.to_bytes();
         let digest = anchors::state_digest(&bytes).unwrap();
         let split = bytes.len() / 2;
-        let upload = |offset, part: &[u8]| {
-            message(Repair {
-                nonce: [9; 32],
-                digest,
-                snapshot: None,
-                chunk: Some(Chunk::Upload {
-                    offset,
-                    total: bytes.len(),
-                    bytes: part.to_vec(),
-                }),
-            })
-        };
-        let first = upload(0, &bytes[..split]);
-        let response = Repair::decode(&peers.handle(&first).await.unwrap()).unwrap();
-        assert!(matches!(response.chunk, Some(Chunk::Accepted { next }) if next == split));
+        let chunk = |offset, part: &[u8]| message(upload(digest, offset, bytes.len(), part));
+        let first = chunk(0, &bytes[..split]);
+        let response = answer(&peers.handle(&first).await.unwrap());
+        assert!(matches!(
+            response,
+            ResponseBody::Snapshot(SnapshotResponse::Accepted { next }) if next == split as u64
+        ));
         assert_eq!(
             KeyStore::new(dir).peer_state().unwrap(),
             saved,
@@ -2778,11 +2341,11 @@ mod tests {
         );
         assert!(
             peers
-                .handle(&upload(split + 1, &bytes[split..]))
+                .handle(&chunk(split + 1, &bytes[split..]))
                 .await
                 .is_err()
         );
-        let last = upload(split, &bytes[split..]);
+        let last = chunk(split, &bytes[split..]);
         let mut bad = PeerSync::from_bytes(&last).unwrap();
         *bad.payload.last_mut().unwrap() ^= 1;
         assert!(
@@ -2792,7 +2355,7 @@ mod tests {
         let mut altered = bytes[split..].to_vec();
         *altered.last_mut().unwrap() ^= 1;
         assert!(
-            peers.handle(&upload(split, &altered)).await.is_err(),
+            peers.handle(&chunk(split, &altered)).await.is_err(),
             "a complete upload must match its digest"
         );
         assert_eq!(KeyStore::new(dir).peer_state().unwrap(), saved);
@@ -2800,77 +2363,95 @@ mod tests {
         peers.handle(&last).await.unwrap();
         agirru_crdt::Merge::merge(&mut saved, inbound, &GenerationClock::new());
         assert_eq!(KeyStore::new(dir).peer_state().unwrap(), saved);
-        // A selection reflects the receiver's current state, even after it
-        // changed since the sender's probe.
-        let response = Repair::decode(&peers.handle(selective_probe).await.unwrap()).unwrap();
-        let Some(Chunk::Leaves { summary, .. }) = response.chunk else {
-            panic!("expected bucket entries")
-        };
-        let theirs = decode_summary(&summary).unwrap();
-        let lacking: BTreeSet<anchors::EntryId> = saved
-            .entry_summary()
-            .unwrap()
-            .keys()
-            .filter(|id| !inbound.entry_summary().unwrap().contains_key(*id))
-            .copied()
+        // A bucket answer reflects the receiver's current state, even after
+        // it changed since the sender's earlier request.
+        let got = differing(answer(&peers.handle(buckets_sync).await.unwrap()));
+        let mut plan = repair::Plan::default();
+        for (prefix, theirs) in &got {
+            assert_eq!(*theirs, index_of(&saved).bucket_summaries(prefix));
+            repair::plan_bucket(&index_of(inbound), prefix, theirs, &mut plan);
+        }
+        let lacking: BTreeSet<anchors::EntryId> = index_of(&saved)
+            .bucket_summaries(&[])
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| index_of(inbound).summary(id).is_none())
             .collect();
         assert_eq!(
-            inbound.wanted(&theirs).unwrap(),
+            plan.want.iter().map(|(_, id)| *id).collect::<BTreeSet<_>>(),
             lacking,
             "the sender wants exactly what it lacks"
         );
-        assert_eq!(response.digest, saved.digest().unwrap());
-        let wanted: BTreeSet<anchors::EntryId> =
-            saved.entry_summary().unwrap().keys().copied().collect();
-        let selected_push = message(Repair {
-            nonce: [11; 32],
-            digest: inbound.digest().unwrap(),
-            snapshot: None,
-            chunk: Some(Chunk::PushSelected {
-                wanted: encode_wanted(&wanted).unwrap(),
-                bytes: inbound.to_bytes(),
-            }),
-        });
-        let response = Repair::decode(&peers.handle(&selected_push).await.unwrap()).unwrap();
-        let Some(Chunk::Selected { bytes }) = response.chunk else {
+        let wanted: Vec<anchors::EntryId> = index_of(&saved)
+            .bucket_summaries(&[])
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        let exchange = message(RequestBody::Repair(repair::Request::Exchange {
+            push: vec![WireEntry(inbound.to_bytes())],
+            want: wanted,
+        }));
+        let ResponseBody::Repair(repair::Response::Exchange {
+            entries,
+            later,
+            digest,
+        }) = answer(&peers.handle(&exchange).await.unwrap())
+        else {
             panic!("expected wanted entries")
         };
+        assert_eq!(later, Vec::<anchors::EntryId>::new());
+        let mut got = AnchorState::default();
+        for e in &entries {
+            agirru_crdt::Merge::merge(
+                &mut got,
+                &AnchorState::from_bytes(&e.0).unwrap(),
+                &GenerationClock::new(),
+            );
+        }
+        assert_eq!(got, saved, "the exchange answers with the wanted entries");
         assert_eq!(
-            AnchorState::from_bytes(&bytes).unwrap(),
-            saved,
-            "the push answers with the wanted entries"
-        );
-        assert_eq!(
-            response.digest,
-            anchors::state_digest(&KeyStore::new(dir).peer_state().unwrap().to_bytes()).unwrap(),
-            "selective acknowledgement must describe durable state"
+            digest,
+            index_of(&KeyStore::new(dir).peer_state().unwrap()).digest(),
+            "an exchange acknowledgement must describe durable state"
         );
         saved
     }
+
     async fn check_persistence(
         peers: &Peers,
-        message: &impl Fn(Repair) -> Vec<u8>,
+        message: &impl Fn(RequestBody) -> Vec<u8>,
         inbound: &AnchorState,
         mut saved: AnchorState,
         dir: &std::path::Path,
         exchange: &Arc<Exchange>,
         server: &Arc<EnrollServer>,
     ) {
-        let push = message(repair_snapshot([2; 32], inbound, true).unwrap());
-        let response = Repair::decode(&peers.handle(&push).await.unwrap()).unwrap();
+        let whole = |state: &AnchorState| {
+            let bytes = state.to_bytes();
+            message(upload(
+                anchors::state_digest(&bytes).unwrap(),
+                0,
+                bytes.len(),
+                &bytes,
+            ))
+        };
+        let merged = |response: ResponseBody| match response {
+            ResponseBody::Snapshot(SnapshotResponse::Merged { digest }) => digest,
+            other => panic!("expected a merged upload, got {other:?}"),
+        };
+        let digest = merged(answer(&peers.handle(&whole(inbound)).await.unwrap()));
         agirru_crdt::Merge::merge(&mut saved, inbound, &GenerationClock::new());
-        assert_eq!(
-            response.digest,
-            anchors::state_digest(&saved.to_bytes()).unwrap()
-        );
+        assert_eq!(digest, anchors::state_digest(&saved.to_bytes()).unwrap());
         assert_eq!(KeyStore::new(dir).peer_state().unwrap(), saved);
-        let equal = message(repair_snapshot([3; 32], &saved, false).unwrap());
-        assert!(
-            Repair::decode(&peers.handle(&equal).await.unwrap())
-                .unwrap()
-                .snapshot
-                .is_none()
-        );
+        let equal = message(RequestBody::Snapshot(SnapshotRequest::Fetch {
+            mine: anchors::state_digest(&saved.to_bytes()).unwrap(),
+            pinned: None,
+            offset: 0,
+        }));
+        assert!(matches!(
+            answer(&peers.handle(&equal).await.unwrap()),
+            ResponseBody::Snapshot(SnapshotResponse::Equal)
+        ));
         let mut next = AnchorState::default();
         let next_key = SigningKey::generate_preferred().unwrap();
         next.put(
@@ -2881,7 +2462,7 @@ mod tests {
             &GenerationClock::new(),
         )
         .unwrap();
-        let request = message(repair_snapshot([4; 32], &next, true).unwrap());
+        let request = whole(&next);
         agirru_crdt::Merge::merge(&mut saved, &next, &GenerationClock::new());
         let obstruction = dir.join("peers.tmp");
         std::fs::create_dir(&obstruction).unwrap();
@@ -2892,16 +2473,12 @@ mod tests {
         );
         assert_ne!(KeyStore::new(dir).peer_state().unwrap(), saved);
         std::fs::remove_dir(obstruction).unwrap();
-        let response = Repair::decode(&peers.handle(&request).await.unwrap()).unwrap();
-        assert_eq!(
-            response.digest,
-            anchors::state_digest(&saved.to_bytes()).unwrap()
-        );
+        let digest = merged(answer(&peers.handle(&request).await.unwrap()));
+        assert_eq!(digest, anchors::state_digest(&saved.to_bytes()).unwrap());
         assert_eq!(KeyStore::new(dir).peer_state().unwrap(), saved);
-        let outdated_request = message(repair_snapshot([5; 32], inbound, true).unwrap());
-        let response = Repair::decode(&peers.handle(&outdated_request).await.unwrap()).unwrap();
+        let digest = merged(answer(&peers.handle(&whole(inbound)).await.unwrap()));
         assert_ne!(
-            response.digest,
+            digest,
             anchors::state_digest(&inbound.to_bytes()).unwrap(),
             "a concurrent update must remain unreconciled"
         );
@@ -2916,6 +2493,7 @@ mod tests {
         .unwrap();
         assert_eq!(reopened.engine.durable_snapshot().await.unwrap(), saved);
     }
+
     struct PeerTestRoutes {
         target: Arc<Mutex<Option<Arc<Peers>>>>,
         partitioned: Arc<AtomicBool>,
@@ -2982,24 +2560,31 @@ mod tests {
                         if local {
                             healthy_requests.fetch_add(1, Ordering::SeqCst);
                         }
-                        let repair = PeerSync::from_bytes(&body)
-                            .ok()
-                            .and_then(|sync| Repair::decode(&sync.payload).ok());
+                        let request = PeerSync::from_bytes(&body).ok().and_then(|sync| {
+                            decode::<Message<RequestBody>>(&sync.payload)
+                                .ok()
+                                .map(|m| m.body)
+                        });
                         if matches!(
-                            repair.as_ref().and_then(|repair| repair.chunk.as_ref()),
-                            Some(Chunk::Summary { .. })
+                            request,
+                            Some(RequestBody::Repair(repair::Request::Buckets { .. }))
                         ) {
                             summary_requests.fetch_add(1, Ordering::SeqCst);
                         }
                         if matches!(
-                            repair.as_ref().and_then(|repair| repair.chunk.as_ref()),
-                            Some(Chunk::PushSelected { .. })
+                            &request,
+                            Some(RequestBody::Repair(repair::Request::Exchange { push, .. }))
+                                if !push.is_empty()
                         ) {
                             selective_pushes.fetch_add(1, Ordering::SeqCst);
                         }
-                        let pause = match repair.and_then(|repair| repair.chunk) {
-                            Some(Chunk::Fetch { offset }) if offset > 0 => 1,
-                            Some(Chunk::Upload { offset, .. }) if offset > 0 => 2,
+                        let pause = match request {
+                            Some(RequestBody::Snapshot(SnapshotRequest::Fetch {
+                                offset, ..
+                            })) if offset > 0 => 1,
+                            Some(RequestBody::Snapshot(SnapshotRequest::Upload {
+                                offset, ..
+                            })) if offset > 0 => 2,
                             _ => 0,
                         };
                         if pause != 0
@@ -3165,9 +2750,11 @@ mod tests {
             changed: Notify::new(),
             repair_trigger: Notify::new(),
             repair_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS),
-            uploads: Mutex::new(HashMap::new()),
-            contexts: Mutex::new(HashMap::new()),
-            delivered: Mutex::new(HashMap::new()),
+            snapshots: SnapshotServer::new(),
+            own_seen: ContextReceiver::new(),
+            chain_seen: ContextReceiver::new(),
+            own_sent: ContextSender::new(),
+            chain_sent: ContextSender::new(),
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             failures: Mutex::new(BTreeMap::new()),
         });
@@ -3400,7 +2987,6 @@ mod tests {
         server: &Arc<EnrollServer>,
         dir: &std::path::Path,
         routes: &PeerTestRoutes,
-        clock: &GenerationClock,
     ) -> Arc<Peers> {
         let PeerTestRoutes {
             target,
@@ -3409,6 +2995,8 @@ mod tests {
             chunk_resume,
             ..
         } = routes;
+        // Writes to a node's state carry that node's generation clock.
+        let clock = &sender.exchange.clock;
         let mut large = sender.engine.durable_snapshot().await.unwrap();
         for i in 0..20_000 {
             let mut claim = peer_claim.clone();
@@ -3470,7 +3058,6 @@ mod tests {
         dir: &std::path::Path,
         peer_dir: &std::path::Path,
         routes: &PeerTestRoutes,
-        clock: &GenerationClock,
     ) {
         let PeerTestRoutes {
             pause_chunk,
@@ -3479,6 +3066,7 @@ mod tests {
             healthy_requests,
             ..
         } = routes;
+        let clock = &peers.exchange.clock;
         let mut large = peers.engine.durable_snapshot().await.unwrap();
         for i in 20_000..40_000 {
             let mut claim = peer_claim.clone();
@@ -3510,33 +3098,36 @@ mod tests {
                 .unwrap();
             peers.exchange.store.store_peer_state(&state).unwrap();
         }
-        chunk_resume.notify_one();
-        assert!(
-            in_flight.await.unwrap().is_err(),
-            "a changed snapshot must reject the old continuation"
-        );
         assert_eq!(
             sender.engine.durable_snapshot().await.unwrap(),
             before_pull,
             "a partial download must not merge"
         );
-        let expected_requests = 1 + peers
-            .engine
-            .durable_snapshot()
+        chunk_resume.notify_one();
+        // The download is pinned to the snapshot it started on: it completes
+        // even though the peer wrote meanwhile, and nothing is uploaded back
+        // (the sender held nothing the peer lacked).
+        in_flight
             .await
             .unwrap()
-            .to_bytes()
-            .len()
-            .div_ceil(CHUNK_BYTES);
+            .expect("a pinned download completes across a concurrent write");
+        let pulled = sender.engine.durable_snapshot().await.unwrap();
+        assert_ne!(pulled, before_pull, "the download merged");
+        assert_ne!(
+            pulled,
+            peers.engine.durable_snapshot().await.unwrap(),
+            "the concurrent write is not part of the pinned snapshot"
+        );
+        // The concurrent write is one entry: the next repair moves it alone.
         let requests_before = healthy_requests.load(Ordering::SeqCst);
         sender
             .repair_peer("local")
             .await
             .expect("large download should reconcile after concurrent write");
-        assert_eq!(
-            healthy_requests.load(Ordering::SeqCst) - requests_before,
-            expected_requests,
-            "a pull that already matches the peer must not upload the snapshot again"
+        let requests = healthy_requests.load(Ordering::SeqCst) - requests_before;
+        assert!(
+            requests < 20,
+            "one changed entry is repaired entry by entry, not by a snapshot ({requests} requests)"
         );
         assert_eq!(
             KeyStore::new(peer_dir).peer_state().unwrap(),
@@ -3592,8 +3183,8 @@ mod tests {
         let own = Delegation::new(&peer_claim);
         let own_hash = PeerSync::delegation_hash(&own).unwrap();
         let chain_hash = PeerSync::chain_hash(&[]).unwrap();
-        let sync_of = |repair: Repair, context: bool| {
-            let payload = repair.encode();
+        let sync_of = |body: RequestBody, context: bool| {
+            let payload = payload(body);
             let token =
                 PeerSync::channel_binding("peer", "local", &own_hash, &payload, &chain_hash)
                     .unwrap()
@@ -3610,12 +3201,12 @@ mod tests {
             }
             .to_bytes()
         };
-        let message = |repair: Repair| sync_of(repair, true);
+        let message = |body: RequestBody| sync_of(body, true);
         check_context(&peers, &sync_of, &message, &inbound, &saved).await;
 
-        let selective_probe = check_summary(&peers, &message, &inbound, &saved).await;
+        let buckets_sync = check_summary(&peers, &message, &inbound, &saved).await;
 
-        saved = check_upload(&peers, &message, &inbound, saved, dir, &selective_probe).await;
+        saved = check_upload(&peers, &message, &inbound, saved, dir, &buckets_sync).await;
 
         check_persistence(&peers, &message, &inbound, saved, dir, exchange, server).await;
         (peers, inbound, peer_claim)
@@ -3737,27 +3328,9 @@ mod tests {
             address,
         );
         check_scheduler(&sender, &peers, &dir, &peer_dir, &routes).await;
-        let clock = GenerationClock::new();
-        let peers = check_large_upload(
-            &sender,
-            &peer_claim,
-            &exchange,
-            &server,
-            &dir,
-            &routes,
-            &clock,
-        )
-        .await;
-        check_large_download(
-            &sender,
-            &peers,
-            &peer_claim,
-            &dir,
-            &peer_dir,
-            &routes,
-            &clock,
-        )
-        .await;
+        let peers =
+            check_large_upload(&sender, &peer_claim, &exchange, &server, &dir, &routes).await;
+        check_large_download(&sender, &peers, &peer_claim, &dir, &peer_dir, &routes).await;
         release.notify_waiters();
         server_task.abort();
         std::fs::remove_dir_all(&dir).unwrap();
