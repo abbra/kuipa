@@ -450,34 +450,48 @@ that. Busy answers (`503`, `429`) get up to three delayed retries; a `409`
 for omitted context causes an immediate resend with that context (§4.2).
 Other failures wait until the peer is selected again.
 
-A repair with one peer (each step one authenticated sync):
+A repair with one peer (each step one authenticated sync) is agirru's digest-first
+repair (`agirru_engine::repair`, shared with ahdapa and akamu):
 
-1. **Probe.** The sender sends the digest of its state: `SHA-256` of
-   `"ipa-ku/anchor-state/v1\0" ‖ IPAS`. Equal digests end the repair.
-2. **Buckets.** Each entry is summarised by a 16-byte id hash, its
-   32-byte entry hash and its replacement order (a vouch's or succession's
-   signed `iat`, 0 for keys and claims). Entries fall into `2^bits` buckets
-   by the leading bits of the id hash; the sender picks about eight
-   entries per bucket (at most 4,096 buckets) and sends one 16-byte hash
-   per bucket. The receiver answers with the buckets that differ from its
-   own and its summary entries in them.
-3. **Exchange.** From these, the sender pushes its entries the receiver
-   lacks or would replace with them, and names the receiver's entries it
-   lacks or whose versions would replace its own. Neither side sends a version older
-   than the other's: merging it would change nothing. The receiver admits
-   and persists the push and answers with the named entries (a vouch with
-   its anchor's key) and its digest; the sender admits and persists them
-   and compares that digest with its own.
+1. **Probe.** The sender sends the digest of its repair index: `SHA-256` over
+   `"ipa-ku/anchor-repair/v1\0"` followed by the 16 first-nibble bucket hashes.
+   Each bucket hash covers its entries' ids and hashes in id order. Equal digests
+   end the repair. The answer carries the receiver's entry count. This digest
+   differs from the former flat repair index digest; all peers must be upgraded
+   together to establish convergence.
+2. **Buckets.** Each entry is summarised by a 16-byte id hash, its 32-byte entry hash,
+   its replacement order (a vouch's or succession's signed `iat`, 0 for keys and claims)
+   and its kind (its tag: keys 1, claims 2, vouches 3, successions 4). The sender
+   sends hashes of first-nibble buckets, replacing locally dense buckets with their
+   16 children. The receiver answers each differing bucket with its summaries, or —
+   holding more than 64 entries there — asks for its children, down to six nibbles.
+3. **Exchange.** The sender pushes its entries the receiver lacks or would replace with
+   them and names the receiver's entries it lacks or whose versions would replace its own.
+   Neither side sends a version older than the other's; on equal orders with different
+   content both are sent, and the merge breaks the tie. Entries
+   travel keys first, so each message's vouches arrive after the keys they are checked
+   against, within messages of at most 256 KiB and 8,192 named entries (the rest follows
+   in later exchanges). The receiver admits and persists the push and answers with the
+   named entries (a vouch with its anchor's key) and its digest; the sender admits and
+   persists them.
 
-Admission and merge are the same as for a whole state, whatever changed in
-between. If the resulting digests differ, including after concurrent changes,
-the selective repair is attempted again, up to three attempts in total. If either state has more than
-4,096 entries, or a summary or selection exceeds its bound (4,096 summary
-entries, 256 KiB of summary data, or 128 KiB of selected state), repair
-sends the whole state instead, in authenticated chunks of at most 128 KiB,
-bound to its digest and merged only when complete. Requests and answers are
-limited to 1 MiB; a state, to 64 MiB. Entry hashes and the state digest are
-computed once per state version.
+Admission and merge are the same as for a whole state, whatever changed in between. If
+the digests still differ after three passes (concurrent changes), the repair is
+attempted again, up to two attempts. If the two states' entry counts differ by more than
+4,096, the probe alone decides for a whole-state transfer instead (`agirru_engine::
+snapshot`): the sender downloads the receiver's encoded state (`IPAS`) in chunks of at
+most 128 KiB, each pinned to the digest the download started at — the receiver keeps
+that encoding for the download, so it completes even if its state moves on — verifies
+the whole against the digest, and merges it; if its own state still differs, it uploads
+it the same way, and the receiver merges it only when complete and matching its digest.
+Unfinished uploads are dropped after two minutes and limited to 64 MiB in all; a busy
+receiver says so. Requests and answers are limited to 1 MiB; a state, to 64 MiB. The
+repair index is kept current from the entries changed since it was built, and rebuilt
+after maintenance drops entries.
+
+The delegation and epoch window travel as agirru sync context
+(`agirru_engine::context`): by hash, and in full only when the receiver may not hold
+them; a `409` asks for them in full, and the sender resends once.
 
 An id-hash collision could only hide an entry from repair; it cannot let
 one past admission.
@@ -2442,7 +2456,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/tlog/{kid}` | `IPJQ` (operation data `IPLQ`) → `IPJS` (payload `IPLR`): the caller's own transparency-log entries (DESIGN-tlog.md §6) |
 | POST | `/ipa/ku/seal/{kid}` | `IPJQ` (operation data: a JSON seal operation) → `IPJS` (payload `IPVR`) (§7.6) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
-| POST | `/ipa/ku/peer/sync` | `IPPS` → `IPRD`; `409` asks for the left-out delegation and epoch tail; servers only (§4.2) |
+| POST | `/ipa/ku/peer/sync` | `IPPS` (repair message: CBOR) → repair answer (CBOR); `409` asks for the left-out delegation and epoch tail; servers only (§4.2) |
 | GET | `/ipa/ku/anchor-log?from=n` | → epoch-log entries and the anchors' current vouch heads (§4.8, §4.9) |
 | GET | `/ipa/ku/claim-log/{anchor}?from=i` | → one anchor's claim-log page (§4.9.5) |
 | GET | `/ipa/ku/tlog/{id}/head`, `…/leaves?from=i`, `…/proof?index=i&size=n`, `…/consistency?from=m&size=n` | → the server's transparency log: `IPLS`, and JSON pages of leaves and proofs (DESIGN-tlog.md §5) |
@@ -2619,13 +2633,11 @@ IPKG  namespace(1) nickname alg_arg(1)                                          
       (namespace: 1 dm, 2 ra, 3 ca, 4 ca_wrapped, 5 lwca-store; alg_arg: a wrap
        algorithm selector for ca_wrapped, 0 none; nickname: a string)
 IPKR  value                                                                      keys answer (the handler's JSON)
-IPPS  version 4: sender receiver H(delegation)(32) delegation(JSON or empty) repair(IPRD) token H(tail)(32) has_tail(1) [n(u64) [epoch entry]]
+IPPS  version 4: sender receiver H(delegation)(32) delegation(JSON or empty) repair message token H(tail)(32) has_tail(1) [n(u64) [epoch entry]]
                                                                                  peer sync request (the sender's epoch chain tail, §4.8; H is SHA-256, domain-separated)
-IPRD  nonce(32) digest(32) kind(1) …                                           repair message (§4.2.1): 0 digest only, 1 whole state(IPAS), 2 fetch(offset), 3 data / 4 upload(offset total bytes),
-                                                                                 5 accepted(next), 6 bucket hashes(bits(1) 2^bits×16), 7 named entries(IPAS),
-                                                                                 8 push(IWNT, IPAS), 9 fall back to the whole state, 10 probe, 11 differing buckets(n(u64) [index(2)] ISUM)
-ISUM  n(u64) [id(16) hash(32) order(u64)]                                       repair summary entries
-IWNT  n(u64) [id(16)]                                                           entries a repair wants
+repair message (in IPPS)  CBOR map {n: nonce(32 bytes), b: {r: agirru repair request} | {s: agirru snapshot request}};
+                          the answer echoes n, with b: {r: repair answer} | {s: snapshot answer}. Entries
+                          are IPAS encodings of one entry (a vouch with its anchor's key) (§4.2.1)
 IPDC  realm server anchor(32) key(32) iat(u64) exp(u64)                          claim
 IPVH  version 2: realm anchor(32) iat(u64) exp(u64) size(u64) root(h) live_size(u64) live_root(h)
                                                                                  vouch (signed): the claim log's head and the live tree (§4.9.1)
