@@ -157,9 +157,9 @@ over `POST /ipa/ku/peer/sync`, authenticated with their Kerberos keys.
   1.1 KB, mostly the Kerberos token, and its answer about 70 bytes (measured,
   playground). The delegation and epoch log tail also travel on first contact,
   when changed, or when the receiver has forgotten them, such as after a restart.
-- **Selective repair moves changed entries.** Servers compare bucket hashes,
-  about one per eight entries, to find a renewal's claim and vouch. Large
-  states or selections instead trigger whole-state transfer (DESIGN §4.2.1).
+- **Selective repair moves changed entries.** Servers compare adaptive bucket
+  hashes to find a renewal's claim and vouch. Large differences can trigger
+  whole-state transfer (DESIGN §4.2.1).
 - **What changes.** A server's claim renews at two thirds of its 90-day
   validity, every 60 days, and every anchor then vouches again. Each
   anchor also vouches again at half of a vouch's 7-day validity, every
@@ -186,14 +186,14 @@ converged, with no failed repair attempts in this run.
 
 | replicas | anchors | routine rounds | realm-wide bodies | per replica |
 |---|---|---|---|---|
-| 60 | 6 | 3 | 1.09 MB | 18.1 KB |
-| 100 | 6 | 4 | 2.18 MB | 21.8 KB |
-| 200 | 6 | 5 | 5.20 MB | 26.0 KB |
-| 300 | 6 | 6 | 9.59 MB | 32.0 KB |
-| 60 | all | 3 | 1.13 MB | 18.8 KB |
-| 100 | all | 3 | 1.89 MB | 18.9 KB |
-| 200 | all | 5 | 5.35 MB | 26.8 KB |
-| 300 | all | 6 | 9.59 MB | 32.0 KB |
+| 60 | 6 | 3 | 1.20 MB | 19.9 KB |
+| 100 | 6 | 4 | 2.27 MB | 22.7 KB |
+| 200 | 6 | 5 | 5.55 MB | 27.7 KB |
+| 300 | 6 | 6 | 10.05 MB | 33.5 KB |
+| 60 | all | 3 | 1.14 MB | 18.9 KB |
+| 100 | all | 3 | 2.21 MB | 22.1 KB |
+| 200 | all | 5 | 6.54 MB | 32.7 KB |
+| 300 | all | 6 | 11.12 MB | 37.1 KB |
 
 For comparison, in the full-mesh workload with at least five servers, the
 routine timer selects four peers per minute, and the sweep selects every
@@ -204,11 +204,11 @@ neighbors, so its sweep traffic and propagation time differ.
 Overlapping pending repairs are deduplicated, so actual traffic
 can be lower; retries and local changes add traffic. Each server also receives
 roughly as many requests (computed).
-The final 300-replica update sweep in this loopback run took 1.71 s
-with six anchors and 9.49 s with all anchors; this is not a WAN or
+The final 300-replica update sweep in this loopback run took 1.72 s
+with six anchors and 9.03 s with all anchors; this is not a WAN or
 production convergence measurement.
 
-The measured initial update has similar traffic with six or all anchors.
+The initial update's traffic varies with topology and concurrent peer selection.
 Subsequent re-vouching by other anchors adds changes to propagate, so total
 renewal traffic still depends on the number of anchors. Anchors also make
 the state larger, and each re-vouch costs a signature. Large realms should
