@@ -16,8 +16,8 @@ ciborium = "0.2"
 tang-pqc = { path = "crates/tang-pqc" }
 ml-dsa-blind = { path = "crates/ml-dsa-blind" }
 tang-pqc-clevis = { path = "crates/tang-pqc-clevis" }
-agirru-crdt = "0.2.0"
-agirru-engine = "0.2.0"
+agirru-crdt = "0.3.0"
+agirru-engine = "0.3.0"
 kuipa-enroll = { path = "crates/kuipa-enroll" }
 kuipa-perf = { path = "crates/kuipa-perf" }
 
