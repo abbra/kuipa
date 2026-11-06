@@ -4,18 +4,18 @@ version = 4
 
 [[package]]
 name = "agirru-crdt"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e36b26360e82921f75ca705a80e533b93f079592805037bd11250c02410387e"
+checksum = "50747168da2481e40f98162a4d831c8f5f97ab39aa9aea019f1b1f8a771b584e"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "agirru-engine"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8a6caf776b60244b9e977e0e35af90be6dc53cb29af8e92d2f5b89041c32bde"
+checksum = "95ffd0a79c8c42fd8b24b9e6e015304ca247b3de3f6f4f6ac4e360fdf83e9fa8"
 dependencies = [
  "agirru-crdt",
  "ciborium",
