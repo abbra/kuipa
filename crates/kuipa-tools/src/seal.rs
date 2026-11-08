@@ -2259,6 +2259,18 @@ impl<'a> SealClient<'a> {
         let v = self.op(&SealOp::Revoke { name: name.into() })?;
         Ok(describe_all(&v))
     }
+    /// Revoke a seal as a delegated administrator.
+    ///
+    /// # Errors
+    ///
+    /// A refusal or any other error.
+    pub fn admin_revoke(&self, owner: &str, name: &str) -> Result<Value, Error> {
+        let v = self.op(&SealOp::AdminRevoke {
+            owner: owner.into(),
+            name: name.into(),
+        })?;
+        Ok(describe_all(&v))
+    }
 
     /// `kuipa seal show`.
     ///

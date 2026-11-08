@@ -1720,6 +1720,13 @@ pub enum SealOp {
         /// The seal.
         name: String,
     },
+    /// Revoke another owner's seal using delegated administrative authority.
+    AdminRevoke {
+        /// The owner's Kerberos principal.
+        owner: String,
+        /// The seal's name.
+        name: String,
+    },
     /// Describe one seal.
     Show {
         /// The seal.

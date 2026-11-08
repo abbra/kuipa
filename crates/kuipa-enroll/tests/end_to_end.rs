@@ -52,6 +52,8 @@ struct MemoryDirectory {
     otps: RefCell<HashMap<String, Vec<u8>>>,
     kvno: RefCell<HashMap<String, u32>>,
     admins: HashSet<String>,
+    seal_admins: RefCell<HashSet<String>>,
+    seal_admin_lookup_fails: std::cell::Cell<bool>,
     escrow: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     escrow_files: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     disabled: RefCell<HashSet<String>>,
@@ -283,6 +285,13 @@ impl Directory for MemoryDirectory {
             .get(&(fetch.namespace.id(), fetch.nickname.clone()))
             .cloned()
             .ok_or_else(|| "no such key".into())
+    }
+
+    fn seal_admin(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        if self.seal_admin_lookup_fails.get() {
+            return Err("directory unavailable".into());
+        }
+        Ok(self.seal_admins.borrow().contains(&principal.to_string()))
     }
 
     fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
@@ -1950,6 +1959,86 @@ fn logged_realm() -> (Realm, Arc<MemoryLedger>) {
     let first = r.servers.remove(0).with_ledger(ledger.clone());
     r.servers.insert(0, first);
     (r, ledger)
+}
+#[test]
+fn delegated_admin_revoke_is_authorized_and_logged_before_update() {
+    let (mut r, ledger) = logged_realm();
+    let adv = r.verify(0);
+    let anchors = r.all_anchors();
+    seal_reply(
+        &r,
+        &adv,
+        ALICE,
+        &SealOp::Create {
+            name: "personal".into(),
+            policy: seal::Policy {
+                factors: Factors {
+                    device: Some(Level::Any),
+                    ticket: true,
+                    passkey: false,
+                },
+                ..seal::Policy::default()
+            },
+        },
+    );
+    let revoke = SealOp::AdminRevoke {
+        owner: ALICE.into(),
+        name: "personal".into(),
+    };
+    assert!(seal_op(&r, &adv, BOB, &revoke).is_err());
+    assert_eq!(ledger.leaves().len(), 1);
+    r.dir.seal_admins.borrow_mut().insert(BOB.into());
+    r.dir.seal_admin_lookup_fails.set(true);
+    assert!(seal_op(&r, &adv, BOB, &revoke).is_err());
+    r.dir.seal_admin_lookup_fails.set(false);
+    let first = r
+        .servers
+        .remove(0)
+        .with_ledger(Arc::new(kuipa_enroll::server::NoLedger));
+    r.servers.insert(0, first);
+    assert!(seal_op(&r, &adv, BOB, &revoke).is_err());
+    let first = r.servers.remove(0).with_ledger(Arc::new(BrokenLedger));
+    r.servers.insert(0, first);
+    assert!(seal_op(&r, &adv, BOB, &revoke).is_err());
+    let shown = seal_reply(
+        &r,
+        &adv,
+        ALICE,
+        &SealOp::Show {
+            name: "personal".into(),
+        },
+    );
+    assert_eq!(
+        shown.descriptors[0]
+            .verify(REALM, &anchors, &Policy::default())
+            .unwrap()
+            .seal()
+            .state,
+        seal::State::Enabled
+    );
+    let first = r.servers.remove(0).with_ledger(ledger.clone());
+    r.servers.insert(0, first);
+    let result = seal_reply(&r, &adv, BOB, &revoke);
+    assert_eq!(result.receipts.len(), 1);
+    assert_eq!(ledger.leaves().len(), 2);
+    let event = SealEvent::from_bytes(&ledger.openings()[1].event).unwrap();
+    assert_eq!(event.action, SealAction::Revoke);
+    let shown = seal_reply(
+        &r,
+        &adv,
+        ALICE,
+        &SealOp::Show {
+            name: "personal".into(),
+        },
+    );
+    assert_eq!(
+        shown.descriptors[0]
+            .verify(REALM, &anchors, &Policy::default())
+            .unwrap()
+            .seal()
+            .state,
+        seal::State::Revoked
+    );
 }
 
 #[test]

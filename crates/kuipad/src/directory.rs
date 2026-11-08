@@ -1089,6 +1089,24 @@ impl Directory for LdapDirectory {
             })
             .collect())
     }
+    fn seal_admin(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        let mut conn = self.service_conn()?;
+        let Some(entry) = self.principal_entry(&mut conn, principal, &["memberOf"])? else {
+            return Ok(false);
+        };
+        let privilege = format!(
+            "cn=KUIPA Seal Administrators,cn=privileges,cn=pbac,{}",
+            self.cfg.basedn
+        );
+        let members: String = std::iter::once(&entry.dn)
+            .chain(entry.attrs.get("memberof").into_iter().flatten())
+            .map(|dn| format!("(member={})", filter_escape(dn)))
+            .collect();
+        let membership = format!("(|{members})");
+        Ok(!conn
+            .search(&privilege, Scope::Base, &membership, &["1.1"])?
+            .is_empty())
+    }
 
     fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
         let (policy, devices, state, keys) = Self::seal_attrs(seal)?;
@@ -1205,10 +1223,10 @@ impl Directory for LdapDirectory {
             ],
         )?;
         eprintln!(
-            "kuipad: {} updated seal {} ({}): {state}, {} device(s)",
-            seal.owner,
+            "kuipad: updated seal {} ({}) owned by {}: {state}, {} device(s)",
             seal.id,
             seal.name,
+            seal.owner,
             devices.len()
         );
         Ok(())
