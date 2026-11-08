@@ -11,7 +11,8 @@
 | `ldap_uri` | required | the LDAPI URI of this server's 389-ds |
 | `principal` | required | the daemon's principal, `ipa-ku/<server>@REALM` |
 | `service` | required | its GSS-API service name, `ipa-ku@<server>` |
-| `keytab` | required | its keytab |
+| `keytab` | required | service keytab path; in gssproxy mode the proxy reads it, not kuipad |
+| `gssproxy` | `false` | acquire Kerberos credentials through the UID-matched gssproxy service instead of opening the keytab |
 | `ca_file` | required | the IPA CA chain (PEM): CA certificates only, Merkle Tree CAs included |
 | `pkinit_anchors_file` | `/var/lib/ipa-client/pki/kdc-ca-bundle.pem` | the PKINIT anchors hosts need for armoured `kinit`: CA certificates only |
 | `key_dir` | `/var/lib/ipa/ku` | the key directory |
@@ -28,6 +29,7 @@
 | `enctypes` | `[20, 19, 18, 17]` | Kerberos enctypes to issue keys for, strongest first |
 | `tlog_head_interval` | `3600` | seconds between published transparency-log heads: a head covers what was logged before its period began, so watching it says how many events a period had, not when each happened; `0` publishes every event at once (tests only) |
 | `tlog_retention_months` | `13` | months of transparency-log openings kept: older events stay in the log but can no longer be looked up or tied to anyone |
+| `keys.broker` | none | Unix socket of the privileged custody export broker; the broker uses the configured `keys.handlers` |
 
 Unknown keys are refused, so a typo stops the daemon instead of being
 ignored.
@@ -42,6 +44,7 @@ On `cn=seal-limits,cn=kuipa,cn=etc,<suffix>`, attribute
 | unit | runs |
 |---|---|
 | `kuipad.socket` / `kuipad.service` | the daemon, behind httpd |
+| `kuipad-keys.socket` / `kuipad-keys.service` | root custody export broker, accessible only to the kuipad group |
 | `kuipa-unseal.service` | `kuipa-unseal --all` at boot, before SSSD, gssproxy and certmonger; retries on 75 |
 | `ipa-client-complete.service` | `kuipa complete` while an offline enrollment is pending; retries on 75 |
 | `kuipa-rotate.timer` / `.service` | `kuipa rotate-keys` monthly |

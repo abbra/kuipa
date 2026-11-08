@@ -65,7 +65,7 @@ Two build switches, for `rpmbuild` and `mock --with/--without`:
 | Package | Contents |
 |---|---|
 | `kuipa` | host-side binaries (`/usr/sbin/kuipa`, `/usr/libexec/kuipa-unseal`, `/usr/bin/kuipa-{voucher,witness,audit,mirror,gitsign}`), the unseal / client-complete / rotate units and timer, and the gssproxy keytab snippet example |
-| `kuipa-server` | `/usr/libexec/kuipad`, its socket-activated units, and `ipa/kuipad.json.example` — the `/ipa/ku/` httpd snippet is not shipped: FreeIPA ships it as `conf.d/ipa-kuipa-proxy.conf` because it must sit next to the other `/ipa/` `Location` blocks it overrides |
+| `kuipa-server` | `/usr/libexec/kuipad`, the `kuipad` system account, its socket-activated daemon and privileged custody broker units, and `ipa/kuipad.json.example` — the `/ipa/ku/` httpd snippet is shipped by FreeIPA |
 | `tang-pqc` | the post-quantum Tang client |
 | `clevis-pin-tang-pqc` | the `clevis-*-tang-pqc` pin links and the dracut module (noarch; `rpmbuild --without clevis` skips it) |
 
@@ -73,9 +73,8 @@ Two build switches, for `rpmbuild` and `mock --with/--without`:
 
 `%install` copies the built binaries out of `target/rpm/` explicitly instead of
 using `%cargo_install`: Fedora's Rust packaging guidance is that a workspace of
-binaries installs its own files, which also lets the spec place root-only
-programs (`kuipa`, `kuipa-unseal`, `kuipad`) in `/usr/sbin` or `/usr/libexec`
-and user commands in `/usr/bin`.
+binaries installs its own files, including the unprivileged `kuipad` daemon
+and the root-operated host tools.
 
 ## Bundled dependencies and `bundled(crate())`
 

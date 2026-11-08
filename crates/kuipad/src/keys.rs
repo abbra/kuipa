@@ -7,6 +7,9 @@
 //! NSS handlers.  `ca_wrapped` is export-only, so it never runs
 //! `--import`.
 
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -26,6 +29,7 @@ pub struct Handler {
 /// The `keys` configuration (§18.5).
 pub struct Keys {
     handlers: Vec<(Namespace, Handler)>,
+    broker: Option<PathBuf>,
     /// The audit line prefix: one line per fetch, to stderr until the
     /// daemon grows a file destination.
     audit: Mutex<Vec<String>>,
@@ -49,7 +53,18 @@ impl Keys {
     #[must_use]
     pub fn new(handlers: Vec<(Namespace, Handler)>) -> Self {
         Self {
+            broker: None,
             handlers,
+            audit: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Send exports to the privileged local custody broker.
+    #[must_use]
+    pub fn broker(path: PathBuf) -> Self {
+        Self {
+            handlers: Vec::new(),
+            broker: Some(path),
             audit: Mutex::new(Vec::new()),
         }
     }
@@ -62,6 +77,33 @@ impl Keys {
     /// namespace, the user does not exist, the handler failed, or its
     /// value is too large.
     pub fn fetch(&self, fetch: &KeysFetch) -> Result<KeysAnswer, HandlerError> {
+        if let Some(path) = &self.broker {
+            let mut stream = UnixStream::connect(path)
+                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+            let request = fetch.to_bytes().map_err(|e| HandlerError(e.to_string()))?;
+            stream
+                .write_all(&request)
+                .and_then(|()| stream.shutdown(Shutdown::Write))
+                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+            let mut response = Vec::new();
+            stream
+                .take((MAX_VALUE + 4097) as u64)
+                .read_to_end(&mut response)
+                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+            return match response.split_first() {
+                Some((0, value)) if value.len() <= MAX_VALUE => Ok(KeysAnswer {
+                    value: value.to_vec(),
+                }),
+                Some((1, message)) if message.len() <= 4096 => Err(HandlerError(format!(
+                    "custody broker: {}",
+                    String::from_utf8_lossy(message)
+                ))),
+                _ => Err(HandlerError("invalid custody broker response".into())),
+            };
+        }
         let (_, handler) = self
             .handlers
             .iter()
@@ -73,10 +115,7 @@ impl Keys {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(user) = &handler.runas {
-            // The daemon runs as root behind httpd; the playground and
-            // tests run unprivileged, where a runas user that is not
-            // ourselves would need privileges we do not have.  Set the
-            // user only when it differs from ours.
+            // The broker runs configured handlers as their required identities.
             if !same_user(user) {
                 runas(&mut cmd, user)?;
             }
@@ -114,6 +153,50 @@ impl Keys {
             return Err(HandlerError("handler value too large".into()));
         }
         Ok(KeysAnswer { value: out.stdout })
+    }
+
+    /// Serve fixed-format custody requests on an inherited private socket.
+    ///
+    /// # Errors
+    ///
+    /// A listener failure.
+    pub fn serve_broker(&self, listener: UnixListener) -> std::io::Result<()> {
+        for stream in listener.incoming() {
+            if let Err(error) = self.serve_request(stream?) {
+                eprintln!("kuipad: custody broker request: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    fn serve_request(&self, mut stream: UnixStream) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(60)))?;
+        let result = (|| -> Result<KeysAnswer, HandlerError> {
+            let mut request = Vec::new();
+            (&mut stream)
+                .take(1025)
+                .read_to_end(&mut request)
+                .map_err(|e| HandlerError(e.to_string()))?;
+            if request.len() > 1024 {
+                return Err(HandlerError("custody request too large".into()));
+            }
+            let fetch = KeysFetch::from_bytes(&request).map_err(|e| HandlerError(e.to_string()))?;
+            self.fetch(&fetch)
+        })();
+        let response = match result {
+            Ok(answer) => {
+                let mut response = Vec::with_capacity(answer.value.len() + 1);
+                response.push(0);
+                response.extend_from_slice(&answer.value);
+                response
+            }
+            Err(error) => {
+                eprintln!("kuipad: custody broker: {error}");
+                b"\x01custody export failed".to_vec()
+            }
+        };
+        stream.write_all(&response)
     }
 
     /// The audit line for one fetch (§18.2), and the decision's reason
@@ -236,5 +319,81 @@ mod tests {
     fn single_secret_handlers_get_no_nickname() {
         let dm = echo_keys(Namespace::Dm);
         assert_eq!(run(&dm, Namespace::Dm, "DMHash", None), "--export -");
+    }
+
+    #[test]
+    fn broker_exports_only_configured_namespaces() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "kuipad-broker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).expect("create fixture");
+        let handler = dir.join("handler");
+        std::fs::write(
+            &handler,
+            "#!/bin/sh\n\
+             [ \"$1\" = --export ] && [ \"$2\" = - ] || exit 1\n\
+             case \"$3:$4:$5:$6\" in\n\
+             :::) printf dmhash;;\n\
+             --nickname:certificate::) printf certificate;;\n\
+             --nickname:certificate:--algorithm:2.16.840.1.101.3.4.1.45) printf wrapped;;\n\
+             *) exit 1;;\n\
+             esac\n",
+        )
+        .expect("write handler");
+        std::fs::set_permissions(&handler, std::fs::Permissions::from_mode(0o700))
+            .expect("make handler executable");
+        let path = dir.join("broker.sock");
+        let listener = UnixListener::bind(&path).expect("bind broker");
+        let thread = std::thread::spawn(move || {
+            let keys = Keys::new(
+                [Namespace::Dm, Namespace::Ca, Namespace::CaWrapped]
+                    .into_iter()
+                    .map(|namespace| {
+                        (
+                            namespace,
+                            Handler {
+                                command: handler.clone(),
+                                runas: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            for _ in 0..4 {
+                keys.serve_request(listener.accept().expect("accept").0)
+                    .expect("reply");
+            }
+        });
+        let proxy = Keys::broker(path.clone());
+        let mut fetch = KeysFetch {
+            namespace: Namespace::Dm,
+            nickname: String::new(),
+            alg: None,
+        };
+        assert_eq!(proxy.fetch(&fetch).expect("export").value, b"dmhash");
+        fetch.namespace = Namespace::Ca;
+        fetch.nickname = "certificate".into();
+        assert_eq!(
+            proxy.fetch(&fetch).expect("CA export").value,
+            b"certificate"
+        );
+        fetch.namespace = Namespace::CaWrapped;
+        fetch.alg = Some(kuipa_enroll::keys::WrapAlg::Aes256Wrap);
+        assert_eq!(
+            proxy.fetch(&fetch).expect("wrapped export").value,
+            b"wrapped"
+        );
+        fetch.namespace = Namespace::Ra;
+        fetch.alg = None;
+        assert!(proxy.fetch(&fetch).is_err());
+        thread.join().expect("broker thread");
+        std::fs::remove_dir_all(dir).expect("remove fixture");
     }
 }

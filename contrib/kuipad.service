@@ -1,11 +1,10 @@
 [Unit]
 Description=kuipa post-quantum enrollment daemon
 Documentation=https://github.com/abbra/kuipa
-# Socket activation (optional): with kuipad.socket enabled the daemon
-# inherits the pre-bound /run/ipa/kuipad.sock; without it, 'serve' binds
-# from the "listen" key of its config.  No Requires= so the service can be
-# started on its own, as in ahdapa.service.
-After=kuipad.socket dirsrv.target
+# IPA supplies a drop-in requiring kuipad.socket; standalone deployments
+# can instead bind the configured listen address.
+Requires=kuipad-keys.socket gssproxy.service
+After=kuipad.socket kuipad-keys.socket dirsrv.target gssproxy.service
 
 [Service]
 Type=simple
@@ -13,10 +12,10 @@ ExecStart=/usr/libexec/kuipad serve --config /etc/ipa/kuipad.json
 Restart=on-failure
 RestartSec=5s
 
-# The daemon runs as root: it reads the keytabs in /var/kerberos/krb5
-# and the IPA CA chain, and spawns the custody handlers as their own
-# users (see "runas" in the config).
-User=root
+# Kerberos keys remain root-owned and are used through gssproxy.
+User=kuipad
+Environment=GSS_USE_PROXY=yes
+Environment=GSSPROXY_BEHAVIOR=REMOTE_ONLY
 
 # Config, the CA chain and the PKINIT anchors under /etc/ipa are
 # read-only; everything else is read-only too, except what the daemon
@@ -44,9 +43,7 @@ ProtectControlGroups=yes
 ProtectHostname=yes
 ProtectClock=yes
 ProtectKernelLogs=yes
-# SUID/SGID bits blocked on new files: they are how a process acquires
-# another user's identity, and the custody handlers are not setuid
-# helpers but plain executables kuipad runs as their configured user.
+# The privileged custody broker runs handlers under their required accounts.
 RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes

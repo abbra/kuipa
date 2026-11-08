@@ -1,0 +1,18 @@
+[Unit]
+Description=kuipa privileged custody broker
+Requires=kuipad-keys.socket
+PartOf=kuipad.service
+After=kuipad-keys.socket
+
+[Service]
+ExecStart=/usr/libexec/kuipad keys-broker --config /etc/ipa/kuipad.json
+User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LimitCORE=0

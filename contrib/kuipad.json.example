@@ -6,7 +6,8 @@
   "ldap_uri": "ldapi://%2Frun%2Fslapd-EXAMPLE-TEST.socket",
   "principal": "ipa-ku/ipa1.example.test@EXAMPLE.TEST",
   "service": "ipa-ku@ipa1.example.test",
-  "keytab": "/var/lib/ipa/ku/kuipa.keytab",
+  "keytab": "/etc/ipa/kuipad.keytab",
+  "gssproxy": true,
   "ca_file": "/etc/ipa/ca.crt",
   "pkinit_anchors_file": "/var/lib/ipa-client/pki/kdc-ca-bundle.pem",
   "key_dir": "/var/lib/ipa/ku",
@@ -25,6 +26,7 @@
   "tlog_retention_months": 13,
   "keys": {
     "enabled": true,
+    "broker": "/run/ipa/kuipad-keys.sock",
     "handlers": {
       "dm":          { "command": "/usr/libexec/ipa/custodia/ipa-custodia-dmldap", "runas": "root" },
       "ra":          { "command": "/usr/libexec/ipa/custodia/ipa-custodia-ra-agent", "runas": "root" },

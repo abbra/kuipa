@@ -34,6 +34,9 @@ pub struct Config {
     pub service: String,
     /// The daemon's keytab.
     pub keytab: String,
+    /// Obtain Kerberos credentials through gssproxy instead of opening the keytab.
+    #[serde(default)]
+    pub gssproxy: bool,
     /// PEM file with the IPA CA chain.
     pub ca_file: String,
     /// PEM file with the PKINIT trust anchors clients need (§4.3).
@@ -186,6 +189,9 @@ pub struct KeysConfig {
     /// present.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Local privileged custody broker, when handlers cannot run as the daemon.
+    #[serde(default)]
+    pub broker: Option<PathBuf>,
     /// A handler per namespace, keyed by its label (`dm`, `ra`, `ca`,
     /// `ca_wrapped`, `lwca-store`).
     pub handlers: BTreeMap<String, HandlerConfig>,
@@ -327,6 +333,7 @@ impl Config {
             principal: self.principal.clone(),
             service: self.service.clone(),
             keytab: self.keytab.clone(),
+            gssproxy: self.gssproxy,
             ca_file: self.ca_file.clone(),
             enctypes: self.enctypes.iter().copied().map(Enctype).collect(),
         }
