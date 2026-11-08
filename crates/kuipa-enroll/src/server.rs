@@ -3184,6 +3184,50 @@ impl EnrollServer {
         }
     }
 
+    fn remove_device(
+        &self,
+        caller: &Principal,
+        name: &str,
+        id: &str,
+        directory: &dyn Directory,
+    ) -> Result<Seal, Refusal> {
+        let (mut seal, role) = self.resolve_seal(caller, name, directory)?;
+        let device = seal
+            .devices
+            .iter()
+            .find(|d| d.id == id)
+            .ok_or_else(|| Refusal::because("no such device"))?;
+        if seal.holder(device) != caller.to_string() {
+            need(role, Role::Manager, "remove another member's device")?;
+        }
+        seal.devices.retain(|d| d.id != id);
+        Ok(seal)
+    }
+
+    fn admin_revoke_seal(
+        &self,
+        caller: &Principal,
+        owner: &str,
+        name: &str,
+        directory: &dyn Directory,
+    ) -> Result<Seal, Refusal> {
+        if !directory.seal_admin(caller).map_err(Refusal)? {
+            return Err(Refusal::because("seal administrator privilege required"));
+        }
+        let owner: Principal = owner.parse()?;
+        if owner.realm() != self.info.realm {
+            return Err(Refusal::because("wrong realm"));
+        }
+        let mut seal = directory
+            .seals_of(&owner)
+            .map_err(Refusal)?
+            .into_iter()
+            .find(|seal| seal.name == name)
+            .ok_or_else(|| Refusal::because("no such seal"))?;
+        seal.state = State::Revoked;
+        Ok(seal)
+    }
+
     fn apply_seal_op(
         &self,
         caller: &Principal,
@@ -3257,18 +3301,7 @@ impl EnrollServer {
             }
             op @ SealOp::AddDevice { .. } => self.add_device(caller, op, now, directory)?,
             SealOp::RemoveDevice { name, id } => {
-                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
-                let me = caller.to_string();
-                let device = seal
-                    .devices
-                    .iter()
-                    .find(|d| d.id == id)
-                    .ok_or_else(|| Refusal::because("no such device"))?;
-                if seal.holder(device) != me {
-                    need(role, Role::Manager, "remove another member's device")?;
-                }
-                seal.devices.retain(|d| d.id != id);
-                seal
+                self.remove_device(caller, &name, &id, directory)?
             }
             SealOp::Revoke { name } => {
                 let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
@@ -3277,21 +3310,7 @@ impl EnrollServer {
                 seal
             }
             SealOp::AdminRevoke { owner, name } => {
-                if !directory.seal_admin(caller).map_err(Refusal)? {
-                    return Err(Refusal::because("seal administrator privilege required"));
-                }
-                let owner: Principal = owner.parse()?;
-                if owner.realm() != self.info.realm {
-                    return Err(Refusal::because("wrong realm"));
-                }
-                let mut seal = directory
-                    .seals_of(&owner)
-                    .map_err(Refusal)?
-                    .into_iter()
-                    .find(|seal| seal.name == name)
-                    .ok_or_else(|| Refusal::because("no such seal"))?;
-                seal.state = State::Revoked;
-                seal
+                self.admin_revoke_seal(caller, &owner, &name, directory)?
             }
         };
         record(&seal)?;

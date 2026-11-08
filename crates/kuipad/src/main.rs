@@ -120,6 +120,52 @@ fn parse_args() -> Result<Args, Error> {
     Ok(args)
 }
 
+/// The keys operation's handler: the custody broker where one is configured,
+/// else the handlers run in-process.
+fn open_keys_service(cfg: &Config) -> Result<Option<Arc<kuipad::keys::Keys>>, Error> {
+    match &cfg.keys {
+        Some(keys) if keys.enabled => match &keys.broker {
+            Some(broker) => Ok(Some(Arc::new(kuipad::keys::Keys::broker(broker.clone())))),
+            None => Ok(cfg.keys_service()?),
+        },
+        _ => Ok(cfg.keys_service()?),
+    }
+}
+
+/// The transparency log, opened and expired.
+fn open_ledger(
+    cfg: &Config,
+    store: &KeyStore,
+    hash: kuipa_enroll::merkle::TreeHash,
+) -> Result<Arc<kuipad::ledger::FileLedger>, Error> {
+    let ledger = Arc::new(
+        kuipad::ledger::FileLedger::open(&cfg.key_dir, &cfg.realm, &cfg.server, hash)?
+            .with_witnesses(store.witness_keys()?)
+            .with_head_interval(std::time::Duration::from_secs(cfg.tlog_head_interval))
+            .with_retention(cfg.tlog_retention_months),
+    );
+    ledger.expire(tang_pqc::unix_seconds(std::time::SystemTime::now()))?;
+    eprintln!(
+        "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
+        ledger.id(),
+        ledger.size()
+    );
+    Ok(ledger)
+}
+
+fn peer_settings(cfg: &Config, ca_certs: Vec<Vec<u8>>) -> Settings {
+    Settings {
+        me: cfg.server.clone(),
+        realm: cfg.realm.clone(),
+        peers: cfg.peers.clone(),
+        discover: cfg.discover_peers,
+        endpoints: cfg.peer_endpoints.clone(),
+        interval: std::time::Duration::from_secs(cfg.peer_interval.max(5)),
+        ca_certs,
+        vouch_interval: std::time::Duration::from_secs(cfg.vouch_interval),
+    }
+}
+
 async fn serve(cfg: Config) -> Result<(), Error> {
     let store = KeyStore::new(&cfg.key_dir);
     let keys = store.load()?;
@@ -128,12 +174,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     } else {
         None
     };
-    let keys_service = match &cfg.keys {
-        Some(keys) if keys.enabled && keys.broker.is_some() => Some(Arc::new(
-            kuipad::keys::Keys::broker(keys.broker.clone().expect("broker was checked")),
-        )),
-        _ => cfg.keys_service()?,
-    };
+    let keys_service = open_keys_service(&cfg)?;
     if keys_service.is_some() {
         eprintln!("kuipad: serving the keys operation at /ipa/ku/keys");
     }
@@ -155,38 +196,17 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     )?;
     let info = cfg.realm_info(servers, anchor.as_ref().map(|a| *a.public().thumbprint()))?;
     let ca_certs = info.ca_certs.clone();
-    let ledger = Arc::new(
-        kuipad::ledger::FileLedger::open(
-            &cfg.key_dir,
-            &cfg.realm,
-            &cfg.server,
-            kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg()),
-        )?
-        .with_witnesses(store.witness_keys()?)
-        .with_head_interval(std::time::Duration::from_secs(cfg.tlog_head_interval))
-        .with_retention(cfg.tlog_retention_months),
-    );
-    ledger.expire(tang_pqc::unix_seconds(std::time::SystemTime::now()))?;
-    eprintln!(
-        "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
-        ledger.id(),
-        ledger.size()
-    );
+    let ledger = open_ledger(
+        &cfg,
+        &store,
+        kuipa_enroll::merkle::TreeHash::for_signer(keys.signing.public().alg()),
+    )?;
     let server = Arc::new(
         EnrollServer::new(keys, info, delegation)
             .with_policy(tang_pqc::Policy::from_system()?)
             .with_ledger(ledger.clone()),
     );
-    let settings = Settings {
-        me: cfg.server.clone(),
-        realm: cfg.realm.clone(),
-        peers: cfg.peers.clone(),
-        discover: cfg.discover_peers,
-        endpoints: cfg.peer_endpoints.clone(),
-        interval: std::time::Duration::from_secs(cfg.peer_interval.max(5)),
-        ca_certs,
-        vouch_interval: std::time::Duration::from_secs(cfg.vouch_interval),
-    };
+    let settings = peer_settings(&cfg, ca_certs);
     let initiator = KeytabInitiator::new(cfg.keytab.clone(), cfg.principal.clone());
     let initiator = Arc::new(if cfg.gssproxy {
         initiator.with_gssproxy()
@@ -408,9 +428,9 @@ fn establish_trust(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Er
     Ok(())
 }
 
-fn run(args: &Args) -> Result<(), Error> {
-    let cfg = Config::load(&args.config)?;
-    // Management commands must not create root-owned daemon state.
+/// Management commands must not create root-owned daemon state: as root,
+/// run again as `kuipad`.  Returns only when no re-execution is needed.
+fn reexec_unprivileged(cfg: &Config, args: &Args) -> Result<(), Error> {
     if cfg.gssproxy && args.command != "keys-broker" {
         let status = std::fs::read_to_string("/proc/self/status")?;
         let euid = status
@@ -431,6 +451,12 @@ fn run(args: &Args) -> Result<(), Error> {
                 .into());
         }
     }
+    Ok(())
+}
+
+fn run(args: &Args) -> Result<(), Error> {
+    let cfg = Config::load(&args.config)?;
+    reexec_unprivileged(&cfg, args)?;
     let store = KeyStore::new(&cfg.key_dir);
     match args.command.as_str() {
         "serve" => tokio::runtime::Builder::new_multi_thread()
@@ -442,7 +468,7 @@ fn run(args: &Args) -> Result<(), Error> {
             let listener = listenfd::ListenFd::from_env()
                 .take_unix_listener(0)?
                 .ok_or("custody broker requires socket activation")?;
-            keys.serve_broker(listener)?;
+            keys.serve_broker(&listener)?;
             Ok(())
         }
         "generate-keys" => {
@@ -458,21 +484,7 @@ fn run(args: &Args) -> Result<(), Error> {
             Ok(())
         }
         "enrollment-string" => enrollment_string(&cfg, &store, args),
-        "rotate-anchor" => {
-            let days = args.days("days", MAX_STRING_DAYS)?;
-            if days.is_zero() || days.as_secs() > MAX_STRING_DAYS * 86400 {
-                return Err(format!("--days must be between 1 and {MAX_STRING_DAYS}").into());
-            }
-            let (old, new) = store.rotate_anchor(&cfg.realm, days)?;
-            println!("{new}");
-            eprintln!(
-                "kuipad: anchor {old} replaced by {new}; its succession is valid for {} \
-                 days.\nRestart kuipad, then issue new enrollment strings \
-                 (enrollment-string) and replace pinned anchors in images.",
-                days.as_secs() / 86400
-            );
-            Ok(())
-        }
+        "rotate-anchor" => rotate_anchor(&cfg, &store, args),
         "tang-keygen" => {
             println!("{}", TangKeys::new(&cfg.key_dir).generate()?);
             eprintln!("kuipad: restart the daemon to serve Tang");
@@ -501,25 +513,7 @@ fn run(args: &Args) -> Result<(), Error> {
             eprintln!("kuipad: restart the daemon to accept vouchers under it");
             Ok(())
         }
-        "rotate-keys" => {
-            let mut which = Rotation {
-                retire: Retire {
-                    join: args.flag("join"),
-                    escrow: args.flag("escrow"),
-                    trust: args.flag("trust"),
-                },
-                signing: args.flag("signing"),
-            };
-            if which == Rotation::default() {
-                which.retire = Retire {
-                    join: true,
-                    escrow: true,
-                    trust: true,
-                };
-            }
-            report(&store.rotate(which)?);
-            Ok(())
-        }
+        "rotate-keys" => rotate_keys(&store, args),
         "trust-invitation" => trust_invitation(&cfg, &store, args),
         "establish-trust" => establish_trust(&cfg, &store, args),
         "prune-keys" => {
@@ -528,6 +522,42 @@ fn run(args: &Args) -> Result<(), Error> {
         }
         other => Err(format!("unknown command {other:?}").into()),
     }
+}
+
+fn rotate_anchor(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Error> {
+    let days = args.days("days", MAX_STRING_DAYS)?;
+    if days.is_zero() || days.as_secs() > MAX_STRING_DAYS * 86400 {
+        return Err(format!("--days must be between 1 and {MAX_STRING_DAYS}").into());
+    }
+    let (old, new) = store.rotate_anchor(&cfg.realm, days)?;
+    println!("{new}");
+    eprintln!(
+        "kuipad: anchor {old} replaced by {new}; its succession is valid for {} \
+         days.\nRestart kuipad, then issue new enrollment strings \
+         (enrollment-string) and replace pinned anchors in images.",
+        days.as_secs() / 86400
+    );
+    Ok(())
+}
+
+fn rotate_keys(store: &KeyStore, args: &Args) -> Result<(), Error> {
+    let mut which = Rotation {
+        retire: Retire {
+            join: args.flag("join"),
+            escrow: args.flag("escrow"),
+            trust: args.flag("trust"),
+        },
+        signing: args.flag("signing"),
+    };
+    if which == Rotation::default() {
+        which.retire = Retire {
+            join: true,
+            escrow: true,
+            trust: true,
+        };
+    }
+    report(&store.rotate(which)?);
+    Ok(())
 }
 
 fn report(changes: &Changes) {

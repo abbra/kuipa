@@ -865,6 +865,51 @@ pub struct Host<'a> {
     pub auth: &'a Auth,
 }
 
+/// A ticket for a join or rekey and the name to address the server by, or
+/// none where the authenticator is not Kerberos.  The credential is `None`
+/// where the caller's own ticket cache serves.
+fn join_ticket(
+    auth: &Auth,
+    ambient: Option<&GssClientCred>,
+    adv: &VerifiedRealm,
+    deployment: &Deployment,
+    fqdn: &str,
+    realm: &str,
+) -> Result<Option<(Option<GssClientCred>, String)>, Error> {
+    Ok(match auth {
+        Auth::Ccache => ambient.map(|_| (None, format!("ipa-ku@{}", adv.server()))),
+        Auth::Otp(otp) => Some((
+            Some(armoured_ticket(
+                adv,
+                deployment,
+                &Principal::host(fqdn, realm).to_string(),
+                otp.as_bytes(),
+            )?),
+            service_principal(adv),
+        )),
+        Auth::Password {
+            principal,
+            password,
+        } => {
+            let principal = if principal.contains('@') {
+                principal.clone()
+            } else {
+                format!("{principal}@{realm}")
+            };
+            Some((
+                Some(armoured_ticket(
+                    adv,
+                    deployment,
+                    &principal,
+                    password.as_bytes(),
+                )?),
+                service_principal(adv),
+            ))
+        }
+        Auth::LdapOtp(_) | Auth::Voucher { .. } => None,
+    })
+}
+
 /// `kuipa enroll` (online): join `realm` through the first usable server
 /// of `deployment` whose advertisement verifies against `anchors` (the
 /// enrollment string's, or those pre-provisioned in `/etc/ipa/ku-anchors`
@@ -920,41 +965,7 @@ pub fn enroll_online(
         None,
         op,
         |adv| {
-            // A ticket and the name to address the server by.
-            let kerberos = match auth {
-                Auth::Ccache => ambient
-                    .as_ref()
-                    .map(|_| (None, format!("ipa-ku@{}", adv.server()))),
-                Auth::Otp(otp) => Some((
-                    Some(armoured_ticket(
-                        adv,
-                        deployment,
-                        &Principal::host(fqdn, realm).to_string(),
-                        otp.as_bytes(),
-                    )?),
-                    service_principal(adv),
-                )),
-                Auth::Password {
-                    principal,
-                    password,
-                } => {
-                    let principal = if principal.contains('@') {
-                        principal.clone()
-                    } else {
-                        format!("{principal}@{realm}")
-                    };
-                    Some((
-                        Some(armoured_ticket(
-                            adv,
-                            deployment,
-                            &principal,
-                            password.as_bytes(),
-                        )?),
-                        service_principal(adv),
-                    ))
-                }
-                Auth::LdapOtp(_) | Auth::Voucher { .. } => None,
-            };
+            let kerberos = join_ticket(auth, ambient.as_ref(), adv, deployment, fqdn, realm)?;
             let auth_type = match auth {
                 Auth::LdapOtp(_) => AuthType::Otp,
                 Auth::Voucher { .. } => AuthType::Voucher,

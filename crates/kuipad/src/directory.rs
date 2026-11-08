@@ -1113,8 +1113,12 @@ impl Directory for LdapDirectory {
         );
         let members: String = std::iter::once(&entry.dn)
             .chain(entry.attrs.get("memberof").into_iter().flatten())
-            .map(|dn| format!("(member={})", filter_escape(dn)))
-            .collect();
+            .fold(String::new(), |mut acc, dn| {
+                acc.push_str("(member=");
+                acc.push_str(&filter_escape(dn));
+                acc.push(')');
+                acc
+            });
         let membership = format!("(|{members})");
         Ok(!conn
             .search(&privilege, Scope::Base, &membership, &["1.1"])?
