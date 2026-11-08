@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use kuipa_enroll::delegation::CLOCK_SKEW;
@@ -120,11 +120,10 @@ impl Paths {
         self.state_dir().join("state.json")
     }
 
-    /// `realm.json`: the public part of the state (realm, FQDN, servers),
-    /// world-readable, for users' `kuipa seal` (§7.6.9).
+    /// `/etc/ipa/ku/realm.json`: public realm, hostname and servers.
     #[must_use]
     pub fn public_state(&self) -> PathBuf {
-        self.state_dir().join("realm.json")
+        self.at("etc/ipa/ku/realm.json")
     }
 
     /// PKINIT anchors from the realm (PEM), for anonymous PKINIT armour.
@@ -224,6 +223,7 @@ pub fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), Error> {
         .create_new(true)
         .mode(mode)
         .open(&tmp)?;
+    f.set_permissions(fs::Permissions::from_mode(mode))?;
     f.write_all(data)?;
     f.sync_all()?;
     // Replace a symlink itself, never its target.
@@ -381,8 +381,12 @@ impl State {
             fqdn: self.fqdn.clone(),
             servers: self.servers.clone(),
         };
+        let public_file = paths.public_state();
+        let directory = public_file.parent().expect("public state has a parent");
+        fs::create_dir_all(directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))?;
         write_file(
-            &paths.public_state(),
+            &public_file,
             &serde_json::to_vec_pretty(&public).expect("serialisable"),
             0o644,
         )
@@ -1027,6 +1031,47 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pq-anchors");
         (dir, path)
+    }
+
+    #[test]
+    fn public_realm_is_separate_from_private_client_state() {
+        let (dir, _) = scratch_anchors("public-realm");
+        let paths = Paths::new(&dir);
+        fs::create_dir_all(paths.state_dir()).unwrap();
+        fs::set_permissions(paths.state_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        let state = State {
+            realm: "EXAMPLE.TEST".into(),
+            fqdn: "server.example.test".into(),
+            servers: vec!["server.example.test".into()],
+            ..State::default()
+        };
+        state.store(&paths).unwrap();
+        assert_eq!(PublicState::load(&paths).unwrap().realm, state.realm);
+        assert_eq!(
+            fs::metadata(paths.state_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(paths.public_state())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(paths.public_state().parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

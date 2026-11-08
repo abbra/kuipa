@@ -1816,8 +1816,8 @@ uses the request of §7.6.5:
 
 Users run `kuipa seal` with their own ticket (`KRB5CCNAME`); nothing
 needs root. The realm comes from the host's world-readable files:
-`/var/lib/ipa-client/ku/realm.json` (realm, FQDN, servers, written beside
-the root-only state), `/etc/ipa/ku-anchors` and `/etc/ipa/ca.crt`.
+`/etc/ipa/ku/realm.json` (realm, FQDN, servers),
+`/etc/ipa/ku-anchors` and `/etc/ipa/ca.crt`.
 Per-user state lives in `$KUIPA_USER_DIR`, else `$XDG_DATA_HOME/kuipa`,
 else `~/.local/share/kuipa` (0700, files 0600): `device.key`,
 `seals/<name>.seal` (the last signed descriptor of each seal) and
@@ -2224,7 +2224,7 @@ Common rules:
 | `run/ipa/krb5.keytab` | the unsealed keytab in file mode |
 | `<path>.sealed`, `run/ipa/kuipa/<escaped path>` | another protected keytab or file, sealed and unsealed; `<path>` is a symlink to the latter (§7.5) |
 | `var/lib/ipa-client/ku/state.json` | realm, FQDN, servers (issuer first), protection, other protected keytabs and files |
-| `var/lib/ipa-client/ku/realm.json` | realm, FQDN and servers again, world-readable, for users' `kuipa seal` |
+| `etc/ipa/ku/realm.json` | realm, FQDN and servers again, world-readable, for users' `kuipa seal` |
 | `var/lib/ipa-client/ku/krb5.conf`, `pkinit-anchors.pem` | Kerberos configuration generated from the enrollment |
 | `var/lib/ipa-client/ku/recipient.jwk`, `recipient.pub.jwk` | the mode A machine key |
 | `var/lib/ipa-client/ku/pending.json` | deferred steps after offline enrollment |
