@@ -256,6 +256,10 @@ find vendor/ -type f -exec chmod -x {} \;
 # crates it does not.  Versioned requirements would drag this Fedora's
 # versions into older chroots.
 while read -r _name _ver _cksum; do
+%if 0%{?rhel} == 10
+    # EPEL 10 lacks these packages; their locked sources are in vendor/.
+    case "$_name" in page_size|webpki-root-certs) continue ;; esac
+%endif
     echo "crate($_name)"
 done < %{SOURCE10}
 # %%cargo_generate_buildrequires is deliberately not used: it would demand the

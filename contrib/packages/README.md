@@ -92,6 +92,8 @@ different crate versions.
 3. `%generate_buildrequires` emits `crate()` BuildRequires from
    `system-crates.txt`, so the system crate package is installed when this
    Fedora has it.
+   EPEL 10 lacks `page_size` and `webpki-root-certs`; it builds those
+   from their locked vendor copies without requiring system packages.
 4. `%build` builds everything from `vendor/` — the system crate copies are not
    substituted, because Fedora patches the `Cargo.toml` of its crate packages
    and `cargo --locked` then rejects the metadata mismatch against `Cargo.lock`.
