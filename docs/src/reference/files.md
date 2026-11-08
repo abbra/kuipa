@@ -15,7 +15,7 @@ All paths hang off `$KUIPA_ROOT` (default `/`).
 | `/var/lib/ipa-client/ku/trusts/<REALM>/` | a trusted realm's PKINIT anchors and CA | 0644 |
 | `/etc/krb5.conf.d/kuipa_trust_<REALM>` | a trusted realm's Kerberos configuration | 0644 |
 | `/var/lib/ipa-client/ku/state.json` | realm, host name, servers, protection | 0600 |
-| `/var/lib/ipa-client/ku/realm.json` | realm, host name and servers, for users | 0644 |
+| `/etc/ipa/ku/realm.json` | realm, host name and servers, for users | 0644 |
 | `/var/lib/ipa-client/ku/krb5.conf`, `pkinit-anchors.pem` | Kerberos configuration from the enrollment | 0644 |
 | `/var/lib/ipa-client/ku/recipient.jwk`, `recipient.pub.jwk` | the machine key for a mode A bundle | 0600, 0644 |
 | `/var/lib/ipa-client/ku/pending.json` | steps left after an offline enrollment | 0600 |

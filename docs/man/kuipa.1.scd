@@ -543,7 +543,7 @@ trusting one, or set _N_; _N_ cannot exceed the witnesses trusted.
 	The client's persistent state: machine key, servers,
 	enrollment, protected keytabs and files.
 
-*/var/lib/ipa-client/ku/realm.json*
+*/etc/ipa/ku/realm.json*
 	Realm, FQDN and servers — what any user of the host may know.
 
 */var/lib/ipa-client/ku/pending.json*

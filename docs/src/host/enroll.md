@@ -131,7 +131,7 @@ still has to run.
 | `/etc/ipa/ku-anchors` | the realm's current anchors, refreshed at every key rotation |
 | `/var/lib/ipa-client/ku/krb5.conf`, `pkinit-anchors.pem` | Kerberos configuration from the enrollment, used when the system has none for the realm |
 | `/var/lib/ipa-client/ku/state.json` | realm, host name, servers, protection (root only) |
-| `/var/lib/ipa-client/ku/realm.json` | realm, host name and servers, for users' `kuipa seal` |
+| `/etc/ipa/ku/realm.json` | realm, host name and servers, for users' `kuipa seal` |
 
 `kuipa enroll` does what `ipa-join` does. The rest of
 `ipa-client-install` (SSSD, certificates, DNS update and so on) is not its
