@@ -99,6 +99,16 @@ kuipa enroll --server ipa1.example.test --enrollment-file string.txt --use-ccach
 come from the verified advertisement, so even the `kinit` is armoured with
 anchors the host can trust.
 
+An already enrolled host may also use its own host ticket with
+`--use-ccache`: the daemon rekeys that host only. FreeIPA's server and
+replica installers use this after their normal bootstrap, pinning their
+local daemon's anchor. Existing keytab entries are retained, including
+entries for other principals and the previous host keys. A keytab symlink
+is refused rather than replaced; resolve it before re-enrolling.
+If the keytab contains multiple principals, `kuipa status` reports enrollment
+but cannot report its key version, and `kuipa rotate-keys` and `kuipa protect`
+refuse it rather than discard the other principals.
+
 **With a voucher**, for autoscalers and image pipelines:
 
 ```sh
