@@ -1021,7 +1021,7 @@ pub fn prepare(paths: &Paths, replace: bool, fqdn: &str) -> Result<Value, Error>
         "thumbprint": key.public().kid().to_string(),
         "public_key": public,
         "admin_command": format!(
-            "ipa host-add {fqdn} --pq-stage --pq-recipient={}", public.display()
+            "ipa host-add {fqdn} --stage --recipient={}", public.display()
         ),
     }))
 }

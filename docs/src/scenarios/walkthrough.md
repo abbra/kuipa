@@ -506,7 +506,7 @@ PKINIT armour is obtained with the advertised anchors, and the armoured
 ## 9. Offline enrollment: `pq_offline web5`, `kuipa complete`
 
 web5 prepares a machine key (`kuipa prepare`), the administrator stages
-it (`ipa host-add --pq-stage --pq-recipient=…`, stood in for by
+it (`ipa host-add --stage --recipient=…`, stood in for by
 `kuipa-playground stage`), and web5 enrolls from the sealed, signed
 bundle without talking to a server. The staged enrollment reports the
 bundle's own deadline — the row the host writes to decide when to

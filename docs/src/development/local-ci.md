@@ -221,7 +221,7 @@ live in one shell; nothing touches the real system.
 | `pq_enroll NAME [opts]` | enroll `NAME` online with its OTP string |
 | `pq_password NAME [opts]` | enroll `NAME` with the administrator's password, sealed in the PQ channel |
 | `pq_bootstrap` | `kuipa realm-info`, anonymous PKINIT with the advertised anchors, then the armoured `kinit` of the administrator: what `ipa-client-install` does before `--use-ccache` |
-| `pq_offline NAME` | `kuipa prepare`, staging with an admin ticket (`kuipa-playground stage`, standing in for `ipa host-add --pq-stage`), then `kuipa enroll --bundle` |
+| `pq_offline NAME` | `kuipa prepare`, staging with an admin ticket (`kuipa-playground stage`, standing in for `ipa host-add --stage`), then `kuipa enroll --bundle` |
 | `pq_voucher NAME [--bound] [opts]` | enroll a new host `NAME` with a voucher in host group `webservers`: blind it, have the issuer sign it, unblind it, show it, enroll; with `--bound` it is bound to an ephemeral key `kuipa voucher-key` makes for the host |
 | `pq_tang [SERVER]` | the `tang-pqc` pin configuration (`{"url":…,"thp":…}`) for a server's Tang service (default ipa1): `echo secret \| tang-pqc encrypt "$(pq_tang)" > s.jwe; tang-pqc decrypt < s.jwe` |
 | `pq_trust` | `kuipa trusted-realms` for the current host: install `B.TEST`'s anchors, PKINIT chain, CA and `krb5.conf.d` snippet, verified through `EXAMPLE.TEST` |
