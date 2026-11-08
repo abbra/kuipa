@@ -634,8 +634,12 @@ pin there only breaks enrollment. Enrolled hosts' stored lists (§4.5)
 meet the same rule on rekeys and checks. Such pins
 should carry an expiry for the same reason (`<thumbprint> <expiry>` per
 line, §10.2); lists written from server responses carry none, since every
-rekey refreshes them. There is still no trust on first use: without a
-pinned anchor the client would talk to a server nobody vouched for.
+rekey refreshes them. Trust on first use is opt-in for `realm-info` alone
+(`--trust-first-use`, no enrollment string, no pins): the advertisement is
+trusted as the server serves it, with the anchors its own delegation names,
+and the command warns that nothing was checked against a pin. Enrollment has
+no such mode: without a pinned anchor the client would talk to a server
+nobody vouched for.
 
 An enrollment string together with `--realm` (`ipa-client-install -r`) is
 a cross-check: the string must be for that realm, compared exactly as
@@ -2173,10 +2177,11 @@ rebinding, resealing, anchor refresh) happen inside them.
 | `enroll … --principal P [--password-file F]` | online join with `P`'s password, through an armoured `kinit` on the host (§5.3) |
 | `enroll … --realm R (--principal P \| --use-ccache \| --voucher-file F)` | as above, verified against the pre-provisioned `/etc/ipa/ku-anchors` instead of an enrollment string (§4.4) |
 | `enroll … --use-ccache` | online join with the ticket in `KRB5CCNAME` |
+| `adopt --enrollment-file F [--server S… \| --domain D] [--hostname H]` | record local state for a host that already holds its keytab: the keytab must get a ticket from the KDC as `host/<fqdn>@<realm>`, the realm is verified through the string's pins, no rekey, keytab untouched (§4.4) |
 | `enroll … --voucher-file F [--ephemeral-key F]` | online join with a voucher (§9), with the ephemeral key it is bound to |
 | `voucher-key --out F` | make the ephemeral key to bind a voucher to; print its binding (§9) |
 | `enroll --bundle F [--enrollment-file F] [--hostname H] [--insecure-signed-only]` | offline enrollment (§8.4) |
-| `realm-info --server S… --krb5-dir D [--realm R]` | Kerberos configuration for enrolling with a ticket (§5.4) |
+| `realm-info --server S… --krb5-dir D [--realm R \| --trust-first-use]` | Kerberos configuration for enrolling with a ticket (§5.4); `--trust-first-use` trusts the advertisement with no pins, and warns |
 | `complete` | finish an offline enrollment (§8.5) |
 | `rotate-keys` | new host keys (§6), resealing when protected |
 | `protect` / `unprotect` | seal / unseal the host keytab, file mode (§7.3) |
@@ -2630,7 +2635,7 @@ IPVA  ct sealed                                                                 
 IPRP  principal kind(1) n(1) [retire(h)]                                         registration parameters
 IPRA  principal                                                                  registration answer
 IPKG  namespace(1) nickname alg_arg(1)                                           keys operation data (§18.2)
-      (namespace: 1 dm, 2 ra, 3 ca, 4 ca_wrapped, 5 lwca-store; alg_arg: a wrap
+      (namespace: 1 dm, 2 ra, 3 ca, 4 ca_wrapped, 5 lwca-store, 6 akamu; alg_arg: a wrap
        algorithm selector for ca_wrapped, 0 none; nickname: a string)
 IPKR  value                                                                      keys answer (the handler's JSON)
 IPPS  version 4: sender receiver H(delegation)(32) delegation(JSON or empty) repair message token H(tail)(32) has_tail(1) [n(u64) [epoch entry]]
@@ -2922,6 +2927,7 @@ namespaces, each with a fixed producer and consumer:
 | `ra/ipaCert` | the RA agent key and certificate as PKCS#12 | a clone or non-CA replica | replica promotion, CA topology repair |
 | `ca/<nickname>` | a subsystem certificate and key from Dogtag's NSS database as PKCS#12 | a CA or KRA clone, one nickname at a time | `ipa-ca-install`, `ipa-kra-install` |
 | `ca_wrapped/<nickname>` | a lightweight-CA key wrapped by the CA signing key (PKIArchiveOptions) | nobody: Dogtag itself consumes it | runtime, on CA clones missing a LWCA key |
+| `akamu/<name>` | the Akamu RA agent key and certificate as PEM | a CA replica that runs Akamu | replica promotion, while it is still becoming a CA server |
 
 The `KEYS` service entry (`cn=masters`), the audit log and
 `ipa-custodia-check` complete the surface. The trust root it needs — the
@@ -2942,7 +2948,7 @@ host that is already enrolled:
   `host/<fqdn>` (install-time fetches) or `dogtag/<fqdn>` (lightweight-CA
   retrieval, as today).
 * **Operation data** (`IPKG`): namespace (one of `dm`, `ra`, `ca`,
-  `ca_wrapped`), nickname, and for `ca_wrapped` a wrap-algorithm
+  `ca_wrapped`, `lwca-store`, `akamu`), nickname, and for `ca_wrapped` a wrap-algorithm
   argument validated against an allowlist. No string parsing of the key
   name: the namespace is an enum, the nickname opaque bytes with a
   length bound.
@@ -2955,12 +2961,14 @@ host that is already enrolled:
   `cn=CA,cn=<fqdn>,cn=masters` entry, so a non-CA server cannot ask for
   wrapped CA keys.
 * **Handler execution.** Direct runas spawn on tokio's blocking pool, as
-  Custodia does today: the daemon execs the same four handler executables
+  Custodia does today: the daemon execs the same handler executables
   (`ipa-custodia-dmldap`, `ipa-custodia-pki-tomcat`,
-  `ipa-custodia-pki-tomcat-wrapped`, `ipa-custodia-ra-agent`) with
-  `--export -`, capturing stdout, each under the SELinux domain its file
-  type already selects (root for `dmldap` and `ra-agent`, `pkiuser` for
-  the NSS handlers). Import is the same spawn with `--import -` and the
+  `ipa-custodia-pki-tomcat-wrapped`, `ipa-custodia-ra-agent`,
+  `ipa-custodia-akamu-ra-agent`) with `--export -`, capturing stdout, each
+  under the SELinux domain its file type already selects (root for
+  `dmldap`, `ra-agent` and `akamu-ra-agent`, `pkiuser` for the NSS
+  handlers). The NSS handlers also get `--nickname`, and `ca_wrapped` the
+  wrap algorithm as `--algorithm`. Import is the same spawn with `--import -` and the
   value on stdin. `ca_wrapped` stays export-only.
 * **Response.** The handler's JSON value, sealed in the envelope. The
   body limit (§11.3) is 1 MiB, enough for a CA or KRA subsystem PKCS#12
@@ -3035,21 +3043,22 @@ for the retriever), the anchor list and CA from `/etc/ipa`.
       "ra":      {"command": "/usr/libexec/ipa/custodia/ipa-custodia-ra-agent", "runas": "root"},
       "ca":      {"command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat", "runas": "pkiuser"},
       "ca_wrapped": {"command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat-wrapped", "runas": "pkiuser"},
-      "lwca-store": {"command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat-wrapped", "runas": "pkiuser"}
+      "lwca-store": {"command": "/usr/libexec/ipa/custodia/ipa-custodia-pki-tomcat-wrapped", "runas": "pkiuser"},
+      "akamu":   {"command": "/usr/libexec/ipa/custodia/ipa-custodia-akamu-ra-agent", "runas": "root"}
     },
     "lwca": {"container": "cn=lwca,cn=kuipa,cn=etc"}
   }
 }
 ```
 
-The four handlers keep their names and SELinux labels (they are FreeIPA
+The handlers keep their names and SELinux labels (they are FreeIPA
 files); the daemon only replaces Custodia's forking HTTP server, its
 KEM/JOSE message layer and its LDAP public-key directory. The policy —
 which principal may ask for which namespace — is static in the daemon
-(`host/*` in `cn=masters` for `dm`, `ra`, `ca`; `dogtag/*` or `host/*`
-for `ca_wrapped` and `lwca-store`), checked against the server list and
+(`host/*` in `cn=masters` for `dm`, `ra`, `ca`, `akamu`; `dogtag/*` or `host/*`
+for `ca_wrapped` and `lwca-store`; `host/*` in `cn=masters` for `akamu` too), checked against the server list and
 CA role in `cn=masters` before any handler runs. Nothing is
-LDAP-configurable: the four flows have no runtime policy to change, and
+LDAP-configurable: the flows have no runtime policy to change, and
 a static table is the smallest surface to audit.
 
 ### 18.6 What stays out
@@ -3080,9 +3089,34 @@ a static table is the smallest surface to audit.
 | trusted realms: `trusts` member and its validation, `kuipa trusted-realms`, per-realm anchors, PKINIT anchors and `krb5.conf.d` snippets (§17.1–§17.3) | implemented, tested against two real KDCs |
 | establishing a trust: invitation, trust request, trust secret, cross-realm keys, partner refresh (§17.4) | implemented, tested against two real KDCs; the LDAP side **not yet run against FreeIPA** |
 | units, httpd snippet, config example | provided (`contrib/`) |
-| Tamarin model of the core exchange plus vouchers and user seals (pins and advertisement verification, join/rekey key schedule, OTP and Kerberos authenticators, sealed-keytab escrow, blind-issued bound and bearer vouchers, the two-share seal format and the unified recovery request): secrecy, server authentication, rekey forward secrecy, offline resistance, voucher single use and issuer authentication, the two-share DEK needing the device key, and the §13/§7.6.10/§9 attacks (mis-delivered string, stolen anchor, bearer voucher, compromised escrow key, stolen device plus observed unlock) | provided and proved (`contrib/tamarin/kuipa.spthy`, `tamarin-prover --prove`) |
-| Tamarin model of trust establishment (§17.4): the invitation and one-time secret, the request/response exchange sealed to the trust key, the jointly derived trust secret, the cross-realm `krbtgt` keys and tickets, the `trusts` publication: agreement, responder authentication, trust-secret secrecy, the accepted-ticket source, and the §17.4 "Limits" attacks (mis-delivered invitation, leaked trust secret minting the cross-realm keys) | provided and proved (`contrib/tamarin/trust.spthy`, a standalone theory as `tang-pqc` is; `tamarin-prover --prove`) |
-| Tamarin model of signing statements (DESIGN-sign.md): the policy check (users, groups, hosts, services), the statement with its log leaf, the client bundle and offline verification against the pinned realm: authorization, delegation-vouched signer, batch binding, the no-policy refusal, and the "Not a server that cannot lie" attack for a mis-pinned verifier | provided and proved (`contrib/tamarin/sign.spthy`, a standalone theory as `tang-pqc` is; `tamarin-prover --prove`) |
+| Tamarin model of the core exchange plus vouchers and user seals (pins and advertisement verification, join/rekey key schedule, OTP and Kerberos authenticators, sealed-keytab escrow, blind-issued bound and bearer vouchers, the two-share seal format and the unified recovery request): secrecy, server authentication, rekey forward secrecy, voucher issuer authentication, and the §13/§7.6.10/§9 attacks (mis-delivered string, stolen anchor, bearer voucher, compromised escrow key, stolen device plus observed unlock) | provided, partly proved (`contrib/tamarin/kuipa.spthy`, proved by `contrib/ci/proofs.sh`). The rules now register each persistent fact with an action (`ServerRegistered`, `JoinEncap`, `EscrowKeyRegistered`, `DeviceRegistered`, `FileSealed`, `UserReleased`, `FileOpened`): a fact that appears only in a rule's premises and conclusions is observable at no trace index, so the earlier secrecy and availability claims keyed on `!Server`/`!Device`/`!SealedUserFile`/`!EscrowKey` were vacuous, and these are the same claims over actions. One claim was lost when the model was instrumented and has since been recovered, and the fault was in its guard: the two-share DEK needing the device key (`SealNeedsDeviceKey`) went FALSE over the actions — it had only ever verified vacuously. Seven antecedent variants over `DeviceRegistered` were refuted with the same trace; the rules were then changed to supply the pairing the model lacked (`!SealedUserFile` records the device public key whose slot it sealed; `user_unseal` and `device_key_thief` require it), matching `crates/kuipa-enroll/src/seal.rs`, where each device share key is `HKDF(s_j, "device", … ‖ id_j ‖ H(c_j))` and the answer is encrypted to that device's key. That did not fix it; the guard did. "Not compromised" had been written as `not(Ex #j. K(seed) @j)`, a statement about a term, while this model defines compromise by the actions `StolenDeviceKey` and `StolenEscrowKey`, which is what the rules revealing a share require — pinning the shares showed the term guard excluded nothing (`a`, `b` and `r` each reachable with it in place). Guarding the compromise action for the key the file was actually sealed under verifies it, with no escrow guard needed at all, which is the §7.6.10 sentence literally and what makes the escrow row meaningful. Two explanations entertained in earlier rounds were disproved or unsupported: two registrations sharing one `kem_pk` are not realizable (witness FALSE), and the equation-only-KEM comparison had a falsified positive control, so it proved nothing. Both directions are non-vacuous: `Attack_StolenDevicePlusReleaseOpensSeal` is falsified, i.e. with the device key stolen the DEK is known. The two companion DEK claims, refuted by the same guard error, verify with the same correction. What the model establishes alongside it is the factor-provenance property the design actually promises — a sealed file opens only after the server released a binding its owner requested through a registered device (`OpeningNeedsRelease`, `ReleaseNeedsOwnerRequest`, `CopyAtRestNeedsOwnerFactor`) — which is statement-level rather than key-confidentiality-level, and is therefore expressible and proved. Four lemmas (`Exec`, `KeytabSecret`, `VoucherSingleUse`, `BoundVoucherKeytabSecret`) are open (not refuted) at 6 GiB and 300–700 s, with the same four timing out in the unmodified theory at the same settings, so that cost is pre-existing; `SealedNoOffline` and `VoucherExec` fail at 300 s and verify at 700 s, so the settings a run uses are part of its result. The Rust seal format and its recovery path are tested, not refined to this model |
+| Tamarin model of trust establishment (§17.4): the invitation and one-time secret, the request/response exchange sealed to the trust key, the jointly derived trust secret, the cross-realm `krbtgt` keys and tickets, the `trusts` publication: agreement, responder authentication, trust-secret secrecy, the accepted-ticket source, and the §17.4 "Limits" attacks (mis-delivered invitation, leaked trust secret minting the cross-realm keys) | provided and proved (`contrib/tamarin/trust.spthy`, a standalone theory as `tang-pqc` is; proved lemma by lemma with `contrib/ci/proofs.sh`, which gives this theory a longer derivation-check timeout). Responder authentication and the accepted-ticket source previously reasoned over `!Realm`, `!TrustAdv` and `!TrustEstablishedB` at a timepoint; those are not action facts and are observable at no trace index, so the lemmas were vacuous. The rules now record the same facts as actions (`RealmRegistered`, `TrustAdvVerified`, `TrustEstablishedBRecorded`) at the steps that create or read them, and both claims are proved over those, with identical quantifier structure and witnesses; every lemma in the theory was re-run, the two expected-falsified "Limits" attacks still are |
+| Tamarin model of signing statements (DESIGN-sign.md): the policy check (users, groups, hosts, services), the statement with its log leaf, the client bundle and offline verification against the pinned realm: authorization, delegation-vouched signer, batch binding, the no-policy refusal, and the "Not a server that cannot lie" attack for a mis-pinned verifier | provided and proved (`contrib/tamarin/sign.spthy`, a standalone theory as `tang-pqc` is; proved lemma by lemma with `contrib/ci/proofs.sh`, which gives this theory a longer derivation-check timeout). The rogue-anchor row previously reasoned over `!Realm` at a timepoint, which is not an action fact and is observable at no index, so its "verified" was vacuous; `realm_setup` now records the realm registration as an action and the claim is proved over that, with the same binding. All eight lemmas were re-run and every verdict is unchanged, the mis-pinned-verifier attack still falsified |
+| Tamarin peer-sync abstraction (§4.2.1): request and response correspondence, hash-addressed context, cache-miss resend, signed-entry origin and a digest-pinned snapshot | proved under idealized authentication and signature verification (`contrib/tamarin/peer-sync.spthy`); full admission policy, actual GSS/TLS, snapshot chunking and convergence are not modeled. Cache eviction is modeled separately and proved there (`contrib/tamarin/peer-cache.spthy`), where the rules emit observations of the slot state they act on so that state is visible to trace formulas at all: cache origin, replacement and restart provenance, incarnation lifetimes and reachability witnesses. Six statements stay open and unrefuted; two of them were counted as proved only because each assumed the other |
+| Focused peer-sync theories (`contrib/tamarin/peer-{binding,attestation,admission,response,snapshot,order,cache,membership,retention,pruning,replacement,ownership,policy,rotation,rotation-origin,rotation-client,trust,pin-delivery,admission-checks}.spthy`, proved by `contrib/ci/proofs.sh`) | symbolic channel binding, a single-attestation membership model, a simplified signed-vouch trust bridge, response nonce binding, two-chunk snapshot integrity, two-version ordering, one-claim retention, per-entry pruning cascades, entry replacement, ownership and key rotation provenance, four-hop trust propagation and admission checks: 203 of 223 lemmas verified, none refuted. Every lemma is now non-vacuous: a fact that appears only in a rule's premises and conclusions is observable at no trace index, so lemmas written over such a fact held vacuously and have been restated over explicit observation actions or removed, and `contrib/ci/vacuity-check.py` fails CI if one reappears; each theory also proves reachability witnesses for the states its invariants quantify over. The 20 open goals are six cache lifetime and reachability statements, four
+admission-path lemmas (a claim admitted after a join, after a removal, with one
+realm, with live membership), three membership-generation closure properties, two
+replacement persistence claims, three rotation properties about a key retired by
+rotation, one pruning-cascade witness and one ownership release property; none is
+refuted and each theory's header names its own. Three verdicts previously counted
+as verified were not: `[reuse]` injects a lemma's statement into later proofs
+whether or not that lemma was ever proved, and in per-lemma mode an earlier
+`[reuse]` lemma is never attempted in the same process, so it is only ever an
+assumption. Two cache invariants were each proved solely by assuming the other -
+a circular pair - and a replacement claim rested on an open goal above it; all
+three are now reported open, with the `[reuse]` markers removed so nothing
+downstream can assume them. `contrib/ci/proofs.sh` prints a `note` line naming
+any open `[reuse]` source for exactly this reason. One claim guessed to be in
+that group is proved on its own (`validity_interval_origin`, 1300 s) and keeps
+its marker, because removing the marker from a proved lemma loses the results
+that use it. One statement that had been open at every limit tried closed by
+restating it, not by raising limits: a refill provenance claim that quantified
+over two starts and never named the refill step, confined to name that one action
+(verified in 141 s, same 8 GiB). Every remaining open goal has the same shape - a
+claim about a chain of observations whose induction step is the gap between two
+adjacent observations, which no statement in these theories names. Closing them
+needs that stronger simultaneous induction, not more memory.
+sources. SMT models of validity, ownership, pruning and replacement arithmetic are separate abstractions. These models are not composed into an end-to-end proof and are not refined to the Rust code |
 | vouch heads: claim logs, head proofs in advertisements and delegations, `?head=` selection with signature fallback, heads in pins and sealed responses, `ipa-ku2` strings, public claim logs (§4.9) | implemented, tested (claim logs and head proofs, tampering and stale heads, HTTP flows with a head-pinned client, pin-file round trips, KDC exchange) |
 | claim logs on typed leaves with tombstones (DESIGN-tlog.md §8): `IPVH`/`IPSV` v2 with the live tree, signature proofs against it, retired claims learned by hosts at every pin and refused head-wise, a shrinking log refused as a fork | implemented, tested (tombstone rules, retired claims proving nothing by an old head, `retired_at` prefixes, the pin grammar's `retired` lines, a host enrolling against a log that retired a claim, the audit's split for a shorter tree, real-KDC re-vouching, the playground) |
 | zero-knowledge proofs over boolean circuits (`crates/ml-dsa-zk`): VOLE in the head, QuickSilver, a Keccak-f[1600] gadget | research prototype, tested (completeness, tampering of proof bytes, wrong outputs and circuits, a Keccak preimage proof of 86 KB at λ = 128 and 172 KB at λ = 256, the level the crypto policy picks; AES-256 and SHA-512 only, no SHA-3/SHAKE as the proof's hash); the `Z_q` arithmetic an ML-DSA statement needs **not yet**, and nothing reviewed |

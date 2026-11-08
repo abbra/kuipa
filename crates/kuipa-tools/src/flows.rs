@@ -6,7 +6,7 @@ use std::fs;
 use std::time::SystemTime;
 
 use kuipa_enroll::bundle::{Bundle, Opener};
-use kuipa_enroll::delegation::HeadPin;
+use kuipa_enroll::delegation::{Delegation, HeadPin};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::epoch::verify_chain;
 use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer};
@@ -1692,7 +1692,8 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
         "ca" => Namespace::Ca,
         "ca_wrapped" => Namespace::CaWrapped,
         "lwca" | "lwca-store" => Namespace::LwcaStore,
-        _ => return Err("namespace must be dm, ra, ca, ca_wrapped or lwca".into()),
+        "akamu" => Namespace::Akamu,
+        _ => return Err("namespace must be dm, ra, ca, ca_wrapped, lwca or akamu".into()),
     };
     if nickname.is_empty() && namespace != Namespace::Dm && namespace != Namespace::Ra {
         return Err("the nickname is empty".into());
@@ -2645,11 +2646,11 @@ fn landmark_chain(
 }
 
 /// `kuipa realm-info`: verify the realm through the first usable server
-/// and write what Kerberos needs before enrollment into `dir`: a
-/// `krb5.conf`, the PKINIT anchors and the IPA CA.  `ipa-client-install`
-/// uses it to `kinit -n` (anonymous PKINIT armour) and then `kinit -T` an
-/// administrator with an external IdP or a passkey, before
-/// `kuipa enroll --use-ccache`.
+/// against its pinned anchors, and write what Kerberos needs before
+/// enrollment into `dir`: a `krb5.conf`, the PKINIT anchors and the IPA
+/// CA.  `ipa-client-install` uses it to `kinit -n` (anonymous PKINIT
+/// armour) and then `kinit -T` an administrator with an external IdP or a
+/// passkey, before `kuipa enroll --use-ccache`.
 ///
 /// # Errors
 ///
@@ -2664,10 +2665,97 @@ pub fn realm_info(
     deployment: &Deployment,
     dir: &std::path::Path,
 ) -> Result<Value, Error> {
-    let mut skipped = Vec::new();
-    for server in &deployment.servers {
+    realm_info_with(deployment, dir, |server| {
         // Before enrollment: the heads come from the enrollment string,
         // and nothing is known of what their logs retired.
+        verified(
+            server,
+            &Trust::FirstContact,
+            Pins {
+                realm,
+                anchors,
+                heads,
+                retired: &[],
+                frozen: &[],
+            },
+            None,
+        )
+        .map(|(_, adv, _)| adv)
+    })
+}
+
+/// `kuipa realm-info --trust-first-use`: [`realm_info`] with no pinned
+/// anchors.  Each server's advertisement is trusted as served: its realm
+/// and anchors are the ones its own delegation names, and it must verify
+/// against them.  Every other check still applies, the deployment
+/// included.  The caller warns that nothing was verified against a pin.
+///
+/// # Errors
+///
+/// As [`realm_info`].
+pub fn realm_info_first_use(
+    deployment: &Deployment,
+    dir: &std::path::Path,
+) -> Result<Value, Error> {
+    realm_info_with(deployment, dir, |server| {
+        let (realm, anchors) = first_use_anchors(server)?;
+        verified(
+            server,
+            &Trust::FirstContact,
+            Pins {
+                realm: &realm,
+                anchors: &anchors,
+                heads: &[],
+                retired: &[],
+                frozen: &[],
+            },
+            None,
+        )
+        .map(|(_, adv, _)| adv)
+    })
+}
+
+/// `kuipa adopt`: record this host's kuipa state when it already holds its
+/// keytab.  Nothing is rekeyed: the realm is verified through the
+/// enrollment string's pins, as [`realm_info`] does, and the state names
+/// the servers that verified advertisement lists.  The keytab must obtain a
+/// ticket from the KDC as `host/<fqdn>@<realm>` first; this writes local
+/// state only.
+///
+/// # Errors
+///
+/// No keytab, a keytab that does not authenticate the host, no verifiable
+/// server, or a state that cannot be written.
+pub fn adopt(
+    paths: &Paths,
+    realm: &str,
+    anchors: &[Thumbprint],
+    heads: &[HeadPin],
+    fqdn: &str,
+    deployment: &Deployment,
+) -> Result<Value, Error> {
+    let keytab = paths.keytab();
+    if !keytab.exists() {
+        return Err("this host has no keytab to adopt (run ipa-server-install first)".into());
+    }
+    // The keytab must authenticate as this host: a ticket from the KDC for
+    // exactly `host/<fqdn>@<realm>`, not merely a file that parses.
+    let host = Principal::host(fqdn, realm);
+    let cred = GssClientCred::from_client_keytab(
+        keytab.to_str().ok_or("non-UTF-8 keytab path")?,
+        Some(&host.to_string()),
+        None,
+    )
+    .map_err(|e| format!("{} does not authenticate {host}: {e}", keytab.display()))?;
+    if cred
+        .principal_name()
+        .and_then(|p| p.parse::<Principal>().ok())
+        != Some(host.clone())
+    {
+        return Err(format!("{} does not act as {host}", keytab.display()).into());
+    }
+    let mut skipped = Vec::new();
+    for server in &deployment.servers {
         match verified(
             server,
             &Trust::FirstContact,
@@ -2681,6 +2769,65 @@ pub fn realm_info(
             None,
         ) {
             Ok((_, adv, _)) => {
+                check_deployment(server, &adv, deployment)?;
+                let mut servers = vec![server.clone()];
+                servers.extend(adv.info().servers.iter().filter(|s| *s != server).cloned());
+                State {
+                    realm: adv.info().realm.clone(),
+                    fqdn: fqdn.into(),
+                    servers: servers.clone(),
+                    holder: Holder::None,
+                    // Other protected keytabs and files outlive a re-enrollment.
+                    protected: State::load(paths).map(|s| s.protected).unwrap_or_default(),
+                }
+                .store(paths)?;
+                return Ok(json!({
+                    "realm": adv.info().realm,
+                    "domain": adv.info().domain,
+                    "server": server,
+                    "servers": servers,
+                }));
+            }
+            Err(e) => skipped.push(format!("{server}: {e}")),
+        }
+    }
+    Err(Outcome::RetryLater(format!("no usable server: {}", skipped.join("; "))).into())
+}
+
+/// The realm and anchors a server's advertisement names, unverified: the
+/// anchors whose signatures its delegation carries.  [`verified`] then
+/// checks those signatures.
+///
+/// shortcut: the advertisement is fetched twice, once here and once
+/// verified; a second answer signed by other anchors is refused.
+fn first_use_anchors(server: &str) -> Result<(String, Vec<Thumbprint>), String> {
+    let endpoint = Endpoint::new(server, &Trust::FirstContact).map_err(|e| e.to_string())?;
+    let adv = endpoint.advertisement(&[]).map_err(|e| e.to_string())?;
+    let delegation = adv
+        .unverified_member("delegation")
+        .ok()
+        .flatten()
+        .and_then(|v| Delegation::from_value(v).ok())
+        .ok_or("the advertisement carries no delegation")?;
+    let claim = delegation.claim().map_err(|e| e.to_string())?;
+    let anchors = delegation.signers(&Policy::from_system().map_err(|e| e.to_string())?);
+    if anchors.is_empty() {
+        return Err("no anchor signs its delegation".into());
+    }
+    Ok((claim.realm, anchors))
+}
+
+/// The first server that verifies writes the realm's Kerberos
+/// configuration into `dir`; `verify` checks one server's advertisement.
+fn realm_info_with(
+    deployment: &Deployment,
+    dir: &std::path::Path,
+    verify: impl Fn(&str) -> Result<VerifiedRealm, String>,
+) -> Result<Value, Error> {
+    let mut skipped = Vec::new();
+    for server in &deployment.servers {
+        match verify(server.as_str()) {
+            Ok(adv) => {
                 check_deployment(server, &adv, deployment)?;
                 let anchors_file = dir.join("pkinit-anchors.pem");
                 let conf =

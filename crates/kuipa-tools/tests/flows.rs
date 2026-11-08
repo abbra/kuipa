@@ -651,6 +651,117 @@ fn advertisement_must_describe_the_deployment() {
     assert_eq!(ldap_otp(&ok).unwrap()["issuer"], "ipa2.example.test");
 }
 
+/// `realm-info` without pins: `--trust-first-use` trusts the advertisement
+/// as served and writes the configuration, with a warning; the flag is
+/// refused with `--realm` or an enrollment file; without it, nothing pins
+/// the anchors and the command refuses; the deployment is still checked.
+#[test]
+fn realm_info_trust_first_use_is_explicit() {
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, info, delegation) = server_keys(&anchor, "ipa2.example.test");
+    let honest = app(
+        Arc::new(EnrollServer::new(keys, info, delegation)),
+        Dir::default(),
+    );
+    let url = spawn(honest);
+    kuipa_tools::net::set_thread_endpoint("ipa2.example.test", &url);
+    let paths = root("trust-first-use");
+    let krb5 = paths.dir.join("krb5");
+    std::fs::create_dir_all(&krb5).unwrap();
+    let enrollment = paths.dir.join("enrollment");
+    std::fs::write(&enrollment, b"").unwrap();
+
+    let kuipa = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_kuipa"))
+            .arg("realm-info")
+            .args(["--server", "ipa2.example.test", "--krb5-dir"])
+            .arg(&krb5)
+            .args(args)
+            .env("KUIPA_ROOT", &paths.dir)
+            .env("KUIPA_ENDPOINTS", format!("ipa2.example.test={url}"))
+            .env_remove("KUIPA_ENROLLMENT_FILE")
+            .env_remove("KUIPA_TRACE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // No pins and no flag: nothing to verify the advertisement against.
+    let (code, stderr) = kuipa(&[]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("missing enrollment string"), "{stderr}");
+    let (code, stderr) = kuipa(&["--realm", REALM]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("no pinned anchors"), "{stderr}");
+
+    // The flag is refused with pins.
+    let file = enrollment.to_str().unwrap();
+    for args in [
+        vec!["--trust-first-use", "--realm", REALM],
+        vec!["--trust-first-use", "--enrollment-file", file],
+    ] {
+        let (code, stderr) = kuipa(&args);
+        assert_eq!(code, 1, "{stderr}");
+        assert!(
+            stderr.contains("refused with --realm or --enrollment-file"),
+            "{stderr}"
+        );
+    }
+    assert!(!krb5.join("krb5.conf").exists());
+
+    // Trusted on first use: the configuration is written, and the warning
+    // says nothing was checked against a pin.
+    let (code, stderr) = kuipa(&["--trust-first-use"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("trusted on first use"), "{stderr}");
+    assert!(krb5.join("krb5.conf").exists());
+    assert!(krb5.join("ca.crt").exists());
+
+    // The deployment is still checked: another domain is refused.
+    let elsewhere = Deployment {
+        servers: vec!["ipa2.example.test".into()],
+        domain: Some("example.org".into()),
+    };
+    let err = flows::realm_info_first_use(&elsewhere, &krb5).unwrap_err();
+    assert!(
+        matches!(err.downcast_ref::<Outcome>(), Some(Outcome::NeedsAdmin(m)) if m.contains("not example.org")),
+        "{err}"
+    );
+}
+
+/// `adopt` writes nothing unless the keytab authenticates the host; the
+/// success path runs against a real KDC (`kdc.rs`).
+#[test]
+fn adopt_refuses_without_a_host_keytab() {
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
+    let url = spawn(app(
+        Arc::new(EnrollServer::new(keys, info, delegation)),
+        Dir::default(),
+    ));
+    kuipa_tools::net::set_thread_endpoint("ipa1.example.test", &url);
+    let paths = root("adopt");
+    let deployment = Deployment {
+        servers: vec!["ipa1.example.test".into()],
+        domain: Some("Example.Test".into()),
+    };
+    let thumb = *anchor.public().thumbprint();
+
+    // No keytab: nothing to adopt.
+    assert!(flows::adopt(&paths, REALM, &[thumb], &[], HOST, &deployment).is_err());
+
+    // A file that is not a keytab for this host proves nothing.
+    std::fs::create_dir_all(paths.keytab().parent().unwrap()).unwrap();
+    std::fs::write(paths.keytab(), b"existing keytab").unwrap();
+    assert!(flows::adopt(&paths, REALM, &[thumb], &[], HOST, &deployment).is_err());
+    assert_eq!(std::fs::read(paths.keytab()).unwrap(), b"existing keytab");
+    assert!(kuipa_tools::paths::State::load(&paths).is_err());
+}
+
 #[test]
 fn guessing_is_rate_limited_per_host() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();

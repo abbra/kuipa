@@ -23,7 +23,10 @@ User=root
 # writes at runtime: the keys, delegation.json and log heads under
 # /var/lib/ipa/ku, and its own socket in /run/ipa.
 ProtectSystem=strict
-ReadWritePaths=/var/lib/ipa/ku /run/ipa
+# The CA key handlers run pk12util on Dogtag's NSS database, which SQLite
+# opens read-write even to export; the leading "-" keeps a server without
+# a CA starting.
+ReadWritePaths=/var/lib/ipa/ku /run/ipa -/etc/pki/pki-tomcat/alias
 
 # Logs only to the journal: 'serve' writes its audit lines to stderr and
 # kuipad keys its audit to its own log head, so a private /tmp and a
@@ -31,7 +34,8 @@ ReadWritePaths=/var/lib/ipa/ku /run/ipa
 # from dumping its keys into the journal.
 PrivateTmp=yes
 PrivateDevices=yes
-NoNewPrivileges=yes
+# No NoNewPrivileges=: the daemon changes user to run the NSS key handlers
+# as pkiuser (§18.5), and with it set that spawn fails with EPERM.
 LimitCORE=0
 ProtectHome=yes
 ProtectKernelTunables=yes

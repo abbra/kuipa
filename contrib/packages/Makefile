@@ -53,7 +53,7 @@ SYSTEM_CRATES := system-crates.txt
 # (docs/src/realm/deploy.md), and an IPA server ships its own /ipa/ku/ proxy.
 EXTRA_SOURCES := kuipad.service kuipad.socket kuipa-unseal.service \
                  ipa-client-complete.service kuipa-rotate.service \
-                 kuipa-rotate.timer kuipad.json.example
+                 kuipa-rotate.timer kuipad.json.example kuipad.sysusers
 
 # Git ref used for the tarball and the snapshot release identifiers.
 # Defaults to HEAD so snapshots reflect the current branch tip.

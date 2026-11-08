@@ -74,6 +74,7 @@ Source8:        kuipad.json.example
 # crate() BuildRequires from it; %build strips those crates from the
 # bundled(crate()) Provides in cargo-vendor.txt.
 Source10:       system-crates.txt
+Source13:       kuipad.sysusers
 
 ExclusiveArch:  %{rust_arches}
 
@@ -157,6 +158,8 @@ systemd units that run them.  kuipa-server provides the IPA server daemon.
 %package server
 Summary:        Post-quantum enrollment daemon for IPA servers
 Requires:       %{name} = %{version}-%{release}
+Provides:       kuipa-admin-revoke = 1
+Provides:       kuipa-host-self-enroll = 1
 # Fronted by httpd on /ipa/ku/; an IPA server already has it.
 %{?systemd_requires}
 
@@ -175,6 +178,7 @@ Install this package on IPA servers; ipa-server-install configures it.
 %config(noreplace) %{_sysconfdir}/ipa/kuipad.json.example
 %{_unitdir}/kuipad.service
 %{_unitdir}/kuipad.socket
+%{_sysusersdir}/kuipad.conf
 %doc docs/DESIGN.md
 %doc docs/DESIGN-schema.md
 
@@ -328,6 +332,7 @@ install -Dpm 0644 %{SOURCE7} %{buildroot}%{_unitdir}/kuipa-rotate.timer
 # The daemon's configuration template.  %{_sysconfdir}/httpd/conf.d/ stays
 # empty: an IPA server ships its own /ipa/ku/ proxy snippet.
 install -Dpm 0644 %{SOURCE8} %{buildroot}%{_sysconfdir}/ipa/kuipad.json.example
+install -Dpm 0644 %{SOURCE13} %{buildroot}%{_sysusersdir}/kuipad.conf
 
 # The Clevis pin is the same binary, chosen by its name (as in
 # contrib/clevis/install.sh); the dracut module brings it into the initramfs.
@@ -360,6 +365,7 @@ install -Dpm 0755 contrib/clevis/dracut/60clevis-pin-tang-pqc/module-setup.sh \
 %systemd_postun_with_restart kuipa-unseal.service
 
 %post server
+%sysusers_create %{_sysusersdir}/kuipad.conf
 %systemd_post kuipad.socket kuipad.service
 
 %preun server
