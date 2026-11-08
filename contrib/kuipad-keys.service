@@ -7,10 +7,14 @@ After=kuipad-keys.socket
 [Service]
 ExecStart=/usr/libexec/kuipad keys-broker --config /etc/ipa/kuipad.json
 User=root
-NoNewPrivileges=yes
+# No NoNewPrivileges=: the broker changes user to run the NSS key handlers
+# as pkiuser, and with it set that spawn fails with EPERM.
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
+# pk12util opens Dogtag's NSS database read-write even to export; the
+# leading "-" keeps a server without a CA starting.
+ReadWritePaths=-/etc/pki/pki-tomcat/alias
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
