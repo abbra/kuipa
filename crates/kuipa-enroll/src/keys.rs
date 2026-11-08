@@ -43,6 +43,9 @@ pub enum Namespace {
     CaWrapped,
     /// The sealed lightweight-CA artifact store (§18.3).
     LwcaStore,
+    /// `akamu/<name>`: the Akamu RA agent key and certificate (PEM), one
+    /// secret, fetched like `ra` by a replica that is becoming a CA server.
+    Akamu,
 }
 
 impl Namespace {
@@ -55,6 +58,7 @@ impl Namespace {
             Self::Ca => 3,
             Self::CaWrapped => 4,
             Self::LwcaStore => 5,
+            Self::Akamu => 6,
         }
     }
 
@@ -70,6 +74,7 @@ impl Namespace {
             3 => Self::Ca,
             4 => Self::CaWrapped,
             5 => Self::LwcaStore,
+            6 => Self::Akamu,
             _ => return Err(Error::Malformed("namespace")),
         })
     }
@@ -83,6 +88,7 @@ impl Namespace {
             Self::Ca => "ca",
             Self::CaWrapped => "ca_wrapped",
             Self::LwcaStore => "lwca-store",
+            Self::Akamu => "akamu",
         }
     }
 }
@@ -268,7 +274,11 @@ impl KeysPolicy {
         let in_masters = self.servers.iter().any(|s| s.eq_ignore_ascii_case(fqdn));
         let is_ca = self.ca_servers.iter().any(|s| s.eq_ignore_ascii_case(fqdn));
         match (service, namespace) {
-            ("host", Namespace::Dm | Namespace::Ra | Namespace::Ca) if in_masters => None,
+            ("host", Namespace::Dm | Namespace::Ra | Namespace::Ca | Namespace::Akamu)
+                if in_masters =>
+            {
+                None
+            }
             ("host", Namespace::CaWrapped | Namespace::LwcaStore) if in_masters && is_ca => None,
             ("dogtag", Namespace::CaWrapped | Namespace::LwcaStore) if is_ca => None,
             ("dogtag", _) => Some(format!("dogtag/ may not fetch {}", namespace.label())),

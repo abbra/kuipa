@@ -81,14 +81,22 @@ impl Keys {
                 runas(&mut cmd, user)?;
             }
         }
-        if fetch.namespace == Namespace::CaWrapped {
-            // The wrap algorithm the caller chose (§18.3), validated by
-            // the wire format's allowlist before any handler runs.
-            let alg = fetch.alg.map_or_else(
-                || "2.16.840.1.101.3.4.1.42".to_owned(),
-                |a| a.oid().to_owned(),
-            );
-            cmd.arg(&alg);
+        // The NSS handlers take the nickname as a flag; `ca_wrapped` also
+        // takes the wrap algorithm the caller chose (§18.3), validated by
+        // the wire format's allowlist before any handler runs.  `dm` and
+        // `ra` have one secret and take neither.
+        match fetch.namespace {
+            Namespace::Ca => {
+                cmd.args(["--nickname", &fetch.nickname]);
+            }
+            Namespace::CaWrapped => {
+                let alg = fetch.alg.map_or_else(
+                    || "2.16.840.1.101.3.4.1.42".to_owned(),
+                    |a| a.oid().to_owned(),
+                );
+                cmd.args(["--nickname", &fetch.nickname, "--algorithm", &alg]);
+            }
+            _ => {}
         }
         let out = cmd
             .output()
@@ -172,4 +180,61 @@ fn runas(cmd: &mut Command, user: &str) -> Result<(), HandlerError> {
         .ok_or_else(|| HandlerError(format!("no such user: {user}")))?;
     cmd.uid(uid).gid(gid);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuipa_enroll::keys::WrapAlg;
+
+    /// A handler that prints its arguments, one line.  `/bin/echo` and not a
+    /// script we write: the test tmpdir may be mounted noexec.
+    fn echo_keys(namespace: Namespace) -> Keys {
+        Keys::new(vec![(
+            namespace,
+            Handler {
+                command: "/bin/echo".into(),
+                runas: None,
+            },
+        )])
+    }
+
+    fn run(keys: &Keys, namespace: Namespace, nickname: &str, alg: Option<WrapAlg>) -> String {
+        let fetch = KeysFetch {
+            namespace,
+            nickname: nickname.to_owned(),
+            alg,
+        };
+        let answer = keys.fetch(&fetch).unwrap();
+        String::from_utf8(answer.value).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn nss_handlers_get_their_flags() {
+        let ca = echo_keys(Namespace::Ca);
+        assert_eq!(
+            run(&ca, Namespace::Ca, "subsystemCert cert-pki-ca", None),
+            "--export - --nickname subsystemCert cert-pki-ca"
+        );
+        let wrapped = echo_keys(Namespace::CaWrapped);
+        assert_eq!(
+            run(
+                &wrapped,
+                Namespace::CaWrapped,
+                "lwca",
+                Some(WrapAlg::Aes256Wrap)
+            ),
+            "--export - --nickname lwca --algorithm 2.16.840.1.101.3.4.1.45"
+        );
+        assert_eq!(
+            run(&wrapped, Namespace::CaWrapped, "lwca", None),
+            "--export - --nickname lwca --algorithm 2.16.840.1.101.3.4.1.42"
+        );
+    }
+
+    #[test]
+    fn single_secret_handlers_get_no_nickname() {
+        let dm = echo_keys(Namespace::Dm);
+        assert_eq!(run(&dm, Namespace::Dm, "DMHash", None), "--export -");
+    }
 }

@@ -15,7 +15,7 @@
 //! kuipa voucher-key --out F                 the ephemeral key to bind a
 //!                                            voucher to; prints its binding
 //! kuipa realm-info [--server S... | --domain D] --krb5-dir D
-//!                   [--enrollment-file F | --realm R]
+//!                   [--enrollment-file F | --realm R | --trust-first-use]
 //!                                            Kerberos configuration for
 //!                                            enrolling with an existing ticket
 //! kuipa enroll --bundle F [--enrollment-file F] [--insecure-signed-only]
@@ -80,6 +80,12 @@
 //! configuration management), and nothing but the password is read.  With
 //! an enrollment file as well (`ipa-client-install -r`), `--realm` is a
 //! cross-check instead: the string must be for realm R.
+//!
+//! `--trust-first-use` (`realm-info` only) is the explicit opt-in for a host
+//! with no enrollment string and no pinned anchors: the advertisement is
+//! trusted as the server serves it, with the anchors its own delegation
+//! names, and a warning on stderr says so.  It is refused with `--realm` or
+//! an enrollment file.
 //!
 //! Every advertisement must describe the deployment given here: its server
 //! one of `--server` (or the servers found in DNS), its domain `--domain`
@@ -227,6 +233,18 @@ enum Command {
         /// Directory to write the realm's Kerberos configuration to.
         #[arg(long, value_name = "DIR")]
         krb5_dir: String,
+        /// Trust the advertisement as served, with no pinned anchors (no
+        /// enrollment string): explicit opt-in, warned about on stderr.
+        #[arg(long)]
+        trust_first_use: bool,
+    },
+    /// Record this host's state when it already holds its keytab: no
+    /// rekey.  The realm is verified through the enrollment string's pins.
+    Adopt {
+        #[command(flatten)]
+        realm: RealmInput,
+        #[command(flatten)]
+        deployment: DeploymentInput,
     },
     /// Finish an offline enrollment.
     Complete,
@@ -356,7 +374,7 @@ enum TlogAction {
 #[derive(Subcommand)]
 enum KeysAction {
     /// Fetch a secret named `<namespace>/<nickname>` (`dm`, `ra`, `ca`,
-    /// `ca_wrapped`, `lwca`) and print its value on standard output.
+    /// `ca_wrapped`, `lwca`, `akamu`) and print its value on standard output.
     Fetch {
         /// The secret, as `<namespace>/<nickname>`.
         name: String,
@@ -1061,6 +1079,7 @@ impl Command {
             Command::Enroll { .. } => "enroll",
             Command::VoucherKey { .. } => "voucher-key",
             Command::RealmInfo { .. } => "realm-info",
+            Command::Adopt { .. } => "adopt",
             Command::Complete => "complete",
             Command::RotateKeys => "rotate-keys",
             Command::Protect { .. } => "protect",
@@ -1114,6 +1133,7 @@ impl Command {
                 realm,
                 deployment,
                 krb5_dir,
+                trust_first_use,
             } => {
                 a.set("enrollment-file", realm.enrollment_file.as_deref());
                 a.set("realm", realm.realm.as_deref());
@@ -1122,8 +1142,9 @@ impl Command {
                 a.set("domain", deployment.domain.as_deref());
                 a.set("hostname", deployment.hostname.as_deref());
                 a.set("krb5-dir", Some(krb5_dir.as_str()));
+                a.mark("trust-first-use", *trust_first_use);
             }
-            Command::Advertisement { realm, deployment } => {
+            Command::Advertisement { realm, deployment } | Command::Adopt { realm, deployment } => {
                 a.set("enrollment-file", realm.enrollment_file.as_deref());
                 a.set("realm", realm.realm.as_deref());
                 a.set("password-file", realm.password_file.as_deref());
@@ -1490,17 +1511,41 @@ fn run(args: &Args) -> Result<Value, Error> {
             let binding = kuipa_tools::voucher::ephemeral(std::path::Path::new(out))?;
             Ok(serde_json::json!({ "binding": tang_pqc::b64::encode(&binding) }))
         }
-        "realm-info" => {
-            let dir = args.option("krb5-dir").ok_or("--krb5-dir is required")?;
+        "adopt" => {
             let deployment = args.deployment()?;
             let (pins, _) = args.pins(&paths, false)?;
-            flows::realm_info(
+            let fqdn = args
+                .option("hostname")
+                .map_or_else(flows::hostname, |h| Ok(h.to_owned()))?;
+            flows::adopt(
+                &paths,
                 &pins.realm,
                 &pins.anchors,
                 &pins.heads,
+                &fqdn,
                 &deployment,
-                std::path::Path::new(dir),
             )
+        }
+        "realm-info" => {
+            let dir = args.option("krb5-dir").ok_or("--krb5-dir is required")?;
+            let deployment = args.deployment()?;
+            let dir = std::path::Path::new(dir);
+            if args.flag("trust-first-use") {
+                if args.option("realm").is_some() || args.enrollment_file().is_some() {
+                    Err("--trust-first-use is refused with --realm or --enrollment-file: those pin the anchors".into())
+                } else {
+                    let value = flows::realm_info_first_use(&deployment, dir)?;
+                    eprintln!(
+                        "kuipa: warning: the advertisement of realm {} from {} was trusted on first use, not verified against pinned anchors",
+                        value["realm"].as_str().unwrap_or(""),
+                        value["server"].as_str().unwrap_or(""),
+                    );
+                    Ok(value)
+                }
+            } else {
+                let (pins, _) = args.pins(&paths, false)?;
+                flows::realm_info(&pins.realm, &pins.anchors, &pins.heads, &deployment, dir)
+            }
         }
         "complete" => flows::complete(&paths),
         "rotate-keys" => flows::rotate_keys(&paths, None),

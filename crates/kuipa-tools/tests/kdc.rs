@@ -2079,6 +2079,51 @@ fn against_a_real_kdc() {
     offline_enrollment(&world);
     realm_wide_strings(&world);
     refused_syncs(&world);
+    adopt_authenticates(&world);
+}
+
+/// `adopt` records state for a host whose keytab authenticates it, and for
+/// no other: a keytab of another principal, or a pin that verifies no
+/// server, writes nothing, and the keytab is never rekeyed.
+fn adopt_authenticates(world: &Scenario) {
+    let realm = &world.realm;
+    let host = "adopt1.example.test";
+    let keytab_for = |name: &str, principal: &str| {
+        let p = root(realm, name);
+        std::fs::create_dir_all(p.keytab().parent().unwrap()).unwrap();
+        std::fs::write(p.keytab(), realm.new_keys(principal)).unwrap();
+        p
+    };
+
+    let ok = keytab_for("adopt-ok", &format!("host/{host}@{REALM}"));
+    let before = std::fs::read(ok.keytab()).unwrap();
+    let out = flows::adopt(&ok, REALM, &world.anchors, &[], host, &world.servers).unwrap();
+    assert_eq!(out["realm"], REALM);
+    assert_eq!(paths::State::load(&ok).unwrap().fqdn, host);
+    assert_eq!(std::fs::read(ok.keytab()).unwrap(), before, "no rekey");
+
+    // Another host's keytab does not authenticate this host.
+    let other = keytab_for("adopt-other", &format!("host/other.example.test@{REALM}"));
+    assert!(flows::adopt(&other, REALM, &world.anchors, &[], host, &world.servers).is_err());
+    assert!(paths::State::load(&other).is_err());
+
+    // A pin from another anchor verifies no server: nothing is written.
+    let pinned = keytab_for("adopt-pin", &format!("host/{host}@{REALM}"));
+    let stranger = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let err = flows::adopt(
+        &pinned,
+        REALM,
+        &[*stranger.public().thumbprint()],
+        &[],
+        host,
+        &world.servers,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<Outcome>(),
+        Some(Outcome::RetryLater(_))
+    ));
+    assert!(paths::State::load(&pinned).is_err());
 }
 
 /// Alice's data directory in the test realm.

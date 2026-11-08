@@ -3976,6 +3976,32 @@ fn keys_fetch_follows_the_masters_policy() {
     let (req, _) = request(&other_dogtag, &wrapped);
     assert!(r.send(0, Operation::Keys, &req).is_err());
 
+    // The Akamu RA key goes to any server in cn=masters, as `ra` does (the
+    // caller is still becoming a CA server); dogtag/ may not fetch it.
+    let akamu = kuipa_enroll::keys::KeysFetch {
+        namespace: kuipa_enroll::keys::Namespace::Akamu,
+        nickname: "raAgent".into(),
+        alg: None,
+    };
+    r.dir.key_secrets.borrow_mut().insert(
+        (akamu.namespace.id(), akamu.nickname.clone()),
+        b"{\"certfile\":\"x\"}".to_vec(),
+    );
+    let (req, pending) = request(&server, &akamu);
+    let response = r.send(0, Operation::Keys, &req).unwrap();
+    assert_eq!(
+        pending.finish_keys(&response, &adv).unwrap().value,
+        b"{\"certfile\":\"x\"}"
+    );
+    let (req, _) = request(&dogtag, &akamu);
+    assert!(r.send(0, Operation::Keys, &req).is_err());
+    *r.dir.masters.borrow_mut() = vec![SERVERS[0].to_owned(), SERVERS[1].to_owned()];
+    let non_ca = format!("host/{}@{REALM}", SERVERS[1]);
+    let (req, _) = request(&non_ca, &akamu);
+    assert!(r.send(0, Operation::Keys, &req).is_ok());
+    let (req, _) = request(&client, &akamu);
+    assert!(r.send(0, Operation::Keys, &req).is_err());
+
     // A user's ticket may not fetch anything.
     let (req, _) = request("admin@EXAMPLE.TEST", &dm);
     assert!(r.send(0, Operation::Keys, &req).is_err());

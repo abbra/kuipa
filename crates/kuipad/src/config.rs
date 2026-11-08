@@ -249,6 +249,7 @@ impl Config {
                 "ca" => kuipa_enroll::keys::Namespace::Ca,
                 "ca_wrapped" => kuipa_enroll::keys::Namespace::CaWrapped,
                 "lwca-store" => kuipa_enroll::keys::Namespace::LwcaStore,
+                "akamu" => kuipa_enroll::keys::Namespace::Akamu,
                 _ => return Err(format!("unknown keys namespace: {label}").into()),
             };
             handlers.push((
