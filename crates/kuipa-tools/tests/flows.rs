@@ -475,7 +475,7 @@ fn enrollment_preserves_existing_keytab_principals_and_rejects_damage_before_joi
                 fqdn: HOST,
                 auth: &Auth::LdapOtp(Secret::new(b"Secret123")),
             },
-            &Deployment::servers(&[url.clone()]),
+            &Deployment::servers(std::slice::from_ref(&url)),
         )
     };
     assert!(enroll().is_err());
@@ -488,7 +488,7 @@ fn enrollment_preserves_existing_keytab_principals_and_rejects_damage_before_joi
     let mut entries = &bytes[2..];
     let mut principals = Vec::new();
     while !entries.is_empty() {
-        let size = i32::from_be_bytes(entries[..4].try_into().unwrap()) as usize;
+        let size = usize::try_from(i32::from_be_bytes(entries[..4].try_into().unwrap())).unwrap();
         let mut record = vec![5, 2];
         record.extend_from_slice(&entries[..4 + size]);
         let keytab = Keytab::from_mit(&record).unwrap();

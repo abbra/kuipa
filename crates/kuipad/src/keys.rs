@@ -160,7 +160,7 @@ impl Keys {
     /// # Errors
     ///
     /// A listener failure.
-    pub fn serve_broker(&self, listener: UnixListener) -> std::io::Result<()> {
+    pub fn serve_broker(&self, listener: &UnixListener) -> std::io::Result<()> {
         for stream in listener.incoming() {
             if let Err(error) = self.serve_request(stream?) {
                 eprintln!("kuipad: custody broker request: {error}");
