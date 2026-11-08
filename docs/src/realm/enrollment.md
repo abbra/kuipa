@@ -128,6 +128,6 @@ The host opens the bundle offline and finishes at first contact.
   `--insecure-signed-only`.
 
 The staged keys expire at the time you choose, enforced by the KDC. The
-`ipa host-add --pq-stage` command that stages a host is part of the
+`ipa host-add --stage` command that stages a host is part of the
 pending FreeIPA integration; the playground's `pq_offline` helper stages
 with an administrator's ticket the way it will.

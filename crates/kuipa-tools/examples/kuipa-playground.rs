@@ -13,7 +13,7 @@
 //! kuipa-playground run --env-file F [--hosts N]
 //!     start the realm; write shell settings to F; serve until SIGINT/SIGTERM
 //! kuipa-playground stage --host FQDN (--recipient JWK | --secret) --out FILE
-//!     what `ipa host-add --pq-stage` would do, with the admin ticket in
+//!     what `ipa host-add --stage` would do, with the admin ticket in
 //!     KRB5CCNAME; prints the enrollment string to use with the bundle
 //! kuipa-playground passkey [--user PRINCIPAL [--alg ALG]] [--pin PIN | --no-pin]
 //!                          [--user-verification on|off]
@@ -1135,7 +1135,7 @@ pq_password() {{
     echo {ADMIN_PASSWORD} | kuipa enroll $PQ_SERVERS --hostname "$PQ_HOST" --principal {ADMIN} "$@"
 }}
 # pq_offline NAME: prepare NAME, stage it with an admin ticket (what
-# `ipa host-add --pq-stage` does), and enroll it offline from the bundle.
+# `ipa host-add --stage` does), and enroll it offline from the bundle.
 pq_offline() {{
     pq_host "$1"
     kuipa prepare --hostname "$PQ_HOST" || return
@@ -1333,7 +1333,7 @@ pq_voucher() {{
     Ok(())
 }
 
-/// `ipa host-add --pq-stage`, the administrator side of §8.3.
+/// `ipa host-add --stage`, the administrator side of §8.3.
 fn stage(args: &[String]) -> Result<(), Error> {
     let host = option(args, "--host").ok_or("--host is required")?;
     let out = PathBuf::from(option(args, "--out").ok_or("--out is required")?);

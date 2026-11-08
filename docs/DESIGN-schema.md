@@ -406,7 +406,7 @@ Rationale for the classes:
   writes on existing host/service/user entries (§7.5): the two binding
   sets, staging, the spent voucher salt, the lease, device escrow.
   Hosts and services get it at enrollment; users at first device
-  escrow. One class instead of several keeps `host-add --pq-stage`
+  escrow. One class instead of several keeps `host-add --stage`
   and the voucher join each adding a single objectClass.
 * `ipaKURealmConfig` sits on the `cn=<name>,cn=kuipa,cn=etc,$SUFFIX`
   settings entries (`recovery`, `vouchers`, `seal-limits`,
@@ -502,7 +502,7 @@ the binding set. The lease presence index serves the purge sweep.
   `ipaRequireUserVerification`, `member`, `memberOf`, `fqdn`,
   `ipaUniqueID`: existing FreeIPA schema, used as-is. The daemon's
   staging writes GeneralizedTime `krbPrincipalExpiration` exactly as
-  `host-add --pq-stage` will.
+  `host-add --stage` will.
 * `cn=lwca,cn=kuipa,cn=etc` (secrets transport, TODO.md) needs only a
   container when that lands; no new attributeTypes today.
 
@@ -713,7 +713,7 @@ aci: (target = "ldap:///cn=*,cn=accounts,$SUFFIX")
   userdn = "ldap:///self";)
 ```
 
-Staging runs as the admin who stages (`host-add --pq-stage`), which is
+Staging runs as the admin who stages (`host-add --stage`), which is
 an authorisation decision, not self-service: it is a framework
 permission (§8.6), not a raw ACI, so administrators can delegate it to
 helpdesk without touching `cn=etc`.
@@ -752,7 +752,7 @@ ipa permission-add 'Manage kuipa realm settings' \
   --attrs={ipaKURecovery,ipaKUVouchers,ipaKUSealLimits,ipaKUSignPolicy} \
   --type=attr --bindtype=permission
 
-# Staging: who may run host-add --pq-stage / stage for a host.
+# Staging: who may run host-add --stage / stage for a host.
 ipa permission-add 'Stage kuipa host enrollment' \
   --attrs={ipaKUStaged,krbPrincipalExpiration} \
   --type=attr --bindtype=permission

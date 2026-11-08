@@ -336,9 +336,9 @@ design first.
       (including adding hosts and host-group members for vouchers, and
       cross-realm `krbtgt` principals and their keys for trusts, and the
       escrow attributes on service and user entries as well as hosts, §7.5);
-      framework commands (`pq-anchor-show`,
-      `host-add/host-mod --pq-stage`, enrollment strings from `--random`,
-      `--clear-pq-escrow`, also for services and users); `host-disable` and
+      framework commands (`kuipa-anchor-show`,
+      `host-add/host-mod --stage`, enrollment strings from `--random`,
+      `--clear-escrow`, also for services and users); `host-disable` and
       `service-disable` must also set `nsAccountLock`, so a disabled
       principal is locked out of PKINIT and its sealed keytabs and files
       stop opening (§7.2); installers and
@@ -346,7 +346,7 @@ design first.
       principal, keytab and delegation rule), httpd snippet, SELinux module
       (`kuipa_unseal_t`). Enrollment strings use the issuing server's
       anchor and expire (`kuipad enrollment-string --days N`, §4.4);
-      `pq-anchor-show` lists the realm's anchors from the advertisement.
+      `kuipa-anchor-show` lists the realm's anchors from the advertisement.
       `host-add --random` also sets the OTP as the host's Kerberos key, with
       `krbPrincipalExpiration` at the string's expiry, so OTP joins get a
       Kerberos root (§5.3; until then `kuipa enroll --ldap-otp`); the
@@ -354,8 +354,8 @@ design first.
       extended operation does. A `rotate-anchor` workflow for replicas
       (§4.7): reissue strings and image pins, and check that every host has
       rekeyed within the succession's lifetime.
-- [ ] FreeIPA client: `ipa-client-install --pq-enroll`, `--pq-bundle`,
-      `--no-pq`; for `-p` with external IdP or passkeys: `kuipa realm-info`,
+- [ ] FreeIPA client: `ipa-client-install --kuipa`, `--bundle`,
+      `--no-kuipa`; for `-p` with external IdP or passkeys: `kuipa realm-info`,
       temporary `KRB5_CONFIG` and ccache, `kinit -n`, armoured `kinit -T`,
       `kuipa enroll --use-ccache`; for password users `--principal` (an
       armoured `kinit` in `kuipa`, §5.3); the units in `contrib/`.

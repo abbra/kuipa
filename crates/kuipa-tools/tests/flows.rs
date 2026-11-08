@@ -1410,7 +1410,7 @@ fn offline_enrollment_from_a_bundle() {
         prepared["admin_command"]
             .as_str()
             .unwrap()
-            .contains("--pq-stage")
+            .contains("--stage")
     );
     let public =
         tang_pqc::ExchangeKey::from_jwk_json(&std::fs::read(paths.recipient_public()).unwrap())

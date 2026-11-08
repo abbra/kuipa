@@ -118,7 +118,7 @@ voucher while the old host entry exists: delete the old entry first
 ### Pre-stage instances that boot without network access to IPA
 
 **available** on the host; **needs FreeIPA** for staging (`ipa host-add
---pq-stage`)
+--stage`)
 
 Some instances can't reach the IPA servers when they first boot (a private
 subnet brought up later, an air-gapped build), or you want the join to be
