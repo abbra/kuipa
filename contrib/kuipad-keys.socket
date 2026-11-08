@@ -1,0 +1,13 @@
+[Unit]
+Description=kuipa privileged custody broker socket
+PartOf=kuipad.service
+
+[Socket]
+ListenStream=/run/ipa/kuipad-keys.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=kuipad
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

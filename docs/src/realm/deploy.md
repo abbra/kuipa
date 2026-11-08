@@ -57,9 +57,11 @@ target and rule.
 On the server itself:
 
 ```sh
-install -d -m 0700 /var/lib/ipa/ku
+systemd-sysusers contrib/kuipad.sysusers
+install -d -m 0700 -o kuipad -g kuipad /var/lib/ipa/ku
 ipa-getkeytab -s ipa1.example.test -p ipa-ku/ipa1.example.test \
-    -k /var/lib/ipa/ku/kuipa.keytab
+    -k /etc/ipa/kuipad.keytab
+chmod 0600 /etc/ipa/kuipad.keytab
 ```
 
 ## 2. The configuration
@@ -75,7 +77,8 @@ ipa-getkeytab -s ipa1.example.test -p ipa-ku/ipa1.example.test \
   "ldap_uri": "ldapi://%2Frun%2Fslapd-EXAMPLE-TEST.socket",
   "principal": "ipa-ku/ipa1.example.test@EXAMPLE.TEST",
   "service": "ipa-ku@ipa1.example.test",
-  "keytab": "/var/lib/ipa/ku/kuipa.keytab",
+  "keytab": "/etc/ipa/kuipad.keytab",
+  "gssproxy": true,
   "ca_file": "/etc/ipa/ca.crt",
   "pkinit_anchors_file": "/var/lib/ipa-client/pki/kdc-ca-bundle.pem",
   "key_dir": "/var/lib/ipa/ku"
@@ -85,6 +88,15 @@ ipa-getkeytab -s ipa1.example.test -p ipa-ku/ipa1.example.test \
 The other settings have sensible defaults; [Configuration](../reference/configuration.md)
 lists them all: the anchor exchange (`peers`, `discover_peers`,
 `peer_interval`, `anchor`), rate limits, configured trusts, enctypes.
+
+Configure gssproxy for the `kuipad` UID with `keytab` and `client_keytab`
+pointing to `/etc/ipa/kuipad.keytab`, `cred_usage = both`,
+`allow_protocol_transition = true`, and `allow_constrained_delegation = true`.
+The IPA installer writes this policy automatically. Keep the keytab root-owned;
+the daemon obtains credentials from gssproxy without reading the file.
+The daemon config must be root-owned and readable by the kuipad group.
+For custody exports, set `keys.broker` to `/run/ipa/kuipad-keys.sock`
+and configure the existing namespace handlers in `keys.handlers`.
 
 ## 3. The keys
 
@@ -105,7 +117,8 @@ on most of them and keep a few anchor servers (see
 ```sh
 install -m 0755 target/release/kuipad /usr/libexec/kuipad
 install -m 0644 contrib/kuipa.conf /etc/httpd/conf.d/kuipa.conf
-install -m 0644 contrib/kuipad.socket contrib/kuipad.service /etc/systemd/system/
+install -m 0644 contrib/kuipad.socket contrib/kuipad.service \
+    contrib/kuipad-keys.socket contrib/kuipad-keys.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now kuipad.socket kuipad.service
 systemctl reload httpd
@@ -116,7 +129,10 @@ httpd forwards `/ipa/ku/` to the daemon's socket and adds the
 the socket only starts the daemon on a request, while the anchor exchange,
 the voucher lease purge and the log-head publishing run inside it. The daemon
 starts on its own keys, with its own sandbox: `/etc/ipa` read-only, core
-dumps off.
+dumps off. The daemon runs as `kuipad`. The separate root custody broker runs
+only the configured export handlers; its socket is accessible to the kuipad
+group. Root-invoked management commands in gssproxy mode re-execute as
+`kuipad`, so input files supplied to those commands must be readable by that user.
 
 ## 5. Check it
 

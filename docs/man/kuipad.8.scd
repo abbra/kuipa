@@ -36,6 +36,12 @@ no outage.
 On a configured IPA server *kuipad* configuration and state is managed by IPA
 tools and does not require manual adjustment.
 
+The IPA service runs as the *kuipad* system account.  Its Kerberos keytab
+is root-only; gssproxy supplies credentials without exposing the keytab.
+The root custody broker runs the configured export handlers on behalf of the
+daemon.  In gssproxy mode, management commands invoked by root run as
+*kuipad*, so input files must be readable by that account.
+
 # COMMANDS
 
 ## serve [--config _FILE_]

@@ -151,6 +151,8 @@ pub struct Config {
     pub service: String,
     /// The daemon's keytab.
     pub keytab: String,
+    /// Obtain credentials through gssproxy.
+    pub gssproxy: bool,
     /// PEM file with the IPA CA chain (`/etc/ipa/ca.crt`).
     pub ca_file: String,
     /// Enctypes the realm allows, strongest first.
@@ -178,7 +180,11 @@ impl LdapDirectory {
     ///
     /// A GSS-API error (keytab missing or unreadable, wrong principal).
     pub fn new(cfg: Config) -> Result<Self, DirectoryError> {
-        let server_cred = GssServerCred::acquire(&cfg.service, &cfg.keytab)?;
+        let server_cred = if cfg.gssproxy {
+            GssServerCred::from_gssproxy(&cfg.service)?
+        } else {
+            GssServerCred::acquire(&cfg.service, &cfg.keytab)?
+        };
         Ok(Self {
             cfg,
             server_cred,
@@ -216,15 +222,17 @@ impl LdapDirectory {
             .initiator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // One named ccache, reused: MIT keeps its TGT there and renews it
-        // from the keytab.
-        let cred = GssClientCred::from_client_keytab(
-            &self.cfg.keytab,
-            Some(&self.cfg.principal),
-            Some("MEMORY:kuipad-service"),
-        )?;
         let mut conn = self.connect()?;
-        conn.bind_with_s4u_cred(&cred)?;
+        if self.cfg.gssproxy {
+            conn.bind(&Auth::Gssapi)?;
+        } else {
+            let cred = GssClientCred::from_client_keytab(
+                &self.cfg.keytab,
+                Some(&self.cfg.principal),
+                Some("MEMORY:kuipad-service"),
+            )?;
+            conn.bind_with_s4u_cred(&cred)?;
+        }
         Ok(conn)
     }
 
@@ -255,7 +263,12 @@ impl LdapDirectory {
 
     /// A connection bound as `principal`, through constrained delegation.
     fn conn_as(&self, principal: &str) -> Result<LdapConnection, DirectoryError> {
-        let cred = kuipa_gssapi::impersonate_with_server_cred(&self.server_cred, principal)?;
+        let cred = if self.cfg.gssproxy {
+            let initiator = GssClientCred::from_ccache(kuipa_gssapi::Impersonation::Both)?;
+            GssClientCred::impersonate(&initiator, principal)?
+        } else {
+            kuipa_gssapi::impersonate_with_server_cred(&self.server_cred, principal)?
+        };
         let mut conn = self.connect()?;
         conn.bind_with_s4u_cred(&cred)?;
         Ok(conn)

@@ -128,7 +128,12 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     } else {
         None
     };
-    let keys_service = cfg.keys_service()?;
+    let keys_service = match &cfg.keys {
+        Some(keys) if keys.enabled && keys.broker.is_some() => Some(Arc::new(
+            kuipad::keys::Keys::broker(keys.broker.clone().expect("broker was checked")),
+        )),
+        _ => cfg.keys_service()?,
+    };
     if keys_service.is_some() {
         eprintln!("kuipad: serving the keys operation at /ipa/ku/keys");
     }
@@ -182,10 +187,12 @@ async fn serve(cfg: Config) -> Result<(), Error> {
         ca_certs,
         vouch_interval: std::time::Duration::from_secs(cfg.vouch_interval),
     };
-    let initiator = Arc::new(KeytabInitiator::new(
-        cfg.keytab.clone(),
-        cfg.principal.clone(),
-    ));
+    let initiator = KeytabInitiator::new(cfg.keytab.clone(), cfg.principal.clone());
+    let initiator = Arc::new(if cfg.gssproxy {
+        initiator.with_gssproxy()
+    } else {
+        initiator
+    });
     let peers = Peers::new(
         settings,
         anchor,
@@ -403,12 +410,41 @@ fn establish_trust(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Er
 
 fn run(args: &Args) -> Result<(), Error> {
     let cfg = Config::load(&args.config)?;
+    // Management commands must not create root-owned daemon state.
+    if cfg.gssproxy && args.command != "keys-broker" {
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let euid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|uids| uids.split_whitespace().nth(1))
+            .ok_or("cannot determine effective user")?;
+        if euid == "0" {
+            use std::os::unix::process::CommandExt as _;
+            return Err(std::process::Command::new("/usr/sbin/runuser")
+                .args(["-u", "kuipad", "--"])
+                .arg(std::env::current_exe()?)
+                .args(std::env::args_os().skip(1))
+                .env("GSS_USE_PROXY", "yes")
+                .env("GSSPROXY_BEHAVIOR", "REMOTE_ONLY")
+                .env_remove("KRB5CCNAME")
+                .exec()
+                .into());
+        }
+    }
     let store = KeyStore::new(&cfg.key_dir);
     match args.command.as_str() {
         "serve" => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
             .block_on(serve(cfg)),
+        "keys-broker" => {
+            let keys = cfg.keys_service()?.ok_or("custody handlers are disabled")?;
+            let listener = listenfd::ListenFd::from_env()
+                .take_unix_listener(0)?
+                .ok_or("custody broker requires socket activation")?;
+            keys.serve_broker(listener)?;
+            Ok(())
+        }
         "generate-keys" => {
             println!("{}", store.generate()?.public().thumbprint());
             Ok(())

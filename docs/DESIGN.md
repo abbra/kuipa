@@ -1369,20 +1369,12 @@ fit directly. SSSD's `ldap_child` and `krb5_child`, certmonger and
 they move to GSS-API through gssproxy. Service principals therefore come
 first; `host/<fqdn>` follows SSSD.
 
-kuipa's own clients are GSS-API consumers in the same way. Whenever kuipa
-or kuipad authenticates from a keytab (a rekey, a registration, `kuipa
-keys fetch`, `kuipa check`, `kuipa escrow`, the daemon's LDAP binds and
-anchor exchange), it asks GSS-API for an initiator credential with
-`gss_acquire_cred_from` and `{"client_keytab": path, "ccache": name}`
-(`GssClientCred::from_client_keytab`), and learns the principal it acts
-as from `gss_inquire_cred` when it does not name one. It never opens the
-keytab to get a ticket, so with `GSS_USE_PROXY=yes` gssproxy holds the
-keytab and kuipa needs no access to it; the ccache it names keeps a ticket
-already in the default ccache from standing in for the keytab's
-principal. Only where kuipa handles a keytab's contents (sealing it,
-rekeying it, reading its key versions) does it read the file. Heimdal has
-no credential store, so there kuipa still reads the keytab and gets the
-ticket with libkrb5.
+kuipa clients acquiring credentials from a keytab use GSS-API's credential
+store. On an IPA server, kuipad instead uses gssproxy for its acceptor,
+initiator and constrained-delegation credentials. The root-owned keytab
+is not readable by the `kuipad` account. The daemon's LDAP service bind uses
+the ambient proxy credential; impersonated binds use S4U2Self and S4U2Proxy.
+Operations that handle keytab contents still need to read the file.
 
 IPA servers' own keytabs stay plain: binding them to peer replicas would make
 a full-realm cold start depend on a non-network unlocker.
@@ -2960,16 +2952,11 @@ host that is already enrolled:
   handler runs. `dogtag/<fqdn>` additionally requires the peer's
   `cn=CA,cn=<fqdn>,cn=masters` entry, so a non-CA server cannot ask for
   wrapped CA keys.
-* **Handler execution.** Direct runas spawn on tokio's blocking pool, as
-  Custodia does today: the daemon execs the same handler executables
-  (`ipa-custodia-dmldap`, `ipa-custodia-pki-tomcat`,
-  `ipa-custodia-pki-tomcat-wrapped`, `ipa-custodia-ra-agent`,
-  `ipa-custodia-akamu-ra-agent`) with `--export -`, capturing stdout, each
-  under the SELinux domain its file type already selects (root for
-  `dmldap`, `ra-agent` and `akamu-ra-agent`, `pkiuser` for the NSS
-  handlers). The NSS handlers also get `--nickname`, and `ca_wrapped` the
-  wrap algorithm as `--algorithm`. Import is the same spawn with `--import -` and the
-  value on stdin. `ca_wrapped` stays export-only.
+* **Handler execution.** The unprivileged daemon sends a bounded fetch to the
+  root custody broker over its `root:kuipad` Unix socket after the policy
+  check. The broker executes the configured export handler as `root` or
+  `pkiuser`, capturing stdout. It accepts no arbitrary command or user from
+  the request. Import remains the caller's responsibility.
 * **Response.** The handler's JSON value, sealed in the envelope. The
   body limit (§11.3) is 1 MiB, enough for a CA or KRA subsystem PKCS#12
   and ML-DSA-sized wrapped keys; Custodia's 10 MiB limit was never
@@ -3038,6 +3025,7 @@ for the retriever), the anchor list and CA from `/etc/ipa`.
 {
   "keys": {
     "enabled": true,
+    "broker": "/run/ipa/kuipad-keys.sock",
     "handlers": {
       "dm":      {"command": "/usr/libexec/ipa/custodia/ipa-custodia-dmldap", "runas": "root"},
       "ra":      {"command": "/usr/libexec/ipa/custodia/ipa-custodia-ra-agent", "runas": "root"},

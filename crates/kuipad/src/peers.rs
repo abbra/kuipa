@@ -57,6 +57,7 @@ pub trait Initiator: Send + Sync {
 pub struct KeytabInitiator {
     keytab: String,
     principal: String,
+    gssproxy: bool,
     lock: Mutex<()>,
 }
 
@@ -67,19 +68,31 @@ impl KeytabInitiator {
         Self {
             keytab: keytab.into(),
             principal: principal.into(),
+            gssproxy: false,
             lock: Mutex::new(()),
         }
+    }
+
+    /// Obtain the service credential through gssproxy.
+    #[must_use]
+    pub fn with_gssproxy(mut self) -> Self {
+        self.gssproxy = true;
+        self
     }
 }
 
 impl Initiator for KeytabInitiator {
     fn token(&self, peer: &str, cb: &[u8; 32]) -> Result<Vec<u8>, Error> {
         let _guard = lock(&self.lock);
-        let cred = kuipa_gssapi::GssClientCred::from_client_keytab(
-            &self.keytab,
-            Some(&self.principal),
-            Some(&format!("MEMORY:kuipa-peer-{}", self.principal)),
-        )?;
+        let cred = if self.gssproxy {
+            kuipa_gssapi::GssClientCred::from_ccache(kuipa_gssapi::Impersonation::No)?
+        } else {
+            kuipa_gssapi::GssClientCred::from_client_keytab(
+                &self.keytab,
+                Some(&self.principal),
+                Some(&format!("MEMORY:kuipa-peer-{}", self.principal)),
+            )?
+        };
         match kuipa_gssapi::init_token(&cred, &format!("ipa-ku@{peer}"), Some(cb))? {
             kuipa_gssapi::InitStep::Complete(t) => Ok(t),
             kuipa_gssapi::InitStep::Continue { .. } => {
