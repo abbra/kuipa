@@ -264,6 +264,14 @@ pub trait Directory {
         let _ = principal;
         Err("groups are not supported by this directory".into())
     }
+    /// Whether the caller has the delegated seal administrator privilege.
+    ///
+    /// # Errors
+    ///
+    /// Any directory or authorization lookup failure.
+    fn seal_admin(&self, _principal: &Principal) -> Result<bool, DirectoryError> {
+        Err("seal administration is not supported by this directory".into())
+    }
 
     /// Store a new seal; refuse a name its owner already uses.
     ///
@@ -747,6 +755,9 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     }
     fn principal_groups(&self, principal: &Principal) -> Result<Vec<String>, DirectoryError> {
         (**self).principal_groups(principal)
+    }
+    fn seal_admin(&self, principal: &Principal) -> Result<bool, DirectoryError> {
+        (**self).seal_admin(principal)
     }
     fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
         (**self).seal_add(seal)
@@ -1764,11 +1775,18 @@ impl EnrollServer {
                 (vec![started.seal], Some(started.token), started.released)
             }
             op => {
+                let require_log = matches!(op, SealOp::AdminRevoke { .. });
                 // A change is recorded before the directory stores it, so a
                 // failed append leaves the seal as it was.
                 let mut record = |seal: &Seal| {
                     if let Some((action, device)) = event.take() {
-                        receipts.extend(self.record_change(seal, action, device)?);
+                        let receipt = self.record_change(seal, action, device)?;
+                        if require_log && receipt.is_none() {
+                            return Err(Refusal::because(
+                                "seal administration requires a transparency log",
+                            ));
+                        }
+                        receipts.extend(receipt);
                     }
                     Ok(())
                 };
@@ -3174,6 +3192,7 @@ impl EnrollServer {
         directory: &dyn Directory,
         record: &mut dyn FnMut(&Seal) -> Result<(), Refusal>,
     ) -> Result<Vec<Seal>, Refusal> {
+        let admin_revoke = matches!(&op, SealOp::AdminRevoke { .. });
         let seal = match op {
             SealOp::List => return list_seals(caller, directory),
             SealOp::Unlock { .. }
@@ -3257,9 +3276,32 @@ impl EnrollServer {
                 seal.state = State::Revoked;
                 seal
             }
+            SealOp::AdminRevoke { owner, name } => {
+                if !directory.seal_admin(caller).map_err(Refusal)? {
+                    return Err(Refusal::because("seal administrator privilege required"));
+                }
+                let owner: Principal = owner.parse()?;
+                if owner.realm() != self.info.realm {
+                    return Err(Refusal::because("wrong realm"));
+                }
+                let mut seal = directory
+                    .seals_of(&owner)
+                    .map_err(Refusal)?
+                    .into_iter()
+                    .find(|seal| seal.name == name)
+                    .ok_or_else(|| Refusal::because("no such seal"))?;
+                seal.state = State::Revoked;
+                seal
+            }
         };
         record(&seal)?;
         directory.seal_update(&seal).map_err(Refusal)?;
+        if admin_revoke {
+            eprintln!(
+                "kuipad: {caller} administratively revoked seal {} ({}) owned by {}",
+                seal.id, seal.name, seal.owner
+            );
+        }
         Ok(vec![seal])
     }
 
@@ -3642,7 +3684,7 @@ fn seal_event(op: &SealOp) -> Option<(SealAction, Option<String>)> {
     Some(match op {
         SealOp::Create { .. } => (SealAction::Create, None),
         SealOp::SetPolicy { .. } => (SealAction::SetPolicy, None),
-        SealOp::Revoke { .. } => (SealAction::Revoke, None),
+        SealOp::Revoke { .. } | SealOp::AdminRevoke { .. } => (SealAction::Revoke, None),
         SealOp::AddDevice { .. } => (SealAction::AddDevice, None),
         SealOp::RemoveDevice { id, .. } => (SealAction::RemoveDevice, Some(id.clone())),
         SealOp::Share { .. } => (SealAction::Share, None),

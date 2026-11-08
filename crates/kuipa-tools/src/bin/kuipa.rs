@@ -578,6 +578,13 @@ enum SealCommand {
         /// The seal.
         seal: String,
     },
+    /// Revoke another owner's seal using delegated administrator authority.
+    AdminRevoke {
+        /// The owner's Kerberos principal.
+        owner: String,
+        /// The seal's name.
+        name: String,
+    },
 }
 
 /// `kuipa escrow` subcommands: the host, or the principal of a keytab on
@@ -2848,6 +2855,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
         SealCommand::List => client.list(),
         SealCommand::RecoveryShards { action } => run_recovery_shards(&client, action),
         SealCommand::Revoke { seal } => client.revoke(seal),
+        SealCommand::AdminRevoke { owner, name } => client.admin_revoke(owner, name),
     }
 }
 

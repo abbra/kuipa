@@ -350,6 +350,12 @@ Describe a seal.  *seal list* describes all your seals and those
 shared with you; *seal revoke SEAL* revokes it: no file sealed to it
 opens any more.
 
+## seal admin-revoke _OWNER@REALM_ _NAME_
+
+Revoke another owner's seal with the KUIPA Seal Administrators privilege.
+The caller needs Kerberos credentials for kuipad and the usual trusted realm
+configuration; the revocation is recorded in the transparency log.
+
 ## seal deposit put _SEAL_ _FILE_ [--name _NAME_]
 
 Seal _FILE_ to the seal and leave it with the servers as a deposit, in

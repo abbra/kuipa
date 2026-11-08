@@ -99,6 +99,15 @@ longer have are refused at once.
 | a service's sealed keytab and files | `ipa service-del` (or lock the entry) |
 | one sealed file of a host or service | the host retires it with `kuipa unprotect --file`; otherwise remove its binding values from `ipaKUEscrowFileBinding` on the entry |
 | a user's seals | `ipa user-disable` (locks the entry) or `ipa user-del` |
-| one seal | its owner runs `kuipa seal revoke`; an administrator command is pending |
+| one seal | its owner or manager runs `kuipa seal revoke`; a delegated administrator runs `kuipa seal admin-revoke OWNER@REALM NAME` |
 | an anchor | `kuipad rotate-anchor` on its server |
 | a voucher key | delete `voucher-<thp>.jwk` and restart `kuipad` |
+
+Administrative revocation requires membership, directly or through IPA roles
+and groups, in `cn=KUIPA Seal Administrators,cn=privileges,cn=pbac,$SUFFIX`.
+For example, add this privilege to an IPA role and add users or groups to that
+role. The daemon's LDAP identity must be able to read the caller's `memberOf`
+and the privilege's `member`. The caller needs Kerberos credentials able to
+obtain a kuipad service ticket, and the client needs the usual kuipa realm
+configuration and trusted anchors. An HTTP-only service ticket is not a
+delegated user TGT. The change is logged before it is stored in LDAP.

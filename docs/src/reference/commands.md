@@ -46,6 +46,7 @@ usage.
 | `retire SEAL SEALED…` | with registered sealing: make every copy of these unopenable |
 | `unlock SEAL [--offline]` / `lock SEAL` | start or end a session on this host |
 | `show SEAL` / `list` / `revoke SEAL` | describe or revoke seals |
+| `admin-revoke OWNER@REALM NAME` | revoke another owner's seal using delegated administrator authority |
 
 ## kuipa tlog and kuipa sign (users)
 
