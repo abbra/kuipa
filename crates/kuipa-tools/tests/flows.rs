@@ -446,6 +446,61 @@ fn a_stale_head_falls_back_to_the_signature_proof() {
 }
 
 #[test]
+fn enrollment_preserves_existing_keytab_principals_and_rejects_damage_before_join() {
+    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+    let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
+    let dir = Dir::default();
+    let host_old = dir.keys(HOST).to_mit().unwrap();
+    let other = dir.keys("other.example.test").to_mit().unwrap();
+    dir.otps
+        .lock()
+        .unwrap()
+        .insert(HOST.into(), b"Secret123".to_vec());
+    let url = serve_as(
+        "ipa1.example.test",
+        app(Arc::new(EnrollServer::new(keys, info, delegation)), dir),
+    );
+    let paths = root("preserve-keytab");
+    std::fs::create_dir_all(paths.keytab().parent().unwrap()).unwrap();
+    std::fs::write(paths.keytab(), [5, 2, 0, 0, 0, 100]).unwrap();
+    let s = string(&anchor, b"Secret123");
+    let enroll = || {
+        flows::enroll_online(
+            &paths,
+            s.realm(),
+            &[*s.anchor()],
+            &[],
+            &[],
+            flows::Host {
+                fqdn: HOST,
+                auth: &Auth::LdapOtp(Secret::new(b"Secret123")),
+            },
+            &Deployment::servers(&[url.clone()]),
+        )
+    };
+    assert!(enroll().is_err());
+    let mut existing = host_old.as_ref().to_vec();
+    existing.extend_from_slice(&other.as_ref()[2..]);
+    std::fs::write(paths.keytab(), existing).unwrap();
+    enroll().unwrap();
+
+    let bytes = std::fs::read(paths.keytab()).unwrap();
+    let mut entries = &bytes[2..];
+    let mut principals = Vec::new();
+    while !entries.is_empty() {
+        let size = i32::from_be_bytes(entries[..4].try_into().unwrap()) as usize;
+        let mut record = vec![5, 2];
+        record.extend_from_slice(&entries[..4 + size]);
+        let keytab = Keytab::from_mit(&record).unwrap();
+        principals.push((keytab.principal().to_string(), keytab.kvno().unwrap()));
+        entries = &entries[4 + size..];
+    }
+    assert!(principals.contains(&(format!("host/{HOST}@{REALM}"), 1)));
+    assert!(principals.contains(&(format!("host/other.example.test@{REALM}"), 2)));
+    assert!(principals.contains(&(format!("host/{HOST}@{REALM}"), 3)));
+}
+
+#[test]
 fn online_enrollment_with_failover() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, info, delegation) = server_keys(&anchor, "ipa2.example.test");

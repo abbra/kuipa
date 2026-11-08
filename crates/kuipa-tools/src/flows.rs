@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 
 use kuipa_enroll::bundle::{Bundle, Opener};
@@ -625,6 +626,47 @@ fn merge_previous(mut new: Keytab, old: Option<Keytab>) -> Result<Keytab, Error>
     Ok(new)
 }
 
+fn existing_keytab(paths: &Paths) -> Result<Option<SecretBuf>, Error> {
+    let path = paths.keytab();
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err("refusing to replace a keytab symlink".into());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        _ => {}
+    }
+    let bytes = SecretBuf::new(fs::read(path)?);
+    let mut rest = bytes.as_ref();
+    if !rest.starts_with(&[5, 2]) {
+        return Err("unsupported existing keytab format".into());
+    }
+    rest = &rest[2..];
+    while !rest.is_empty() {
+        let header: [u8; 4] = rest
+            .get(..4)
+            .ok_or("truncated existing keytab")?
+            .try_into()?;
+        let len = i32::from_be_bytes(header).unsigned_abs() as usize;
+        rest = rest
+            .get(4..)
+            .and_then(|r| r.get(len..))
+            .ok_or("truncated existing keytab")?;
+    }
+    Ok(Some(bytes))
+}
+
+// shortcut: mixed-principal keytabs cannot be rotated or protected, extend the parser before supporting either.
+fn enrollment_keytab(keytab: &Keytab, old: Option<&[u8]>) -> Result<SecretBuf, Error> {
+    let new = keytab.to_mit()?;
+    let Some(old) = old else { return Ok(new) };
+    let mut merged = SecretBuf::with_len(old.len() + new.as_ref().len() - 2);
+    let out = merged.as_mut_slice();
+    out[..old.len()].copy_from_slice(old);
+    out[old.len()..].copy_from_slice(&new.as_ref()[2..]);
+    Ok(merged)
+}
+
 /// Install an enrollment's identity: keytab, CA chain, anchors and state.
 ///
 /// `proved` is what the verified response behind this enrollment proved
@@ -636,8 +678,16 @@ fn install(
     enrollment: &Enrollment,
     fqdn: &str,
     proved: &[HeadPin],
+    old_keytab: Option<&[u8]>,
 ) -> Result<(), Error> {
-    paths::write_file(&paths.keytab(), enrollment.keytab.to_mit()?.as_ref(), 0o600)?;
+    let ca = paths.ca();
+    let ipa_dir = ca.parent().ok_or("IPA CA path has no parent")?;
+    if !ipa_dir.exists() {
+        fs::create_dir_all(ipa_dir)?;
+        fs::set_permissions(ipa_dir, fs::Permissions::from_mode(0o755))?;
+    }
+    let keytab = enrollment_keytab(&enrollment.keytab, old_keytab)?;
+    paths::write_file(&paths.keytab(), keytab.as_ref(), 0o600)?;
     paths::write_pem(&paths.ca(), &enrollment.ca_certs)?;
     let heads = enrollment
         .anchors
@@ -834,6 +884,7 @@ pub fn enroll_online(
     deployment: &Deployment,
 ) -> Result<Value, Error> {
     let Host { fqdn, auth } = host;
+    let old_keytab = existing_keytab(paths)?;
     if deployment.servers.is_empty() {
         return Err("no server given (--server)".into());
     }
@@ -933,7 +984,13 @@ pub fn enroll_online(
             Ok(p.seal(authenticator.as_ref(), &[], &[])?)
         },
     )?;
-    install(paths, &enrollment, fqdn, adv.proved_heads())?;
+    install(
+        paths,
+        &enrollment,
+        fqdn,
+        adv.proved_heads(),
+        old_keytab.as_ref().map(AsRef::as_ref),
+    )?;
     Ok(summary(&enrollment))
 }
 
@@ -981,6 +1038,7 @@ pub fn enroll_bundle(
     insecure_signed_only: bool,
     expected_fqdn: Option<&str>,
 ) -> Result<Value, Error> {
+    let old_keytab = existing_keytab(paths)?;
     let anchors = match string {
         Some(s) => {
             check_string(s)?;
@@ -1027,7 +1085,13 @@ pub fn enroll_bundle(
     // A bundle carries no anchor signature over a head (§4): nothing here
     // proves one, so a payload head is pinned only if the issuer's
     // advertisement for that anchor proves it.
-    install(paths, &enrollment, &fqdn, &[])?;
+    install(
+        paths,
+        &enrollment,
+        &fqdn,
+        &[],
+        old_keytab.as_ref().map(AsRef::as_ref),
+    )?;
     paths::remove(&paths.recipient())?;
     paths::remove(&paths.recipient_public())?;
     let pending = json!({

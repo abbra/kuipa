@@ -547,6 +547,45 @@ impl LdapDirectory {
         Principal::host(fqdn, &self.cfg.realm).to_string()
     }
 
+    fn rekey_host(
+        &self,
+        fqdn: &str,
+        caller: &str,
+        enctypes: &[Enctype],
+    ) -> Result<Keytab, DirectoryError> {
+        let host = self.host_principal(fqdn);
+        if caller != host {
+            return Err(format!("{caller} may not rekey {host}").into());
+        }
+        let mut conn = self.conn_as(caller)?;
+        let keytab = self.new_keys(&mut conn, &host, enctypes)?;
+        let dn = self.host_dn(fqdn);
+        let mut svc = self.service_conn()?;
+        let entry = svc.search(&dn, Scope::Base, "(objectClass=*)", &[STAGED_ATTR])?;
+        if entry
+            .first()
+            .is_some_and(|e| e.bin_attrs.contains_key(&STAGED_ATTR.to_lowercase()))
+        {
+            svc.modify_s(
+                &dn,
+                &[
+                    (ModOp::Delete, STAGED_ATTR, Vec::new()),
+                    (ModOp::Delete, "krbPrincipalExpiration", Vec::new()),
+                ],
+            )?;
+            eprintln!("kuipad: first contact: {host} unstaged");
+        }
+        match svc.modify_s(&dn, &[(ModOp::Delete, "userPassword", Vec::new())]) {
+            Ok(()) => eprintln!("kuipad: first contact: {host}'s OTP consumed"),
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_ATTRIBUTE,
+                ..
+            }) => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(keytab)
+    }
+
     /// The entry of `principal`, with `attrs`: a host's by its FQDN, any
     /// other principal's (services, users) by name under `cn=accounts`.
     fn principal_entry(
@@ -633,6 +672,9 @@ impl Directory for LdapDirectory {
         enctypes: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let (caller, binding) = self.accept_bound(token, cb)?;
+        if caller == self.host_principal(fqdn) {
+            return Ok((self.rekey_host(fqdn, &caller, enctypes)?, binding));
+        }
         let mut conn = self.conn_as(&caller)?;
         let principal = Self::join(&mut conn, fqdn)?;
         Ok((self.new_keys(&mut conn, &principal, enctypes)?, binding))
@@ -646,40 +688,7 @@ impl Directory for LdapDirectory {
         enctypes: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let (caller, binding) = self.accept_bound(token, cb)?;
-        let host = self.host_principal(fqdn);
-        if caller != host {
-            return Err(format!("{caller} may not rekey {host}").into());
-        }
-        let mut conn = self.conn_as(&caller)?;
-        let keytab = self.new_keys(&mut conn, &host, enctypes)?;
-        // First contact after offline enrollment: unstage (§8.5).
-        let dn = self.host_dn(fqdn);
-        let mut svc = self.service_conn()?;
-        let entry = svc.search(&dn, Scope::Base, "(objectClass=*)", &[STAGED_ATTR])?;
-        if entry
-            .first()
-            .is_some_and(|e| e.bin_attrs.contains_key(&STAGED_ATTR.to_lowercase()))
-        {
-            svc.modify_s(
-                &dn,
-                &[
-                    (ModOp::Delete, STAGED_ATTR, Vec::new()),
-                    (ModOp::Delete, "krbPrincipalExpiration", Vec::new()),
-                ],
-            )?;
-            eprintln!("kuipad: first contact: {host} unstaged");
-        }
-        // First contact with an OTP-derived key (§5.3): the new keys replaced
-        // it; the OTP must not work for an LDAP join either.
-        match svc.modify_s(&dn, &[(ModOp::Delete, "userPassword", Vec::new())]) {
-            Ok(()) => eprintln!("kuipad: first contact: {host}'s OTP consumed"),
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_ATTRIBUTE,
-                ..
-            }) => {}
-            Err(e) => return Err(e.into()),
-        }
-        Ok((keytab, binding))
+        Ok((self.rekey_host(fqdn, &caller, enctypes)?, binding))
     }
 
     fn stage_with_gss(
