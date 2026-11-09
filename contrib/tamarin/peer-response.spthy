@@ -1,0 +1,36 @@
+// Authenticated HTTPS response and nonce association, abstracted by a server
+// signature. The authenticated request is an idealized fact; TLS itself and
+// confidentiality are not modeled. Outstanding nonces are linear.
+theory peer_response
+begin
+builtins: signing, hashing
+restriction Equality: "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule receiver:
+  [ Fr(~sk) ]
+  --[ ReceiverCreated($receiver,pk(~sk)) ]->
+  [ !Receiver($receiver,~sk,pk(~sk)), Out(pk(~sk)) ]
+rule compromise:
+  [ !Receiver(receiver,sk,key) ]
+  --[ Compromised(receiver,key) ]-> [ Out(sk) ]
+rule request:
+  [ !Receiver(receiver,sk,key), Fr(~nonce) ]
+  --[ Requested($sender,receiver,~nonce,key) ]->
+  [ Outstanding($sender,receiver,~nonce,key), !AuthenticatedRequest($sender,receiver,~nonce),
+    Out(<$sender,receiver,~nonce>) ]
+rule answer:
+  [ !Receiver(receiver,sk,key), !AuthenticatedRequest(sender,receiver,nonce), In(body) ]
+  --[ Answered(sender,receiver,nonce,body,key) ]->
+  [ Out(<sender,receiver,nonce,body,sign(h(<sender,receiver,nonce,body>),sk)>) ]
+rule accept:
+  [ Outstanding(sender,receiver,nonce,key), In(<sender,receiver,nonce,body,token>) ]
+  --[ Eq(verify(token,h(<sender,receiver,nonce,body>),key),true),
+      Accepted(sender,receiver,nonce,body,key) ]-> [ ]
+
+lemma honest_response: exists-trace
+  "Ex s r n b k #i. Accepted(s,r,n,b,k) @i & not (Ex r2 k2 #j. Compromised(r2,k2) @j)"
+lemma response_origin:
+  "All s r n b k #i. Accepted(s,r,n,b,k) @i ==> (Ex #j. Answered(s,r,n,b,k) @j & #j < #i) | (Ex #j. Compromised(r,k) @j & #j < #i)"
+lemma nonce_accepts_at_most_once:
+  "All s r n b1 b2 k #i #j. Accepted(s,r,n,b1,k) @i & Accepted(s,r,n,b2,k) @j ==> #i = #j"
+end

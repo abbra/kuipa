@@ -1,0 +1,30 @@
+// Two-version repair ordering. The `new` entry is assumed to dominate `old`
+// according to the application's merge order; ties, arbitrary versions,
+// message authentication and garbage collection are not modeled. Delivery
+// is adversarial: an older message may arrive after the newer one. No fairness
+// assumption is made, so eventual delivery/convergence is not claimed.
+theory peer_order
+begin
+
+rule initial:
+  [ Fr(~id) ]
+  --[ Initial(~id) ]-> [ Old(~id), Out(<'old',~id>), Out(<'new',~id>) ]
+
+rule newer:
+  [ Old(id), In(<'new',id>) ]
+  --[ NewerInstalled(id) ]-> [ New(id) ]
+
+rule stale:
+  [ New(id), In(<'old',id>) ]
+  --[ StaleIgnored(id) ]-> [ New(id) ]
+
+rule observe_old:
+  [ Old(id) ] --[ ObserveOld(id) ]-> [ Old(id) ]
+rule observe_new:
+  [ New(id) ] --[ ObserveNew(id) ]-> [ New(id) ]
+
+lemma update_runs: exists-trace
+  "Ex id #i #j. NewerInstalled(id) @i & StaleIgnored(id) @j & #i < #j"
+lemma older_never_wins [use_induction]:
+  "All id #i #j. NewerInstalled(id) @i & ObserveOld(id) @j ==> not (#i < #j)"
+end

@@ -1,0 +1,158 @@
+// kuipa peer sync: symbolic GSS binding, receiver context cache and signed
+// admission (DESIGN 4.2.1). Authenticated facts idealize GSS channel binding
+// and authenticated HTTPS responses. The attacker can replay these facts;
+// after channel compromise it can forge them. This does not prove Kerberos,
+// TLS, SHA-384 truncation, or the implementation of those mechanisms.
+//
+// A Signed fact idealizes verification of one anchor-signed entry. Unsigned
+// keys, the full admission policy, membership changes, quorum trust, epochs,
+// ordering, encoding, cache replacement and convergence are not modeled.
+// Cache misses after restart are modeled, but historical cache entries also
+// persist: this over-approximates stale acceptance and does not prove eviction.
+// Outstanding requests can be replayed, so injective correspondence is not
+// claimed. One digest-checked signed entry abstracts a snapshot; chunking,
+// concurrent replacement and resource limits are not modeled. Hashes are perfect.
+//
+// Run in a bounded cgroup, e.g. systemd-run --user --scope -p MemoryMax=2G
+// -p MemorySwapMax=0 env PATH=/path/to/maude:$PATH tamarin-prover --prove
+// contrib/tamarin/peer-sync.spthy +RTS -N1 -RTS
+//
+// Tamarin 1.12.0 and Maude 3.5.1: all eleven lemmas verified, including
+// the honest execution witnesses and the compromised-member witness.
+
+theory peer_sync
+begin
+builtins: hashing
+
+rule setup:
+  [ Fr(~anchor), Fr(~delegation), Fr(~epochs) ]
+  --[ Setup($sender, $receiver, ~anchor) ]->
+  [ !Channel($sender, $receiver), !Anchor(~anchor),
+    !Context($sender, $receiver, ~delegation, ~epochs), Out(~anchor) ]
+
+rule issue:
+  [ !Anchor(anchor), Fr(~entry) ]
+  --[ Issued(anchor, ~entry) ]->
+  [ !Signed(anchor, ~entry), Out(~entry) ]
+
+rule compromise_channel:
+  [ !Channel(sender, receiver) ]
+  --[ ChannelCompromised(sender, receiver) ]-> [ !LeakedChannel(sender, receiver) ]
+
+rule compromise_anchor:
+  [ !Anchor(anchor) ]
+  --[ AnchorCompromised(anchor) ]-> [ !LeakedAnchor(anchor) ]
+
+rule forge_signature:
+  [ !LeakedAnchor(anchor), In(entry) ]
+  --> [ !Signed(anchor, entry) ]
+
+rule send_full:
+  [ !Channel(sender, receiver), !Signed(anchor, entry),
+    !Context(sender, receiver, delegation, epochs), Fr(~nonce), In(kind) ]
+  --[ Sent(sender, receiver, ~nonce, kind, anchor, entry, h(delegation), h(epochs)) ]->
+  [ !FullTicket(sender, receiver, ~nonce, kind, anchor, entry, delegation, epochs),
+    !Outstanding(sender, receiver, ~nonce, kind, anchor, entry),
+    Out(<delegation, epochs>) ]
+
+rule send_cached:
+  [ !Channel(sender, receiver), !Signed(anchor, entry),
+    !Context(sender, receiver, delegation, epochs), Fr(~nonce), In(kind) ]
+  --[ Sent(sender, receiver, ~nonce, kind, anchor, entry, h(delegation), h(epochs)) ]->
+  [ !CachedTicket(sender, receiver, ~nonce, kind, anchor, entry, h(delegation), h(epochs)),
+    !Outstanding(sender, receiver, ~nonce, kind, anchor, entry) ]
+
+rule forge_full:
+  [ !LeakedChannel(sender, receiver), !Signed(anchor, entry),
+    Fr(~nonce), Fr(~delegation), Fr(~epochs), In(kind) ]
+  --> [ !FullTicket(sender, receiver, ~nonce, kind, anchor, entry, ~delegation, ~epochs) ]
+
+rule forge_cached:
+  [ !LeakedChannel(sender, receiver), !Signed(anchor, entry),
+    In(<delegation, epochs>), Fr(~nonce), In(kind) ]
+  --> [ !CachedTicket(sender, receiver, ~nonce, kind, anchor, entry, h(delegation), h(epochs)) ]
+
+// After restart the receiver may have no cache for a hash-only request.
+// Historical caches remain possible, over-approximating stale cache use.
+rule restart:
+  [ !Channel(sender, receiver), Fr(~incarnation) ]
+  --[ Restart(sender, receiver, ~incarnation) ]->
+  [ EmptyCache(sender, receiver, ~incarnation) ]
+
+rule context_needed:
+  [ EmptyCache(sender, receiver, incarnation),
+    !CachedTicket(sender, receiver, nonce, kind, anchor, entry, dh, eh) ]
+  --[ ContextNeeded(sender, receiver, nonce) ]->
+  [ Retry(sender, receiver, nonce, kind, anchor, entry, dh, eh) ]
+
+rule resend_full:
+  [ Retry(sender, receiver, nonce, kind, anchor, entry, h(delegation), h(epochs)),
+    !Context(sender, receiver, delegation, epochs) ]
+  --[ ResentFull(sender, receiver, nonce) ]->
+  [ !FullTicket(sender, receiver, nonce, kind, anchor, entry, delegation, epochs) ]
+
+rule receive_full:
+  [ !FullTicket(sender, receiver, nonce, kind, anchor, entry, delegation, epochs),
+    !Signed(anchor, entry) ]
+  --[ Accepted(sender, receiver, nonce, kind, anchor, entry, h(delegation), h(epochs)),
+      FullReceived(sender, receiver, nonce),
+      FullContext(sender, receiver, h(delegation), h(epochs)), Admitted(anchor, entry) ]->
+  [ !Cache(sender, receiver, delegation, epochs),
+    !Answer(sender, receiver, nonce, kind, anchor, entry) ]
+
+rule receive_cached:
+  [ !CachedTicket(sender, receiver, nonce, kind, anchor, entry, h(delegation), h(epochs)),
+    !Signed(anchor, entry), !Cache(sender, receiver, delegation, epochs) ]
+  --[ Accepted(sender, receiver, nonce, kind, anchor, entry, h(delegation), h(epochs)),
+      CachedContext(sender, receiver, h(delegation), h(epochs)), Admitted(anchor, entry) ]->
+  [ !Answer(sender, receiver, nonce, kind, anchor, entry) ]
+
+rule forge_answer:
+  [ !LeakedChannel(sender, receiver), !Outstanding(sender, receiver, nonce, kind, anchor, entry) ]
+  --> [ !Answer(sender, receiver, nonce, kind, anchor, entry) ]
+
+rule receive_answer:
+  [ !Outstanding(sender, receiver, nonce, kind, anchor, entry),
+    !Answer(sender, receiver, nonce, kind, anchor, entry) ]
+  --[ AnswerAccepted(sender, receiver, nonce, kind, anchor, entry) ]-> [ ]
+
+// Pin a digest before accepting complete decoded content from the network.
+rule snapshot_offer:
+  [ !Signed(anchor, entry) ]
+  --[ SnapshotOffered(anchor, h(entry)) ]->
+  [ !PinnedSnapshot(anchor, h(entry)), Out(entry) ]
+
+rule snapshot_admit:
+  [ !PinnedSnapshot(anchor, h(entry)), !Signed(anchor, entry), In(entry) ]
+  --[ SnapshotAdmitted(anchor, h(entry), entry), Admitted(anchor, entry) ]-> [ ]
+
+lemma full_exchange: exists-trace
+  "Ex s r n k a e d w #i #j. FullReceived(s,r,n) @i & Accepted(s,r,n,k,a,e,d,w) @i & AnswerAccepted(s,r,n,k,a,e) @j & #i < #j & not (Ex x y #t. ChannelCompromised(x,y) @t) & not (Ex x #t. AnchorCompromised(x) @t)"
+lemma cached_exchange: exists-trace
+  "Ex s r d w #i. CachedContext(s,r,d,w) @i & not (Ex x y #t. ChannelCompromised(x,y) @t) & not (Ex x #t. AnchorCompromised(x) @t)"
+lemma restart_retry_exchange: exists-trace
+  "Ex s r n k a e d w #i #j #l. ContextNeeded(s,r,n) @i & ResentFull(s,r,n) @j & FullReceived(s,r,n) @l & Accepted(s,r,n,k,a,e,d,w) @l & #i < #j & #j < #l & not (Ex x y #t. ChannelCompromised(x,y) @t) & not (Ex x #t. AnchorCompromised(x) @t)"
+lemma resend_follows_miss:
+  "All s r n #i. ResentFull(s,r,n) @i ==> (Ex #j. ContextNeeded(s,r,n) @j & #j < #i)"
+lemma request_authentication:
+  "All s r n k a e d w #i. Accepted(s,r,n,k,a,e,d,w) @i ==>
+    (Ex #j. Sent(s,r,n,k,a,e,d,w) @j & #j < #i) |
+    (Ex #j. ChannelCompromised(s,r) @j & #j < #i)"
+lemma cached_context_origin:
+  "All s r d w #i. CachedContext(s,r,d,w) @i ==>
+    (Ex #j. FullContext(s,r,d,w) @j & #j < #i)"
+lemma response_correspondence:
+  "All s r n k a e #i. AnswerAccepted(s,r,n,k,a,e) @i ==>
+    (Ex d w #j. Accepted(s,r,n,k,a,e,d,w) @j & #j < #i) |
+    (Ex #j. ChannelCompromised(s,r) @j & #j < #i)"
+lemma signed_entry_origin:
+  "All a e #i. Admitted(a,e) @i ==>
+    (Ex #j. Issued(a,e) @j & #j < #i) |
+    (Ex #j. AnchorCompromised(a) @j & #j < #i)"
+lemma snapshot_digest_origin:
+  "All a e #i. SnapshotAdmitted(a,h(e),e) @i ==> (Ex #j. SnapshotOffered(a,h(e)) @j & #j < #i)"
+lemma snapshot_exchange: exists-trace
+  "Ex a e #i. SnapshotAdmitted(a,h(e),e) @i & not (Ex x #t. AnchorCompromised(x) @t)"
+lemma compromised_member_can_forge_request: exists-trace
+  "Ex s r n k a e d w #i #j. ChannelCompromised(s,r) @i & Accepted(s,r,n,k,a,e,d,w) @j & #i < #j & not (Ex #t. Sent(s,r,n,k,a,e,d,w) @t) & not (Ex x #t. AnchorCompromised(x) @t)"
+end

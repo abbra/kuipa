@@ -1,0 +1,58 @@
+// Attestation checks in PeerSync::attest. GSS is modeled as a signature
+// under the member key. Anchored delegation proofs are signatures by their
+// own (possibly attacker-chosen) anchor. Validity and policy are idealized;
+// no claim log is modeled. Each enrollment permits at most one attestation;
+// re-enrollment of the same server and realm is not modeled.
+theory peer_attestation
+begin
+builtins: signing, hashing
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+restriction UniqueEnrollment:
+  "All s r k1 k2 #i #j. Enrolled(s,r,k1) @i & Enrolled(s,r,k2) @j ==> #i = #j"
+
+rule setup:
+  [ Fr(~memberkey), Fr(~anchorkey), Fr(~signer) ]
+  --[ Enrolled($server, $realm, pk(~memberkey)), AnchorCreated($server, $realm, pk(~anchorkey)) ]->
+  [ !Credential($server, $realm, ~memberkey, pk(~memberkey)),
+    !OwnAnchor($server, $realm, ~anchorkey, pk(~anchorkey), ~signer),
+    Active($server, $realm), Out(<pk(~memberkey),pk(~anchorkey),~signer>) ]
+
+rule remove_member:
+  [ Active(server, realm) ]
+  --[ Removed(server,realm) ]-> [ ]
+
+rule compromise_member:
+  [ !Credential(server,realm,sk,key) ]
+  --[ Compromised(server,realm,key) ]-> [ Out(sk) ]
+
+rule delegation:
+  [ !OwnAnchor(server,realm,sk,anchor,signer) ]
+  --> [ Out(<server,realm,anchor,signer,sign(<server,realm,anchor,signer>,sk)>) ]
+
+rule send:
+  [ !Credential(server,realm,sk,key), !OwnAnchor(server,realm,ask,anchor,signer),
+    Fr(~payload), In(receiver) ]
+  --[ Sent(server,realm,receiver,~payload,key) ]->
+  [ Out(<server,realm,receiver,~payload,
+    sign(h(<server,realm,receiver,~payload,
+      h(<server,realm,anchor,signer,sign(<server,realm,anchor,signer>,ask)>)>),sk)>) ]
+
+rule attest:
+  [ !Credential(server,realm,sk,key), Active(server,realm),
+    In(<server,realm,receiver,payload,token>),
+    In(<server,realm,anchor,signer,proof>) ]
+  --[ Eq(verify(token,h(<server,realm,receiver,payload,h(<server,realm,anchor,signer,proof>)>),key),true),
+      Eq(verify(proof,<server,realm,anchor,signer>,anchor),true),
+      Attested(server,realm,receiver,payload,key,anchor,signer) ]->
+  [ ]
+
+lemma honest_attestation: exists-trace
+  "Ex s realm r p key a x #i. Attested(s,realm,r,p,key,a,x) @i & not (Ex s2 realm2 key2 #j. Compromised(s2,realm2,key2) @j)"
+lemma attestation_requires_member_authentication:
+  "All s realm r p key a x #i. Attested(s,realm,r,p,key,a,x) @i ==> (Ex #j. Sent(s,realm,r,p,key) @j & #j < #i) | (Ex #j. Compromised(s,realm,key) @j & #j < #i)"
+lemma removed_member_cannot_be_attested:
+  "All s realm r p key a x #i #j. Removed(s,realm) @i & Attested(s,realm,r,p,key,a,x) @j & #i < #j ==> (Ex key2 #k. Enrolled(s,realm,key2) @k & #i < #k & #k < #j)"
+lemma stolen_member_key_can_introduce_an_anchor: exists-trace
+  "Ex s realm r p key a x #i #j. Compromised(s,realm,key) @i & Attested(s,realm,r,p,key,a,x) @j & #i < #j & not (Ex #t. Sent(s,realm,r,p,key) @t) & not (Ex #t. AnchorCreated(s,realm,a) @t)"
+end
