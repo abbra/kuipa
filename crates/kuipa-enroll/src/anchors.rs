@@ -1380,6 +1380,34 @@ mod tests {
     }
 
     #[test]
+    fn admission_rechecks_signature_policy_for_each_entry() {
+        let server = Server::new("a");
+        let next = Server::new("b");
+        let clock = GenerationClock::new();
+        let mut state = AnchorState::default();
+        let relaxed = Policy::default();
+        let strict = Policy::default().with_signature_algs(&[SignatureAlg::MlDsa87]);
+        let key = Entry::Key(server.anchor.public().to_jwk_json());
+        server.step(&mut state, NOW, &[], &servers(&["a"]), &clock);
+        let vouch = Entry::Vouch(state.vouch(&server.thp()).unwrap().clone());
+        let succession = Entry::Succession(
+            SignedSuccession::issue(&server.anchor, REALM, &next.thp(), NOW, NOW + 60).unwrap(),
+        );
+        for entry in [&key, &vouch, &succession] {
+            assert!(state.check(entry, None, REALM, &relaxed, NOW).is_ok());
+            assert!(matches!(
+                state.check(entry, None, REALM, &strict, NOW),
+                Err(Error::UntrustedAnchor)
+            ));
+        }
+        assert!(
+            state
+                .check(&Entry::Key("not a JWK".into()), None, REALM, &relaxed, NOW)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn trust_spreads_from_kerberos_attestation() {
         let (a, b, c) = (Server::new("a"), Server::new("b"), Server::new("c"));
         let all = servers(&["a", "b", "c"]);
