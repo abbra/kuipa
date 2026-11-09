@@ -1,0 +1,55 @@
+// Anchor admission and pinned advertisement trust, simplified to one claim
+// and one vouch. A claim and public key are attacker-controlled data; accepting
+// them into replicated state does not itself make them trusted. A vouch is
+// accepted only when its signature verifies for its stated anchor and realm.
+// The client trusts a claim only when covered by its pinned anchor. This is
+// not the full Trust::compute algorithm: membership is static, self-attested
+// peers, quorum, expiration, succession, rotation and retention are omitted.
+theory peer_admission
+begin
+builtins: signing
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule anchor:
+  [ Fr(~sk) ]
+  --[ AnchorCreated($realm,pk(~sk)) ]->
+  [ !AnchorKey($realm,~sk,pk(~sk)), Out(pk(~sk)) ]
+
+rule member:
+  [ ]
+  --[ MemberCreated($realm,$server) ]->
+  [ !RealmMember($realm,$server), Out(<$realm,$server>) ]
+
+rule compromise:
+  [ !AnchorKey(realm,sk,key) ]
+  --[ AnchorCompromised(realm,key) ]-> [ Out(sk) ]
+
+rule make_vouch:
+  [ !AnchorKey(realm,sk,key), !RealmMember(realm,server), In(serverkey) ]
+  --[ Issued(realm,key,server,serverkey) ]->
+  [ Out(<realm,key,server,serverkey,sign(<realm,server,serverkey>,sk)>) ]
+
+rule admit_claim:
+  [ !RealmMember(realm,server), In(serverkey) ]
+  --[ ClaimAdmitted(realm,server,serverkey) ]->
+  [ !Claim(realm,server,serverkey) ]
+
+rule admit_vouch:
+  [ In(<realm,key,server,serverkey,sig>) ]
+  --[ Eq(verify(sig,<realm,server,serverkey>,key),true),
+      VouchAdmitted(realm,key,server,serverkey) ]->
+  [ !Vouch(realm,key,server,serverkey) ]
+
+rule advertise:
+  [ !AnchorKey(realm,sk,pin), !Claim(realm,server,serverkey),
+    !Vouch(realm,pin,server,serverkey) ]
+  --[ Trusted(realm,pin,server,serverkey) ]-> [ ]
+
+lemma honest_trust: exists-trace
+  "Ex r a s k #i. Trusted(r,a,s,k) @i & not (Ex r2 a2 #j. AnchorCompromised(r2,a2) @j)"
+lemma admitted_claim_need_not_be_vouched: exists-trace
+  "Ex r s k #i. ClaimAdmitted(r,s,k) @i & not (Ex a #j. Issued(r,a,s,k) @j)"
+lemma pinned_advertisement_origin:
+  "All r a s k #i. Trusted(r,a,s,k) @i ==> (Ex #j. Issued(r,a,s,k) @j & #j < #i) | (Ex #j. AnchorCompromised(r,a) @j & #j < #i)"
+end

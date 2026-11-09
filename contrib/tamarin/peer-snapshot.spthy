@@ -1,0 +1,35 @@
+// Two-chunk snapshot integrity under an authenticated pinned digest. Hashing
+// and authenticated initial digest are idealized. Each distinct snapshot has
+// two chunks; bytes, lengths, upload, arbitrary chunk counts and concurrency
+// bounds are not modeled. Network chunks are attacker controlled.
+theory peer_snapshot
+begin
+builtins: hashing
+
+rule offer:
+  [ Fr(~first), Fr(~second) ]
+  --[ Offered(h(<~first,~second>),~first,~second) ]->
+  [ !Pinned(h(<~first,~second>)),
+    Out(<'0','2',h(<~first,~second>),~first>),
+    Out(<'1','2',h(<~first,~second>),~second>) ]
+
+rule receive_first:
+  [ !Pinned(digest), In(<'0','2',digest,first>) ]
+  --[ Started(digest,first) ]->
+  [ Partial(digest,first) ]
+
+rule receive_second:
+  [ Partial(h(<first,second>),first), In(<'1','2',h(<first,second>),second>) ]
+  --[ Completed(h(<first,second>),first,second) ]-> [ ]
+
+rule changed:
+  [ Partial(digest,first) ]
+  --[ Restarted(digest) ]-> [ ]
+
+lemma honest_transfer: exists-trace
+  "Ex d a b #i. Completed(d,a,b) @i"
+lemma completed_is_offered:
+  "All d a b #i. Completed(d,a,b) @i ==> (Ex #j. Offered(d,a,b) @j & #j < #i)"
+lemma restart_possible: exists-trace
+  "Ex d #i. Restarted(d) @i"
+end

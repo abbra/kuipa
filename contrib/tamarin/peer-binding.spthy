@@ -1,0 +1,43 @@
+// Symbolic peer request channel binding. A GSS authenticator is modeled as a
+// signature under the member credential, not as Kerberos itself. Hashes are
+// collision-free symbolic functions. The attacker controls network messages
+// and can replay or alter every field; member-key compromise is explicit.
+// This theory does not model delegation validity or membership changes.
+// Run under a memory-limited systemd cgroup; see README.
+theory peer_binding
+begin
+builtins: signing, hashing
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule setup:
+  [ Fr(~sk) ]
+  --[ MemberCreated($sender, pk(~sk)) ]->
+  [ !Member($sender, ~sk, pk(~sk)), Out(pk(~sk)) ]
+
+rule compromise:
+  [ !Member(sender, sk, key) ]
+  --[ Compromised(sender, key) ]-> [ Out(sk) ]
+
+rule send:
+  [ !Member(sender, sk, key), Fr(~nonce), Fr(~payload), Fr(~own), Fr(~epochs), In(receiver) ]
+  --[ Sent(sender, receiver, ~nonce, ~payload, h(~own), h(~epochs), key) ]->
+  [ Out(<sender, receiver, ~nonce, ~payload, h(~own), h(~epochs),
+         sign(h(<sender, receiver, ~nonce, ~payload, h(~own), h(~epochs)>), sk)>) ]
+
+rule receive:
+  [ !Member(sender, sk, key),
+    In(<sender, receiver, nonce, payload, ownhash, epochhash, token>) ]
+  --[ Eq(verify(token, h(<sender, receiver, nonce, payload, ownhash, epochhash>), key), true),
+      Accepted(sender, receiver, nonce, payload, ownhash, epochhash, key) ]-> [ ]
+
+lemma honest_exchange: exists-trace
+  "Ex s r n p d e k #i. Accepted(s,r,n,p,d,e,k) @i & not (Ex x y #j. Compromised(x,y) @j)"
+lemma request_binding:
+  "All s r n p d e k #i. Accepted(s,r,n,p,d,e,k) @i ==>
+   (Ex #j. Sent(s,r,n,p,d,e,k) @j & #j < #i) |
+   (Ex #j. Compromised(s,k) @j & #j < #i)"
+lemma compromised_forgery: exists-trace
+  "Ex s r n p d e k #i #j. Compromised(s,k) @i & Accepted(s,r,n,p,d,e,k) @j & #i < #j & not (Ex #t. Sent(s,r,n,p,d,e,k) @t)"
+end
