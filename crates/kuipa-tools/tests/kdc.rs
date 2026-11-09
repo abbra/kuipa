@@ -2101,6 +2101,11 @@ fn adopt_authenticates(world: &Scenario) {
     assert_eq!(out["realm"], REALM);
     assert_eq!(paths::State::load(&ok).unwrap().fqdn, host);
     assert_eq!(std::fs::read(ok.keytab()).unwrap(), before, "no rekey");
+    assert_eq!(
+        paths::read_anchors(&ok).unwrap(),
+        world.anchors,
+        "anchors pinned"
+    );
 
     // Another host's keytab does not authenticate this host.
     let other = keytab_for("adopt-other", &format!("host/other.example.test@{REALM}"));
