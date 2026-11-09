@@ -40,6 +40,14 @@
 //     rows -- a rogue realm states anything for anyone ("Not a server
 //     that cannot lie"), an honest verifier refuses it, and whoever
 //     pinned the rogue anchor accepts it.
+//   Attack_RogueAnchorSignsAnything's "verified" used to be vacuous:
+//     the existential its conclusion negated ranged over !Realm at a
+//     timepoint, a persistent premise observable at no index, so the
+//     negated existential was unreachable and true for free.  realm_setup now
+//     emits RealmRegistered(...) with the realm's anchor and signing
+//     key and the lemma reads that action instead -- same claim, now
+//     actually established.  All eight verdicts above are from the
+//     instrumented theory (contrib/ci/proofs.sh, ~13 s wall).
 
 theory sign
 begin
@@ -55,11 +63,17 @@ functions: sgn/2, vk/1, h/1
 
 rule realm_setup:
   [ Fr(~ask), Fr(~ssk) ]
-  --[ HonestRealm(vk(~ask)) ]->
+  --[ HonestRealm(vk(~ask)),
+      RealmRegistered($realm, ~ask, vk(~ask), ~ssk, vk(~ssk)) ]->
   [ !Realm($realm, ~ask, vk(~ask), ~ssk, vk(~ssk)) ]
   // the anchor and the server signing key its delegation names;  the
   // delegation itself is abstracted into the anchor -> key binding
-  // of this fact, verified "as of iat" (no clock)
+  // of this fact, verified "as of iat" (no clock).  RealmRegistered
+  // is the observable copy of that registration: !Realm is a
+  // persistent premise, observable at no timepoint, so the attack
+  // lemma's "a realm registered with this signing key" needs the
+  // action.  No premises, conclusions or Out() change here, so the
+  // transition system and the attacker's knowledge are unchanged.
 
 rule rogue_realm_setup:
   [ Fr(~ask), Fr(~ssk) ]
@@ -278,8 +292,15 @@ lemma Attack_RogueAnchorSignsAnything:
   "All realmR principal purpose digest svkR #i.
     RogueStated(realmR, principal, purpose, digest, svkR) @i
     ==> not(Ex realm2 ask avk ssk #j.
-      ( !Realm(realm2, ask, avk, ssk, svkR) @j
+      ( RealmRegistered(realm2, ask, avk, ssk, svkR) @j
         & Ex #k. Verified(realm2, principal, purpose, digest, svkR) @k ))"
+  // restated over RealmRegistered: !Realm is a persistent premise,
+  // so the old `!Realm(realm2, ...) @j` was observable at no index,
+  // the existential unreachable and the `not` vacuously true (the
+  // header claimed verified -- it was).  RealmRegistered is emitted
+  // exactly once per honest realm by realm_setup with the same tuple
+  // the !Realm fact holds, so "a realm registered with this signing
+  // key" means the same thing here.
   // (the honest-verifier side: a rogue statement never passes an
   // honest realm's anchors -- verified above)
 
