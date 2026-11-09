@@ -2832,10 +2832,21 @@ pub fn adopt(
             },
             None,
         ) {
-            Ok((_, adv, _)) => {
+            Ok((_, adv, epoch)) => {
                 check_deployment(server, &adv, deployment)?;
                 let mut servers = vec![server.clone()];
                 servers.extend(adv.info().servers.iter().filter(|s| *s != server).cloned());
+                // The host is a client of its realm too: without pinned
+                // anchors `kuipa seal` and the other verified calls fail.
+                let heads = anchors.iter().map(|a| (*a, None)).collect::<Vec<_>>();
+                write_windows(
+                    paths,
+                    epoch,
+                    &adv.info().realm,
+                    server,
+                    &heads,
+                    adv.proved_heads(),
+                )?;
                 State {
                     realm: adv.info().realm.clone(),
                     fqdn: fqdn.into(),
