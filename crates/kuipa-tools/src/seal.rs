@@ -1878,7 +1878,7 @@ impl<'a> SealClient<'a> {
     ///
     /// A paper too damaged to read, papers of different sets, fewer than
     /// the threshold readable.
-    fn gather_shares(words: &[String]) -> Result<(Vec<Share>, Vec<Value>), Error> {
+    pub(crate) fn gather_shares(words: &[String]) -> Result<(Vec<Share>, Vec<Value>), Error> {
         let mut read: Vec<Share> = Vec::new();
         let mut report = Vec::new();
         for text in words {

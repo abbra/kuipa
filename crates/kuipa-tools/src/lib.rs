@@ -1,6 +1,7 @@
 //! kuipa client tools for FreeIPA hosts.
 
 pub mod audit;
+pub mod backup;
 pub mod dns;
 pub mod escrow;
 pub mod flows;

@@ -513,6 +513,39 @@ step 0 "git verifies the commit offline" \
     'git -C "$KUIPA_PLAYGROUND/repo" verify-commit HEAD' \
     "Good signature by admin@EXAMPLE.TEST for git-commit"
 
+section "Backups sealed to paper" \
+    "A server backup is sealed to a recovery key kept on paper (DESIGN-backup.md), so that it opens after every server is lost, and the realm signs it, so that a planted file is refused before anything is decrypted. Making the key needs no ticket and registers nothing. Opening needs the papers, their passphrase, and the realm card's anchors: a host with no enrollment at all does it."
+step 0 "Make the realm's backup recovery key: three papers, two of which are enough" \
+    'b="$KUIPA_PLAYGROUND/backup" && mkdir -p "$b" && echo "six honest words to open the papers" > "$b/words" && kuipa backup key create --realm EXAMPLE.TEST --threshold 2 --shares 3 --recovery-file "$b/words" -o "$b/recipient.json" | tee "$b/all.txt"' \
+    "Backup recovery key" "any 2 are needed"
+step 0 "Each paper is kept as its own page" \
+    "python3 -c \"import sys;[open(sys.argv[1]+'/paper-'+str(k+1),'w').write(p.strip()+chr(10)) for k,p in enumerate(p for p in sys.stdin.read().split(chr(10)*2) if p.startswith('kuipa backup recovery'))]\" \"\$b\" < \"\$b/all.txt\" && ls \"\$b\"" \
+    "paper-1" "paper-3"
+step 0 "The papers are checked before they are trusted" \
+    '{ cat "$b/paper-1"; echo; cat "$b/paper-3"; } | kuipa backup key check --recipient "$b/recipient.json" --recovery-file "$b/words"' \
+    "Those papers recover the key"
+step 1 "A wrong recovery passphrase does not make that key" \
+    'echo "five dishonest words" > "$b/lies" && { cat "$b/paper-1"; echo; cat "$b/paper-3"; } | kuipa backup key check --recipient "$b/recipient.json" --recovery-file "$b/lies"' \
+    "is wrong"
+step 0 "A backup is sealed with only the public half, and the realm signs it with its header" \
+    'head -c 400000 /dev/urandom > "$b/ipa-full.tar" && echo "ipa-backup header" > "$b/header" && kuipa backup seal --recipient "$b/recipient.json" -o "$b/ipa-full.tar.kuipa" < "$b/ipa-full.tar" && kuipa sign blob --purpose ipa-backup "$b/ipa-full.tar.kuipa" "$b/header"' \
+    "Signed by admin@EXAMPLE.TEST for ipa-backup"
+step 0 "The card names the realm and its anchors: it is kept with the papers" \
+    'kuipa backup card --recipient "$b/recipient.json" | tee "$b/card.txt"' \
+    "anchor" "recovery key"
+step 0 "On a host with no enrollment, two papers and the card's anchor open the backup" \
+    'a=$(kuipa --json backup card | python3 -c "import json,sys;print(json.load(sys.stdin)[\"anchors\"][0])") && { cat "$b/paper-1"; echo; cat "$b/paper-3"; } | KUIPA_ROOT="$b/nowhere" kuipa backup open "$b/ipa-full.tar.kuipa" --also "$b/header" --realm EXAMPLE.TEST --anchor "$a" --signer admin --out "$b/restored.tar" --recovery-file "$b/words" && cmp "$b/ipa-full.tar" "$b/restored.tar" && echo restored identical' \
+    "after its signature verified" "restored identical"
+step 1 "A backup someone planted is refused at the signature, before the papers are asked for" \
+    'cp "$b/ipa-full.tar.kuipa" "$b/planted.kuipa" && cp "$b/ipa-full.tar.kuipa.kusig" "$b/planted.kuipa.kusig" && printf x >> "$b/planted.kuipa" && kuipa backup open "$b/planted.kuipa" --out "$b/never.tar" < /dev/null' \
+    "does not match"
+step 1 "A signature for another purpose is not a backup's" \
+    'cp "$b/ipa-full.tar.kuipa" "$b/other.kuipa" && kuipa sign blob --purpose blob "$b/other.kuipa" && kuipa backup open "$b/other.kuipa" --out "$b/never.tar" < /dev/null' \
+    "purpose a backup needs"
+step 1 "An anchor the realm does not have verifies nothing" \
+    'k=$(kuipa --json backup card --recipient "$b/recipient.json" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"recovery_key\"])") && kuipa backup open "$b/ipa-full.tar.kuipa" --realm EXAMPLE.TEST --anchor "$k" --out "$b/never.tar" < /dev/null' \
+    "not signed by a trusted realm anchor"
+
 section "Failover" \
     "With ipa1 unreachable, web2 enrolls through ipa2: every server presents an advertisement that ipa1's anchor vouches for.  Enrolled, web2 must then keep verifying ipa2 with the anchors it pinned — not the one anchor of the enrollment string it was issued, whose server is the one that is down."
 step 0 "Make ipa1 unreachable" 'pq_down ipa1'

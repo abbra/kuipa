@@ -136,6 +136,30 @@ impl Digest {
         })
     }
 
+    /// The digest of everything `data` yields under `alg`, without holding
+    /// it: for a backup of gigabytes.
+    ///
+    /// # Errors
+    ///
+    /// An OpenSSL or I/O error.
+    pub fn of_reader(alg: DigestAlg, mut data: impl std::io::Read) -> Result<Self> {
+        let md = native_ossl::digest::DigestAlg::fetch(alg.openssl_name(), None)?;
+        let mut ctx = md.new_context()?;
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            match data.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => ctx.update(&buf[..n])?,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(Error::Io(e.to_string())),
+            }
+        }
+        let mut value = vec![0u8; md.output_len()];
+        let n = ctx.finish(&mut value)?;
+        value.truncate(n);
+        Ok(Self { alg, value })
+    }
+
     /// Its leaf in a statement's batch tree of `tree`, the signing
     /// server's hash: `H(0x00 ‖ IPGL ‖ 1 ‖ alg ‖ value)`.
     ///
@@ -571,7 +595,23 @@ impl Bundle {
         anchors: &[Thumbprint],
         policy: &CryptoPolicy,
     ) -> Result<Verified> {
-        if Digest::of(self.digest.alg, data)? != self.digest {
+        self.verify_digest(&Digest::of(self.digest.alg, data)?, realm, anchors, policy)
+    }
+
+    /// [`verify`](Self::verify) for data already digested with
+    /// [`Digest::of_reader`] under the bundle's algorithm.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify`](Self::verify).
+    pub fn verify_digest(
+        &self,
+        data: &Digest,
+        realm: &str,
+        anchors: &[Thumbprint],
+        policy: &CryptoPolicy,
+    ) -> Result<Verified> {
+        if *data != self.digest {
             return Err(Error::Mismatch("signed data"));
         }
         if !self.in_batch()? {
@@ -829,6 +869,17 @@ mod tests {
     use tang_pqc::{Policy, SignatureAlg};
 
     use super::*;
+
+    #[test]
+    fn a_streamed_digest_is_the_whole_digest() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| i.to_le_bytes()[0]).collect();
+        for alg in [DigestAlg::Sha256, DigestAlg::Sha384, DigestAlg::Sha512] {
+            assert_eq!(
+                Digest::of_reader(alg, &data[..]).unwrap(),
+                Digest::of(alg, &data).unwrap()
+            );
+        }
+    }
 
     const REALM: &str = "EXAMPLE.TEST";
     const NOW: u64 = 1_800_000_000;

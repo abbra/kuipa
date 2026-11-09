@@ -54,7 +54,17 @@ usage.
 |---|---|
 | `tlog watch SEAL` | what every server logged about your seal since the last watch; flags what your stored description does not account for |
 | `sign blob [--purpose P] FILE…` | have a realm server state, under your ticket, that you signed the files; writes `FILE.kusig` |
-| `sign verify FILE [--signature S] [--signer U] [--purpose P]` | check a signature offline with this host's pinned anchors |
+| `sign verify FILE [--signature S] [--realm R --anchor T…] [--signer U] [--purpose P]` | check a signature offline with this host's pinned anchors, or with those given |
+
+## kuipa backup (realm administrators)
+
+| command | does |
+|---|---|
+| `backup key create --realm R -o FILE` | make the backup recovery key; print its papers; write the recipient file |
+| `backup key check --recipient FILE` | check papers read from standard input |
+| `backup seal --recipient FILE… -o FILE` | seal standard input to the recovery keys |
+| `backup open FILE -o OUT [--also F…] [--realm R --anchor T…]` | verify the signature, read papers, open the backup |
+| `backup card [--recipient FILE]` | print the realm, its anchors and the key id, to keep with the papers |
 
 ## kuipa-gitsign
 

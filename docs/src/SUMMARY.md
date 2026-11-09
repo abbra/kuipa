@@ -15,6 +15,7 @@
 - [Trusted realms](realm/trusts.md)
 - [Limits and revocation](realm/limits.md)
 - [Auditing and mirroring](realm/audit.md)
+- [Backups sealed to paper](realm/backup.md)
 
 # Host administrators
 

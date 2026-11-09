@@ -26,6 +26,8 @@ pub enum Error {
     BadResponse,
     /// A recipient key or secret cannot open this bundle.
     WrongRecipient,
+    /// Reading or writing a stream failed.
+    Io(String),
     /// A required item is missing (e.g. no join key in the advertisement).
     Missing(&'static str),
     /// The operation needs an explicit opt-in (e.g. a signed-only bundle).
@@ -65,6 +67,7 @@ impl fmt::Display for Error {
             Self::Refused => f.write_str("the server refused the request"),
             Self::BadResponse => f.write_str("the server response is not valid for this request"),
             Self::WrongRecipient => f.write_str("this key or secret cannot open the bundle"),
+            Self::Io(why) => write!(f, "i/o: {why}"),
             Self::Missing(what) => write!(f, "missing {what}"),
             Self::Insecure(what) => write!(f, "{what} requires an explicit opt-in"),
             Self::PeerSync(what) => write!(f, "peer sync refused: {what}"),
