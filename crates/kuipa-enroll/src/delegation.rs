@@ -1778,6 +1778,29 @@ mod tests {
     /// `peer-validity.smt2` models this check with bitvector arithmetic.
     /// Keep the skew and the maximum period the model hardcodes in sync
     /// with the constants this code actually uses.
+    #[test]
+    fn validity_smt_model_matches_constants() {
+        let model = include_str!("../../../contrib/tamarin/peer-validity.smt2");
+        assert!(
+            model.contains(&format!(
+                "(define-fun skew () (_ BitVec 64) (_ bv{CLOCK_SKEW} 64))"
+            )),
+            "peer-validity.smt2 must use the same clock skew as valid_at"
+        );
+        assert!(
+            model.contains("(declare-const max-period (_ BitVec 64))"),
+            "peer-validity.smt2 must leave the period limit symbolic; \
+             check_period's limit is the caller-supplied `max`"
+        );
+        // The period query is meaningful only under the longest accepted
+        // period; the model's own bound stays symbolic, so assert the
+        // largest value the caller may pass.
+        assert!(
+            model.contains(&format!("(_ bv{MAX_VALIDITY} 64)")),
+            "peer-validity.smt2's rollback witness is sized for MAX_VALIDITY = {MAX_VALIDITY} seconds"
+        );
+    }
+
     fn key() -> SigningKey {
         SigningKey::generate(SignatureAlg::MlDsa65).unwrap()
     }
