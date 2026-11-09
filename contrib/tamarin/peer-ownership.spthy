@@ -1,0 +1,54 @@
+// One realm, one anchor, and two servers in Trust::admit. A single owner
+// slot determines which claim is anchored; both are unanchored when free.
+// Replacements are assumed newer; timestamp ordering, trust propagation,
+// additional anchors, signatures and membership are not modeled.
+// Reassignment and replacement witnesses and ownership provenance verify;
+// release-safety across different observed owners remains unproved. That goal's
+// status is not fully settled either: its generated antecedent probe (contrib/ci/
+// vacuity-probes.py) exhausts the search (exit 137 at 8 GiB, 100-550 s), so the
+// antecedent is shown neither reachable nor unreachable - the goal is not known
+// to be vacuous, and it is not known to be a real obligation.
+theory peer_ownership
+begin
+
+// The prior-owner tag is ghost state; it does not affect admission.
+rule initialize:
+  [ Fr(~realm), Fr(~anchor) ]
+  --[ Initialized(~realm,~anchor) ]->
+  [ Free(~realm,~anchor,'initial'), !Server('alice'), !Server('bob') ]
+
+rule claim_anchor:
+  [ Free(realm,anchor,prior), !Server(server) ]
+  --[ AnchorClaimed(realm,anchor,server), ClaimedFrom(realm,anchor,server,prior) ]->
+  [ Owned(realm,anchor,server) ]
+
+rule replace_with_unanchored:
+  [ Owned(realm,anchor,server) ]
+  --[ AnchorReleased(realm,anchor,server), OwnerActive(realm,anchor,server) ]->
+  [ Free(realm,anchor,<'previous',server>) ]
+
+rule replace_anchored_claim:
+  [ Owned(realm,anchor,server) ]
+  --[ AnchoredClaimReplaced(realm,anchor,server), OwnerActive(realm,anchor,server) ]->
+  [ Owned(realm,anchor,server) ]
+
+rule observe_owner:
+  [ Owned(realm,anchor,server) ]
+  --[ OwnerObserved(realm,anchor,server), OwnerActive(realm,anchor,server) ]->
+  [ Owned(realm,anchor,server) ]
+
+lemma prior_owner_was_released [reuse]:
+  "All r a s previous #i. ClaimedFrom(r,a,s,<'previous',previous>) @i ==> (Ex #j. AnchorReleased(r,a,previous) @j & #j < #i)"
+lemma active_has_prior_claim [use_induction, reuse]:
+  "All r a s #i. OwnerActive(r,a,s) @i ==> (Ex #j. AnchorClaimed(r,a,s) @j & #j < #i)"
+lemma release_has_prior_claim:
+  "All r a s #i. AnchorReleased(r,a,s) @i ==> (Ex #j. AnchorClaimed(r,a,s) @j & #j < #i)"
+lemma owner_has_prior_claim:
+  "All r a s #i. OwnerObserved(r,a,s) @i ==> (Ex #j. AnchorClaimed(r,a,s) @j & #j < #i)"
+lemma reassignment_witness: exists-trace
+  "Ex r a #i #j #k #l. AnchorClaimed(r,a,'alice') @i & AnchorReleased(r,a,'alice') @j & AnchorClaimed(r,a,'bob') @k & OwnerObserved(r,a,'bob') @l & #i < #j & #j < #k & #k < #l"
+lemma replacement_witness: exists-trace
+  "Ex r a #i #j #k. AnchorClaimed(r,a,'alice') @i & AnchoredClaimReplaced(r,a,'alice') @j & OwnerObserved(r,a,'alice') @k & #i < #j & #j < #k"
+lemma changed_owner_requires_release [use_induction]:
+  "All r a s1 s2 #i #j. OwnerObserved(r,a,s1) @i & OwnerObserved(r,a,s2) @j & not (s1 = s2) & #i < #j ==> (Ex #k. AnchorReleased(r,a,s1) @k & #i < #k & #k < #j)"
+end

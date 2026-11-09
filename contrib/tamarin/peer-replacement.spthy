@@ -1,0 +1,57 @@
+// Two replicas and three totally ordered versions of one vouch or succession.
+// The order abstracts the (iat, encoded bytes) comparison in AnchorState.
+// Admission, pruning, message delivery and concrete byte ordering are omitted.
+//
+// Verified: for the maximum version, the received next-version is the maximum
+// (maximum_is_not_replaced); that both replicas take both orders in one trace
+// (both_orders_converge).
+// Open, and neither is refuted: the two persistence claims below. Both were
+// reported verified earlier with maximum_persists marked [reuse] after
+// after_maximum_holds_maximum, which is open - [reuse] injects a lemma's
+// statement into later proofs whether or not that lemma was proved, so the
+// second verdict rested on an unproved assumption. With neither marked [reuse]
+// and nothing assumed, both exhaust the search (exit 137 at 8 GiB, 700-1300 s).
+// The obstruction is the same shape as in peer-cache: the claim is about a chain
+// of observations, and an induction over it needs the step between two adjacent
+// observations, which these statements do not name. Whether either is vacuous is
+// UNKNOWN rather than settled: the generated antecedent probes (contrib/ci/
+// vacuity-probes.py) both exhaust the search (exit 137 at 8 GiB, 100-550 s), so
+// the antecedents are shown neither reachable nor unreachable. Contrast
+// peer-rotation and peer-membership, where the same probes verify in seconds and
+// the open goals there are demonstrably non-vacuous.
+theory peer_replacement
+begin
+
+rule order:
+  [ ] --> [ !Version('0'), !Version('1'), !Version('2'),
+    !Max('0','0','0'), !Max('0','1','1'), !Max('0','2','2'),
+    !Max('1','0','1'), !Max('1','1','1'), !Max('1','2','2'),
+    !Max('2','0','2'), !Max('2','1','2'), !Max('2','2','2') ]
+
+rule initialize:
+  [ Fr(~session) ] --[ Initialized(~session) ]->
+  [ Replica(~session,'left','0'), Replica(~session,'right','0') ]
+
+rule receive:
+  [ Replica(session,replica,current), !Version(incoming), !Max(current,incoming,next) ]
+  --[ Received(session,replica,current,incoming,next), ReplicaObs(session,replica,current), ReplicaObs(session,replica,next) ]->
+  [ Replica(session,replica,next) ]
+
+// Versions are distinct and totally ordered here, so the held maximum is
+// stable. `EntryVersion::replaces` also admits same-iat replacement;
+// peer-replacement.smt2 covers that case with the real iat field.
+lemma maximum_is_not_replaced:
+  "All id replica incoming next #i. Received(id,replica,'2',incoming,next) @i ==> next = '2'"
+lemma both_orders_converge: exists-trace
+  "Ex id #i #j #k #l. Received(id,'left','0','1','1') @i & Received(id,'left','1','2','2') @j & Received(id,'right','0','2','2') @k & Received(id,'right','2','1','2') @l & #i < #j & #k < #l"
+// The state (which version a replica holds) is observable only through the
+// ReplicaObs actions the receive rule emits for the version it consumes and the
+// one it leaves: a fact that appears only in premises and conclusions is
+// observable at no index, so a goal written over Replica(...) @ k holds
+// vacuously. Once a replica holds the maximum, no later observation shows it
+// holding anything else.
+lemma after_maximum_holds_maximum [use_induction]:
+  "All id replica current incoming v #i #k. ReplicaObs(id,replica,v) @k & Received(id,replica,current,incoming,'2') @i & #i < #k ==> v = '2'"
+lemma maximum_persists [use_induction]:
+  "All id replica current incoming old offer next #i #j #k. ReplicaObs(id,replica,old) @k & Received(id,replica,old,offer,next) @j & Received(id,replica,current,incoming,'2') @i & #i < #j ==> old = '2'"
+end

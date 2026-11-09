@@ -1,0 +1,57 @@
+// Two claims, one modeled anchor, its vouch and key in AnchorState::retain.
+// Each claim independently names that anchor or does not. Membership, realm,
+// validity and signature checks are assumed to pass; grace is a per-pass oracle
+// and vouch coverage changes only on replacement. Replacement is assumed newer
+// and valid. Other vouches and keys, succession, timestamps and Merkle proofs
+// are not modeled.
+theory peer_pruning
+begin
+rule bits:
+  [ ] --> [ !Bit('yes'), !Bit('no'),
+            !Both('yes','yes','yes'), !Both('yes','no','no'),
+            !Both('no','yes','no'), !Both('no','no','no'),
+            !Either('yes','yes','yes'), !Either('yes','no','yes'),
+            !Either('no','yes','yes'), !Either('no','no','no') ]
+
+rule initialize:
+  [ Fr(~state), !Bit(first), !Bit(second), !Bit(names1), !Bit(names2),
+    !Bit(cover1), !Bit(cover2) ]
+  --[ Initialized(~state,first,second) ]->
+  [ State(~state,first,second,'yes','yes',names1,names2,cover1,cover2) ]
+
+rule replace_vouch:
+  [ State(id,first,second,'yes','yes',names1,names2,old1,old2),
+    !Bit(new1), !Bit(new2) ]
+  --[ VouchReplaced(id,old1,old2,new1,new2) ]->
+  [ State(id,first,second,'yes','yes',names1,names2,new1,new2) ]
+
+// Vouches are filtered against claims before uncovered claims are removed.
+rule retain:
+  [ State(id,first,second,vouch,key,names1,names2,cover1,cover2),
+    !Bit(grace1), !Bit(grace2), !Both(first,names1,named1),
+    !Both(second,names2,named2), !Either(named1,named2,named),
+    !Both(vouch,named,vnext), !Both(vnext,cover1,covered1),
+    !Both(vnext,cover2,covered2), !Either(grace1,covered1,keep1),
+    !Either(grace2,covered2,keep2), !Both(first,keep1,fnext),
+    !Both(second,keep2,snext), !Both(fnext,names1,ref1),
+    !Both(snext,names2,ref2), !Either(ref1,ref2,claims),
+    !Either(claims,vnext,referenced), !Both(key,referenced,knext) ]
+  --[ Retained(id,first,second,vouch,key,fnext,snext,vnext,knext),
+      ClaimNames(id,names1,names2), VouchCoverage(id,cover1,cover2) ]->
+  [ State(id,fnext,snext,vnext,knext,names1,names2,cover1,cover2) ]
+
+lemma retained_vouch_was_named:
+  "All id f s v k fn sn kn n1 n2 #i. Retained(id,f,s,v,k,fn,sn,'yes',kn) @i & ClaimNames(id,n1,n2) @i ==> (f = 'yes' & n1 = 'yes') | (s = 'yes' & n2 = 'yes')"
+lemma retained_claim_was_present:
+  "All id f s v k sn vn kn #i. Retained(id,f,s,v,k,'yes',sn,vn,kn) @i ==> f = 'yes'"
+lemma orphan_vouch_then_pruned: exists-trace
+  "Ex id f s v k #i #j. Retained(id,f,s,v,k,'no','no','yes','yes') @i & Retained(id,'no','no','yes','yes','no','no','no','no') @j & #i < #j"
+lemma two_claims_remain: exists-trace
+  "Ex id f s v k #i. Retained(id,f,s,v,k,'yes','yes','yes','yes') @i"
+lemma removed_anchor_claim_temporarily_supports_other: exists-trace
+  "Ex id #i #j. Retained(id,'yes','yes','yes','yes','no','yes','yes','yes') @i & ClaimNames(id,'yes','no') @i & Retained(id,'no','yes','yes','yes','no','no','no','no') @j & #i < #j"
+lemma replacement_then_claim_pruned: exists-trace
+  "Ex id old2 new2 #i #j. VouchReplaced(id,'yes',old2,'no',new2) @i & Retained(id,'yes','yes','yes','yes','no','yes','yes','yes') @j & #i < #j"
+lemma replacement_can_remove_coverage: exists-trace
+  "Ex id old2 new2 #i #j #k. Retained(id,'yes','yes','yes','yes','yes','yes','yes','yes') @i & VouchCoverage(id,'yes',old2) @i & VouchReplaced(id,'yes',old2,'no',new2) @j & Retained(id,'yes','yes','yes','yes','no','yes','yes','yes') @k & VouchCoverage(id,'no',new2) @k & #i < #j & #j < #k"
+end

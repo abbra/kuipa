@@ -1,0 +1,269 @@
+// One receiver's per-sender cache for one peer: initialize, replace, restart,
+// refill, cached, miss. The earlier formulation put the content in the state
+// fact (Cache(s,r,d,e,incarnation)) and left every guarantee to be stated over
+// actions. That was unprovable here: an action-level goal whose subject appears
+// only in action facts and in facts with varying arguments gives induction
+// nothing to follow.
+//
+// A trace formula can only refer to action facts. The manual is explicit: the
+// application of a rule "is recorded in the trace by appending the instantiated
+// action facts", and a trace property is a guarded first-order formula "over
+// action facts and timepoints". Measured on two-rule theories (Tamarin 1.12.0,
+// every verdict at exit 0): a fact that appears only in a rule's premises and
+// conclusions is observable at NO index - not at its creating step, not at its
+// consuming step, not at an unrelated later step. That holds for persistent
+// facts too: a never-consumed !Keep(x) has no index at which it is observable.
+// So any statement over "Slot(s,r,st,inc) @t" or "Content(s,r,d,e) @t" holds
+// vacuously. This file used to rest on such statements; they are gone, and the
+// earlier claim that a fact is "observable strictly between the steps that
+// create and consume it" was wrong - there is no such window.
+//
+// The state is made trace-relevant by observing it: every rule that acts on a
+// slot emits SlotObs(sender,receiver,'held'|'empty',incarnation) for the state
+// it consumes and, where it changes, the state it leaves. Premises, conclusions
+// and Out facts are unchanged, so the transition system, the reachable states
+// and the adversary's knowledge are exactly as before; only observations are
+// added. Every lemma is then stated over actions, and the bridges below tie
+// each action to the state it acted on at its own step.
+//
+// One consequence to keep in mind: restart emits held and empty for the same
+// incarnation at one step, which is legitimate - that step is where held
+// becomes empty. An invariant forbidding that pair is therefore FALSE: checked,
+// both "one slot never reports both states" and "never empty then held" read
+// over SlotObs are refuted. The true statement is directional - an incarnation
+// observed empty is never observed held at a LATER step.
+//
+// Verified (see the order below: every [reuse] source precedes what uses it):
+// each cache action occurs at a step observing the state it names (the
+// current/empty/ended/started/resolved bridges, 3-9 steps); those observations
+// really occur, including a held one followed later by an empty one (three
+// witnesses); a cached resolution, a restart then a miss; an incarnation start for
+// one pair is unique; every observation of a slot holding an incarnation traces to
+// a start of it at or before that step, hence an end action traces to an earlier
+// start; a current action traces to an earlier start; a miss records an earlier
+// end; an end is observed holding and is followed at the same step by empty; a
+// resolution traces to an earlier delivery; a refill follows the restart that
+// emptied the slot.
+// Open at 8 GiB, exit 137 (a cgroup kill, not a timeout) at every budget tried
+// from 400 to 1300 seconds, and none is refuted:
+// - the two forms of "an incarnation observed empty or ended is never observed
+//   held again" (no_held_obs_after_empty, no_held_obs_after_end). Each verifies
+//   ONLY when the other stands above it as a [reuse] source; with neither
+//   assumed both exhaust the search. That is circular, so neither is a proof:
+//   [reuse] injects a lemma's statement into later proofs whether or not that
+//   lemma was proved, and in per-lemma mode an earlier [reuse] lemma is never
+//   attempted in the same process, so it is only ever an assumption. Both are
+//   now without [reuse] and reported open, so that nothing below can assume them.
+// - the two consequences that used to read them as sources
+//   (empty_incarnation_not_current_afterward, cache_incarnation_active). A
+//   contrapositive shape (positive observation at the induction index, negated
+//   existential) and an adjacency-bounded shape were both tried on these and
+//   exhausted the search too.
+// - no_resolution_after_restart_without_refill, and restart_refill_resolves_
+//   witness (its restart -> refill half verifies alone; its refill -> resolution
+//   half does not).
+// [use_induction] was added to restart_refill_resolves_witness in case the
+// admission theories' fix applied here; it did not (137 at 500 s), and an
+// exists-trace has no induction to steer. Confined restatements of the
+// resolution goals (delivery between restart and resolution; the delivery a
+// resolution rests on with no restart in between; the same keyed on the empty
+// observation) and a witness with the principals pinned to constants all
+// exhausted the search too.
+// Antecedent reachability of these six, from generated probes
+// their antecedents are satisfiable, asserted in this file as
+// Nonvac_no_held_obs_after_empty and Nonvac_no_held_obs_after_end (generated by
+// contrib/ci/vacuity-probes.py: exists-trace of the antecedent alone, the
+// conclusion's ordering removed):
+// the other three probes exhaust the limit (exit 137 at 8 GiB, 100-550 s), so
+// those three remain of unknown status rather than known-vacuous. (Five probes:
+// the restart -> refill -> resolution witness has no antecedent to probe.) A probe that
+// does not finish is not evidence of vacuity, exactly as a failed proof is not
+// evidence of falsity.
+// All six open goals have the same shape: a claim about a
+// chain of observations whose induction step is the gap between two adjacent
+// observations, which no statement here names. Closing them needs that stronger
+// simultaneous induction, not more time or memory. A single combined form with a
+// disjunctive antecedent does not parse: unguarded #i.
+// One statement that had been open at every limit tried closed by restating it,
+// not by raising limits: refill_follows_restart quantified over two starts and
+// never named the refill step, so the search had to consider every pair of starts
+// in every interleaving; the confined form (refill_follows_prior_restart) puts
+// that one action in the antecedent and verifies in 141 seconds.
+// Lemma order is part of a result here: with [reuse], a lemma may only use
+// sources written above it, and this file's order is chosen so each chain lemma
+// follows its sources. Do not reorder without re-running.
+//
+// Proof skeletons do parse in this version, but not the way the manual's prose
+// suggests: a skeleton is a BARE method chain after the formula (simplify /
+// solve( Fact( args ) @ #t ) / case rule / SOLVED / qed); 'by' is only a
+// complete standalone suffix form, which is why 'by solve( ... )' fails to
+// parse while 'by sorry' does. Forcing the action -> rule case split that way
+// was tried on two of the open goals above and did not close them.
+theory peer_cache
+begin
+builtins: hashing
+
+restriction UniqueCache:
+  "All s r #i #j. Initialized(s,r) @i & Initialized(s,r) @j ==> #i = #j"
+
+rule initialize:
+  [ Fr(~delegation), Fr(~epochs), Fr(~incarnation) ]
+  --[ Initialized($sender,$receiver), Full($sender,$receiver,h(~delegation),h(~epochs)), CacheStarted($sender,$receiver,~incarnation), SlotObs($sender,$receiver,'held',~incarnation) ]->
+  [ Slot($sender,$receiver,'held',~incarnation), Content($sender,$receiver,~delegation,~epochs), Out(<~delegation,~epochs>) ]
+
+rule replace:
+  [ Slot(sender,receiver,'held',incarnation), Content(sender,receiver,old,oldepochs), Fr(~delegation), Fr(~epochs) ]
+  --[ Full(sender,receiver,h(~delegation),h(~epochs)), CacheCurrent(sender,receiver,incarnation), SlotObs(sender,receiver,'held',incarnation) ]->
+  [ Slot(sender,receiver,'held',incarnation), Content(sender,receiver,~delegation,~epochs), Out(<~delegation,~epochs>) ]
+
+// Restart ends the incarnation holding the cache. No action names it current on
+// that step, and the cached pair is dropped: an empty cache holds no content.
+rule restart:
+  [ Slot(sender,receiver,'held',incarnation), Content(sender,receiver,d,e) ]
+  --[ Restart(sender,receiver), CacheEnded(sender,receiver,incarnation), SlotObs(sender,receiver,'held',incarnation), SlotObs(sender,receiver,'empty',incarnation) ]->
+  [ Slot(sender,receiver,'empty',incarnation) ]
+
+// Refill leaves the previous incarnation behind: it observes that slot empty and
+// the new one held. It does not emit CacheEmpty for the previous incarnation;
+// the record of emptiness belongs to the restart that created it.
+rule refill:
+  [ Slot(sender,receiver,'empty',previous), Fr(~delegation), Fr(~epochs), Fr(~incarnation) ]
+  --[ Full(sender,receiver,h(~delegation),h(~epochs)), CacheStarted(sender,receiver,~incarnation), CacheRefilled(sender,receiver,previous,~incarnation,h(~delegation),h(~epochs)), SlotObs(sender,receiver,'empty',previous), SlotObs(sender,receiver,'held',~incarnation) ]->
+  [ Slot(sender,receiver,'held',~incarnation), Content(sender,receiver,~delegation,~epochs), Out(<~delegation,~epochs>) ]
+
+rule cached:
+  [ Slot(sender,receiver,'held',incarnation), Content(sender,receiver,d,e), In(<h(d),h(e)>) ]
+  --[ Resolved(sender,receiver,h(d),h(e)), CacheCurrent(sender,receiver,incarnation), SlotObs(sender,receiver,'held',incarnation) ]->
+  [ Slot(sender,receiver,'held',incarnation), Content(sender,receiver,d,e) ]
+
+rule miss:
+  [ Slot(sender,receiver,'empty',incarnation), In(<dh,eh>) ]
+  --[ NeedContext(sender,receiver,dh,eh), CacheEmpty(sender,receiver,incarnation), SlotObs(sender,receiver,'empty',incarnation) ]->
+  [ Slot(sender,receiver,'empty',incarnation) ]
+
+// The bridges: each cache action occurs at a step that observes the state it
+// names. They hold by construction of the rules, and they are what makes the
+// state reachable to a trace formula.
+// Non-vacuity, before anything is marked [reuse]: the observed states really
+// occur, in the order the protocol produces them, and the cache operations
+// themselves are reachable. Without these the invariants below would be
+// unreadable as guarantees.
+// One pair starts one incarnation.
+// Every observation of a slot holding an incarnation traces to a start of it at
+// or before that step: initialize emits both at one step, which is why the
+// non-strict form is the one that holds. Composed with ended_obs_at_step this
+// gives the start of an incarnation that was ended.
+// Provenance of the cache-generation actions: what a request saw as current, and
+// what a miss found empty, both trace back to an earlier step.
+// Lifetime of one incarnation, stated over the state observations: an action
+// that names it current is supported by a held observation at or before that
+// step; a step that ends it is observed holding and leaves it empty; after an
+// end or an empty observation the slot is never observed holding it again.
+// The action-level consequences: no request finds an incarnation current after
+// it ended or after the cache was seen empty for it, and no current action
+// precedes that incarnation's end.
+// Two history claims stay open, and neither is refuted: the refill that starts a
+// new incarnation follows the restart that emptied the cache, and a resolution
+// after a restart follows a delivery. Both quantify over which earlier step
+// produced the state now acted on rather than over the state at the acting
+// step, so the bridges above do not reach them. The second also names a
+// delivered pair, which this theory records only as an action.
+// Every resolution traces to an earlier delivery of that pair.
+lemma current_obs_at_step [use_induction]:
+  "All s r incarnation #i. CacheCurrent(s,r,incarnation) @i ==> SlotObs(s,r,'held',incarnation) @i"
+lemma empty_obs_at_step [use_induction]:
+  "All s r incarnation #i. CacheEmpty(s,r,incarnation) @i ==> SlotObs(s,r,'empty',incarnation) @i"
+lemma ended_obs_at_step [use_induction]:
+  "All s r incarnation #i. CacheEnded(s,r,incarnation) @i ==> SlotObs(s,r,'held',incarnation) @i"
+lemma started_obs_at_step [use_induction]:
+  "All s r incarnation #i. CacheStarted(s,r,incarnation) @i ==> SlotObs(s,r,'held',incarnation) @i"
+lemma resolved_obs_at_step [use_induction]:
+  "All s r dh eh #i. Resolved(s,r,dh,eh) @i ==> (Ex inc. SlotObs(s,r,'held',inc) @i)"
+
+lemma w_obs_held [use_induction]:
+  exists-trace "Ex s r inc #t. SlotObs(s,r,'held',inc) @t"
+lemma w_obs_empty [use_induction]:
+  exists-trace "Ex s r inc #t. SlotObs(s,r,'empty',inc) @t"
+lemma w_both_obs [use_induction]:
+  exists-trace "Ex s r inc #k #t. SlotObs(s,r,'held',inc) @k & SlotObs(s,r,'empty',inc) @t & #k < #t"
+lemma honest_cached: exists-trace
+  "Ex s r d e #i. Resolved(s,r,d,e) @i"
+lemma restart_miss: exists-trace
+  "Ex s r d e #i #j. Restart(s,r) @i & NeedContext(s,r,d,e) @j & #i < #j"
+lemma restart_refill_resolves_witness: exists-trace
+  "Ex s r old new d e #i #j #k. Restart(s,r) @i & CacheEnded(s,r,old) @i & CacheRefilled(s,r,old,new,d,e) @j & Resolved(s,r,d,e) @k & CacheCurrent(s,r,new) @k & #i < #j & #j < #k"
+
+lemma cache_incarnation_unique:
+  "All s r s2 r2 incarnation #i #j. CacheStarted(s,r,incarnation) @i & CacheStarted(s2,r2,incarnation) @j ==> #i = #j"
+
+lemma held_obs_has_start [use_induction, reuse]:
+  "All s r incarnation #t. SlotObs(s,r,'held',incarnation) @t ==> (Ex #j. CacheStarted(s,r,incarnation) @j & (#j < #t | #j = #t))"
+lemma cache_incarnation_end_has_start:
+  "All s r incarnation #i. CacheEnded(s,r,incarnation) @i ==> (Ex #j. CacheStarted(s,r,incarnation) @j & #j < #i)"
+
+lemma cache_incarnation_source [use_induction, reuse]:
+  "All s r incarnation #i. CacheCurrent(s,r,incarnation) @i ==> (Ex #j. CacheStarted(s,r,incarnation) @j & #j < #i)"
+lemma empty_incarnation_end_source [use_induction, reuse]:
+  "All s r incarnation #i. CacheEmpty(s,r,incarnation) @i ==> (Ex #j. CacheEnded(s,r,incarnation) @j & #j < #i)"
+
+lemma current_observes_held [use_induction]:
+  "All s r incarnation #i. CacheCurrent(s,r,incarnation) @i ==> (Ex #t. SlotObs(s,r,'held',incarnation) @t & (#t < #i | #t = #i))"
+lemma empty_obs_after_end [use_induction, reuse]:
+  "All s r incarnation #c. CacheEnded(s,r,incarnation) @c ==> SlotObs(s,r,'empty',incarnation) @c"
+
+// Two forms of "an incarnation observed empty or ended is never observed held
+// again". Neither is proved: with neither statement available as a source both
+// exhaust the search (exit 137 at 8 GiB, 1200 s), while each one verifies only
+// when the other stands above it as a [reuse] source - a lemma's statement is
+// injected into later proofs whether or not that lemma itself was proved, so
+// those two verdicts are conditional on an open goal, not proofs. The pair is
+// therefore kept open and WITHOUT [reuse]: no verified verdict below may rest on
+// either. Proving them needs a stronger simultaneous induction than this theory
+// currently states, not more time or memory. A single combined form with a
+// disjunctive antecedent does not parse (unguarded #i).
+lemma no_held_obs_after_empty [use_induction]:
+  "All s r incarnation #i #t. SlotObs(s,r,'empty',incarnation) @i & SlotObs(s,r,'held',incarnation) @t ==> not (#i < #t)"
+
+// Non-vacuity of no_held_obs_after_empty: its antecedent is satisfiable, so that lemma is a
+// real obligation and not an empty statement. Generated from it by
+// contrib/ci/vacuity-probes.py (exists-trace of the antecedent alone, the
+// conclusion's ordering removed - with the ordering the search does not finish).
+lemma Nonvac_no_held_obs_after_empty: exists-trace
+  "Ex s r incarnation #i #t. SlotObs(s,r,'empty',incarnation) @i & SlotObs(s,r,'held',incarnation) @t"
+// The same claim read over end actions instead of empty observations. It follows
+// from the lemma above plus empty_obs_after_end (restart emits both at one step),
+// so with that statement available as a [reuse] source it verifies; with nothing
+// assumed it exhausts the search (exit 137 at 8 GiB, 1100-1200 s). Reported open,
+// and not usable as a source by anything below: a conditional result resting on an
+// open goal is not a proof. Read the pair the other way round: the empty-observation
+// form is strictly stronger, because refill emits an empty observation for the
+// previous incarnation without any end action, so no end-only invariant covers it.
+lemma no_held_obs_after_end [use_induction]:
+  "All s r incarnation #c #t. CacheEnded(s,r,incarnation) @c & SlotObs(s,r,'held',incarnation) @t ==> not (#c < #t)"
+
+// Non-vacuity of no_held_obs_after_end: its antecedent is satisfiable, so that lemma is a
+// real obligation and not an empty statement. Generated from it by
+// contrib/ci/vacuity-probes.py (exists-trace of the antecedent alone, the
+// conclusion's ordering removed - with the ordering the search does not finish).
+lemma Nonvac_no_held_obs_after_end: exists-trace
+  "Ex s r incarnation #c #t. CacheEnded(s,r,incarnation) @c & SlotObs(s,r,'held',incarnation) @t"
+lemma empty_incarnation_not_current_afterward [use_induction]:
+  "All s r incarnation #i #j. CacheEmpty(s,r,incarnation) @i & CacheCurrent(s,r,incarnation) @j ==> not (#i < #j)"
+lemma cache_incarnation_active [use_induction]:
+  "All s r incarnation #i #j. CacheCurrent(s,r,incarnation) @i & CacheEnded(s,r,incarnation) @j ==> not (#j < #i)"
+
+// A refill only happens against a slot a restart emptied. Stated with the single
+// action it is about in the antecedent. The previous form quantified over two
+// starts and never named the refill step, and it exhausted the search at every
+// setting tried (exit 137 at 8 GiB, 400-700 s) while this one verifies in 141 s.
+// The search space, not the memory ceiling, was the obstacle.
+lemma refill_follows_prior_restart [use_induction]:
+  "All s r previous current d e #i.
+     CacheRefilled(s,r,previous,current,d,e) @i
+     ==> (Ex #j. Restart(s,r) @j & #j < #i)"
+lemma no_resolution_after_restart_without_refill [use_induction]:
+  "All s r d e #i #j. Restart(s,r) @i & Resolved(s,r,d,e) @j & #i < #j ==> (Ex d2 e2 #k. Full(s,r,d2,e2) @k & #i < #k & #k < #j)"
+
+lemma cache_origin [use_induction]:
+  "All s r d e #i. Resolved(s,r,d,e) @i ==> (Ex #j. Full(s,r,d,e) @j & #j < #i)"
+end

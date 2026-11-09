@@ -1,0 +1,73 @@
+// Symbolic client verification of carried anchor successions and a vouch.
+// The pin is an authenticated input. Signatures are idealized, and an honest
+// root signs any attacker-requested successor or claim. This deliberately
+// over-approximates issuance but does not prove issuance authorization.
+// Paths are bounded to four succession hops; cycles and duplicate anchors
+// are allowed, over-approximating the verifier's cycle handling. Validity,
+// algorithm policy, claim-log heads and trust computation are omitted.
+theory peer_succession
+begin
+builtins: signing
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule root:
+  [ Fr(~sk) ]
+  --[ Root($realm,pk(~sk)) ]->
+  [ !RootKey($realm,~sk), !Pinned($realm,pk(~sk)),
+    !Reach($realm,pk(~sk),pk(~sk),'0'), Out(pk(~sk)) ]
+
+rule issue_succession:
+  [ !RootKey(realm,sk), In(new) ]
+  --[ SuccessionIssued(realm,pk(sk),new) ]->
+  [ Out(sign(<'succession',realm,pk(sk),new>,sk)) ]
+
+rule issue_vouch:
+  [ !RootKey(realm,sk), In(claim) ]
+  --[ VouchIssued(realm,pk(sk),claim) ]->
+  [ Out(sign(<'vouch',realm,pk(sk),claim>,sk)) ]
+
+rule compromise:
+  [ !RootKey(realm,sk) ]
+  --[ Compromised(realm,pk(sk)) ]-> [ Out(sk) ]
+
+rule accept_direct:
+  [ !Pinned(realm,pin), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<'vouch',realm,pin,claim>,pin),true),
+      AcceptedDirect(realm,pin,claim) ]-> [ ]
+
+rule accept_successor:
+  [ !Pinned(realm,pin), In(<new,claim,succession,vouch>) ]
+  --[ Eq(verify(succession,<'succession',realm,pin,new>,pin),true),
+      Eq(verify(vouch,<'vouch',realm,new,claim>,new),true),
+      AcceptedSuccessor(realm,pin,new,claim) ]-> [ ]
+
+rule levels:
+  [ ] --> [ !Step('0','1'), !Step('1','2'), !Step('2','3'), !Step('3','4') ]
+
+rule follow:
+  [ !Reach(realm,pin,old,level), !Step(level,next), In(<new,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,old,new>,old),true),
+      Followed(realm,pin,old,new,next) ]->
+  [ !Reach(realm,pin,new,next) ]
+
+rule accept_path:
+  [ !Reach(realm,pin,anchor,level), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<'vouch',realm,anchor,claim>,anchor),true),
+      AcceptedPath(realm,pin,anchor,claim,level) ]-> [ ]
+
+lemma direct_witness: exists-trace
+  "Ex r pin claim #i. AcceptedDirect(r,pin,claim) @i & not (Ex r2 p2 #j. Compromised(r2,p2) @j)"
+lemma successor_witness: exists-trace
+  "Ex r pin new claim #i. AcceptedSuccessor(r,pin,new,claim) @i & not (Ex r2 p2 #j. Compromised(r2,p2) @j)"
+lemma direct_vouch_origin:
+  "All r pin claim #i. AcceptedDirect(r,pin,claim) @i ==> (Ex #j. VouchIssued(r,pin,claim) @j & #j < #i) | (Ex #j. Compromised(r,pin) @j & #j < #i)"
+lemma successor_authorization_origin:
+  "All r pin new claim #i. AcceptedSuccessor(r,pin,new,claim) @i ==> (Ex #j. SuccessionIssued(r,pin,new) @j & #j < #i) | (Ex #j. Compromised(r,pin) @j & #j < #i)"
+lemma four_hop_witness: exists-trace
+  "Ex r pin anchor claim #i. AcceptedPath(r,pin,anchor,claim,'4') @i & not (Ex r2 p2 #j. Compromised(r2,p2) @j)"
+lemma rooted_first_hop_origin:
+  "All r pin new #i. Followed(r,pin,pin,new,'1') @i ==> (Ex #j. SuccessionIssued(r,pin,new) @j & #j < #i) | (Ex #j. Compromised(r,pin) @j & #j < #i)"
+lemma four_hop_root_authorization:
+  "All r pin anchor claim #i. AcceptedPath(r,pin,anchor,claim,'4') @i ==> (Ex new #j. SuccessionIssued(r,pin,new) @j & #j < #i) | (Ex #j. Compromised(r,pin) @j & #j < #i)"
+end
