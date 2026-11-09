@@ -1632,6 +1632,28 @@ mod tests {
     }
 
     #[test]
+    fn orphan_vouch_and_key_are_pruned_on_next_pass() {
+        let (a, b) = (Server::new("a"), Server::new("b"));
+        let clock = GenerationClock::new();
+        let policy = Policy::default();
+        let mut state = AnchorState::default();
+        a.step(&mut state, NOW, &[], &servers(&["a", "b"]), &clock);
+        let mut claim = b.claim(NOW + 100);
+        claim.anchor = Some(a.thp());
+        state
+            .put(Entry::Claim(claim), REALM, &policy, NOW, &clock)
+            .unwrap();
+        let now = NOW + UNVOUCHED_GRACE + 101;
+        state.retain(&servers(&["b"]), REALM, &policy, now);
+        assert_eq!(state.claims().count(), 0);
+        assert!(state.vouch(&a.thp()).is_some());
+        assert!(state.key(&a.thp()).is_some());
+        state.retain(&servers(&["b"]), REALM, &policy, now);
+        assert!(state.vouch(&a.thp()).is_none());
+        assert!(state.key(&a.thp()).is_none());
+    }
+
+    #[test]
     fn renewal_replaces_claims_and_vouches() {
         let (a, b) = (Server::new("a"), Server::new("b"));
         let all = servers(&["a", "b"]);
