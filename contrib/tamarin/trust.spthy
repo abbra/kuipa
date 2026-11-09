@@ -76,7 +76,9 @@ equations: kem_dec(kem_sk(x), kem_ct(kem_pk(x), s)) = s,
 
 rule realm_setup:
   [ Fr(~ask), Fr(~ssk), Fr(~tseed) ]
-  --[ HonestRealm(vk(~ask)) ]->
+  --[ HonestRealm(vk(~ask)),
+      RealmRegistered($realm, ~ask, vk(~ask), ~ssk, vk(~ssk), ~tseed,
+                      kem_pk(~tseed)) ]->
   [ !Realm($realm, ~ask, vk(~ask), ~ssk, vk(~ssk), ~tseed,
            kem_pk(~tseed)) ]
   // one fact binds a realm to its anchor, the server signing key its
@@ -84,7 +86,8 @@ rule realm_setup:
 
 rule rogue_realm_setup:
   [ Fr(~ask), Fr(~ssk), Fr(~tseed) ]
-  -->
+  --[ RealmRegistered($realm, ~ask, vk(~ask), ~ssk, vk(~ssk), ~tseed,
+                      kem_pk(~tseed)) ]->
   [ !Realm($realm, ~ask, vk(~ask), ~ssk, vk(~ssk), ~tseed,
            kem_pk(~tseed)),
     Out(~ask), Out(~ssk), Out(~tseed) ]
@@ -141,7 +144,9 @@ rule trust_respond:
     !Realm(realmA, askA, avkA, sskA, svkA, tseedA, tekA),
     Fr(~sse) ]
   --[ TrustAccept(avkB, avkA, realmB, realmA,
-                  h(<ss, ~sse, 'trust-secret'>)) ]->
+                  h(<ss, ~sse, 'trust-secret'>)),
+      TrustEstablishedBRecorded(avkA, avkB, realmA, realmB,
+                                h(<ss, ~sse, 'trust-secret'>)) ]->
   [ !TrustEstablishedB(avkA, avkB, realmA, realmB,
                         h(<ss, ~sse, 'trust-secret'>)),
     TrustRsp(realmA, avkA, avkB, ek_e, ~sse, ss,
@@ -235,7 +240,8 @@ rule publish_trusts:
 rule a_host_accepts_cross_realm:
   [ XRealmTicket(realmA, realmB, ts),
     !TrustAdv(avkA, avkB, realmA, realmB, ts) ]
-  --[ CrossRealmAccepted(avkA, realmA, realmB, ts) ]->
+  --[ CrossRealmAccepted(avkA, realmA, realmB, ts),
+      TrustAdvVerified(avkA, avkB, realmA, realmB, ts) ]->
   [ ]
 
 // ------------------------------------------------------------------
@@ -269,13 +275,15 @@ lemma TrustInvitationAuth:
 // honest, unstolen B anchor, B's trust key answered the request --
 // only B holds tseed, so only B could decapsulate A's request and
 // produce the response under ss || ss_e.  The rogue responder needs
-// the rogue key's public seed.
+// the rogue key's public seed.  Stated over the RealmRegistered
+// action of the registration rules: the !Realm fact alone is
+// observable at no index, and the action carries the same fields.
 lemma TrustResponderAuth:
   "All avkA avkB realmA realmB ts #i.
     ( TrustDone(avkA, avkB, realmA, realmB, ts) @i
       & HonestRealm(avkB) @i )
     ==> Ex realmB2 askB sskB svkB tseedB tekB #j.
-      ( !Realm(realmB2, askB, avkB, sskB, svkB, tseedB, tekB) @j )"
+      ( RealmRegistered(realmB2, askB, avkB, sskB, svkB, tseedB, tekB) @j )"
 
 // The trust secret is derived from both encapsulations, so neither
 // side chose it alone: with both anchors honest, the attacker never
@@ -294,13 +302,18 @@ lemma TrustSecretSecret:
 // the trust secret leaked -- there is no third way to the krbtgt
 // keys.  The ticket itself carries no proof of its issuer, which is
 // exactly Kerberos's cross-realm model (S17.4 "Limits"): the trust
-// secret is what the ticket is worth.
+// secret is what the ticket is worth.  Both the advertisement the
+// host verified and B's own record are stated as actions -- the
+// TrustAdvVerified action is written by the same step as
+// CrossRealmAccepted, and TrustEstablishedBRecorded by the step that
+// creates B's record; !TrustAdv/!TrustEstablishedB are observable at
+// no index.
 lemma CrossRealmTicketSource:
   "All avkA avkB realmA realmB ts #i.
     ( CrossRealmAccepted(avkA, realmA, realmB, ts) @i
-      & !TrustAdv(avkA, avkB, realmA, realmB, ts) @i
+      & TrustAdvVerified(avkA, avkB, realmA, realmB, ts) @i
       & HonestRealm(avkA) @i )
-    ==> ( Ex #j. !TrustEstablishedB(avkA, avkB, realmA, realmB, ts) @j )
+    ==> ( Ex #j. TrustEstablishedBRecorded(avkA, avkB, realmA, realmB, ts) @j )
      | ( Ex #j. LeakTrustSecret(realmA, realmB, ts) @j )"
 
 // ------------------------------------------------------------------
