@@ -1,0 +1,56 @@
+// Per-call signature policy for key, vouch and succession admission.
+// Two symbolic policies differ on one algorithm; JWK parsing, real algorithm
+// semantics, validity, membership and policy provisioning are not modeled.
+theory peer_policy
+begin
+builtins: signing
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule configure:
+  [ ] --> [ !Allowed('strict','approved'), !Allowed('relaxed','approved'),
+            !Allowed('relaxed','other') ]
+
+rule create_anchor:
+  [ Fr(~sk), In(alg) ]
+  --[ AnchorCreated(<alg,pk(~sk)>) ]->
+  [ !AnchorSecret(alg,~sk), Out(<alg,pk(~sk)>) ]
+
+rule issue_vouch:
+  [ !AnchorSecret(alg,sk), In(claim) ]
+  --[ VouchIssued(<alg,pk(sk)>,claim) ]->
+  [ Out(sign(<'vouch',<alg,pk(sk)>,claim>,sk)) ]
+
+rule issue_succession:
+  [ !AnchorSecret(alg,sk), In(next) ]
+  --[ SuccessionIssued(<alg,pk(sk)>,next) ]->
+  [ Out(sign(<'succession',<alg,pk(sk)>,next>,sk)) ]
+
+rule accept_key:
+  [ !Allowed(policy,alg), In(<alg,key>) ]
+  --[ KeyAdmitted(policy,<alg,key>) ]-> [ !Key(<alg,key>) ]
+
+rule accept_vouch:
+  [ !Allowed(policy,alg), !Key(<alg,key>), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<'vouch',<alg,key>,claim>,key),true),
+      VouchAdmitted(policy,<alg,key>,claim) ]-> [ ]
+
+rule accept_succession:
+  [ !Allowed(policy,alg), In(<alg,key,next,sig>) ]
+  --[ Eq(verify(sig,<'succession',<alg,key>,next>,key),true),
+      SuccessionAdmitted(policy,<alg,key>,next) ]-> [ ]
+
+lemma strict_rejects_other_key:
+  "All key #i. KeyAdmitted('strict',<'other',key>) @i ==> F"
+lemma strict_rejects_other_vouch:
+  "All key claim #i. VouchAdmitted('strict',<'other',key>,claim) @i ==> F"
+lemma strict_rejects_other_succession:
+  "All key next #i. SuccessionAdmitted('strict',<'other',key>,next) @i ==> F"
+lemma relaxed_accepts_other_vouch: exists-trace
+  "Ex key claim #i #j. KeyAdmitted('relaxed',<'other',key>) @i & VouchAdmitted('relaxed',<'other',key>,claim) @j & #i < #j"
+lemma relaxed_accepts_other_succession: exists-trace
+  "Ex key next #i. SuccessionAdmitted('relaxed',<'other',key>,next) @i"
+lemma strict_accepts_previously_relaxed_approved_vouch: exists-trace
+  "Ex key claim #i #j. KeyAdmitted('relaxed',<'approved',key>) @i & VouchAdmitted('strict',<'approved',key>,claim) @j & #i < #j"
+end

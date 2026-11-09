@@ -1,0 +1,114 @@
+// One active anchor key per modeled rotation chain. Honest rotation creates a
+// fresh successor and consumes the old key; compromise exposes an active key.
+// Disk snapshots, crashes, concurrent writers, policy, validity and deployment
+// authorization are omitted; this is not a proof of physical key erasure.
+// A trace formula can only refer to action facts, so a fact that appears only in
+// a rule's premises and conclusions is observable at no index and a goal written
+// over it holds vacuously. The rule's Retired fact was such a fact: the earlier
+// "a retired key is never active again" was vacuous and is replaced by the same
+// claim over the Rotated action and an ActiveObs observation, which each rule
+// reading or changing the active key emits. Premises, conclusions and reachable
+// states are unchanged.
+// Freshness, active-key provenance, succession origin, the necessity of
+// compromise for an attacker-chosen successor, that an ActiveKey action observes
+// the key it names, and honest-rotation and forgery witnesses all verify. Two
+// related properties are open at 8 GiB and 300 seconds and neither is refuted:
+// that after a rotation the old key is never observed active again, and the
+// action-level form that follows from it. A later lemma verified while the first
+// was marked [reuse] and did not verify without it, so neither is annotated
+// reuse and the earlier "verified" is not a result. One further property is open
+// at 40 GiB: after a rotation the retired key is never later the subject of a
+// compromise. All three open goals here are NON-VACUOUS: their antecedents are
+// reachable, proven by the antecedent-only probes (Nonvac_rotated_key_never_active_again,
+// Nonvac_retired_key_not_active and Nonvac_retired_anchor_not_compromised, in this
+// file and all verified), which exist-trace the antecedent with
+// the conclusion's ordering removed. Asking for the antecedent plus the ordering
+// is a different and much harder search (those witnesses exhaust the limit), so
+// reachability must be probed on the antecedent alone. Generate these with
+// contrib/ci/vacuity-probes.py.
+theory peer_rotation
+begin
+builtins: signing
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule initialize:
+  [ Fr(~sk) ]
+  --[ KeyGenerated($realm,$server,pk(~sk)), ActiveObs($realm,$server,pk(~sk)) ]->
+  [ Active($realm,$server,~sk), Out(pk(~sk)) ]
+
+rule rotate:
+  [ Active(realm,server,old), Fr(~new) ]
+  --[ Rotated(realm,server,pk(old),pk(~new)), KeyGenerated(realm,server,pk(~new)), ActiveKey(realm,server,pk(old)), ActiveObs(realm,server,pk(old)), ActiveObs(realm,server,pk(~new)) ]->
+  [ Active(realm,server,~new), Retired(realm,server,pk(old)), Out(pk(~new)),
+    Out(sign(<'succession',realm,pk(old),pk(~new)>,old)) ]
+
+rule compromise:
+  [ Active(realm,server,sk) ]
+  --[ Compromised(realm,server,pk(sk)), ActiveKey(realm,server,pk(sk)), ActiveObs(realm,server,pk(sk)) ]->
+  [ Active(realm,server,sk), Out(sk) ]
+
+rule accept:
+  [ In(<realm,old,new,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,old,new>,old),true),
+      SuccessionAccepted(realm,old,new) ]-> [ ]
+
+lemma generated_anchor_unique [reuse]:
+  "All r s key r2 s2 #i #j. KeyGenerated(r,s,key) @i & KeyGenerated(r2,s2,key) @j ==> #i = #j"
+lemma active_key_was_generated [use_induction, reuse]:
+  "All r s key #i. ActiveKey(r,s,key) @i ==> (Ex #j. KeyGenerated(r,s,key) @j & #j < #i)"
+lemma honest_rotation_avoids_attacker_key [reuse]:
+  "All r s old #i. Rotated(r,s,old,pk('attacker')) @i ==> F"
+lemma honest_rotation_witness: exists-trace
+  "Ex r s old new #i #j. Rotated(r,s,old,new) @i & SuccessionAccepted(r,old,new) @j & #i < #j & not (Ex r2 s2 a #k. Compromised(r2,s2,a) @k)"
+lemma generated_anchor_succession_origin [use_induction, reuse, heuristic=C]:
+  "All r s old new #i #j. KeyGenerated(r,s,old) @i & SuccessionAccepted(r,old,new) @j ==> (Ex #k. Rotated(r,s,old,new) @k & #k < #j) | (Ex #k. Compromised(r,s,old) @k & #k < #j)"
+lemma attacker_successor_requires_compromise [use_induction, reuse, heuristic=C]:
+  "All r s old #i #j. KeyGenerated(r,s,old) @i & SuccessionAccepted(r,old,pk('attacker')) @j ==> (Ex #k. Compromised(r,s,old) @k & #k < #j)"
+lemma stolen_anchor_forgery_witness: exists-trace
+  "Ex r s old #i #j. Compromised(r,s,old) @i & SuccessionAccepted(r,old,pk('attacker')) @j & #i < #j & not (Ex #k. Rotated(r,s,old,pk('attacker')) @k)"
+// A key retired by rotation is not active at any later step. Stated over the
+// Rotated action: the Retired fact in the rule's conclusion is not an action
+// fact, so it is observable at no index and a goal written over it holds
+// vacuously. Rotated names the retired key as its first argument, and the
+// rotation step itself marks that key active, hence the strict order.
+// The active key is observable through ActiveObs, which each rule that reads or
+// changes it emits for the key in effect before and after the step. A fact that
+// appears only in premises and conclusions is observable at no index, so a goal
+// over Active(...) or Retired(...) @ t holds vacuously.
+lemma active_key_observed [use_induction, reuse]:
+  "All r s key #i. ActiveKey(r,s,key) @i ==> ActiveObs(r,s,key) @i"
+// Open, and deliberately NOT marked reuse: a later lemma that "verified" while
+// this was assumed proved in fact did not (checked - retired_key_not_active
+// verifies with this as a source and is open without it).
+lemma rotated_key_never_active_again [use_induction]:
+  "All r s old new #i #t. Rotated(r,s,old,new) @i & ActiveObs(r,s,old) @t ==> not (#i < #t)"
+
+// Non-vacuity of rotated_key_never_active_again: its antecedent is satisfiable, so that lemma is a
+// real obligation and not an empty statement. Generated from it by
+// contrib/ci/vacuity-probes.py (exists-trace of the antecedent alone, the
+// conclusion's ordering removed - with the ordering the search does not finish).
+lemma Nonvac_rotated_key_never_active_again: exists-trace
+  "Ex r s old new #i #t. Rotated(r,s,old,new) @i & ActiveObs(r,s,old) @t"
+lemma retired_key_not_active:
+  "All r s old new #i #j. Rotated(r,s,old,new) @i & ActiveKey(r,s,old) @j ==> not (#i < #j)"
+
+// Non-vacuity of retired_key_not_active: its antecedent is satisfiable, so that lemma is a
+// real obligation and not an empty statement. Generated from it by
+// contrib/ci/vacuity-probes.py (exists-trace of the antecedent alone, the
+// conclusion's ordering removed - with the ordering the search does not finish).
+lemma Nonvac_retired_key_not_active: exists-trace
+  "Ex r s old new #i #j. Rotated(r,s,old,new) @i & ActiveKey(r,s,old) @j"
+lemma compromise_marks_active_key [reuse]:
+  "All r s key #i. Compromised(r,s,key) @i ==> ActiveKey(r,s,key) @i"
+lemma retired_anchor_not_compromised [use_induction]:
+  "All r s old new #i #j. Rotated(r,s,old,new) @i & Compromised(r,s,old) @j ==> not (#i < #j)"
+
+// Non-vacuity of retired_anchor_not_compromised: its antecedent is satisfiable, so that lemma is a
+// real obligation and not an empty statement. Generated from it by
+// contrib/ci/vacuity-probes.py (exists-trace of the antecedent alone, the
+// conclusion's ordering removed - with the ordering the search does not finish).
+lemma Nonvac_retired_anchor_not_compromised: exists-trace
+  "Ex r s old new #i #j. Rotated(r,s,old,new) @i & Compromised(r,s,old) @j"
+end
