@@ -404,6 +404,35 @@ job_proof_vacuity() {
         return 1
     fi
     echo "no vacuous lemmas"
+    # Second, separate audit: antecedent reachability. A universal lemma over
+    # real action facts still says nothing if no trace satisfies its antecedent,
+    # and an open proof leaves that unknown. Proving the probes is the expensive
+    # part (the proof sweep); CI checks only that a probe can be generated for
+    # every universal lemma, so the status is always checkable rather than
+    # assumed.
+    echo "Generating antecedent-reachability probes…"
+    if ! python3 contrib/ci/vacuity-probes.py --self-test; then
+        fail "the antecedent-probe generator no longer parses lemma forms"
+        return 1
+    fi
+    local tmp rc=0 universal
+    tmp=$(mktemp -d)
+    for theory in contrib/tamarin/*.spthy; do
+        # A theory with no universal lemma legitimately yields no probe.
+        universal=$(grep -cE '^lemma [A-Za-z_][A-Za-z0-9_]*([[:space:]]*:|[[:space:]]+\[)' "$theory")
+        universal=$((universal - $(grep -cE '^lemma [A-Za-z_][A-Za-z0-9_]*([[:space:]]+\[[^]]*\])?[[:space:]]*:?[[:space:]]*exists-trace' "$theory")))
+        if [[ $universal -gt 0 ]] &&
+           ! python3 contrib/ci/vacuity-probes.py -o "$tmp/probes.spthy" "$theory" >/dev/null; then
+            echo "no antecedent probe could be generated from $theory ($universal universal lemmas)" >&2
+            rc=1
+        fi
+    done
+    rm -rf "$tmp"
+    if [[ $rc -ne 0 ]]; then
+        fail "contrib/ci/vacuity-probes.py could not probe every universal lemma"
+        return 1
+    fi
+    echo "antecedent probes generated for all universal lemmas"
 }
 
 job_fmt() {
