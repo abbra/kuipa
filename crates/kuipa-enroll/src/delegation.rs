@@ -1757,6 +1757,27 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
+    #[test]
+    fn validity_skew_and_period_boundaries() {
+        let iat = 1_000;
+        let exp = 2_000;
+        assert!(!valid_at(iat, exp, iat - CLOCK_SKEW - 1));
+        assert!(valid_at(iat, exp, iat - CLOCK_SKEW));
+        assert!(valid_at(iat, exp, exp + CLOCK_SKEW));
+        assert!(!valid_at(iat, exp, exp + CLOCK_SKEW + 1));
+        assert!(valid_at(iat, exp, exp), "clock rollback restores validity");
+        assert!(valid_at(0, 1, 0));
+        assert!(valid_at(u64::MAX - 1, u64::MAX, u64::MAX));
+        assert!(!valid_at(u64::MAX, u64::MAX, u64::MAX - CLOCK_SKEW - 1));
+        assert!(check_period(0, MAX_VALIDITY, MAX_VALIDITY, "period").is_ok());
+        assert!(check_period(0, MAX_VALIDITY + 1, MAX_VALIDITY, "period").is_err());
+        assert!(check_period(1, 1, MAX_VALIDITY, "period").is_err());
+        assert!(check_period(u64::MAX, 0, MAX_VALIDITY, "period").is_err());
+    }
+
+    /// `peer-validity.smt2` models this check with bitvector arithmetic.
+    /// Keep the skew and the maximum period the model hardcodes in sync
+    /// with the constants this code actually uses.
     fn key() -> SigningKey {
         SigningKey::generate(SignatureAlg::MlDsa65).unwrap()
     }
