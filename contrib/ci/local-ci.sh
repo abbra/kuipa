@@ -281,7 +281,7 @@ skip_job() {
     return $SKIP_RC
 }
 
-ALL_JOBS=(build fmt lint-workflows deps clippy doc test kdc-test playground-test)
+ALL_JOBS=(build fmt lint-workflows deps proof-vacuity clippy doc test kdc-test playground-test)
 # Opt-in jobs: not part of 'all' (need an extra toolchain).
 EXTRA_JOBS=(msrv bench)
 
@@ -391,6 +391,19 @@ job_deps() {
         return 1
     fi
     echo "none of ${#RUSTCRYPTO_CRATES[@]} RustCrypto crates found"
+}
+
+# A trace formula can only refer to the action facts a rule labels its
+# transitions with. A lemma whose antecedent is any other fact at a timepoint is
+# vacuously true and would report as verified, so this is a proof-correctness
+# check, not a style one.
+job_proof_vacuity() {
+    echo "Checking that no lemma reasons over a non-action fact…"
+    if ! python3 contrib/ci/vacuity-check.py contrib/tamarin/*.spthy; then
+        fail "lemmas above reason over facts that are observable at no trace index"
+        return 1
+    fi
+    echo "no vacuous lemmas"
 }
 
 job_fmt() {
@@ -799,6 +812,7 @@ dispatch_job() {
         fmt)            run_job fmt            job_fmt ;;
         lint-workflows) run_job lint-workflows job_lint_workflows ;;
         deps)           run_job deps           job_deps ;;
+        proof-vacuity)  run_job proof-vacuity  job_proof_vacuity ;;
         clippy)         run_job clippy         job_clippy ;;
         doc)            run_job doc            job_doc ;;
         test)           run_job test           job_test ;;
