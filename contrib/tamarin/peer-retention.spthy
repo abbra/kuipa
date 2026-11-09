@@ -1,0 +1,107 @@
+// One claim's lifecycle through AnchorState::retain. The four state flags
+// abstract current membership, validity, the grace deadline and whether a
+// remaining vouch covers the claim. Removing a claim is final in this model;
+// re-admission, membership rejoin, timestamp arithmetic, other claims,
+// vouch/key pruning, succession and entry replacement are not modeled.
+// Coverage is an oracle, not a proof of vouch signature or Merkle inclusion.
+// Interval provenance, non-overlap, coverage origin, expiry, removal,
+// past-grace coverage and two execution witnesses are proved individually.
+theory peer_retention
+begin
+
+rule admitted:
+  [ Fr(~claim) ]
+  --[ Admitted(~claim) ]->
+  [ Live(~claim,'member','valid','grace','uncovered') ]
+
+rule remove_member:
+  [ Live(c,'member',validity,grace,coverage) ]
+  --[ Removed(c), CoverageState(c,coverage), Current(c,'member',validity) ]-> [ Live(c,'removed',validity,grace,coverage) ]
+
+rule expire:
+  [ Live(c,membership,'valid',grace,coverage) ]
+  --[ Expired(c), CoverageState(c,coverage), Current(c,membership,'valid') ]-> [ Live(c,membership,'expired',grace,coverage) ]
+
+rule grace_ends:
+  [ Live(c,membership,validity,'grace',coverage) ]
+  --[ GraceEnded(c), CoverageState(c,coverage), Current(c,membership,validity) ]-> [ Live(c,membership,validity,'past',coverage) ]
+
+rule cover:
+  [ Live(c,membership,validity,grace,'uncovered'), Fr(~interval) ]
+  --[ Covered(c), IntervalStarted(c,~interval), CoverageState(c,'uncovered'), Current(c,membership,validity) ]-> [ Live(c,membership,validity,grace,<'covered',~interval>) ]
+
+rule uncover:
+  [ Live(c,membership,validity,grace,<'covered',interval>) ]
+  --[ Uncovered(c), IntervalEnded(c,interval), CoverageState(c,<'covered',interval>), Current(c,membership,validity) ]-> [ Live(c,membership,validity,grace,'uncovered') ]
+
+rule retain_grace:
+  [ Live(c,'member','valid','grace',coverage) ]
+  --[ Retained(c), RetainedGrace(c), CoverageState(c,coverage), Current(c,'member','valid') ]-> [ Live(c,'member','valid','grace',coverage) ]
+
+rule retain_covered:
+  [ Live(c,'member','valid','past',<'covered',interval>) ]
+  --[ Retained(c), RetainedCovered(c), CoverageState(c,<'covered',interval>), Current(c,'member','valid') ]-> [ Live(c,'member','valid','past',<'covered',interval>) ]
+
+rule drop_removed:
+  [ Live(c,'removed',validity,grace,coverage) ]
+  --[ Dropped(c), CoverageState(c,coverage), Current(c,'removed',validity) ]-> [ ]
+
+rule drop_expired:
+  [ Live(c,membership,'expired',grace,coverage) ]
+  --[ Dropped(c), CoverageState(c,coverage), Current(c,membership,'expired') ]-> [ ]
+
+rule drop_uncovered:
+  [ Live(c,membership,validity,'past','uncovered') ]
+  --[ Dropped(c), CoverageState(c,'uncovered'), Current(c,membership,validity) ]-> [ ]
+
+lemma valid_state_not_expired [use_induction, reuse]:
+  "All c membership #i #j. Current(c,membership,'valid') @i & Expired(c) @j ==> not (#j < #i)"
+lemma member_state_not_removed [use_induction, reuse]:
+  "All c validity #i #j. Current(c,'member',validity) @i & Removed(c) @j ==> not (#j < #i)"
+
+// Fresh identifiers distinguish coverage intervals without restricting cycles.
+lemma coverage_interval_unique [reuse]:
+  "All c d interval #i #j. IntervalStarted(c,interval) @i & IntervalStarted(d,interval) @j ==> #i = #j"
+lemma interval_start_is_cover [reuse]:
+  "All c interval #i. IntervalStarted(c,interval) @i ==> Covered(c) @i"
+lemma uncover_ends_interval [reuse]:
+  "All c #i. Uncovered(c) @i ==> (Ex interval. IntervalEnded(c,interval) @i)"
+lemma coverage_interval_source [use_induction, reuse]:
+  "All c interval #i. CoverageState(c,<'covered',interval>) @i ==> (Ex #j. IntervalStarted(c,interval) @j & #j < #i)"
+lemma coverage_interval_active [use_induction, reuse]:
+  "All c interval #i #j. CoverageState(c,<'covered',interval>) @i & IntervalEnded(c,interval) @j ==> not (#j < #i)"
+lemma coverage_interval_ends_once [reuse]:
+  "All c interval #i #j. IntervalEnded(c,interval) @i & IntervalEnded(c,interval) @j ==> #i = #j"
+lemma coverage_interval_end_has_start [reuse]:
+  "All c interval #i. IntervalEnded(c,interval) @i ==> (Ex #j. IntervalStarted(c,interval) @j & #j < #i)"
+lemma uncovered_state_closes_prior_intervals [use_induction, reuse]:
+  "All c interval #i #j. CoverageState(c,'uncovered') @i & IntervalStarted(c,interval) @j & #j < #i ==> (Ex #k. IntervalEnded(c,interval) @k & #j < #k & #k < #i)"
+lemma successive_intervals_separated [use_induction, reuse]:
+  "All c first second #i #j. IntervalStarted(c,first) @i & IntervalStarted(c,second) @j & #i < #j ==> (Ex #k. IntervalEnded(c,first) @k & #i < #k & #k < #j)"
+lemma coverage_intervals_do_not_overlap [use_induction, reuse]:
+  "All c active previous #i #j. CoverageState(c,<'covered',active>) @i & IntervalStarted(c,previous) @j & #j < #i ==> active = previous | (Ex #k. IntervalEnded(c,previous) @k & #j < #k & #k < #i)"
+lemma no_interval_end_during_active [use_induction, reuse]:
+  "All c active other #s #e #i. IntervalStarted(c,active) @s & IntervalEnded(c,other) @e & CoverageState(c,<'covered',active>) @i & #s < #e & #e < #i ==> F"
+lemma no_uncover_during_active [reuse]:
+  "All c active #s #e #i. IntervalStarted(c,active) @s & Uncovered(c) @e & CoverageState(c,<'covered',active>) @i & #s < #e & #e < #i ==> F"
+lemma covered_state_started_without_uncover [reuse]:
+  "All c interval #i #j. CoverageState(c,<'covered',interval>) @i & IntervalStarted(c,interval) @j ==> Covered(c) @j & #j < #i & not (Ex #k. Uncovered(c) @k & #j < #k & #k < #i)"
+lemma covered_state_with_interval_origin [reuse]:
+  "All c interval #i. CoverageState(c,<'covered',interval>) @i ==> (Ex #j. IntervalStarted(c,interval) @j & Covered(c) @j & #j < #i & not (Ex #k. Uncovered(c) @k & #j < #k & #k < #i))"
+
+lemma retained_case [reuse]:
+  "All c #i. Retained(c) @i ==> RetainedGrace(c) @i | RetainedCovered(c) @i"
+lemma covered_retention_has_cover:
+  "All c #i. RetainedCovered(c) @i ==> (Ex #j. Covered(c) @j & #j < #i)"
+
+lemma grace_then_vouch_detailed_witness: exists-trace
+  "Ex c interval #i #j #k #l. RetainedGrace(c) @i & GraceEnded(c) @j & IntervalStarted(c,interval) @k & RetainedCovered(c) @l & #i < #j & #j < #k & #k < #l"
+lemma expired_then_dropped_witness: exists-trace
+  "Ex c #i #j. Expired(c) @i & Dropped(c) @j & #i < #j"
+lemma expired_not_retained [use_induction]:
+  "All c #i #j. Expired(c) @i & Retained(c) @j ==> not (#i < #j)"
+lemma removed_not_retained [use_induction]:
+  "All c #i #j. Removed(c) @i & Retained(c) @j ==> not (#i < #j)"
+lemma past_grace_requires_coverage [use_induction]:
+  "All c #i #j. GraceEnded(c) @i & Retained(c) @j & #i < #j ==> (Ex #k. Covered(c) @k & #k < #j)"
+end
