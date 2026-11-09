@@ -66,6 +66,10 @@ GIT_REF ?= HEAD
 SNAPDATE   := $(shell git -C "$(REPOROOT)" log -1 --format=%cd --date=format:%Y%m%d%H%M $(GIT_REF) 2>/dev/null)
 SNAPCOMMIT := $(shell git -C "$(REPOROOT)" rev-parse --short $(GIT_REF) 2>/dev/null)
 RELEASE    := 1.$(SNAPDATE).git$(SNAPCOMMIT)
+FULLCOMMIT := $(shell git -C "$(REPOROOT)" rev-parse $(GIT_REF) 2>/dev/null)
+
+TARBALL_REF := .$(TARBALL).ref
+SRPM        := $(NAME)-$(VERSION)-$(RELEASE)$(shell rpm --eval %dist).src.rpm
 
 # Mock chroot for 'make mock'.
 # Override on the command line:  make mock MOCK_CONFIG=fedora-44-x86_64
@@ -109,10 +113,13 @@ sources: tarball vendor
 # [patch.crates-io] entries are path dependencies, and cargo vendor does not
 # vendor path or workspace members.
 tarball: $(TARBALL)
-# FORCE: $(TARBALL) has no file prerequisite that a new commit touches, so a
-# leftover tarball from an earlier run would silently become Source0 of a
-# snapshot whose Release names a different commit.  git archive is cheap.
-$(TARBALL): FORCE
+# $(TARBALL_REF) holds the commit the tarball was made from and is rewritten
+# only when GIT_REF resolves to a different commit.  A leftover tarball from an
+# earlier commit is therefore rebuilt, an unchanged one is not.
+$(TARBALL_REF): FORCE
+	@echo '$(FULLCOMMIT)' | cmp -s - $@ || echo '$(FULLCOMMIT)' > $@
+
+$(TARBALL): $(TARBALL_REF)
 	@echo "==> Creating $@ from $(GIT_REF)"
 	git -C "$(REPOROOT)" archive \
 	    --prefix=$(NAME)-$(VERSION)/ \
@@ -141,9 +148,11 @@ $(TARBALL): FORCE
 vendor: $(VENDOR_TARBALL)
 
 # Cargo.lock/Cargo.toml are the only inputs of the crate graph here: a lock
-# change is exactly when the vendor tarball must be regenerated.
-$(VENDOR_TARBALL): $(REPOROOT)/Cargo.lock $(REPOROOT)/Cargo.toml
-	@echo "==> Creating $@ — filtering and vendoring for Linux platforms"
+# change is exactly when the vendor tarball must be regenerated.  The tarball
+# and system-crates.txt are one grouped target: either one missing or stale
+# regenerates both, so the manifest always matches the tarball.
+$(VENDOR_TARBALL) $(SYSTEM_CRATES) &: $(REPOROOT)/Cargo.lock $(REPOROOT)/Cargo.toml
+	@echo "==> Creating $(VENDOR_TARBALL) — filtering and vendoring for Linux platforms"
 	@# A [patch.crates-io] entry pointing outside the repository is a
 	@# development override; the tarball has no such directory.
 	@if grep -qE '^[[:space:]]*[a-z0-9_-]+[[:space:]]*=[[:space:]]*\{[[:space:]]*path[[:space:]]*=[[:space:]]*"\.\./' "$(REPOROOT)/Cargo.toml"; then \
@@ -184,24 +193,37 @@ $(VENDOR_TARBALL): $(REPOROOT)/Cargo.lock $(REPOROOT)/Cargo.toml
 # Fill in the snapshot release identifiers.  kuipa.spec.in is the maintained
 # file; kuipa.spec is generated and never committed.
 
-spec:
-	@echo "==> Generating $(SPEC_OUT) from $(SPEC_IN)"
+# Regenerated only when the template or the commit changes.
+$(SPEC_OUT): $(SPEC_IN) $(TARBALL_REF)
+	@echo "==> Generating $@ from $(SPEC_IN)"
 	sed \
 	    -e "s/^%global snapdate[[:space:]].*/%global snapdate    $(SNAPDATE)/" \
 	    -e "s/^%global snapcommit[[:space:]].*/%global snapcommit  $(SNAPCOMMIT)/" \
-	    "$(SPEC_IN)" > "$(SPEC_OUT)"
+	    -e "s/^Version:[[:space:]].*/Version:        $(VERSION)/" \
+	    "$(SPEC_IN)" > "$@"
+
+spec: $(SPEC_OUT)
+# The spec is a throwaway: make deletes it after the SRPM build, and a missing
+# intermediate does not make the SRPM stale.
+.INTERMEDIATE: $(SPEC_OUT)
 
 # ── srpm ──────────────────────────────────────────────────────────────────────
+# A real file target: nothing is rebuilt while the sources, spec template and
+# units are older than the SRPM.  The name carries the commit, so a new commit
+# always yields a new SRPM.
 
-srpm: sources spec
-	@echo "==> Building SRPM ($(NAME)-$(VERSION)-$(RELEASE))"
+srpm: $(SRPM)
+
+$(SRPM): $(SPEC_OUT) $(TARBALL) $(VENDOR_TARBALL) $(SYSTEM_CRATES) \
+         $(addprefix $(REPOROOT)/contrib/,$(EXTRA_SOURCES))
+	@echo "==> Building SRPM $@"
 	cp -f $(addprefix "$(REPOROOT)/contrib/",$(EXTRA_SOURCES)) .
 	rpmbuild -bs \
 	    --define "_sourcedir $(CURDIR)" \
 	    --define "_specdir   $(CURDIR)" \
 	    --define "_srcrpmdir $(CURDIR)" \
 	    "$(SPEC_OUT)"
-	rm -f "$(SPEC_OUT)" $(EXTRA_SOURCES)
+	rm -f $(EXTRA_SOURCES)
 	@echo "==> To skip the tests:      rpmbuild -bs --without check ..."
 	@echo "==> To skip the Clevis pin: rpmbuild -bs --without clevis ..."
 
@@ -214,12 +236,7 @@ srpm: sources spec
 # A custom MOCK_CONFIG that is not a COPR chroot name needs its own repo URL.
 RUST_DEPS_REPO := https://download.copr.fedorainfracloud.org/results/abbra/rust-deps/$(MOCK_CONFIG)/
 
-mock: srpm
-	$(eval SRPM := $(shell ls -1t "$(CURDIR)"/$(NAME)-$(VERSION)-*.src.rpm 2>/dev/null | head -1))
-	@if [ -z "$(SRPM)" ]; then \
-	    echo "ERROR: no SRPM found in $(CURDIR) for $(NAME)-$(VERSION)"; \
-	    exit 1; \
-	fi
+mock: $(SRPM)
 	@echo "==> Rebuilding $(SRPM) in mock ($(MOCK_CONFIG))"
 	mock -r "$(MOCK_CONFIG)" --addrepo "$(RUST_DEPS_REPO)" --rebuild "$(SRPM)"
 
@@ -235,13 +252,13 @@ check-deps:
 # Requires COPR=owner/project.  Public action: nothing is submitted without an
 # explicit 'make copr-build COPR=…' invocation.
 
-copr-build: srpm
+copr-build: $(SRPM)
 	@if [ -z "$(COPR)" ]; then echo "ERROR: COPR=owner/project is required"; exit 1; fi
-	$(eval SRPM := $(shell ls -1t "$(CURDIR)"/$(NAME)-$(VERSION)-*.src.rpm 2>/dev/null | head -1))
 	copr-cli build --nowait "$(COPR)" "$(SRPM)"
 
 clean:
-	rm -f $(TARBALL) $(VENDOR_TARBALL) $(SPEC_OUT) $(SYSTEM_CRATES) $(EXTRA_SOURCES)
+	rm -f $(TARBALL) $(TARBALL_REF) $(VENDOR_TARBALL) $(SPEC_OUT) $(SYSTEM_CRATES) $(EXTRA_SOURCES) \
+	    $(NAME)-$(VERSION)-*.src.rpm
 	rm -rf $(NAME)-$(VERSION)
 
 FORCE:
