@@ -421,11 +421,16 @@ over hand-written bytes.
 
 ### Protocol model
 
-The core exchange is modelled in `contrib/tamarin/kuipa.spthy` and
-`contrib/tamarin/tang-pqc.spthy`.  A change to the wire format or the key
-schedule must be reflected there and proved with
-`tamarin-prover --prove contrib/tamarin/kuipa.spthy`; CI does not run the
-prover, so run it yourself when a change touches the protocol.
+The protocol is modelled formally under `contrib/tamarin/` — the core exchange
+(`kuipa.spthy`) and Tang (`tang-pqc.spthy`) among 25 Tamarin theories, plus Z3
+models of the arithmetic parts. A change to the wire format, the key schedule or
+a state transition must be reflected in the matching theory and re-proved with
+`./contrib/ci/proofs.sh contrib/tamarin/kuipa.spthy` (one lemma per process,
+inside a bounded cgroup). CI runs the two static audits over every theory
+(`./contrib/ci/local-ci.sh proof-vacuity`) but not the prover itself, so prove
+by hand when a change touches the protocol, and update that theory's header
+Verified/Open/Falsified list from the run. `contrib/tamarin/README.md` explains
+what is here, how to read a result, and which theory owns which obligation.
 
 ---
 
