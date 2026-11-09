@@ -1,0 +1,41 @@
+// Signature-origin over-approximation for honest anchor rotation. Keys are
+// generated independently and may be reused, compromised or selected as a
+// successor later; unlike the implementation, old keys are never retired here.
+// This omits validity, policy, storage, concurrency and crash recovery.
+theory peer_rotation_origin
+begin
+builtins: signing
+restriction Equality: "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule generate:
+  [ Fr(~sk) ] --[ KeyGenerated($realm,$server,pk(~sk)) ]->
+  [ !Anchor($realm,$server,~sk), Out(pk(~sk)) ]
+
+rule rotate:
+  [ !Anchor(realm,server,old), !Anchor(realm,server,new) ]
+  --[ Rotated(realm,server,pk(old),pk(new)) ]->
+  [ Out(sign(<'succession',realm,pk(old),pk(new)>,old)) ]
+
+rule compromise:
+  [ !Anchor(realm,server,sk) ] --[ Compromised(realm,server,pk(sk)) ]-> [ Out(sk) ]
+
+rule attacker_key:
+  [ Fr(~sk) ] --[ AttackerKey(pk(~sk)) ]-> [ Out(~sk) ]
+
+rule accept:
+  [ In(<realm,old,new,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,old,new>,old),true), SuccessionAccepted(realm,old,new) ]-> [ ]
+
+lemma generated_anchor_succession_origin:
+  "All r s old new #i #j. KeyGenerated(r,s,old) @i & SuccessionAccepted(r,old,new) @j ==> (Ex #k. Rotated(r,s,old,new) @k & #k < #j) | (Ex #k. Compromised(r,s,old) @k & #k < #j)"
+lemma attacker_successor_requires_compromise:
+  "All r s old #i #j. KeyGenerated(r,s,old) @i & SuccessionAccepted(r,old,pk('attacker')) @j ==> (Ex #k. Compromised(r,s,old) @k & #k < #j)"
+lemma attacker_owned_successor_requires_compromise:
+  "All r s old new #i #a #j. KeyGenerated(r,s,old) @i & AttackerKey(new) @a & SuccessionAccepted(r,old,new) @j ==> (Ex #k. Compromised(r,s,old) @k & #k < #j)"
+lemma attacker_owned_successor_forgery_witness: exists-trace
+  "Ex r s old new #a #i #j. AttackerKey(new) @a & Compromised(r,s,old) @i & SuccessionAccepted(r,old,new) @j & #a < #j & #i < #j & not (Ex #k. Rotated(r,s,old,new) @k)"
+lemma honest_rotation_witness: exists-trace
+  "Ex r s old new #i #j. Rotated(r,s,old,new) @i & SuccessionAccepted(r,old,new) @j & #i < #j & not (Ex r2 s2 key #k. Compromised(r2,s2,key) @k)"
+lemma stolen_anchor_forgery_witness: exists-trace
+  "Ex r s old #i #j. Compromised(r,s,old) @i & SuccessionAccepted(r,old,pk('attacker')) @j & #i < #j & not (Ex #k. Rotated(r,s,old,pk('attacker')) @k)"
+end

@@ -1,0 +1,64 @@
+// Enrollment strings carry a realm and a local anchor over an out-of-band
+// channel. Authenticated and attacker-controlled delivery are distinct cases.
+// Expiry, head pins, membership, trust propagation and succession are omitted.
+theory peer_pin_delivery
+begin
+builtins: signing
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule create_anchor:
+  [ Fr(~sk) ]
+  --[ AnchorCreated($realm,pk(~sk)) ]->
+  [ !Anchor($realm,~sk), Out(pk(~sk)) ]
+
+rule issue_enrollment:
+  [ !Anchor(realm,sk), Fr(~string) ]
+  --[ EnrollmentIssued(realm,pk(sk),~string) ]->
+  [ !Enrollment(realm,pk(sk),~string), Out(<realm,pk(sk),~string>) ]
+
+// The out-of-band channel's authenticity is an explicit assumption.
+rule deliver_authenticated:
+  [ !Enrollment(realm,pin,string), Fr(~client) ]
+  --[ AuthenticatedDelivery(~client,realm,pin,string) ]->
+  [ !AuthenticatedPin(~client,realm,pin) ]
+
+// Parsing alone authenticates neither a string nor its anchor.
+rule deliver_untrusted:
+  [ In(<realm,pin,string>), Fr(~client) ]
+  --[ UntrustedDelivery(~client,realm,pin,string) ]->
+  [ !UntrustedPin(~client,realm,pin) ]
+
+rule issue_vouch:
+  [ !Anchor(realm,sk), In(claim) ]
+  --[ VouchIssued(realm,pk(sk),claim) ]->
+  [ Out(sign(<realm,claim>,sk)) ]
+
+rule compromise_anchor:
+  [ !Anchor(realm,sk) ]
+  --[ AnchorCompromised(realm,pk(sk)) ]-> [ Out(sk) ]
+
+rule attacker_anchor:
+  [ Fr(~sk) ]
+  --[ AttackerAnchor(pk(~sk)) ]-> [ Out(~sk), Out(pk(~sk)) ]
+
+rule verify_authenticated:
+  [ !AuthenticatedPin(client,realm,pin), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<realm,claim>,pin),true),
+      AuthenticatedAcceptance(client,realm,pin,claim) ]-> [ ]
+
+rule verify_untrusted:
+  [ !UntrustedPin(client,realm,pin), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<realm,claim>,pin),true),
+      UntrustedAcceptance(client,realm,pin,claim) ]-> [ ]
+
+lemma authenticated_pin_was_issued:
+  "All c r pin claim #i. AuthenticatedAcceptance(c,r,pin,claim) @i ==> (Ex string #j. EnrollmentIssued(r,pin,string) @j & #j < #i)"
+lemma authenticated_acceptance_has_signature_origin:
+  "All c r pin claim #i. AuthenticatedAcceptance(c,r,pin,claim) @i ==> (Ex #j. VouchIssued(r,pin,claim) @j & #j < #i) | (Ex #j. AnchorCompromised(r,pin) @j & #j < #i)"
+lemma authentic_enrollment_works: exists-trace
+  "Ex c r pin claim #i. AuthenticatedAcceptance(c,r,pin,claim) @i & not (Ex r2 p2 #j. AnchorCompromised(r2,p2) @j)"
+lemma untrusted_delivery_accepts_attacker_anchor: exists-trace
+  "Ex c r pin claim #i #j. AttackerAnchor(pin) @i & UntrustedAcceptance(c,r,pin,claim) @j & #i < #j & not (Ex r2 p2 #k. AnchorCompromised(r2,p2) @k)"
+end

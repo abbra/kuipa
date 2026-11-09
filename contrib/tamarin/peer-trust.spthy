@@ -1,0 +1,190 @@
+// Symbolic key, claim and vouch admission feeding root-based trust.
+// A vouch covers one claim; signatures are modeled symbolically. Key parsing,
+// signature-algorithm policy and admission-time validity are abstracted.
+// Honest roots sign attacker-requested claims and successions. Initial pins
+// come from an issued enrollment string; subsequent pins use an authenticated
+// refresh of computed trust. Both delivery channels are assumed authentic.
+// An anchor has one owner per realm and is never released or replaced;
+// expiry, removal, retention and claim replacement are omitted. Anchored and
+// unanchored claims for the same server can coexist. Membership is static;
+// succession paths permit cycles and at most four hops.
+theory peer_trust
+begin
+builtins: signing
+
+restriction Equality:
+  "All x y #i. Eq(x,y) @i ==> x = y"
+
+
+restriction Different:
+  "All x #i. Different(x,x) @i ==> F"
+restriction UniqueAnchorSlot:
+  "All r a #i #j. AnchorSlot(r,a) @i & AnchorSlot(r,a) @j ==> #i = #j"
+
+rule membership:
+  [ ] --[ MemberAdded($realm,$server) ]-> [ !Member($realm,$server) ]
+
+// Root represents either the local claim or a Kerberos-attested delegation.
+rule root:
+  [ !Member(realm,server), Fr(~sk) ]
+  --[ TrustRoot(realm,server,pk(~sk)), TrustAdded(realm,server,pk(~sk)),
+      AnchorSlot(realm,pk(~sk)), OwnerClaimed(realm,pk(~sk),server) ]->
+  [ !Trusted(realm,server,pk(~sk)), !RootKey(realm,~sk), Out(pk(~sk)) ]
+
+rule unanchored_root:
+  [ !Member(realm,server) ]
+  --[ UnanchoredRoot(realm,server), UnanchoredTrusted(realm,server) ]->
+  [ !TrustedUnanchored(realm,server) ]
+
+// Honest signing is deliberately permissive: any requested claim is signed.
+rule issue:
+  [ !RootKey(realm,sk), In(<server,claimanchor>) ]
+  --[ Issued(realm,pk(sk),server,claimanchor) ]->
+  [ Out(sign(<realm,pk(sk),server,claimanchor>,sk)) ]
+
+rule issue_succession:
+  [ !RootKey(realm,sk), In(next) ]
+  --[ SuccessionIssued(realm,pk(sk),next) ]->
+  [ Out(sign(<'succession',realm,pk(sk),next>,sk)) ]
+
+rule compromise:
+  [ !RootKey(realm,sk) ]
+  --[ Compromised(realm,pk(sk)) ]-> [ Out(sk) ]
+
+rule admit_key:
+  [ In(<realm,anchor>) ]
+  --[ KeyAdmitted(realm,anchor) ]-> [ !AdmittedKey(realm,anchor) ]
+
+rule admit_claim:
+  [ !Member(realm,server), In(anchor) ]
+  --[ ClaimAdmitted(realm,server,anchor) ]->
+  [ !AdmittedClaim(realm,server,anchor) ]
+
+rule vouch:
+  [ !AdmittedKey(realm,anchor), In(<realm,anchor,server,claimanchor,sig>) ]
+  --[ Eq(verify(sig,<realm,anchor,server,claimanchor>,anchor),true),
+      VouchAdded(realm,anchor,server,claimanchor) ]->
+  [ !Vouch(realm,anchor,server,claimanchor) ]
+
+rule register_anchor:
+  [ In(<realm,anchor>) ] --[ AnchorSlot(realm,anchor) ]-> [ Free(realm,anchor) ]
+
+rule propagate:
+  [ !Member(realm,server), !AdmittedClaim(realm,server,claimanchor),
+    !Trusted(realm,other,anchor),
+    !Vouch(realm,claimanchor,server,claimanchor),
+    !Vouch(realm,anchor,server,claimanchor), Free(realm,claimanchor) ]
+  --[ Different(other,server),
+      Propagated(realm,server,claimanchor,other,anchor),
+      TrustAdded(realm,server,claimanchor), OwnerClaimed(realm,claimanchor,server) ]->
+  [ !Trusted(realm,server,claimanchor) ]
+
+rule propagate_unanchored:
+  [ !Member(realm,server), !AdmittedClaim(realm,server,'unanchored'),
+    !Trusted(realm,other,anchor), !Vouch(realm,anchor,server,'unanchored') ]
+  --[ Different(other,server), PropagatedUnanchored(realm,server,other,anchor),
+      UnanchoredTrusted(realm,server) ]->
+  [ !TrustedUnanchored(realm,server) ]
+
+rule levels:
+  [ ] --> [ !Step('0','1'), !Step('1','2'), !Step('2','3'), !Step('3','4') ]
+
+rule issue_enrollment:
+  [ !RootKey(realm,sk), Fr(~string) ]
+  --[ EnrollmentIssued(realm,pk(sk),~string) ]->
+  [ !Enrollment(realm,pk(sk),~string), Out(<realm,pk(sk),~string>) ]
+
+// The enrollment string is delivered over an authentic out-of-band channel.
+rule deliver_enrollment:
+  [ !Enrollment(realm,pin,string), !Trusted(realm,owner,pin), Fr(~client) ]
+  --[ InitialPinDelivered(~client,realm,owner,pin,string),
+      PinProvisioned(realm,owner,pin) ]->
+  [ !PinHolder(~client,realm), !Reach(~client,realm,owner,pin,pin,'0') ]
+
+// Refresh is authenticated and supplies a currently computed trusted anchor.
+rule refresh_pin:
+  [ !PinHolder(client,realm), !Trusted(realm,owner,pin) ]
+  --[ RefreshedPinDelivered(client,realm,owner,pin),
+      PinProvisioned(realm,owner,pin) ]->
+  [ !Reach(client,realm,owner,pin,pin,'0') ]
+
+rule follow_succession:
+  [ !Reach(client,realm,owner,pin,old,level), !Step(level,next), In(<new,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,old,new>,old),true),
+      SuccessionFollowed(client,realm,pin,old,new) ]->
+  [ !Reach(client,realm,owner,pin,new,next) ]
+
+rule verify_advertisement:
+  [ !Reach(client,realm,owner,pin,anchor,level),
+    In(<server,claimanchor,sig>) ]
+  --[ Eq(verify(sig,<realm,anchor,server,claimanchor>,anchor),true),
+      ClientAccepted(client,realm,owner,pin,anchor,server,claimanchor,level) ]->
+  [ ]
+
+lemma anchor_owner_unique [reuse]:
+  "All r a s1 s2 #i #j. OwnerClaimed(r,a,s1) @i & OwnerClaimed(r,a,s2) @j ==> s1 = s2"
+lemma trusted_anchor_unique_owner:
+  "All r a s1 s2 #i #j. TrustAdded(r,s1,a) @i & TrustAdded(r,s2,a) @j ==> s1 = s2"
+lemma uncompromised_propagation_witness: exists-trace
+  "Ex r s a other oa #i. Propagated(r,s,a,other,oa) @i & not (Ex r2 a2 #j. Compromised(r2,a2) @j)"
+lemma propagation_requires_other_server:
+  "All r s a oa #i. Propagated(r,s,a,s,oa) @i ==> F"
+lemma unanchored_trust_has_root_or_other_voucher:
+  "All r s #i. UnanchoredTrusted(r,s) @i ==> UnanchoredRoot(r,s) @i | (Ex other anchor #j. PropagatedUnanchored(r,s,other,anchor) @i & TrustAdded(r,other,anchor) @j & #j < #i)"
+lemma unanchored_propagation_has_admitted_claim_and_vouch:
+  "All r s other anchor #i. PropagatedUnanchored(r,s,other,anchor) @i ==> (Ex #j #k. ClaimAdmitted(r,s,'unanchored') @j & VouchAdded(r,anchor,s,'unanchored') @k & #j < #i & #k < #i)"
+lemma unanchored_propagation_requires_other_server:
+  "All r s anchor #i. PropagatedUnanchored(r,s,s,anchor) @i ==> F"
+lemma unanchored_propagation_witness: exists-trace
+  "Ex r s other anchor #i. PropagatedUnanchored(r,s,other,anchor) @i & not (Ex r2 a2 #j. Compromised(r2,a2) @j)"
+lemma rooted_vouch_origin:
+  "All r s a target ca #i #j. TrustRoot(r,s,a) @i & VouchAdded(r,a,target,ca) @j ==> (Ex #k. Issued(r,a,target,ca) @k & #k < #j) | (Ex #k. Compromised(r,a) @k & #k < #j)"
+lemma rooted_client_acceptance_origin:
+  "All c r owner pin signer signerowner s ca level #h #i. TrustRoot(r,signerowner,signer) @h & ClientAccepted(c,r,owner,pin,signer,s,ca,level) @i ==> (Ex #j. Issued(r,signer,s,ca) @j & #j < #i) | (Ex #j. Compromised(r,signer) @j & #j < #i)"
+lemma rooted_succession_origin:
+  "All c r pin old oldowner next #h #i. TrustRoot(r,oldowner,old) @h & SuccessionFollowed(c,r,pin,old,next) @i ==> (Ex #j. SuccessionIssued(r,old,next) @j & #j < #i) | (Ex #j. Compromised(r,old) @j & #j < #i)"
+lemma one_step_acceptance_has_followed_succession:
+  "All c r owner pin anchor s ca #i. ClientAccepted(c,r,owner,pin,anchor,s,ca,'1') @i ==> (Ex #j. SuccessionFollowed(c,r,pin,pin,anchor) @j & #j < #i)"
+lemma two_step_acceptance_has_followed_successions:
+  "All c r owner pin anchor s ca #i. ClientAccepted(c,r,owner,pin,anchor,s,ca,'2') @i ==> (Ex middle #j #k. SuccessionFollowed(c,r,pin,pin,middle) @j & SuccessionFollowed(c,r,pin,middle,anchor) @k & #j < #k & #k < #i)"
+lemma three_step_acceptance_has_followed_successions:
+  "All c r owner pin anchor s ca #i. ClientAccepted(c,r,owner,pin,anchor,s,ca,'3') @i ==> (Ex m1 m2 #j #k #l. SuccessionFollowed(c,r,pin,pin,m1) @j & SuccessionFollowed(c,r,pin,m1,m2) @k & SuccessionFollowed(c,r,pin,m2,anchor) @l & #j < #k & #k < #l & #l < #i)"
+lemma four_step_acceptance_has_followed_successions:
+  "All c r owner pin anchor s ca #i. ClientAccepted(c,r,owner,pin,anchor,s,ca,'4') @i ==> (Ex m1 m2 m3 #j #k #l #m. SuccessionFollowed(c,r,pin,pin,m1) @j & SuccessionFollowed(c,r,pin,m1,m2) @k & SuccessionFollowed(c,r,pin,m2,m3) @l & SuccessionFollowed(c,r,pin,m3,anchor) @m & #j < #k & #k < #l & #l < #m & #m < #i)"
+lemma four_step_acceptance_witness [heuristic=i, hide_lemma=anchor_owner_unique]: exists-trace
+  "Ex c r owner pin anchor s ca #i. ClientAccepted(c,r,owner,pin,anchor,s,ca,'4') @i & not (Ex r2 a2 #j. Compromised(r2,a2) @j)"
+lemma rooted_three_step_distinct_witness [heuristic=i, hide_lemma=anchor_owner_unique]: exists-trace
+  "Ex c r owner pin m1 o1 m2 o2 anchor o3 s ca #r0 #r1 #r2 #r3 #j #k #l #i. TrustRoot(r,owner,pin) @r0 & TrustRoot(r,o1,m1) @r1 & TrustRoot(r,o2,m2) @r2 & TrustRoot(r,o3,anchor) @r3 & SuccessionFollowed(c,r,pin,pin,m1) @j & SuccessionFollowed(c,r,pin,m1,m2) @k & SuccessionFollowed(c,r,pin,m2,anchor) @l & ClientAccepted(c,r,owner,pin,anchor,s,ca,'3') @i & #r0 < #r1 & #r1 < #r2 & #r2 < #r3 & #r3 < #j & #j < #k & #k < #l & #l < #i & not (Ex r2 a2 #x. Compromised(r2,a2) @x)"
+lemma rooted_two_step_witness [heuristic=i, hide_lemma=anchor_owner_unique]: exists-trace
+  "Ex c r owner pin middle middleowner anchor anchorowner s ca #h #m #n #i #j #k. TrustRoot(r,owner,pin) @h & TrustRoot(r,middleowner,middle) @m & TrustRoot(r,anchorowner,anchor) @n & SuccessionFollowed(c,r,pin,pin,middle) @i & SuccessionFollowed(c,r,pin,middle,anchor) @j & ClientAccepted(c,r,owner,pin,anchor,s,ca,'2') @k & not (pin = middle) & not (middle = anchor) & not (pin = anchor) & #h < #i & #m < #j & #n < #k & #i < #j & #j < #k & not (Ex r2 a2 #x. Compromised(r2,a2) @x)"
+lemma rooted_one_step_acceptance_succession_origin:
+  "All c r owner pin anchor s ca #h #i. TrustRoot(r,owner,pin) @h & ClientAccepted(c,r,owner,pin,anchor,s,ca,'1') @i ==> (Ex #j. SuccessionIssued(r,pin,anchor) @j & #j < #i) | (Ex #j. Compromised(r,pin) @j & #j < #i)"
+lemma rooted_one_step_chain_origins:
+  "All c r owner pin signer signerowner s ca #h #t #i. TrustRoot(r,owner,pin) @h & TrustRoot(r,signerowner,signer) @t & ClientAccepted(c,r,owner,pin,signer,s,ca,'1') @i ==> ((Ex #j. SuccessionIssued(r,pin,signer) @j & #j < #i) | (Ex #j. Compromised(r,pin) @j & #j < #i)) & ((Ex #k. Issued(r,signer,s,ca) @k & #k < #i) | (Ex #k. Compromised(r,signer) @k & #k < #i))"
+lemma rooted_one_step_chain_witness [heuristic=C]: exists-trace
+  "Ex c r owner pin signer signerowner s ca #h #t #i. TrustRoot(r,owner,pin) @h & TrustRoot(r,signerowner,signer) @t & ClientAccepted(c,r,owner,pin,signer,s,ca,'1') @i & not (pin = signer) & #h < #i & #t < #i & not (Ex r2 a2 #j. Compromised(r2,a2) @j)"
+lemma attacker_chosen_successor_without_root_compromise [heuristic=C]: exists-trace
+  "Ex c r owner pin server claimanchor #h #i #j. TrustRoot(r,owner,pin) @h & SuccessionIssued(r,pin,pk('attacker')) @i & ClientAccepted(c,r,owner,pin,pk('attacker'),server,claimanchor,'1') @j & #h < #i & #i < #j & not (Ex r2 a2 #k. Compromised(r2,a2) @k)"
+lemma initial_pin_has_issued_enrollment:
+  "All c r owner pin string #i. InitialPinDelivered(c,r,owner,pin,string) @i ==> (Ex #j. EnrollmentIssued(r,pin,string) @j & #j < #i)"
+lemma refreshed_pin_has_prior_enrollment:
+  "All c r owner pin #i. RefreshedPinDelivered(c,r,owner,pin) @i ==> (Ex owner2 pin2 string #j. InitialPinDelivered(c,r,owner2,pin2,string) @j & #j < #i)"
+lemma client_acceptance_witness: exists-trace
+  "Ex c r owner pin a s ca level #i. ClientAccepted(c,r,owner,pin,a,s,ca,level) @i & not (Ex r2 a2 #j. Compromised(r2,a2) @j)"
+lemma admission_through_refreshed_pin_to_succession [heuristic=C]: exists-trace
+  "Ex c r owner pin other oa anchor initialowner initialpin string #a #b #d #h #i #j #t #k. ClaimAdmitted(r,owner,pin) @a & KeyAdmitted(r,oa) @b & VouchAdded(r,oa,owner,pin) @d & InitialPinDelivered(c,r,initialowner,initialpin,string) @h & Propagated(r,owner,pin,other,oa) @i & RefreshedPinDelivered(c,r,owner,pin) @j & SuccessionFollowed(c,r,pin,pin,anchor) @t & ClientAccepted(c,r,owner,pin,anchor,owner,pin,'1') @k & #a < #i & #b < #d & #d < #i & #h < #j & #i < #j & #j < #t & #t < #k & not (Ex r2 a2 #x. Compromised(r2,a2) @x)"
+lemma accepted_client_has_prior_enrollment:
+  "All c r owner pin a s ca level #i. ClientAccepted(c,r,owner,pin,a,s,ca,level) @i ==> (Ex initialowner initialpin string #j. InitialPinDelivered(c,r,initialowner,initialpin,string) @j & #j < #i)"
+lemma trust_has_root_or_other_voucher [reuse]:
+  "All r s a #i. TrustAdded(r,s,a) @i ==> TrustRoot(r,s,a) @i | (Ex other oa #j. Propagated(r,s,a,other,oa) @i & TrustAdded(r,other,oa) @j & #j < #i)"
+lemma propagated_claim_was_admitted [reuse, hide_lemma=trust_has_root_or_other_voucher]:
+  "All r s a other oa #i. Propagated(r,s,a,other,oa) @i ==> (Ex #j. ClaimAdmitted(r,s,a) @j & #j < #i)"
+lemma client_pin_was_trusted [reuse]:
+  "All c r owner pin a s ca level #i. ClientAccepted(c,r,owner,pin,a,s,ca,level) @i ==> (Ex #j. TrustAdded(r,owner,pin) @j & #j < #i)"
+lemma propagation_requires_self_and_other_vouch [reuse, hide_lemma=trust_has_root_or_other_voucher, hide_lemma=propagated_claim_was_admitted, hide_lemma=client_pin_was_trusted]:
+  "All r s a other oa #i. Propagated(r,s,a,other,oa) @i ==> (Ex #j #k. VouchAdded(r,a,s,a) @j & VouchAdded(r,oa,s,a) @k & #j < #i & #k < #i)"
+lemma admitted_vouch_has_admitted_key [reuse, hide_lemma=trust_has_root_or_other_voucher, hide_lemma=propagated_claim_was_admitted, hide_lemma=client_pin_was_trusted, hide_lemma=propagation_requires_self_and_other_vouch]:
+  "All r a s ca #i. VouchAdded(r,a,s,ca) @i ==> (Ex #j. KeyAdmitted(r,a) @j & #j < #i)"
+lemma accepted_pin_has_root_or_admitted_vouch:
+  "All c r owner pin a s ca level #i. ClientAccepted(c,r,owner,pin,a,s,ca,level) @i ==> (Ex #j. TrustRoot(r,owner,pin) @j & #j < #i) | (Ex other oa #claim #key #vouch #prop. ClaimAdmitted(r,owner,pin) @claim & KeyAdmitted(r,oa) @key & VouchAdded(r,oa,owner,pin) @vouch & Propagated(r,owner,pin,other,oa) @prop & #claim < #prop & #key < #vouch & #vouch < #prop & #prop < #i)"
+end

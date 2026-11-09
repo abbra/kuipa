@@ -1,0 +1,115 @@
+// One- through four-hop verification with authenticated initial pin delivery.
+// Honest successors are independently generated keys for the same server;
+// keys may be reused or compromised and are never retired. Honest anchors sign
+// attacker-chosen claims. Validity, policy, membership, storage and trust
+// propagation are omitted; the attacker-key rule is not every possible leak.
+theory peer_rotation_client
+begin
+builtins: signing
+restriction Equality: "All x y #i. Eq(x,y) @i ==> x = y"
+
+rule generate:
+  [ Fr(~sk) ] --[ KeyGenerated($realm,$server,pk(~sk)) ]->
+  [ !Anchor($realm,$server,~sk), Out(pk(~sk)) ]
+
+rule provision:
+  [ !Anchor(realm,server,sk), Fr(~client) ]
+  --[ InitialPin(~client,realm,pk(sk)) ]->
+  [ !Reach(~client,realm,pk(sk),pk(sk),'0') ]
+
+rule rotate:
+  [ !Anchor(realm,server,old), !Anchor(realm,server,new) ]
+  --[ Rotated(realm,server,pk(old),pk(new)) ]->
+  [ Out(sign(<'succession',realm,pk(old),pk(new)>,old)) ]
+
+rule vouch:
+  [ !Anchor(realm,server,sk), In(claim) ]
+  --[ VouchIssued(realm,pk(sk),claim) ]->
+  [ Out(sign(<'vouch',realm,pk(sk),claim>,sk)) ]
+
+rule compromise:
+  [ !Anchor(realm,server,sk) ] --[ Compromised(realm,server,pk(sk)) ]-> [ Out(sk) ]
+
+rule attacker_key:
+  [ Fr(~sk) ] --[ AttackerKey(pk(~sk)) ]-> [ Out(~sk) ]
+
+rule follow:
+  [ !Reach(client,realm,pin,pin,'0'), In(<next,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,pin,next>,pin),true), Followed(client,realm,pin,next) ]->
+  [ !Reach(client,realm,pin,next,'1') ]
+
+rule follow_second:
+  [ !Reach(client,realm,pin,middle,'1'), In(<next,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,middle,next>,middle),true),
+      FollowedSecond(client,realm,pin,middle,next) ]->
+  [ !Reach(client,realm,pin,next,'2') ]
+
+rule follow_third:
+  [ !Reach(client,realm,pin,middle,'2'), In(<next,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,middle,next>,middle),true),
+      FollowedThird(client,realm,pin,middle,next) ]->
+  [ !Reach(client,realm,pin,next,'3') ]
+
+rule follow_fourth:
+  [ !Reach(client,realm,pin,middle,'3'), In(<next,sig>) ]
+  --[ Eq(verify(sig,<'succession',realm,middle,next>,middle),true),
+      FollowedFourth(client,realm,pin,middle,next) ]->
+  [ !Reach(client,realm,pin,next,'4') ]
+
+rule accept:
+  [ !Reach(client,realm,pin,anchor,'1'), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<'vouch',realm,anchor,claim>,anchor),true),
+      ClientAccepted(client,realm,pin,anchor,claim) ]-> [ ]
+
+rule accept_second:
+  [ !Reach(client,realm,pin,anchor,'2'), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<'vouch',realm,anchor,claim>,anchor),true),
+      ClientAcceptedSecond(client,realm,pin,anchor,claim) ]-> [ ]
+
+rule accept_third:
+  [ !Reach(client,realm,pin,anchor,'3'), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<'vouch',realm,anchor,claim>,anchor),true),
+      ClientAcceptedThird(client,realm,pin,anchor,claim) ]-> [ ]
+
+rule accept_fourth:
+  [ !Reach(client,realm,pin,anchor,'4'), In(<claim,sig>) ]
+  --[ Eq(verify(sig,<'vouch',realm,anchor,claim>,anchor),true),
+      ClientAcceptedFourth(client,realm,pin,anchor,claim) ]-> [ ]
+
+lemma accepted_successor_has_rotation_origin:
+  "All c r pin anchor claim #i. ClientAccepted(c,r,pin,anchor,claim) @i ==> (Ex server #j. Rotated(r,server,pin,anchor) @j & #j < #i) | (Ex server #j. Compromised(r,server,pin) @j & #j < #i)"
+lemma accepted_honest_signer_has_vouch_origin:
+  "All c r pin anchor claim server #h #i. KeyGenerated(r,server,anchor) @h & ClientAccepted(c,r,pin,anchor,claim) @i ==> (Ex #j. VouchIssued(r,anchor,claim) @j & #j < #i) | (Ex #j. Compromised(r,server,anchor) @j & #j < #i)"
+lemma attacker_successor_requires_pin_compromise:
+  "All c r pin anchor claim #a #i. AttackerKey(anchor) @a & ClientAccepted(c,r,pin,anchor,claim) @i ==> (Ex server #j. Compromised(r,server,pin) @j & #j < #i)"
+lemma two_hop_has_ordered_follows:
+  "All c r pin anchor claim #i. ClientAcceptedSecond(c,r,pin,anchor,claim) @i ==> (Ex middle #j #k. Followed(c,r,pin,middle) @j & FollowedSecond(c,r,pin,middle,anchor) @k & #j < #k & #k < #i)"
+lemma attacker_final_requires_chain_compromise:
+  "All c r pin anchor claim #a #i. AttackerKey(anchor) @a & ClientAcceptedSecond(c,r,pin,anchor,claim) @i ==> (Ex middle #j #k. Followed(c,r,pin,middle) @j & FollowedSecond(c,r,pin,middle,anchor) @k & #j < #k & #k < #i & ((Ex server #t. Compromised(r,server,pin) @t & #t < #j) | (Ex server #t. Compromised(r,server,middle) @t & #t < #k)))"
+lemma three_hop_has_ordered_follows:
+  "All c r pin anchor claim #i. ClientAcceptedThird(c,r,pin,anchor,claim) @i ==> (Ex m1 m2 #j #k #l. Followed(c,r,pin,m1) @j & FollowedSecond(c,r,pin,m1,m2) @k & FollowedThird(c,r,pin,m2,anchor) @l & #j < #k & #k < #l & #l < #i)"
+lemma attacker_final_requires_three_hop_compromise:
+  "All c r pin anchor claim #a #i. AttackerKey(anchor) @a & ClientAcceptedThird(c,r,pin,anchor,claim) @i ==> (Ex m1 m2 #j #k #l. Followed(c,r,pin,m1) @j & FollowedSecond(c,r,pin,m1,m2) @k & FollowedThird(c,r,pin,m2,anchor) @l & #j < #k & #k < #l & #l < #i & ((Ex server #t. Compromised(r,server,pin) @t & #t < #j) | (Ex server #t. Compromised(r,server,m1) @t & #t < #k) | (Ex server #t. Compromised(r,server,m2) @t & #t < #l)))"
+lemma four_hop_has_ordered_follows:
+  "All c r pin anchor claim #i. ClientAcceptedFourth(c,r,pin,anchor,claim) @i ==> (Ex m1 m2 m3 #j #k #l #m. Followed(c,r,pin,m1) @j & FollowedSecond(c,r,pin,m1,m2) @k & FollowedThird(c,r,pin,m2,m3) @l & FollowedFourth(c,r,pin,m3,anchor) @m & #j < #k & #k < #l & #l < #m & #m < #i)"
+lemma attacker_final_requires_four_hop_compromise:
+  "All c r pin anchor claim #a #i. AttackerKey(anchor) @a & ClientAcceptedFourth(c,r,pin,anchor,claim) @i ==> (Ex m1 m2 m3 #j #k #l #m. Followed(c,r,pin,m1) @j & FollowedSecond(c,r,pin,m1,m2) @k & FollowedThird(c,r,pin,m2,m3) @l & FollowedFourth(c,r,pin,m3,anchor) @m & #j < #k & #k < #l & #l < #m & #m < #i & ((Ex server #t. Compromised(r,server,pin) @t & #t < #j) | (Ex server #t. Compromised(r,server,m1) @t & #t < #k) | (Ex server #t. Compromised(r,server,m2) @t & #t < #l) | (Ex server #t. Compromised(r,server,m3) @t & #t < #m)))"
+lemma honest_four_hop_witness [heuristic=i]: exists-trace
+  "Ex c r pin m1 m2 m3 anchor claim server #h #i #j #k #l #m #n. InitialPin(c,r,pin) @h & Rotated(r,server,pin,m1) @i & Rotated(r,server,m1,m2) @j & Rotated(r,server,m2,m3) @k & Rotated(r,server,m3,anchor) @l & FollowedFourth(c,r,pin,m3,anchor) @m & ClientAcceptedFourth(c,r,pin,anchor,claim) @n & not (pin = m1) & not (pin = m2) & not (pin = m3) & not (pin = anchor) & not (m1 = m2) & not (m1 = m3) & not (m1 = anchor) & not (m2 = m3) & not (m2 = anchor) & not (m3 = anchor) & #h < #i & #i < #j & #j < #k & #k < #l & #l < #m & #m < #n & not (Ex r2 s2 key #t. Compromised(r2,s2,key) @t)"
+lemma stolen_third_intermediate_accepts_attacker_final [heuristic=C]: exists-trace
+  "Ex c r pin m1 m2 m3 anchor claim server #h #i #j #k #l #a #m #n. InitialPin(c,r,pin) @h & Rotated(r,server,pin,m1) @i & Rotated(r,server,m1,m2) @j & Rotated(r,server,m2,m3) @k & Compromised(r,server,m3) @l & AttackerKey(anchor) @a & FollowedFourth(c,r,pin,m3,anchor) @m & ClientAcceptedFourth(c,r,pin,anchor,claim) @n & #h < #i & #i < #j & #j < #k & #k < #l & #l < #m & #a < #m & #m < #n & not (Ex other #t. Compromised(r,other,pin) @t) & not (Ex other #t. Compromised(r,other,m1) @t) & not (Ex other #t. Compromised(r,other,m2) @t) & not (Ex other #t. Rotated(r,other,m3,anchor) @t)"
+lemma honest_three_hop_witness [heuristic=i]: exists-trace
+  "Ex c r pin m1 m2 anchor claim server #h #i #j #k #l #m. InitialPin(c,r,pin) @h & Rotated(r,server,pin,m1) @i & Rotated(r,server,m1,m2) @j & Rotated(r,server,m2,anchor) @k & FollowedThird(c,r,pin,m2,anchor) @l & ClientAcceptedThird(c,r,pin,anchor,claim) @m & not (pin = m1) & not (pin = m2) & not (pin = anchor) & not (m1 = m2) & not (m1 = anchor) & not (m2 = anchor) & #h < #i & #i < #j & #j < #k & #k < #l & #l < #m & not (Ex r2 s2 key #t. Compromised(r2,s2,key) @t)"
+lemma stolen_second_intermediate_accepts_attacker_final [heuristic=C]: exists-trace
+  "Ex c r pin m1 m2 anchor claim server #h #i #j #k #a #l #m. InitialPin(c,r,pin) @h & Rotated(r,server,pin,m1) @i & Rotated(r,server,m1,m2) @j & Compromised(r,server,m2) @k & AttackerKey(anchor) @a & FollowedThird(c,r,pin,m2,anchor) @l & ClientAcceptedThird(c,r,pin,anchor,claim) @m & not (pin = m1) & #h < #i & #i < #j & #j < #k & #k < #l & #a < #l & #l < #m & not (Ex other #t. Compromised(r,other,pin) @t) & not (Ex other #t. Compromised(r,other,m1) @t) & not (Ex other #t. Rotated(r,other,m2,anchor) @t)"
+lemma honest_two_hop_witness [heuristic=C]: exists-trace
+  "Ex c r pin middle anchor claim server #h #i #j #k #l. InitialPin(c,r,pin) @h & Rotated(r,server,pin,middle) @i & Rotated(r,server,middle,anchor) @j & FollowedSecond(c,r,pin,middle,anchor) @k & ClientAcceptedSecond(c,r,pin,anchor,claim) @l & not (pin = middle) & not (middle = anchor) & not (pin = anchor) & #h < #i & #i < #j & #j < #k & #k < #l & not (Ex r2 s2 key #t. Compromised(r2,s2,key) @t)"
+lemma stolen_intermediate_accepts_attacker_final [heuristic=C]: exists-trace
+  "Ex c r pin middle anchor claim server #h #i #j #a #k #l. InitialPin(c,r,pin) @h & Rotated(r,server,pin,middle) @i & Compromised(r,server,middle) @j & AttackerKey(anchor) @a & FollowedSecond(c,r,pin,middle,anchor) @k & ClientAcceptedSecond(c,r,pin,anchor,claim) @l & #h < #i & #i < #j & #j < #k & #a < #k & #k < #l & not (Ex other #t. Compromised(r,other,pin) @t) & not (Ex other #t. Rotated(r,other,middle,anchor) @t)"
+lemma honest_client_witness: exists-trace
+  "Ex c r pin anchor claim server #h #i #j #k. InitialPin(c,r,pin) @h & Rotated(r,server,pin,anchor) @i & Followed(c,r,pin,anchor) @j & ClientAccepted(c,r,pin,anchor,claim) @k & not (pin = anchor) & #h < #i & #i < #j & #j < #k & not (Ex r2 s2 key #t. Compromised(r2,s2,key) @t)"
+lemma stolen_pin_accepts_attacker_successor: exists-trace
+  "Ex c r pin anchor claim s #h #a #i #j. InitialPin(c,r,pin) @h & AttackerKey(anchor) @a & Compromised(r,s,pin) @i & ClientAccepted(c,r,pin,anchor,claim) @j & #h < #i & #a < #j & #i < #j & not (Ex s2 #k. Rotated(r,s2,pin,anchor) @k)"
+lemma stolen_successor_forges_without_pin_compromise [heuristic=C]: exists-trace
+  "Ex c r pin anchor claim server #h #i #j #k #l. InitialPin(c,r,pin) @h & Rotated(r,server,pin,anchor) @i & Compromised(r,server,anchor) @j & Followed(c,r,pin,anchor) @k & ClientAccepted(c,r,pin,anchor,claim) @l & #h < #i & #i < #j & #j < #k & #k < #l & not (Ex other #t. Compromised(r,other,pin) @t) & not (Ex #t. VouchIssued(r,anchor,claim) @t)"
+end
