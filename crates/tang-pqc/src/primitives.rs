@@ -218,6 +218,84 @@ pub fn open(key: &[u8], sealed: &[u8]) -> Result<SecretBuf> {
     Ok(out)
 }
 
+/// The nonce of chunk `counter` of a stream: a 4-byte per-stream prefix and
+/// the counter, big endian.
+fn chunk_nonce(prefix: [u8; 4], counter: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..4].copy_from_slice(&prefix);
+    n[4..].copy_from_slice(&counter.to_be_bytes());
+    n
+}
+
+/// The associated data of a chunk: the stream's header, and whether this is
+/// the last chunk, so truncating or extending a stream fails to authenticate.
+fn chunk_aad(header: &[u8], last: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(header.len() + 1);
+    aad.extend_from_slice(header);
+    aad.push(u8::from(last));
+    aad
+}
+
+/// AES-256-GCM of one chunk of a stream under a 32-byte key used for that
+/// stream only; returns `ct ‖ tag`.  A nonce is never reused while each
+/// `counter` is used once per key.
+///
+/// # Errors
+///
+/// [`Error::Malformed`] for a key that is not 32 bytes, or an OpenSSL error.
+pub fn seal_chunk(
+    key: &[u8],
+    prefix: &[u8; 4],
+    counter: u64,
+    header: &[u8],
+    last: bool,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    if key.len() != 32 {
+        return Err(Error::Malformed("AES-256-GCM key"));
+    }
+    let mut ctx = AeadEncryptCtx::new(&aes_256_gcm()?, key, &chunk_nonce(*prefix, counter), None)?;
+    ctx.set_aad(&chunk_aad(header, last))?;
+    let mut out = vec![0u8; plaintext.len() + TAG_LEN];
+    let n = ctx.update(plaintext, &mut out)?;
+    let n = n + ctx.finalize(&mut out[n..])?;
+    ctx.tag(&mut out[n..n + TAG_LEN])?;
+    out.truncate(n + TAG_LEN);
+    Ok(out)
+}
+
+/// Inverse of [`seal_chunk`].
+///
+/// # Errors
+///
+/// [`Error::RecoveryFailed`] if the chunk is truncated, is out of place, has
+/// the wrong last flag or header, or does not authenticate.
+pub fn open_chunk(
+    key: &[u8],
+    prefix: &[u8; 4],
+    counter: u64,
+    header: &[u8],
+    last: bool,
+    sealed: &[u8],
+) -> Result<SecretBuf> {
+    if key.len() != 32 {
+        return Err(Error::Malformed("AES-256-GCM key"));
+    }
+    let split = sealed
+        .len()
+        .checked_sub(TAG_LEN)
+        .ok_or(Error::RecoveryFailed)?;
+    let (ciphertext, tag) = sealed.split_at(split);
+    let mut ctx = AeadDecryptCtx::new(&aes_256_gcm()?, key, &chunk_nonce(*prefix, counter), None)?;
+    ctx.set_aad(&chunk_aad(header, last))?;
+    let mut out = SecretBuf::with_len(ciphertext.len());
+    let n = ctx.update(ciphertext, out.as_mut_slice())?;
+    ctx.set_tag(tag)?;
+    ctx.finalize(&mut out.as_mut_slice()[n..])
+        .map_err(|_| Error::RecoveryFailed)?;
+    Ok(out)
+}
+
 /// ML-KEM encapsulation; returns `(ciphertext, shared secret)`.
 pub(crate) fn encapsulate(key: &Pkey<Public>) -> Result<(Vec<u8>, SecretBuf)> {
     let r = EncapCtx::new(key)?.encapsulate()?;
@@ -250,6 +328,45 @@ mod tests {
             Err(Error::RecoveryFailed)
         ));
         assert!(seal(&[0u8; 16], b"x").is_err());
+    }
+
+    #[test]
+    fn chunks_match_an_independent_aes_gcm() {
+        // AES-256-GCM, key 00..1f, nonce 01020304 ‖ 7 (u64 BE), aad
+        // "hdr" ‖ 01, from Python's `cryptography`.
+        let key: Vec<u8> = (0..32).collect();
+        let expect = "771d49a91446e43e1d087f64bca14cd9fd07b5267e797316dcdb";
+        let sealed = seal_chunk(&key, &[1, 2, 3, 4], 7, b"hdr", true, b"chunk data").unwrap();
+        let hex = sealed.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+            s
+        });
+        assert_eq!(hex, expect);
+        assert_eq!(
+            open_chunk(&key, &[1, 2, 3, 4], 7, b"hdr", true, &sealed)
+                .unwrap()
+                .as_ref(),
+            b"chunk data"
+        );
+    }
+
+    #[test]
+    fn a_chunk_opens_only_in_its_place() {
+        let key = [5u8; 32];
+        let sealed = seal_chunk(&key, &[0; 4], 1, b"h", false, b"x").unwrap();
+        for (prefix, counter, header, last) in [
+            ([1, 0, 0, 0], 1, &b"h"[..], false),
+            ([0; 4], 2, b"h", false),
+            ([0; 4], 1, b"g", false),
+            ([0; 4], 1, b"h", true),
+        ] {
+            assert!(matches!(
+                open_chunk(&key, &prefix, counter, header, last, &sealed),
+                Err(Error::RecoveryFailed)
+            ));
+        }
+        assert!(open_chunk(&key, &[0; 4], 1, b"h", false, &sealed[..5]).is_err());
     }
 
     #[test]

@@ -465,11 +465,46 @@ SHA-256, or SHA-384 when the system crypto policy allows only ML-DSA-87
 (CNSA 2.0); a CNSA server refuses SHA-256 digests.  See *kuipa-gitsign*
 for git commits.
 
-## sign verify _FILE_ [--signature _SIG_] [--signer _S_] [--purpose _P_]
+## sign verify _FILE_ [--signature _SIG_] [--realm _R_ --anchor _THUMBPRINT_]... [--signer _S_] [--purpose _P_]
 
 Verify _FILE_ against its bundle (default _FILE_*.kusig*) offline, with
-this host's pinned anchors, as of the time it was signed.  Exits 1 for
-another signer or purpose than asked for.
+this host's pinned anchors, as of the time it was signed.  With
+*--realm* and one or more *--anchor*, verify against those anchors
+instead: a host that is not enrolled can verify.  The file is read as a
+stream, so a backup of any size is checked in constant memory.  Exits 1
+for another signer or purpose than asked for.
+
+## backup key create --realm _R_ --out _FILE_ [--threshold _N_] [--shares _M_] [--recovery-file _F_]
+
+Make the recovery key a realm's server backups are sealed to, and print
+its papers: _M_ pages (default 3), of which any _N_ (default 2) and a
+recovery passphrase open it.  _FILE_ is the recipient file for the hosts
+that make backups: public data only.  Needs no ticket and registers
+nothing.  See *docs/DESIGN-backup.md*.
+
+## backup key check --recipient _FILE_ [--recovery-file _F_]
+
+Read papers from standard input (a blank line between pages, *?* for a
+word that cannot be read) and report whether they, with the passphrase,
+make the key _FILE_ names.
+
+## backup seal --recipient _FILE_... --out _FILE_
+
+Seal standard input to up to four recovery keys.  The output is written
+atomically, mode 0600.
+
+## backup open _FILE_ --out _FILE_|- [--also _FILE_]... [--realm _R_ --anchor _THUMBPRINT_]... [--signer _S_] [--no-verify] [--recovery-file _F_]
+
+Check _FILE_ and each *--also* file against their *.kusig* bundles (the
+purpose must be *ipa-backup*), then read the papers from standard input,
+make the recovery key, and write the backup out.  Nothing contacts a
+server; on a host that is not enrolled give the realm and its anchors
+from the realm card.  A damaged file leaves no output behind.
+
+## backup card [--recipient _FILE_]
+
+Print this host's realm and anchors and, with _FILE_, the recovery key's
+id: the page to keep with the papers.
 
 ## tlog witnesses [--add _JWK_] [--remove _THUMBPRINT_] [--required _N_]
 

@@ -19,6 +19,7 @@
 //!   cosignatures (`docs/DESIGN-tlog.md`).
 
 pub mod anchors;
+pub mod backup;
 pub mod bundle;
 pub mod certs;
 pub mod delegation;

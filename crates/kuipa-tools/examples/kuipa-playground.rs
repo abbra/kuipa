@@ -444,8 +444,8 @@ fn configure_policy(directory: &KdcDirectory) {
             },
         ];
     }
-    // And let the release group sign blobs (DESIGN-sign.md); the
-    // administrator is in it.
+    // And let the release group sign blobs and backups (DESIGN-sign.md,
+    // DESIGN-backup.md); the administrator is in it.
     directory.sign_policy.lock().unwrap().purposes.insert(
         "blob".into(),
         kuipa_enroll::sign::Signers {
@@ -455,6 +455,13 @@ fn configure_policy(directory: &KdcDirectory) {
     );
     directory.sign_policy.lock().unwrap().purposes.insert(
         "git-commit".into(),
+        kuipa_enroll::sign::Signers {
+            groups: vec!["release".into()],
+            ..kuipa_enroll::sign::Signers::default()
+        },
+    );
+    directory.sign_policy.lock().unwrap().purposes.insert(
+        "ipa-backup".into(),
         kuipa_enroll::sign::Signers {
             groups: vec!["release".into()],
             ..kuipa_enroll::sign::Signers::default()

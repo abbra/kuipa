@@ -288,6 +288,15 @@ design first.
         volume.
   - [x] Device-key deposits in a helpdesk seal, and their delivery
         (`kuipa seal recover helpdesk|deliver|fetch`).
+- [ ] Sealed, signed server backups (`docs/DESIGN-backup.md`; FreeIPA side
+      in its `doc/designs/kuipa-backup.md`):
+  - [x] Chunked AES-256-GCM (`tang-pqc::primitives::seal_chunk`), the
+        `IPBK` container (`kuipa-enroll::backup`).
+  - [x] `kuipa backup key|seal|open|card`, streaming digests for `sign`,
+        `sign verify --realm --anchor`; run in the playground session
+        (unenrolled host, planted file, wrong purpose, wrong anchor).
+  - [ ] `ipa-backup --kuipa` / `ipa-restore --kuipa` in FreeIPA, and
+        `/var/lib/ipa/ku` in the backed-up files.
 - [x] M-of-N approvals for break-glass releases, recorded in the
       transparency log (`docs/DESIGN-approvals.md`).
 - [x] Short-lived CI runner identities (voucher leases, `ticket.leased`)

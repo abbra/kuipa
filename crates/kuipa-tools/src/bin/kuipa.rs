@@ -313,6 +313,12 @@ enum Command {
         #[command(subcommand)]
         action: SignAction,
     },
+    /// Seal a server backup to the realm's paper recovery key, and open
+    /// one with the papers, with no realm needed (`DESIGN-backup.md`).
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
 }
 
 /// `kuipa sign` subcommands.
@@ -337,12 +343,117 @@ enum SignAction {
         /// The signature (default `<file>.kusig`).
         #[arg(long)]
         signature: Option<std::path::PathBuf>,
+        /// Verify against these anchors and not this host's, for a host that
+        /// is not enrolled (repeatable; needs --realm).
+        #[arg(long, value_name = "THUMBPRINT", requires = "realm")]
+        anchor: Vec<String>,
+        /// The realm the statement must be for, with --anchor.
+        #[arg(long, requires = "anchor")]
+        realm: Option<String>,
         /// Require this signer (`alice` or `alice@REALM`).
         #[arg(long)]
         signer: Option<String>,
         /// Require this purpose.
         #[arg(long)]
         purpose: Option<String>,
+    },
+}
+
+/// `kuipa backup` subcommands.
+#[derive(Subcommand)]
+enum BackupAction {
+    /// The realm's backup recovery key: make it with its papers, or
+    /// check papers.
+    Key {
+        #[command(subcommand)]
+        action: BackupKeyAction,
+    },
+    /// Seal standard input to one or more recovery keys (at most four),
+    /// into a file written atomically.
+    Seal {
+        /// A recipient file made by `backup key create`.
+        #[arg(long, required = true, value_name = "FILE")]
+        recipient: Vec<std::path::PathBuf>,
+        /// The sealed file.
+        #[arg(long, short, value_name = "FILE")]
+        out: std::path::PathBuf,
+    },
+    /// Open a sealed backup with its papers: check its signature, read
+    /// the words of at least N papers from standard input and the
+    /// recovery passphrase, and write the backup out.
+    Open {
+        /// The sealed backup.
+        file: std::path::PathBuf,
+        /// Where to write it (`-` for standard output).
+        #[arg(long, short, value_name = "FILE")]
+        out: String,
+        /// Trust these anchors and not this host's, for a host that is not
+        /// enrolled (repeatable; from the realm card).
+        #[arg(long, value_name = "THUMBPRINT", requires = "realm")]
+        anchor: Vec<String>,
+        /// The realm the signature must be for, with --anchor.
+        #[arg(long, requires = "anchor")]
+        realm: Option<String>,
+        /// Another file to check against its own `<file>.kusig` (the
+        /// backup's `header`).
+        #[arg(long, value_name = "FILE")]
+        also: Vec<std::path::PathBuf>,
+        /// Require this signer (`host/ipa1.example.test`).
+        #[arg(long)]
+        signer: Option<String>,
+        /// Open without checking any signature.
+        #[arg(long)]
+        no_verify: bool,
+        /// Read the recovery passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        recovery_file: Option<String>,
+    },
+    /// Print this host's realm and anchors, and a recovery key's id: the
+    /// page to keep with the papers.
+    Card {
+        /// A recipient file, to name its key.
+        #[arg(long, value_name = "FILE")]
+        recipient: Option<std::path::PathBuf>,
+    },
+}
+
+/// `kuipa backup key` subcommands.
+#[derive(Subcommand)]
+enum BackupKeyAction {
+    /// Make a recovery key and print its papers; needs no ticket and
+    /// registers nothing.
+    Create {
+        /// The realm the backups are of.
+        #[arg(long)]
+        realm: String,
+        /// How many papers are enough to recover (2 to --shares).
+        #[arg(long, value_name = "N", default_value_t = 2)]
+        threshold: u8,
+        /// How many papers to print (at most 16).
+        #[arg(long, value_name = "M", default_value_t = 3)]
+        shares: u8,
+        /// Read the recovery passphrase from this file (asked for twice
+        /// otherwise; at least 16 characters).
+        #[arg(long, value_name = "FILE")]
+        recovery_file: Option<String>,
+        /// Accept a shorter recovery passphrase than kuipa advises.
+        #[arg(long)]
+        weak_passphrase: bool,
+        /// Make papers with no passphrase: the papers alone are then the key.
+        #[arg(long)]
+        no_passphrase: bool,
+        /// Where to write the recipient file the backup hosts keep.
+        #[arg(long, short, value_name = "FILE")]
+        out: std::path::PathBuf,
+    },
+    /// Check papers against a recipient file without opening anything.
+    Check {
+        /// The recipient file.
+        #[arg(long, value_name = "FILE")]
+        recipient: std::path::PathBuf,
+        /// Read the recovery passphrase from this file.
+        #[arg(long, value_name = "FILE")]
+        recovery_file: Option<String>,
     },
 }
 
@@ -1101,6 +1212,7 @@ impl Command {
             Command::Keys { .. } => "keys",
             Command::Tlog { .. } => "tlog",
             Command::Sign { .. } => "sign",
+            Command::Backup { .. } => "backup",
         }
     }
 
@@ -1751,6 +1863,7 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
         "rotate-keys" => render_rotated(value, "New host keys"),
         "tlog" => render_tlog(value),
         "sign" => render_sign(value),
+        "backup" => render_backup(value),
         "protect" if get(value, "contents").is_string() => render_protect_other(value),
         "protect" => render_protect(value),
         "unprotect" if get(value, "contents").is_string() => render_unprotect_other(value),
@@ -1800,6 +1913,65 @@ fn render_sign(value: &Value) {
         text(get(value, "log")),
         get(value, "index")
     );
+}
+
+fn render_backup(value: &Value) {
+    let text = |v: &Value| v.as_str().unwrap_or("?").to_owned();
+    if let Some(pages) = get(value, "pages").as_array() {
+        println!(
+            "Backup recovery key {} (set {}) written to {}: {} of {} papers and the recovery passphrase open the realm's backups.",
+            text(get(value, "recovery_key")),
+            text(get(value, "set")),
+            text(get(value, "recipient")),
+            get(value, "threshold").as_u64().unwrap_or(0),
+            get(value, "shares").as_u64().unwrap_or(0),
+        );
+        for page in pages {
+            println!();
+            println!("{}", text(page).trim_end());
+        }
+        println!();
+        println!(
+            "Print each page, and keep the pages apart from each other and from the backups. Check them now with `kuipa backup key check` — a paper backup is only as good as the day it was tested. Then run `kuipa backup card` on an enrolled host and keep that page with them."
+        );
+    } else if get(value, "card") == &Value::Bool(true) {
+        println!("kuipa backup card for realm {}", text(get(value, "realm")));
+        for a in list(get(value, "anchors")) {
+            println!("  anchor {}", text(a));
+        }
+        if let Some(k) = get(value, "recovery_key").as_str() {
+            println!("  recovery key {k} (set {})", text(get(value, "set")));
+        }
+        println!(
+            "Keep this page with the papers: `kuipa backup open --realm R --anchor T` needs the anchors."
+        );
+    } else if get(value, "sealed").is_string() {
+        println!("Sealed to {}.", text(get(value, "sealed")));
+    } else if get(value, "opened").is_string() {
+        let skipped = get(value, "signature_skipped") == &Value::Bool(true);
+        println!(
+            "Opened {}{}.",
+            text(get(value, "opened")),
+            if skipped {
+                ", with no signature checked"
+            } else {
+                ", after its signature verified"
+            }
+        );
+    } else {
+        println!(
+            "Those papers recover the key {}: the passphrase and the key id match.",
+            text(get(value, "recovery_key"))
+        );
+        for s in list(get(value, "repaired")) {
+            println!(
+                "  paper {}: {} unreadable word(s), {} wrong word(s) repaired",
+                get(s, "index").as_u64().unwrap_or(0),
+                get(s, "erased").as_u64().unwrap_or(0),
+                get(s, "wrong").as_u64().unwrap_or(0)
+            );
+        }
+    }
 }
 
 fn render_tlog(value: &Value) {
@@ -2452,6 +2624,21 @@ fn with_passkey_pin<'a>(
 /// `kuipa keys fetch` (§18.4): the value on standard output, or in a
 /// file with `--out`.  Standard output only when it is not a terminal,
 /// as `kuipa-unseal` does (§10.5).
+/// The anchors given on the command line, if any.
+fn pins(realm: Option<&str>, anchors: &[String]) -> Result<Option<kuipa_tools::sign::Pins>, Error> {
+    let (Some(realm), false) = (realm, anchors.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(kuipa_tools::sign::Pins {
+        realm: realm.to_owned(),
+        anchors: anchors
+            .iter()
+            .map(|a| a.parse())
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("not an anchor thumbprint: {e}"))?,
+    }))
+}
+
 fn run_sign(paths: &Paths, action: &SignAction) -> Result<Value, Error> {
     match action {
         SignAction::Blob { purpose, files } => {
@@ -2460,15 +2647,135 @@ fn run_sign(paths: &Paths, action: &SignAction) -> Result<Value, Error> {
         SignAction::Verify {
             file,
             signature,
+            anchor,
+            realm,
             signer,
             purpose,
         } => kuipa_tools::sign::verify_file(
             paths,
             file,
             signature.as_deref(),
+            pins(realm.as_deref(), anchor)?.as_ref(),
             signer.as_deref(),
             purpose.as_deref(),
         ),
+    }
+}
+
+/// `kuipa backup …`.
+#[allow(clippy::too_many_lines)]
+fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
+    use kuipa_tools::backup;
+    match action {
+        BackupAction::Key {
+            action:
+                BackupKeyAction::Create {
+                    realm,
+                    threshold,
+                    shares,
+                    recovery_file,
+                    weak_passphrase,
+                    no_passphrase,
+                    out,
+                },
+        } => {
+            let pass =
+                recovery_passphrase(recovery_file.as_deref(), *weak_passphrase, *no_passphrase)?;
+            let made = backup::create_key(realm, pass.as_ref(), *threshold, *shares)?;
+            made.file.write(out)?;
+            Ok(serde_json::json!({
+                "recovery_key": made.file.key_id,
+                "set": format!("{:05X}", made.file.set),
+                "threshold": threshold,
+                "shares": shares,
+                "recipient": out,
+                "pages": made.pages,
+            }))
+        }
+        BackupAction::Key {
+            action:
+                BackupKeyAction::Check {
+                    recipient,
+                    recovery_file,
+                },
+        } => {
+            let file = backup::RecipientFile::read(recipient)?;
+            let words = read_words()?;
+            let pass = recovery_passphrase(recovery_file.as_deref(), true, true)?;
+            backup::check(&words, pass.as_ref(), &file)
+        }
+        BackupAction::Seal { recipient, out } => {
+            let recipients = recipient
+                .iter()
+                .map(|p| backup::RecipientFile::read(p)?.recipient())
+                .collect::<Result<Vec<_>, _>>()?;
+            backup::seal_file(&recipients, std::io::stdin().lock(), out)?;
+            Ok(serde_json::json!({ "sealed": out }))
+        }
+        BackupAction::Open {
+            file,
+            out,
+            anchor,
+            realm,
+            also,
+            signer,
+            no_verify,
+            recovery_file,
+        } => {
+            let mut verified = Vec::new();
+            if !no_verify {
+                let pins = pins(realm.as_deref(), anchor)?;
+                for f in std::iter::once(file).chain(also) {
+                    let v = kuipa_tools::sign::verify_file(
+                        paths,
+                        f,
+                        None,
+                        pins.as_ref(),
+                        signer.as_deref(),
+                        Some("ipa-backup"),
+                    )?;
+                    if get(&v, "ok") != &Value::Bool(true) {
+                        return Err(format!(
+                            "{} is signed, but not by the signer and for the purpose a backup needs: {v}",
+                            f.display()
+                        )
+                        .into());
+                    }
+                    verified.push(v);
+                }
+            }
+            let words = read_words()?;
+            let pass = recovery_passphrase(recovery_file.as_deref(), true, true)?;
+            let (key, _) = backup::recover_key(&words, pass.as_ref())?;
+            let input =
+                std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
+            if out == "-" {
+                backup::open_stream(&key, input, std::io::stdout().lock())?;
+                return Ok(serde_json::json!({ "quiet": true }));
+            }
+            backup::open_file(&key, input, std::path::Path::new(out))?;
+            Ok(
+                serde_json::json!({ "opened": out, "verified": verified, "signature_skipped": no_verify }),
+            )
+        }
+        BackupAction::Card { recipient } => {
+            let public = kuipa_tools::paths::PublicState::load(paths)?;
+            let anchors: Vec<String> = kuipa_tools::paths::read_anchors(paths)?
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            let key = recipient
+                .as_deref()
+                .map(backup::RecipientFile::read)
+                .transpose()?;
+            Ok(serde_json::json!({
+                "card": true,
+                "realm": public.realm,
+                "anchors": anchors,
+                "recovery_key": key.as_ref().map(|k| k.key_id.clone()),
+                "set": key.as_ref().map(|k| format!("{:05X}", k.set)),
+            }))
+        }
     }
 }
 
@@ -3174,6 +3481,7 @@ fn main() -> ExitCode {
         Command::Keys { action } => run_keys(&paths, action),
         Command::Tlog { action } => run_tlog(&paths, action),
         Command::Sign { action } => run_sign(&paths, action),
+        Command::Backup { action } => run_backup(&paths, action),
         _ => run(&args),
     };
     match result {

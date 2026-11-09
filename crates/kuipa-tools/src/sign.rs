@@ -43,8 +43,8 @@ pub fn sign_files(
     let alg = DigestAlg::for_policy(&tang_pqc::Policy::from_system()?);
     let mut digests = Vec::with_capacity(files.len());
     for f in files {
-        let data = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
-        digests.push(Digest::of(alg, &data)?);
+        let file = std::fs::File::open(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        digests.push(Digest::of_reader(alg, file)?);
     }
     let asked = Request {
         purpose: purpose.to_owned(),
@@ -59,8 +59,8 @@ pub fn sign_files(
     }
     let first = bundles.first().ok_or("the server answered no bundle")?;
     let public = PublicState::load(host)?;
-    let v = first.verify(
-        &std::fs::read(&files[0])?,
+    let v = first.verify_digest(
+        &asked.digests[0],
         &public.realm,
         &paths::read_anchors(host)?,
         &tang_pqc::Policy::from_system()?,
@@ -121,8 +121,17 @@ pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Ve
     Ok(bundles)
 }
 
+/// The anchors to verify against when this host has none of its own (a new
+/// host in a restore): the realm, and the thumbprints a person carries.
+pub struct Pins {
+    /// The realm the statement must be for.
+    pub realm: String,
+    /// The trusted anchors.
+    pub anchors: Vec<tang_pqc::Thumbprint>,
+}
+
 /// `kuipa sign verify`: check `file` against its bundle (`signature`,
-/// else `<file>.kusig`) offline, with this host's pinned anchors; and
+/// else `<file>.kusig`) offline, with this host's pinned anchors, or `pins`; and
 /// when given, that the signer is `signer` and the purpose `purpose`.
 /// `ok` is false for a mismatch of either.
 ///
@@ -133,17 +142,22 @@ pub fn verify_file(
     host: &Paths,
     file: &Path,
     signature: Option<&Path>,
+    pins: Option<&Pins>,
     signer: Option<&str>,
     purpose: Option<&str>,
 ) -> Result<Value, Error> {
     let sig = signature.map_or_else(|| bundle_path(file), Path::to_path_buf);
     let bundle =
         Bundle::from_bytes(&std::fs::read(&sig).map_err(|e| format!("{}: {e}", sig.display()))?)?;
-    let public = PublicState::load(host)?;
-    let v = bundle.verify(
-        &std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?,
-        &public.realm,
-        &paths::read_anchors(host)?,
+    let (realm, anchors) = match pins {
+        Some(p) => (p.realm.clone(), p.anchors.clone()),
+        None => (PublicState::load(host)?.realm, paths::read_anchors(host)?),
+    };
+    let data = std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let v = bundle.verify_digest(
+        &Digest::of_reader(bundle.digest().alg, data)?,
+        &realm,
+        &anchors,
         &tang_pqc::Policy::from_system()?,
     )?;
     let principal = v.principal.to_string();
