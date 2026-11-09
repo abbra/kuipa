@@ -258,36 +258,17 @@ section of the session.
 [A traced session](docs/src/scenarios/walkthrough.md) explains one step
 by step.
 
-A symbolic model of the enrollment protocol's core exchange (anchor
-pins, advertisement verification, the ML-KEM join and rekey key
-schedule, OTP and Kerberos authenticators, sealed-keytab escrow),
-its vouchers (blind issue, bound and bearer use) and its user seals
-(the two-share format and the unified recovery request) is in
-[`contrib/tamarin/kuipa.spthy`](contrib/tamarin/kuipa.spthy), for the
-Tamarin prover. `tamarin-prover --prove contrib/tamarin/kuipa.spthy`
-verifies secrecy, server authentication, rekey forward secrecy,
-sealed-keytab offline resistance, voucher single use and issuer
-authentication, and that the sealed file's DEK needs the device key
-even against a compromised escrow key, and reproduces the attacks
-DESIGN §13, §7.6.10 and §9 predict for a mis-delivered enrollment
-string, a stolen anchor, a bearer voucher, a compromised escrow key
-and a stolen device key with an observed unlock. The model's header
-documents its abstractions.
+### Formal models
 
-A second, standalone model of trust establishment between realms
-(the §17.4 invitation, the trust request/response exchange, the
-jointly derived trust secret and the cross-realm tickets) is in
-[`contrib/tamarin/trust.spthy`](contrib/tamarin/trust.spthy).
-`tamarin-prover --prove contrib/tamarin/trust.spthy` verifies
-agreement, responder authentication and trust-secret secrecy, and
-reproduces the §17.4 "Limits" attacks for a mis-delivered invitation
-and a leaked trust secret.
+The protocol's proved properties live in [`contrib/tamarin/`](contrib/tamarin/README.md): 25
+Tamarin theories and seven Z3 models of the arithmetic parts Tamarin cannot
+express. That README is the guide — what is here, how to
+run a proof, how to read a result, what each theory covers, and what is still open. Ledger at 8 GiB and 700 s per lemma: **250 of 284 lemmas verified, 23
+open, 11 falsified**, those 11 all being the intended `Attack_*` rows the design
+predicts. `./contrib/ci/local-ci.sh proof-vacuity` runs two static audits over
+every theory: no lemma may key on a fact that no trace can observe, and an
+antecedent-reachability probe must generate for every universal lemma.
 
-A third models signing statements (`contrib/tamarin/sign.spthy`):
-the policy check, the signed statement and its log leaf, and offline
-bundle verification -- authorization, the delegation-vouched signer,
-and the "not a server that cannot lie" attack for a verifier that
-pinned the wrong anchor.
 
 ## Documentation
 
