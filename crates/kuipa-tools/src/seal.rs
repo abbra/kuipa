@@ -71,6 +71,21 @@ pub struct UserPaths {
     dir: PathBuf,
 }
 
+thread_local! {
+    /// The user directory for the current thread only, ahead of the
+    /// environment: see [`set_thread_user_dir`].
+    static THREAD_USER_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Use `dir` as the user data directory on the current thread only, so
+/// parallel tests neither share nor touch the real one (`net::set_thread_endpoint`
+/// does the same for servers).
+#[doc(hidden)]
+pub fn set_thread_user_dir(dir: Option<PathBuf>) {
+    THREAD_USER_DIR.with_borrow_mut(|d| *d = dir);
+}
+
 impl UserPaths {
     /// `$KUIPA_USER_DIR`, `$XDG_DATA_HOME/kuipa`, or `~/.local/share/kuipa`.
     ///
@@ -78,6 +93,9 @@ impl UserPaths {
     ///
     /// Without any of those variables or `$HOME`.
     pub fn from_env() -> Result<Self, Error> {
+        if let Some(d) = THREAD_USER_DIR.with_borrow(Clone::clone) {
+            return Ok(Self::new(d));
+        }
         if let Some(d) = std::env::var_os("KUIPA_USER_DIR") {
             return Ok(Self::new(d));
         }
