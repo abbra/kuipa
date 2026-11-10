@@ -274,6 +274,8 @@ fn root(name: &str) -> TempRoot {
         std::env::temp_dir().join(format!("kuipa-flows-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // `leave` clears the caller's advertisement cache: never the real one.
+    kuipa_tools::seal::set_thread_user_dir(Some(dir.join("kuipa-user")));
     TempRoot {
         paths: Paths::new(&dir),
         dir,

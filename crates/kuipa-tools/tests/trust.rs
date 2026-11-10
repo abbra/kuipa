@@ -247,6 +247,8 @@ fn establish_trust(s: &Setup) {
 fn enroll_host(s: &Setup) -> Paths {
     let dir = s.realm_a.dir.join("root-web1");
     std::fs::create_dir_all(&dir).unwrap();
+    // `leave` clears the caller's advertisement cache: never the real one.
+    kuipa_tools::seal::set_thread_user_dir(Some(s.realm_a.dir.join("user-web1")));
     let p = Paths::new(&dir);
     let mut string = EnrollmentString::new(
         A,
