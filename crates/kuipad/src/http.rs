@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::escrow::EscrowRequest;
-use kuipa_enroll::join::{Operation, Request};
+use kuipa_enroll::join::{AuthType, Operation, Request};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::TrustRequest;
 use serde_json::json;
@@ -548,22 +548,24 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
         Ok(_) => return refused("request", &"kid does not match the path"),
         Err(e) => return refused("request", &e),
     };
-    let what = format!("{op:?} {}", request.fqdn());
-    let host = match op {
-        Operation::Register
-        | Operation::Seal
-        | Operation::Keys
-        | Operation::Tlog
-        | Operation::Sign => None,
-        _ => Some(request.fqdn()),
-    };
-    if let Err(status) = admit_for(&app, &what, host, headers) {
-        return status.into_response();
     // Every operation, host-keyed or not: the name is logged below.
     if !plausible_name(request.fqdn()) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let what = format!("{op:?} {}", request.fqdn());
+    // Only a guessable credential (an OTP) is limited per host, and only
+    // failures use that allowance: charging unauthenticated requests would
+    // let anyone lock a named host out of rekey or unseal.
+    let guessable = request.auth_type() == AuthType::Otp;
+    if let Err(status) = admit_for(&app, &what, None, headers) {
+        return status.into_response();
     }
+    let fqdn = request.fqdn().to_owned();
+    if guessable && app.limiter.host_open(&fqdn).is_err() {
+        eprintln!("kuipad: {what}: rate limited (host)");
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let limiter_app = app.clone();
     let result = tokio::task::spawn_blocking(move || {
         app.server
             .handle(&request, &app.directory)
@@ -571,6 +573,9 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
             .map_err(|e| e.to_string())
     })
     .await;
+    if guessable && !matches!(result, Ok(Ok(_))) {
+        limiter_app.limiter.charge_host(&fqdn);
+    }
     match result {
         Ok(Ok(body)) => {
             eprintln!("kuipad: {what}: ok");
@@ -680,15 +685,15 @@ async fn recover<D: Directory + Send + Sync + 'static>(
         Ok(_) => return refused("recover", &"kid does not match the path"),
         Err(e) => return refused("recover", &e),
     };
+    // Shape-check before the name reaches a log line or a limiter key.
+    if !plausible_name(&request.principal().to_string()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let what = format!("recover {}", request.principal());
-    // A machine seal is opened by its principal, limited before anything
-    // is decapsulated.  A user seal's `P` is its owner, whoever opens it:
-    // only the source is limited first, and the opener once known, so a
-    // shared seal's members each have their own allowance (§7.6.12).
-    let machine = app.server.is_machine_request(&request);
-    let principal = request.principal().to_string();
-    let host = machine.then_some(principal.as_str());
-    if let Err(status) = admit_for(&app, &what, host, &headers) {
+    // Source only, before anything is decapsulated: a per-principal bucket
+    // charged here would let anyone drain a named machine's allowance.  The
+    // opener's own limit applies below, once it is known (§7.6.12).
+    if let Err(status) = admit_for(&app, &what, None, &headers) {
         return status.into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
@@ -696,10 +701,6 @@ async fn recover<D: Directory + Send + Sync + 'static>(
         let admit = |opener: &kuipa_enroll::keytab::Principal| {
             let ok = app.limiter.check(&opener.to_string(), None).is_ok();
             limited.set(!ok);
-    // Shape-check before the name reaches a log line or a limiter key.
-    if !plausible_name(&request.principal().to_string()) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
             ok
         };
         app.server
