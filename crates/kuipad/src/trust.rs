@@ -103,6 +103,22 @@ fn client(ca: Option<&[Vec<u8>]>) -> Result<reqwest::Client, Error> {
         .build()?)
 }
 
+/// Largest partner response read: advertisements and trust answers are a
+/// few tens of KiB; the partner is unauthenticated until they verify.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// The body of `response`, refusing more than [`MAX_RESPONSE_BYTES`].
+async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+            return Err("partner response exceeds size limit".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Where `server` is: its URL from `endpoints`, else `https://<server>`.
 fn url<'a>(server: &'a str, endpoints: &'a BTreeMap<String, String>) -> &'a str {
     endpoints.get(server).map_or(server, String::as_str)
@@ -132,7 +148,7 @@ pub async fn advertisement(
     let query: Vec<String> = anchors.iter().map(|a| format!("anchor={a}")).collect();
     let url = format!("{}adv?{}", base(url(server, endpoints)), query.join("&"));
     let response = client(None)?.get(url).send().await?.error_for_status()?;
-    let adv = SignedAdvertisement::from_json(&response.bytes().await?)?;
+    let adv = SignedAdvertisement::from_json(&capped_body(response).await?)?;
     Ok(VerifiedRealm::verify(
         &adv,
         realm,
@@ -189,7 +205,8 @@ pub async fn establish(
                 format!("{s} refused the trust request (HTTP {})", response.status()).into(),
             );
         }
-        let established = pending.finish(&TrustResponse::from_bytes(&response.bytes().await?)?)?;
+        let body = capped_body(response).await?;
+        let established = pending.finish(&TrustResponse::from_bytes(&body)?)?;
         let recorded =
             match directory.record_trust(&established.partner, established.secret.as_ref()) {
                 Ok(()) => true,
