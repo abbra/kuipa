@@ -355,6 +355,8 @@ pub struct Exchange {
     /// The log of another server disagrees with ours at a sequence both
     /// have: appending is paused until the two are reconciled.
     forked: AtomicBool,
+    /// Whether the directory has listed the IPA servers at least once.
+    members_known: AtomicBool,
     /// The contents the next epoch entry would carry and when they
     /// were first seen: minting waits for a full round of stability.
     settling: Mutex<Option<(kuipa_enroll::epoch::EpochHead, Instant)>>,
@@ -512,6 +514,7 @@ impl Peers {
             attested: Mutex::new(BTreeMap::new()),
             epoch: Mutex::new(chain.clone()),
             forked: AtomicBool::new(false),
+            members_known: AtomicBool::new(false),
             settling: Mutex::new(None),
             changed: Notify::new(),
             repair_trigger: Notify::new(),
@@ -1288,6 +1291,7 @@ impl Exchange {
                         .collect();
                     set.insert(self.settings.me.clone());
                     members.0 = set;
+                    self.members_known.store(true, Ordering::Relaxed);
                 } else if let Err(e) = servers {
                     eprintln!("kuipad: anchor exchange: cannot list servers: {e}");
                 }
@@ -1646,6 +1650,20 @@ fn mint_epoch(
         return Ok(()); // handle() said why; reconciling is an operator's job
     }
     let mut chain = lock(&x.epoch);
+    // A server with no log must not start its own history from only its own
+    // anchor while other servers exist: theirs differs, the logs conflict and
+    // neither server extends them again.  Servers that start together reach
+    // the same first entry once they trust each other's anchors, and a server
+    // joining a realm adopts the log it is sent while that completes.  So
+    // with membership unknown, or fewer trusted anchors than members, wait.
+    // shortcut: a member without the anchor role keeps this server waiting;
+    // upgrade when anchorless servers are supported.
+    if chain.is_empty()
+        && ((x.settings.discover && !x.members_known.load(Ordering::Relaxed))
+            || trusted.len() < x.members().len())
+    {
+        return Ok(());
+    }
     let current = chain.last().and_then(|e| e.statement().ok());
     let prev = match current.as_ref() {
         None => epoch::GENESIS,
@@ -2772,6 +2790,7 @@ mod tests {
             attested: Mutex::new(BTreeMap::new()),
             epoch: Mutex::new(Vec::new()),
             forked: AtomicBool::new(false),
+            members_known: AtomicBool::new(false),
             settling: Mutex::new(None),
             changed: Notify::new(),
             repair_trigger: Notify::new(),
