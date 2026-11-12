@@ -185,6 +185,32 @@ impl Limiter {
         }
     }
 
+    /// Whether `host` still has allowance, without using any: the gate for
+    /// requests whose host bucket is charged only by [`charge_host`](Self::charge_host).
+    ///
+    /// # Errors
+    ///
+    /// [`Limited::Host`] when it is empty.
+    pub fn host_open(&self, host: &str) -> Result<(), Limited> {
+        let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        let open = hosts
+            .buckets
+            .get(key(&host.to_ascii_lowercase()))
+            .is_none_or(|b| level(b, self.limits.per_host, Instant::now()) >= 1.0);
+        if open { Ok(()) } else { Err(Limited::Host) }
+    }
+
+    /// Take one token from `host`'s bucket: called when a guessable
+    /// credential (an OTP) failed, so that only failures use the allowance.
+    pub fn charge_host(&self, host: &str) {
+        let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        hosts.take(
+            key(&host.to_ascii_lowercase()),
+            self.limits.per_host,
+            Instant::now(),
+        );
+    }
+
     fn check_at(&self, host: &str, source: Option<&str>, now: Instant) -> Result<(), Limited> {
         if let Some(source) = source {
             let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
@@ -276,6 +302,18 @@ mod tests {
             );
         }
         assert_eq!(l.check_at("web2", Some("198.51.100.8"), t), Ok(()));
+    }
+
+    #[test]
+    fn only_charged_failures_close_a_host() {
+        let l = limiter((2.0, 1.0), (100.0, 100.0));
+        for _ in 0..10 {
+            assert_eq!(l.host_open("web1"), Ok(()), "peeking uses nothing");
+        }
+        l.charge_host("WEB1");
+        l.charge_host("web1");
+        assert_eq!(l.host_open("web1"), Err(Limited::Host));
+        assert_eq!(l.host_open("web2"), Ok(()));
     }
 
     #[test]
