@@ -213,7 +213,14 @@ impl KeyStore {
     ///
     /// I/O errors, or a key the system crypto policy disables.
     pub fn generate(&self) -> Result<SigningKey, Error> {
-        fs::create_dir_all(&self.dir)?;
+        // Private keys live here: not readable by other users.
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.dir)?;
+        }
         if self.path("signing.jwk").exists() || self.path("anchor.jwk").exists() {
             return Err("keys already exist".into());
         }
