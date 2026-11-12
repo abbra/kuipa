@@ -398,6 +398,15 @@ objectClasses: (
   SUP top AUXILIARY
   MAY ( ipaKUServerEscrowKey )
   X-ORIGIN 'IPA v4.13' )
+
+objectClasses: (
+  2.16.840.1.113730.3.8.33.9
+  NAME 'ipaKUVoucherSpentRecord'
+  DESC 'kuipa spent voucher salt, kept until the voucher expires'
+  SUP top STRUCTURAL
+  MUST ( cn )
+  MAY ( ipaKUVoucherSpent $ ipaKULease )
+  X-ORIGIN 'IPA v4.13' )
 ```
 
 Rationale for the classes:
@@ -417,6 +426,13 @@ Rationale for the classes:
 * `ipaKUSealContainer` mirrors FreeIPA's `ipaSealContainer` shape
   (STRUCTURAL, MUST cn) for the `cn=seals` root and any future
   sub-containers.
+* `ipaKUVoucherSpentRecord` (STRUCTURAL, MUST cn) is one spent voucher
+  salt, a child of `cn=vouchers,cn=kuipa,cn=etc,$SUFFIX` named by the
+  hex salt. Adding it is the single-use gate (it fails for every server
+  but one) and it outlives the host entry, so deleting the host (lease
+  purge, `host-del`) does not make the voucher usable again. Its
+  `ipaKULease` is the voucher's `not_after`; the daemon purges the
+  record an hour after it.
 * `ipaKUSealUnlocks`/`ipaKUReleaseUses` stay MAY and multi-valued —
   the per-server counter idiom (§7.6.7) depends on per-value
   add/delete, which SINGLE-VALUE would forbid.
@@ -613,6 +629,12 @@ aci: (target = "ldap:///cn=*,cn=hostgroups,cn=accounts,$SUFFIX")
   (targetattr = "member")
   (version 3.0; acl "kuipa daemons add voucher hosts to host groups";
   allow (write)
+  groupdn = "ldap:///$KUIPA_GROUP";)
+
+aci: (target = "ldap:///cn=*,cn=vouchers,cn=kuipa,cn=etc,$SUFFIX")
+  (targetattr = "objectClass || cn || ipaKUVoucherSpent || ipaKULease")
+  (version 3.0; acl "kuipa daemons record and purge spent voucher salts";
+  allow (add, delete, read, search, compare)
   groupdn = "ldap:///$KUIPA_GROUP";)
 ```
 

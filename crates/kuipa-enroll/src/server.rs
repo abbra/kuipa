@@ -560,7 +560,8 @@ pub trait Directory {
 
     /// Create host `fqdn` for a verified voucher (§9): refuse an existing
     /// host or a spent `salt`, add the host to `hostgroup` (if not empty),
-    /// record the salt as spent, and create keys.
+    /// record the salt as spent until the voucher's `not_after` — beyond
+    /// the host's own life — and create keys.
     ///
     /// # Errors
     ///
@@ -570,10 +571,11 @@ pub trait Directory {
         fqdn: &str,
         hostgroup: &str,
         salt: &[u8; 32],
+        not_after: u64,
         enctypes: &[Enctype],
         lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {
-        let _ = (fqdn, hostgroup, salt, enctypes, lease);
+        let _ = (fqdn, hostgroup, salt, not_after, enctypes, lease);
         Err("vouchers are not supported by this directory".into())
     }
 
@@ -867,10 +869,11 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         fqdn: &str,
         hostgroup: &str,
         salt: &[u8; 32],
+        not_after: u64,
         enctypes: &[Enctype],
         lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {
-        (**self).join_with_voucher(fqdn, hostgroup, salt, enctypes, lease)
+        (**self).join_with_voucher(fqdn, hostgroup, salt, not_after, enctypes, lease)
     }
     fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
         (**self).principal_lease(principal)
@@ -1604,7 +1607,14 @@ impl EnrollServer {
                 let claims = voucher.verify(key, &self.info.realm, fqdn, &ephemeral, now)?;
                 let lease = voucher_lease(claims, now, directory)?;
                 let keytab = directory
-                    .join_with_voucher(fqdn, &claims.hostgroup, voucher.salt(), enctypes, lease)
+                    .join_with_voucher(
+                        fqdn,
+                        &claims.hostgroup,
+                        voucher.salt(),
+                        claims.not_after,
+                        enctypes,
+                        lease,
+                    )
                     .map_err(Refusal)?;
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
