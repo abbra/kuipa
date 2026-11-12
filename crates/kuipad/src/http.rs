@@ -185,6 +185,9 @@ async fn advertisement<D: Directory + Send + Sync + 'static>(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(status) = admit_for(&app, "advertisement", None, &headers) {
+        return status.into_response();
+    }
     match app.server.advertisement_with_heads(
         &wanted_anchors(query.as_deref()),
         &wanted_heads(query.as_deref()),
@@ -228,7 +231,11 @@ async fn advertisement<D: Directory + Send + Sync + 'static>(
 async fn anchor_log<D: Directory + Send + Sync + 'static>(
     State(app): State<Arc<App<D>>>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(status) = admit_for(&app, "anchor log", None, &headers) {
+        return status.into_response();
+    }
     let from = query
         .unwrap_or_default()
         .split('&')
@@ -258,7 +265,11 @@ async fn claim_log<D: Directory + Send + Sync + 'static>(
     State(app): State<Arc<App<D>>>,
     Path(anchor): Path<String>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(status) = admit_for(&app, "claim log", None, &headers) {
+        return status.into_response();
+    }
     let from = query
         .unwrap_or_default()
         .split('&')
