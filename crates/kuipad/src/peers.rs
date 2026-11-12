@@ -157,6 +157,19 @@ fn failed(e: impl fmt::Display) -> PeerError {
     PeerError::Failed(e.to_string())
 }
 
+/// `e` with its sources: reqwest names only the request, and the cause
+/// (a certificate the client refused, a refused connection) is in the chain.
+fn failed_chain(e: &(dyn std::error::Error + 'static)) -> PeerError {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        text.push_str(": ");
+        text.push_str(&s.to_string());
+        source = s.source();
+    }
+    PeerError::Failed(text)
+}
+
 fn now() -> u64 {
     unix_seconds(SystemTime::now())
 }
@@ -1432,11 +1445,11 @@ impl Exchange {
             .body(body)
             .send()
             .await
-            .map_err(failed)?;
+            .map_err(|e| failed_chain(&e))?;
         match response.status() {
             reqwest::StatusCode::OK => {
                 let mut body = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(failed)? {
+                while let Some(chunk) = response.chunk().await.map_err(|e| failed_chain(&e))? {
                     if chunk.len() > MAX_SYNC_BYTES.saturating_sub(body.len()) {
                         return Err(failed("peer repair response exceeds size limit"));
                     }
