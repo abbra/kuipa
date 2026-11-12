@@ -47,6 +47,107 @@ impl std::fmt::Display for HandlerError {
 
 impl std::error::Error for HandlerError {}
 
+/// Magic of a broker request.
+const BROKER_MAGIC: &[u8; 4] = b"IPKB";
+
+/// Largest broker request: a Kerberos token with its PAC, the channel
+/// binding and a fetch.
+const MAX_BROKER_REQUEST: usize = 64 * 1024;
+
+/// What the daemon sends the custody broker: the fetch with the caller's
+/// token and channel binding, so the broker derives the caller itself.
+#[derive(Debug)]
+pub struct BrokerRequest {
+    /// The caller's one-leg GSS-API token.
+    pub token: Vec<u8>,
+    /// The channel binding the token is bound to.
+    pub cb: [u8; 32],
+    /// What to fetch.
+    pub fetch: KeysFetch,
+}
+
+impl BrokerRequest {
+    fn to_bytes(&self) -> Result<Vec<u8>, HandlerError> {
+        let len =
+            u32::try_from(self.token.len()).map_err(|_| HandlerError("token too large".into()))?;
+        let mut out = BROKER_MAGIC.to_vec();
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&self.token);
+        out.extend_from_slice(&self.cb);
+        out.extend_from_slice(
+            &self
+                .fetch
+                .to_bytes()
+                .map_err(|e| HandlerError(e.to_string()))?,
+        );
+        if out.len() > MAX_BROKER_REQUEST {
+            return Err(HandlerError("custody request too large".into()));
+        }
+        Ok(out)
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, HandlerError> {
+        let bad = || HandlerError("malformed custody request".into());
+        let rest = bytes.strip_prefix(BROKER_MAGIC).ok_or_else(bad)?;
+        let (len, rest) = rest.split_first_chunk::<4>().ok_or_else(bad)?;
+        let len = usize::try_from(u32::from_be_bytes(*len)).map_err(|_| bad())?;
+        let (token, rest) = rest.split_at_checked(len).ok_or_else(bad)?;
+        let (cb, fetch) = rest.split_first_chunk::<32>().ok_or_else(bad)?;
+        Ok(Self {
+            token: token.to_vec(),
+            cb: *cb,
+            fetch: KeysFetch::from_bytes(fetch).map_err(|e| HandlerError(e.to_string()))?,
+        })
+    }
+}
+
+/// What the broker answers: the caller it authenticated, the binding its
+/// context derived, and the handler's value.
+#[derive(Debug)]
+pub struct BrokerAnswer {
+    /// The caller's principal.
+    pub principal: String,
+    /// The binding derived from the caller's context.
+    pub binding: Vec<u8>,
+    /// The handler's value.
+    pub value: Vec<u8>,
+}
+
+impl BrokerAnswer {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in [self.principal.as_bytes(), &self.binding] {
+            out.extend_from_slice(&u16::try_from(part.len()).unwrap_or(u16::MAX).to_be_bytes());
+            out.extend_from_slice(part);
+        }
+        out.extend_from_slice(&self.value);
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, HandlerError> {
+        let bad = || HandlerError("invalid custody broker response".into());
+        let field = |rest: &mut &[u8]| -> Result<Vec<u8>, HandlerError> {
+            let (len, tail) = rest.split_first_chunk::<2>().ok_or_else(bad)?;
+            let (part, tail) = tail
+                .split_at_checked(usize::from(u16::from_be_bytes(*len)))
+                .ok_or_else(bad)?;
+            *rest = tail;
+            Ok(part.to_vec())
+        };
+        let mut rest = bytes;
+        let principal = String::from_utf8(field(&mut rest)?).map_err(|_| bad())?;
+        let binding = field(&mut rest)?;
+        if rest.len() > MAX_VALUE {
+            return Err(bad());
+        }
+        Ok(Self {
+            principal,
+            binding,
+            value: rest.to_vec(),
+        })
+    }
+}
+
 impl Keys {
     /// From the configuration's handler table; `None` where the table
     /// names no executable for a namespace, disabling it.
@@ -69,6 +170,61 @@ impl Keys {
         }
     }
 
+    /// Hand `fetch` to the custody broker with the caller's `token` and its
+    /// channel binding `cb`.  The broker authenticates the caller, applies
+    /// the policy and runs the handler; its answer names the caller it
+    /// found, with the binding its context derived.
+    ///
+    /// # Errors
+    ///
+    /// A [`HandlerError`]: no broker is configured, it cannot be reached, or
+    /// it refused.
+    pub fn fetch_via_broker(
+        &self,
+        fetch: &KeysFetch,
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<BrokerAnswer, HandlerError> {
+        let path = self
+            .broker
+            .as_ref()
+            .ok_or_else(|| HandlerError("no custody broker".into()))?;
+        let mut stream =
+            UnixStream::connect(path).map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+        let request = BrokerRequest {
+            token: token.to_vec(),
+            cb: *cb,
+            fetch: fetch.clone(),
+        }
+        .to_bytes()?;
+        stream
+            .write_all(&request)
+            .and_then(|()| stream.shutdown(Shutdown::Write))
+            .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+        let mut response = Vec::new();
+        stream
+            .take((MAX_VALUE + 4097) as u64)
+            .read_to_end(&mut response)
+            .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+        match response.split_first() {
+            Some((0, answer)) => BrokerAnswer::from_bytes(answer),
+            Some((1, message)) if message.len() <= 4096 => Err(HandlerError(format!(
+                "custody broker: {}",
+                String::from_utf8_lossy(message)
+            ))),
+            _ => Err(HandlerError("invalid custody broker response".into())),
+        }
+    }
+
+    /// Whether fetches go to a custody broker.
+    #[must_use]
+    pub fn has_broker(&self) -> bool {
+        self.broker.is_some()
+    }
+
     /// Run the handler for `fetch` and answer with its value (§18.2).
     ///
     /// # Errors
@@ -77,33 +233,6 @@ impl Keys {
     /// namespace, the user does not exist, the handler failed, or its
     /// value is too large.
     pub fn fetch(&self, fetch: &KeysFetch) -> Result<KeysAnswer, HandlerError> {
-        if let Some(path) = &self.broker {
-            let mut stream = UnixStream::connect(path)
-                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
-            let request = fetch.to_bytes().map_err(|e| HandlerError(e.to_string()))?;
-            stream
-                .write_all(&request)
-                .and_then(|()| stream.shutdown(Shutdown::Write))
-                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
-            let mut response = Vec::new();
-            stream
-                .take((MAX_VALUE + 4097) as u64)
-                .read_to_end(&mut response)
-                .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
-            return match response.split_first() {
-                Some((0, value)) if value.len() <= MAX_VALUE => Ok(KeysAnswer {
-                    value: value.to_vec(),
-                }),
-                Some((1, message)) if message.len() <= 4096 => Err(HandlerError(format!(
-                    "custody broker: {}",
-                    String::from_utf8_lossy(message)
-                ))),
-                _ => Err(HandlerError("invalid custody broker response".into())),
-            };
-        }
         let (_, handler) = self
             .handlers
             .iter()
@@ -155,40 +284,45 @@ impl Keys {
         Ok(KeysAnswer { value: out.stdout })
     }
 
-    /// Serve fixed-format custody requests on an inherited private socket.
+    /// Serve custody requests on an inherited private socket: `handle`
+    /// authenticates the forwarded caller and runs the handler.
     ///
     /// # Errors
     ///
     /// A listener failure.
-    pub fn serve_broker(&self, listener: &UnixListener) -> std::io::Result<()> {
+    pub fn serve_broker(
+        listener: &UnixListener,
+        handle: &dyn Fn(&BrokerRequest) -> Result<BrokerAnswer, HandlerError>,
+    ) -> std::io::Result<()> {
         for stream in listener.incoming() {
-            if let Err(error) = self.serve_request(stream?) {
+            if let Err(error) = Self::serve_request(stream?, handle) {
                 eprintln!("kuipad: custody broker request: {error}");
             }
         }
         Ok(())
     }
 
-    fn serve_request(&self, mut stream: UnixStream) -> std::io::Result<()> {
+    fn serve_request(
+        mut stream: UnixStream,
+        handle: &dyn Fn(&BrokerRequest) -> Result<BrokerAnswer, HandlerError>,
+    ) -> std::io::Result<()> {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(60)))?;
-        let result = (|| -> Result<KeysAnswer, HandlerError> {
+        let result = (|| -> Result<BrokerAnswer, HandlerError> {
             let mut request = Vec::new();
             (&mut stream)
-                .take(1025)
+                .take(MAX_BROKER_REQUEST as u64 + 1)
                 .read_to_end(&mut request)
                 .map_err(|e| HandlerError(e.to_string()))?;
-            if request.len() > 1024 {
+            if request.len() > MAX_BROKER_REQUEST {
                 return Err(HandlerError("custody request too large".into()));
             }
-            let fetch = KeysFetch::from_bytes(&request).map_err(|e| HandlerError(e.to_string()))?;
-            self.fetch(&fetch)
+            handle(&BrokerRequest::from_bytes(&request)?)
         })();
         let response = match result {
             Ok(answer) => {
-                let mut response = Vec::with_capacity(answer.value.len() + 1);
-                response.push(0);
-                response.extend_from_slice(&answer.value);
+                let mut response = vec![0];
+                response.extend_from_slice(&answer.to_bytes());
                 response
             }
             Err(error) => {
@@ -367,8 +501,16 @@ mod tests {
                     .collect(),
             );
             for _ in 0..4 {
-                keys.serve_request(listener.accept().expect("accept").0)
-                    .expect("reply");
+                Keys::serve_request(listener.accept().expect("accept").0, &|request| {
+                    assert_eq!(request.token, b"token", "the proof reaches the broker");
+                    assert_eq!(request.cb, [7; 32]);
+                    Ok(BrokerAnswer {
+                        principal: "host/ipa1.example.test@EXAMPLE.TEST".into(),
+                        binding: vec![9; 32],
+                        value: keys.fetch(&request.fetch)?.value,
+                    })
+                })
+                .expect("reply");
             }
         });
         let proxy = Keys::broker(path.clone());
@@ -377,22 +519,32 @@ mod tests {
             nickname: String::new(),
             alg: None,
         };
-        assert_eq!(proxy.fetch(&fetch).expect("export").value, b"dmhash");
+        let (token, cb) = (b"token".as_slice(), [7; 32]);
+        let answer = proxy.fetch_via_broker(&fetch, token, &cb).expect("export");
+        assert_eq!(answer.value, b"dmhash");
+        assert_eq!(answer.principal, "host/ipa1.example.test@EXAMPLE.TEST");
+        assert_eq!(answer.binding, [9; 32], "the broker's binding comes back");
         fetch.namespace = Namespace::Ca;
         fetch.nickname = "certificate".into();
         assert_eq!(
-            proxy.fetch(&fetch).expect("CA export").value,
+            proxy
+                .fetch_via_broker(&fetch, token, &cb)
+                .expect("CA export")
+                .value,
             b"certificate"
         );
         fetch.namespace = Namespace::CaWrapped;
         fetch.alg = Some(kuipa_enroll::keys::WrapAlg::Aes256Wrap);
         assert_eq!(
-            proxy.fetch(&fetch).expect("wrapped export").value,
+            proxy
+                .fetch_via_broker(&fetch, token, &cb)
+                .expect("wrapped export")
+                .value,
             b"wrapped"
         );
         fetch.namespace = Namespace::Ra;
         fetch.alg = None;
-        assert!(proxy.fetch(&fetch).is_err());
+        assert!(proxy.fetch_via_broker(&fetch, token, &cb).is_err());
         thread.join().expect("broker thread");
         std::fs::remove_dir_all(dir).expect("remove fixture");
     }

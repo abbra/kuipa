@@ -98,6 +98,13 @@ The daemon config must be root-owned and readable by the kuipad group.
 For custody exports, set `keys.broker` to `/run/ipa/kuipad-keys.sock`
 and configure the existing namespace handlers in `keys.handlers`.
 
+The custody broker is the only process that accepts a custody caller's
+token (the daemon hands it over), so it needs a gssproxy section of its
+own for root, beside the daemon's: `euid = 0` with `program =
+/usr/libexec/kuipad` (other root sections, nfs-client, match euid 0 too),
+the same `keytab` and `client_keytab`, and `cred_usage = both`. See
+`contrib/gssproxy-kuipad-keys.conf.example`; the IPA installer writes it.
+
 ## 3. The keys
 
 ```sh

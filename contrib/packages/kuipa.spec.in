@@ -187,6 +187,7 @@ Install this package on IPA servers; ipa-server-install configures it.
 %{_sysusersdir}/kuipad.conf
 %doc docs/DESIGN.md
 %doc docs/DESIGN-schema.md
+%doc contrib/gssproxy-kuipad-keys.conf.example
 
 
 # ── Subpackage: post-quantum Tang bindings (library + server tool) ───────────

@@ -1,0 +1,14 @@
+# /etc/gssproxy/21-kuipad-keys.conf — the custody broker's Kerberos identity.
+#
+# The broker runs as root and is the only process that accepts a custody
+# caller's token (DESIGN §18.2): the daemon hands it the token whole.
+# Beside the daemon's section (20-kuipad.conf, euid kuipad) it needs one of
+# its own for root; `program` keeps it apart from other root sections
+# (nfs-client matches euid 0 too).
+[service/kuipad-keys]
+  mechs = krb5
+  cred_store = keytab:/etc/ipa/kuipad.keytab
+  cred_store = client_keytab:/etc/ipa/kuipad.keytab
+  cred_usage = both
+  euid = 0
+  program = /usr/libexec/kuipad

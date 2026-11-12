@@ -468,7 +468,14 @@ fn run(args: &Args) -> Result<(), Error> {
             let listener = listenfd::ListenFd::from_env()
                 .take_unix_listener(0)?
                 .ok_or("custody broker requires socket activation")?;
-            keys.serve_broker(&listener)?;
+            // Through gssproxy, as the daemon does, but under its own service
+            // section (`contrib/gssproxy-kuipad-keys.conf.example`): the broker
+            // is the only one that accepts a custody caller's token.
+            let mut directory = LdapDirectory::new(cfg.directory())?;
+            directory.serve_keys(keys);
+            kuipad::keys::Keys::serve_broker(&listener, &|request| {
+                directory.broker_fetch(request)
+            })?;
             Ok(())
         }
         "generate-keys" => {

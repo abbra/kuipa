@@ -2944,7 +2944,9 @@ host that is already enrolled:
   argument validated against an allowlist. No string parsing of the key
   name: the namespace is an enum, the nickname opaque bytes with a
   length bound.
-* **Policy** (static, in `kuipad.json`, §18.5): the daemon checks the
+* **Policy** (static, in `kuipad.json`, §18.5): the process that accepts the
+  caller's token (the broker, or the daemon with in-process handlers)
+  checks the
   caller's principal against the namespace's allowed shape and against
   the server list in `cn=masters,cn=ipa,cn=etc`, the way Ahdapa admits
   gossip peers by IPA topology: a host not in `cn=masters` — a locked or
@@ -2952,11 +2954,22 @@ host that is already enrolled:
   handler runs. `dogtag/<fqdn>` additionally requires the peer's
   `cn=CA,cn=<fqdn>,cn=masters` entry, so a non-CA server cannot ask for
   wrapped CA keys.
-* **Handler execution.** The unprivileged daemon sends a bounded fetch to the
-  root custody broker over its `root:kuipad` Unix socket after the policy
-  check. The broker executes the configured export handler as `root` or
-  `pkiuser`, capturing stdout. It accepts no arbitrary command or user from
-  the request. Import remains the caller's responsibility.
+* **Handler execution.** The unprivileged daemon never accepts a custody
+  caller's token.  It hands the fetch, with the token and its channel
+  binding, to the root custody broker over its `root:kuipad` Unix socket.
+  The broker accepts the token under its own gssproxy service section,
+  derives the principal, applies the policy above against LDAP itself,
+  and only then executes the configured export handler as `root` or
+  `pkiuser`, capturing stdout.  It answers with the principal it
+  authenticated, the binding its context derived (so the daemon can seal
+  the response to that Kerberos context, §5.1) and the value.  It accepts
+  no arbitrary command or user from the request.  A compromised daemon can
+  thus fetch only on behalf of a token it has been handed by a legitimate
+  caller (single-use at the broker, bound to the request's channel
+  binding), not name a principal of its own choosing.  Import remains the
+  caller's responsibility.
+* **Broker audit.** The broker writes its own allowed or refused line per
+  fetch to the journal of `kuipad-keys.service`, separate from the daemon's.
 * **Response.** The handler's JSON value, sealed in the envelope. The
   body limit (§11.3) is 1 MiB, enough for a CA or KRA subsystem PKCS#12
   and ML-DSA-sized wrapped keys; Custodia's 10 MiB limit was never
@@ -3048,6 +3061,14 @@ for `ca_wrapped` and `lwca-store`; `host/*` in `cn=masters` for `akamu` too), ch
 CA role in `cn=masters` before any handler runs. Nothing is
 LDAP-configurable: the flows have no runtime policy to change, and
 a static table is the smallest surface to audit.
+
+The broker runs as root, in `kuipad_t` like the daemon, and reads no
+keytab: like the daemon it gets its Kerberos credentials from gssproxy,
+under a service section of its own beside the daemon's
+(`contrib/gssproxy-kuipad-keys.conf.example`: `euid = 0`, `program =
+/usr/libexec/kuipad`, the same keytab).  It is the only process that
+accepts a custody caller's token, so no replay cache is shared with the
+daemon's.  The IPA installer writes both sections.
 
 ### 18.6 What stays out
 

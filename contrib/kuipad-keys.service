@@ -2,13 +2,18 @@
 Description=kuipa privileged custody broker
 Requires=kuipad-keys.socket
 PartOf=kuipad.service
-After=kuipad-keys.socket
+After=kuipad-keys.socket gssproxy.service dirsrv.target
 
 [Service]
 ExecStart=/usr/libexec/kuipad keys-broker --config /etc/ipa/kuipad.json
 User=root
 # No NoNewPrivileges=: the broker changes user to run the NSS key handlers
 # as pkiuser, and with it set that spawn fails with EPERM.
+# The Kerberos keys stay with gssproxy: the broker's own service section
+# there (euid 0, program kuipad) holds the keytab and a replay cache of its
+# own.
+Environment=GSS_USE_PROXY=yes
+Environment=GSSPROXY_BEHAVIOR=REMOTE_ONLY
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict

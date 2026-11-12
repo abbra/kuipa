@@ -60,6 +60,18 @@ pub struct Accepted {
     pub transited: Option<Vec<String>>,
 }
 
+/// A `keys` fetch the custody broker answered: the caller it
+/// authenticated, the binding its context derived, and the value.
+#[derive(Debug)]
+pub struct BrokeredKey {
+    /// The caller's principal.
+    pub principal: String,
+    /// The binding the broker's context derived (§5.1).
+    pub binding: KerberosBinding,
+    /// The handler's value.
+    pub value: Vec<u8>,
+}
+
 /// The directory operations behind the protocol, implemented by the daemon
 /// over LDAPI and GSSAPI (§11.4).
 ///
@@ -186,6 +198,26 @@ pub trait Directory {
     ) -> Result<Vec<u8>, DirectoryError> {
         let _ = (principal, fetch);
         Err("the keys operation is not supported by this directory".into())
+    }
+
+    /// A `keys` fetch handed whole to a privileged custody broker, which
+    /// alone accepts the caller's `token` (bound to `cb`): the broker's
+    /// own authentication, policy and handler, so the unprivileged daemon
+    /// never names the caller.  `None` where fetches are not brokered; the
+    /// caller is then accepted here and [`fetch_key`](Self::fetch_key)
+    /// asked.
+    ///
+    /// # Errors
+    ///
+    /// Any refusal, the broker's included.
+    fn fetch_key_via_broker(
+        &self,
+        token: &[u8],
+        cb: &[u8; 32],
+        fetch: &crate::keys::KeysFetch,
+    ) -> Result<Option<BrokeredKey>, DirectoryError> {
+        let _ = (token, cb, fetch);
+        Ok(None)
     }
 
     /// The IPA CA chain (DER).
@@ -730,6 +762,14 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
         fetch: &crate::keys::KeysFetch,
     ) -> Result<Vec<u8>, DirectoryError> {
         (**self).fetch_key(principal, fetch)
+    }
+    fn fetch_key_via_broker(
+        &self,
+        token: &[u8],
+        cb: &[u8; 32],
+        fetch: &crate::keys::KeysFetch,
+    ) -> Result<Option<BrokeredKey>, DirectoryError> {
+        (**self).fetch_key_via_broker(token, cb, fetch)
     }
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
         (**self).ca_certificates()
@@ -1911,15 +1951,29 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<Response, Refusal> {
         let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory
-            .accept_user(body.authenticator.as_ref(), &cb)
-            .map_err(Refusal)?;
-        let caller: Principal = accepted.principal.parse()?;
-        if caller.realm() != self.info.realm {
-            return Err(Refusal::because("wrong realm"));
-        }
         let fetch = crate::keys::KeysFetch::from_bytes(&body.extra)?;
-        let value = directory.fetch_key(&caller, &fetch).map_err(Refusal)?;
+        let same_realm = |caller: &Principal| {
+            if caller.realm() == self.info.realm {
+                Ok(())
+            } else {
+                Err(Refusal::because("wrong realm"))
+            }
+        };
+        let token = body.authenticator.as_ref();
+        let (caller, binding, value) = if let Some(brokered) = directory
+            .fetch_key_via_broker(token, &cb, &fetch)
+            .map_err(Refusal)?
+        {
+            let caller: Principal = brokered.principal.parse()?;
+            same_realm(&caller)?;
+            (caller, brokered.binding, brokered.value)
+        } else {
+            let accepted = directory.accept_user(token, &cb).map_err(Refusal)?;
+            let caller: Principal = accepted.principal.parse()?;
+            same_realm(&caller)?;
+            let value = directory.fetch_key(&caller, &fetch).map_err(Refusal)?;
+            (caller, accepted.binding, value)
+        };
         self.record(
             Kind::KEYS_FETCH,
             caller.to_string().as_bytes(),
@@ -1931,7 +1985,7 @@ impl EnrollServer {
         let payload = answer
             .to_bytes()
             .map_err(|e| Refusal::because(e.to_string()))?;
-        Ok(request.respond(ss, t, Some(&accepted.binding), &payload)?)
+        Ok(request.respond(ss, t, Some(&binding), &payload)?)
     }
 
     /// Answer a signing request (`DESIGN-sign.md`): authenticate the
