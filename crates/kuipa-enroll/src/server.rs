@@ -1539,6 +1539,17 @@ impl EnrollServer {
             && p.epoch == published.epoch
             && p.vouches == published.vouches
         {
+            // Keys follow what clients ask for: bound the cache, dropping the oldest.
+            const MAX_CACHED_ADVERTISEMENTS: usize = 64;
+            if p.advertisements.len() >= MAX_CACHED_ADVERTISEMENTS
+                && let Some(oldest) = p
+                    .advertisements
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(k, _)| *k)
+            {
+                p.advertisements.remove(&oldest);
+            }
             p.advertisements.insert(signer, (adv.clone(), now));
         }
         Ok(adv)
