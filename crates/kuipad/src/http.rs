@@ -559,6 +559,10 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     };
     if let Err(status) = admit_for(&app, &what, host, headers) {
         return status.into_response();
+    // Every operation, host-keyed or not: the name is logged below.
+    if !plausible_name(request.fqdn()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     }
     let result = tokio::task::spawn_blocking(move || {
         app.server
@@ -692,6 +696,10 @@ async fn recover<D: Directory + Send + Sync + 'static>(
         let admit = |opener: &kuipa_enroll::keytab::Principal| {
             let ok = app.limiter.check(&opener.to_string(), None).is_ok();
             limited.set(!ok);
+    // Shape-check before the name reaches a log line or a limiter key.
+    if !plausible_name(&request.principal().to_string()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
             ok
         };
         app.server
