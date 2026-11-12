@@ -210,6 +210,7 @@ impl Directory for KdcDirectory {
         fqdn: &str,
         hostgroup: &str,
         salt: &[u8; 32],
+        _not_after: u64,
         _: &[Enctype],
         lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {

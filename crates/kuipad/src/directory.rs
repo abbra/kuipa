@@ -60,6 +60,12 @@ const STAGED_ATTR: &str = "ipaKUStaged";
 const NO_SUCH_ATTRIBUTE: std::ffi::c_int = 16;
 /// LDAP result code 32: the entry is not there.
 const NO_SUCH_OBJECT: std::ffi::c_int = 32;
+/// LDAP result code 68: the entry is there already.
+const ALREADY_EXISTS: std::ffi::c_int = 68;
+/// A spent voucher salt's own entry under `cn=vouchers,cn=kuipa,cn=etc`;
+/// its `ipaKULease` is when the voucher stops being valid, after which it
+/// may be purged.
+const SPENT_CLASS: &str = "ipaKUVoucherSpentRecord";
 /// Spent voucher salts on created hosts (new schema).
 const VOUCHER_SPENT_ATTR: &str = "ipaKUVoucherSpent";
 /// Seal entries and their attributes (new schema, §7.6.2).
@@ -1070,6 +1076,31 @@ impl Directory for LdapDirectory {
                 gone.push(fqdn);
             }
         }
+        // Spent records outlive their host, but not their voucher.
+        let spent_base = format!("cn=vouchers,cn=kuipa,cn=etc,{}", self.cfg.basedn);
+        let records = match conn.search(
+            &spent_base,
+            Scope::OneLevel,
+            &format!("(objectClass={SPENT_CLASS})"),
+            &[LEASE_ATTR],
+        ) {
+            Ok(r) => r,
+            Err(kuipa_ldap::LdapError::Protocol {
+                code: NO_SUCH_OBJECT,
+                ..
+            }) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        for record in records {
+            let end: Option<u64> = record
+                .attrs
+                .get(&LEASE_ATTR.to_lowercase())
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse().ok());
+            if end.is_some_and(|end| end < before) {
+                conn.delete_s(&record.dn)?;
+            }
+        }
         Ok(gone)
     }
 
@@ -1641,6 +1672,7 @@ impl Directory for LdapDirectory {
         fqdn: &str,
         hostgroup: &str,
         salt: &[u8; 32],
+        not_after: u64,
         enctypes: &[Enctype],
         lease: Option<u64>,
     ) -> Result<Keytab, DirectoryError> {
@@ -1664,6 +1696,7 @@ impl Directory for LdapDirectory {
         {
             return Err("spent voucher".into());
         }
+        self.spend_voucher(&mut conn, &spent, not_after)?;
         let principal = self.host_principal(fqdn);
         let short = fqdn.split('.').next().unwrap_or(fqdn);
         let dn = self.host_dn(fqdn);
@@ -1704,7 +1737,8 @@ impl Directory for LdapDirectory {
                 ]
             }))
             .collect::<Vec<_>>(),
-        )?;
+        )
+        .inspect_err(|_| self.unspend_voucher(&mut conn, &spent))?;
         // The voucher names a host group, so a host without it is not the
         // join that was asked for: undo the host entry, and with it the
         // spent salt, so a retry with a corrected group can work.
@@ -1721,6 +1755,7 @@ impl Directory for LdapDirectory {
             if let Err(de) = conn.delete_s(&dn) {
                 eprintln!("kuipad: voucher {fqdn}: undo host after group failure: {de}");
             }
+            self.unspend_voucher(&mut conn, &spent);
             return Err(format!("hostgroup {hostgroup}: {e}").into());
         }
         match &lease {
@@ -1804,6 +1839,51 @@ impl Directory for LdapDirectory {
 }
 
 impl LdapDirectory {
+    /// The durable record: its own entry, so the salt stays spent after the
+    /// host entry is deleted (lease purge, `host-del`).  Adding it is the
+    /// atomic single-use gate: it fails for every server but one.
+    fn spend_voucher(
+        &self,
+        conn: &mut LdapConnection,
+        spent: &str,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
+        let expires = not_after.to_string();
+        conn.add_s(
+            &self.spent_dn(spent),
+            &[
+                (
+                    "objectClass",
+                    vec![b"top".as_slice(), SPENT_CLASS.as_bytes()],
+                ),
+                ("cn", vec![spent.as_bytes()]),
+                (VOUCHER_SPENT_ATTR, vec![spent.as_bytes()]),
+                (LEASE_ATTR, vec![expires.as_bytes()]),
+            ],
+        )
+        .map_err(|e| match e {
+            kuipa_ldap::LdapError::Protocol {
+                code: ALREADY_EXISTS,
+                ..
+            } => DirectoryError::from("spent voucher"),
+            e => e.into(),
+        })
+    }
+    fn spent_dn(&self, spent: &str) -> String {
+        format!(
+            "cn={},cn=vouchers,cn=kuipa,cn=etc,{}",
+            dn_escape(spent),
+            self.cfg.basedn
+        )
+    }
+
+    /// Release a salt recorded by a join that then failed, so a retry can work.
+    fn unspend_voucher(&self, conn: &mut LdapConnection, spent: &str) {
+        if let Err(e) = conn.delete_s(&self.spent_dn(spent)) {
+            eprintln!("kuipad: voucher: releasing the spent record: {e}");
+        }
+    }
+
     /// Replace `partner`'s value on the trusts entry, or add it.
     fn update_or_add(
         &self,
