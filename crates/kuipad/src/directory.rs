@@ -41,7 +41,7 @@ use kuipa_enroll::seal::{
     Seal, State,
 };
 use kuipa_enroll::server::Accepted;
-use kuipa_enroll::server::{Directory, DirectoryError, Staged};
+use kuipa_enroll::server::{BrokeredKey, Directory, DirectoryError, Staged};
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
 use native_ossl::util::SecretBuf;
@@ -983,6 +983,25 @@ impl Directory for LdapDirectory {
         Ok(answer.value)
     }
 
+    fn fetch_key_via_broker(
+        &self,
+        token: &[u8],
+        cb: &[u8; 32],
+        fetch: &kuipa_enroll::keys::KeysFetch,
+    ) -> Result<Option<BrokeredKey>, DirectoryError> {
+        let Some(keys) = self.keys.as_ref().filter(|k| k.has_broker()) else {
+            return Ok(None);
+        };
+        let answer = keys
+            .fetch_via_broker(fetch, token, cb)
+            .map_err(|e| DirectoryError::from(e.to_string()))?;
+        Ok(Some(BrokeredKey {
+            principal: answer.principal,
+            binding: KerberosBinding::new(&answer.binding)?,
+            value: answer.value,
+        }))
+    }
+
     fn seal_limits(&self) -> Result<Limits, DirectoryError> {
         Ok(self
             .realm_setting("seal-limits", SEAL_LIMITS_ATTR)?
@@ -1839,6 +1858,41 @@ impl Directory for LdapDirectory {
 }
 
 impl LdapDirectory {
+    /// The custody broker's side of a `keys` fetch: accept the forwarded
+    /// token with this process's own credential — the only place it is
+    /// accepted — derive the caller from it, and apply the namespace
+    /// policy before any handler runs.  The daemon's word about who is
+    /// asking is never used.
+    ///
+    /// # Errors
+    ///
+    /// A refusal: the token does not authenticate, the caller is of another
+    /// realm, the policy refuses, or the handler fails.
+    pub fn broker_fetch(
+        &self,
+        request: &crate::keys::BrokerRequest,
+    ) -> Result<crate::keys::BrokerAnswer, crate::keys::HandlerError> {
+        let refuse = |e: &dyn std::fmt::Display| crate::keys::HandlerError(e.to_string());
+        let (principal, derived) = kuipa_gssapi::accept_bound(
+            &self.server_cred,
+            &request.token,
+            &request.cb,
+            &kerberos_prf_input(&request.cb),
+            KERBEROS_BINDING_LEN,
+        )
+        .map_err(|e| refuse(&e))?;
+        let caller: Principal = principal.parse().map_err(|e| refuse(&e))?;
+        if caller.realm() != self.cfg.realm {
+            return Err(refuse(&"caller of another realm"));
+        }
+        let value = Directory::fetch_key(self, &caller, &request.fetch).map_err(|e| refuse(&e))?;
+        Ok(crate::keys::BrokerAnswer {
+            principal,
+            binding: derived,
+            value,
+        })
+    }
+
     /// The durable record: its own entry, so the salt stays spent after the
     /// host entry is deleted (lease purge, `host-del`).  Adding it is the
     /// atomic single-use gate: it fails for every server but one.
