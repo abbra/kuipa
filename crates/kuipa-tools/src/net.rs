@@ -205,7 +205,12 @@ fn cache_advertisement(dir: &std::path::Path, url: &str, tag: &str, body: &[u8])
     let n = CACHE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(cache_name(url));
     let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
-    if std::fs::write(&tmp, &record)
+    // `create_new` (O_EXCL) never follows a link planted at the temporary name.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, &record))
         .and_then(|()| std::fs::rename(&tmp, &path))
         .is_err()
     {

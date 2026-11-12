@@ -3440,13 +3440,23 @@ fn render_seal(value: &Value) {
 /// kuipa directory once it exists; none otherwise.  Nothing is created
 /// outside a directory kuipa already keeps.
 fn advertisement_cache(paths: &Paths) -> Option<std::path::PathBuf> {
+    // Writable, and owned by whoever runs this: root never fills (or
+    // follows links in) a directory another user controls.  The probe is
+    // created exclusively; the owner it gets is ours.
     let usable = |dir: std::path::PathBuf| {
-        (std::fs::create_dir(&dir).is_ok() || dir.is_dir())
-            && std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(".writable"))
-                .is_ok()
+        use std::os::unix::fs::MetadataExt as _;
+        if !(std::fs::create_dir(&dir).is_ok() || dir.is_dir()) {
+            return false;
+        }
+        let probe = dir.join(format!(".writable.{}", std::process::id()));
+        let owned = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .and_then(|f| Ok(f.metadata()?.uid()))
+            .is_ok_and(|me| std::fs::metadata(&dir).is_ok_and(|d| d.uid() == me));
+        let _ = std::fs::remove_file(&probe);
+        owned
     };
     let host = paths.state().exists().then(|| paths.advertisements());
     let user = kuipa_tools::seal::UserPaths::from_env()
