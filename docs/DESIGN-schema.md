@@ -10,7 +10,7 @@ schema …") and §19.1 of `DESIGN.md`.
 
 The proposal allocates the following arcs in the Red Hat OID registry:
 
-* attributes: `2.16.840.1.113730.3.8.32.1` ...`.32.30` — kuipa schema
+* attributes: `2.16.840.1.113730.3.8.32.1` ...`.32.32` — kuipa schema
   attributes
 * objectClasses: `2.16.840.1.113730.3.8.33.1` ... `.33.9` — kuipa schema
   objectClasses
@@ -319,6 +319,24 @@ attributeTypes: (
   EQUALITY caseExactMatch
   SYNTAX 1.3.6.1.4.1.1466.115.121.1.15
   X-ORIGIN 'IPA v4.13' )
+
+attributeTypes: (
+  2.16.840.1.113730.3.8.32.31
+  NAME 'ipaKUVoucherHost'
+  DESC 'FQDN of the host a spent voucher salt was spent for'
+  EQUALITY caseIgnoreMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.15
+  SINGLE-VALUE
+  X-ORIGIN 'IPA v4.13' )
+
+attributeTypes: (
+  2.16.840.1.113730.3.8.32.32
+  NAME 'ipaKUVoucherRedeemer'
+  DESC 'FQDN of the IPA server that took the join a voucher salt was spent for'
+  EQUALITY caseIgnoreMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.15
+  SINGLE-VALUE
+  X-ORIGIN 'IPA v4.13' )
 ```
 
 ## 4. objectClasses
@@ -405,7 +423,7 @@ objectClasses: (
   DESC 'kuipa spent voucher salt, kept until the voucher expires'
   SUP top STRUCTURAL
   MUST ( cn )
-  MAY ( ipaKUVoucherSpent $ ipaKULease )
+  MAY ( ipaKUVoucherSpent $ ipaKUVoucherHost $ ipaKUVoucherRedeemer $ ipaKULease )
   X-ORIGIN 'IPA v4.13' )
 ```
 
@@ -428,8 +446,11 @@ Rationale for the classes:
   sub-containers.
 * `ipaKUVoucherSpentRecord` (STRUCTURAL, MUST cn) is one spent voucher
   salt, a child of `cn=vouchers,cn=kuipa,cn=etc,$SUFFIX` named by the
-  hex salt. Adding it is the single-use gate (it fails for every server
-  but one) and it outlives the host entry, so deleting the host (lease
+  hex salt. Only the voucher's home server writes it (§9 of DESIGN.md):
+  adding it is the single-use gate, and `ipaKUVoucherHost` and
+  `ipaKUVoucherRedeemer` name the host and the server that took the join,
+  so a repeated request for the same join is answered ok and a release
+  is refused for any other. It outlives the host entry, so deleting the host (lease
   purge, `host-del`) does not make the voucher usable again. Its
   `ipaKULease` is the voucher's `not_after`; the daemon purges the
   record an hour after it.
@@ -632,7 +653,7 @@ aci: (target = "ldap:///cn=*,cn=hostgroups,cn=accounts,$SUFFIX")
   groupdn = "ldap:///$KUIPA_GROUP";)
 
 aci: (target = "ldap:///cn=*,cn=vouchers,cn=kuipa,cn=etc,$SUFFIX")
-  (targetattr = "objectClass || cn || ipaKUVoucherSpent || ipaKULease")
+  (targetattr = "objectClass || cn || ipaKUVoucherSpent || ipaKUVoucherHost || ipaKUVoucherRedeemer || ipaKULease")
   (version 3.0; acl "kuipa daemons record and purge spent voucher salts";
   allow (add, delete, read, search, compare)
   groupdn = "ldap:///$KUIPA_GROUP";)
