@@ -1,0 +1,128 @@
+// The custody broker (DESIGN §4.10, F3): the root process behind kuipad that
+// returns a named custody secret (the CA signing key, the DM hash, ...) to an
+// authenticated server.
+//
+// The daemon runs as an unprivileged user and relays requests; the broker
+// authenticates the caller itself from the Kerberos token the daemon forwards,
+// together with the channel binding that names the request. The network between
+// the caller and the broker, the daemon included, is the attacker.
+//
+// Kerberos is abstracted: a host principal p and the broker's keytab share a key
+// k_p; a token is h(<'ap', p, h(name), nonce, k_p>), which only a holder of k_p
+// can make, and the request's name is inside it (the channel binding). The
+// broker accepts a token for a principal of class 'host' (host/ and service
+// principals of IPA servers); an administrator's ticket, class 'user', is
+// refused. The secret goes back wrapped under a key derived from k_p and the
+// nonce, standing for the GSS wrap that only the authenticated caller can undo.
+//
+// `replay_cache` is the restriction for gssproxy's replay cache: a nonce is
+// accepted once. `broker_no_cache` is the broker without it; `NoCache` marks
+// its use. The previous broker authenticated nobody: `broker_trusting_daemon`
+// answers whatever name the daemon asks for, and `Trusting` marks its use.
+//
+// Omitted: handler policy per name (any host principal may fetch any custody
+// name here, as the broker allows), principal naming, KDC, ticket lifetime, and
+// the socket's file permissions.
+//
+// Run 2026-11-13, Tamarin 1.12.0, Maude 3.5.1, proofs.sh -t 250 (8 GiB), one lemma
+// per process.
+// Verified: fetch_works, user_class_registered, replay_without_cache,
+// secret_with_stolen_key (reachability and the secrecy control);
+// release_matches_request, release_once, user_class_refused,
+// secret_needs_host_key.
+// Falsified, as expected: release_once_no_cache (no replay cache),
+// secret_trusting_daemon (the previous broker).
+theory peer_custody
+begin
+
+builtins: symmetric-encryption, hashing
+
+restriction replay_cache:
+  "All p n #i #j. Accepted(p, n) @i & Accepted(p, n) @j ==> #i = #j"
+
+rule register_principal:
+  [ Fr(~k) ]
+  --[ Registered($p, $class) ]->
+  [ !Key($p, ~k), !Class($p, $class) ]
+
+rule compromise:
+  [ !Key(p, k) ]
+  --[ Compromised(p) ]->
+  [ Out(k) ]
+
+rule provision:
+  [ Fr(~s) ]
+  --[ Provisioned($name, ~s) ]->
+  [ !Secret($name, ~s) ]
+
+// A host's request: the token is bound to the name asked for.
+rule host_request:
+  [ !Key(p, k), !Class(p, 'host'), Fr(~n) ]
+  --[ Requested(p, $name, ~n) ]->
+  [ Out(<$name, p, ~n, h(<'ap', p, h($name), ~n, k>)>) ]
+
+rule broker:
+  [ In(<name, p, n, h(<'ap', p, h(name), n, k>)>), !Key(p, k), !Class(p, 'host'),
+    !Secret(name, s) ]
+  --[ Accepted(p, n), Released(p, name, n) ]->
+  [ Out(senc(s, h(<'wrap', n, k>))) ]
+
+rule broker_no_cache:
+  [ In(<name, p, n, h(<'ap', p, h(name), n, k>)>), !Key(p, k), !Class(p, 'host'),
+    !Secret(name, s) ]
+  --[ NoCache(), Released(p, name, n) ]->
+  [ Out(senc(s, h(<'wrap', n, k>))) ]
+
+// The previous broker: whatever the daemon relays, with no token.
+rule broker_trusting_daemon:
+  [ In(name), !Secret(name, s) ]
+  --[ Trusting(), Released('daemon', name, 'none') ]->
+  [ Out(s) ]
+
+// Reachability: a host fetches a secret and the broker releases it for exactly
+// that request.
+lemma fetch_works: exists-trace
+  "Ex p name n #i #j. Requested(p, name, n) @i & Released(p, name, n) @j & #i < #j"
+lemma user_class_registered: exists-trace
+  "Ex p #i. Registered(p, 'user') @i"
+lemma replay_without_cache: exists-trace
+  "Ex p name n #i #j. Released(p, name, n) @i & Released(p, name, n) @j & not(#i = #j) & NoCache() @i"
+
+// Authentication and binding: a release names a request the principal made, for
+// that name, unless the principal's key was stolen.
+lemma release_matches_request:
+  "All p name n #i. Released(p, name, n) @i & not(Ex #k. Trusting() @k)
+     & not(Ex #k. NoCache() @k) & not(Ex #k. Compromised(p) @k)
+     ==> Ex #j. Requested(p, name, n) @j & #j < #i"
+
+// Each request is answered once.
+lemma release_once:
+  "All p name n #i #j. Released(p, name, n) @i & Released(p, name, n) @j
+     & not(Ex #k. Trusting() @k) & not(Ex #k. NoCache() @k) & not(Ex #k. Compromised(p) @k)
+     ==> #i = #j"
+
+// Secrecy: the attacker, which includes the daemon, learns a custody secret only
+// if the key of some host-class principal was stolen.
+lemma secret_needs_host_key:
+  "All name s #i #k. Provisioned(name, s) @i & K(s) @k & not(Ex #m. Trusting() @m)
+     ==> Ex p #j #m. Compromised(p) @j & Registered(p, 'host') @m"
+
+// Control for the secrecy lemma: with a host key stolen, the secret is known.
+lemma secret_with_stolen_key: exists-trace
+  "Ex name s p #i #j #k. Provisioned(name, s) @i & Compromised(p) @j & K(s) @k"
+
+// An administrator's ticket (class 'user') is never answered.
+lemma user_class_refused:
+  "All p name n #i. Released(p, name, n) @i & not(Ex #k. Trusting() @k)
+     & not(Ex #k. NoCache() @k) ==> Ex #m. Registered(p, 'host') @m"
+
+// Without the replay cache a token is answered twice. Expected to be falsified.
+lemma release_once_no_cache:
+  "All p name n #i #j. Released(p, name, n) @i & Released(p, name, n) @j
+     & not(Ex #k. Trusting() @k) & not(Ex #k. Compromised(p) @k) ==> #i = #j"
+
+// With the previous broker any name leaks. Expected to be falsified.
+lemma secret_trusting_daemon:
+  "All name s #i #k. Provisioned(name, s) @i & K(s) @k
+     ==> Ex p #j #m. Compromised(p) @j & Registered(p, 'host') @m"
+end
