@@ -1,0 +1,109 @@
+// The spent-voucher record in the directory (DESIGN §9, F5), and what deleting
+// a host does to it.
+//
+// A voucher carries a salt. kuipad accepts a salt once: it refuses a join whose
+// salt is already recorded as spent. `Slot(salt, 'fresh')` is the absence of such a
+// record and `Slot(salt, 'spent')` its presence: one token per salt that a join
+// moves from fresh to spent, a rollback moves back, and a purge removes. `Alive(salt)` is the
+// voucher's validity window: the signature verifies until its expiry.
+//
+// The previous code, as controls for peer-voucher-spent.spthy (which has the same
+// join and the current rules). Previous code kept the record on the host entry,
+// so deleting the host freed the salt (`host_delete_old`, `SpentOnHostEntry`),
+// and it released the salt after any failure of a join, whether or not the host
+// was gone (`release_after_failure_old`, `ReleasedWithHost`).
+//
+// Run 2026-11-13, Tamarin 1.12.0, Maude 3.5.1, proofs.sh -t 300 (8 GiB), one lemma
+// per process.
+// Verified: old_code_reuses_salt, old_code_reuses_after_error (reachability).
+// Falsified, as expected: salt_single_use_host_entry,
+// second_host_needs_rollback_previous.
+theory peer_voucher_spent_previous
+begin
+
+rule issue:
+  [ Fr(~salt) ]
+  --[ Issued(~salt) ]->
+  [ Slot(~salt, 'fresh'), Alive(~salt) ]
+
+// A join writes the spent record, then the host entry, then adds the host to
+// its group (kuipad's join in directory.rs). `Pending` is the join between the
+// host add and the group update.
+rule join_add:
+  [ Slot(salt, 'fresh'), Fr(~host) ]
+  --[ HostCreated(salt, ~host) ]->
+  [ Slot(salt, 'spent'), Host(~host, salt), Pending(~host, salt) ]
+
+// The group update succeeds and the join is done.
+rule group_ok:
+  [ Pending(host, salt) ]
+  --[ Joined(salt, host) ]->
+  [ ]
+
+// The group update fails and the host delete succeeds: the voucher enrolled
+// no one and the record is released, so a retry can work.
+rule group_fails_rollback:
+  [ Pending(host, salt), Host(host, salt), Slot(salt, 'spent') ]
+  --[ RolledBack(salt, host) ]->
+  [ Slot(salt, 'fresh') ]
+
+// The group update fails and the host delete fails too, or the host add
+// committed but reported an error: a host may exist. Current code keeps the
+// record.
+rule group_fails_host_remains:
+  [ Pending(host, salt) ]
+  --[ HostRemains(salt, host) ]->
+  [ ]
+
+// Previous code released the salt after any failure, whether or not the host
+// was gone.
+rule release_after_failure_old:
+  [ Pending(host, salt), Slot(salt, 'spent') ]
+  --[ ReleasedWithHost(salt) ]->
+  [ Slot(salt, 'fresh') ]
+
+// Current code: the host goes, the record stays.
+rule host_delete:
+  [ Host(host, salt) ]
+  --[ HostDeleted(host, salt) ]->
+  [ ]
+
+// Previous code: the record was on the host entry, so deleting the host freed
+// the salt.
+rule host_delete_old:
+  [ Host(host, salt), Slot(salt, 'spent') ]
+  --[ HostDeleted(host, salt), SpentOnHostEntry(salt) ]->
+  [ Slot(salt, 'fresh') ]
+
+// The window closes. An unused voucher lapses with it; a spent one leaves its
+// record waiting to be purged.
+rule expire:
+  [ Alive(salt) ]
+  --[ Expired(salt) ]->
+  [ Closed(salt) ]
+
+rule lapse:
+  [ Closed(salt), Slot(salt, 'fresh') ]
+  --[ Lapsed(salt) ]->
+  [ ]
+
+rule purge:
+  [ Closed(salt), Slot(salt, 'spent') ]
+  --[ Purged(salt) ]->
+  [ ]
+
+// Reachability: under the previous code a salt enrols two hosts that both exist,
+// the second after a lost reply or a failed host delete.
+lemma old_code_reuses_salt: exists-trace
+  "Ex salt h1 h2 #i #j. Joined(salt, h1) @i & Joined(salt, h2) @j & #i < #j & not(h1 = h2)"
+lemma old_code_reuses_after_error: exists-trace
+  "Ex salt h1 h2 #i #j. HostCreated(salt, h1) @i & HostCreated(salt, h2) @j & #i < #j & not(h1 = h2) & (Ex #k. ReleasedWithHost(salt) @k)"
+
+// The claims of peer-voucher-spent.spthy fail with the previous rules. Expected
+// to be falsified.
+lemma salt_single_use_host_entry:
+  "All salt h1 h2 #i #j. Joined(salt, h1) @i & Joined(salt, h2) @j ==> #i = #j"
+lemma second_host_needs_rollback_previous:
+  "All salt h1 h2 #i #j. HostCreated(salt, h1) @i & HostCreated(salt, h2) @j & #i < #j
+     ==> Ex #k. RolledBack(salt, h1) @k & #i < #k & #k < #j"
+end
