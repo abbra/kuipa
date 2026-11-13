@@ -2143,10 +2143,19 @@ The server opens the join request as for an OTP join, then verifies the
 voucher with the public key only: the key is one it accepts, the realm and
 FQDN are the request's, now is within `not_before`…`not_after`, and a
 non-zero `binding` matches the request's `ek_e`. The directory then, as
-the daemon, adds the host entry with the spent salt in `ipaKUVoucherSpent`
-(refusing a spent salt and, by the add itself, an existing FQDN), adds it to
-the host group, and creates the keys. A voucher therefore creates one host
-once. A bound voucher is useless to anyone without the host's ephemeral
+the daemon, writes the spent record, one entry per salt under
+`cn=vouchers,cn=kuipa,cn=etc` (`ipaKUVoucherSpentRecord`, refused if it exists,
+kept until the voucher's `not_after`), adds the host entry (refusing an existing
+FQDN), adds it to the host group, and creates the keys. The record is its own
+entry, so deleting the host does not free the salt; older hosts carry the salt
+in `ipaKUVoucherSpent` on the host entry, which is still searched and does not
+outlive the host. A failed join releases the record only when the host is
+certainly absent: a host add whose outcome is unknown, or a host the rollback
+could not delete, keeps it. A voucher therefore creates one host once
+(`contrib/tamarin/peer-voucher-spent.spthy`). Two replicas that take the same
+salt before the record replicates can both succeed; the record is a directory
+entry, not a cross-replica lock, and a holder who submits one voucher to two
+servers at once is not stopped. A bound voucher is useless to anyone without the host's ephemeral
 private key, which `kuipa voucher-key` makes on the host before the
 voucher is requested; an unbound voucher is a bearer credential until used.
 
@@ -2482,7 +2491,7 @@ runs on tokio's blocking pool.
 | escrow | as the daemon, on the principal's entry (a host's by FQDN, others by `krbPrincipalName`/`krbCanonicalName` under `cn=accounts`): replace `ipaKUEscrowBinding`; read it and `ipaKUEscrowFileBinding` with `nsAccountLock` |
 | seals (§7.6) | accept the owner's token with `cb`; as the daemon: one entry `cn=<seal id>` under `cn=seals,cn=kuipa,cn=etc` (`objectClass: ipaKUSeal`, owner, name, policy JSON, one JSON value per device, state, `ipaKUSealUnlocks` per server, `ipaKUSealSessionKey` per epoch); each server's escrow public key as `ipaKUServerEscrowKey` on its `cn=masters` entry; searched one level by `ipaKUSealOwner`; limits from `ipaKUSealLimits` (JSON) on `cn=seal-limits,cn=kuipa,cn=etc`, defaults when absent; the owner's lock from `nsAccountLock` on their entry. Names are unique per owner as checked before the add; two servers creating the same name at once can both succeed |
 | registration (§7.5) | accept the token with `cb`, caller must be the principal; as the daemon: replace `ipaKUEscrowBinding`, or delete each retired value of `ipaKUEscrowFileBinding` (an absent one is no error) and add the new ones |
-| voucher join | as the daemon, after the voucher verified: search `ipaKUVoucherSpent` for the salt (hosts from before spent records); add the spent record `cn=<hex salt>,cn=vouchers,cn=kuipa,cn=etc` (`ipaKUVoucherSpentRecord`, `ipaKULease` = the voucher's `not_after`; refused if it exists, and removed again if the join fails); add the host entry (as `host-add` lays it out) with the salt; add it as `member` of `cn=<group>,cn=hostgroups,cn=accounts`; `KEYTAB_GET` |
+| voucher join | as the daemon, after the voucher verified: search `ipaKUVoucherSpent` for the salt (hosts from before spent records); add the spent record `cn=<hex salt>,cn=vouchers,cn=kuipa,cn=etc` (`ipaKUVoucherSpentRecord`, `ipaKULease` = the voucher's `not_after`; refused if it exists, and removed again only if the join fails with the host certainly absent); add the host entry (as `host-add` lays it out) with the salt; add it as `member` of `cn=<group>,cn=hostgroups,cn=accounts`; `KEYTAB_GET` |
 | trust invitation | as the daemon: add `ipaKUTrustInvitation: <hex SHA-384 of the secret> <not after>` to `cn=trusts,cn=kuipa,cn=etc,<suffix>`; using it deletes that exact value, which only one server can do |
 | record a trust | as the daemon: add `krbtgt/<B>@<A>` and `krbtgt/<A>@<B>` under `cn=<A>,cn=kerberos,<suffix>` and give them keys from the trust secret with `KEYTAB_GET` and a password (as `ipa-getkeytab -P`); store the partner as JSON in `ipaKUTrustedRealm` |
 | servers | as the daemon: the `cn` of the entries under `cn=masters,cn=ipa,cn=etc` |
