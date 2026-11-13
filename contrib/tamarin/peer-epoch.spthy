@@ -1,0 +1,158 @@
+// The first entry of the anchor epoch log (DESIGN §4.8) on two servers.
+// An entry carries the set of anchors its server trusts: 'L' (only L's own),
+// 'R' (only R's own) or 'LR' (both). Two servers that mint different first
+// entries have forked their logs; neither extends them again (the `forked`
+// flag in kuipad's handle()). Later entries, signatures, the settle delay and
+// the repair protocol are omitted.
+//
+// Servers. L is the first server of the realm; R is a second one. `init_staggered`
+// starts L alone (its directory lists one member) and R knowing two (it is
+// installed later). `init_together` starts both knowing two: the case the
+// kdc-test and the playground start.
+//
+// Rules. `mint_alone` is a server whose directory lookup listed only itself;
+// `mint_covered` is a server that trusts every member's anchor. Both are the
+// current gate in mint_epoch (peers.rs): a server with an empty log mints only
+// when membership is known and either lists nobody else or its trusted anchors
+// cover every member. `mint_unguarded` is the previous code, which minted from
+// whatever it trusted at the time; `Unguarded` marks its use.
+//
+// Delivery. A sync that carries a peer's anchor claim to a server is modelled
+// two ways. `learn_with_log` is the assumption the gate relies on: the sync
+// that teaches a server the peer's anchor also carries the peer's log, once the
+// peer has one (handle() merges the sender's epoch window before it answers).
+// `learn_without_log` applies while the peer has not minted yet, so there is
+// nothing to carry. `learn_early` is the weaker delivery, anchor claim without
+// the log although the peer has one (repair state arriving before the epoch
+// window); `Early` marks its use.
+//
+// Run 2026-11-13, Tamarin 1.12.0, Maude 3.5.1, proofs.sh -t 200 (8 GiB), one lemma
+// per process.
+// Verified: both_mint, joiner_adopts, previous_code_forks (reachability);
+// first_entry_agrees (with the previous code, early delivery and an unordered
+// join excluded).
+// Falsified, as expected: first_entry_agrees_early_delivery (a claim that
+// arrives without the log the peer already has lets the joiner mint 'LR' against
+// the master's 'L'), first_entry_agrees_unordered_join (R installed before L has
+// minted).
+// So the gate is safe under two assumptions the model states and the code does
+// not enforce: a sync that teaches a server a peer's anchor carries that peer's
+// log once it has one, and the second server is installed after the first has
+// minted. Nothing proves either holds in kuipad.
+theory peer_epoch
+begin
+
+rule logged_values:
+  [ ] --> [ !Logged('L'), !Logged('R'), !Logged('LR') ]
+
+rule init_staggered:
+  [ Fr(~r) ]
+  --[ Realm(~r) ]->
+  [ Srv(~r,'L','none','L','1'), Unlogged(~r,'L'), Pending(~r) ]
+
+// R is installed after L has minted its first entry: minutes after the first
+// server's install completes, against the one minute L waits before it mints.
+rule join:
+  [ Pending(r), !Log(r,'L',c) ]
+  --[ Joined(r) ]->
+  [ Srv(r,'R','none','R','2'), Unlogged(r,'R') ]
+
+// R is installed while L has not minted yet; the case the timing above rules out.
+rule join_unlogged:
+  [ Pending(r), Unlogged(r,'L') ]
+  --[ Joined(r), JoinedUnlogged(r) ]->
+  [ Srv(r,'R','none','R','2'), Unlogged(r,'R'), Unlogged(r,'L') ]
+
+rule init_together:
+  [ Fr(~r) ]
+  --[ Realm(~r), Joined(~r) ]->
+  [ Srv(~r,'L','none','L','2'), Unlogged(~r,'L'),
+    Srv(~r,'R','none','R','2'), Unlogged(~r,'R') ]
+
+// The gate: membership is known and lists no one else.
+rule mint_alone:
+  [ Srv(r,x,'none',t,'1'), Unlogged(r,x) ]
+  --[ Minted(r,x,t) ]->
+  [ Srv(r,x,t,t,'1'), !Log(r,x,t) ]
+
+// The gate: every member's anchor is trusted.
+rule mint_covered:
+  [ Srv(r,x,'none','LR','2'), Unlogged(r,x) ]
+  --[ Minted(r,x,'LR') ]->
+  [ Srv(r,x,'LR','LR','2'), !Log(r,x,'LR') ]
+
+// The previous behaviour.
+rule mint_unguarded:
+  [ Srv(r,x,'none',t,n), Unlogged(r,x) ]
+  --[ Minted(r,x,t), Unguarded(r) ]->
+  [ Srv(r,x,t,t,n), !Log(r,x,t) ]
+
+// The peer has no log yet: the sync brings the anchor claim only.
+rule learn_without_log_L:
+  [ Srv(r,'L','none','L',n), Unlogged(r,'R') ]
+  --[ Learned(r,'L') ]->
+  [ Srv(r,'L','none','LR',n), Unlogged(r,'R') ]
+rule learn_without_log_R:
+  [ Srv(r,'R','none','R',n), Unlogged(r,'L') ]
+  --[ Learned(r,'R') ]->
+  [ Srv(r,'R','none','LR',n), Unlogged(r,'L') ]
+
+// The peer has a log: the sync brings the claim and the log, and a server with
+// no log of its own adopts it.
+rule learn_with_log_L:
+  [ Srv(r,'L','none',t,n), !Log(r,'R',c), Unlogged(r,'L') ]
+  --[ Learned(r,'L'), Adopted(r,'L',c) ]->
+  [ Srv(r,'L',c,'LR',n), !Log(r,'L',c) ]
+rule learn_with_log_R:
+  [ Srv(r,'R','none',t,n), !Log(r,'L',c), Unlogged(r,'R') ]
+  --[ Learned(r,'R'), Adopted(r,'R',c) ]->
+  [ Srv(r,'R',c,'LR',n), !Log(r,'R',c) ]
+
+// A server that has its own log meanwhile learns the claim; the entry is not
+// replaced.
+rule learn_logged:
+  [ Srv(r,x,log,t,n), !Logged(log) ]
+  --[ LearnedLogged(r,x) ]->
+  [ Srv(r,x,log,'LR',n) ]
+
+// The weaker delivery: claim without the log although the peer has one.
+rule learn_early_L:
+  [ Srv(r,'L','none','L',n), !Log(r,'R',c) ]
+  --[ Early(r) ]->
+  [ Srv(r,'L','none','LR',n), !Log(r,'R',c) ]
+rule learn_early_R:
+  [ Srv(r,'R','none','R',n), !Log(r,'L',c) ]
+  --[ Early(r) ]->
+  [ Srv(r,'R','none','LR',n), !Log(r,'L',c) ]
+
+// Reachability, so the universal lemmas below are not vacuous: both servers
+// mint, and the trace with a fork exists under the previous code.
+lemma both_mint: exists-trace
+  "Ex r #i #j. Minted(r,'L','LR') @i & Minted(r,'R','LR') @j & not(#i = #j)"
+lemma joiner_adopts: exists-trace
+  "Ex r c #i #j. Minted(r,'L',c) @i & Adopted(r,'R',c) @j & #i < #j"
+lemma previous_code_forks: exists-trace
+  "Ex r a b #i #j. Minted(r,'L',a) @i & Minted(r,'R',b) @j & not(a = b) & Unguarded(r) @i"
+
+// Safety: every first entry minted in one realm is the same, provided the
+// previous code is not in use and a claim never arrives without the log it
+// should come with.
+lemma first_entry_agrees [use_induction]:
+  "All r x y a b #i #j. Minted(r,x,a) @i & Minted(r,y,b) @j
+     & not(Ex #k. Unguarded(r) @k) & not(Ex #k. Early(r) @k)
+     & not(Ex #k. JoinedUnlogged(r) @k) ==> a = b"
+
+// The gate on its own, with early delivery allowed: a server that is installed
+// after the first one has minted can mint a different first entry. Expected to
+// be falsified; this is the residual race of the gate.
+lemma first_entry_agrees_early_delivery:
+  "All r x y a b #i #j. Minted(r,x,a) @i & Minted(r,y,b) @j
+     & not(Ex #k. Unguarded(r) @k) & not(Ex #k. JoinedUnlogged(r) @k) ==> a = b"
+
+// The gate with the join timing relaxed: R can be installed before L has
+// minted. Expected to be falsified; this is why the gate relies on the master
+// having minted before a replica exists.
+lemma first_entry_agrees_unordered_join:
+  "All r x y a b #i #j. Minted(r,x,a) @i & Minted(r,y,b) @j
+     & not(Ex #k. Unguarded(r) @k) & not(Ex #k. Early(r) @k) ==> a = b"
+end
