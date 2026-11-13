@@ -801,7 +801,8 @@ lemma VoucherExec: exists-trace
 
 // A voucher is worth one host: two accepted voucher joins never
 // spent the same salt under the same issuer key -- the directory's
-// spent record (which outlives the host entry) refuses the second.
+// spent record (which outlives the host entry, and which only the voucher's
+// home server writes) refuses the second.
 // Unforgeability is the linear fact: only issuance under a
 // realm-accepted key creates a Voucher.
 lemma VoucherSingleUse:

@@ -879,8 +879,8 @@ table above predates them and does not count them.
 | Theory | proved | refuted | what the refuted lemmas are |
 |---|---|---|---|
 | `peer-epoch.spthy` | 4 | 2 | the gate with early delivery of a peer's claim; the gate with a replica installed before the master minted |
-| `peer-voucher-spent.spthy` | 7 | 0 | none |
-| `peer-voucher-spent-previous.spthy` | 2 | 2 | the record kept on the host entry; the salt released after any failed join |
+| `peer-voucher-spent.spthy` | 8 | 0 | none |
+| `peer-voucher-spent-previous.spthy` | 2 | 2 | the record kept on the host entry, released after any failed join, or kept per directory |
 | `peer-custody.spthy` | 8 | 2 | no replay cache; the previous broker that trusted the daemon |
 
 The refuted lemmas are controls, like the `Attack_*` ones: each drops one
@@ -897,19 +897,22 @@ log, and a replica is installed after the master minted. The two falsified lemma
 are the traces without them. The Rust change does not close those races; it makes
 them narrow. Nothing enforces either assumption.
 
-**`peer-voucher-spent.spthy`.** Isolates the spent-salt record. With the record on
-the host entry, deleting the host frees the salt and a voucher inside its window
-enrols a second host; with one record per salt it does not. A failed join keeps the
-record unless the host is certainly gone: a rollback that deleted the host
-releases the salt, a lost reply from the host add or a failed delete keeps it.
-`second_host_needs_rollback` proves that a second host is created for a salt only
-after the first was rolled back, and `salt_single_use` that a salt completes one
-join. `peer-voucher-spent-previous.spthy` has the previous rules, where both claims
-fail. The signature and key exchange stay in `kuipa.spthy`. The model has one
-directory: two replicas that take the same salt before the record replicates can
-both succeed, and nothing here, nor in the code, stops a holder who submits one
-voucher to two servers at once. The directory side was not run against a real
-389-ds.
+**`peer-voucher-spent.spthy`.** Isolates the spent-salt record. A voucher names a
+home server, and every attempt for a salt, from whichever server takes the join,
+goes through the home server's one record; the model has one token per salt that
+a join spends and a rollback releases. Any server may be the redeemer. With the
+record on the host entry, deleting the host frees the salt; with a token per
+directory, two servers that take the same voucher before replication both accept
+it; with one record per salt kept by the home server, neither happens. A failed
+join keeps the record unless the host is certainly gone: a rollback that deleted
+the host releases the salt, a lost reply from the host add or a failed delete
+keeps it. `second_host_needs_rollback` proves that a second host is created for a
+salt, by any server, only after the first was rolled back, and `salt_single_use`
+that a salt completes one join. `peer-voucher-spent-previous.spthy` has the previous
+rules, where both claims fail. The signature and key exchange stay in
+`kuipa.spthy`. Not modelled: the spend and release requests' authentication, a
+repeated spend (always refused), and a release by the wrong redeemer, which kuipad
+refuses and the tests cover. The directory side was not run against a real 389-ds.
 
 **`peer-custody.spthy`.** The attacker is the network and a daemon that forges or
 replays requests. A token is bound to the name asked for and to a key only the host

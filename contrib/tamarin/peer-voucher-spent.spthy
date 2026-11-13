@@ -1,39 +1,48 @@
-// The spent-voucher record in the directory (DESIGN §9, F5), and what deleting
-// a host does to it.
+// The spent-voucher record in the directory (DESIGN §9, F5): what deleting a
+// host does to it, what a failed join does to it, and which server writes it.
 //
-// A voucher carries a salt. kuipad accepts a salt once: it refuses a join whose
-// salt is already recorded as spent. `Slot(salt, 'fresh')` is the absence of such a
-// record and `Slot(salt, 'spent')` its presence: one token per salt that a join
-// moves from fresh to spent, a rollback moves back, and a purge removes. `Alive(salt)` is the
-// voucher's validity window: the signature verifies until its expiry.
+// A voucher carries a salt and names a home server. kuipad accepts a salt once:
+// `Slot(salt, 'fresh')` is the absence of a record for it and `Slot(salt,
+// 'spent')` its presence, one token per salt that a join moves from fresh to
+// spent, a rollback moves back, and a purge removes. `Alive(salt)` is the
+// voucher's validity window.
 //
-// Previous code kept the record on the host entry (ipaKUVoucherSpent), so deleting
-// the host freed the salt; peer-voucher-spent-previous.spthy models that and the
-// other previous behaviour as controls.
+// The token is the home server's directory entry. Any server may take a join (the
+// redeemer, `$r` in the actions), but it asks the home server to spend the salt
+// first, so every attempt for a salt goes through the one token and two servers
+// cannot each accept the voucher before their directories replicate.
+// peer-voucher-spent-previous.spthy models the earlier design with a token per
+// directory, where they can.
 //
-// Current code writes one record per salt (ipaKUVoucherSpentRecord) that
-// outlives the host: `host_delete` removes the host entry only. A purge removes
-// a record once the voucher can no longer verify (`expire`, then `purge`), so
-// the directory does not grow without bound.
+// The previous code also kept the record on the host entry, so deleting the host
+// freed the salt, and released it after any failure; the controls model that too.
+// Current code writes one record per salt (ipaKUVoucherSpentRecord) that outlives
+// the host: `host_delete` removes the host entry only. A purge removes a record
+// once the voucher can no longer verify (`expire`, then `purge`).
 //
-// A join is `join_add` (record and host entry written; the join is `Pending`),
-// then `group_ok`, or a failure. A failed join keeps the record unless the host
-// is certainly absent: `group_fails_rollback` (the host delete succeeded)
-// releases the salt; a lost reply from the host add, or a host delete that fails
-// (`group_fails_host_remains`), keep it. A refused host add leaves nothing to
-// model. The salt is one token `Slot(salt, status)`, fresh or spent.
+// A join is `join_add` (the home server's record and the host entry written; the
+// join is `Pending`), then `group_ok`, or a failure. A failed join keeps the record
+// unless the host is certainly absent: `group_fails_rollback` (the host delete
+// succeeded, and the redeemer has the home server release the record) releases the
+// salt; a lost reply from the host add, or a host delete that fails
+// (`group_fails_host_remains`), keep it. A join the home server answered ok for
+// and that is then refused with no host made has the record released, and changes
+// nothing, so it is not a step.
 //
 // Omitted: the signature and the join's key exchange (kuipa.spthy VoucherSingleUse
-// owns those), the lease, the voucher's validity check at the join, and
-// concurrent joins: the model has one directory, and two replicas that take the
-// same salt before the record replicates are not covered.
+// owns those), the lease, the voucher's validity check at the join, the request
+// that spends and the one that releases (their authentication is the peer-sync
+// kind: see the Kerberos-bound channel in DESIGN §9), a repeated spend (the home
+// server refuses every repeat), the best-effort release after an unanswered spend,
+// and a release by a redeemer other than the one that spent: no rule allows it,
+// and the home server refuses it in kuipad.
 //
-// Run 2026-11-13, Tamarin 1.12.0, Maude 3.5.1, proofs.sh -t 300 (8 GiB), one lemma
+// Run 2026-11-13, Tamarin 1.12.0, Maude 3.5.1, proofs.sh -t 400 (8 GiB), one lemma
 // per process.
-// Verified: join_then_delete, purge_after_join, rollback_then_retry,
-// host_remains_reachable (reachability); second_host_needs_rollback;
-// salt_single_use (uses second_host_needs_rollback as a source, [reuse], which
-// verifies on its own); purge_only_after_expiry.
+// Verified: join_then_delete, purge_after_join, rollback_then_other_server,
+// host_remains_reachable (reachability); rollback_by_redeemer;
+// second_host_needs_rollback; salt_single_use (uses second_host_needs_rollback as
+// a source, [reuse], which verifies on its own); purge_only_after_expiry.
 // Open: none.
 theory peer_voucher_spent
 begin
@@ -43,32 +52,37 @@ rule issue:
   --[ Issued(~salt) ]->
   [ Slot(~salt, 'fresh'), Alive(~salt) ]
 
-// A join writes the spent record, then the host entry, then adds the host to
-// its group (kuipad's join in directory.rs). `Pending` is the join between the
-// host add and the group update.
+// A redeemer, the server that takes a join, asks the voucher's home server to
+// spend the salt and adds the host entry when the home server answers ok
+// (kuipad's join in directory.rs). Only the home server writes the record:
+// `Slot` is its one token for the salt, the directory entry, and it names the
+// redeemer the record was written for. The two steps are one here: a join that
+// the home server answered ok for and then refused, with no host made, has the
+// record released and is a step that changes nothing. `Pending` is the join
+// between the host add and the group update.
 rule join_add:
   [ Slot(salt, 'fresh'), Fr(~host) ]
-  --[ HostCreated(salt, ~host) ]->
-  [ Slot(salt, 'spent'), Host(~host, salt), Pending(~host, salt) ]
+  --[ HomeSpent(salt, $r), HostCreated(salt, ~host, $r) ]->
+  [ Slot(salt, 'spent'), Host(~host, salt), Pending(~host, salt, $r) ]
 
 // The group update succeeds and the join is done.
 rule group_ok:
-  [ Pending(host, salt) ]
+  [ Pending(host, salt, r) ]
   --[ Joined(salt, host) ]->
   [ ]
 
 // The group update fails and the host delete succeeds: the voucher enrolled
-// no one and the record is released, so a retry can work.
+// no one and the redeemer has the record released, so a retry can work.
 rule group_fails_rollback:
-  [ Pending(host, salt), Host(host, salt), Slot(salt, 'spent') ]
-  --[ RolledBack(salt, host) ]->
+  [ Pending(host, salt, r), Host(host, salt), Slot(salt, 'spent') ]
+  --[ RolledBack(salt, host, r) ]->
   [ Slot(salt, 'fresh') ]
 
 // The group update fails and the host delete fails too, or the host add
-// committed but reported an error: a host may exist. Current code keeps the
-// record.
+// committed but reported an error: a host may exist. The redeemer does not
+// ask for a release and the record stays.
 rule group_fails_host_remains:
-  [ Pending(host, salt) ]
+  [ Pending(host, salt, r) ]
   --[ HostRemains(salt, host) ]->
   [ ]
 
@@ -96,22 +110,27 @@ rule purge:
   [ ]
 
 // Reachability: a voucher enrols a host that is then deleted; a failed group
-// update rolls back and the salt is used again.
+// update rolls back and another server takes the salt.
 lemma join_then_delete: exists-trace
   "Ex salt host #i #j. Joined(salt, host) @i & HostDeleted(host, salt) @j & #i < #j"
 lemma purge_after_join: exists-trace
   "Ex salt host #i #j. Joined(salt, host) @i & Purged(salt) @j & #i < #j"
-lemma rollback_then_retry: exists-trace
-  "Ex salt h1 h2 #i #j #k. HostCreated(salt, h1) @i & RolledBack(salt, h1) @j & HostCreated(salt, h2) @k & #j < #k & not(h1 = h2)"
+lemma rollback_then_other_server: exists-trace
+  "Ex salt h1 h2 #i #j #k. HostCreated(salt, h1, 'A') @i & RolledBack(salt, h1, 'A') @j & HostCreated(salt, h2, 'B') @k & #j < #k"
 lemma host_remains_reachable: exists-trace
   "Ex salt host #i. HostRemains(salt, host) @i"
 
-// A second host is created for a salt only after the first was cleanly rolled
-// back; a lost reply, a failed delete or an administrator's host-del never makes
-// the salt usable again.
+// A rollback releases the record of the redeemer that made the host, and no
+// other redeemer's: the token names the redeemer it was spent for.
+lemma rollback_by_redeemer:
+  "All salt h r #i. RolledBack(salt, h, r) @i ==> Ex #j. HostCreated(salt, h, r) @j & HomeSpent(salt, r) @j & #j < #i"
+
+// A second host is created for a salt, by any server, only after the first was
+// cleanly rolled back; a lost reply, a failed delete or an administrator's
+// host-del never makes the salt usable again.
 lemma second_host_needs_rollback [use_induction, reuse]:
-  "All salt h1 h2 #i #j. HostCreated(salt, h1) @i & HostCreated(salt, h2) @j & #i < #j
-     ==> Ex #k. RolledBack(salt, h1) @k & #i < #k & #k < #j"
+  "All salt h1 h2 r1 r2 #i #j. HostCreated(salt, h1, r1) @i & HostCreated(salt, h2, r2) @j & #i < #j
+     ==> Ex #k. RolledBack(salt, h1, r1) @k & #i < #k & #k < #j"
 
 // A salt completes a join at most once, whatever happens to the host in between.
 // A corollary of the lemma above, which it uses as a source: the first host's
