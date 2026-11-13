@@ -2116,13 +2116,18 @@ A voucher is an ML-DSA signature, with context `ipa-ku-enroll/v1 voucher`,
 on `salt ‖ m`:
 
 ```text
-m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
+m = "IPVM" ‖ realm ‖ fqdn ‖ server ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
 binding = H("ipa-ku-enroll/v1 voucher binding" ‖ ek_e)  or empty
           H: ek_e's KEM suite hash, SHA-256 (ML-KEM-768) or SHA-384 (ML-KEM-1024)
 ```
 
 `lease` is how long the host lives from its join, in seconds, or 0: a
 leased host gets no ticket after it and is removed (`DESIGN-ci.md` §1).
+
+`server` is the IPA server that owns the voucher's single use, its *home*:
+the only server that writes the voucher's spent record. The provisioner
+chooses it (`kuipa-voucher request --server`); the issuer still sees only
+`μ`. A voucher that names no server does not verify.
 
 The provisioner blinds `m` with `ml-dsa-blind` (`μ = SHAKE256(tr ‖ 0 ‖
 |ctx| ‖ ctx ‖ salt ‖ m)` with a fresh secret salt) and sends the issuer
@@ -2143,19 +2148,45 @@ The server opens the join request as for an OTP join, then verifies the
 voucher with the public key only: the key is one it accepts, the realm and
 FQDN are the request's, now is within `not_before`…`not_after`, and a
 non-zero `binding` matches the request's `ek_e`. The directory then, as
-the daemon, writes the spent record, one entry per salt under
-`cn=vouchers,cn=kuipa,cn=etc` (`ipaKUVoucherSpentRecord`, refused if it exists,
-kept until the voucher's `not_after`), adds the host entry (refusing an existing
-FQDN), adds it to the host group, and creates the keys. The record is its own
+the daemon, has the voucher's home server write the spent record, one entry
+per salt under `cn=vouchers,cn=kuipa,cn=etc` (`ipaKUVoucherSpentRecord`, refused
+if it exists, kept until the voucher's `not_after`, naming the host and the
+server that took the join), adds the host entry (refusing an existing FQDN),
+adds it to the host group, and creates the keys. The record is its own
 entry, so deleting the host does not free the salt; older hosts carry the salt
 in `ipaKUVoucherSpent` on the host entry, which is still searched and does not
 outlive the host. A failed join releases the record only when the host is
 certainly absent: a host add whose outcome is unknown, or a host the rollback
 could not delete, keeps it. A voucher therefore creates one host once
-(`contrib/tamarin/peer-voucher-spent.spthy`). Two replicas that take the same
-salt before the record replicates can both succeed; the record is a directory
-entry, not a cross-replica lock, and a holder who submits one voucher to two
-servers at once is not stopped. A bound voucher is useless to anyone without the host's ephemeral
+(`contrib/tamarin/peer-voucher-spent.spthy`).
+
+*The home server.* 389-ds is multi-master: the uniqueness plugin does not
+check replicated updates, and a second add of the same DN on another replica
+is resolved after both have succeeded, so a record written by whichever server
+takes the join cannot stop two servers each accepting one voucher. Every
+attempt for a salt goes to its home server instead. A server that takes a join
+for a voucher naming another server (the *redeemer*) sends that server
+`POST /ipa/ku/peer/spend`, authenticated like a peer sync (a GSS-API token from
+the redeemer's `ipa-ku/<fqdn>` key with a channel binding over the operation,
+both servers, the host and the voucher); the home server re-verifies the voucher
+(key, realm, host, validity, and that it names this server; not the binding,
+which only the redeemer can check), adds the record, and answers. The redeemer
+adds the host only after that. A salt that is already recorded is refused,
+whoever asks: the home server cannot tell a repeat after a lost answer from a
+host that was made and since deleted, and answering ok to the first would let
+the second make the host again. A failed join that left no host asks the home
+server to release the record, which it does only for the redeemer that wrote
+it and while no host made with the salt is visible to it. A redeemer that gets
+no answer from the home server (`503` after 20 s) also asks for a release,
+best effort, since no host exists; if that fails too the record stays and the
+voucher is spent, and is issued again. A directory failure at the home server
+is a `503`, not a refusal, so the client may retry. The redeemer contacts only
+a server that is a member of the realm, whatever the voucher names. A member
+server that is compromised can spend a voucher it holds, bound or not, without
+the host's key (the binding is the redeemer's check), and so make it unusable;
+it can already enrol hosts. If the home server is removed from the realm the
+voucher cannot be spent and is reissued. The price is that a voucher can be
+redeemed only while its home server is up and the redeemer can reach it. A bound voucher is useless to anyone without the host's ephemeral
 private key, which `kuipa voucher-key` makes on the host before the
 voucher is requested; an unbound voucher is a bearer credential until used.
 
@@ -2463,6 +2494,7 @@ delegation, which the next exchange round issues and vouches for.
 | POST | `/ipa/ku/seal/{kid}` | `IPJQ` (operation data: a JSON seal operation) → `IPJS` (payload `IPVR`) (§7.6) |
 | POST | `/ipa/ku/rec/{kid}` | `IPEQ` → `TQRS`, or `IPVA` when the request names a device (§7.6.5) |
 | POST | `/ipa/ku/peer/sync` | `IPPS` (repair message: CBOR) → repair answer (CBOR); `409` asks for the left-out delegation and epoch tail; servers only (§4.2) |
+| POST | `/ipa/ku/peer/spend` | `IPVS` → empty `200`; `403` refuses, `503` asks to retry; servers only: spends or releases a voucher's salt on its home server (§9) |
 | GET | `/ipa/ku/anchor-log?from=n` | → epoch-log entries and the anchors' current vouch heads (§4.8, §4.9) |
 | GET | `/ipa/ku/claim-log/{anchor}?from=i` | → one anchor's claim-log page (§4.9.5) |
 | GET | `/ipa/ku/tlog/{id}/head`, `…/leaves?from=i`, `…/proof?index=i&size=n`, `…/consistency?from=m&size=n` | → the server's transparency log: `IPLS`, and JSON pages of leaves and proofs (DESIGN-tlog.md §5) |
@@ -2653,8 +2685,9 @@ IPSR  old_key(JWK) succession(IPAR) signature                                   
 IPAE  realm seq(u64) prev(48) n(u64)[anchor(32)] m(u64)[signed-succession]  anchor epoch entry (signed bytes; `head` is `SHA-384` of them under a domain-separation context, in every profile; `prev` is the previous entry's head, `0…0` for the first)
 IEPS  entry(IPAE) signature n(u64) [key(JWK) signature]                    signed anchor epoch entry
 IPAS  version 1: n(u64) [tag(1) value]                                           exchange state (1 key, 2 claim, 3 vouch, 4 succession)
-IPVM  realm fqdn hostgroup not_before(u64) not_after(u64) binding             voucher message (no version; binding: empty, 32 or 48 bytes)
-IPVO  key(32) realm fqdn hostgroup not_before(u64) not_after(u64) binding
+IPVS  version 1: op(1 spend, 2 release) sender receiver fqdn voucher token       voucher spend request
+IPVM  realm fqdn server hostgroup not_before(u64) not_after(u64) lease(u64) binding             voucher message (no version; binding: empty, 32 or 48 bytes)
+IPVO  key(32) realm fqdn server hostgroup not_before(u64) not_after(u64) lease(u64) binding
       salt(32) signature                                                         voucher
 IPTQ  alg kid(32) realm initiator ct ek_e sealed                                trust request
 IPTT  alg kid(32) signer(32) realm initiator H(ct) H(ek_e)                      trust transcript input (no version)
@@ -2684,7 +2717,9 @@ IPLR  signer(JWK) head(IPLS or empty) n(u64) [index(u64) leaf(IPLF) m(1) [hash(h
 including the signer key. The `IPPS` token's channel binding is
 the first 32 bytes of `SHA-384("ipa-ku-enroll/v4 peer" ‖ IPPS(sender,
 receiver, H(delegation), repair, H(tail)))`, without the token or the
-delegation and tail themselves. `TQBD`, `TQRQ` and `TQRS` are `tang-pqc`'s binding,
+delegation and tail themselves. The `IPVS` token's channel binding is the first 32
+bytes of `SHA-384("ipa-ku-enroll/v1 voucher spend" ‖ IPVS(op, sender, receiver,
+fqdn, voucher))`, without the token. `TQBD`, `TQRQ` and `TQRS` are `tang-pqc`'s binding,
 recovery request and response.
 
 ## 15. What kuipa uses from `tang-pqc`

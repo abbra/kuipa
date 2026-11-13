@@ -183,6 +183,7 @@ pub struct State {
     key: String,
     realm: String,
     fqdn: String,
+    server: String,
     hostgroup: String,
     not_before: u64,
     not_after: u64,
@@ -200,6 +201,7 @@ impl State {
         Ok(Claims {
             realm: self.realm.clone(),
             fqdn: self.fqdn.clone(),
+            server: self.server.clone(),
             hostgroup: self.hostgroup.clone(),
             not_before: self.not_before,
             not_after: self.not_after,
@@ -223,6 +225,7 @@ pub fn request(public: &[u8], claims: &Claims, state: &Path) -> Result<String, E
         key: key.to_jwk_json(),
         realm: claims.realm.clone(),
         fqdn: claims.fqdn.clone(),
+        server: claims.server.clone(),
         hostgroup: claims.hostgroup.clone(),
         not_before: claims.not_before,
         not_after: claims.not_after,
@@ -294,6 +297,7 @@ mod tests {
         let claims = Claims {
             realm: "EXAMPLE.TEST".into(),
             fqdn: "web.example.test".into(),
+            server: "ipa1.example.test".into(),
             hostgroup: String::new(),
             not_before: 0,
             not_after: 1,

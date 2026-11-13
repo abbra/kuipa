@@ -58,6 +58,7 @@ use tang_pqc::{ExchangeKeyPair, Policy, SignatureAlg, SigningKey, Thumbprint, b6
 const REALM: &str = "EXAMPLE.TEST";
 const DOMAIN: &str = "example.test";
 const SERVERS: [&str; 2] = ["ipa1.example.test", "ipa2.example.test"];
+const SERVER0: &str = SERVERS[0];
 const ADMIN: &str = "admin@EXAMPLE.TEST";
 const ADMIN_PASSWORD: &str = "Secret123";
 /// The realm's other users, for shared seals, approvals and deposits
@@ -1327,7 +1328,7 @@ pq_voucher() {{
             *) break ;;
         esac
     done
-    kuipa-voucher request --public "$v/issuer.jwk" --realm {REALM} --fqdn "$PQ_HOST" \
+    kuipa-voucher request --public "$v/issuer.jwk" --realm {REALM} --fqdn "$PQ_HOST" --server {SERVER0} \
         --hostgroup "$group" "${{bind[@]}}" "${{lease[@]}}" --state "$v/$name.state" \
         | kuipa-voucher sign --key "$v/issuer.pem" --quota "$v/quota.json" \
         | kuipa-voucher finish --state "$v/$name.state" > "$v/$name.voucher" || return

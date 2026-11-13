@@ -30,6 +30,7 @@ use crate::seal::{
     RecoverySettings, ReleaseRequest, ReleasedKeys, Reply, Role, Seal, SealAnswer, SealOp,
     SessionFor, SessionKey, SessionToken, ShardsRegistration, State,
 };
+use crate::spend::{SpendError, VoucherSpender};
 use crate::tlog::{Entry, Kind, LogId, Opening, Receipt, SealAction, SealEvent, SignedHead};
 use crate::trust::{self, TrustRequest, TrustResponse};
 use crate::voucher::Voucher;
@@ -590,10 +591,48 @@ pub trait Directory {
         Err("the anchor exchange is not supported".into())
     }
 
-    /// Create host `fqdn` for a verified voucher (§9): refuse an existing
-    /// host or a spent `salt`, add the host to `hostgroup` (if not empty),
-    /// record the salt as spent until the voucher's `not_after` — beyond
-    /// the host's own life — and create keys.
+    /// Record `salt` as spent by `redeemer` for a join of `fqdn`, until the
+    /// voucher's `not_after` — beyond the host's own life (§9).  This server
+    /// is the voucher's home: the add of the record is the single-use gate,
+    /// and no other server writes it.  Asked again for the same `fqdn` and
+    /// `redeemer`, it succeeds.
+    ///
+    /// # Errors
+    ///
+    /// A refusal for a salt spent for another host or redeemer; by default
+    /// vouchers are not supported.
+    fn spend_voucher(
+        &self,
+        salt: &[u8; 32],
+        fqdn: &str,
+        redeemer: &str,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
+        let _ = (salt, fqdn, redeemer, not_after);
+        Err("vouchers are not supported by this directory".into())
+    }
+
+    /// Remove the record `redeemer` wrote for `salt` and `fqdn`, because the
+    /// host it made does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Any failure, or a record that is another host's or redeemer's.
+    fn release_voucher(
+        &self,
+        salt: &[u8; 32],
+        fqdn: &str,
+        redeemer: &str,
+    ) -> Result<(), DirectoryError> {
+        let _ = (salt, fqdn, redeemer);
+        Err("vouchers are not supported by this directory".into())
+    }
+
+    /// Create host `fqdn` for a voucher whose salt is already spent (§9):
+    /// refuse an existing host, add the host to `hostgroup` (if not empty)
+    /// and create keys.  Does not touch the spent record; on failure it says
+    /// whether the host certainly does not exist, which is when the record
+    /// may be released.
     ///
     /// # Errors
     ///
@@ -603,12 +642,14 @@ pub trait Directory {
         fqdn: &str,
         hostgroup: &str,
         salt: &[u8; 32],
-        not_after: u64,
         enctypes: &[Enctype],
         lease: Option<u64>,
-    ) -> Result<Keytab, DirectoryError> {
-        let _ = (fqdn, hostgroup, salt, not_after, enctypes, lease);
-        Err("vouchers are not supported by this directory".into())
+    ) -> Result<Keytab, VoucherJoinError> {
+        let _ = (fqdn, hostgroup, salt, enctypes, lease);
+        Err(VoucherJoinError {
+            error: "vouchers are not supported by this directory".into(),
+            host_absent: true,
+        })
     }
 
     /// When the lease of `principal`'s host ends, if it is leased
@@ -904,16 +945,32 @@ impl<D: Directory + ?Sized> Directory for std::sync::Arc<D> {
     ) -> Result<(), DirectoryError> {
         (**self).publish_escrow_key(server, key)
     }
+    fn spend_voucher(
+        &self,
+        salt: &[u8; 32],
+        fqdn: &str,
+        redeemer: &str,
+        not_after: u64,
+    ) -> Result<(), DirectoryError> {
+        (**self).spend_voucher(salt, fqdn, redeemer, not_after)
+    }
+    fn release_voucher(
+        &self,
+        salt: &[u8; 32],
+        fqdn: &str,
+        redeemer: &str,
+    ) -> Result<(), DirectoryError> {
+        (**self).release_voucher(salt, fqdn, redeemer)
+    }
     fn join_with_voucher(
         &self,
         fqdn: &str,
         hostgroup: &str,
         salt: &[u8; 32],
-        not_after: u64,
         enctypes: &[Enctype],
         lease: Option<u64>,
-    ) -> Result<Keytab, DirectoryError> {
-        (**self).join_with_voucher(fqdn, hostgroup, salt, not_after, enctypes, lease)
+    ) -> Result<Keytab, VoucherJoinError> {
+        (**self).join_with_voucher(fqdn, hostgroup, salt, enctypes, lease)
     }
     fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
         (**self).principal_lease(principal)
@@ -1022,9 +1079,29 @@ impl Ledger for NoLedger {
 #[derive(Debug)]
 pub struct Refusal(DirectoryError);
 
+/// Why a voucher join failed, and whether the host certainly does not exist.
+/// Only then may the voucher's spent record be released: a host add that may
+/// have committed, or a host that could not be removed, keeps the salt spent.
+#[derive(Debug)]
+pub struct VoucherJoinError {
+    /// What failed.
+    pub error: DirectoryError,
+    /// Whether the directory says no host of this join exists.
+    pub host_absent: bool,
+}
+
 impl Refusal {
     fn because(reason: impl Into<DirectoryError>) -> Self {
         Self(reason.into())
+    }
+
+    /// Whether the refusal is a server that could not be reached rather than
+    /// an answer: the client may retry.  The HTTP layer answers `503`.
+    #[must_use]
+    pub fn is_unavailable(&self) -> bool {
+        self.0
+            .downcast_ref::<SpendError>()
+            .is_some_and(|e| matches!(e, SpendError::Unavailable(_)))
     }
 }
 
@@ -1178,6 +1255,7 @@ pub struct EnrollServer {
     info: RealmInfo,
     policy: tang_pqc::Policy,
     ledger: Arc<dyn Ledger>,
+    spender: std::sync::OnceLock<Arc<dyn VoucherSpender>>,
     published: RwLock<Published>,
 }
 
@@ -1194,6 +1272,7 @@ impl EnrollServer {
             info,
             policy: tang_pqc::Policy::default(),
             ledger: Arc::new(NoLedger),
+            spender: std::sync::OnceLock::new(),
             published: RwLock::new(Published {
                 delegation,
                 anchors,
@@ -1219,6 +1298,13 @@ impl EnrollServer {
     pub fn with_ledger(mut self, ledger: Arc<dyn Ledger>) -> Self {
         self.ledger = ledger;
         self
+    }
+
+    /// Ask other servers to spend the vouchers they own.  Set once, after
+    /// the exchange that reaches them exists; without it a voucher for
+    /// another server is refused.
+    pub fn set_voucher_spender(&self, spender: Arc<dyn VoucherSpender>) {
+        let _ = self.spender.set(spender);
     }
 
     /// The hash of this server's log: its signing key's
@@ -1635,27 +1721,8 @@ impl EnrollServer {
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
             (Operation::Join, AuthType::Voucher) => {
-                let voucher = Voucher::parse(token)?;
-                let key = self
-                    .keys
-                    .vouchers
-                    .iter()
-                    .find(|k| k.thumbprint() == voucher.key())
-                    .ok_or_else(|| Refusal::because("unknown voucher key"))?;
-                let ephemeral = crate::voucher::binding(request.ephemeral_key())?;
-                let now = unix_seconds(SystemTime::now());
-                let claims = voucher.verify(key, &self.info.realm, fqdn, &ephemeral, now)?;
-                let lease = voucher_lease(claims, now, directory)?;
-                let keytab = directory
-                    .join_with_voucher(
-                        fqdn,
-                        &claims.hostgroup,
-                        voucher.salt(),
-                        claims.not_after,
-                        enctypes,
-                        lease,
-                    )
-                    .map_err(Refusal)?;
+                let keytab =
+                    self.voucher_join(token, fqdn, request.ephemeral_key(), enctypes, directory)?;
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
             (Operation::Join, AuthType::Kerberos) => {
@@ -1707,6 +1774,116 @@ impl EnrollServer {
                 .map_err(Refusal)?;
         }
         Ok(request.respond(ss.as_ref(), &t, kerberos.as_ref(), payload.as_ref())?)
+    }
+
+    /// A voucher join (§9): verify the voucher, have its home server record
+    /// the salt as spent, then add the host.  When the join fails with the
+    /// host certainly absent the record is released again, so a retry can
+    /// work; otherwise it stays.
+    fn voucher_join(
+        &self,
+        token: &[u8],
+        fqdn: &str,
+        ephemeral_key: &[u8],
+        enctypes: &[Enctype],
+        directory: &dyn Directory,
+    ) -> Result<Keytab, Refusal> {
+        let voucher = Voucher::parse(token)?;
+        let key = self
+            .keys
+            .vouchers
+            .iter()
+            .find(|k| k.thumbprint() == voucher.key())
+            .ok_or_else(|| Refusal::because("unknown voucher key"))?;
+        let ephemeral = crate::voucher::binding(ephemeral_key)?;
+        let now = unix_seconds(SystemTime::now());
+        let claims = voucher.verify(key, &self.info.realm, fqdn, &ephemeral, now)?;
+        let lease = voucher_lease(claims, now, directory)?;
+        let (home, me) = (&claims.server, &self.info.server);
+        let host = fqdn.to_ascii_lowercase();
+        let local = home.eq_ignore_ascii_case(me);
+        if local {
+            directory
+                .spend_voucher(voucher.salt(), &host, me, claims.not_after)
+                .map_err(directory_refusal)?;
+        } else if let Err(e) = self.spender()?.spend(home, &host, token) {
+            // The home server may have recorded the salt before the answer was
+            // lost; no host exists, so ask it to release the record, as far as
+            // it can be reached.  A salt that stays recorded is spent, not
+            // reusable: the voucher is then issued again.
+            if matches!(e, SpendError::Unavailable(_)) {
+                let _ = self.spender()?.release(home, &host, token);
+            }
+            return Err(Refusal::because(e));
+        }
+        directory
+            .join_with_voucher(fqdn, &claims.hostgroup, voucher.salt(), enctypes, lease)
+            .map_err(|e| {
+                if e.host_absent {
+                    let released: Result<(), DirectoryError> = if local {
+                        directory.release_voucher(voucher.salt(), &host, me)
+                    } else {
+                        self.spender()
+                            .map_err(|r| r.to_string().into())
+                            .and_then(|s| s.release(home, &host, token).map_err(Into::into))
+                    };
+                    if let Err(r) = released {
+                        eprintln!("kuipad: voucher {host}: releasing the spent record: {r}");
+                    }
+                }
+                Refusal(e.error)
+            })
+    }
+
+    fn spender(&self) -> Result<&Arc<dyn VoucherSpender>, Refusal> {
+        self.spender.get().ok_or_else(|| {
+            Refusal::because("the voucher belongs to another server and none can be asked")
+        })
+    }
+
+    /// Spend or release a salt for another server, the voucher's home is
+    /// this one (§9).  `sender` is the server the request's token
+    /// authenticated; the caller checked that it is a member of the realm.
+    ///
+    /// # Errors
+    ///
+    /// A [`Refusal`] for a voucher that does not verify here, one that
+    /// names another server, a request not addressed to this server or not
+    /// from `sender`, or a salt that is spent for another host.
+    pub fn spend_for_peer(
+        &self,
+        request: &crate::spend::SpendRequest,
+        sender: &str,
+        directory: &dyn Directory,
+    ) -> Result<(), Refusal> {
+        let me = &self.info.server;
+        if !request.receiver.eq_ignore_ascii_case(me)
+            || !request.sender.eq_ignore_ascii_case(sender)
+        {
+            return Err(Refusal::because("a voucher spend for another server"));
+        }
+        let voucher = Voucher::parse(&request.voucher)?;
+        let key = self
+            .keys
+            .vouchers
+            .iter()
+            .find(|k| k.thumbprint() == voucher.key())
+            .ok_or_else(|| Refusal::because("unknown voucher key"))?;
+        let now = unix_seconds(SystemTime::now());
+        let claims = voucher.verify_for_spend(key, &self.info.realm, &request.fqdn, now)?;
+        if !claims.server.eq_ignore_ascii_case(me) {
+            return Err(Refusal::because("the voucher belongs to another server"));
+        }
+        let host = request.fqdn.to_ascii_lowercase();
+        let redeemer = sender.to_ascii_lowercase();
+        match request.op {
+            crate::spend::SpendOp::Spend => directory
+                .spend_voucher(voucher.salt(), &host, &redeemer, claims.not_after)
+                .map_err(directory_refusal),
+            crate::spend::SpendOp::Release => directory
+                .release_voucher(voucher.salt(), &host, &redeemer)
+                .map_err(directory_refusal),
+        }
     }
 
     /// Stage a host (§8.3): keys from the directory, packed into a bundle
@@ -4113,6 +4290,30 @@ pub fn parse_stage_result(
         bundle,
         (!secret.is_empty()).then(|| crate::enrollment::Secret::new(secret)),
     ))
+}
+
+/// A directory's answer no to a voucher spend or release: the salt is spent,
+/// or the record is not this join's.  Any other directory error is a failure
+/// that may pass, and is answered `503`.
+#[derive(Debug)]
+pub struct VoucherRefused(pub &'static str);
+
+impl fmt::Display for VoucherRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for VoucherRefused {}
+
+/// A refusal for a directory's refusal, and an unavailable server for any
+/// other error.
+fn directory_refusal(e: DirectoryError) -> Refusal {
+    if e.is::<VoucherRefused>() {
+        Refusal(e)
+    } else {
+        Refusal::because(SpendError::Unavailable(e))
+    }
 }
 
 /// When the host a voucher creates at `now` loses its lease

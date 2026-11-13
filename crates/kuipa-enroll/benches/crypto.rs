@@ -242,6 +242,7 @@ fn vouchers(c: &mut Criterion) {
     let claims = Claims {
         realm: REALM.into(),
         fqdn: HOST.into(),
+        server: "ipa1.example.test".into(),
         hostgroup: "web".into(),
         not_before: at - 60,
         not_after: at + 3600,

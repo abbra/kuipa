@@ -12,7 +12,7 @@
 //!                                   print the response
 //!
 //! Provisioner (knows what each voucher allows):
-//! kuipa-voucher request --public JWK --realm R --fqdn H [--hostgroup G]
+//! kuipa-voucher request --public JWK --realm R --fqdn H --server S [--hostgroup G]
 //!                        [--days N] [--binding B] --state F
 //!                                   blind a voucher; print the request
 //! kuipa-voucher finish --state F   unblind the response on standard input;
@@ -92,6 +92,11 @@ enum Command {
         /// The host the voucher admits.
         #[arg(long, value_name = "FQDN")]
         fqdn: String,
+        /// The IPA server that owns the voucher's single use.  A server
+        /// that gets the join asks this one to spend the salt, so it must
+        /// stay a member of the realm until the voucher is used or expires.
+        #[arg(long, value_name = "FQDN")]
+        server: String,
         /// Only hosts of this IPA host group.
         #[arg(long, value_name = "GROUP")]
         hostgroup: Option<String>,
@@ -158,6 +163,7 @@ fn run(command: Command) -> Result<(), Error> {
             public,
             realm,
             fqdn,
+            server,
             hostgroup,
             days,
             lease_hours,
@@ -184,6 +190,7 @@ fn run(command: Command) -> Result<(), Error> {
             let claims = Claims {
                 realm,
                 fqdn: fqdn.to_ascii_lowercase(),
+                server: server.to_ascii_lowercase(),
                 hostgroup: hostgroup.unwrap_or_default(),
                 not_before: now.saturating_sub(300),
                 not_after: validity,
@@ -206,6 +213,7 @@ fn run(command: Command) -> Result<(), Error> {
                     "key": v.key().to_string(),
                     "realm": c.realm,
                     "fqdn": c.fqdn,
+                    "server": c.server,
                     "hostgroup": c.hostgroup,
                     "not_before": c.not_before,
                     "not_after": c.not_after,

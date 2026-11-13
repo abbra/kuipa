@@ -221,6 +221,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
         initiator,
         store,
     )?;
+    server.set_voucher_spender(peers.voucher_spender());
     tokio::spawn(peers.clone().run());
     spawn_maintenance(
         &cfg,

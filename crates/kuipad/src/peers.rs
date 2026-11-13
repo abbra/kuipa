@@ -33,6 +33,7 @@ use kuipa_enroll::delegation::{
 use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
 use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::server::Directory;
+use kuipa_enroll::spend::{MAX_SPEND_BYTES, SpendError, SpendOp, SpendRequest, VoucherSpender};
 use tang_pqc::{Policy, SigningKey, Thumbprint, unix_seconds};
 use tokio::sync::{Notify, RwLock};
 
@@ -1856,6 +1857,126 @@ impl GossipRuntime<AnchorState, String> for Runtime {
     }
     fn codec(&self) -> &CborCodec {
         &self.1
+    }
+}
+
+/// Asks a voucher's home server to spend or release its salt (§9), over the
+/// same Kerberos-authenticated HTTPS the anchor exchange uses.
+struct PeerSpender {
+    exchange: Arc<Exchange>,
+    /// The daemon's runtime: the join runs on a blocking thread, which waits
+    /// for the request here.
+    runtime: tokio::runtime::Handle,
+}
+
+impl fmt::Debug for PeerSpender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PeerSpender")
+    }
+}
+
+/// How long the client waits for the home server: it is waiting too.
+const SPEND_TIMEOUT: Duration = Duration::from_secs(20);
+
+impl PeerSpender {
+    fn call(&self, op: SpendOp, home: &str, fqdn: &str, voucher: &[u8]) -> Result<(), SpendError> {
+        let x = &self.exchange;
+        let unavailable = |e: &dyn fmt::Display| SpendError::Unavailable(e.to_string().into());
+        // The voucher names the server, and the issuer's signature does not make
+        // it a member: contact only the realm's own servers.
+        self.runtime.block_on(x.refresh_members());
+        if !x.members().contains(&home.to_ascii_lowercase()) {
+            return Err(SpendError::Refused(
+                format!("{home} is not a server of the realm").into(),
+            ));
+        }
+        let cb = SpendRequest::channel_binding(op, &x.settings.me, home, fqdn, voucher)
+            .map_err(|e| unavailable(&e))?;
+        let token = x.initiator.token(home, &cb).map_err(|e| unavailable(&e))?;
+        let body = SpendRequest {
+            op,
+            sender: x.settings.me.clone(),
+            receiver: home.to_owned(),
+            fqdn: fqdn.to_owned(),
+            voucher: voucher.to_vec(),
+            token,
+        }
+        .to_bytes();
+        let url = format!("{}/peer/spend", x.base(home));
+        let sent = self.runtime.block_on(
+            x.client
+                .post(url)
+                .header("content-type", "application/vnd.ipa-ku.voucher-spend")
+                .timeout(SPEND_TIMEOUT)
+                .body(body)
+                .send(),
+        );
+        match sent {
+            Ok(r) if r.status() == reqwest::StatusCode::OK => Ok(()),
+            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
+                Err(SpendError::Refused(format!("{home} answered 403").into()))
+            }
+            Ok(r) => Err(unavailable(&format!("{home} answered HTTP {}", r.status()))),
+            Err(e) => Err(unavailable(&failed_chain(&e))),
+        }
+    }
+}
+
+impl VoucherSpender for PeerSpender {
+    fn spend(&self, home: &str, fqdn: &str, voucher: &[u8]) -> Result<(), SpendError> {
+        self.call(SpendOp::Spend, home, fqdn, voucher)
+    }
+
+    fn release(&self, home: &str, fqdn: &str, voucher: &[u8]) -> Result<(), SpendError> {
+        self.call(SpendOp::Release, home, fqdn, voucher)
+    }
+}
+
+impl Peers {
+    /// The voucher spender for the enrollment server.  Call it on the
+    /// daemon's runtime.
+    #[must_use]
+    pub fn voucher_spender(&self) -> Arc<dyn VoucherSpender> {
+        Arc::new(PeerSpender {
+            exchange: self.exchange.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        })
+    }
+
+    /// `POST /ipa/ku/peer/spend`: authenticate the redeemer as a member of the
+    /// realm, then spend or release the salt of a voucher this server owns.
+    ///
+    /// # Errors
+    ///
+    /// A malformed request, a token that does not authenticate the sender, a
+    /// sender that is not a member, or the enrollment server's refusal.
+    pub async fn handle_spend(&self, body: &[u8]) -> Result<(), Error> {
+        let x = &self.exchange;
+        if body.len() > MAX_SPEND_BYTES {
+            return Err("voucher spend exceeds size limit".into());
+        }
+        let request = SpendRequest::from_bytes(body)?;
+        let cb = SpendRequest::channel_binding(
+            request.op,
+            &request.sender,
+            &request.receiver,
+            &request.fqdn,
+            &request.voucher,
+        )?;
+        let (directory, token) = (x.directory.clone(), request.token.clone());
+        let principal =
+            tokio::task::spawn_blocking(move || directory.accept_peer(&token, &cb)).await??;
+        x.refresh_members().await;
+        if principal != anchors::peer_principal(&request.sender, &x.settings.realm)
+            || !x.members().contains(&request.sender)
+        {
+            return Err("the token does not authenticate the sender".into());
+        }
+        let (server, directory) = (x.server.clone(), x.directory.clone());
+        let sender = request.sender.clone();
+        tokio::task::spawn_blocking(move || server.spend_for_peer(&request, &sender, &*directory))
+            .await??;
+        Ok(())
     }
 }
 
