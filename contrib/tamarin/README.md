@@ -18,7 +18,7 @@ file.
 
 ## What is here
 
-Twenty-five Tamarin theories and seven Z3 models. Each theory header says what it
+Twenty-eight Tamarin theories and seven Z3 models. Each theory header says what it
 assumes and what it leaves out, and lists its own proved, open, and refuted
 results.
 
@@ -66,6 +66,14 @@ results.
 | `peer-pruning.spthy` | how far removing one entry cascades |
 | `peer-replacement.spthy` | two replicas merging the same entry |
 | `peer-cache.spthy` | a receiver's cache across restarts and refills |
+
+### Peer theories, deployment changes
+
+| File | What it models |
+|---|---|
+| `peer-epoch.spthy` | the first entry of the anchor epoch log on two servers, and the gate that keeps them from forking it |
+| `peer-voucher-spent.spthy` | the spent-voucher record, and what deleting a host does to it |
+| `peer-custody.spthy` | the custody broker authenticating its callers, the replay cache, and the secrecy of custody secrets |
 
 ### Z3 models, for the arithmetic Tamarin cannot express
 
@@ -859,6 +867,50 @@ chain after the formula (`simplify`, `solve( Fact( args ) @ #t )`, `case rule`,
 split that way was tried on two of the open goals and did not close them. Membership
 changes, expiry, and any connection to the admission and trust theories are outside
 this model.
+
+## Epoch log start, spent vouchers and the custody broker
+
+Three theories follow the changes made after a security review and a real replica
+deployment. They were run on their own, 2026-11-13, Tamarin 1.12.0 with Maude 3.5.1,
+`contrib/ci/proofs.sh` at 200-250 s per lemma inside an 8 GiB cgroup; the whole-tree
+table above predates them and does not count them.
+
+| Theory | proved | refuted | what the refuted lemmas are |
+|---|---|---|---|
+| `peer-epoch.spthy` | 4 | 2 | the gate with early delivery of a peer's claim; the gate with a replica installed before the master minted |
+| `peer-voucher-spent.spthy` | 5 | 1 | the record kept on the host entry |
+| `peer-custody.spthy` | 8 | 2 | no replay cache; the previous broker that trusted the daemon |
+
+The refuted lemmas are controls, like the `Attack_*` ones: each drops one
+mechanism and the prover finds the trace the mechanism prevents.
+
+**`peer-epoch.spthy`.** Two servers each mint entry 1 of the anchor epoch log, with
+the set of anchors they trust. Before the change, a server minted at once, so the
+replica's `{R}` met the master's `{L}` and the logs forked
+(`previous_code_forks`). The gate mints only when membership is known and the
+trusted anchors cover every member. `first_entry_agrees` proves that all first
+entries agree, but only with two assumptions the model makes and the code does not
+enforce: a sync that teaches a server a peer's anchor also carries that peer's
+log, and a replica is installed after the master minted. The two falsified lemmas
+are the traces without them. The Rust change does not close those races; it makes
+them narrow.
+
+**`peer-voucher-spent.spthy`.** Isolates the spent-salt record. With the record on
+the host entry, deleting the host frees the salt and a voucher inside its window
+enrols a second host. With one record per salt, deleting the host removes the host
+only, and a record is purged only after the voucher's window closed
+(`purge_only_after_expiry`). The signature and key exchange stay in `kuipa.spthy`.
+It does not cover concurrent writes to one record, and the directory side was not
+run against a real 389-ds.
+
+**`peer-custody.spthy`.** The attacker is the network and the daemon. A token is
+bound to the name asked for and to a key only the host holds; the broker accepts
+host-class principals only and a nonce once. Proved: a release names a request the
+principal made, for that name; each request is answered once; an administrator's
+ticket is never answered; a custody secret is known only if a host-class key was
+stolen. Kerberos, GSS wrap and handler policy are abstracted: the model says
+nothing about how gssproxy implements the replay cache or about the socket's
+permissions.
 
 ## What is still open
 

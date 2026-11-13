@@ -422,7 +422,7 @@ over hand-written bytes.
 ### Protocol model
 
 The protocol is modelled formally under `contrib/tamarin/` — the core exchange
-(`kuipa.spthy`) and Tang (`tang-pqc.spthy`) among 25 Tamarin theories, plus Z3
+(`kuipa.spthy`) and Tang (`tang-pqc.spthy`) among 28 Tamarin theories, plus Z3
 models of the arithmetic parts. A change to the wire format, the key schedule or
 a state transition must be reflected in the matching theory and re-proved with
 `./contrib/ci/proofs.sh contrib/tamarin/kuipa.spthy` (one lemma per process,
