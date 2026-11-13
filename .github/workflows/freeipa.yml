@@ -1,0 +1,157 @@
+---
+# kuipa on a real FreeIPA realm: a master, a replica and two clients on qemu
+# VMs, FreeIPA and ipacta from COPR abbra/pqc and Fedora.  The realm's VMs
+# start with the COPR kuipa while kuipa is built from this commit in a
+# parallel job; the VMs are then upgraded to that build and the tests run.
+# ci-freeipa (https://github.com/freeipa/ci-freeipa) provisions the VMs and
+# runs the ipatests; the topology and the tests are in
+# contrib/ci/freeipa/kuipa-ipa.yaml, the RPM build in
+# contrib/ci/freeipa/build-rpms.sh.
+name: FreeIPA integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: freeipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # ci-freeipa is pinned: a newer tool is a deliberate change of this line.
+  # This commit adds the multicast probe fix that four VMs need.
+  CI_FREEIPA_REPO: https://github.com/freeipa/ci-freeipa
+  CI_FREEIPA_REF: 6b325c372050f9bdc193dcf208cfe25831cc3be2
+  PRESET: contrib/ci/freeipa/kuipa-ipa.yaml
+
+jobs:
+  # ── RPMs ───────────────────────────────────────────────────────────────────
+  # kuipa and kuipa-server of this commit.  The COPR carries the crates and
+  # libraries Fedora lacks; enabling abbra/pqc enables abbra/rust-deps too.
+  # git-core goes in before the checkout so that it gets a real clone:
+  # `make srpm` runs git archive.
+  rpms:
+    name: Build kuipa RPMs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container: quay.io/fedora/fedora:45
+    steps:
+      - name: Enable the COPR repository
+        run: dnf install -y dnf-plugins-core git-core && dnf copr -y enable abbra/pqc
+      - uses: actions/checkout@v7
+      - name: Build the RPMs
+        run: ./contrib/ci/freeipa/build-rpms.sh kuipa-rpms
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kuipa-rpms
+          path: kuipa-rpms/*.rpm
+          if-no-files-found: error
+
+  # ── Realm ──────────────────────────────────────────────────────────────────
+  freeipa:
+    name: FreeIPA master, replica, clients
+    permissions:
+      actions: read  # gh run download of the rpms job's artifact
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      WORK: ${{ github.workspace }}/work
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same host preparation as ci-freeipa's own qemu job.
+      - name: Prepare the host
+        run: |
+          # let the runner user use KVM; load the module first, since a
+          # runner may not have loaded it
+          sudo modprobe kvm_intel 2>/dev/null || sudo modprobe kvm_amd 2>/dev/null || true
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          for _ in $(seq 15); do [ -w /dev/kvm ] && break; sleep 2; done
+          if [ ! -w /dev/kvm ]; then
+              echo "::error::/dev/kvm is not available on this runner (no nested virtualization)"
+              exit 1
+          fi
+          # azure.archive.ubuntu.com does not always resolve: use the main
+          # archive, then kernel.org's mirror
+          sudo sed -i 's#azure\.archive\.ubuntu\.com#archive.ubuntu.com#g' \
+              /etc/apt/apt-mirrors.txt /etc/apt/sources.list \
+              /etc/apt/sources.list.d/* 2>/dev/null || true
+          mirror=https://mirrors.edge.kernel.org/ubuntu/
+          apt_opts="-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20"
+          for attempt in 1 2 3; do
+              # shellcheck disable=SC2086
+              sudo apt-get $apt_opts update && sudo apt-get $apt_opts install -y --no-install-recommends \
+                  qemu-system-x86 qemu-utils xorriso rsync openssh-client podman python3-yaml && break
+              [ "$attempt" = 3 ] && { echo "::error::apt is unreachable"; exit 1; }
+              echo "$mirror" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+              sudo sed -i -E "s#https?://([a-z]+\.)?(archive|security)\.ubuntu\.com/ubuntu/?#$mirror#g" \
+                  /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+              sleep 10
+          done
+          # the VMs authorize the runner's ssh key
+          [ -e ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          mkdir -p "$WORK"
+
+      - name: Check out ci-freeipa
+        run: |
+          git clone --quiet "$CI_FREEIPA_REPO" "$RUNNER_TEMP/ci-freeipa"
+          git -C "$RUNNER_TEMP/ci-freeipa" checkout --quiet "$CI_FREEIPA_REF"
+
+      # Provisioning the VMs and installing FreeIPA with the COPR kuipa takes
+      # about as long as the RPM build, so the two jobs run side by side.
+      - name: Start the VMs with the COPR packages
+        run: |
+          "$RUNNER_TEMP/ci-freeipa/env/freeipa-env" up "$PRESET" --workdir "$WORK/env"
+
+      # The rpms job is a sibling, not a dependency: its artifact is
+      # downloaded as soon as it appears, and a failed build ends the wait.
+      - name: Wait for the kuipa RPMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs_api="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs"
+          until gh run download "$GITHUB_RUN_ID" --name kuipa-rpms --dir kuipa-rpms 2>/dev/null; do
+              state="$(gh api "$jobs_api" --jq '.jobs[] | select(.name == "Build kuipa RPMs") | .conclusion')"
+              case "$state" in
+                  failure|cancelled|timed_out)
+                      echo "::error::the kuipa RPM build ended with: $state"; exit 1 ;;
+              esac
+              sleep 20
+          done
+          ls -l kuipa-rpms
+
+      # The VMs hold the COPR kuipa: this is also the package upgrade test.
+      - name: Upgrade kuipa on the VMs to this commit
+        run: ./contrib/ci/freeipa/upgrade-kuipa.sh "$WORK/env" kuipa-rpms
+
+      - name: Run the kuipa tests
+        run: |
+          "$RUNNER_TEMP/ci-freeipa/env/freeipa-env" run "$PRESET" --workdir "$WORK/env"
+
+      - name: Summarize and tear down
+        if: always()
+        run: |
+          cli="$RUNNER_TEMP/ci-freeipa/env/freeipa-env"
+          "$cli" show "$PRESET" --workdir "$WORK/env" >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          "$cli" summary "$PRESET" --workdir "$WORK/env" >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          "$cli" down "$PRESET" --workdir "$WORK/env" || true
+
+      - name: Keep the test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: freeipa-logs
+          path: work/env/logs
+          retention-days: 14
+          if-no-files-found: ignore
