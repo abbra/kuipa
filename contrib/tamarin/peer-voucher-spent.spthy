@@ -1,0 +1,98 @@
+// The spent-voucher record in the directory (DESIGN §9, F5), and what deleting
+// a host does to it.
+//
+// A voucher carries a salt. kuipad accepts a salt once: it refuses a join whose
+// salt is already recorded as spent. `Fresh(salt)` is the absence of such a
+// record: issuance creates it, a join consumes it. `Alive(salt)` is the
+// voucher's validity window: the signature verifies until its expiry.
+//
+// Previous code kept the record on the host entry (ipaKUVoucherSpent). Deleting
+// the host deleted the record, so the salt was fresh again and the voucher,
+// still inside its window, enrolled a second host: `host_delete_old` puts
+// Fresh(salt) back, and `SpentOnHostEntry` marks its use.
+//
+// Current code writes one record per salt (ipaKUVoucherSpentRecord) that
+// outlives the host: `host_delete` removes the host entry only. A purge removes
+// a record once the voucher can no longer verify (`expire`, then `purge`), so
+// the directory does not grow without bound.
+//
+// Omitted: the signature and the join's key exchange (kuipa.spthy VoucherSingleUse
+// owns those), the lease, the host group, and concurrent writes to one record
+// (389-ds refuses the second add of the same entry).
+//
+// Run 2026-11-13, Tamarin 1.12.0, Maude 3.5.1, proofs.sh -t 200 (8 GiB), one lemma
+// per process.
+// Verified: join_then_delete, old_code_reuses_salt, purge_after_join
+// (reachability); salt_single_use; purge_only_after_expiry.
+// Falsified, as expected: salt_single_use_host_entry (with the record on the host
+// entry, deleting the host frees the salt).
+theory peer_voucher_spent
+begin
+
+rule issue:
+  [ Fr(~salt) ]
+  --[ Issued(~salt) ]->
+  [ Fresh(~salt), Alive(~salt) ]
+
+// A join needs the voucher inside its window and no record of the salt.
+// The host entry and the spent record are written together.
+rule join:
+  [ Fresh(salt), Alive(salt), Fr(~host) ]
+  --[ Joined(salt, ~host) ]->
+  [ Alive(salt), Host(~host, salt), Record(salt) ]
+
+// Current code: the host goes, the record stays.
+rule host_delete:
+  [ Host(host, salt) ]
+  --[ HostDeleted(host, salt) ]->
+  [ ]
+
+// Previous code: the record was on the host entry, so deleting the host freed
+// the salt.
+rule host_delete_old:
+  [ Host(host, salt), Record(salt) ]
+  --[ HostDeleted(host, salt), SpentOnHostEntry(salt) ]->
+  [ Fresh(salt) ]
+
+// The window closes. An unused voucher lapses with it; a spent one leaves its
+// record waiting to be purged.
+rule expire:
+  [ Alive(salt) ]
+  --[ Expired(salt) ]->
+  [ Closed(salt) ]
+
+rule lapse:
+  [ Closed(salt), Fresh(salt) ]
+  --[ Lapsed(salt) ]->
+  [ ]
+
+rule purge:
+  [ Closed(salt), Record(salt) ]
+  --[ Purged(salt) ]->
+  [ ]
+
+// Reachability: a voucher enrolls a host that is then deleted, and under the
+// previous code the same salt enrolls a second host.
+lemma join_then_delete: exists-trace
+  "Ex salt host #i #j. Joined(salt, host) @i & HostDeleted(host, salt) @j & #i < #j"
+lemma old_code_reuses_salt: exists-trace
+  "Ex salt h1 h2 #i #j. Joined(salt, h1) @i & Joined(salt, h2) @j & #i < #j & not(h1 = h2)"
+lemma purge_after_join: exists-trace
+  "Ex salt host #i #j. Joined(salt, host) @i & Purged(salt) @j & #i < #j"
+
+// A salt enrolls at most one host, whatever happens to the host in between,
+// while the record is on its own entry.
+lemma salt_single_use:
+  "All salt h1 h2 #i #j. Joined(salt, h1) @i & Joined(salt, h2) @j
+     & not(Ex s #k. SpentOnHostEntry(s) @k) ==> #i = #j"
+
+// A record is purged only after the voucher's window closed, so a purge never
+// makes a still-valid voucher usable again.
+lemma purge_only_after_expiry:
+  "All salt #i. Purged(salt) @i ==> Ex #j. Expired(salt) @j & #j < #i"
+
+// With the record on the host entry the same claim fails: deleting the host
+// frees the salt. Expected to be falsified.
+lemma salt_single_use_host_entry:
+  "All salt h1 h2 #i #j. Joined(salt, h1) @i & Joined(salt, h2) @j ==> #i = #j"
+end

@@ -409,8 +409,10 @@ rule unseal:
 //
 // The linear fact Voucher(sig, salt, m, vsk) is both the signature's
 // validity (only issuance under a realm-accepted key creates it) and
-// the directory's spent-salt record (ipaKUVoucherSpent): consumed at
-// the join, a voucher is worth one host.  Quotas and one-more
+// the directory's spent-salt record (ipaKUVoucherSpentRecord, one entry
+// per salt, kept until the voucher expires and not tied to the host
+// entry; peer-voucher-spent.spthy models that independence): consumed
+// at the join, a voucher is worth one host.  Quotas and one-more
 // unforgeability are issuer policy, out of scope.
 // ------------------------------------------------------------------
 
@@ -513,9 +515,9 @@ rule server_voucher_join:
   // unify), the signature verifies under the issuer key the realm
   // accepts (vsk of !VKey, tied to this advertisement's anchor), and
   // m names this request's fqdn (shared variable fqdn).  Consuming
-  // the linear Voucher fact is the ipaKUVoucherSpent write plus the
+  // the linear Voucher fact is the spent-record write plus the
   // host add: the salt is spent and the FQDN exists, so the same
-  // voucher cannot enroll twice.
+  // voucher cannot enroll twice, even if the host is deleted later.
 
 rule server_voucher_join_bearer:
   [ !Adv(srv, ask, avk, ssk, svk, jseed, ek),
@@ -799,7 +801,7 @@ lemma VoucherExec: exists-trace
 
 // A voucher is worth one host: two accepted voucher joins never
 // spent the same salt under the same issuer key -- the directory's
-// ipaKUVoucherSpent record and the host add refuse the second.
+// spent record (which outlives the host entry) refuses the second.
 // Unforgeability is the linear fact: only issuance under a
 // realm-accepted key creates a Voucher.
 lemma VoucherSingleUse:
