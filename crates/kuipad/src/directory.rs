@@ -1757,7 +1757,7 @@ impl Directory for LdapDirectory {
             }))
             .collect::<Vec<_>>(),
         )
-        .inspect_err(|_| self.unspend_voucher(&mut conn, &spent))?;
+        .inspect_err(|_| self.release_if_host_absent(&mut conn, &dn, &spent))?;
         // The voucher names a host group, so a host without it is not the
         // join that was asked for: undo the host entry, and with it the
         // spent salt, so a retry with a corrected group can work.
@@ -1771,10 +1771,14 @@ impl Directory for LdapDirectory {
                 &[(ModOp::Add, "member", vec![dn.as_bytes()])],
             )
         {
-            if let Err(de) = conn.delete_s(&dn) {
-                eprintln!("kuipad: voucher {fqdn}: undo host after group failure: {de}");
+            match conn.delete_s(&dn) {
+                // The host is gone: the voucher enrolled no one, and a retry may work.
+                Ok(()) => self.unspend_voucher(&mut conn, &spent),
+                // The host may remain: keep the record, or the voucher enrolls twice.
+                Err(de) => {
+                    eprintln!("kuipad: voucher {fqdn}: undo host after group failure: {de}");
+                }
             }
-            self.unspend_voucher(&mut conn, &spent);
             return Err(format!("hostgroup {hostgroup}: {e}").into());
         }
         match &lease {
@@ -1929,6 +1933,23 @@ impl LdapDirectory {
             dn_escape(spent),
             self.cfg.basedn
         )
+    }
+
+    /// After a failed host add, release the salt only when the directory says no
+    /// host of ours exists: the add may have committed before the error, and an
+    /// unknown answer keeps the record (the voucher is then spent, not reusable).
+    fn release_if_host_absent(&self, conn: &mut LdapConnection, dn: &str, spent: &str) {
+        let ours = match conn.search(dn, Scope::Base, "(objectClass=*)", &[VOUCHER_SPENT_ATTR]) {
+            Ok(entries) => entries.iter().any(|e| {
+                e.attrs
+                    .get(&VOUCHER_SPENT_ATTR.to_ascii_lowercase())
+                    .is_some_and(|v| v.iter().any(|s| s == spent))
+            }),
+            Err(_) => true,
+        };
+        if !ours {
+            self.unspend_voucher(conn, spent);
+        }
     }
 
     /// Release a salt recorded by a join that then failed, so a retry can work.
