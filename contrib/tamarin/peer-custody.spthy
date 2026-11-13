@@ -4,15 +4,21 @@
 //
 // The daemon runs as an unprivileged user and relays requests; the broker
 // authenticates the caller itself from the Kerberos token the daemon forwards,
-// together with the channel binding that names the request. The network between
-// the caller and the broker, the daemon included, is the attacker.
+// together with the channel binding that names the request. The attacker is the
+// network between the caller and the broker, and a daemon that forges or replays
+// requests. The broker hands the value it fetched to the daemon, which wraps it
+// for the caller (broker_fetch / keys_op), so a daemon that is compromised can
+// read the values of requests that honest hosts make. The model keeps that out
+// of scope: the secret goes back wrapped for the caller (`Out(senc(...))`), the
+// wrapping the daemon adds. What the broker prevents is the daemon asking for
+// values nobody entitled to them asked for.
 //
 // Kerberos is abstracted: a host principal p and the broker's keytab share a key
 // k_p; a token is h(<'ap', p, h(name), nonce, k_p>), which only a holder of k_p
 // can make, and the request's name is inside it (the channel binding). The
 // broker accepts a token for a principal of class 'host' (host/ and service
 // principals of IPA servers); an administrator's ticket, class 'user', is
-// refused. The secret goes back wrapped under a key derived from k_p and the
+// refused. A principal has one class (`one_class`). The secret goes back wrapped under a key derived from k_p and the
 // nonce, standing for the GSS wrap that only the authenticated caller can undo.
 //
 // `replay_cache` is the restriction for gssproxy's replay cache: a nonce is
@@ -26,10 +32,10 @@
 //
 // Run 2026-11-13, Tamarin 1.12.0, Maude 3.5.1, proofs.sh -t 250 (8 GiB), one lemma
 // per process.
-// Verified: fetch_works, user_class_registered, replay_without_cache,
+// Verified: fetch_works, user_request_made, replay_without_cache,
 // secret_with_stolen_key (reachability and the secrecy control);
-// release_matches_request, release_once, user_class_refused,
-// secret_needs_host_key.
+// release_matches_request, release_once, user_request_refused (a user-class
+// principal sends a request; no release follows), secret_needs_host_key.
 // Falsified, as expected: release_once_no_cache (no replay cache),
 // secret_trusting_daemon (the previous broker).
 theory peer_custody
@@ -39,6 +45,9 @@ builtins: symmetric-encryption, hashing
 
 restriction replay_cache:
   "All p n #i #j. Accepted(p, n) @i & Accepted(p, n) @j ==> #i = #j"
+
+restriction one_class:
+  "All p c1 c2 #i #j. Registered(p, c1) @i & Registered(p, c2) @j ==> c1 = c2"
 
 rule register_principal:
   [ Fr(~k) ]
@@ -59,6 +68,13 @@ rule provision:
 rule host_request:
   [ !Key(p, k), !Class(p, 'host'), Fr(~n) ]
   --[ Requested(p, $name, ~n) ]->
+  [ Out(<$name, p, ~n, h(<'ap', p, h($name), ~n, k>)>) ]
+
+// An administrator's ticket: a user-class principal makes the same request the
+// host makes and sends it to the broker.
+rule user_request:
+  [ !Key(p, k), !Class(p, 'user'), Fr(~n) ]
+  --[ UserRequested(p, $name, ~n) ]->
   [ Out(<$name, p, ~n, h(<'ap', p, h($name), ~n, k>)>) ]
 
 rule broker:
@@ -83,8 +99,8 @@ rule broker_trusting_daemon:
 // that request.
 lemma fetch_works: exists-trace
   "Ex p name n #i #j. Requested(p, name, n) @i & Released(p, name, n) @j & #i < #j"
-lemma user_class_registered: exists-trace
-  "Ex p #i. Registered(p, 'user') @i"
+lemma user_request_made: exists-trace
+  "Ex p name n #i. UserRequested(p, name, n) @i"
 lemma replay_without_cache: exists-trace
   "Ex p name n #i #j. Released(p, name, n) @i & Released(p, name, n) @j & not(#i = #j) & NoCache() @i"
 
@@ -111,10 +127,12 @@ lemma secret_needs_host_key:
 lemma secret_with_stolen_key: exists-trace
   "Ex name s p #i #j #k. Provisioned(name, s) @i & Compromised(p) @j & K(s) @k"
 
-// An administrator's ticket (class 'user') is never answered.
-lemma user_class_refused:
-  "All p name n #i. Released(p, name, n) @i & not(Ex #k. Trusting() @k)
-     & not(Ex #k. NoCache() @k) ==> Ex #m. Registered(p, 'host') @m"
+// An administrator's ticket (class 'user') is never answered: a release for a
+// principal that made a user request names a host-class registration, which a
+// principal with a user class cannot have.
+lemma user_request_refused:
+  "All p name n #i #j. UserRequested(p, name, n) @i & Released(p, name, n) @j
+     & not(Ex #k. Trusting() @k) & not(Ex #k. NoCache() @k) ==> F"
 
 // Without the replay cache a token is answered twice. Expected to be falsified.
 lemma release_once_no_cache:
