@@ -79,7 +79,7 @@ kuipa-voucher quota --quota quota.json --limit 500
 
 # provisioner, per instance
 kuipa-voucher request --public voucher.pub.jwk --realm EXAMPLE.TEST \
-    --fqdn web-17.example.test --hostgroup webservers --days 1 --state web-17.state > req
+    --fqdn web-17.example.test --server ipa1.example.test --hostgroup webservers --days 1 --state web-17.state > req
 #   … the issuer runs:  kuipa-voucher sign --key voucher.key --quota quota.json < req > rsp
 kuipa-voucher finish --state web-17.state < rsp > web-17.voucher
 
@@ -300,7 +300,7 @@ to clean up:
 
 ```sh
 kuipa-voucher request --public "$JWK" --realm EXAMPLE.TEST \
-    --fqdn runner-17.example.test --hostgroup ci-runners --lease-hours 4 \
+    --fqdn runner-17.example.test --server ipa1.example.test --hostgroup ci-runners --lease-hours 4 \
     --binding "$BINDING" --state st.json > req
 ```
 

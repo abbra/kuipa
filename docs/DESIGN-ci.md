@@ -24,7 +24,7 @@ seals, §7.6.12). This design adds the two missing pieces:
 The voucher message (DESIGN.md §9) carries a lease:
 
 ```text
-m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
+m = "IPVM" ‖ realm ‖ fqdn ‖ server ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
 ```
 
 `lease` is the host's lifetime in seconds from its join, 0 for none.

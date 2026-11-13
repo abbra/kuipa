@@ -44,7 +44,7 @@ response for *finish*.
 
 # PROVISIONER COMMANDS
 
-## request --public _FILE_ --realm _REALM_ --fqdn _FQDN_ [_flags_]
+## request --public _FILE_ --realm _REALM_ --fqdn _FQDN_ --server _FQDN_ [_flags_]
 
 Blind a voucher for one host; print the request for *sign*.
 
@@ -56,6 +56,12 @@ Blind a voucher for one host; print the request for *sign*.
 
 *--fqdn* _FQDN_
 	The host the voucher admits.
+
+*--server* _FQDN_
+	The IPA server that owns the voucher's single use. Any server
+	can take the join, but it asks this one to record the voucher as
+	spent, so the voucher can be redeemed only while this server is
+	up and a member of the realm.
 
 *--hostgroup* _GROUP_
 	Only hosts of this IPA host group.
@@ -108,7 +114,7 @@ Issue one voucher for one host:
 	# on the host: the ephemeral key and its binding
 	kuipa voucher-key --out eph.key
 	# provisioner: blind the request
-	kuipa-voucher request --public voucher.pub --realm EXAMPLE.TEST --fqdn web1.example.test --binding <BINDING> --state st.json > req
+	kuipa-voucher request --public voucher.pub --realm EXAMPLE.TEST --fqdn web1.example.test --server ipa1.example.test --binding <BINDING> --state st.json > req
 	# issuer: sign it
 	kuipa-voucher sign --key voucher.jwk --quota voucher.quota < req > resp
 	# provisioner: unblind and hand over the voucher

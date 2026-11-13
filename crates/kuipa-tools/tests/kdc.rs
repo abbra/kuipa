@@ -43,7 +43,8 @@ use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
 use tang_pqc::{
-    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, Thumbprint, unix_seconds,
+    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, Thumbprint, VerifyingKey,
+    unix_seconds,
 };
 
 const REALM: &str = "EXAMPLE.TEST";
@@ -97,6 +98,7 @@ fn spawn(listener: std::net::TcpListener, app: Arc<App<Arc<KdcDirectory>>>) {
     std::thread::spawn(move || {
         rt.block_on(async move {
             if let Some(peers) = app.peers.clone() {
+                app.server.set_voucher_spender(peers.voucher_spender());
                 tokio::spawn(peers.run());
             }
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -302,7 +304,12 @@ fn start_ipa_server(
         join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
         escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
         trust: Vec::new(),
-        vouchers: Vec::new(),
+        vouchers: vec![
+            VerifyingKey::from_jwk_json(
+                &std::fs::read(realm.dir.join("voucher-issuer.jwk")).unwrap(),
+            )
+            .unwrap(),
+        ],
         retired: Vec::new(),
     };
     let info = RealmInfo {
@@ -400,6 +407,11 @@ fn start_ipa_servers(
             .unwrap()
             .insert(format!("{host}.example.test"), b"Secret123".to_vec());
     }
+    // The issuer's voucher key, which both servers accept.
+    let public =
+        kuipa_tools::voucher::keygen(&realm.dir.join("voucher-issuer.pem"), SignatureAlg::MlDsa65)
+            .unwrap();
+    std::fs::write(realm.dir.join("voucher-issuer.jwk"), public).unwrap();
     let mut own_anchors = Vec::new();
     let mut ipa = Vec::new();
     for (i, listener) in listeners.into_iter().enumerate() {
@@ -1997,6 +2009,137 @@ fn refused_syncs(world: &Scenario) {
     );
 }
 
+/// A voucher for `claims`, blinded, signed under the realm's issuer key and
+/// unblinded.
+fn issue_voucher(
+    dir: &Path,
+    quota: &Path,
+    public: &[u8],
+    claims: &kuipa_enroll::voucher::Claims,
+    name: &str,
+) -> native_ossl::util::SecretBuf {
+    let state = dir.join(format!("{name}.state"));
+    let request = kuipa_tools::voucher::request(public, claims, &state).unwrap();
+    let signed =
+        kuipa_tools::voucher::sign(&dir.join("voucher-issuer.pem"), quota, &request).unwrap();
+    kuipa_tools::voucher::finish(&state, &signed)
+        .unwrap()
+        .encode()
+}
+
+/// A voucher is spent on the server it names, through the real peer route: a
+/// join the other server takes asks the home server, whose directory then
+/// holds the record, and a spend that does not authenticate its sender is
+/// refused.
+fn voucher_across_servers(world: &Scenario) {
+    let (realm, dir) = (&world.realm, &world.realm.dir);
+    let host = "vweb1.example.test";
+    let public = std::fs::read(dir.join("voucher-issuer.jwk")).unwrap();
+    let quota = dir.join("voucher-quota.json");
+    kuipa_tools::voucher::set_quota(&quota, 3).unwrap();
+    let claims = kuipa_enroll::voucher::Claims {
+        realm: REALM.into(),
+        fqdn: host.into(),
+        server: SERVER.into(),
+        hostgroup: String::new(),
+        not_before: now() - 60,
+        not_after: now() + 3600,
+        lease: 0,
+        binding: Vec::new(),
+    };
+    let encoded = issue_voucher(dir, &quota, &public, &claims, "vweb1");
+    let enroll = |name: &str, server: &str, anchor: Thumbprint| {
+        flows::enroll_online(
+            &root(realm, name),
+            REALM,
+            &[anchor],
+            &[],
+            &[],
+            flows::Host {
+                fqdn: host,
+                auth: &Auth::Voucher {
+                    voucher: Secret::new(encoded.as_ref()),
+                    ephemeral: None,
+                },
+            },
+            &Deployment::servers(&[server.to_owned()]),
+        )
+    };
+
+    // Taken by ipa2: ipa1 records the salt for ipa2's join.
+    enroll("vweb1", SERVER2, world.own_anchors[1]).unwrap();
+    assert!(realm.has(&format!("host/{host}@{REALM}")));
+    assert_eq!(
+        world
+            .directory
+            .spent
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [(host.to_owned(), SERVER2.to_owned())]
+    );
+    // Used up where it is local, too.
+    assert!(enroll("vweb1-again", SERVER, world.own_anchors[0]).is_err());
+
+    // A spend whose token is another server's, or no token, is refused: for a
+    // fresh voucher, so that only the token can be the reason.
+    let (other_host, other_claims) = (
+        "vweb2.example.test",
+        kuipa_enroll::voucher::Claims {
+            fqdn: "vweb2.example.test".into(),
+            ..claims.clone()
+        },
+    );
+    let fresh = issue_voucher(dir, &quota, &public, &other_claims, "vweb2");
+    let post = |sender: &str, token: Vec<u8>| {
+        let body = kuipa_enroll::spend::SpendRequest {
+            op: kuipa_enroll::spend::SpendOp::Spend,
+            sender: sender.into(),
+            receiver: SERVER.into(),
+            fqdn: other_host.into(),
+            voucher: fresh.as_ref().to_vec(),
+            token,
+        };
+        reqwest::blocking::Client::new()
+            .post(format!("{}/ipa/ku/peer/spend", world.urls[0]))
+            .body(body.to_bytes())
+            .send()
+            .unwrap()
+            .status()
+    };
+    let cb = kuipa_enroll::spend::SpendRequest::channel_binding(
+        kuipa_enroll::spend::SpendOp::Spend,
+        SERVER2,
+        SERVER,
+        other_host,
+        fresh.as_ref(),
+    )
+    .unwrap();
+    let first_key = KeytabInitiator::new(
+        realm
+            .dir
+            .join(format!("kuipa-{SERVER}.keytab"))
+            .display()
+            .to_string(),
+        format!("ipa-ku/{SERVER}@{REALM}"),
+    );
+    assert_eq!(
+        post(SERVER2, first_key.token(SERVER, &cb).unwrap()),
+        403,
+        "a token from another server's key"
+    );
+    assert_eq!(
+        post(SERVER2, b"not a token".to_vec()),
+        403,
+        "no valid token"
+    );
+    // The voucher was valid and unspent, so only the token was refused: nothing
+    // was recorded.
+    assert_eq!(world.directory.spent.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn against_a_real_kdc() {
     let Some(realm) = Realm::start(REALM, "kdc") else {
@@ -2078,6 +2221,7 @@ fn against_a_real_kdc() {
     collection_through_kuipa(&world, &conf_path);
     offline_enrollment(&world);
     realm_wide_strings(&world);
+    voucher_across_servers(&world);
     refused_syncs(&world);
     adopt_authenticates(&world);
 }

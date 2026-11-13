@@ -12,7 +12,9 @@ use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_inp
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::realm::TrustedRealm;
 use kuipa_enroll::seal::{Approval, ReleaseRequest, Seal};
-use kuipa_enroll::server::{Accepted, Directory, DirectoryError, Staged};
+use kuipa_enroll::server::{
+    Accepted, Directory, DirectoryError, Staged, VoucherJoinError, VoucherRefused,
+};
 use kuipa_gssapi::{AcceptStep, GssServerCred};
 
 use super::kdc::Realm;
@@ -29,7 +31,9 @@ pub struct KdcDirectory {
     pub staged: Mutex<HashSet<String>>,
     pub servers: Vec<String>,
     /// Spent voucher salts.
-    pub spent: Mutex<HashSet<[u8; 32]>>,
+    pub spent: Mutex<HashMap<[u8; 32], (String, String)>>,
+    /// Salts that made a host on this directory (the marker on the host entry).
+    pub made: Mutex<HashSet<[u8; 32]>>,
     /// When each leased host's lease ends (`DESIGN-ci.md` §1), by FQDN.
     pub leases: Mutex<HashMap<String, u64>>,
     /// Host groups and their members, as voucher joins add them.
@@ -98,7 +102,8 @@ impl KdcDirectory {
             escrow_files: Mutex::new(HashMap::new()),
             staged: Mutex::new(HashSet::new()),
             servers: servers.iter().map(|s| (*s).to_owned()).collect(),
-            spent: Mutex::new(HashSet::new()),
+            spent: Mutex::new(HashMap::new()),
+            made: Mutex::new(HashSet::new()),
             leases: Mutex::new(HashMap::new()),
             hostgroups: Mutex::new(HashMap::new()),
             invitations: Mutex::new(HashMap::new()),
@@ -205,20 +210,54 @@ impl Directory for KdcDirectory {
         self.keys(fqdn)
     }
 
+    fn spend_voucher(
+        &self,
+        salt: &[u8; 32],
+        fqdn: &str,
+        redeemer: &str,
+        _not_after: u64,
+    ) -> Result<(), DirectoryError> {
+        let mut spent = self.spent.lock().unwrap();
+        match spent.get(salt) {
+            None => {
+                spent.insert(*salt, (fqdn.to_owned(), redeemer.to_owned()));
+                Ok(())
+            }
+            // Spent for any join, this one included.
+            Some(_) => Err(VoucherRefused("spent voucher").into()),
+        }
+    }
+
+    fn release_voucher(
+        &self,
+        salt: &[u8; 32],
+        fqdn: &str,
+        redeemer: &str,
+    ) -> Result<(), DirectoryError> {
+        let mut spent = self.spent.lock().unwrap();
+        match spent.get(salt) {
+            Some((f, r)) if f == fqdn && r == redeemer => {
+                spent.remove(salt);
+                Ok(())
+            }
+            _ => Err(VoucherRefused("the spent record is not this join's").into()),
+        }
+    }
+
     fn join_with_voucher(
         &self,
         fqdn: &str,
         hostgroup: &str,
         salt: &[u8; 32],
-        _not_after: u64,
         _: &[Enctype],
         lease: Option<u64>,
-    ) -> Result<Keytab, DirectoryError> {
+    ) -> Result<Keytab, VoucherJoinError> {
         if self.realm.has(&format!("host/{fqdn}@{}", self.realm.name)) {
-            return Err("the host exists".into());
-        }
-        if !self.spent.lock().unwrap().insert(*salt) {
-            return Err("spent voucher".into());
+            // A host this salt made is no reason to release its record.
+            return Err(VoucherJoinError {
+                error: "the host exists".into(),
+                host_absent: !self.made.lock().unwrap().contains(salt),
+            });
         }
         if !hostgroup.is_empty() {
             self.hostgroups
@@ -228,7 +267,10 @@ impl Directory for KdcDirectory {
                 .or_default()
                 .push(fqdn.to_owned());
         }
-        let keytab = self.keys(fqdn)?;
+        let keytab = self.keys(fqdn).map_err(|error| VoucherJoinError {
+            error,
+            host_absent: false,
+        })?;
         if let Some(end) = lease {
             // As krbPrincipalExpiration does: no ticket after the lease.
             self.realm.kadmin(&[
@@ -239,6 +281,8 @@ impl Directory for KdcDirectory {
             ]);
             self.leases.lock().unwrap().insert(fqdn.to_owned(), end);
         }
+        // The host marker of the real directory: this salt made a host here.
+        self.made.lock().unwrap().insert(*salt);
         Ok(keytab)
     }
 

@@ -38,6 +38,7 @@ pub mod seal;
 pub mod server;
 pub mod shards;
 pub mod sign;
+pub mod spend;
 pub mod tlog;
 #[cfg(feature = "tls")]
 pub mod tls;

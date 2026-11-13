@@ -3,20 +3,22 @@
 //! provisioner blinds a voucher for a host, the issuer signs it without
 //! seeing it, and the provisioner unblinds it; the host enrolls with it.
 //! A voucher creates one host only, a bound voucher works only with its
-//! ephemeral key, and the quota counts every signature.
+//! ephemeral key, the quota counts every signature, and a voucher is spent on
+//! the server it names whichever server takes the join.
 //!
-//! One test function: `KUIPA_ENDPOINTS` is set once, before any thread
-//! exists.
+//! One test function: the servers are reached through thread endpoints.
 
 mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
+use kuipa_enroll::spend::{SpendError, SpendOp, SpendRequest, VoucherSpender};
 use kuipa_enroll::voucher::{Claims, Voucher};
 use kuipa_enroll::{Directory as _, EnrollServer};
 use kuipa_tools::flows::{self, Auth};
@@ -40,6 +42,7 @@ fn claims(fqdn: &str, binding: Vec<u8>) -> Claims {
     Claims {
         realm: REALM.into(),
         fqdn: fqdn.into(),
+        server: SERVER.into(),
         hostgroup: "webservers".into(),
         not_before: now() - 60,
         not_after: now() + 3600,
@@ -87,6 +90,7 @@ impl Issuer {
 /// The IPA server under test: its anchor, its enrollment string, and the
 /// directory it writes to.
 struct Ipa {
+    name: String,
     dir: PathBuf,
     anchor: SigningKey,
     server: Arc<EnrollServer>,
@@ -97,12 +101,17 @@ struct Ipa {
 impl Ipa {
     /// Start the server on a local port, accepting vouchers under `public`.
     fn start(realm: &Arc<Realm>, public: &str) -> Self {
+        Self::start_named(realm, public, SERVER)
+    }
+
+    /// The same, as the IPA server `name`.
+    fn start_named(realm: &Arc<Realm>, public: &str, name: &str) -> Self {
         let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         let delegation = Delegation::issue(
             &anchor,
             REALM,
-            SERVER,
+            name,
             signing.public(),
             now() - 60,
             now() + 86400,
@@ -112,8 +121,8 @@ impl Ipa {
             realm: REALM.into(),
             domain: "voucher.test".into(),
             basedn: "dc=voucher,dc=test".into(),
-            server: SERVER.into(),
-            servers: vec![SERVER.into()],
+            server: name.into(),
+            servers: vec![name.into()],
             ca_certs: vec![realm.chain.ca_der.clone()],
             pkinit_anchors: vec![realm.chain.ca_der.clone()],
             anchors: vec![*anchor.public().thumbprint()],
@@ -130,14 +139,10 @@ impl Ipa {
             retired: Vec::new(),
         };
         let server = Arc::new(EnrollServer::new(keys, info, delegation));
-        let directory = Arc::new(KdcDirectory::new(realm.clone(), &[SERVER], &[]));
+        let directory = Arc::new(KdcDirectory::new(realm.clone(), &[name], &[]));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        // SAFETY: the only test in this binary, before any thread starts.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("KUIPA_ENDPOINTS", format!("{SERVER}={url}"));
-        }
+        kuipa_tools::net::set_thread_endpoint(name, &url);
         let app = Arc::new(App {
             server: server.clone(),
             directory: directory.clone(),
@@ -162,6 +167,7 @@ impl Ipa {
             None,
         );
         Self {
+            name: name.to_owned(),
             dir: realm.dir.clone(),
             anchor,
             server,
@@ -193,7 +199,7 @@ impl Ipa {
                 fqdn: host,
                 auth: &auth,
             },
-            &Deployment::servers(&[SERVER.into()]),
+            &Deployment::servers(std::slice::from_ref(&self.name)),
         )
     }
 
@@ -329,6 +335,124 @@ fn quota_is_used_up(issuer: &Issuer) {
     assert!(err.to_string().contains("quota exhausted"), "{err}");
 }
 
+/// A spender that reaches the voucher's home server in this process, as
+/// kuipad does over HTTPS, unless `up` is cleared.
+struct HomeSpender {
+    home: Arc<EnrollServer>,
+    directory: Arc<KdcDirectory>,
+    me: String,
+    up: AtomicBool,
+    /// What the redeemer asked, in order.
+    ops: std::sync::Mutex<Vec<(SpendOp, String)>>,
+}
+
+impl std::fmt::Debug for HomeSpender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HomeSpender")
+    }
+}
+
+impl HomeSpender {
+    fn call(&self, op: SpendOp, fqdn: &str, voucher: &[u8]) -> Result<(), SpendError> {
+        if !self.up.load(Ordering::SeqCst) {
+            return Err(SpendError::Unavailable("connection refused".into()));
+        }
+        self.ops.lock().unwrap().push((op, fqdn.to_owned()));
+        let request = SpendRequest {
+            op,
+            sender: self.me.clone(),
+            receiver: SERVER.into(),
+            fqdn: fqdn.into(),
+            voucher: voucher.to_vec(),
+            token: Vec::new(),
+        };
+        self.home
+            .spend_for_peer(&request, &self.me, &*self.directory)
+            .map_err(|r| SpendError::Refused(r.to_string().into()))
+    }
+}
+
+impl VoucherSpender for HomeSpender {
+    fn spend(&self, _: &str, fqdn: &str, voucher: &[u8]) -> Result<(), SpendError> {
+        self.call(SpendOp::Spend, fqdn, voucher)
+    }
+
+    fn release(&self, _: &str, fqdn: &str, voucher: &[u8]) -> Result<(), SpendError> {
+        self.call(SpendOp::Release, fqdn, voucher)
+    }
+}
+
+/// A voucher's salt is spent on the server it names, whichever server takes
+/// the join, and only there: the other server writes no record and cannot
+/// accept the voucher by itself, so two servers cannot each take it before
+/// their directories replicate.
+fn voucher_is_spent_on_its_home_server(realm: &Arc<Realm>) {
+    const OTHER: &str = "ipa2.voucher.test";
+    let dir = realm.dir.join("home-server");
+    std::fs::create_dir_all(&dir).unwrap();
+    let issuer = Issuer::new(&dir);
+    let home = Ipa::start_named(realm, &issuer.public, SERVER);
+    let other = Ipa::start_named(realm, &issuer.public, OTHER);
+    let spender = Arc::new(HomeSpender {
+        home: home.server.clone(),
+        directory: home.directory.clone(),
+        me: OTHER.into(),
+        up: AtomicBool::new(true),
+        ops: std::sync::Mutex::new(Vec::new()),
+    });
+    other.server.set_voucher_spender(spender.clone());
+    let records = |ipa: &Ipa| ipa.directory.spent.lock().unwrap().clone();
+
+    // Taken by the other server: the record is on the home server's directory.
+    let web5 = issuer.issue(&claims("web5.voucher.test", Vec::new()), "web5");
+    other.enroll("web5.voucher.test", &web5, None).unwrap();
+    assert!(realm.has(&format!("host/web5.voucher.test@{REALM}")));
+    assert!(records(&other).is_empty(), "the redeemer writes no record");
+    assert_eq!(
+        records(&home).into_values().collect::<Vec<_>>(),
+        [("web5.voucher.test".to_owned(), OTHER.to_owned())]
+    );
+    // Used up at either server.
+    assert!(home.enroll("web5.voucher.test", &web5, None).is_err());
+    assert!(other.enroll("web5.voucher.test", &web5, None).is_err());
+
+    // The home server cannot be asked: the join fails, nothing is recorded, and
+    // it works when the home server is back.
+    let web6 = issuer.issue(&claims("web6.voucher.test", Vec::new()), "web6");
+    spender.up.store(false, Ordering::SeqCst);
+    assert!(other.enroll("web6.voucher.test", &web6, None).is_err());
+    assert!(!realm.has(&format!("host/web6.voucher.test@{REALM}")));
+    assert_eq!(records(&home).len(), 1);
+    spender.up.store(true, Ordering::SeqCst);
+    other.enroll("web6.voucher.test", &web6, None).unwrap();
+    assert_eq!(records(&home).len(), 2);
+
+    // A join that fails with no host made releases the record on the home
+    // server: web1 exists already.
+    let web1 = issuer.issue(&claims("web1.voucher.test", Vec::new()), "web1");
+    let before = spender.ops.lock().unwrap().len();
+    assert!(other.enroll("web1.voucher.test", &web1, None).is_err());
+    assert_eq!(
+        spender.ops.lock().unwrap()[before..],
+        [
+            (SpendOp::Spend, "web1.voucher.test".to_owned()),
+            (SpendOp::Release, "web1.voucher.test".to_owned())
+        ],
+        "spent, then released: nothing was made"
+    );
+    assert_eq!(records(&home).len(), 2, "the record was released");
+
+    // A voucher for a server that is not the one asked is not spent for it.
+    let elsewhere = Claims {
+        server: "ipa3.voucher.test".into(),
+        ..claims("web7.voucher.test", Vec::new())
+    };
+    let web7 = issuer.issue(&elsewhere, "web7");
+    assert!(other.enroll("web7.voucher.test", &web7, None).is_err());
+    assert!(!realm.has(&format!("host/web7.voucher.test@{REALM}")));
+    assert_eq!(records(&home).len(), 2);
+}
+
 #[test]
 fn vouchers_against_a_real_kdc() {
     let Some(realm) = Realm::start(REALM, "voucher") else {
@@ -342,5 +466,6 @@ fn vouchers_against_a_real_kdc() {
     bound_voucher_needs_its_ephemeral_key(&realm, &ipa, &issuer);
     voucher_under_unknown_key_is_refused(&ipa, &issuer);
     leased_voucher_creates_a_host_that_ends(&realm, &ipa, &issuer);
+    voucher_is_spent_on_its_home_server(&realm);
     quota_is_used_up(&issuer);
 }

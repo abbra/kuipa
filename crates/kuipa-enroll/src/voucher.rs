@@ -4,8 +4,13 @@
 //! publishes, on
 //!
 //! ```text
-//! m = "IPVM" ‖ realm ‖ fqdn ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
+//! m = "IPVM" ‖ realm ‖ fqdn ‖ server ‖ hostgroup ‖ not_before ‖ not_after ‖ lease ‖ binding
 //! ```
+//!
+//! `server` is the IPA server that owns the voucher's single use: it alone writes
+//! the spent record. Another server that receives the join asks it to spend the
+//! salt first, so two servers cannot each accept the same voucher before their
+//! directories replicate (`DESIGN.md` §9).
 //!
 //! `lease` (`DESIGN-ci.md` §1) is how long the host the voucher creates
 //! lives from its join, in seconds, 0 for no lease; the realm caps it
@@ -71,6 +76,8 @@ pub struct Claims {
     pub realm: String,
     /// The host to create.
     pub fqdn: String,
+    /// The IPA server that spends the voucher's salt.
+    pub server: String,
     /// The host group to add it to; empty for none.
     pub hostgroup: String,
     /// Unix seconds.
@@ -95,6 +102,7 @@ impl Claims {
     fn put(&self, w: &mut Writer) {
         w.str(&self.realm)
             .str(&self.fqdn)
+            .str(&self.server)
             .str(&self.hostgroup)
             .u64(self.not_before)
             .u64(self.not_after)
@@ -106,6 +114,7 @@ impl Claims {
         Ok(Self {
             realm: r.str()?.to_owned(),
             fqdn: r.str()?.to_owned(),
+            server: r.str()?.to_owned(),
             hostgroup: r.str()?.to_owned(),
             not_before: r.u64()?,
             not_after: r.u64()?,
@@ -254,12 +263,41 @@ impl Voucher {
         ephemeral: &[u8],
         now: u64,
     ) -> Result<&Claims> {
+        self.check(key, realm, fqdn, Some(ephemeral), now)
+    }
+
+    /// [`verify`](Self::verify) without the ephemeral key, which only the
+    /// server that took the join has: the server that spends the salt for
+    /// another one checks the rest.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify`](Self::verify), for everything but the binding.
+    pub fn verify_for_spend(
+        &self,
+        key: &VerifyingKey,
+        realm: &str,
+        fqdn: &str,
+        now: u64,
+    ) -> Result<&Claims> {
+        self.check(key, realm, fqdn, None, now)
+    }
+
+    fn check(
+        &self,
+        key: &VerifyingKey,
+        realm: &str,
+        fqdn: &str,
+        ephemeral: Option<&[u8]>,
+        now: u64,
+    ) -> Result<&Claims> {
         let c = &self.claims;
         let signed = [&self.salt[..], &c.message()].concat();
         if key.thumbprint() != &self.key
             || c.realm != realm
             || !c.fqdn.eq_ignore_ascii_case(fqdn)
-            || (c.is_bound() && c.binding != ephemeral)
+            || c.server.is_empty()
+            || ephemeral.is_some_and(|e| c.is_bound() && c.binding != e)
             || now < c.not_before
             || now > c.not_after
             || key
@@ -300,6 +338,7 @@ mod tests {
         Claims {
             realm: "EXAMPLE.TEST".into(),
             fqdn: "web1.example.test".into(),
+            server: "ipa1.example.test".into(),
             hostgroup: "webservers".into(),
             not_before: 100,
             not_after: 200,
@@ -412,6 +451,42 @@ mod tests {
                 .verify(k, "EXAMPLE.TEST", "web1.example.test", &ek, 150)
                 .is_err(),
             "the lease is signed"
+        );
+    }
+
+    #[test]
+    fn the_home_server_checks_all_but_the_binding() {
+        let key = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let k = key.public();
+        let ek = binding(&ek_of(KemAlg::MlKem768)).unwrap();
+        let bound = voucher(&key, claims(ek.clone()));
+        assert!(
+            bound
+                .verify_for_spend(k, "EXAMPLE.TEST", "web1.example.test", 150)
+                .is_ok()
+        );
+        assert!(
+            bound
+                .verify_for_spend(k, "EXAMPLE.TEST", "web2.example.test", 150)
+                .is_err()
+        );
+        // A voucher that names no server is refused.
+        let unowned = voucher(
+            &key,
+            Claims {
+                server: String::new(),
+                ..claims(Vec::new())
+            },
+        );
+        assert!(
+            unowned
+                .verify(k, "EXAMPLE.TEST", "web1.example.test", &ek, 150)
+                .is_err()
+        );
+        assert!(
+            unowned
+                .verify_for_spend(k, "EXAMPLE.TEST", "web1.example.test", 150)
+                .is_err()
         );
     }
 }

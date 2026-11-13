@@ -117,6 +117,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/keys/{kid}", post(keys::<D>))
         .route("/ipa/ku/rec/{kid}", post(recover::<D>))
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
+        .route("/ipa/ku/peer/spend", post(peer_spend::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
         .route("/ipa/ku/tlog/{id}", post(tlog::<D>))
@@ -581,10 +582,13 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
         app.server
             .handle(&request, &app.directory)
             .map(|r| r.to_bytes())
-            .map_err(|e| e.to_string())
+            .map_err(|e| (e.is_unavailable(), e.to_string()))
     })
     .await;
-    if guessable && !matches!(result, Ok(Ok(_))) {
+    // A voucher's home server that could not be asked is not the client's
+    // fault: no charge, and a `503` that tells it to retry.
+    let unavailable = matches!(result, Ok(Err((true, _))));
+    if guessable && !unavailable && !matches!(result, Ok(Ok(_))) {
         limiter_app.limiter.charge_host(&fqdn);
     }
     match result {
@@ -592,7 +596,11 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
             eprintln!("kuipad: {what}: ok");
             binary(body, "application/vnd.ipa-ku.join-rsp")
         }
-        Ok(Err(reason)) => refused(&what, &reason),
+        Ok(Err((true, reason))) => {
+            eprintln!("kuipad: {what}: {reason}");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Ok(Err((false, reason))) => refused(&what, &reason),
         Err(e) => refused(&what, &e),
     }
 }
@@ -760,6 +768,40 @@ async fn establish_trust<D: Directory + Send + Sync + 'static>(
         }
         Ok(Err(reason)) => refused(&what, &reason),
         Err(e) => refused(&what, &e),
+    }
+}
+
+/// `POST /ipa/ku/peer/spend`: another server asks this one, the home of a
+/// voucher, to spend or release its salt (§9).
+async fn peer_spend<D: Directory + Send + Sync + 'static>(
+    State(app): State<Arc<App<D>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let source =
+        limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
+    if app.limiter.check_source(source.as_deref()).is_err() {
+        eprintln!("kuipad: peer spend: rate limited");
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let Some(peers) = &app.peers else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match peers.handle_spend(&body).await {
+        Ok(()) => {
+            eprintln!("kuipad: peer spend: ok");
+            StatusCode::OK.into_response()
+        }
+        // The home server's directory failed, or the salt may be recorded and the
+        // answer lost: the redeemer may try again.
+        Err(e)
+            if e.downcast_ref::<kuipa_enroll::server::Refusal>()
+                .is_some_and(kuipa_enroll::server::Refusal::is_unavailable) =>
+        {
+            eprintln!("kuipad: peer spend: {e}");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(e) => refused("peer spend", &e),
     }
 }
 

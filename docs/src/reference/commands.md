@@ -93,7 +93,7 @@ git config user.signingkey kuipa     # any value: the ticket decides
 | `keygen --key F [--alg ml-dsa-65]` | issuer | make the voucher key; print its public JWK for `kuipad add-voucher-key` |
 | `quota --quota F --limit N` | issuer | set how many vouchers may ever be signed |
 | `sign --key F --quota F` | issuer | count, then sign the blinded request on standard input |
-| `request --public JWK --realm R --fqdn H [--hostgroup G] [--days N] [--binding B] --state F` | provisioner | blind a voucher for one host |
+| `request --public JWK --realm R --fqdn H --server S [--hostgroup G] [--days N] [--binding B] --state F` | provisioner | blind a voucher for one host |
 | `finish --state F` | provisioner | unblind the issuer's answer; print the voucher |
 | `show` | anyone | print a voucher's claims |
 
