@@ -1,0 +1,38 @@
+# FreeIPA master + replica + two clients on qemu VMs (Fedora 45), IPA from the
+# abbra/pqc COPR with the kuipa that COPR carries.  `freeipa-env up` stops
+# there; .github/workflows/freeipa.yml then upgrades kuipa on every VM to the
+# build of the commit (upgrade-kuipa.sh) before `freeipa-env run`, which is
+# also a test of the package upgrade.  ci-freeipa's env/freeipa-env:
+# `freeipa-env up|run|down FILE --workdir DIR`.
+#
+# - copr: abbra/pqc is enabled first, so `ipa-distro` pulls FreeIPA (and kuipa,
+#   ahdapa and akamu) from it.
+# - ipacta is the CA instead of Dogtag: no JVM, so the servers need little RAM.
+# - the clients are what the tests ask for: test_kuipa_enrollment needs two.
+name: kuipa-ipa
+domain: ipa.test
+provider: nested
+inner: external
+hosts:
+  - {role: master, name: master1}
+  - {role: replica, name: replica1}
+  - {role: client, name: client1}
+  - {role: client, name: client2}
+resources:
+  master: {memory: 2500m, memory-swap: 5000m}
+  replica: {memory: 2500m, memory-swap: 5000m}
+  client: {memory: 1536m, memory-swap: 3000m}
+run:
+  mode: integration
+  tests:
+    - test_integration/test_kuipa_enrollment.py
+    - test_integration/test_kuipa_seal_admin.py
+    - test_integration/test_kuipa_server_enrollment.py
+vm:
+  backend: qemu
+  image: containerdisk:ghcr.io/freeipa/ci-freeipa-vm-images/fedora-45:latest
+  cpus: 4
+  disk: 40G
+  selinux: enforcing
+  copr: [abbra/pqc]
+  guest_packages: [ipa-distro, ipacta]
