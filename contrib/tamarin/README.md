@@ -18,7 +18,7 @@ file.
 
 ## What is here
 
-Twenty-eight Tamarin theories and seven Z3 models. Each theory header says what it
+Twenty-nine Tamarin theories and seven Z3 models. Each theory header says what it
 assumes and what it leaves out, and lists its own proved, open, and refuted
 results.
 
@@ -72,7 +72,8 @@ results.
 | File | What it models |
 |---|---|
 | `peer-epoch.spthy` | the first entry of the anchor epoch log on two servers, and the gate that keeps them from forking it |
-| `peer-voucher-spent.spthy` | the spent-voucher record, and what deleting a host does to it |
+| `peer-voucher-spent.spthy` | the spent-voucher record, what deleting a host does to it, and what a failed join does to it |
+| `peer-voucher-spent-previous.spthy` | the previous voucher behaviour, as controls |
 | `peer-custody.spthy` | the custody broker authenticating its callers, the replay cache, and the secrecy of custody secrets |
 
 ### Z3 models, for the arithmetic Tamarin cannot express
@@ -878,7 +879,8 @@ table above predates them and does not count them.
 | Theory | proved | refuted | what the refuted lemmas are |
 |---|---|---|---|
 | `peer-epoch.spthy` | 4 | 2 | the gate with early delivery of a peer's claim; the gate with a replica installed before the master minted |
-| `peer-voucher-spent.spthy` | 5 | 1 | the record kept on the host entry |
+| `peer-voucher-spent.spthy` | 7 | 0 | none |
+| `peer-voucher-spent-previous.spthy` | 2 | 2 | the record kept on the host entry; the salt released after any failed join |
 | `peer-custody.spthy` | 8 | 2 | no replay cache; the previous broker that trusted the daemon |
 
 The refuted lemmas are controls, like the `Attack_*` ones: each drops one
@@ -893,24 +895,34 @@ entries agree, but only with two assumptions the model makes and the code does n
 enforce: a sync that teaches a server a peer's anchor also carries that peer's
 log, and a replica is installed after the master minted. The two falsified lemmas
 are the traces without them. The Rust change does not close those races; it makes
-them narrow.
+them narrow. Nothing enforces either assumption.
 
 **`peer-voucher-spent.spthy`.** Isolates the spent-salt record. With the record on
 the host entry, deleting the host frees the salt and a voucher inside its window
-enrols a second host. With one record per salt, deleting the host removes the host
-only, and a record is purged only after the voucher's window closed
-(`purge_only_after_expiry`). The signature and key exchange stay in `kuipa.spthy`.
-It does not cover concurrent writes to one record, and the directory side was not
-run against a real 389-ds.
+enrols a second host; with one record per salt it does not. A failed join keeps the
+record unless the host is certainly gone: a rollback that deleted the host
+releases the salt, a lost reply from the host add or a failed delete keeps it.
+`second_host_needs_rollback` proves that a second host is created for a salt only
+after the first was rolled back, and `salt_single_use` that a salt completes one
+join. `peer-voucher-spent-previous.spthy` has the previous rules, where both claims
+fail. The signature and key exchange stay in `kuipa.spthy`. The model has one
+directory: two replicas that take the same salt before the record replicates can
+both succeed, and nothing here, nor in the code, stops a holder who submits one
+voucher to two servers at once. The directory side was not run against a real
+389-ds.
 
-**`peer-custody.spthy`.** The attacker is the network and the daemon. A token is
-bound to the name asked for and to a key only the host holds; the broker accepts
-host-class principals only and a nonce once. Proved: a release names a request the
-principal made, for that name; each request is answered once; an administrator's
-ticket is never answered; a custody secret is known only if a host-class key was
-stolen. Kerberos, GSS wrap and handler policy are abstracted: the model says
-nothing about how gssproxy implements the replay cache or about the socket's
-permissions.
+**`peer-custody.spthy`.** The attacker is the network and a daemon that forges or
+replays requests. A token is bound to the name asked for and to a key only the host
+holds; the broker accepts host-class principals only, a principal has one class, and
+a nonce is accepted once. Proved: a release names a request the principal made, for
+that name; each request is answered once; a user-class principal's request, the
+administrator's ticket, is never answered; a custody secret is known only if a
+host-class key was stolen. What the model does not show: the broker returns the
+value to the daemon, which wraps it for the caller, so a compromised daemon can read
+the values of requests that honest hosts make. The proof covers requests nobody
+entitled to the value made. Kerberos, GSS wrap and handler policy are abstracted,
+and the model says nothing about how gssproxy implements the replay cache or about
+the socket's permissions.
 
 ## What is still open
 
