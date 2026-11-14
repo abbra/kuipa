@@ -188,8 +188,8 @@ replica and two clients. FreeIPA and kuipa come from `abbra/pqc` and the CA is
 and `contrib/ci/freeipa/upgrade-kuipa.sh` upgrades kuipa on every VM, which
 tests the package upgrade; then it runs the `test_kuipa_*` tests of
 `python3-ipatests`. The topology, packages and tests are in
-`contrib/ci/freeipa/kuipa-ipa.yaml`; the ci-freeipa version is pinned in the
-workflow. It needs `/dev/kvm`, podman and qemu, which the GitHub runner has. On
+`contrib/ci/freeipa/kuipa-ipa.yaml`; the workflow uses the main
+branch of ci-freeipa. It needs `/dev/kvm`, podman and qemu, which the GitHub runner has. On
 a workstation with those, run `freeipa-env up` on the preset, then
 `upgrade-kuipa.sh WORKDIR RPMDIR`, then `freeipa-env run` and `down`.
 

@@ -24,10 +24,9 @@ permissions:
   contents: read
 
 env:
-  # ci-freeipa is pinned: a newer tool is a deliberate change of this line.
-  # This commit adds the multicast probe fix that four VMs need.
+  # ci-freeipa follows its main branch.
   CI_FREEIPA_REPO: https://github.com/freeipa/ci-freeipa
-  CI_FREEIPA_REF: 6b325c372050f9bdc193dcf208cfe25831cc3be2
+  CI_FREEIPA_REF: main
   PRESET: contrib/ci/freeipa/kuipa-ipa.yaml
 
 jobs:
@@ -146,6 +145,13 @@ jobs:
           "$cli" show "$PRESET" --workdir "$WORK/env" >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
           "$cli" summary "$PRESET" --workdir "$WORK/env" >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
           "$cli" down "$PRESET" --workdir "$WORK/env" || true
+          # the full report, after `down` has collected the logs; a step
+          # summary is capped at 1 MiB, so the whole file stays in the artifact
+          "$cli" report "$PRESET" --workdir "$WORK/env" --format md || true
+          md="$WORK/env/logs/results.md"
+          if [ -f "$md" ]; then
+              head -c 900000 "$md" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Keep the test logs
         if: always()
