@@ -236,8 +236,7 @@ impl Bundle {
                 primitives::seal(key.as_ref(), payload.as_ref())?.into()
             }
             Recipient::Secret => {
-                let mut s = SecretBuf::with_len(32);
-                Rand::fill_private(s.as_mut_slice())?;
+                let s = tang_pqc::primitives::random_secret(32)?;
                 let key = bundle.key(s.as_ref(), "bundle-secret")?;
                 secret = Some(Secret::new(tang_pqc::b64::encode(s.as_ref()).as_bytes()));
                 primitives::seal(key.as_ref(), payload.as_ref())?.into()

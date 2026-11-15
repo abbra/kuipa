@@ -223,9 +223,7 @@ impl Request {
         let realm = r.str()?.to_owned();
         let fqdn = r.str()?.to_owned();
         let auth_type = AuthType::from_id(r.u8()?)?;
-        let enctypes = (0..r.u8()?)
-            .map(|_| r.fixed().map(|b| Enctype(i32::from_be_bytes(b))))
-            .collect::<Result<_, _>>()?;
+        let enctypes = r.list(|r| r.fixed().map(|b| Enctype(i32::from_be_bytes(b))))?;
         let request = Self {
             op,
             alg,

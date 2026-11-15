@@ -22,7 +22,6 @@
 //! unsealing needs no extra round trip to seal the request.  The key is
 //! authenticated by the binding's `kid`.
 
-use native_ossl::rand::Rand;
 use native_ossl::util::SecretBuf;
 use tang_pqc::primitives::{self, Domain};
 use tang_pqc::wire::{Reader, Writer};
@@ -303,8 +302,7 @@ impl Sealer {
         }
 
         let ctx = context(principal);
-        let mut dek = SecretBuf::with_len(32);
-        Rand::fill_private(dek.as_mut_slice())?;
+        let dek = tang_pqc::primitives::random_secret(32)?;
         let mut slots = Vec::with_capacity(servers.len());
         let mut registrations = Vec::with_capacity(servers.len());
         for realm in servers {

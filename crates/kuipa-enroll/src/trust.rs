@@ -59,8 +59,7 @@ impl Invitation {
     ///
     /// An OpenSSL error.
     pub fn new(realm: &str, anchor: Thumbprint) -> Result<Self> {
-        let mut s = SecretBuf::with_len(32);
-        native_ossl::rand::Rand::fill_private(s.as_mut_slice())?;
+        let s = tang_pqc::primitives::random_secret(32)?;
         Ok(Self {
             realm: realm.into(),
             anchor,
@@ -147,12 +146,8 @@ fn put_realm(w: &mut Writer, r: &TrustedRealm) -> Result<()> {
 fn get_realm(r: &mut Reader) -> Result<TrustedRealm> {
     let realm = r.str()?.to_owned();
     let domain = r.str()?.to_owned();
-    let servers = (0..r.u8()?)
-        .map(|_| r.str().map(str::to_owned))
-        .collect::<Result<_, _>>()?;
-    let anchors = (0..r.u8()?)
-        .map(|_| r.fixed().map(Thumbprint::from_bytes))
-        .collect::<Result<_, _>>()?;
+    let servers = r.list(|r| r.str().map(str::to_owned))?;
+    let anchors = r.list(|r| r.fixed().map(Thumbprint::from_bytes))?;
     Ok(TrustedRealm {
         realm,
         domain,

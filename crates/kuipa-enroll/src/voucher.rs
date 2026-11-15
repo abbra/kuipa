@@ -149,9 +149,7 @@ pub fn is_binding_len(len: usize) -> bool {
 ///
 /// [`Error::Malformed`] for a key of no ML-KEM set, or an OpenSSL error.
 pub fn binding(ephemeral_key: &[u8]) -> Result<Vec<u8>> {
-    let alg = tang_pqc::KemAlg::ALL
-        .into_iter()
-        .find(|a| a.encapsulation_key_len() == ephemeral_key.len())
+    let alg = tang_pqc::KemAlg::from_key_len(ephemeral_key.len())
         .ok_or(Error::Malformed("ephemeral key"))?;
     Ok(primitives::digest(
         alg.hash(),

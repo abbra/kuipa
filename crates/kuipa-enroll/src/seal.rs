@@ -19,7 +19,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-use native_ossl::rand::Rand;
 use native_ossl::util::SecretBuf;
 use serde::{Deserialize, Serialize};
 use tang_pqc::primitives::{self, Domain};
@@ -71,9 +70,7 @@ pub const DEFAULT_EPOCH: u64 = 30 * 86_400;
 ///
 /// [`Error::Malformed`] for a ciphertext of no ML-KEM set.
 fn suite(ct: &[u8]) -> Result<&'static std::ffi::CStr> {
-    tang_pqc::KemAlg::ALL
-        .into_iter()
-        .find(|a| a.ciphertext_len() == ct.len())
+    tang_pqc::KemAlg::from_ciphertext_len(ct.len())
         .map(tang_pqc::KemAlg::hash)
         .ok_or(Error::Malformed("KEM ciphertext"))
 }
@@ -1109,8 +1106,7 @@ impl SessionSealedFile {
             .ok_or_else(|| Error::Policy("the seal has no offline sessions".into()))?;
         let principal = descriptor.owner().clone();
         let committed = commitment_data(&principal, &seal.id);
-        let mut a = SecretBuf::with_len(32);
-        Rand::fill_private(a.as_mut_slice())?;
+        let a = tang_pqc::primitives::random_secret(32)?;
         let (ct_e, secret_e) = current.public()?.encapsulate()?;
         let k_e = epoch_share_key(secret_e.as_ref(), &committed, current.epoch, &ct_e)?;
         let (devices, b) = device_slots(seal, &committed)?;
@@ -1234,8 +1230,7 @@ fn device_slots(seal: &Seal, committed: &[u8]) -> Result<(Vec<DeviceSlot>, Secre
         return Err(Error::Malformed("too many devices to seal"));
     }
 
-    let mut b = SecretBuf::with_len(32);
-    Rand::fill_private(b.as_mut_slice())?;
+    let b = tang_pqc::primitives::random_secret(32)?;
     let mut devices = Vec::new();
     for d in &seal.devices {
         let public = d.public()?;
@@ -2510,8 +2505,7 @@ impl SealedFile {
         let principal = descriptor.owner().clone();
         let committed = commitment_data(&principal, &seal.id);
         let ctx = BindingContext::new(escrow::DOMAIN, &committed);
-        let mut a = SecretBuf::with_len(32);
-        Rand::fill_private(a.as_mut_slice())?;
+        let a = tang_pqc::primitives::random_secret(32)?;
         let mut slots = Vec::with_capacity(servers.len());
         for realm in servers {
             // The seal's realm, not the owner's: a trusted realm's user may own it.

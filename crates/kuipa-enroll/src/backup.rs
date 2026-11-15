@@ -20,7 +20,6 @@
 use std::ffi::CStr;
 use std::io::{Read, Write};
 
-use native_ossl::rand::Rand;
 use native_ossl::util::SecretBuf;
 use tang_pqc::primitives::{self, Domain};
 use tang_pqc::wire::{Reader, Writer};
@@ -64,10 +63,7 @@ fn data_hash(algs: impl IntoIterator<Item = KemAlg>) -> &'static CStr {
 }
 
 fn kem_of(ct: &[u8]) -> Result<KemAlg> {
-    KemAlg::ALL
-        .into_iter()
-        .find(|a| a.ciphertext_len() == ct.len())
-        .ok_or(Error::Malformed("KEM ciphertext"))
+    KemAlg::from_ciphertext_len(ct.len()).ok_or(Error::Malformed("KEM ciphertext"))
 }
 
 fn wrap_key(secret: &[u8], kid: &[u8; 32], ct: &[u8], alg: KemAlg) -> Result<SecretBuf> {
@@ -119,8 +115,7 @@ pub fn seal_stream(
     if !(MIN_CHUNK_LOG2..=MAX_CHUNK_LOG2).contains(&chunk_log2) {
         return Err(Error::Malformed("backup chunk size"));
     }
-    let mut k = SecretBuf::with_len(32);
-    Rand::fill_private(k.as_mut_slice())?;
+    let k = tang_pqc::primitives::random_secret(32)?;
 
     let mut w = Writer::new(MAGIC);
     let count =

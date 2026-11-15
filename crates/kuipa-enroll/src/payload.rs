@@ -101,15 +101,9 @@ impl Enrollment {
         let domain = r.str()?.to_owned();
         let basedn = r.str()?.to_owned();
         let issuer = r.str()?.to_owned();
-        let servers: Vec<String> = (0..r.u8()?)
-            .map(|_| r.str().map(str::to_owned))
-            .collect::<Result<_, _>>()?;
-        let ca_certs = (0..r.u8()?)
-            .map(|_| r.bytes().map(<[u8]>::to_vec))
-            .collect::<Result<_, _>>()?;
-        let pkinit_anchors = (0..r.u8()?)
-            .map(|_| r.bytes().map(<[u8]>::to_vec))
-            .collect::<Result<_, _>>()?;
+        let servers: Vec<String> = r.list(|r| r.str().map(str::to_owned))?;
+        let ca_certs = r.list(|r| r.bytes().map(<[u8]>::to_vec))?;
+        let pkinit_anchors = r.list(|r| r.bytes().map(<[u8]>::to_vec))?;
         let (anchors, heads) = read_anchors(&mut r)?;
         let (epoch_seq, epoch_head) = (r.u64()?, r.fixed()?);
         let keytab = Keytab::from_mit(r.bytes()?)?;
