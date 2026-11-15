@@ -196,12 +196,41 @@ pub(crate) fn commitment_data(principal: &Principal, seal: &SealId) -> Vec<u8> {
 
 /// One server's way into the sealed object.
 #[derive(Clone, PartialEq, Eq)]
-struct Slot {
-    server: String,
-    binding: Binding,
-    escrow_key: ExchangeKey,
-    commitment: [u8; 32],
-    wrapped: Box<[u8]>,
+pub(crate) struct Slot {
+    pub(crate) server: String,
+    pub(crate) binding: Binding,
+    pub(crate) escrow_key: ExchangeKey,
+    pub(crate) commitment: [u8; 32],
+    pub(crate) wrapped: Box<[u8]>,
+}
+
+impl Slot {
+    pub(crate) fn write(&self, w: &mut Writer) {
+        w.str(&self.server)
+            .bytes(&self.binding.to_bytes())
+            .bytes(self.escrow_key.as_bytes())
+            .fixed(&self.commitment)
+            .bytes(&self.wrapped);
+    }
+
+    pub(crate) fn read(r: &mut Reader<'_>, ctx: &BindingContext) -> Result<Self> {
+        let server = r.str()?.to_owned();
+        if !crate::realm::is_safe_name(&server) {
+            return Err(Error::Malformed("sealed slot server"));
+        }
+        let binding = Binding::from_bytes_with(ctx, r.bytes()?)?;
+        let escrow_key = ExchangeKey::from_bytes(binding.alg(), r.bytes()?)?;
+        if escrow_key.kid() != binding.kid() {
+            return Err(Error::Mismatch("escrow key"));
+        }
+        Ok(Self {
+            server,
+            binding,
+            escrow_key,
+            commitment: r.fixed()?,
+            wrapped: r.bytes()?.into(),
+        })
+    }
 }
 
 /// The TPM share of a sealed object (§7.1): a 32-byte share kept as a
@@ -565,11 +594,7 @@ impl Sealed {
         w.str(&self.principal.to_string())
             .u8(u8::try_from(self.slots.len()).expect("at most 255 servers"));
         for s in &self.slots {
-            w.str(&s.server)
-                .bytes(&s.binding.to_bytes())
-                .bytes(s.escrow_key.as_bytes())
-                .fixed(&s.commitment)
-                .bytes(&s.wrapped);
+            s.write(&mut w);
         }
         if let Some(t) = &self.tpm {
             w.str(&t.pcrs).bytes(&t.credential);
@@ -596,24 +621,7 @@ impl Sealed {
         let principal: Principal = r.str()?.parse()?;
         let ctx = context(&principal);
         let slots = (0..r.u8()?)
-            .map(|_| {
-                let server = r.str()?.to_owned();
-                if !crate::realm::is_safe_name(&server) {
-                    return Err(Error::Malformed("sealed slot server"));
-                }
-                let binding = Binding::from_bytes_with(&ctx, r.bytes()?)?;
-                let escrow_key = ExchangeKey::from_bytes(binding.alg(), r.bytes()?)?;
-                if escrow_key.kid() != binding.kid() {
-                    return Err(Error::Mismatch("escrow key"));
-                }
-                Ok(Slot {
-                    server,
-                    binding,
-                    escrow_key,
-                    commitment: r.fixed()?,
-                    wrapped: r.bytes()?.into(),
-                })
-            })
+            .map(|_| Slot::read(&mut r, &ctx))
             .collect::<Result<_>>()?;
         let tpm = if tpm {
             Some(TpmShare {

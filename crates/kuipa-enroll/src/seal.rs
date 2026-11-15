@@ -24,13 +24,13 @@ use serde::{Deserialize, Serialize};
 use tang_pqc::primitives::{self, Domain};
 use tang_pqc::wire::{Reader, Writer};
 use tang_pqc::{
-    Binding, BindingContext, ExchangeKey, ExchangeKeyPair, KemAlg, Policy as CryptoPolicy,
-    RecoveryResponse, SigningKey, Thumbprint, VerifyingKey, b64,
+    BindingContext, ExchangeKey, ExchangeKeyPair, KemAlg, Policy as CryptoPolicy, RecoveryResponse,
+    SigningKey, Thumbprint, VerifyingKey, b64,
 };
 
 use crate::delegation::{Delegation, VerifiedDelegation};
 use crate::error::{Error, Result};
-use crate::escrow::{self, BindingHash, EscrowRequest, SealId, commitment_data};
+use crate::escrow::{self, BindingHash, EscrowRequest, SealId, Slot, commitment_data};
 use crate::keytab::Principal;
 use crate::realm::VerifiedRealm;
 use crate::tlog::Receipt;
@@ -1175,9 +1175,7 @@ impl SessionSealedFile {
             .bytes(&self.wrapped_a)
             .u8(u8::try_from(self.devices.len()).expect("at most 255 devices"));
         for d in &self.devices {
-            w.fixed(d.id.as_bytes())
-                .bytes(&d.ciphertext)
-                .bytes(&d.wrapped);
+            d.write(&mut w);
         }
         w.bytes(&self.ciphertext).finish()
     }
@@ -1195,13 +1193,7 @@ impl SessionSealedFile {
         let ciphertext_e = r.bytes()?.into();
         let wrapped_a = r.bytes()?.into();
         let devices = (0..r.u8()?)
-            .map(|_| {
-                Ok(DeviceSlot {
-                    id: Thumbprint::from_bytes(r.fixed()?),
-                    ciphertext: r.bytes()?.into(),
-                    wrapped: r.bytes()?.into(),
-                })
-            })
+            .map(|_| DeviceSlot::read(&mut r))
             .collect::<Result<_>>()?;
         let ciphertext = r.bytes()?.into();
         r.finish()?;
@@ -2402,19 +2394,26 @@ impl Recovered {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct ServerSlot {
-    server: String,
-    binding: Binding,
-    escrow_key: ExchangeKey,
-    commitment: [u8; 32],
-    wrapped: Box<[u8]>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
 struct DeviceSlot {
     id: Thumbprint,
     ciphertext: Box<[u8]>,
     wrapped: Box<[u8]>,
+}
+
+impl DeviceSlot {
+    fn write(&self, w: &mut Writer) {
+        w.fixed(self.id.as_bytes())
+            .bytes(&self.ciphertext)
+            .bytes(&self.wrapped);
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self> {
+        Ok(Self {
+            id: Thumbprint::from_bytes(r.fixed()?),
+            ciphertext: r.bytes()?.into(),
+            wrapped: r.bytes()?.into(),
+        })
+    }
 }
 
 /// A file sealed to a user seal.
@@ -2422,7 +2421,7 @@ struct DeviceSlot {
 pub struct SealedFile {
     principal: Principal,
     seal: SealId,
-    servers: Vec<ServerSlot>,
+    servers: Vec<Slot>,
     devices: Vec<DeviceSlot>,
     ciphertext: Box<[u8]>,
 }
@@ -2518,7 +2517,7 @@ impl SealedFile {
                 Some(escrow_key.kid()),
                 &committed,
             )?;
-            slots.push(ServerSlot {
+            slots.push(Slot {
                 server: realm.server().into(),
                 wrapped: primitives::seal(key.as_ref(), a.as_ref())?.into(),
                 binding,
@@ -2661,17 +2660,11 @@ impl SealedFile {
             .fixed(self.seal.as_bytes())
             .u8(u8::try_from(self.servers.len()).expect("at most 255 servers"));
         for s in &self.servers {
-            w.str(&s.server)
-                .bytes(&s.binding.to_bytes())
-                .bytes(s.escrow_key.as_bytes())
-                .fixed(&s.commitment)
-                .bytes(&s.wrapped);
+            s.write(&mut w);
         }
         w.u8(u8::try_from(self.devices.len()).expect("at most 255 devices"));
         for d in &self.devices {
-            w.fixed(d.id.as_bytes())
-                .bytes(&d.ciphertext)
-                .bytes(&d.wrapped);
+            d.write(&mut w);
         }
         w.bytes(&self.ciphertext).finish()
     }
@@ -2687,33 +2680,10 @@ impl SealedFile {
         let seal = SealId::from_bytes(r.fixed()?);
         let ctx = BindingContext::new(escrow::DOMAIN, &commitment_data(&principal, &seal));
         let servers = (0..r.u8()?)
-            .map(|_| {
-                let server = r.str()?.to_owned();
-                if !crate::realm::is_safe_name(&server) {
-                    return Err(Error::Malformed("sealed slot server"));
-                }
-                let binding = Binding::from_bytes_with(&ctx, r.bytes()?)?;
-                let escrow_key = ExchangeKey::from_bytes(binding.alg(), r.bytes()?)?;
-                if escrow_key.kid() != binding.kid() {
-                    return Err(Error::Mismatch("escrow key"));
-                }
-                Ok(ServerSlot {
-                    server,
-                    binding,
-                    escrow_key,
-                    commitment: r.fixed()?,
-                    wrapped: r.bytes()?.into(),
-                })
-            })
+            .map(|_| Slot::read(&mut r, &ctx))
             .collect::<Result<_>>()?;
         let devices = (0..r.u8()?)
-            .map(|_| {
-                Ok(DeviceSlot {
-                    id: Thumbprint::from_bytes(r.fixed()?),
-                    ciphertext: r.bytes()?.into(),
-                    wrapped: r.bytes()?.into(),
-                })
-            })
+            .map(|_| DeviceSlot::read(&mut r))
             .collect::<Result<_>>()?;
         let ciphertext = r.bytes()?.into();
         r.finish()?;
