@@ -46,9 +46,9 @@ use std::ffi::c_char;
 use std::ffi::{CStr, CString};
 use std::ptr;
 
-use status::format_gss_status;
 
 pub use error::GssError;
+use error::cstring;
 pub use kinit::{ticket, NoPreauth, Preauth};
 
 /// Whether this build links MIT Kerberos (the cfg `build.rs` sets):
@@ -145,22 +145,21 @@ impl GssServerCred {
     ///
     /// # Errors
     ///
-    /// - [`GssError::NulInServiceName`] — `service_name` contains a NUL byte.
-    /// - [`GssError::NulInKeytabPath`] — `keytab_file` contains a NUL byte.
-    /// - [`GssError::ImportName`] — `gss_import_name` rejected the service name.
-    /// - [`GssError::AcquireCred`] — credential acquisition failed (keytab
+    /// - [`GssError::Nul`] — `service_name` or `keytab_file` contains a NUL byte.
+    /// - [`GssError::Gss`] — `gss_import_name` rejected the service name.
+    /// - [`GssError::Gss`] — credential acquisition failed (keytab
     ///   missing, wrong principal, or Kerberos library error).
     /// - [`GssError::Krb5`] — Heimdal could not open the keytab.
     pub fn acquire(service_name: &str, keytab_file: &str) -> Result<Self, GssError> {
         // Validate strings first so NUL-byte errors are reported before any I/O.
         #[cfg(mit_kerberos)]
-        let svc_cstr = CString::new(service_name).map_err(|_| GssError::NulInServiceName)?;
+        let svc_cstr = cstring(service_name, "service name")?;
         // Heimdal's acceptor credential carries no principal, so the service
         // name is validated and then dropped — but a NUL in it is still the
         // caller's bug and must be reported the same way.
         #[cfg(heimdal_kerberos)]
-        CString::new(service_name).map_err(|_| GssError::NulInServiceName)?;
-        let kt_cstr = CString::new(keytab_file).map_err(|_| GssError::NulInKeytabPath)?;
+        cstring(service_name, "service name")?;
+        let kt_cstr = cstring(keytab_file, "keytab path")?;
 
         // Pre-flight readability check before calling into the GSSAPI library so that a
         // missing or wrong-path keytab produces a clear error rather than an
@@ -198,13 +197,7 @@ impl GssServerCred {
             )
         };
         if major != ffi::GSS_S_COMPLETE {
-            let detail = format_gss_status(major, minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "gss_import_name (service name) failed");
-            return Err(GssError::ImportName {
-                detail,
-                major,
-                minor,
-            });
+            return Err(GssError::gss("gss_import_name", major, minor));
         }
 
         // Build the credential store: {keytab, client_keytab} both pointing at the
@@ -295,13 +288,7 @@ impl GssServerCred {
                 // SAFETY: cred_handle is non-null and was written by gss_acquire_cred_from.
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (server keytab) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_from", major, error_minor));
         }
 
         if cred_usage == ffi::GSS_C_ACCEPT {
@@ -351,7 +338,7 @@ impl GssServerCred {
             ffi::gss_release_oid_set(minor, actual_mechs);
             *actual_mechs = ptr::null_mut();
         }
-        let detail = format_gss_status(major, *minor);
+        let detail = status::format_gss_status(major, *minor);
         tracing::warn!(%detail, "GSS_C_BOTH acquire failed, retrying with GSS_C_ACCEPT (S4U2Self will be unavailable)");
         ffi::gss_acquire_cred_from(
             minor,
@@ -417,13 +404,7 @@ impl GssServerCred {
                     // SAFETY: set by gss_krb5_import_cred.
                     ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle);
                 }
-                let detail = format_gss_status(major, error_minor);
-                tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_krb5_import_cred (acceptor keytab) failed");
-                return Err(GssError::AcquireCred {
-                    detail,
-                    major,
-                    minor: error_minor,
-                });
+                return Err(GssError::gss("gss_acquire_cred_from", major, error_minor));
             }
             Ok(GssServerCred { raw: cred_handle })
         }
@@ -445,7 +426,7 @@ impl GssServerCred {
     /// # Errors
     ///
     /// - [`GssError::Unsupported`] — this build links Heimdal.
-    /// - [`GssError::AcquireCred`] — gssproxy denied the request, the service
+    /// - [`GssError::Gss`] — gssproxy denied the request, the service
     ///   has no gssproxy entry, or the Kerberos library returned an error.
     pub fn from_gssproxy(_service_name: &str) -> Result<Self, GssError> {
         #[cfg(heimdal_kerberos)]
@@ -506,13 +487,7 @@ impl GssServerCred {
                 // SAFETY: cred_handle is non-null and was written by gss_acquire_cred_from.
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (gssproxy) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_from", major, error_minor));
         }
 
         Ok(GssServerCred { raw: cred_handle })
@@ -638,7 +613,7 @@ impl GssClientCred {
     ///
     /// # Errors
     ///
-    /// - [`GssError::AcquireCred`] — no valid TGT in the ccache or the Kerberos
+    /// - [`GssError::Gss`] — no valid TGT in the ccache or the Kerberos
     ///   library returned an error.
     pub fn ambient() -> Result<Self, GssError> {
         Self::from_ccache(Impersonation::No)
@@ -669,7 +644,7 @@ impl GssClientCred {
     /// # Errors
     ///
     /// - [`GssError::Unsupported`] — [`Impersonation::Both`] under Heimdal.
-    /// - [`GssError::AcquireCred`] — no valid TGT in the ccache, or the
+    /// - [`GssError::Gss`] — no valid TGT in the ccache, or the
     ///   Kerberos library returned an error.
     pub fn from_ccache(impersonation: Impersonation) -> Result<Self, GssError> {
         #[cfg(heimdal_kerberos)]
@@ -724,13 +699,7 @@ impl GssClientCred {
             if !cred_handle.is_null() {
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (default ccache) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_from", major, error_minor));
         }
 
         Ok(GssClientCred { raw: cred_handle })
@@ -763,13 +732,7 @@ impl GssClientCred {
             if !cred_handle.is_null() {
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
-            let detail = format_gss_status(major, minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "gss_acquire_cred (default ccache) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_from", major, minor));
         }
 
         Ok(GssClientCred { raw: cred_handle })
@@ -795,12 +758,11 @@ impl GssClientCred {
     ///
     /// # Errors
     ///
-    /// - [`GssError::NulInKeytabPath`], [`GssError::NulInUserPrincipal`],
-    ///   [`GssError::NulInCcacheName`] — an argument contains a NUL byte.
-    /// - [`GssError::ImportName`] — `principal` is not a principal name.
+    /// - [`GssError::Nul`] — an argument contains a NUL byte.
+    /// - [`GssError::Gss`] — `principal` is not a principal name.
     /// - [`GssError::Krb5`] — Heimdal could not read the keytab or obtain the
     ///   TGT.
-    /// - [`GssError::AcquireCred`] — credential acquisition failed.
+    /// - [`GssError::Gss`] — credential acquisition failed.
     ///
     /// # Panics
     ///
@@ -812,13 +774,12 @@ impl GssClientCred {
         ccache: Option<&str>,
     ) -> Result<Self, GssError> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let kt_cstr = CString::new(keytab_file).map_err(|_| GssError::NulInKeytabPath)?;
+        let kt_cstr = cstring(keytab_file, "keytab path")?;
         let principal = principal
-            .map(CString::new)
-            .transpose()
-            .map_err(|_| GssError::NulInUserPrincipal)?;
+            .map(|p| cstring(p, "user principal"))
+            .transpose()?;
         let ccache = match ccache {
-            Some(name) => CString::new(name).map_err(|_| GssError::NulInCcacheName)?,
+            Some(name) => cstring(name, "ccache name")?,
             None => CString::new(format!(
                 "MEMORY:kuipa-client-keytab-{}-{}",
                 std::process::id(),
@@ -868,12 +829,7 @@ impl GssClientCred {
                 )
             };
             if major != ffi::GSS_S_COMPLETE {
-                let detail = format_gss_status(major, minor);
-                return Err(GssError::ImportName {
-                    detail,
-                    major,
-                    minor,
-                });
+                return Err(GssError::gss("gss_import_name", major, minor));
             }
         }
         let mut elements: Vec<ffi::GssKeyValueElementDesc> = store
@@ -927,13 +883,7 @@ impl GssClientCred {
                 // SAFETY: cred_handle is non-null and was written by gss_acquire_cred_from.
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(store = ?store, major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (keytab) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_from", major, error_minor));
         }
 
         Ok(GssClientCred { raw: cred_handle })
@@ -958,9 +908,9 @@ impl GssClientCred {
     /// # Errors
     ///
     /// - [`GssError::Unsupported`] — this build links Heimdal.
-    /// - [`GssError::NulInUserPrincipal`] — `user_principal` contains a NUL byte.
-    /// - [`GssError::ImportName`] — `gss_import_name` rejected the principal.
-    /// - [`GssError::ImpersonateCred`] — `gss_acquire_cred_impersonate_name` failed
+    /// - [`GssError::Nul`] — `user_principal` contains a NUL byte.
+    /// - [`GssError::Gss`] — `gss_import_name` rejected the principal.
+    /// - [`GssError::Gss`] — `gss_acquire_cred_impersonate_name` failed
     ///   (KDC policy, missing delegation config, or unknown principal).
     pub fn impersonate(initiator: &GssClientCred, user_principal: &str) -> Result<Self, GssError> {
         #[cfg(mit_kerberos)]
@@ -977,7 +927,7 @@ impl GssClientCred {
     #[cfg(mit_kerberos)]
     fn impersonate_mit(initiator: &GssClientCred, user_principal: &str) -> Result<Self, GssError> {
         let principal_cstr =
-            CString::new(user_principal).map_err(|_| GssError::NulInUserPrincipal)?;
+            cstring(user_principal, "user principal")?;
         let mut minor: ffi::OmUint32 = 0;
 
         // Import the user principal as a Kerberos principal name.
@@ -995,13 +945,7 @@ impl GssClientCred {
             )
         };
         if major != ffi::GSS_S_COMPLETE {
-            let detail = format_gss_status(major, minor);
-            tracing::warn!(principal = user_principal, major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "gss_import_name (user principal for S4U2Self) failed");
-            return Err(GssError::ImportName {
-                detail,
-                major,
-                minor,
-            });
+            return Err(GssError::gss("gss_import_name", major, minor));
         }
 
         let mut impersonated: ffi::GssCredIdT = ptr::null_mut();
@@ -1041,13 +985,7 @@ impl GssClientCred {
                 // SAFETY: impersonated was set by gss_acquire_cred_impersonate_name.
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut impersonated) };
             }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(principal = user_principal, major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_impersonate_name (S4U2Self) failed");
-            return Err(GssError::ImpersonateCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_impersonate_name", major, error_minor));
         }
 
         Ok(GssClientCred { raw: impersonated })
@@ -1070,11 +1008,11 @@ impl GssClientCred {
     ///
     /// # Errors
     ///
-    /// - [`GssError::NulInCcacheName`] — `ccache_name` contains a NUL byte.
-    /// - [`GssError::AcquireCred`] — acquisition failed (the ccache does not
+    /// - [`GssError::Nul`] — `ccache_name` contains a NUL byte.
+    /// - [`GssError::Gss`] — acquisition failed (the ccache does not
     ///   exist or contains no usable credential).
     pub fn from_named_ccache(ccache_name: &str) -> Result<Self, GssError> {
-        let ccache_cstr = CString::new(ccache_name).map_err(|_| GssError::NulInCcacheName)?;
+        let ccache_cstr = cstring(ccache_name, "ccache name")?;
 
         #[cfg(mit_kerberos)]
         return Self::from_named_ccache_mit(&ccache_cstr);
@@ -1130,13 +1068,7 @@ impl GssClientCred {
                 // SAFETY: cred_handle was written by gss_acquire_cred_from.
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle) };
             }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(ccache = %ccache_cstr.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_from (named ccache) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_from", major, error_minor));
         }
 
         Ok(GssClientCred { raw: cred_handle })
@@ -1389,7 +1321,7 @@ fn keytab_first_principal(kt: &CStr) -> Result<CString, GssError> {
 ///
 /// # Errors
 ///
-/// - [`GssError::AcquireCred`] — the ccache could not be opened, parsed, or
+/// - [`GssError::Gss`] — the ccache could not be opened, parsed, or
 ///   imported.
 fn acquire_initiator_from_ccache(ccache_name: &CStr) -> Result<ffi::GssCredIdT, GssError> {
     // SAFETY: all handles are initialised here and released on every path.
@@ -1436,13 +1368,7 @@ fn acquire_initiator_from_ccache(ccache_name: &CStr) -> Result<ffi::GssCredIdT, 
                 // Set by gss_krb5_import_cred; already inside the unsafe block.
                 ffi::gss_release_cred(&raw mut minor, &raw mut cred_handle);
             }
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(ccache = %ccache_name.to_string_lossy(), major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_krb5_import_cred (initiator ccache) failed");
-            return Err(GssError::AcquireCred {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_acquire_cred_from", major, error_minor));
         }
         Ok(cred_handle)
     }
@@ -1499,14 +1425,14 @@ impl GssClientContext {
     ///
     /// # Errors
     ///
-    /// - [`GssError::NulInTargetName`] — `target_service` contains a NUL byte.
-    /// - [`GssError::ImportName`] — `gss_import_name` rejected the name.
+    /// - [`GssError::Nul`] — `target_service` contains a NUL byte.
+    /// - [`GssError::Gss`] — `gss_import_name` rejected the name.
     pub(crate) fn new(target_service: &str) -> Result<Self, GssError> {
         Self::with_name_type(target_service, &ffi::gss_c_nt_hostbased_service())
     }
 
     fn with_name_type(target_service: &str, svc_oid: &ffi::GssOidDesc) -> Result<Self, GssError> {
-        let svc_cstr = CString::new(target_service).map_err(|_| GssError::NulInTargetName)?;
+        let svc_cstr = cstring(target_service, "target service name")?;
         let mut minor: ffi::OmUint32 = 0;
         let svc_buf = ffi::GssBufferDesc::borrowing(svc_cstr.to_bytes());
         let mut target_name: ffi::GssNameT = ptr::null_mut();
@@ -1520,13 +1446,7 @@ impl GssClientContext {
             )
         };
         if major != ffi::GSS_S_COMPLETE {
-            let detail = format_gss_status(major, minor);
-            tracing::warn!(target = target_service, major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "gss_import_name (target service) failed");
-            return Err(GssError::ImportName {
-                detail,
-                major,
-                minor,
-            });
+            return Err(GssError::gss("gss_import_name", major, minor));
         }
         Ok(GssClientContext {
             raw: ffi::GSS_C_NO_CONTEXT,
@@ -1562,7 +1482,7 @@ impl GssClientContext {
     ///
     /// # Errors
     ///
-    /// [`GssError::PseudoRandom`] if the context is not established or the
+    /// [`GssError::Gss`] if the context is not established or the
     /// mechanism cannot derive them.
     pub(crate) fn pseudo_random(&self, input: &[u8], len: usize) -> Result<Vec<u8>, GssError> {
         pseudo_random(self.raw, input, len)
@@ -1585,7 +1505,7 @@ impl GssClientContext {
     ///
     /// # Errors
     ///
-    /// - [`GssError::InitContext`] — `gss_init_sec_context` returned a status
+    /// - [`GssError::Gss`] — `gss_init_sec_context` returned a status
     ///   other than `GSS_S_COMPLETE` or `GSS_S_CONTINUE_NEEDED`.
     pub(crate) fn step(
         &mut self,
@@ -1673,13 +1593,7 @@ impl GssClientContext {
         };
 
         if major != ffi::GSS_S_COMPLETE && major != ffi::GSS_S_CONTINUE_NEEDED {
-            let detail = format_gss_status(major, error_minor);
-            tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_init_sec_context failed");
-            return Err(GssError::InitContext {
-                detail,
-                major,
-                minor: error_minor,
-            });
+            return Err(GssError::gss("gss_init_sec_context", major, error_minor));
         }
 
         Ok((out_token, major == ffi::GSS_S_COMPLETE))
@@ -1757,8 +1671,8 @@ impl GssServerContext {
     ///
     /// # Errors
     ///
-    /// - [`GssError::AcceptContext`] — `gss_accept_sec_context` rejected the token.
-    /// - [`GssError::DisplayName`] — the principal name could not be converted.
+    /// - [`GssError::Gss`] — `gss_accept_sec_context` rejected the token.
+    /// - [`GssError::Gss`] — the principal name could not be converted.
     /// - [`GssError::InvalidUtf8`] — the principal name is not valid UTF-8.
     pub(crate) fn step(
         self,
@@ -1869,14 +1783,8 @@ impl GssServerContext {
                     // SAFETY: src_name is valid.
                     unsafe { ffi::gss_release_name(&raw mut minor, &raw mut src_name) };
                 }
-                let detail = format_gss_status(major, error_minor);
-                tracing::warn!(major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_accept_sec_context failed");
                 // self goes out of scope here; Drop deletes self.raw.
-                Err(GssError::AcceptContext {
-                    detail,
-                    major,
-                    minor: error_minor,
-                })
+                Err(GssError::gss("gss_accept_sec_context", major, error_minor))
             }
         }
     }
@@ -1903,7 +1811,7 @@ impl GssServerContext {
     }
 
     /// Release `src_name` and return its display name, or a
-    /// [`GssError::DisplayName`] / [`GssError::InvalidUtf8`].
+    /// [`GssError::Gss`] / [`GssError::InvalidUtf8`].
     ///
     /// # Safety
     ///
@@ -1934,11 +1842,7 @@ impl GssServerContext {
         } else {
             // SAFETY: name_buf may be empty or null; gss_release_buffer handles both.
             unsafe { ffi::gss_release_buffer(minor, &raw mut name_buf) };
-            Err(GssError::DisplayName {
-                detail: format_gss_status(major_dn, dn_minor),
-                major: major_dn,
-                minor: dn_minor,
-            })
+            Err(GssError::gss("gss_display_name", major_dn, dn_minor))
         }
     }
 }
@@ -1995,9 +1899,9 @@ pub enum InitStep {
 ///
 /// - [`GssError::Unsupported`] — this build links Heimdal, which has no
 ///   `gss_acquire_cred_impersonate_name`.
-/// - [`GssError::NulInUserPrincipal`] — `user_principal` contains a NUL byte.
-/// - [`GssError::ImportName`] — `gss_import_name` rejected the principal.
-/// - [`GssError::ImpersonateCred`] — `gss_acquire_cred_impersonate_name` failed.
+/// - [`GssError::Nul`] — `user_principal` contains a NUL byte.
+/// - [`GssError::Gss`] — `gss_import_name` rejected the principal.
+/// - [`GssError::Gss`] — `gss_acquire_cred_impersonate_name` failed.
 pub fn impersonate_with_server_cred(
     server: &GssServerCred,
     user_principal: &str,
@@ -2018,7 +1922,7 @@ fn impersonate_with_server_cred_mit(
     server: &GssServerCred,
     user_principal: &str,
 ) -> Result<GssClientCred, GssError> {
-    let principal_cstr = CString::new(user_principal).map_err(|_| GssError::NulInUserPrincipal)?;
+    let principal_cstr = cstring(user_principal, "user principal")?;
     let mut minor: ffi::OmUint32 = 0;
 
     let principal_oid = ffi::gss_krb5_nt_principal_name();
@@ -2034,13 +1938,7 @@ fn impersonate_with_server_cred_mit(
         )
     };
     if major != ffi::GSS_S_COMPLETE {
-        let detail = format_gss_status(major, minor);
-        tracing::warn!(principal = user_principal, major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "gss_import_name (user principal for server-cred S4U2Self) failed");
-        return Err(GssError::ImportName {
-            detail,
-            major,
-            minor,
-        });
+        return Err(GssError::gss("gss_import_name", major, minor));
     }
 
     let mut impersonated: ffi::GssCredIdT = ptr::null_mut();
@@ -2075,13 +1973,7 @@ fn impersonate_with_server_cred_mit(
         if !impersonated.is_null() {
             unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut impersonated) };
         }
-        let detail = format_gss_status(major, error_minor);
-        tracing::warn!(principal = user_principal, major = %format_args!("{major:#010x}"), minor = %format_args!("{error_minor:#010x}"), %detail, "gss_acquire_cred_impersonate_name (server-cred S4U2Self) failed");
-        return Err(GssError::ImpersonateCred {
-            detail,
-            major,
-            minor: error_minor,
-        });
+        return Err(GssError::gss("gss_acquire_cred_impersonate_name", major, error_minor));
     }
 
     Ok(GssClientCred { raw: impersonated })
@@ -2101,9 +1993,9 @@ fn impersonate_with_server_cred_mit(
 ///
 /// # Errors
 ///
-/// - [`GssError::NulInTargetName`] — `target_service` contains a NUL byte.
-/// - [`GssError::ImportName`] — `gss_import_name` rejected the target name.
-/// - [`GssError::InitContext`] — `gss_init_sec_context` failed.
+/// - [`GssError::Nul`] — `target_service` contains a NUL byte.
+/// - [`GssError::Gss`] — `gss_import_name` rejected the target name.
+/// - [`GssError::Gss`] — `gss_init_sec_context` failed.
 pub fn init_token(
     cred: &GssClientCred,
     target_service: &str,
@@ -2125,7 +2017,8 @@ fn pseudo_random(raw: ffi::GssCtxIdT, input: &[u8], len: usize) -> Result<Vec<u8
     let mut minor: ffi::OmUint32 = 0;
     let in_buf = ffi::GssBufferDesc::borrowing(input);
     let mut out_buf = ffi::gss_c_no_buffer();
-    let wanted = isize::try_from(len).map_err(|_| GssError::PseudoRandom {
+    let wanted = isize::try_from(len).map_err(|_| GssError::Gss {
+        op: "gss_pseudo_random",
         major: 0,
         minor: 0,
         detail: "output length too large".into(),
@@ -2158,11 +2051,7 @@ fn pseudo_random(raw: ffi::GssCtxIdT, input: &[u8], len: usize) -> Result<Vec<u8
         Vec::new()
     };
     if major != ffi::GSS_S_COMPLETE || out.len() != len {
-        return Err(GssError::PseudoRandom {
-            detail: format_gss_status(major, error_minor),
-            major,
-            minor: error_minor,
-        });
+        return Err(GssError::gss("gss_pseudo_random", major, error_minor));
     }
     Ok(out)
 }
@@ -2177,7 +2066,7 @@ fn pseudo_random(raw: ffi::GssCtxIdT, input: &[u8], len: usize) -> Result<Vec<u8
 /// # Errors
 ///
 /// As for [`init_token`], [`GssError::NotComplete`] if the mechanism needs
-/// another round trip, or [`GssError::PseudoRandom`].
+/// another round trip, or [`GssError::Gss`].
 pub fn init_bound(
     cred: &GssClientCred,
     target_service: &str,
@@ -2201,7 +2090,7 @@ pub fn init_bound(
 /// # Errors
 ///
 /// As for [`accept_token`], [`GssError::NotComplete`] if the exchange
-/// needs another round trip, or [`GssError::PseudoRandom`].
+/// needs another round trip, or [`GssError::Gss`].
 pub fn accept_bound(
     cred: &GssServerCred,
     input_token: &[u8],
@@ -2261,9 +2150,9 @@ pub fn accept_bound_delegated(
 ///
 /// # Errors
 ///
-/// - [`GssError::AcceptContext`] — `gss_accept_sec_context` rejected the token
+/// - [`GssError::Gss`] — `gss_accept_sec_context` rejected the token
 ///   (expired ticket, wrong service, replay, or forged token).
-/// - [`GssError::DisplayName`] — the authenticated name could not be converted
+/// - [`GssError::Gss`] — the authenticated name could not be converted
 ///   to a printable string by `gss_display_name`.
 /// - [`GssError::InvalidUtf8`] — the display name returned by the GSSAPI
 ///   library is not valid UTF-8.
@@ -2285,19 +2174,19 @@ mod tests {
     #[test]
     fn acquire_nul_in_service_name_returns_error() {
         let err = GssServerCred::acquire("HTTP\0badname", "/tmp/fake.keytab").unwrap_err();
-        assert!(matches!(err, GssError::NulInServiceName));
+        assert!(matches!(err, GssError::Nul { what: "service name" }));
     }
 
     #[test]
     fn acquire_nul_in_keytab_path_returns_error() {
         let err = GssServerCred::acquire("HTTP", "/tmp/\0fake.keytab").unwrap_err();
-        assert!(matches!(err, GssError::NulInKeytabPath));
+        assert!(matches!(err, GssError::Nul { what: "keytab path" }));
     }
 
     #[test]
     fn from_keytab_nul_in_path_returns_error() {
         let err = GssClientCred::from_client_keytab("/tmp/\0bad.keytab", None, None).unwrap_err();
-        assert!(matches!(err, GssError::NulInKeytabPath));
+        assert!(matches!(err, GssError::Nul { what: "keytab path" }));
     }
 
     #[test]
@@ -2309,7 +2198,7 @@ mod tests {
             raw: ptr::null_mut(),
         };
         let err = init_token(&cred, "HTTP\0bad.host", None).unwrap_err();
-        assert!(matches!(err, GssError::NulInTargetName));
+        assert!(matches!(err, GssError::Nul { what: "target service name" }));
         // Prevent Drop from calling gss_release_cred on a null handle.
         std::mem::forget(cred);
     }

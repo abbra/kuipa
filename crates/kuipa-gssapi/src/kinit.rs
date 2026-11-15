@@ -55,7 +55,7 @@ use std::ptr;
 
 use std::ffi::{c_char, c_int, c_void};
 
-use crate::error::GssError;
+use crate::error::{cstring, GssError};
 use crate::ffi;
 use native_ossl::util::SecretBuf;
 
@@ -66,8 +66,7 @@ impl Context {
     /// A context that reads `config` and nothing else.
     #[cfg(mit_kerberos)]
     fn from_file(config: &Path) -> Result<Self, GssError> {
-        let path = CString::new(config.as_os_str().as_encoded_bytes())
-            .map_err(|_| GssError::NulInConfigPath)?;
+        let path = cstring(config.as_os_str().as_encoded_bytes(), "configuration path")?;
         let mut profile: ffi::Profile = ptr::null_mut();
         // SAFETY: path is a live C string; profile is a valid output pointer.
         let ret = unsafe { ffi::profile_init_path(path.as_ptr(), &raw mut profile) };
@@ -101,8 +100,7 @@ impl Context {
     /// defaults and realms from it.
     #[cfg(heimdal_kerberos)]
     fn from_file(config: &Path) -> Result<Self, GssError> {
-        let path = CString::new(config.as_os_str().as_encoded_bytes())
-            .map_err(|_| GssError::NulInConfigPath)?;
+        let path = cstring(config.as_os_str().as_encoded_bytes(), "configuration path")?;
         let mut ctx: ffi::Krb5Context = ptr::null_mut();
         // SAFETY: ctx is a valid output pointer.
         let ret = unsafe { ffi::krb5_init_context(&raw mut ctx) };
@@ -144,7 +142,7 @@ impl Context {
     }
 
     fn principal(&self, name: &str) -> Result<Principal<'_>, GssError> {
-        let name = CString::new(name).map_err(|_| GssError::NulInUserPrincipal)?;
+        let name = cstring(name, "user principal")?;
         let mut p: ffi::Krb5Principal = ptr::null_mut();
         // SAFETY: name is a live C string; p is a valid output pointer.
         self.check(
@@ -155,7 +153,7 @@ impl Context {
     }
 
     fn ccache(&self, name: &str) -> Result<Ccache<'_>, GssError> {
-        let name = CString::new(name).map_err(|_| GssError::NulInCcacheName)?;
+        let name = cstring(name, "ccache name")?;
         let mut cc: ffi::Krb5Ccache = ptr::null_mut();
         // SAFETY: name is a live C string; cc is a valid output pointer.
         self.check(
@@ -272,7 +270,7 @@ impl Context {
         let opt = self.options()?;
         // The realm's defaults for an init-creds exchange: `kinit` applies
         // them, and `krb5_init_creds_init` does not when options are given.
-        let realm = CString::new(realm).map_err(|_| GssError::NulInUserPrincipal)?;
+        let realm = cstring(realm, "user principal")?;
         // SAFETY: opt is live; the realm string outlives the call, which
         // copies what it takes.
         unsafe {
@@ -934,16 +932,15 @@ pub fn ticket(
     preauth: &dyn Preauth,
 ) -> Result<(), GssError> {
     let password = secret
-        .map(CString::new)
-        .transpose()
-        .map_err(|_| GssError::NulInPassword)?
+        .map(|s| cstring(s, "password"))
+        .transpose()?
         .map(cleansed);
-    let service = CString::new(service).map_err(|_| GssError::NulInTargetName)?;
+    let service = cstring(service, "target service name")?;
     let realm = principal
         .rsplit_once('@')
         .map(|(_, r)| r)
         .filter(|r| !r.is_empty())
-        .ok_or(GssError::NulInUserPrincipal)?;
+        .ok_or(GssError::NoRealm)?;
     let ctx = Context::from_file(config)?;
 
     // The armour: an anonymous PKINIT ticket in a private ccache.  Nothing

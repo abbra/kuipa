@@ -1,6 +1,9 @@
 //! Error type for GSSAPI operations.
 
+use std::ffi::CString;
+
 use crate::ffi::OmUint32;
+use crate::status::format_gss_status;
 
 /// An error from a GSSAPI call, carrying the major and minor status codes.
 ///
@@ -10,11 +13,18 @@ use crate::ffi::OmUint32;
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum GssError {
-    /// `gss_import_name` failed to parse the service name string.
+    /// A GSS-API call failed.
     ///
-    /// This typically indicates an empty or structurally invalid service name.
-    #[error("gss_import_name failed: {detail}")]
-    ImportName {
+    /// Common causes: for `gss_acquire_cred_from`, an unreadable keytab or one
+    /// without a key for the service; for `gss_accept_sec_context`, an
+    /// expired ticket, the wrong service, a replay or a forged token; for
+    /// `gss_init_sec_context`, an expired TGT, an unreachable KDC or an
+    /// unknown service principal; for `gss_acquire_cred_impersonate_name`
+    /// (S4U2Self), KDC policy that forbids protocol transition.
+    #[error("{op} failed: {detail}")]
+    Gss {
+        /// The failing C function.
+        op: &'static str,
         /// GSS major status code.
         major: OmUint32,
         /// Mechanism-specific minor status code.
@@ -23,46 +33,12 @@ pub enum GssError {
         detail: String,
     },
 
-    /// `gss_acquire_cred_from` failed to load acceptor credentials from the
-    /// keytab.
-    ///
-    /// Common causes: the keytab file does not exist or is not readable by the
-    /// akamu process, the file does not contain a key for the requested
-    /// service principal, or the Kerberos libraries are not installed.
-    #[error("gss_acquire_cred_from failed: {detail}")]
-    AcquireCred {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
-
-    /// `gss_accept_sec_context` rejected the client token.
-    ///
-    /// Common causes: the service ticket has expired, the client targeted the
-    /// wrong service principal, the token was replayed, or it was forged.
-    #[error("gss_accept_sec_context failed: {detail}")]
-    AcceptContext {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
-
-    /// `gss_display_name` failed to convert the authenticated name to a
-    /// printable string.
-    #[error("gss_display_name failed: {detail}")]
-    DisplayName {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
+    /// A string passed in cannot go to the C library: it has an interior NUL
+    /// byte.
+    #[error("{what} contains an interior NUL byte")]
+    Nul {
+        /// Which argument.
+        what: &'static str,
     },
 
     /// The display name returned by `gss_display_name` is not valid UTF-8.
@@ -71,16 +47,6 @@ pub enum GssError {
     /// returns ASCII-compatible principal name strings.
     #[error("principal name is not valid UTF-8")]
     InvalidUtf8,
-
-    /// `service_name` passed to [`crate::GssServerCred::acquire`] contains an
-    /// interior NUL byte and cannot be passed to the C GSSAPI library.
-    #[error("service name contains an interior NUL byte")]
-    NulInServiceName,
-
-    /// `keytab_file` passed to [`crate::GssServerCred::acquire`] contains an
-    /// interior NUL byte and cannot be passed to the C GSSAPI library.
-    #[error("keytab path contains an interior NUL byte")]
-    NulInKeytabPath,
 
     /// The keytab file does not exist or is not readable by the current process.
     ///
@@ -95,48 +61,6 @@ pub enum GssError {
         source: std::io::Error,
     },
 
-    /// `target_service` passed to [`crate::init_token`] contains an interior NUL byte.
-    #[error("target service name contains an interior NUL byte")]
-    NulInTargetName,
-
-    /// `user_principal` passed to [`crate::GssClientCred::impersonate`] contains an interior NUL byte.
-    #[error("user principal contains an interior NUL byte")]
-    NulInUserPrincipal,
-
-    /// A ccache name passed to a credential function contains an interior NUL byte.
-    #[error("ccache name contains an interior NUL byte")]
-    NulInCcacheName,
-
-    /// `gss_init_sec_context` failed to produce the initial token.
-    ///
-    /// Common causes: the Kerberos TGT in the default ccache has expired
-    /// (run `kinit` to obtain a new one), the KDC is unreachable, or the
-    /// target service principal does not exist in the Kerberos database.
-    #[error("gss_init_sec_context failed: {detail}")]
-    InitContext {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
-
-    /// `gss_acquire_cred_impersonate_name` failed (S4U2Self).
-    ///
-    /// Common causes: the KDC does not allow protocol transition for this
-    /// service, the user principal does not exist, or constrained delegation
-    /// is not configured.
-    #[error("gss_acquire_cred_impersonate_name failed: {detail}")]
-    ImpersonateCred {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
-
     /// A libkrb5 function failed (TGT acquisition or ccache operation).
     #[error("krb5 error in {msg}: code {code:#010x}")]
     Krb5 {
@@ -146,28 +70,13 @@ pub enum GssError {
         msg: &'static str,
     },
 
-    /// `gss_pseudo_random` failed, or the mechanism returned a short output.
-    #[error("gss_pseudo_random failed: {detail}")]
-    PseudoRandom {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
+    /// The principal has no realm to name the KDC by.
+    #[error("user principal has no realm")]
+    NoRealm,
 
     /// The exchange needs another round trip where one token must suffice.
     #[error("the GSS-API exchange needs more than one token")]
     NotComplete,
-
-    /// A password contains an interior NUL byte.
-    #[error("password contains an interior NUL byte")]
-    NulInPassword,
-
-    /// The Kerberos configuration path contains an interior NUL byte.
-    #[error("configuration path contains an interior NUL byte")]
-    NulInConfigPath,
 
     /// libkrb5 rejected a request, with its own message.
     #[error("{msg}: {detail}")]
@@ -198,4 +107,19 @@ pub enum GssError {
         /// The missing capability.
         feature: &'static str,
     },
+}
+
+impl GssError {
+    /// A failed GSS-API call `op`, with the status codes rendered; logged
+    /// once here for every caller.
+    pub(crate) fn gss(op: &'static str, major: OmUint32, minor: OmUint32) -> Self {
+        let detail = format_gss_status(major, minor);
+        tracing::warn!(op, major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "GSS-API call failed");
+        Self::Gss { op, major, minor, detail }
+    }
+}
+
+/// `s` as a C string, or [`GssError::Nul`] naming `what`.
+pub(crate) fn cstring(s: impl Into<Vec<u8>>, what: &'static str) -> Result<CString, GssError> {
+    CString::new(s).map_err(|_| GssError::Nul { what })
 }
