@@ -139,6 +139,21 @@ time, memory and disk space; increase the per-round timeout as needed. On one
 and a quarter minutes and 13 GB of resident memory for all in-process
 replicas.
 
+## LDAP footprint
+
+Measured on a FreeIPA master (Fedora 45, ipacta, 549 other entries,
+about 718 KB of LDIF) with `ldapsearch` of every entry and attribute,
+operational ones included. One client enrolled with kuipa adds no kuipa
+entry and about 2 KB to the host entry. The kuipa containers under
+`cn=kuipa,cn=etc` take 6.3 KB of LDIF when empty. A seal is one entry of
+about 965 bytes (a ticket-only seal; more members, devices and approvals
+grow its `ipaKUSealPolicy`); a sealed file adds none, since its bindings
+travel in the file unless the seal registers them. Eleven seals took
+11.5 KB. Realm limits set through `ipa sealconfig-mod` are one entry
+of 1.1-1.4 KB. The database files on disk did not change in size over the
+run (3.9 MB, before checkpointing), so these figures are LDIF bytes, not
+disk use.
+
 ## CI
 
 `local-ci.sh bench` (opt-in, like `msrv`) runs the smoke profile in quick mode
