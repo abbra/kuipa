@@ -61,19 +61,12 @@ pub(crate) struct GssKeyValueSetDesc {
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 pub(crate) const GSS_S_COMPLETE: OmUint32 = 0;
-#[allow(dead_code)]
 pub(crate) const GSS_S_CONTINUE_NEEDED: OmUint32 = 1;
 
-#[allow(dead_code)]
 pub(crate) const GSS_C_ACCEPT: i32 = 2;
 
 pub(crate) const GSS_C_NO_CONTEXT: GssCtxIdT = ptr::null_mut();
-#[allow(dead_code)]
-pub(crate) const GSS_C_NO_CREDENTIAL: GssCredIdT = ptr::null_mut();
-#[allow(dead_code)]
-pub(crate) const GSS_C_NO_NAME: GssNameT = ptr::null_mut();
 pub(crate) const GSS_C_NO_OID_SET: GssOidSetT = ptr::null_mut();
 
 pub(crate) fn gss_c_no_buffer() -> GssBufferDesc {
@@ -94,10 +87,6 @@ pub(crate) const GSS_C_INITIATE: i32 = 1;
 pub(crate) const GSS_C_GSS_CODE: i32 = 1;
 /// Status type: interpret `status_value` as a mechanism-specific minor code.
 pub(crate) const GSS_C_MECH_CODE: i32 = 2;
-
-/// Request flag: ask the acceptor to perform mutual authentication.
-#[allow(dead_code)]
-pub(crate) const GSS_C_MUTUAL_FLAG: OmUint32 = 2;
 
 /// Return flag: replay detection is active on this context (RFC 2744).
 pub(crate) const GSS_C_REPLAY_FLAG: OmUint32 = 4;
@@ -259,9 +248,6 @@ extern "C" {
     pub(crate) fn krb5_free_cred_contents(context: Krb5Context, val: *mut Krb5Creds);
     pub(crate) fn krb5_get_error_message(ctx: Krb5Context, code: c_int) -> *const c_char;
     pub(crate) fn krb5_free_error_message(ctx: Krb5Context, msg: *const c_char);
-
-    #[allow(dead_code)]
-    pub(crate) fn krb5_free_data_contents(context: Krb5Context, val: *mut Krb5Data);
 
     pub(crate) fn krb5_cc_destroy(context: Krb5Context, cache: Krb5Ccache) -> c_int;
     pub(crate) fn krb5_get_init_creds_opt_alloc(
@@ -611,37 +597,6 @@ extern "C" {
         output_cred_handle: *mut GssCredIdT,
         actual_mechs: *mut GssOidSetT,
         time_rec: *mut OmUint32,
-    ) -> OmUint32;
-
-    /// Store a credential into a named credential store (RFC 7512 extension).
-    ///
-    /// Pass `{"ccache", "MEMORY:name"}` in `elements` to write into a named
-    /// in-process credential cache.  Combined with `gss_krb5_ccache_name`,
-    /// this lets a blocking thread use a specific credential for SASL GSSAPI
-    /// without mutating the process-wide default ccache.
-    pub(crate) fn gss_store_cred_into(
-        minor_status: *mut OmUint32,
-        input_cred_handle: GssCredIdT,
-        cred_usage: i32,
-        desired_mech: *const GssOidDesc,
-        overwrite_cred: OmUint32,
-        default_cred: OmUint32,
-        elements: *const GssKeyValueSetDesc,
-        elements_stored: *mut GssOidSetT,
-        cred_usage_stored: *mut i32,
-    ) -> OmUint32;
-
-    /// Set the thread-local default Kerberos credential cache for GSSAPI calls.
-    ///
-    /// MIT Kerberos extension (from `<gssapi/gssapi_krb5.h>`).  When `name` is
-    /// non-null, the GSSAPI library uses the named ccache (e.g. `"MEMORY:foo"`)
-    /// for `gss_acquire_cred` on the calling thread instead of the process-wide
-    /// default.  The previous ccache name is written to `*old_name` if non-null;
-    /// call this function again with the old name to restore the prior state.
-    pub(crate) fn gss_krb5_ccache_name(
-        minor_status: *mut OmUint32,
-        name: *const c_char,
-        old_name: *mut *const c_char,
     ) -> OmUint32;
 }
 

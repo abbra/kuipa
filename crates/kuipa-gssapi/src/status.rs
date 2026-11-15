@@ -41,7 +41,7 @@ pub(crate) fn display_one_status(status_value: ffi::OmUint32, status_type: i32) 
 /// Example output: `"An invalid status code was supplied (major 0x000d0000);
 /// Ticket expired (minor 0x96c73a20)"`.
 #[must_use]
-pub fn format_gss_status(major: ffi::OmUint32, minor: ffi::OmUint32) -> String {
+pub(crate) fn format_gss_status(major: ffi::OmUint32, minor: ffi::OmUint32) -> String {
     let maj_text =
         display_one_status(major, ffi::GSS_C_GSS_CODE).unwrap_or_else(|| "unknown".into());
     let min_text =

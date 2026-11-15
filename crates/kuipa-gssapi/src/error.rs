@@ -137,39 +137,6 @@ pub enum GssError {
         detail: String,
     },
 
-    /// Credential export via FILE: ccache failed.
-    #[error("credential export failed: {detail}")]
-    ExportCred {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
-
-    /// `gss_store_cred_into` failed to write the credential to the named cache.
-    #[error("gss_store_cred_into failed: {detail}")]
-    StoreCred {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
-
-    /// `gss_krb5_ccache_name` failed to set the thread-local credential cache.
-    #[error("gss_krb5_ccache_name failed: {detail}")]
-    SetCcache {
-        /// GSS major status code.
-        major: OmUint32,
-        /// Mechanism-specific minor status code.
-        minor: OmUint32,
-        /// Formatted status text.
-        detail: String,
-    },
-
     /// A libkrb5 function failed (TGT acquisition or ccache operation).
     #[error("krb5 error in {msg}: code {code:#010x}")]
     Krb5 {
@@ -231,25 +198,4 @@ pub enum GssError {
         /// The missing capability.
         feature: &'static str,
     },
-}
-
-const GSS_S_CALL_INACCESSIBLE_READ: OmUint32 = 0x0100_0000;
-const GSS_CALLING_ERROR_MASK: OmUint32 = 0xFF00_0000;
-
-impl GssError {
-    /// Whether this error indicates the credential handle has become stale
-    /// (e.g. gssproxy restarted, TGT expired and was purged).
-    ///
-    /// Re-acquiring the server credential from the original source
-    /// (keytab / gssproxy) and retrying the operation usually succeeds.
-    #[must_use]
-    pub fn is_stale_credential(&self) -> bool {
-        let major = match self {
-            GssError::ImpersonateCred { major, .. }
-            | GssError::AcquireCred { major, .. }
-            | GssError::InitContext { major, .. } => *major,
-            _ => return false,
-        };
-        major & GSS_CALLING_ERROR_MASK == GSS_S_CALL_INACCESSIBLE_READ
-    }
 }
