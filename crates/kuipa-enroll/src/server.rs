@@ -4372,16 +4372,30 @@ mod tests {
                 .unwrap_or("?")
                 .to_owned()
         };
-        let adv1 = server
-            .advertisement_with_heads(
-                &[],
-                &[HeadPin {
-                    anchor: thp1,
-                    size: 1,
-                    root,
-                }],
+        let pin1 = HeadPin {
+            anchor: thp1,
+            size: 1,
+            root,
+        };
+        let adv1 = server.advertisement_with_heads(&[], &[pin1]).unwrap();
+        // A frozen anchor needs its own pinned head to prove the claim.
+        let policy = tang_pqc::Policy::default();
+        let frozen = |f: &[Thumbprint]| {
+            let pinned = crate::delegation::Pinned {
+                heads: &[pin1],
+                frozen: f,
+                ..Default::default()
+            };
+            crate::realm::VerifiedRealm::verify_pinned(
+                &adv1,
+                "EXAMPLE.TEST",
+                &pinned,
+                &policy,
+                std::time::SystemTime::now(),
             )
-            .unwrap();
+        };
+        frozen(&[thp1]).unwrap();
+        assert!(matches!(frozen(&[thp1, thp2]), Err(Error::Frozen(a)) if a == thp2));
         let adv2 = server
             .advertisement_with_heads(
                 &[],

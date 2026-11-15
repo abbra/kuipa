@@ -1209,14 +1209,22 @@ pub struct ProvenBy {
     pub head: bool,
 }
 
-/// What a delegation's proofs are checked against: the client's pinned
-/// anchors, heads and retired claims, its policy, and the time.
-struct Pins<'a> {
-    anchors: &'a [Thumbprint],
-    heads: &'a [HeadPin],
-    retired: &'a [Hash],
-    policy: &'a Policy,
-    at: u64,
+/// What a client pins for a realm, all of it from the same out-of-band
+/// source: what a delegation's proofs are checked against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pinned<'a> {
+    /// The anchors whose signatures are accepted.
+    pub anchors: &'a [Thumbprint],
+    /// The anchors' vouch heads (§4.9): a head proof that checks against
+    /// one, for a claim not retired, is accepted with no signature, and
+    /// wins over a signature proof.  Not a replacement for `anchors`.
+    pub heads: &'a [HeadPin],
+    /// The claims the pinned logs retired, as the client learned them.
+    pub retired: &'a [Hash],
+    /// The anchors that are frozen (DESIGN-claim-logs.md §2): the realm
+    /// verifier ([`VerifiedRealm::verify_pinned`](crate::realm::VerifiedRealm::verify_pinned))
+    /// accepts only a head proof for each of them.
+    pub frozen: &'a [Thumbprint],
 }
 
 /// How many distinct anchors' proofs an advertisement carries for a client
@@ -1558,11 +1566,18 @@ impl Delegation {
         policy: &Policy,
         at: u64,
     ) -> Result<VerifiedDelegation> {
-        self.verify_at_with_heads(anchors, &[], &[], policy, at)
+        self.verify_pinned(
+            &Pinned {
+                anchors,
+                ..Pinned::default()
+            },
+            policy,
+            at,
+        )
     }
 
-    /// [`verify_at`](Self::verify_at) with the client's pinned vouch
-    /// heads (§4.9) and the claims it learned their logs retired: a head
+    /// [`verify_at`](Self::verify_at) against everything the client pins
+    /// (`frozen` is for the realm verifier): a head
     /// proof that checks against one of them, for a claim not retired, is
     /// accepted with no signature, and wins over a signature proof.  The
     /// claim's validity is still checked, and the successions still lead
@@ -1571,21 +1586,18 @@ impl Delegation {
     /// # Errors
     ///
     /// As [`verify_at`](Self::verify_at).
-    pub(crate) fn verify_at_with_heads(
+    pub(crate) fn verify_pinned(
         &self,
-        anchors: &[Thumbprint],
-        heads: &[HeadPin],
-        retired: &[Hash],
+        pinned: &Pinned<'_>,
         policy: &Policy,
         at: u64,
     ) -> Result<VerifiedDelegation> {
-        let pins = Pins {
+        let Pinned {
             anchors,
             heads,
             retired,
-            policy,
-            at,
-        };
+            ..
+        } = *pinned;
         let claim = self.claim()?;
         if let Some(anchor) = self
             .head_proofs
@@ -1596,7 +1608,7 @@ impl Delegation {
                 return Err(Error::Expired);
             }
             let first = ProvenBy { anchor, head: true };
-            let proven_by = self.proven_by(&claim, first, &pins);
+            let proven_by = self.proven_by(&claim, first, pinned, policy, at);
             return Ok(VerifiedDelegation {
                 realm: claim.realm,
                 server: claim.server,
@@ -1639,7 +1651,7 @@ impl Delegation {
             anchor,
             head: false,
         };
-        let proven_by = self.proven_by(&claim, first, &pins);
+        let proven_by = self.proven_by(&claim, first, pinned, policy, at);
         Ok(VerifiedDelegation {
             realm: claim.realm,
             server: claim.server,
@@ -1655,21 +1667,28 @@ impl Delegation {
     }
 
     /// `first`, then every other pinned anchor whose own proof of `claim`
-    /// checks against `pins`: by a pinned head, else by a signature in its
+    /// checks against `pinned`: by a pinned head, else by a signature in its
     /// lifetime.  Each anchor once.
-    fn proven_by(&self, claim: &Claim, first: ProvenBy, pins: &Pins<'_>) -> Vec<ProvenBy> {
+    fn proven_by(
+        &self,
+        claim: &Claim,
+        first: ProvenBy,
+        pinned: &Pinned<'_>,
+        policy: &Policy,
+        at: u64,
+    ) -> Vec<ProvenBy> {
         let mut out = vec![first];
         let by_head = self
             .head_proofs()
             .iter()
-            .filter_map(|p| p.check(claim, pins.heads, pins.retired))
+            .filter_map(|p| p.check(claim, pinned.heads, pinned.retired))
             .map(|anchor| ProvenBy { anchor, head: true })
             .collect::<Vec<_>>();
         let by_signature = self
             .proofs
             .iter()
-            .filter_map(|p| p.check(claim, Some(pins.anchors), pins.policy))
-            .filter(|(_, v)| v.valid_at(pins.at))
+            .filter_map(|p| p.check(claim, Some(pinned.anchors), policy))
+            .filter(|(_, v)| v.valid_at(at))
             .map(|(anchor, _)| ProvenBy {
                 anchor,
                 head: false,
@@ -1989,7 +2008,14 @@ mod tests {
         let mut d = Delegation::new(&claims[0]);
         d.add_head_proofs([hp]);
         let v = d
-            .verify_at_with_heads(&[], &[head1], &[], &Policy::default(), NOW + 5)
+            .verify_pinned(
+                &Pinned {
+                    heads: &[head1],
+                    ..Pinned::default()
+                },
+                &Policy::default(),
+                NOW + 5,
+            )
             .unwrap();
         assert_eq!(v.head_anchor, Some(head1.anchor));
         assert_eq!(v.vouched_until, u64::MAX, "a head proof never expires");
@@ -2060,11 +2086,26 @@ mod tests {
         let mut dropped = Delegation::new(&claims[1]);
         dropped.head_proofs = vec![old];
         dropped
-            .verify_at_with_heads(&[], &[pin1], &[], &Policy::default(), NOW + 2)
+            .verify_pinned(
+                &Pinned {
+                    heads: &[pin1],
+                    ..Pinned::default()
+                },
+                &Policy::default(),
+                NOW + 2,
+            )
             .unwrap();
         assert!(
             dropped
-                .verify_at_with_heads(&[], &[pin1], v2.retired(), &Policy::default(), NOW + 2)
+                .verify_pinned(
+                    &Pinned {
+                        heads: &[pin1],
+                        retired: v2.retired(),
+                        ..Pinned::default()
+                    },
+                    &Policy::default(),
+                    NOW + 2,
+                )
                 .is_err(),
             "a retired claim proves nothing by an old head"
         );
@@ -2592,7 +2633,7 @@ mod tests {
         let served = delegation.select(&[thp(&second), thp(&first)]);
         assert_eq!(served.signers(&policy), [thp(&second), thp(&first)]);
         let v = served
-            .verify_at_with_heads(&[thp(&first), thp(&second)], &[], &[], &policy, NOW)
+            .verify_at(&[thp(&first), thp(&second)], &policy, NOW)
             .unwrap();
         let proven: Vec<_> = v.proven_by.iter().map(|p| (p.anchor, p.head)).collect();
         assert_eq!(proven, [(thp(&second), false), (thp(&first), false)]);
@@ -2606,9 +2647,7 @@ mod tests {
         let all = delegation.select(&[thp(&first), thp(&second), thp(&third)]);
         assert_eq!(all.signers(&policy).len(), SERVED_PROOFS);
         // A proof the client does not pin proves nothing to it.
-        let v = all
-            .verify_at_with_heads(&[thp(&first)], &[], &[], &policy, NOW)
-            .unwrap();
+        let v = all.verify_at(&[thp(&first)], &policy, NOW).unwrap();
         assert_eq!(v.proven_by.len(), 1);
     }
 
@@ -2634,7 +2673,15 @@ mod tests {
         assert_eq!(served.signers(&policy), [thp(&second)]);
         assert_eq!(served.head_proofs().len(), 1);
         let v = served
-            .verify_at_with_heads(&[thp(&first), thp(&second)], &[head], &[], &policy, NOW)
+            .verify_pinned(
+                &Pinned {
+                    anchors: &[thp(&first), thp(&second)],
+                    heads: &[head],
+                    ..Pinned::default()
+                },
+                &policy,
+                NOW,
+            )
             .unwrap();
         let proven: Vec<_> = v.proven_by.iter().map(|p| (p.anchor, p.head)).collect();
         assert_eq!(proven, [(thp(&first), true), (thp(&second), false)]);

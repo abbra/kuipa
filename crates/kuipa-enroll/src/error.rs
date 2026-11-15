@@ -43,6 +43,10 @@ pub enum Error {
     Policy(String),
     /// A passkey assertion does not satisfy the passkey factor (§7.6.5).
     Passkey(&'static str),
+    /// A frozen pin's anchor is not proven the claim by its own pinned head
+    /// (DESIGN-claim-logs.md §2): a signature, or another anchor's proof,
+    /// is exactly what the freeze removes.
+    Frozen(tang_pqc::Thumbprint),
     /// An advertised CA certificate or PKINIT anchor is not a certificate a
     /// host may install as a CA: which list, which entry (from 1), and
     /// what it is instead ([`check_ca`](crate::certs::check_ca)).
@@ -74,6 +78,12 @@ impl fmt::Display for Error {
             Self::PeerSync(what) => write!(f, "peer sync refused: {what}"),
             Self::Deployment(why) | Self::Policy(why) => f.write_str(why),
             Self::Passkey(why) => write!(f, "passkey: {why}"),
+            Self::Frozen(anchor) => {
+                write!(
+                    f,
+                    "frozen: the pinned head of {anchor} does not prove this claim"
+                )
+            }
             Self::NotCa { list, entry, what } => write!(f, "{list} {entry} is {what}"),
         }
     }

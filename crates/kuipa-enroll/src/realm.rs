@@ -14,7 +14,7 @@ use tang_pqc::{
 };
 
 use crate::delegation::Claim;
-use crate::delegation::{Delegation, HeadPin, HeadProof, VerifiedDelegation};
+use crate::delegation::{Delegation, HeadPin, HeadProof, Pinned, VerifiedDelegation};
 use crate::error::{Error, Result};
 
 /// JWK member naming a key's role.
@@ -308,6 +308,30 @@ pub fn is_safe_name(name: &str) -> bool {
 }
 
 impl RealmInfo {
+    /// Metadata with names only: no servers, certificates, anchors,
+    /// heads, trusts or KDC proxy.
+    #[must_use]
+    pub fn new(
+        realm: impl Into<String>,
+        domain: impl Into<String>,
+        basedn: impl Into<String>,
+        server: impl Into<String>,
+    ) -> Self {
+        Self {
+            realm: realm.into(),
+            domain: domain.into(),
+            basedn: basedn.into(),
+            server: server.into(),
+            servers: Vec::new(),
+            ca_certs: Vec::new(),
+            pkinit_anchors: Vec::new(),
+            anchors: Vec::new(),
+            heads: Vec::new(),
+            trusts: Vec::new(),
+            kdc_proxy: None,
+        }
+    }
+
     fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("serialisable")
     }
@@ -386,6 +410,19 @@ pub struct ServerKeys {
 }
 
 impl ServerKeys {
+    /// Keys with only a signing key: nothing advertised yet.
+    #[must_use]
+    pub fn new(signing: SigningKey) -> Self {
+        Self {
+            signing,
+            join: Vec::new(),
+            escrow: Vec::new(),
+            trust: Vec::new(),
+            vouchers: Vec::new(),
+            retired: Vec::new(),
+        }
+    }
+
     /// Sign this server's advertisement carrying `delegation`, valid from
     /// `iat` to `exp`.
     ///
@@ -551,26 +588,29 @@ impl VerifiedRealm {
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
-        Self::verify_with_heads(adv, realm, anchors, &[], &[], policy, now)
+        let pinned = Pinned {
+            anchors,
+            ..Pinned::default()
+        };
+        Self::verify_pinned(adv, realm, &pinned, policy, now)
     }
 
-    /// [`verify`](Self::verify) with the client's pinned vouch heads
-    /// (§4.9) and the claims their logs retired, as the client learned
-    /// them: a delegation that carries a head proof for one of them, for a
-    /// claim not retired, is accepted with no signature.  The heads do not
-    /// replace the pins:
+    /// [`verify`](Self::verify) against everything the client pins: vouch
+    /// heads (§4.9) and the claims their logs retired.  A delegation that
+    /// carries a head proof for one of them, for a claim not retired, is
+    /// accepted with no signature.  The heads do not replace the anchors:
     /// an expired or absent head falls back to the signature proofs the
-    /// advertisement also carries or the client asks for again.
+    /// advertisement also carries or the client asks for again.  Every
+    /// `frozen` anchor must be proven the claim by a head proof that checks
+    /// against one of its own pinned heads (DESIGN-claim-logs.md §2).
     ///
     /// # Errors
     ///
-    /// As [`verify`](Self::verify).
-    pub fn verify_with_heads(
+    /// As [`verify`](Self::verify), and [`Error::Frozen`].
+    pub fn verify_pinned(
         adv: &SignedAdvertisement,
         realm: &str,
-        anchors: &[Thumbprint],
-        heads: &[HeadPin],
-        retired: &[crate::merkle::Hash],
+        pinned: &Pinned<'_>,
         policy: &Policy,
         now: SystemTime,
     ) -> Result<Self> {
@@ -581,8 +621,7 @@ impl VerifiedRealm {
         let proved_heads = parsed.verified_heads(policy, unix_seconds(now));
         let head_proofs = parsed.head_proofs();
         let claim = parsed.claim()?;
-        let delegation =
-            parsed.verify_at_with_heads(anchors, heads, retired, policy, unix_seconds(now))?;
+        let delegation = parsed.verify_pinned(pinned, policy, unix_seconds(now))?;
         if delegation.realm != realm {
             return Err(Error::WrongRealm);
         }
@@ -604,7 +643,7 @@ impl VerifiedRealm {
                 .filter(|_| seq > 0)
                 .map(|h| (seq, h))
         });
-        Ok(Self {
+        let verified = Self {
             info,
             delegation,
             head_proofs: head_proofs.to_vec(),
@@ -613,6 +652,50 @@ impl VerifiedRealm {
             adv,
             signed,
             epoch,
+        };
+        if let Some(f) = pinned
+            .frozen
+            .iter()
+            .find(|f| !verified.head_proves(f, pinned.heads))
+        {
+            return Err(Error::Frozen(*f));
+        }
+        Ok(verified)
+    }
+
+    /// [`verify_pinned`](Self::verify_pinned) with no frozen anchors.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify`](Self::verify).
+    pub fn verify_with_heads(
+        adv: &SignedAdvertisement,
+        realm: &str,
+        anchors: &[Thumbprint],
+        heads: &[HeadPin],
+        retired: &[crate::merkle::Hash],
+        policy: &Policy,
+        now: SystemTime,
+    ) -> Result<Self> {
+        let pinned = Pinned {
+            anchors,
+            heads,
+            retired,
+            frozen: &[],
+        };
+        Self::verify_pinned(adv, realm, &pinned, policy, now)
+    }
+
+    /// Whether it carries, for `anchor`, a head proof that checks against
+    /// one of `anchor`'s pinned `heads` (§2): what a frozen pin accepts,
+    /// and nothing else.
+    fn head_proves(&self, anchor: &Thumbprint, heads: &[HeadPin]) -> bool {
+        self.head_proofs.iter().any(|p| {
+            p.anchor() == anchor
+                && heads
+                    .iter()
+                    .filter(|h| &h.anchor == anchor)
+                    .any(|h| h.check(&self.claim, p).unwrap_or(false))
         })
     }
 
@@ -1643,14 +1726,7 @@ pub(crate) mod tests {
         let a = *t.anchor.public().thumbprint();
         let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         let server = EnrollServer::new(
-            ServerKeys {
-                signing,
-                join: Vec::new(),
-                escrow: Vec::new(),
-                trust: Vec::new(),
-                vouchers: Vec::new(),
-                retired: Vec::new(),
-            },
+            ServerKeys::new(signing),
             t.info.clone(),
             t.delegation.clone(),
         );
