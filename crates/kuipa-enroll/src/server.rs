@@ -2203,6 +2203,10 @@ impl EnrollServer {
             .accept_user(body.authenticator.as_ref(), &cb)
             .map_err(Refusal)?;
         let caller: Principal = accepted.principal.parse()?;
+        let asked = crate::sign::Request::from_bytes(&body.extra)?;
+        let groups = directory.principal_groups(&caller).map_err(Refusal)?;
+        // After the groups: an override removed before that read shows
+        // here (gone is locked), not as a user with no groups.
         if directory.principal_locked(&caller).map_err(Refusal)? {
             return Err(Refusal::because(format!("{caller} is locked or gone")));
         }
