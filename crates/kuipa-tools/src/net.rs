@@ -19,6 +19,7 @@
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
+use kuipa_enroll::delegation::MAX_WANTED;
 use tang_pqc::b64;
 
 /// How to authenticate the server's TLS certificate.
@@ -437,17 +438,9 @@ impl Endpoint {
     ) -> Result<tang_pqc::SignedAdvertisement, NetError> {
         let query: Vec<String> = anchors
             .iter()
-            .take(16)
+            .take(MAX_WANTED)
             .map(|a| format!("anchor={a}"))
-            .collect();
-        let query: Vec<String> = query
-            .into_iter()
-            .chain(
-                heads
-                    .iter()
-                    .take(16)
-                    .map(|h| format!("head={}.{}.{}", h.anchor, h.size, b64::encode(&h.root))),
-            )
+            .chain(heads.iter().take(MAX_WANTED).map(|h| format!("head={h}")))
             .collect();
         let url = if query.is_empty() {
             format!("{}adv", self.base)
