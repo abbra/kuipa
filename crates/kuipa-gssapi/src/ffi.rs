@@ -75,6 +75,7 @@ pub(crate) struct GssKeyValueSetDesc {
 pub(crate) const GSS_S_COMPLETE: OmUint32 = 0;
 pub(crate) const GSS_S_CONTINUE_NEEDED: OmUint32 = 1;
 
+#[cfg(mit_kerberos)]
 pub(crate) const GSS_C_ACCEPT: i32 = 2;
 
 pub(crate) const GSS_C_NO_CONTEXT: GssCtxIdT = ptr::null_mut();
@@ -828,15 +829,6 @@ extern "C" {
         keytab_principal: Krb5Principal,
         keytab: Krb5Keytab,
         out: *mut GssCredIdT,
-    ) -> OmUint32;
-
-    /// Copy the credential cache behind `cred` into `out`, which the library
-    /// initializes itself.  `cred` must carry a ccache: a credential from a
-    /// keytab alone has none, and the call fails.
-    pub(crate) fn gss_krb5_copy_ccache(
-        minor_status: *mut OmUint32,
-        cred: GssCredIdT,
-        out: Krb5Ccache,
     ) -> OmUint32;
 }
 
