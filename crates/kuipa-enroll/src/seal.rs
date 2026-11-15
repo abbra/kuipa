@@ -1993,6 +1993,16 @@ pub struct Reply {
     pub passkeys: Option<crate::passkey::PasskeyInfo>,
 }
 
+/// A length-prefixed JSON value.
+fn put_json<T: Serialize>(w: &mut Writer, value: &T) {
+    w.bytes(&serde_json::to_vec(value).unwrap_or_default());
+}
+
+/// Read what [`put_json`] wrote.
+fn get_json<T: serde::de::DeserializeOwned>(r: &mut Reader<'_>, what: &'static str) -> Result<T> {
+    serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed(what))
+}
+
 impl Reply {
     /// Encode: `IPVR` version 6, `n(u64) [descriptor] session released
     /// m(u8) [receipt] requests escrows deposits devices recovery`
@@ -2035,13 +2045,13 @@ impl Reply {
         for receipt in &self.receipts {
             w.bytes(&receipt.to_bytes());
         }
-        w.bytes(&serde_json::to_vec(&self.requests).unwrap_or_default());
-        w.bytes(&serde_json::to_vec(&self.escrows).unwrap_or_default());
-        w.bytes(&serde_json::to_vec(&self.deposits).unwrap_or_default());
-        w.bytes(&serde_json::to_vec(&self.devices).unwrap_or_default());
-        w.bytes(&serde_json::to_vec(&self.recovery).unwrap_or_default());
+        put_json(&mut w, &self.requests);
+        put_json(&mut w, &self.escrows);
+        put_json(&mut w, &self.deposits);
+        put_json(&mut w, &self.devices);
+        put_json(&mut w, &self.recovery);
         if let Some(passkeys) = &self.passkeys {
-            w.bytes(&serde_json::to_vec(passkeys).unwrap_or_default());
+            put_json(&mut w, passkeys);
         }
         Ok(w.finish())
     }
@@ -2074,18 +2084,13 @@ impl Reply {
         let receipts = (0..r.u8()?)
             .map(|_| Receipt::from_bytes(r.bytes()?))
             .collect::<Result<_>>()?;
-        let requests =
-            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("release requests"))?;
-        let escrows =
-            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("device escrows"))?;
-        let deposits =
-            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("deposits"))?;
-        let devices =
-            serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("devices"))?;
-        let recovery = serde_json::from_slice(r.bytes()?)
-            .map_err(|_| Error::Malformed("recovery settings"))?;
+        let requests = get_json(&mut r, "release requests")?;
+        let escrows = get_json(&mut r, "device escrows")?;
+        let deposits = get_json(&mut r, "deposits")?;
+        let devices = get_json(&mut r, "devices")?;
+        let recovery = get_json(&mut r, "recovery settings")?;
         let passkeys = if version == REPLY_VERSION_PASSKEYS {
-            Some(serde_json::from_slice(r.bytes()?).map_err(|_| Error::Malformed("passkeys"))?)
+            Some(get_json(&mut r, "passkeys")?)
         } else {
             None
         };
