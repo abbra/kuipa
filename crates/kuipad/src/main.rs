@@ -86,7 +86,19 @@ impl Args {
                 .map_err(|_| format!("--{name} needs a number of days"))?,
             None => default,
         };
-        Ok(std::time::Duration::from_secs(days * 86400))
+        let secs = days
+            .checked_mul(86400)
+            .ok_or_else(|| format!("--{name} is too large"))?;
+        Ok(std::time::Duration::from_secs(secs))
+    }
+
+    /// `--days`, at least one and at most [`MAX_STRING_DAYS`].
+    fn bounded_days(&self, default: u64) -> Result<std::time::Duration, Error> {
+        let days = self.days("days", default)?;
+        if days.is_zero() || days.as_secs() > MAX_STRING_DAYS * 86400 {
+            return Err(format!("--days must be between 1 and {MAX_STRING_DAYS}").into());
+        }
+        Ok(days)
     }
 }
 
@@ -319,10 +331,7 @@ const MAX_STRING_DAYS: u64 = 400;
 /// (§4.9), from the stored delegation's proof by this anchor: the host
 /// then checks delegations with no signature at all.
 fn enrollment_string(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Error> {
-    let days = args.days("days", 7)?;
-    if days.is_zero() || days.as_secs() > MAX_STRING_DAYS * 86400 {
-        return Err(format!("--days must be between 1 and {MAX_STRING_DAYS}").into());
-    }
+    let days = args.bounded_days(7)?;
     let exp = tang_pqc::unix_seconds(std::time::SystemTime::now()) + days.as_secs();
     let head = args.flag("head").then(|| head_of(store)).transpose()?;
     let string = kuipa_enroll::enrollment::EnrollmentString::with_head(
@@ -351,7 +360,7 @@ fn trust_invitation(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), E
     let anchor = store.anchor()?;
     let invitation =
         kuipa_enroll::trust::Invitation::new(&cfg.realm, *anchor.public().thumbprint())?;
-    let days = args.days("days", 7)?;
+    let days = args.bounded_days(7)?;
     let not_after = tang_pqc::unix_seconds(std::time::SystemTime::now()) + days.as_secs();
     LdapDirectory::new(cfg.directory())?
         .add_trust_invitation(&invitation.secret_hash()?, not_after)?;
@@ -533,10 +542,7 @@ fn run(args: &Args) -> Result<(), Error> {
 }
 
 fn rotate_anchor(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Error> {
-    let days = args.days("days", MAX_STRING_DAYS)?;
-    if days.is_zero() || days.as_secs() > MAX_STRING_DAYS * 86400 {
-        return Err(format!("--days must be between 1 and {MAX_STRING_DAYS}").into());
-    }
+    let days = args.bounded_days(MAX_STRING_DAYS)?;
     let (old, new) = store.rotate_anchor(&cfg.realm, days)?;
     println!("{new}");
     eprintln!(

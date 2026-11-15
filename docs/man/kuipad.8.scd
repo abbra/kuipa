@@ -98,7 +98,7 @@ its cosignatures, posted to */ipa/ku/tlog/ID/cosign*.  Remove the
 ## trust-invitation [--days _N_] [--config _FILE_]
 
 Invite another realm to trust this one; the invitation is valid _N_
-days (default 7).
+days (default 7, at most 400).
 
 ## establish-trust --invitation-file _FILE_ --server _HOST_... [--config _FILE_]
 
