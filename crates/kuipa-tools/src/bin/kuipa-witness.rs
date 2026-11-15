@@ -21,6 +21,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
+use kuipa_tools::paths::Error;
 use tang_pqc::{SignatureAlg, SigningKey};
 
 #[derive(Parser)]
@@ -71,29 +72,29 @@ enum Command {
     },
 }
 
-fn algorithm(name: Option<&str>) -> Result<SignatureAlg, String> {
+fn algorithm(name: Option<&str>) -> Result<SignatureAlg, Error> {
     match name {
         Some("ml-dsa-44") => Ok(SignatureAlg::MlDsa44),
         Some("ml-dsa-65") => Ok(SignatureAlg::MlDsa65),
         Some("ml-dsa-87") => Ok(SignatureAlg::MlDsa87),
-        Some(other) => Err(format!("unknown algorithm {other:?}")),
+        Some(other) => Err(format!("unknown algorithm {other:?}").into()),
         // The witness role defaults to ML-DSA-44; a policy without it
         // (CNSA 2.0) falls back to what it allows.
         None => match SignatureAlg::MlDsa44.allowed_by_system() {
             Ok(true) => Ok(SignatureAlg::MlDsa44),
-            Ok(false) => SignatureAlg::preferred().map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
+            Ok(false) => Ok(SignatureAlg::preferred()?),
+            Err(e) => Err(e.into()),
         },
     }
 }
 
-fn keygen(key: &std::path::Path, alg: Option<&str>) -> Result<String, String> {
+fn keygen(key: &std::path::Path, alg: Option<&str>) -> Result<String, Error> {
     if key.exists() {
-        return Err(format!("{} already exists", key.display()));
+        return Err(format!("{} already exists", key.display()).into());
     }
-    let signing = SigningKey::generate(algorithm(alg)?).map_err(|e| e.to_string())?;
-    let private = signing.to_jwk().map_err(|e| e.to_string())?;
-    kuipa_tools::paths::write_file(key, private.as_ref(), 0o600).map_err(|e| e.to_string())?;
+    let signing = SigningKey::generate(algorithm(alg)?)?;
+    let private = signing.to_jwk()?;
+    kuipa_tools::paths::write_file(key, private.as_ref(), 0o600)?;
     Ok(signing.public().to_jwk_json())
 }
 
@@ -123,16 +124,10 @@ fn forked(value: &serde_json::Value) -> bool {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match &cli.command {
-        Command::Keygen { key, alg } => match keygen(key, alg.as_deref()) {
-            Ok(public) => {
-                println!("{public}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("kuipa-witness keygen: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        Command::Keygen { key, alg } => kuipa_tools::cli::finish(
+            "kuipa-witness keygen",
+            keygen(key, alg.as_deref()).map(|public| println!("{public}")),
+        ),
         Command::Run {
             key,
             state,
@@ -141,13 +136,12 @@ fn main() -> ExitCode {
             interval,
             once,
         } => {
-            let signing = match std::fs::read(key)
-                .map_err(|e| e.to_string())
-                .and_then(|b| SigningKey::from_jwk(&b).map_err(|e| e.to_string()))
+            let signing = match kuipa_tools::paths::read(key)
+                .and_then(|b| Ok(SigningKey::from_jwk(&b)?))
             {
                 Ok(k) => k,
                 Err(e) => {
-                    eprintln!("kuipa-witness: {}: {e}", key.display());
+                    eprintln!("kuipa-witness: {e}");
                     return ExitCode::FAILURE;
                 }
             };

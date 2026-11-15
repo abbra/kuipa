@@ -8,6 +8,7 @@
 //! older cache untouched — and an anchor string that does not parse is
 //! skipped with a warning rather than trusted or fatal.
 
+use crate::paths::Error;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
@@ -141,13 +142,12 @@ pub(crate) fn signed_heads(adv_json: &[u8], at: u64) -> Vec<HeadPin> {
 /// A message naming the endpoint that failed.  An unparsable anchor is
 /// not an error: it is skipped with a warning, and the realm's own
 /// anchors still sync.
-pub fn sync(origin: &Endpoint, cache: &Cache) -> Result<(), String> {
+pub fn sync(origin: &Endpoint, cache: &Cache) -> Result<(), Error> {
     // The plain advertisement, and the anchors it names.
-    let adv = origin.advertisement(&[]).map_err(|e| e.to_string())?;
+    let adv = origin.advertisement(&[])?;
     let bytes = adv.to_json().into_bytes();
     let anchors: Vec<String> = adv
-        .unverified_member("ipa")
-        .map_err(|e| e.to_string())?
+        .unverified_member("ipa")?
         .as_ref()
         .and_then(|ipa| ipa.get("anchors"))
         .and_then(serde_json::Value::as_array)
@@ -165,18 +165,17 @@ pub fn sync(origin: &Endpoint, cache: &Cache) -> Result<(), String> {
     // recorded once per anchor.
     for anchor in &anchors {
         match sync_anchor(cache, anchor, &heads, |a, from| {
-            origin.claim_log(a, from).map_err(|e| e.to_string())
+            origin.claim_log(a, from).map_err(Error::from)
         }) {
             Ok(Some(head)) => walked.push(head),
             Ok(None) => {}
-            Err(e) => return Err(format!("claim log {anchor}: {e}")),
+            Err(e) => return Err(format!("claim log {anchor}: {e}").into()),
         }
     }
 
     // The anchor log, with the heads the pages just walked.
-    let entries = origin.anchor_log(0).map_err(|e| e.to_string())?;
-    let log = serde_json::to_vec(&serde_json::json!({ "entries": entries, "heads": walked }))
-        .map_err(|e| e.to_string())?;
+    let entries = origin.anchor_log(0)?;
+    let log = serde_json::to_vec(&serde_json::json!({ "entries": entries, "heads": walked }))?;
     *cache
         .anchor_log
         .write()
@@ -211,8 +210,8 @@ fn sync_anchor(
     cache: &Cache,
     anchor: &str,
     heads: &[HeadPin],
-    fetch: impl Fn(&Thumbprint, u64) -> Result<ClaimLogPage, String>,
-) -> Result<Option<serde_json::Value>, String> {
+    fetch: impl Fn(&Thumbprint, u64) -> Result<ClaimLogPage, Error>,
+) -> Result<Option<serde_json::Value>, Error> {
     let Ok(a) = anchor.parse::<Thumbprint>() else {
         eprintln!("kuipa-mirror: sync: skipping unparsable anchor {anchor}");
         return Ok(None);
@@ -233,8 +232,8 @@ fn walk(
     anchor: &str,
     a: &Thumbprint,
     heads: &[HeadPin],
-    mut fetch: impl FnMut(u64) -> Result<ClaimLogPage, String>,
-) -> Result<Option<serde_json::Value>, String> {
+    mut fetch: impl FnMut(u64) -> Result<ClaimLogPage, Error>,
+) -> Result<Option<serde_json::Value>, Error> {
     let mut from = 0;
     let mut head = None;
     let mut complete = false;
@@ -257,7 +256,7 @@ fn walk(
             );
             return Ok(None);
         }
-        let page_bytes = serde_json::to_vec(&page).map_err(|e| e.to_string())?;
+        let page_bytes = serde_json::to_vec(&page)?;
         cache.put_page(anchor, from, page_bytes);
         head = Some(serde_json::json!({
             "anchor": page.anchor,
@@ -283,13 +282,13 @@ fn walk(
 /// # Errors
 ///
 /// A filesystem error writing any cached object.
-pub fn store(cache: &Cache, dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+pub fn store(cache: &Cache, dir: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(dir)?;
     if let Some(bytes) = cache.advertisement() {
-        std::fs::write(dir.join("adv"), bytes).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("adv"), bytes)?;
     }
     if let Some(bytes) = cache.anchor_log() {
-        std::fs::write(dir.join("anchor-log"), bytes).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("anchor-log"), bytes)?;
     }
     for ((anchor, from), bytes) in cache
         .claim_log
@@ -297,8 +296,7 @@ pub fn store(cache: &Cache, dir: &Path) -> Result<(), String> {
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
     {
-        std::fs::write(dir.join(format!("claim-log-{anchor}-{from}")), bytes)
-            .map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("claim-log-{anchor}-{from}")), bytes)?;
     }
     Ok(())
 }
@@ -312,7 +310,7 @@ pub fn store(cache: &Cache, dir: &Path) -> Result<(), String> {
 ///
 /// A message when the default directory cannot be created or made
 /// private.
-pub fn cache_dir(data: Option<&Path>, pid: u32) -> Result<PathBuf, String> {
+pub fn cache_dir(data: Option<&Path>, pid: u32) -> Result<PathBuf, Error> {
     if let Some(dir) = data {
         return Ok(dir.to_owned());
     }
@@ -321,6 +319,68 @@ pub fn cache_dir(data: Option<&Path>, pid: u32) -> Result<PathBuf, String> {
     std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
         .map_err(|e| format!("cache dir {}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+/// The read-only routes of a mirror: the cached advertisement, anchor log
+/// and claim-log pages, and nothing authenticated.
+pub fn router(cache: std::sync::Arc<Cache>) -> axum::Router {
+    axum::Router::new()
+        .route("/ipa/ku/adv", axum::routing::get(adv))
+        .route("/ipa/ku/anchor-log", axum::routing::get(anchor_log))
+        .route("/ipa/ku/claim-log/{anchor}", axum::routing::get(claim_log))
+        .with_state(cache)
+}
+
+use axum::response::IntoResponse;
+
+type Shared = std::sync::Arc<Cache>;
+
+async fn adv(
+    axum::extract::State(cache): axum::extract::State<Shared>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    let query = query.unwrap_or_default();
+    if query.contains("head=") {
+        if let Some(bytes) = cache.head_answer(&query) {
+            return binary(bytes);
+        }
+        // Not cached: remember the query for the next sync and serve
+        // the plain advertisement — the client's stale-head fallback
+        // (§4.9.2), which verifies through signatures.
+        cache.remember_wanted(&query);
+    }
+    cache
+        .advertisement()
+        .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
+}
+
+async fn anchor_log(
+    axum::extract::State(cache): axum::extract::State<Shared>,
+) -> axum::response::Response {
+    cache
+        .anchor_log()
+        .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
+}
+
+async fn claim_log(
+    axum::extract::State(cache): axum::extract::State<Shared>,
+    axum::extract::Path(anchor): axum::extract::Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    let from = query
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|p| p.strip_prefix("from="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    cache
+        .claim_log(&anchor, from)
+        .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
+}
+
+fn binary(bytes: Vec<u8>) -> axum::response::Response {
+    use axum::http::header;
+    ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
 #[cfg(test)]
@@ -556,7 +616,7 @@ mod tests {
         let fetch = |a: &Thumbprint, from: u64| {
             server
                 .claim_log(a, from)
-                .ok_or_else(|| "the origin has no such anchor".to_owned())
+                .ok_or_else(|| "the origin has no such anchor".into())
         };
         assert!(
             sync_anchor(&cache, "not-a-thumbprint", &heads, fetch)

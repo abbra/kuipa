@@ -33,7 +33,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::response::IntoResponse;
 use clap::Parser;
 use kuipa_tools::mirror::{self, Cache};
 use kuipa_tools::net::{Endpoint, Trust};
@@ -65,106 +64,39 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let dir = match mirror::cache_dir(cli.data.as_deref(), std::process::id()) {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("kuipa-mirror: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let cache = Arc::new(Cache::default());
-    if let Err(e) = run(&cli, &dir, Arc::clone(&cache)) {
-        eprintln!("kuipa-mirror: {e}");
-        return ExitCode::FAILURE;
-    }
-    ExitCode::SUCCESS
+    kuipa_tools::cli::finish("kuipa-mirror", run(&cli))
 }
 
-fn run(cli: &Cli, dir: &std::path::Path, cache: Arc<Cache>) -> Result<(), String> {
+fn run(cli: &Cli) -> Result<(), kuipa_tools::paths::Error> {
+    let dir = mirror::cache_dir(cli.data.as_deref(), std::process::id())?;
+    let cache = Arc::new(Cache::default());
     // Fail fast when the origin is unusable, before binding.
-    drop(Endpoint::new(&cli.origin, &Trust::FirstContact).map_err(|e| e.to_string())?);
-    {
-        let origin = Endpoint::new(&cli.origin, &Trust::FirstContact).map_err(|e| e.to_string())?;
-        let cache = Arc::clone(&cache);
-        let dir = dir.to_owned();
-        let interval = cli.interval;
-        std::thread::spawn(move || {
-            loop {
-                if let Err(e) = mirror::sync(&origin, &cache) {
-                    eprintln!("kuipa-mirror: sync: {e}");
-                } else if let Err(e) = mirror::store(&cache, &dir) {
-                    eprintln!("kuipa-mirror: store: {e}");
-                }
-                std::thread::sleep(Duration::from_secs(interval.max(1)));
+    let origin = Endpoint::new(&cli.origin, &Trust::FirstContact)?;
+    let synced = Arc::clone(&cache);
+    let interval = cli.interval.max(1);
+    std::thread::spawn(move || {
+        loop {
+            if let Err(e) = mirror::sync(&origin, &synced) {
+                eprintln!("kuipa-mirror: sync: {e}");
+            } else if let Err(e) = mirror::store(&synced, &dir) {
+                eprintln!("kuipa-mirror: store: {e}");
             }
-        });
-    }
+            std::thread::sleep(Duration::from_secs(interval));
+        }
+    });
 
-    let app = axum::Router::new()
-        .route("/ipa/ku/adv", axum::routing::get(adv))
-        .route("/ipa/ku/anchor-log", axum::routing::get(anchor_log))
-        .route("/ipa/ku/claim-log/{anchor}", axum::routing::get(claim_log))
-        .with_state(cache);
-    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let app = mirror::router(cache);
+    let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&cli.listen)
             .await
             .map_err(|e| format!("listen {}: {e}", cli.listen))?;
         // Port 0 asks for a free one; say which, so a caller (the
         // playground session) learns where to reach the mirror.
-        let bound = listener.local_addr().map_err(|e| e.to_string())?;
+        let bound = listener.local_addr()?;
         println!("{}", bound.port());
         eprintln!("kuipa-mirror: serving {} on {}", cli.origin, bound);
-        axum::serve(listener, app).await.map_err(|e| e.to_string())
+        axum::serve(listener, app).await?;
+        Ok(())
     })
-}
-
-type Shared = Arc<Cache>;
-
-async fn adv(
-    axum::extract::State(cache): axum::extract::State<Shared>,
-    axum::extract::RawQuery(query): axum::extract::RawQuery,
-) -> axum::response::Response {
-    let query = query.unwrap_or_default();
-    if query.contains("head=") {
-        if let Some(bytes) = cache.head_answer(&query) {
-            return binary(bytes);
-        }
-        // Not cached: remember the query for the next sync and serve
-        // the plain advertisement — the client's stale-head fallback
-        // (§4.9.2), which verifies through signatures.
-        cache.remember_wanted(&query);
-    }
-    cache
-        .advertisement()
-        .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
-}
-
-async fn anchor_log(
-    axum::extract::State(cache): axum::extract::State<Shared>,
-) -> axum::response::Response {
-    cache
-        .anchor_log()
-        .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
-}
-
-async fn claim_log(
-    axum::extract::State(cache): axum::extract::State<Shared>,
-    axum::extract::Path(anchor): axum::extract::Path<String>,
-    axum::extract::RawQuery(query): axum::extract::RawQuery,
-) -> axum::response::Response {
-    let from = query
-        .unwrap_or_default()
-        .split('&')
-        .find_map(|p| p.strip_prefix("from="))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    cache
-        .claim_log(&anchor, from)
-        .map_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response(), binary)
-}
-
-fn binary(bytes: Vec<u8>) -> axum::response::Response {
-    use axum::http::header;
-    ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
