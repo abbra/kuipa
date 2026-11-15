@@ -429,6 +429,47 @@ pub struct Limits {
     /// say otherwise ([`Limits::for_groups`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupLimits>,
+    /// Which users of trusted realms may own seals (§7.6.2).
+    #[serde(default, skip_serializing_if = "TrustedOwners::is_empty")]
+    pub trusted_owners: TrustedOwners,
+}
+
+/// Which principals of other realms may own seals: those matching `allow`
+/// and no `deny`.  An entry is a realm (`AD.TEST`), `*.SUFFIX` for any
+/// realm ending in `.SUFFIX` (not `SUFFIX` itself), `*` for any realm, or a
+/// principal (`bob@AD.TEST`, it has an `@`).  Realms compare without
+/// case.  Nothing allowed, the default, keeps seals to the realm's users.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedOwners {
+    /// Who may own seals.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Who may not, whatever `allow` says.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl TrustedOwners {
+    fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
+
+    /// Whether `owner`, a principal of another realm, may own seals.
+    #[must_use]
+    pub fn permits(&self, owner: &Principal) -> bool {
+        let realm = owner.realm().to_ascii_uppercase();
+        let user = owner.to_string().to_ascii_uppercase();
+        let hit = |entry: &String| {
+            let e = entry.to_ascii_uppercase();
+            match e.strip_prefix("*.") {
+                _ if e == "*" => true,
+                _ if e.contains('@') => e == user,
+                Some(suffix) => realm.strip_suffix(suffix).is_some_and(|h| h.ends_with('.')),
+                None => e == realm,
+            }
+        };
+        self.allow.iter().any(hit) && !self.deny.iter().any(hit)
+    }
 }
 
 /// Limits for the members of one user group or host group: each field
@@ -486,6 +527,9 @@ pub struct LimitOverrides {
     /// [`Limits::factors`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factors: Option<Vec<Factors>>,
+    /// [`Limits::trusted_owners`], replaced as a whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_owners: Option<TrustedOwners>,
 }
 
 /// A field that is present, `null` included: `Some` of what it holds.
@@ -520,6 +564,7 @@ impl Default for Limits {
             descriptor_age: 30 * 86_400,
             factors: Vec::new(),
             groups: Vec::new(),
+            trusted_owners: TrustedOwners::default(),
         }
     }
 }
@@ -554,6 +599,7 @@ impl Limits {
         out.without_device = o.without_device.unwrap_or(out.without_device);
         out.descriptor_age = o.descriptor_age.unwrap_or(out.descriptor_age);
         out.factors = o.factors.unwrap_or(out.factors);
+        out.trusted_owners = o.trusted_owners.unwrap_or(out.trusted_owners);
         out
     }
 
@@ -1382,10 +1428,9 @@ impl Descriptor {
             return Err(Error::Mismatch("descriptor signer"));
         }
         key.verify_with_context(&self.signed_part(), DESCRIPTOR_CONTEXT, &self.signature)?;
+        // The owner may be a user of a trusted realm the realm permits
+        // (`Limits::trusted_owners`): the realm vouches for the descriptor.
         let owner: Principal = body.seal.owner.parse()?;
-        if owner.realm() != realm {
-            return Err(Error::WrongRealm);
-        }
         Ok(VerifiedDescriptor {
             seal: body.seal,
             owner,
@@ -2478,7 +2523,8 @@ impl SealedFile {
         Rand::fill_private(a.as_mut_slice())?;
         let mut slots = Vec::with_capacity(servers.len());
         for realm in servers {
-            if realm.info().realm != principal.realm() {
+            // The seal's realm, not the owner's: a trusted realm's user may own it.
+            if realm.info().realm != descriptor.delegation.realm {
                 return Err(Error::WrongRealm);
             }
             let escrow_key = realm.escrow_key()?.clone();
@@ -2874,5 +2920,30 @@ mod tests {
             ..Reply::default()
         };
         assert!(matches!(over.to_bytes(), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn trusted_owners_match_realms_wildcards_and_users() {
+        let owners = |allow: &[&str], deny: &[&str]| TrustedOwners {
+            allow: allow.iter().map(|s| (*s).into()).collect(),
+            deny: deny.iter().map(|s| (*s).into()).collect(),
+        };
+        let ok = |o: &TrustedOwners, who: &str| o.permits(&who.parse().unwrap());
+        let o = owners(
+            &["ad.test", "*.corp.test", "bob@PARTNER.TEST"],
+            &["old.corp.test", "eve@AD.TEST"],
+        );
+        assert!(ok(&o, "ada@AD.TEST"), "exact realm, any case");
+        assert!(ok(&o, "ada@eu.corp.test".to_uppercase().as_str()));
+        assert!(!ok(&o, "ada@CORP.TEST"), "a wildcard excludes its apex");
+        assert!(!ok(&o, "ada@XCORP.TEST"), "and needs a label boundary");
+        assert!(ok(&o, "bob@PARTNER.TEST") && !ok(&o, "amy@PARTNER.TEST"));
+        assert!(!ok(&o, "ada@OLD.CORP.TEST"), "deny beats a wildcard");
+        assert!(!ok(&o, "eve@AD.TEST"), "deny beats the realm, by user");
+        assert!(ok(&owners(&["*"], &[]), "x@ANY.TEST"));
+        assert!(
+            !ok(&TrustedOwners::default(), "x@AD.TEST"),
+            "nothing by default"
+        );
     }
 }

@@ -1970,13 +1970,12 @@ impl EnrollServer {
             .map_err(Refusal)?;
         let caller: Principal = accepted.principal.parse()?;
         let op = SealOp::from_bytes(&body.extra)?;
-        // A user of a trusted realm owns no seal (seals, their descriptors and
-        // their files are this realm's), but may administer them when the
-        // realm's privilege says so.
-        if caller.realm() != self.info.realm && matches!(op, SealOp::Create { .. }) {
-            return Err(Refusal::because("wrong realm"));
-        }
         self.admit_caller(&caller, directory)?;
+        // A user of a trusted realm owns a seal only where the realm's
+        // `trusted_owners` limit says so.
+        if caller.realm() != self.info.realm && matches!(op, SealOp::Create { .. }) {
+            owner_permitted(&caller, directory)?;
+        }
         let now = unix_seconds(SystemTime::now());
         let mut event = seal_event(&op);
         // Whoever loses a device or their membership must not open files
@@ -2533,6 +2532,11 @@ impl EnrollServer {
             Some(o) if o.contains('@') => o.parse()?,
             Some(o) => format!("{o}@{}", self.info.realm).parse()?,
         };
+        // A seal of a foreign owner the realm no longer permits is gone for
+        // everyone but the seal administrators' revocation.
+        if owner.realm() != self.info.realm && owner_permitted(&owner, directory).is_err() {
+            return Err(missing_seal(caller, reference));
+        }
         directory
             .seals_of(&owner)
             .map_err(Refusal)?
@@ -3477,7 +3481,6 @@ impl EnrollServer {
     }
 
     fn admin_revoke_seal(
-        &self,
         caller: &Principal,
         owner: &str,
         name: &str,
@@ -3487,9 +3490,6 @@ impl EnrollServer {
             return Err(Refusal::because("seal administrator privilege required"));
         }
         let owner: Principal = owner.parse()?;
-        if owner.realm() != self.info.realm {
-            return Err(Refusal::because("wrong realm"));
-        }
         let mut seal = directory
             .seals_of(&owner)
             .map_err(Refusal)?
@@ -3582,7 +3582,7 @@ impl EnrollServer {
                 seal
             }
             SealOp::AdminRevoke { owner, name } => {
-                self.admin_revoke_seal(caller, &owner, &name, directory)?
+                Self::admin_revoke_seal(caller, &owner, &name, directory)?
             }
         };
         record(&seal)?;
@@ -3751,8 +3751,13 @@ impl EnrollServer {
             .keys
             .escrow_key(recovery.kid())
             .ok_or_else(|| Refusal::because("unknown escrow key"))?;
+        // Only a user seal has an owner of another realm, and only where the
+        // realm permits one.
         if request.principal().realm() != self.info.realm {
-            return Err(Refusal::because("wrong realm"));
+            if self.is_machine_request(request) {
+                return Err(Refusal::because("wrong realm"));
+            }
+            owner_permitted(request.principal(), directory)?;
         }
         let opened = recovery
             .open(key, escrow::DOMAIN)
@@ -4052,6 +4057,25 @@ fn limits_for(owner: &str, directory: &dyn Directory) -> Result<Limits, Refusal>
     let owner: Principal = owner.parse()?;
     let groups = directory.principal_groups(&owner).map_err(Refusal)?;
     Ok(realm.for_groups(&groups))
+}
+
+/// Whether the realm lets `owner`, a user of another realm, own seals
+/// (`Limits::trusted_owners`, from the groups of their ID override).
+fn owner_permitted(owner: &Principal, directory: &dyn Directory) -> Result<(), Refusal> {
+    if directory.principal_locked(owner).map_err(Refusal)? {
+        return Err(Refusal::because(format!(
+            "{owner} has no usable ID override here"
+        )));
+    }
+    if limits_for(&owner.to_string(), directory)?
+        .trusted_owners
+        .permits(owner)
+    {
+        return Ok(());
+    }
+    Err(Refusal::because(format!(
+        "the realm does not let {owner} own seals"
+    )))
 }
 
 /// The refusal for a seal that does not exist or that `caller` has no
