@@ -125,7 +125,7 @@ pub struct Settings {
 
 /// A failed send, classified for the gossip engine.
 #[derive(Debug)]
-pub enum PeerError {
+pub(crate) enum PeerError {
     /// The peer refused the sync (`401`/`403`).
     Rejected,
     /// The peer temporarily cannot accept another repair.
@@ -327,7 +327,7 @@ fn selected_peers<'a>(
 /// The state shared by the gossip engine, the maintenance task and the
 /// sync route.  Implements agirru's transport, membership, storage and
 /// hooks.
-pub struct Exchange {
+pub(crate) struct Exchange {
     settings: Settings,
     /// This server's anchor; `None` without the anchor role.
     anchor: Option<SigningKey>,
@@ -818,7 +818,7 @@ impl Peers {
     /// # Errors
     ///
     /// Signing or key store errors.
-    pub async fn refresh(&self) -> Result<(), Error> {
+    async fn refresh(&self) -> Result<(), Error> {
         let x = &self.exchange;
         x.refresh_members().await;
         let (me, realm) = (&x.settings.me, &x.settings.realm);
@@ -1803,7 +1803,7 @@ fn epoch_window(chain: &[SignedEpoch]) -> Result<Vec<Vec<u8>>, Error> {
 }
 
 /// The agirru runtime: every part is the [`Exchange`].
-pub struct Runtime(Arc<Exchange>, CborCodec);
+pub(crate) struct Runtime(Arc<Exchange>, CborCodec);
 
 impl GossipRuntime<AnchorState, String> for Runtime {
     type Transport = Exchange;

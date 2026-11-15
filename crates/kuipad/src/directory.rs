@@ -1040,7 +1040,7 @@ impl Directory for LdapDirectory {
             ca_servers,
         };
         if let Some(reason) = policy.check(principal, fetch.namespace) {
-            keys.audit(format!(
+            crate::keys::audit(&format!(
                 "DENIED: {principal} asked for {}/{}: {reason}",
                 fetch.namespace.label(),
                 fetch.nickname
@@ -1050,7 +1050,7 @@ impl Directory for LdapDirectory {
         let answer = keys
             .fetch(fetch)
             .map_err(|e| DirectoryError::from(e.to_string()))?;
-        keys.audit(format!(
+        crate::keys::audit(&format!(
             "ALLOWED: {principal} fetched {}/{}",
             fetch.namespace.label(),
             fetch.nickname

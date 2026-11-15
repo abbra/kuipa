@@ -425,7 +425,7 @@ fn establish_trust(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Er
         );
         println!(
             "trust secret: {}",
-            String::from_utf8_lossy(kuipad::trust::secret_text(&established).as_ref())
+            String::from_utf8_lossy(kuipa_enroll::trust::secret_text(&established.secret).as_ref())
         );
         println!(
             "and add to `trusts` in the configuration: {}",

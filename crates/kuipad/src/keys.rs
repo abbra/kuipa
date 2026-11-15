@@ -12,7 +12,6 @@ use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 
 use kuipa_enroll::keys::{KeysAnswer, KeysFetch, MAX_VALUE, Namespace};
 
@@ -30,9 +29,6 @@ pub struct Handler {
 pub struct Keys {
     handlers: Vec<(Namespace, Handler)>,
     broker: Option<PathBuf>,
-    /// The audit line prefix: one line per fetch, to stderr until the
-    /// daemon grows a file destination.
-    audit: Mutex<Vec<String>>,
 }
 
 /// A handler run failed.
@@ -156,7 +152,6 @@ impl Keys {
         Self {
             broker: None,
             handlers,
-            audit: Mutex::new(Vec::new()),
         }
     }
 
@@ -166,7 +161,6 @@ impl Keys {
         Self {
             handlers: Vec::new(),
             broker: Some(path),
-            audit: Mutex::new(Vec::new()),
         }
     }
 
@@ -332,26 +326,15 @@ impl Keys {
         };
         stream.write_all(&response)
     }
+}
 
-    /// The audit line for one fetch (§18.2), and the decision's reason
-    /// when it was refused.
-    ///
-    /// # Panics
-    ///
-    /// Only when another thread panicked while holding the audit lock.
-    pub fn audit(&self, line: String) {
-        // One line per fetch, the parity `/var/log/ipa-custodia.audit.log`
-        // needs: caller, namespace, nickname, decision.  The daemon logs
-        // to stderr for now; a file destination comes with deployment.
-        eprintln!("kuipad: keys: {line}");
-        let mut audit = self.audit.lock().expect("audit lock");
-        audit.push(line);
-        // Bounded memory: keep the recent tail.
-        let len = audit.len();
-        if len > 1024 {
-            audit.drain(..len - 1024);
-        }
-    }
+/// The audit line for one fetch (§18.2), and the decision's reason when it
+/// was refused: one line per fetch, the parity
+/// `/var/log/ipa-custodia.audit.log` needs (caller, namespace, nickname,
+/// decision).  The daemon logs to stderr for now; a file destination comes
+/// with deployment.
+pub(crate) fn audit(line: &str) {
+    eprintln!("kuipad: keys: {line}");
 }
 
 /// Whether `user` names our own uid (no privilege change needed).

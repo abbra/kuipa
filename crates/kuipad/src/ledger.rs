@@ -47,11 +47,11 @@ use crate::{Error, lock};
 /// nothing was appended: heads carry their time, and monitors want a
 /// recent one.  Also the default publication period
 /// ([`FileLedger::with_head_interval`]).
-pub const HEAD_INTERVAL: Duration = Duration::from_secs(3600);
+pub(crate) const HEAD_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// How many months of openings a server keeps by default: a year and a
 /// month, so a yearly review still finds the whole year.
-pub const RETENTION_MONTHS: u32 = 13;
+pub(crate) const RETENTION_MONTHS: u32 = 13;
 
 /// Largest leaf record accepted when reading the store.
 const MAX_RECORD: usize = tlog::MAX_BODY + 128;
@@ -63,6 +63,7 @@ const MAX_OPENING: usize = 2 * tlog::MAX_BODY + 128;
 #[derive(Debug)]
 pub struct FileLedger {
     id: LogId,
+    #[cfg(test)]
     path: PathBuf,
     openings_dir: PathBuf,
     witnesses: Vec<VerifyingKey>,
@@ -134,6 +135,7 @@ impl FileLedger {
         let openings = read_openings(&openings_dir, &leaves)?;
         let ledger = Self {
             id,
+            #[cfg(test)]
             path,
             openings_dir,
             witnesses: Vec::new(),
@@ -331,8 +333,8 @@ impl FileLedger {
     }
 
     /// The file the leaves are kept in.
-    #[must_use]
-    pub fn path(&self) -> &Path {
+    #[cfg(test)]
+    fn path(&self) -> &Path {
         &self.path
     }
 

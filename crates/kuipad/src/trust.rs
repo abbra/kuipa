@@ -25,7 +25,6 @@ use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::realm::{TrustedRealm, VerifiedRealm};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::{self, Established, Invitation, TrustResponse};
-use native_ossl::util::SecretBuf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -138,7 +137,7 @@ fn base(target: &str) -> String {
 /// # Errors
 ///
 /// Network errors or a failed verification.
-pub async fn advertisement(
+async fn advertisement(
     server: &str,
     endpoints: &BTreeMap<String, String>,
     realm: &str,
@@ -222,12 +221,6 @@ pub async fn establish(
         failures.join("; ")
     )
     .into())
-}
-
-/// The trust secret as `trust-add --trust_secret` takes it.
-#[must_use]
-pub fn secret_text(established: &Established) -> SecretBuf {
-    trust::secret_text(&established.secret)
 }
 
 /// The advertised heads backed by a signature: those also in `proved`,
