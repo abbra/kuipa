@@ -1281,6 +1281,28 @@ rekey that produces the keys they protect (`Sealer::prepare`), so the
 registrations travel in that same authenticated request; the keytab is
 sealed once the response arrives (`Sealer::seal`).
 
+**TPM factor (implemented).** `kuipa protect --tpm [--tpm-pcrs LIST]` also
+binds the object to this host's TPM, so a copied disk or a snapshot
+restored on another instance cannot open it, whatever the servers answer.
+The client draws a second 32-byte share `B` and keeps it as a
+`systemd-creds` credential (`--with-key=tpm2`, so a host without a TPM
+fails instead of falling back to the host key; no PCRs unless
+`--tpm-pcrs` names them), named `kuipa-share`. `DEK` stays what the servers
+wrap (`W_i`); the data key becomes
+
+```
+DEK' = HKDF-SHA-384(DEK ‖ B, "tpm dek", kind ‖ principal)
+IPTK / IPTF = principal ‖ slots ‖ pcrs ‖ credential(B) ‖ GCM_DEK'(contents)
+```
+
+(`IPTK` for a keytab, `IPTF` for a file.) Only the client combines the
+shares: the servers, the wire protocol and the registrations do not change,
+and the server cannot tell a TPM-bound seal from another one. Nothing is
+attested. Unsealing first opens the credential on this host's TPM and fails
+with a plain error, not a retry, when it does not open; a reseal or
+`rotate-keys` keeps the factor and the PCR list with a fresh share, and
+only `unprotect` then `protect` removes it.
+
 ### 7.2 Registration and recovery
 
 Tang servers are stateless; for a host keytab that would let a stolen disk
@@ -1559,6 +1581,7 @@ Devices registered before shared seals have none and are the owner's.
 | `file` | `device.key` in the user's kuipa directory: `IPDK(kdf, iterations, salt, GCM_k(private JWK))` with `k = PBKDF2-HMAC-SHA-512(passphrase, salt)`, 600 000 iterations (native-ossl exports no encrypted PKCS#8 for ML-KEM keys, so the format is kuipa's own) | `any` |
 | `passkey` | a key file encrypted under the FIDO2 `hmac-secret` (WebAuthn PRF) output of a passkey; every use needs a touch, and the PIN if one was given (implemented: `kuipa seal device add --passkey` makes a non-discoverable credential of the device's own, under the RP ID `kuipa:<realm>`, ML-DSA first where the key offers it; `device.key` becomes `IPDK kdf(2) rp_id credential_id uv salt(32) GCM_k(private JWK)` with `k = HKDF(hmac-secret(salt), "passkey device key", salt ‖ credential_id)`, `uv` saying whether the PIN verified the user, since `hmac-secret` answers differently with and without) | `hardware-wrapped` |
 | `pkcs11-wrapped` | a key file wrapped by an AES key on a PKCS#11 token (`CKM_AES_KEY_WRAP_KWP`); RSA or EC wrapping is refused (harvest-now-decrypt-later) | `hardware-wrapped` |
+| `tpm` | a key file kept as a user-scoped `systemd-creds` credential (`kuipa seal device add --tpm`): `device.key` is `IPDK kdf(3) credential`, the credential named `kuipa-device` and opened without a passphrase, only on this host's TPM; the ML-KEM key is decapsulated in RAM, since TPMs have no ML-KEM, so it is never `hardware-bound`; the server asks for a deposit where the realm requires one, as for `file` | `hardware-wrapped` |
 | `pkcs11` | an ML-KEM key generated on a PKCS#11 3.2 token (`CKM_ML_KEM`), non-extractable, used by `pkcs11:` URI through OpenSSL's pkcs11-provider (implemented: kuipa loads the provider into its own library context with a configuration written to the user's runtime directory, passes the PIN as the URI's `pin-value`, and decapsulates on the token; the host remembers the module and URI in `device.pkcs11`; tested with kryoptic) | `hardware-bound` |
 
 No attestation is verified yet, so every device is registered at `any`.
@@ -1801,8 +1824,9 @@ uses the request of §7.6.5:
   today, so an old image stops opening), no sessions, no count.
 * Every binding carries the commitment, so the server's check no longer
   rests on the registration alone.
-* A TPM-protected machine key, when the TPM factor (§7.1) is built, is a
-  machine seal with `factors.device = hardware-bound`.
+* The TPM factor (§7.1) does not change the machine seal: it is a
+  client-side share combined with the server's, not a device level. The
+  server cannot tell, and nothing is attested.
 
 #### 7.6.9 Client
 
@@ -2051,6 +2075,11 @@ offline-session epoch on every removal.
 In mode A the public key must reach the administrator authentically, or an
 attacker substitutes their own. `S` is server-generated and never a
 password, so there is no offline guessing.
+
+`kuipa prepare --tpm` keeps the machine key as a TPM credential
+(`recipient.cred`, named `kuipa-recipient`) instead of `recipient.jwk`;
+`kuipa enroll --bundle` opens it on this host's TPM and removes it with the
+bundle's other staging files.
 
 ### 8.3 Staging
 
@@ -2682,6 +2711,8 @@ IPOB  mode(1) alg(1) realm fqdn id(16) iat(u64) not_after(u64) recipient(32)
       signer(32) ct sealed delegation(JSON) signer_key(JWK) signature            offline bundle
 IPSK  principal n(1) [server binding(TQBD) ek commitment(32) wrapped] sealed     sealed keytab
 IPSF  same fields                                                                sealed file
+IPTK  as IPSK, then pcrs(str) credential, before sealed                           sealed keytab with a TPM share (§7.1)
+IPTF  as IPSF, then pcrs(str) credential, before sealed                           sealed file with a TPM share (§7.1)
 IPCV  principal seal(16)                                                        what a binding commits to (commitment input, never sent)
 IPEQ  principal seal(16) commitment(32) recovery(TQRQ) device session ticket     escrow request (device: empty or a 32-byte thumbprint; session: empty or IPST; ticket: empty or a GSS-API token)
 IPUF  principal seal(16) n(1) [server binding(TQBD) ek commitment(32) wrapped]
@@ -3181,7 +3212,7 @@ daemon's.  The IPA installer writes both sections.
 | claim-log services: head windows with consistency-checked refresh, frozen-trust pins, cross-realm heads, the signed vouch in claim-log pages, `kuipa-audit`, `kuipa-mirror` (DESIGN-claim-logs.md) | implemented, tested (window merge and consistency rules, frozen refusals — every frozen anchor by its own head, trust install of a partner's heads *only where a signature proves them*, claim-log pages with their vouch, the audit's coverage states and split views over HTTP with the served head's signature checked, the mirror's sync/serve/no-route and cached head proofs with pages cached only under proved heads, expired pins trusted no more than absent ones, corrupt pin files refusing, the whole window travelling on `?head=`, fetch caps on oversized trees, playground session steps) |
 | vouchers (§9): `ml-dsa-blind` issuing, `kuipa-voucher`, bound and bearer vouchers, voucher joins | implemented, tested against a real KDC; the LDAP side **not yet run against FreeIPA** |
 | secrets transport (§18): the `keys` operation, handler execution with runas, `kuipa keys fetch`, the `cn=masters` and CA-role policy, a promotion scenario in the playground | implemented, tested; the LDAP policy check **not yet run against a FreeIPA server**; sealed lightweight-CA artifacts (§18.3) designed |
-| TPM factor for sealed keytabs, `prepare --tpm` | designed |
+| TPM factor for sealed keytabs and files (§7.1), `prepare --tpm` (§8.2), the user-seal `tpm` device (§7.6.2) | implemented; tested in `kdc.rs` with a test double for `systemd-creds` (the factor kept through rotation and resealing, another TPM refused without a retry, the TPM-held machine key through `enroll --bundle`, the device key), and on a real swtpm vTPM in ci-freeipa VMs (`protect --tpm`, a restart, `rotate-keys`, `check`, a copied disk refused on another vTPM, `prepare --tpm`, `seal device add --tpm` as an unprivileged user); **not yet**: `enroll --bundle` of a TPM-held machine key on FreeIPA (`host-add --stage` is not in the FreeIPA build), the gssproxy loader under SELinux enforcing, PCR-bound seals surviving a firmware or kernel update |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
 | `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
 | user seals, unified recovery (§7.6): seal model and descriptor, devices (passphrase files, passkey-wrapped files, PKCS#11 tokens), the ticket and passkey factors (classical and ML-DSA passkeys), sessions, offline sessions, unlock counts, registered sealing, shared seals (§7.6.12), release approvals (DESIGN-approvals.md), machine seals for host and service escrow, `kuipa seal` | implemented, tested against a real KDC; **not yet**: attestation for the `hardware-*` levels, PAC delegation info for `ticket.delegation`; the LDAP side **not yet run against FreeIPA** |
