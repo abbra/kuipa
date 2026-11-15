@@ -1125,6 +1125,12 @@ impl From<tang_pqc::Error> for Refusal {
     }
 }
 
+impl From<DirectoryError> for Refusal {
+    fn from(e: DirectoryError) -> Self {
+        Self(e)
+    }
+}
+
 impl From<Error> for Refusal {
     fn from(e: Error) -> Self {
         Self::because(e)
@@ -1321,7 +1327,7 @@ impl EnrollServer {
     fn record(&self, kind: Kind, subject: &[u8], body: &[u8]) -> Result<Option<Receipt>, Refusal> {
         let now = unix_seconds(SystemTime::now());
         let opening = Opening::new(kind, now, subject, body.to_vec())?;
-        let Some(a) = self.ledger.append(opening).map_err(Refusal)? else {
+        let Some(a) = self.ledger.append(opening)? else {
             return Ok(None);
         };
         Ok(Some(Receipt::issue(
@@ -1718,9 +1724,7 @@ impl EnrollServer {
 
         let payload = match (request.operation(), request.auth_type()) {
             (Operation::Join, AuthType::Otp) => {
-                let keytab = directory
-                    .join_with_otp(fqdn, token, enctypes)
-                    .map_err(Refusal)?;
+                let keytab = directory.join_with_otp(fqdn, token, enctypes)?;
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
             (Operation::Join, AuthType::Voucher) => {
@@ -1729,16 +1733,12 @@ impl EnrollServer {
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
             (Operation::Join, AuthType::Kerberos) => {
-                let (keytab, binding) = directory
-                    .join_with_gss(fqdn, token, &cb, enctypes)
-                    .map_err(Refusal)?;
+                let (keytab, binding) = directory.join_with_gss(fqdn, token, &cb, enctypes)?;
                 kerberos = Some(binding);
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
             (Operation::Rekey, AuthType::Kerberos) => {
-                let (keytab, binding) = directory
-                    .rekey_with_gss(fqdn, token, &cb, enctypes)
-                    .map_err(Refusal)?;
+                let (keytab, binding) = directory.rekey_with_gss(fqdn, token, &cb, enctypes)?;
                 kerberos = Some(binding);
                 self.enrollment(keytab, directory)?.to_bytes()?
             }
@@ -1772,9 +1772,7 @@ impl EnrollServer {
             }
         };
         if !body.registrations.is_empty() && request.operation() != Operation::Stage {
-            directory
-                .register_escrow(&principal, &body.registrations)
-                .map_err(Refusal)?;
+            directory.register_escrow(&principal, &body.registrations)?;
         }
         Ok(request.respond(ss.as_ref(), &t, kerberos.as_ref(), payload.as_ref())?)
     }
@@ -1903,15 +1901,13 @@ impl EnrollServer {
             not_after: params.not_after,
             recipient: params.recipient.as_ref().map(|k| *k.kid()),
         };
-        let (keytab, binding) = directory
-            .stage_with_gss(
-                request.fqdn(),
-                body.authenticator.as_ref(),
-                cb,
-                request.enctypes(),
-                &staged,
-            )
-            .map_err(Refusal)?;
+        let (keytab, binding) = directory.stage_with_gss(
+            request.fqdn(),
+            body.authenticator.as_ref(),
+            cb,
+            request.enctypes(),
+            &staged,
+        )?;
         let enrollment = self.enrollment(keytab, directory)?;
         let recipient = match (params.mode, &params.recipient) {
             (crate::bundle::Mode::MachineKey, Some(k)) => Recipient::MachineKey(k),
@@ -1950,9 +1946,7 @@ impl EnrollServer {
         }
         let cb = channel_binding(request.alg(), ss, t)?;
         let token = body.authenticator.as_ref();
-        let binding = directory
-            .register_with_gss(&params, &body.registrations, token, &cb)
-            .map_err(Refusal)?;
+        let binding = directory.register_with_gss(&params, &body.registrations, token, &cb)?;
         Ok(request.respond(ss, t, Some(&binding), &params.acknowledgement())?)
     }
 
@@ -1968,9 +1962,7 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<Response, Refusal> {
         let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory
-            .accept_user(body.authenticator.as_ref(), &cb)
-            .map_err(Refusal)?;
+        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
         let caller: Principal = accepted.principal.parse()?;
         let op = SealOp::from_bytes(&body.extra)?;
         self.admit_caller(&caller, directory)?;
@@ -2070,9 +2062,7 @@ impl EnrollServer {
     /// the realm (keys, enrollment, owning seals) refuse the other realm
     /// before this.
     fn admit_caller(&self, caller: &Principal, directory: &dyn Directory) -> Result<(), Refusal> {
-        if caller.realm() != self.info.realm
-            && directory.principal_locked(caller).map_err(Refusal)?
-        {
+        if caller.realm() != self.info.realm && directory.principal_locked(caller)? {
             return Err(Refusal::because(format!(
                 "wrong realm: {caller} has no ID override here"
             )));
@@ -2103,7 +2093,7 @@ impl EnrollServer {
         }
         let rotated = self.maintain_epochs(seal, now, rotate || !gone.is_empty(), directory)?;
         if rotated || !gone.is_empty() {
-            directory.seal_update(seal).map_err(Refusal)?;
+            directory.seal_update(seal)?;
         }
         Ok(receipts)
     }
@@ -2160,31 +2150,25 @@ impl EnrollServer {
             }
         };
         let token = body.authenticator.as_ref();
-        let (caller, binding, value) = if let Some(brokered) = directory
-            .fetch_key_via_broker(token, &cb, &fetch)
-            .map_err(Refusal)?
-        {
-            let caller: Principal = brokered.principal.parse()?;
-            same_realm(&caller)?;
-            (caller, brokered.binding, brokered.value)
-        } else {
-            let accepted = directory.accept_user(token, &cb).map_err(Refusal)?;
-            let caller: Principal = accepted.principal.parse()?;
-            same_realm(&caller)?;
-            let value = directory.fetch_key(&caller, &fetch).map_err(Refusal)?;
-            (caller, accepted.binding, value)
-        };
+        let (caller, binding, value) =
+            if let Some(brokered) = directory.fetch_key_via_broker(token, &cb, &fetch)? {
+                let caller: Principal = brokered.principal.parse()?;
+                same_realm(&caller)?;
+                (caller, brokered.binding, brokered.value)
+            } else {
+                let accepted = directory.accept_user(token, &cb)?;
+                let caller: Principal = accepted.principal.parse()?;
+                same_realm(&caller)?;
+                let value = directory.fetch_key(&caller, &fetch)?;
+                (caller, accepted.binding, value)
+            };
         self.record(
             Kind::KEYS_FETCH,
             caller.to_string().as_bytes(),
-            &fetch
-                .to_bytes()
-                .map_err(|e| Refusal::because(e.to_string()))?,
+            &fetch.to_bytes()?,
         )?;
         let answer = crate::keys::KeysAnswer { value };
-        let payload = answer
-            .to_bytes()
-            .map_err(|e| Refusal::because(e.to_string()))?;
+        let payload = answer.to_bytes()?;
         Ok(request.respond(ss, t, Some(&binding), &payload)?)
     }
 
@@ -2201,23 +2185,18 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<Response, Refusal> {
         let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory
-            .accept_user(body.authenticator.as_ref(), &cb)
-            .map_err(Refusal)?;
+        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
         let caller: Principal = accepted.principal.parse()?;
         let asked = crate::sign::Request::from_bytes(&body.extra)?;
-        let groups = directory.principal_groups(&caller).map_err(Refusal)?;
+        let groups = directory.principal_groups(&caller)?;
         // After the groups: an override removed before that read shows
         // here (gone is locked), not as a user with no groups.
-        if directory.principal_locked(&caller).map_err(Refusal)? {
+        if directory.principal_locked(&caller)? {
             return Err(Refusal::because(format!("{caller} is locked or gone")));
         }
-        directory.sign_policy().map_err(Refusal)?.check(
-            &self.info.realm,
-            &caller,
-            &groups,
-            &asked.purpose,
-        )?;
+        directory
+            .sign_policy()?
+            .check(&self.info.realm, &caller, &groups, &asked.purpose)?;
         let tree = self.tree_hash();
         if let Some(d) = asked.digests.iter().find(|d| !d.alg.fits(tree)) {
             return Err(Refusal::because(format!(
@@ -2234,7 +2213,7 @@ impl EnrollServer {
             caller.to_string().as_bytes(),
             crate::sign::Statement::log_body(&asked.purpose, leaves.len() as u64, &batch_root, now),
         )?;
-        let Some(appended) = self.ledger.append(opening).map_err(Refusal)? else {
+        let Some(appended) = self.ledger.append(opening)? else {
             return Err(Refusal::because(
                 "this server keeps no transparency log: it states nothing it cannot show",
             ));
@@ -2268,9 +2247,7 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<Response, Refusal> {
         let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory
-            .accept_user(body.authenticator.as_ref(), &cb)
-            .map_err(Refusal)?;
+        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
         let caller: Principal = accepted.principal.parse()?;
         self.admit_caller(&caller, directory)?;
         let (anchors, heads) = self.anchors_and_heads();
@@ -2280,9 +2257,7 @@ impl EnrollServer {
             anchors,
             heads,
         };
-        let bytes = answer
-            .to_bytes()
-            .map_err(|e| Refusal::because(e.to_string()))?;
+        let bytes = answer.to_bytes()?;
         Ok(request.respond(ss, t, Some(&accepted.binding), &bytes)?)
     }
 
@@ -2298,9 +2273,7 @@ impl EnrollServer {
         directory: &dyn Directory,
     ) -> Result<Response, Refusal> {
         let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory
-            .accept_user(body.authenticator.as_ref(), &cb)
-            .map_err(Refusal)?;
+        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
         let caller: Principal = accepted.principal.parse()?;
         self.admit_caller(&caller, directory)?;
         let query = crate::tlog::Query::from_bytes(&body.extra)?;
@@ -2308,8 +2281,7 @@ impl EnrollServer {
             caller.to_string().into_bytes()
         } else {
             directory
-                .seals_of(&caller)
-                .map_err(Refusal)?
+                .seals_of(&caller)?
                 .into_iter()
                 .find(|v| v.name == query.seal)
                 .ok_or_else(|| Refusal::because(format!("{caller} has no seal {:?}", query.seal)))?
@@ -2318,15 +2290,12 @@ impl EnrollServer {
                 .to_vec()
         };
         let now = unix_seconds(SystemTime::now());
-        let head = self
-            .ledger
-            .signed_head(&self.keys.signing, now)
-            .map_err(Refusal)?;
+        let head = self.ledger.signed_head(&self.keys.signing, now)?;
         let entries = match &head {
-            Some(h) => self
-                .ledger
-                .find(&subject, query.from, h.head.size, crate::tlog::MAX_ANSWER)
-                .map_err(Refusal)?,
+            Some(h) => {
+                self.ledger
+                    .find(&subject, query.from, h.head.size, crate::tlog::MAX_ANSWER)?
+            }
             None => Vec::new(),
         };
         let answer = crate::tlog::Answer {
@@ -2343,7 +2312,7 @@ impl EnrollServer {
         &self,
         directory: &dyn Directory,
     ) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, Refusal> {
-        let mut servers = directory.escrow_servers().map_err(Refusal)?;
+        let mut servers = directory.escrow_servers()?;
         let own = self
             .keys
             .escrow
@@ -2352,9 +2321,7 @@ impl EnrollServer {
             .public()
             .clone();
         if !servers.iter().any(|(_, k)| k.kid() == own.kid()) {
-            directory
-                .publish_escrow_key(&self.info.server, &own)
-                .map_err(Refusal)?;
+            directory.publish_escrow_key(&self.info.server, &own)?;
             servers.retain(|(s, _)| s != &self.info.server);
             servers.push((self.info.server.clone(), own));
         }
@@ -2464,10 +2431,7 @@ impl EnrollServer {
         }
         let device = registered.thumbprint()?;
         let released = if offline {
-            if !directory
-                .seal_unlock(&seal.id, &self.info.server, seal.policy.max_unlocks)
-                .map_err(Refusal)?
-            {
+            if !directory.seal_unlock(&seal.id, &self.info.server, seal.policy.max_unlocks)? {
                 return Err(Refusal::because("the seal's unlock limit is reached"));
             }
             let keys = seal
@@ -2541,8 +2505,7 @@ impl EnrollServer {
             return Err(missing_seal(caller, reference));
         }
         directory
-            .seals_of(&owner)
-            .map_err(Refusal)?
+            .seals_of(&owner)?
             .into_iter()
             .find(|v| v.name == name)
             .ok_or_else(|| missing_seal(caller, reference))
@@ -2640,7 +2603,7 @@ impl EnrollServer {
         };
         let digest = self.log_digest(&[&request.log_bytes()])?;
         receipts.extend(self.record_seal(&seal.id, SealAction::Request, None, digest)?);
-        directory.release_add(&request).map_err(Refusal)?;
+        directory.release_add(&request)?;
         eprintln!(
             "kuipad: {caller} asked for release {} of seal {}",
             request.id, seal.id
@@ -2662,10 +2625,7 @@ impl EnrollServer {
         } else {
             let mut all = list_seals(caller, directory)?;
             let groups = directory.principal_groups(caller).unwrap_or_default();
-            for v in directory
-                .seals_approved_by(caller, &groups)
-                .map_err(Refusal)?
-            {
+            for v in directory.seals_approved_by(caller, &groups)? {
                 if !all.iter().any(|a| a.id == v.id) && approves(&v, caller, directory)? {
                     all.push(v);
                 }
@@ -2676,8 +2636,7 @@ impl EnrollServer {
         for v in seals.iter().filter(|v| v.policy.approvals.is_some()) {
             open.extend(
                 directory
-                    .releases(&v.id)
-                    .map_err(Refusal)?
+                    .releases(&v.id)?
                     .into_iter()
                     .filter(|r| r.is_open(now)),
             );
@@ -2702,12 +2661,11 @@ impl EnrollServer {
                 "{caller} does not approve releases of the seal"
             )));
         }
-        if directory.principal_locked(caller).map_err(Refusal)? {
+        if directory.principal_locked(caller)? {
             return Err(Refusal::because(format!("{caller} is locked or gone")));
         }
         let mut request = directory
-            .releases(&seal.id)
-            .map_err(Refusal)?
+            .releases(&seal.id)?
             .into_iter()
             .find(|r| r.id == id)
             .ok_or_else(|| Refusal::because(format!("no release request {id}")))?;
@@ -2732,9 +2690,7 @@ impl EnrollServer {
         };
         let digest = self.log_digest(&[request.id.as_bytes(), b" ", me.as_bytes()])?;
         receipts.extend(self.record_seal(&seal.id, action, None, digest)?);
-        directory
-            .release_mark(&seal.id, &request.id, &approval, deny)
-            .map_err(Refusal)?;
+        directory.release_mark(&seal.id, &request.id, &approval, deny)?;
         eprintln!(
             "kuipad: {caller} {} release {} of seal {}",
             if deny { "denied" } else { "approved" },
@@ -2792,14 +2748,12 @@ impl EnrollServer {
                     added: now,
                 };
                 log(&escrow.device, SealAction::EscrowCode)?;
-                directory
-                    .device_escrow_set(caller, &escrow)
-                    .map_err(Refusal)?;
+                directory.device_escrow_set(caller, &escrow)?;
                 eprintln!("kuipad: {caller} escrowed device {}", escrow.device);
                 Ok((vec![escrow], receipts))
             }
             SealOp::RecoverCode => {
-                let escrows = directory.device_escrows(caller).map_err(Refusal)?;
+                let escrows = directory.device_escrows(caller)?;
                 // Logged before anything is answered.
                 for e in &escrows {
                     log(&e.device, SealAction::RecoverCode)?;
@@ -2848,7 +2802,7 @@ impl EnrollServer {
                 for row in &rows[1..] {
                     log(&row.device, SealAction::EscrowShards)?;
                 }
-                directory.shards_replace(caller, &rows).map_err(Refusal)?;
+                directory.shards_replace(caller, &rows)?;
                 eprintln!(
                     "kuipad: {caller} registered recovery shard set {:05x} with {} device key(s)",
                     registration.set,
@@ -2858,8 +2812,7 @@ impl EnrollServer {
             }
             SealOp::EnrollShards { blobs } => {
                 if !directory
-                    .device_escrows(caller)
-                    .map_err(Refusal)?
+                    .device_escrows(caller)?
                     .iter()
                     .any(|e| e.kind == "shards-key")
                 {
@@ -2880,7 +2833,7 @@ impl EnrollServer {
                         added: now,
                     };
                     log(&row.device, SealAction::EnrollShards)?;
-                    directory.device_escrow_set(caller, &row).map_err(Refusal)?;
+                    directory.device_escrow_set(caller, &row)?;
                     rows.push(row);
                 }
                 eprintln!(
@@ -2891,8 +2844,7 @@ impl EnrollServer {
             }
             SealOp::RecoverShards => {
                 let rows: Vec<DeviceEscrow> = directory
-                    .device_escrows(caller)
-                    .map_err(Refusal)?
+                    .device_escrows(caller)?
                     .into_iter()
                     .filter(|e| e.kind == "shards-key" || e.kind == "shards")
                     .collect();
@@ -2937,7 +2889,7 @@ impl EnrollServer {
             SealOp::Passkeys => Reply {
                 passkeys: Some(PasskeyInfo::of(
                     &self.info.domain,
-                    &directory.passkeys(caller).map_err(Refusal)?,
+                    &directory.passkeys(caller)?,
                 )),
                 ..Reply::default()
             },
@@ -2975,7 +2927,7 @@ impl EnrollServer {
         now: u64,
         directory: &dyn Directory,
     ) -> Result<Reply, Refusal> {
-        let settings = directory.recovery_settings().map_err(Refusal)?;
+        let settings = directory.recovery_settings()?;
         let (user, device) = match &op {
             SealOp::RecoverySettings => {
                 return Ok(Reply {
@@ -3038,9 +2990,7 @@ impl EnrollServer {
             blob,
             added: now,
         };
-        directory
-            .device_escrow_set(&user, &escrow)
-            .map_err(Refusal)?;
+        directory.device_escrow_set(&user, &escrow)?;
         eprintln!(
             "kuipad: {caller} delivered a recovered key to {user}'s device {}",
             escrow.device
@@ -3067,8 +3017,7 @@ impl EnrollServer {
             SealOp::Deposits { name } => {
                 let (seal, role) = self.resolve_seal(caller, &name, directory)?;
                 let listed = directory
-                    .deposits(&seal.id)
-                    .map_err(Refusal)?
+                    .deposits(&seal.id)?
                     .into_iter()
                     .filter(|d| role >= Role::Member || d.depositor == me)
                     .map(|mut d| {
@@ -3135,7 +3084,7 @@ impl EnrollServer {
             return Err(Refusal::because("a malformed deposit subject"));
         }
         let me = caller.to_string();
-        let existing = directory.deposits(&seal.id).map_err(Refusal)?;
+        let existing = directory.deposits(&seal.id)?;
         let (replaced, others): (Vec<Deposit>, Vec<Deposit>) = existing
             .into_iter()
             .filter(|d| d.depositor == me)
@@ -3166,9 +3115,9 @@ impl EnrollServer {
                 .map(crate::seal::binding_hex)
                 .collect();
             register_bindings(&mut seal, add, &[])?;
-            directory.seal_update(&seal).map_err(Refusal)?;
+            directory.seal_update(&seal)?;
         }
-        directory.deposit_add(&deposit).map_err(Refusal)?;
+        directory.deposit_add(&deposit)?;
         receipts.extend(self.retire_deposits(&mut seal, &replaced, directory)?);
         eprintln!(
             "kuipad: {caller} deposited {} in seal {}",
@@ -3192,7 +3141,7 @@ impl EnrollServer {
         for d in deposits {
             let digest = self.log_digest(&[d.id.as_bytes()])?;
             receipts.extend(self.record_seal(&seal.id, SealAction::RetireDeposit, None, digest)?);
-            directory.deposit_remove(&seal.id, &d.id).map_err(Refusal)?;
+            directory.deposit_remove(&seal.id, &d.id)?;
             let file = tang_pqc::b64::decode(&d.sealed)
                 .ok()
                 .and_then(|b| crate::seal::SealedFile::from_bytes(&b).ok());
@@ -3202,7 +3151,7 @@ impl EnrollServer {
         }
         if seal.policy.sealing == crate::seal::Sealing::Registered && !retired.is_empty() {
             register_bindings(seal, Vec::new(), &retired)?;
-            directory.seal_update(seal).map_err(Refusal)?;
+            directory.seal_update(seal)?;
         }
         Ok(receipts)
     }
@@ -3236,8 +3185,7 @@ impl EnrollServer {
             .map(|id| hex(id))
             .ok_or_else(|| Refusal::because("the seal needs an approved release request"))?;
         let release = directory
-            .releases(&seal.id)
-            .map_err(Refusal)?
+            .releases(&seal.id)?
             .into_iter()
             .find(|r| r.id == id)
             .ok_or_else(|| Refusal::because(format!("no release request {id}")))?;
@@ -3259,10 +3207,7 @@ impl EnrollServer {
                 approvals.m
             )));
         }
-        if !directory
-            .release_use(&seal.id, &release.id, &self.info.server, approvals.uses())
-            .map_err(Refusal)?
-        {
+        if !directory.release_use(&seal.id, &release.id, &self.info.server, approvals.uses())? {
             return Err(Refusal::because("the release request is used up"));
         }
         Ok(())
@@ -3341,7 +3286,7 @@ impl EnrollServer {
         record: &mut dyn FnMut(&Seal) -> Result<(), Refusal>,
     ) -> Result<Vec<Seal>, Refusal> {
         let limits = limits_for(&caller.to_string(), directory)?;
-        let mine = directory.seals_of(caller).map_err(Refusal)?;
+        let mine = directory.seals_of(caller)?;
         if name.is_empty() || name.contains('/') {
             return Err(Refusal::because(format!("{name:?} is not a seal name")));
         }
@@ -3371,7 +3316,7 @@ impl EnrollServer {
             bindings: Vec::new(),
         };
         record(&seal)?;
-        directory.seal_add(&seal).map_err(Refusal)?;
+        directory.seal_add(&seal)?;
         Ok(vec![seal])
     }
 
@@ -3431,7 +3376,7 @@ impl EnrollServer {
         device: &crate::seal::Device,
         directory: &dyn Directory,
     ) -> Result<(), Refusal> {
-        let Some(settings) = directory.recovery_settings().map_err(Refusal)? else {
+        let Some(settings) = directory.recovery_settings()? else {
             return Ok(());
         };
         let extractable = matches!(
@@ -3445,15 +3390,11 @@ impl EnrollServer {
         }
         let helpdesk = self.find_seal(caller, &settings.device_seal, directory)?;
         let me = caller.to_string();
-        let deposited = directory
-            .deposits(&helpdesk.id)
-            .map_err(Refusal)?
-            .iter()
-            .any(|d| {
-                d.kind == crate::seal::DepositKind::Device
-                    && d.depositor == me
-                    && d.subject.get("device") == Some(&device.id)
-            });
+        let deposited = directory.deposits(&helpdesk.id)?.iter().any(|d| {
+            d.kind == crate::seal::DepositKind::Device
+                && d.depositor == me
+                && d.subject.get("device") == Some(&device.id)
+        });
         if deposited {
             Ok(())
         } else {
@@ -3489,13 +3430,12 @@ impl EnrollServer {
         name: &str,
         directory: &dyn Directory,
     ) -> Result<Seal, Refusal> {
-        if !directory.seal_admin(caller).map_err(Refusal)? {
+        if !directory.seal_admin(caller)? {
             return Err(Refusal::because("seal administrator privilege required"));
         }
         let owner: Principal = owner.parse()?;
         let mut seal = directory
-            .seals_of(&owner)
-            .map_err(Refusal)?
+            .seals_of(&owner)?
             .into_iter()
             .find(|seal| seal.name == name)
             .ok_or_else(|| Refusal::because("no such seal"))?;
@@ -3589,7 +3529,7 @@ impl EnrollServer {
             }
         };
         record(&seal)?;
-        directory.seal_update(&seal).map_err(Refusal)?;
+        directory.seal_update(&seal)?;
         if admin_revoke {
             eprintln!(
                 "kuipad: {caller} administratively revoked seal {} ({}) owned by {}",
@@ -3625,10 +3565,10 @@ impl EnrollServer {
                 domain: self.info.domain.clone(),
                 basedn: self.info.basedn.clone(),
                 issuer: self.info.server.clone(),
-                servers: directory.servers().map_err(Refusal)?,
+                servers: directory.servers()?,
             },
             keytab,
-            ca_certs: directory.ca_certificates().map_err(Refusal)?,
+            ca_certs: directory.ca_certificates()?,
             pkinit_anchors: self.info.pkinit_anchors.clone(),
             anchors,
             heads,
@@ -3678,9 +3618,7 @@ impl EnrollServer {
         let ss = key.decapsulate(request.ciphertext())?;
         let t = request.transcript(self.keys.signing.public().thumbprint())?;
         let body = request.open(ss.as_ref(), &t)?;
-        directory
-            .consume_trust_invitation(&trust::secret_hash(body.secret.as_ref())?)
-            .map_err(Refusal)?;
+        directory.consume_trust_invitation(&trust::secret_hash(body.secret.as_ref())?)?;
         let partner = body.partner;
         if partner.realm != request.initiator() {
             return Err(Refusal::because("the request and its realm disagree"));
@@ -3698,9 +3636,7 @@ impl EnrollServer {
         }
         signer.verify_with_context(&t, trust::SIGN_CONTEXT, &body.signature)?;
         let (response, secret) = request.respond(ss.as_ref(), &t, &self.as_partner())?;
-        directory
-            .record_trust(&partner, secret.as_ref())
-            .map_err(Refusal)?;
+        directory.record_trust(&partner, secret.as_ref())?;
         Ok(response)
     }
 
@@ -3778,10 +3714,7 @@ impl EnrollServer {
             return self.recover_seal(request, opened, directory, admit);
         };
         let binding = BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?;
-        if !directory
-            .escrow_allowed(request.principal(), kind, &binding)
-            .map_err(Refusal)?
-        {
+        if !directory.escrow_allowed(request.principal(), kind, &binding)? {
             return Err(Refusal::because(
                 "binding not registered or its principal disabled",
             ));
@@ -3825,9 +3758,7 @@ impl EnrollServer {
                 return Err(Refusal::because("the seal needs the opener's ticket"));
             }
             let cb = request.ticket_binding()?;
-            let accepted = directory
-                .accept_user(request.ticket(), &cb)
-                .map_err(Refusal)?;
+            let accepted = directory.accept_user(request.ticket(), &cb)?;
             if !seal
                 .policy
                 .ticket_delegation
@@ -3863,7 +3794,7 @@ impl EnrollServer {
         challenge: &[u8; 32],
         directory: &dyn Directory,
     ) -> Result<(), Refusal> {
-        let passkeys = directory.passkeys(who).map_err(Refusal)?;
+        let passkeys = directory.passkeys(who)?;
         Assertion::from_bytes(assertion)?
             .verify(
                 &passkeys.keys(),
@@ -3887,8 +3818,7 @@ impl EnrollServer {
         admit: &dyn Fn(&Principal) -> bool,
     ) -> Result<Recovered, Refusal> {
         let seal = directory
-            .seal_get(request.seal())
-            .map_err(Refusal)?
+            .seal_get(request.seal())?
             .ok_or_else(|| Refusal::because(format!("unknown seal {}", request.seal())))?;
         // `P` names the seal's owner, whoever opens it.
         if seal.owner != request.principal().to_string() {
@@ -3916,13 +3846,12 @@ impl EnrollServer {
         if !seal.opens(&who, &groups) {
             return Err(Refusal::because(format!("{who} has no part in the seal")));
         }
-        if directory.principal_locked(&who).map_err(Refusal)? {
+        if directory.principal_locked(&who)? {
             return Err(Refusal::because(format!("{who} is locked or gone")));
         }
         if seal.policy.ticket_leased
             && directory
-                .principal_lease(&who)
-                .map_err(Refusal)?
+                .principal_lease(&who)?
                 .is_none_or(|end| now >= end)
         {
             return Err(Refusal::because(format!(
@@ -3961,10 +3890,7 @@ impl EnrollServer {
             ));
         }
         self.check_release(&seal, request, &who, &binding, now, directory)?;
-        if !directory
-            .seal_unlock(request.seal(), &self.info.server, seal.policy.max_unlocks)
-            .map_err(Refusal)?
-        {
+        if !directory.seal_unlock(request.seal(), &self.info.server, seal.policy.max_unlocks)? {
             return Err(Refusal::because("the seal's unlock limit is reached"));
         }
         self.record_release(request, device, &opened)?;
@@ -4053,19 +3979,19 @@ fn prune_departed(seal: &mut Seal, directory: &dyn Directory) -> Result<Vec<Stri
 /// the realm gives them by (§7.6.2).  The owner's groups are looked up only
 /// when the realm sets limits for any.
 fn limits_for(owner: &str, directory: &dyn Directory) -> Result<Limits, Refusal> {
-    let realm = directory.seal_limits().map_err(Refusal)?;
+    let realm = directory.seal_limits()?;
     if realm.groups.is_empty() {
         return Ok(realm);
     }
     let owner: Principal = owner.parse()?;
-    let groups = directory.principal_groups(&owner).map_err(Refusal)?;
+    let groups = directory.principal_groups(&owner)?;
     Ok(realm.for_groups(&groups))
 }
 
 /// Whether the realm lets `owner`, a user of another realm, own seals
 /// (`Limits::trusted_owners`, from the groups of their ID override).
 fn owner_permitted(owner: &Principal, directory: &dyn Directory) -> Result<(), Refusal> {
-    if directory.principal_locked(owner).map_err(Refusal)? {
+    if directory.principal_locked(owner)? {
         return Err(Refusal::because(format!(
             "{owner} has no usable ID override here"
         )));
@@ -4117,7 +4043,7 @@ fn approves(
     let groups = if approvals.from.groups.is_empty() {
         Vec::new()
     } else {
-        directory.principal_groups(principal).map_err(Refusal)?
+        directory.principal_groups(principal)?
     };
     Ok(approvals.from.admits(principal, &groups))
 }
@@ -4139,11 +4065,9 @@ fn approvals_counted(
         let groups = if approvals.from.groups.is_empty() {
             Vec::new()
         } else {
-            directory.principal_groups(&approver).map_err(Refusal)?
+            directory.principal_groups(&approver)?
         };
-        if approvals.from.admits(&approver, &groups)
-            && !directory.principal_locked(&approver).map_err(Refusal)?
-        {
+        if approvals.from.admits(&approver, &groups) && !directory.principal_locked(&approver)? {
             counted.push(&a.approver);
         }
     }
@@ -4153,8 +4077,7 @@ fn approvals_counted(
 /// Deposit `id` of `seal`, with its file.
 fn find_deposit(seal: &Seal, id: &str, directory: &dyn Directory) -> Result<Deposit, Refusal> {
     directory
-        .deposits(&seal.id)
-        .map_err(Refusal)?
+        .deposits(&seal.id)?
         .into_iter()
         .find(|d| d.id == id)
         .ok_or_else(|| Refusal::because(format!("no deposit {id}")))
@@ -4182,13 +4105,10 @@ fn need(role: Role, least: Role, what: &str) -> Result<(), Refusal> {
 
 /// `caller`'s own seals, and those shared with them.
 fn list_seals(caller: &Principal, directory: &dyn Directory) -> Result<Vec<Seal>, Refusal> {
-    let mut all = directory.seals_of(caller).map_err(Refusal)?;
+    let mut all = directory.seals_of(caller)?;
     // A directory without groups shares by name alone.
     let groups = directory.principal_groups(caller).unwrap_or_default();
-    for v in directory
-        .seals_shared_with(caller, &groups)
-        .map_err(Refusal)?
-    {
+    for v in directory.seals_shared_with(caller, &groups)? {
         if v.role(caller, &groups).is_some() && !all.iter().any(|a| a.id == v.id) {
             all.push(v);
         }
@@ -4378,8 +4298,7 @@ fn voucher_lease(
         return Ok(None);
     }
     let max = directory
-        .voucher_settings()
-        .map_err(Refusal)?
+        .voucher_settings()?
         .unwrap_or_default()
         .max_lease();
     if claims.lease > max {
