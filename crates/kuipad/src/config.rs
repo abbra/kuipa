@@ -246,15 +246,9 @@ impl Config {
         }
         let mut handlers = Vec::new();
         for (label, handler) in &cfg.handlers {
-            let namespace = match label.as_str() {
-                "dm" => kuipa_enroll::keys::Namespace::Dm,
-                "ra" => kuipa_enroll::keys::Namespace::Ra,
-                "ca" => kuipa_enroll::keys::Namespace::Ca,
-                "ca_wrapped" => kuipa_enroll::keys::Namespace::CaWrapped,
-                "lwca-store" => kuipa_enroll::keys::Namespace::LwcaStore,
-                "akamu" => kuipa_enroll::keys::Namespace::Akamu,
-                _ => return Err(format!("unknown keys namespace: {label}").into()),
-            };
+            let namespace = label
+                .parse()
+                .map_err(|_| format!("unknown keys namespace: {label}"))?;
             handlers.push((
                 namespace,
                 crate::keys::Handler {

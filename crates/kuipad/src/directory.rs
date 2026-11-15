@@ -30,7 +30,7 @@
 //!   `cn=$REALM,cn=kerberos,$SUFFIX` and given keys from the trust secret
 //!   with `KEYTAB_GET` and a password, as `ipa-getkeytab -P` does.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use kuipa_enroll::escrow::{Kind, RegisterParams, SealId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
@@ -370,8 +370,7 @@ impl LdapDirectory {
             .find(|(oid, _)| oid == KEYTAB_GET_OID)
             .ok_or("KEYTAB_GET returned no reply control")?;
         let reply = getkeytab::decode_reply(&reply.1)?;
-        let timestamp =
-            u32::try_from(tang_pqc::unix_seconds(SystemTime::now())).unwrap_or(u32::MAX);
+        let timestamp = u32::try_from(tang_pqc::now()).unwrap_or(u32::MAX);
         Ok(reply.into_keytab(principal.parse()?, timestamp))
     }
 
@@ -516,13 +515,7 @@ impl LdapDirectory {
     /// A release request from its entry.
     fn release_from(entry: &kuipa_ldap::SearchEntry) -> Result<ReleaseRequest, DirectoryError> {
         let values = |attr: &str| entry.values(attr);
-        let approval = |v: &String| {
-            let (approver, at) = v.rsplit_once(' ')?;
-            Some(Approval {
-                approver: approver.to_owned(),
-                at: at.parse().ok()?,
-            })
-        };
+        let approval = |v: &String| v.parse::<Approval>().ok();
         let core = entry
             .first(RELEASE_REQUEST_ATTR)
             .ok_or_else(|| format!("release entry {} has no request", entry.dn))?;
@@ -1394,12 +1387,7 @@ impl Directory for LdapDirectory {
 
     fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
         // What the directory adds later is kept in attributes of its own.
-        let core = serde_json::to_string(&ReleaseRequest {
-            approvals: Vec::new(),
-            denied: None,
-            uses: 0,
-            ..request.clone()
-        })?;
+        let core = serde_json::to_string(&request.core())?;
         self.service_conn()?.add_s(
             &self.release_dn(&request.seal, &request.id),
             &[
@@ -1433,7 +1421,7 @@ impl Directory for LdapDirectory {
         approval: &Approval,
         deny: bool,
     ) -> Result<(), DirectoryError> {
-        let value = format!("{} {}", approval.approver, approval.at);
+        let value = approval.to_string();
         let attr = if deny {
             RELEASE_DENIED_ATTR
         } else {
@@ -1536,7 +1524,7 @@ impl Directory for LdapDirectory {
         not_after: u64,
     ) -> Result<(), DirectoryError> {
         let mut conn = self.service_conn()?;
-        let spent = hex(salt);
+        let spent = native_ossl::util::hex_encode(salt);
         // A host that an earlier join made with this salt: the voucher is used.
         if !self.hosts_with_salt(&mut conn, &spent)?.is_empty() {
             return Err(VoucherRefused("spent voucher").into());
@@ -1572,7 +1560,7 @@ impl Directory for LdapDirectory {
         redeemer: &str,
     ) -> Result<(), DirectoryError> {
         let mut conn = self.service_conn()?;
-        let spent = hex(salt);
+        let spent = native_ossl::util::hex_encode(salt);
         // Only the server and host that wrote the record may remove it.  The
         // redeemer asks only when its own host add failed with no host made; a
         // host marker here, if replicated, is a second check.
@@ -1608,7 +1596,7 @@ impl Directory for LdapDirectory {
             })
             .transpose()
             .map_err(absent)?;
-        let spent = hex(salt);
+        let spent = native_ossl::util::hex_encode(salt);
         let principal = self.host_principal(fqdn);
         let short = fqdn.split('.').next().unwrap_or(fqdn);
         let dn = self.host_dn(fqdn);
@@ -1703,7 +1691,7 @@ impl Directory for LdapDirectory {
         hash: &kuipa_enroll::trust::InvitationHash,
         not_after: u64,
     ) -> Result<(), DirectoryError> {
-        let value = format!("{} {not_after}", hex(hash));
+        let value = format!("{} {not_after}", native_ossl::util::hex_encode(hash));
         self.service_conn()?
             .modify_s(&self.trusts_dn(), &[Mod::add(INVITATION_ATTR, [&value])])?;
         Ok(())
@@ -1713,7 +1701,7 @@ impl Directory for LdapDirectory {
         &self,
         hash: &kuipa_enroll::trust::InvitationHash,
     ) -> Result<(), DirectoryError> {
-        let prefix = format!("{} ", hex(hash));
+        let prefix = format!("{} ", native_ossl::util::hex_encode(hash));
         let value = self
             .trust_values(INVITATION_ATTR)?
             .into_iter()
@@ -1724,7 +1712,7 @@ impl Directory for LdapDirectory {
             .modify_s(&self.trusts_dn(), &[Mod::delete(INVITATION_ATTR, [&value])])
             .map_err(|_| "unknown or used trust invitation")?;
         let not_after: u64 = value[prefix.len()..].parse()?;
-        if not_after <= tang_pqc::unix_seconds(SystemTime::now()) {
+        if not_after <= tang_pqc::now() {
             return Err("expired trust invitation".into());
         }
         Ok(())
@@ -1857,14 +1845,6 @@ impl LdapDirectory {
         conn.modify_s(&self.trusts_dn(), &mods)?;
         Ok(())
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 /// The master a `cn=<role>,cn=<master>,<base>` DN belongs to, for the
