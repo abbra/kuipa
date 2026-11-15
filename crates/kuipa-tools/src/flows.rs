@@ -2249,7 +2249,8 @@ fn unprotect_other(paths: &Paths, path: &std::path::Path) -> Result<Value, Error
 /// I/O errors.
 pub fn status(paths: &Paths) -> Result<Value, Error> {
     let Ok(state) = State::load(paths) else {
-        return Ok(json!({ "enrolled": false, "prepared": paths.recipient().exists() }));
+        let prepared = paths.recipient().exists() || paths.recipient_tpm().exists();
+        return Ok(json!({ "enrolled": false, "prepared": prepared }));
     };
     let keytab = fs::read(live_keytab(paths, &state))
         .ok()
