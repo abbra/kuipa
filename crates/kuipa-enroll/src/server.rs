@@ -1246,6 +1246,52 @@ struct StartedSession {
     receipts: Vec<Receipt>,
 }
 
+/// One authenticated request being answered: what every handler needs to
+/// authenticate the caller and encrypt the answer.
+#[derive(Clone, Copy)]
+struct Call<'a> {
+    request: &'a Request,
+    ss: &'a [u8],
+    t: &'a [u8],
+    body: &'a RequestBody,
+    directory: &'a dyn Directory,
+    cb: [u8; 32],
+}
+
+impl<'a> Call<'a> {
+    fn new(
+        request: &'a Request,
+        ss: &'a [u8],
+        t: &'a [u8],
+        body: &'a RequestBody,
+        directory: &'a dyn Directory,
+    ) -> Result<Self, Refusal> {
+        Ok(Self {
+            request,
+            ss,
+            t,
+            body,
+            directory,
+            cb: channel_binding(request.alg(), ss, t)?,
+        })
+    }
+
+    /// The caller the request's Kerberos token authenticates, and the
+    /// binding the answer is sealed under.
+    fn accept_user(&self) -> Result<(Principal, KerberosBinding), Refusal> {
+        let accepted = self
+            .directory
+            .accept_user(self.body.authenticator.as_ref(), &self.cb)?;
+        Ok((accepted.principal.parse()?, accepted.binding))
+    }
+
+    fn reply(&self, binding: &KerberosBinding, payload: &[u8]) -> Result<Response, Refusal> {
+        Ok(self
+            .request
+            .respond(self.ss, self.t, Some(binding), payload)?)
+    }
+}
+
 /// What a seal operation came to.
 enum Outcome {
     /// An answer that concerns no descriptor.
@@ -1782,22 +1828,22 @@ impl EnrollServer {
                 payload
             }
             (Operation::Register, AuthType::Kerberos) => {
-                return self.register(request, ss.as_ref(), &t, &body, directory);
+                return self.register(&Call::new(request, ss.as_ref(), &t, &body, directory)?);
             }
             (Operation::Seal, AuthType::Kerberos) => {
-                return self.seal_op(request, ss.as_ref(), &t, &body, directory);
+                return self.seal_op(&Call::new(request, ss.as_ref(), &t, &body, directory)?);
             }
             (Operation::Keys, AuthType::Kerberos) => {
-                return self.keys_op(request, ss.as_ref(), &t, &body, directory);
+                return self.keys_op(&Call::new(request, ss.as_ref(), &t, &body, directory)?);
             }
             (Operation::Tlog, AuthType::Kerberos) => {
-                return self.tlog_op(request, ss.as_ref(), &t, &body, directory);
+                return self.tlog_op(&Call::new(request, ss.as_ref(), &t, &body, directory)?);
             }
             (Operation::Sign, AuthType::Kerberos) => {
-                return self.sign_op(request, ss.as_ref(), &t, &body, directory);
+                return self.sign_op(&Call::new(request, ss.as_ref(), &t, &body, directory)?);
             }
             (Operation::Pins, AuthType::Kerberos) => {
-                return self.pins_op(request, ss.as_ref(), &t, &body, directory);
+                return self.pins_op(&Call::new(request, ss.as_ref(), &t, &body, directory)?);
             }
             (op, auth) => {
                 return Err(Refusal::because(format!(
@@ -1966,22 +2012,17 @@ impl EnrollServer {
 
     /// Answer a registration (§7.5): change the bindings of its principal
     /// as the directory authorises, and acknowledge.
-    fn register(
-        &self,
-        request: &Request,
-        ss: &[u8],
-        t: &[u8],
-        body: &RequestBody,
-        directory: &dyn Directory,
-    ) -> Result<Response, Refusal> {
+    fn register(&self, call: &Call<'_>) -> Result<Response, Refusal> {
+        let Call {
+            body, directory, ..
+        } = *call;
         let params = RegisterParams::from_bytes(&body.extra)?;
         if params.principal.realm() != self.info.realm {
             return Err(Refusal::because("wrong realm"));
         }
-        let cb = channel_binding(request.alg(), ss, t)?;
         let token = body.authenticator.as_ref();
-        let binding = directory.register_with_gss(&params, &body.registrations, token, &cb)?;
-        Ok(request.respond(ss, t, Some(&binding), &params.acknowledgement())?)
+        let binding = directory.register_with_gss(&params, &body.registrations, token, &call.cb)?;
+        Ok(call.reply(&binding, &params.acknowledgement())?)
     }
 
     /// Answer a seal operation (§7.6): authenticate the caller by their
@@ -1990,17 +2031,11 @@ impl EnrollServer {
     // One flat dispatch over every operation, so a new `SealOp` variant is a
     // compile error here rather than a panic.
     #[allow(clippy::too_many_lines)]
-    fn seal_op(
-        &self,
-        request: &Request,
-        ss: &[u8],
-        t: &[u8],
-        body: &RequestBody,
-        directory: &dyn Directory,
-    ) -> Result<Response, Refusal> {
-        let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
-        let caller: Principal = accepted.principal.parse()?;
+    fn seal_op(&self, call: &Call<'_>) -> Result<Response, Refusal> {
+        let Call {
+            body, directory, ..
+        } = *call;
+        let (caller, binding) = call.accept_user()?;
         let op = SealOp::from_bytes(&body.extra)?;
         self.admit_caller(&caller, directory)?;
         // A user of a trusted realm owns a seal only where the realm's
@@ -2139,7 +2174,7 @@ impl EnrollServer {
                 &device,
                 offline,
                 passkey.as_deref(),
-                &cb,
+                &call.cb,
                 now,
                 directory,
             )?),
@@ -2269,7 +2304,7 @@ impl EnrollServer {
             receipts,
             ..side
         };
-        Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes()?)?)
+        Ok(call.reply(&binding, &reply.to_bytes()?)?)
     }
 
     /// Refuse a caller that is neither of this realm nor a user of a trusted
@@ -2349,15 +2384,10 @@ impl EnrollServer {
     /// Answer a `keys` fetch (§18.2): authenticate the caller by their
     /// ticket, let the directory check the namespace policy (the server
     /// list and CA roles) and produce the value, and answer with it.
-    fn keys_op(
-        &self,
-        request: &Request,
-        ss: &[u8],
-        t: &[u8],
-        body: &RequestBody,
-        directory: &dyn Directory,
-    ) -> Result<Response, Refusal> {
-        let cb = channel_binding(request.alg(), ss, t)?;
+    fn keys_op(&self, call: &Call<'_>) -> Result<Response, Refusal> {
+        let Call {
+            body, directory, ..
+        } = *call;
         let fetch = crate::keys::KeysFetch::from_bytes(&body.extra)?;
         let same_realm = |caller: &Principal| {
             if caller.realm() == self.info.realm {
@@ -2368,12 +2398,12 @@ impl EnrollServer {
         };
         let token = body.authenticator.as_ref();
         let (caller, binding, value) =
-            if let Some(brokered) = directory.fetch_key_via_broker(token, &cb, &fetch)? {
+            if let Some(brokered) = directory.fetch_key_via_broker(token, &call.cb, &fetch)? {
                 let caller: Principal = brokered.principal.parse()?;
                 same_realm(&caller)?;
                 (caller, brokered.binding, brokered.value)
             } else {
-                let accepted = directory.accept_user(token, &cb)?;
+                let accepted = directory.accept_user(token, &call.cb)?;
                 let caller: Principal = accepted.principal.parse()?;
                 same_realm(&caller)?;
                 let value = directory.fetch_key(&caller, &fetch)?;
@@ -2386,24 +2416,18 @@ impl EnrollServer {
         )?;
         let answer = crate::keys::KeysAnswer { value };
         let payload = answer.to_bytes()?;
-        Ok(request.respond(ss, t, Some(&binding), &payload)?)
+        Ok(call.reply(&binding, &payload)?)
     }
 
     /// Answer a signing request (`DESIGN-sign.md`): authenticate the
     /// caller by their ticket, check the realm's signing policy against
     /// the caller and its groups, record the statement in the log — no
     /// log, no statement — and sign it with the log's position.
-    fn sign_op(
-        &self,
-        request: &Request,
-        ss: &[u8],
-        t: &[u8],
-        body: &RequestBody,
-        directory: &dyn Directory,
-    ) -> Result<Response, Refusal> {
-        let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
-        let caller: Principal = accepted.principal.parse()?;
+    fn sign_op(&self, call: &Call<'_>) -> Result<Response, Refusal> {
+        let Call {
+            body, directory, ..
+        } = *call;
+        let (caller, binding) = call.accept_user()?;
         let asked = crate::sign::Request::from_bytes(&body.extra)?;
         let groups = directory.principal_groups(&caller)?;
         // After the groups: an override removed before that read shows
@@ -2454,24 +2478,16 @@ impl EnrollServer {
         let signed =
             crate::sign::SignedStatement::sign(&self.keys.signing, &self.delegation(), statement)?;
         let answer = crate::sign::Answer::new(&asked, signed)?;
-        Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
+        Ok(call.reply(&binding, &answer.to_bytes())?)
     }
 
     /// Answer a pins refresh (§4.5): this realm's anchors and their heads,
     /// as a rekey delivers them, bound to the caller's
     /// Kerberos session so a host may update its pins from it (§4.7).
     /// They are public: any principal of the realm may ask.
-    fn pins_op(
-        &self,
-        request: &Request,
-        ss: &[u8],
-        t: &[u8],
-        body: &RequestBody,
-        directory: &dyn Directory,
-    ) -> Result<Response, Refusal> {
-        let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
-        let caller: Principal = accepted.principal.parse()?;
+    fn pins_op(&self, call: &Call<'_>) -> Result<Response, Refusal> {
+        let directory = call.directory;
+        let (caller, binding) = call.accept_user()?;
         self.admit_caller(&caller, directory)?;
         let (anchors, heads) = self.anchors_and_heads();
         let answer = crate::payload::PinsAnswer {
@@ -2481,23 +2497,17 @@ impl EnrollServer {
             heads,
         };
         let bytes = answer.to_bytes()?;
-        Ok(request.respond(ss, t, Some(&accepted.binding), &bytes)?)
+        Ok(call.reply(&binding, &bytes)?)
     }
 
     /// Answer a `tlog` lookup (`DESIGN-tlog.md` §6): the caller's own
     /// entries — about a seal they own, or about their principal — with
     /// proofs against the log's current signed head.
-    fn tlog_op(
-        &self,
-        request: &Request,
-        ss: &[u8],
-        t: &[u8],
-        body: &RequestBody,
-        directory: &dyn Directory,
-    ) -> Result<Response, Refusal> {
-        let cb = channel_binding(request.alg(), ss, t)?;
-        let accepted = directory.accept_user(body.authenticator.as_ref(), &cb)?;
-        let caller: Principal = accepted.principal.parse()?;
+    fn tlog_op(&self, call: &Call<'_>) -> Result<Response, Refusal> {
+        let Call {
+            body, directory, ..
+        } = *call;
+        let (caller, binding) = call.accept_user()?;
         self.admit_caller(&caller, directory)?;
         let query = crate::tlog::Query::from_bytes(&body.extra)?;
         let subject = if query.seal.is_empty() {
@@ -2531,7 +2541,7 @@ impl EnrollServer {
             head,
             entries,
         };
-        Ok(request.respond(ss, t, Some(&accepted.binding), &answer.to_bytes())?)
+        Ok(call.reply(&binding, &answer.to_bytes())?)
     }
 
     /// Every server's escrow key, this one's own current key included
