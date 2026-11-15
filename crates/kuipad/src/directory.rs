@@ -30,7 +30,7 @@
 //!   `cn=$REALM,cn=kerberos,$SUFFIX` and given keys from the trust secret
 //!   with `KEYTAB_GET` and a password, as `ipa-getkeytab -P` does.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use kuipa_enroll::escrow::{Kind, RegisterParams, SealId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
@@ -46,8 +46,8 @@ use kuipa_enroll::server::{
 };
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{
-    ALREADY_EXISTS, Auth, LdapConnection, ModOp, NO_SUCH_ATTRIBUTE, NO_SUCH_OBJECT, Scope,
-    SearchEntry, dn_escape, filter_escape,
+    ALREADY_EXISTS, Auth, LdapConnection, Mod, NO_SUCH_ATTRIBUTE, NO_SUCH_OBJECT, Scope,
+    SearchEntry, Tls, dn_escape, filter_escape,
 };
 use native_ossl::util::SecretBuf;
 
@@ -270,16 +270,15 @@ impl LdapDirectory {
         )?;
         Ok(entries
             .into_iter()
-            .filter_map(|e| e.attrs.get("cn").and_then(|v| v.first().cloned()))
+            .filter_map(|e| e.first("cn").map(str::to_owned))
             .collect())
     }
 
     fn connect(&self) -> Result<LdapConnection, DirectoryError> {
         Ok(LdapConnection::connect(
             &self.cfg.ldap_uri,
-            None,
-            false,
-            30,
+            Tls::Off,
+            Some(Duration::from_secs(30)),
         )?)
     }
 
@@ -415,9 +414,8 @@ impl LdapDirectory {
     fn seal_from(entry: &kuipa_ldap::SearchEntry) -> Result<Seal, DirectoryError> {
         let one = |attr: &str| -> Result<String, DirectoryError> {
             entry
-                .attrs
-                .get(&attr.to_lowercase())
-                .and_then(|v| v.first().cloned())
+                .first(attr)
+                .map(str::to_owned)
                 .ok_or_else(|| format!("seal entry {} has no {attr}", entry.dn).into())
         };
         let id = entry
@@ -427,21 +425,12 @@ impl LdapDirectory {
             .ok_or("seal entry without cn")?
             .parse()?;
         let devices = entry
-            .attrs
-            .get(&SEAL_DEVICE_ATTR.to_lowercase())
-            .into_iter()
-            .flatten()
+            .values(SEAL_DEVICE_ATTR)
+            .iter()
             .map(|d| serde_json::from_str::<Device>(d))
             .collect::<Result<_, _>>()?;
         let members = |attr: &str| {
-            Members::from_entries(
-                entry
-                    .attrs
-                    .get(&attr.to_lowercase())
-                    .into_iter()
-                    .flatten()
-                    .map(String::as_str),
-            )
+            Members::from_entries(entry.values(attr).iter().map(String::as_str))
         };
         let state = match one(SEAL_STATE_ATTR)?.as_str() {
             "enabled" => State::Enabled,
@@ -462,17 +451,11 @@ impl LdapDirectory {
                 .map(|(_, n)| n)
                 .sum(),
             session_keys: entry
-                .attrs
-                .get(&SEAL_SESSION_KEY_ATTR.to_lowercase())
-                .into_iter()
-                .flatten()
+                .values(SEAL_SESSION_KEY_ATTR)
+                .iter()
                 .map(|k| serde_json::from_str(k))
                 .collect::<Result<_, _>>()?,
-            bindings: entry
-                .attrs
-                .get(&SEAL_BINDING_ATTR.to_lowercase())
-                .cloned()
-                .unwrap_or_default(),
+            bindings: entry.values(SEAL_BINDING_ATTR).to_vec(),
         })
     }
 
@@ -488,13 +471,24 @@ impl LdapDirectory {
         entries.iter().map(Self::seal_from).collect()
     }
 
+    /// Whether `nsAccountLock` is true.
+    fn is_locked(entry: &SearchEntry) -> bool {
+        entry
+            .values("nsAccountLock")
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("true"))
+    }
+
+    /// The end of the entry's lease, when it has a valid one.
+    fn lease_end(entry: &SearchEntry) -> Option<u64> {
+        entry.first(LEASE_ATTR)?.parse().ok()
+    }
+
     /// The per-server counts `<server> <n>` in `attr` of an entry.
     fn counts(entry: &kuipa_ldap::SearchEntry, attr: &str) -> Vec<(String, u64)> {
         entry
-            .attrs
-            .get(&attr.to_lowercase())
-            .into_iter()
-            .flatten()
+            .values(attr)
+            .iter()
             .filter_map(|v| {
                 let (server, n) = v.rsplit_once(' ')?;
                 Some((server.to_owned(), n.parse().ok()?))
@@ -527,9 +521,9 @@ impl LdapDirectory {
         let mut mods = Vec::new();
         let old = own.map(|n| format!("{server} {n}"));
         if let Some(old) = &old {
-            mods.push((ModOp::Delete, attr, vec![old.as_bytes()]));
+            mods.push(Mod::delete(attr, [old]));
         }
-        mods.push((ModOp::Add, attr, vec![new.as_bytes()]));
+        mods.push(Mod::add(attr, [&new]));
         svc.modify_s(dn, &mods)?;
         Ok(true)
     }
@@ -549,13 +543,7 @@ impl LdapDirectory {
 
     /// A release request from its entry.
     fn release_from(entry: &kuipa_ldap::SearchEntry) -> Result<ReleaseRequest, DirectoryError> {
-        let values = |attr: &str| {
-            entry
-                .attrs
-                .get(&attr.to_lowercase())
-                .cloned()
-                .unwrap_or_default()
-        };
+        let values = |attr: &str| entry.values(attr);
         let approval = |v: &String| {
             let (approver, at) = v.rsplit_once(' ')?;
             Some(Approval {
@@ -563,11 +551,10 @@ impl LdapDirectory {
                 at: at.parse().ok()?,
             })
         };
-        let core = values(RELEASE_REQUEST_ATTR)
-            .into_iter()
-            .next()
+        let core = entry
+            .first(RELEASE_REQUEST_ATTR)
             .ok_or_else(|| format!("release entry {} has no request", entry.dn))?;
-        let mut request: ReleaseRequest = serde_json::from_str(&core)?;
+        let mut request: ReleaseRequest = serde_json::from_str(core)?;
         request.approvals = values(RELEASE_APPROVAL_ATTR)
             .iter()
             .filter_map(approval)
@@ -622,7 +609,7 @@ impl LdapDirectory {
         )?;
         Ok(entries
             .first()
-            .and_then(|e| e.attrs.get(&attr.to_lowercase()).cloned())
+            .map(|e| e.values(attr).to_vec())
             .unwrap_or_default())
     }
 
@@ -643,17 +630,12 @@ impl LdapDirectory {
         let added = conn.add_s(
             &dn,
             &[
-                (
+                Mod::add(
                     "objectClass",
-                    vec![
-                        b"top".as_slice(),
-                        b"krbPrincipal",
-                        b"krbPrincipalAux",
-                        b"krbTicketPolicyAux",
-                    ],
+                    ["top", "krbPrincipal", "krbPrincipalAux", "krbTicketPolicyAux"],
                 ),
-                ("krbPrincipalName", vec![principal.as_bytes()]),
-                ("krbCanonicalName", vec![principal.as_bytes()]),
+                Mod::add("krbPrincipalName", [principal]),
+                Mod::add("krbCanonicalName", [principal]),
             ],
         );
         // An existing principal (a renewed trust) gets new keys.
@@ -688,18 +670,15 @@ impl LdapDirectory {
         let entry = svc.search(&dn, Scope::Base, "(objectClass=*)", &[STAGED_ATTR])?;
         if entry
             .first()
-            .is_some_and(|e| e.bin_attrs.contains_key(&STAGED_ATTR.to_lowercase()))
+            .is_some_and(|e| e.has(STAGED_ATTR))
         {
             svc.modify_s(
                 &dn,
-                &[
-                    (ModOp::Delete, STAGED_ATTR, Vec::new()),
-                    (ModOp::Delete, "krbPrincipalExpiration", Vec::new()),
-                ],
+                &[Mod::remove(STAGED_ATTR), Mod::remove("krbPrincipalExpiration")],
             )?;
             eprintln!("kuipad: first contact: {host} unstaged");
         }
-        match svc.modify_s(&dn, &[(ModOp::Delete, "userPassword", Vec::new())]) {
+        match svc.modify_s(&dn, &[Mod::remove("userPassword")]) {
             Ok(()) => eprintln!("kuipad: first contact: {host}'s OTP consumed"),
             Err(e) if e.code() == Some(NO_SUCH_ATTRIBUTE) => {}
             Err(e) => return Err(e.into()),
@@ -776,14 +755,11 @@ impl LdapDirectory {
             .principal_entry(conn, principal, &want)?
             .ok_or_else(|| format!("no entry for {principal}"))?;
         let has = entry
-            .attrs
-            .get("objectclass")
-            .is_some_and(|v| v.iter().any(|c| c.eq_ignore_ascii_case(ESCROW_CLASS)));
+            .values("objectClass")
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(ESCROW_CLASS));
         if !has {
-            conn.modify_s(
-                &entry.dn,
-                &[(ModOp::Add, "objectClass", vec![ESCROW_CLASS.as_bytes()])],
-            )?;
+            conn.modify_s(&entry.dn, &[Mod::add("objectClass", [ESCROW_CLASS])])?;
         }
         Ok(entry)
     }
@@ -801,11 +777,7 @@ impl LdapDirectory {
         let entries =
             self.service_conn()?
                 .search_if_exists(&dn, Scope::Base, "(objectClass=*)", &[attr])?;
-        match entries
-            .first()
-            .and_then(|e| e.attrs.get(&attr.to_lowercase()))
-            .and_then(|v| v.first())
-        {
+        match entries.first().and_then(|e| e.first(attr)) {
             Some(json) => Ok(Some(serde_json::from_str(json)?)),
             None => Ok(None),
         }
@@ -879,12 +851,8 @@ impl Directory for LdapDirectory {
         conn.modify_s(
             &self.host_dn(fqdn),
             &[
-                (ModOp::Replace, STAGED_ATTR, vec![record.as_bytes()]),
-                (
-                    ModOp::Replace,
-                    "krbPrincipalExpiration",
-                    vec![expiration.as_bytes()],
-                ),
+                Mod::replace(STAGED_ATTR, [&record]),
+                Mod::replace("krbPrincipalExpiration", [&expiration]),
             ],
         )?;
         eprintln!("kuipad: {caller} staged {principal} until {expiration}");
@@ -902,7 +870,7 @@ impl Directory for LdapDirectory {
             .iter()
             .map(kuipa_enroll::merkle::Hash::as_bytes)
             .collect();
-        svc.modify_s(&entry.dn, &[(ModOp::Replace, ESCROW_ATTR, values)])?;
+        svc.modify_s(&entry.dn, &[Mod::replace(ESCROW_ATTR, values)])?;
         Ok(())
     }
 
@@ -924,10 +892,7 @@ impl Directory for LdapDirectory {
         else {
             return Ok(false);
         };
-        let locked = entry
-            .attrs
-            .get("nsaccountlock")
-            .is_some_and(|v| v.iter().any(|s| s.eq_ignore_ascii_case("true")));
+        let locked = Self::is_locked(&entry);
         let registered = entry
             .bin_attrs
             .get(&attr.to_lowercase())
@@ -957,14 +922,14 @@ impl Directory for LdapDirectory {
             .collect();
         match params.kind {
             Kind::Keytab => {
-                svc.modify_s(&entry.dn, &[(ModOp::Replace, ESCROW_ATTR, values)])?;
+                svc.modify_s(&entry.dn, &[Mod::replace(ESCROW_ATTR, values)])?;
             }
             Kind::File => {
                 // One value at a time: a binding already gone is no error.
                 for old in &params.retire {
                     match svc.modify_s(
                         &entry.dn,
-                        &[(ModOp::Delete, ESCROW_FILE_ATTR, vec![old.as_bytes()])],
+                        &[Mod::delete(ESCROW_FILE_ATTR, [old.as_bytes()])],
                     ) {
                         Ok(()) => {}
                         Err(e) if e.code() == Some(NO_SUCH_ATTRIBUTE) => {}
@@ -972,7 +937,7 @@ impl Directory for LdapDirectory {
                     }
                 }
                 if !values.is_empty() {
-                    svc.modify_s(&entry.dn, &[(ModOp::Add, ESCROW_FILE_ATTR, values)])?;
+                    svc.modify_s(&entry.dn, &[Mod::add(ESCROW_FILE_ATTR, values)])?;
                 }
             }
         }
@@ -1016,14 +981,8 @@ impl Directory for LdapDirectory {
         )?;
         let mut peers = Vec::new();
         for entry in entries {
-            let left = entry
-                .attrs
-                .get("iparepltoposegmentleftnode")
-                .and_then(|v| v.first());
-            let right = entry
-                .attrs
-                .get("iparepltoposegmentrightnode")
-                .and_then(|v| v.first());
+            let left = entry.first("ipaReplTopoSegmentLeftNode");
+            let right = entry.first("ipaReplTopoSegmentRightNode");
             let peer = match (left, right) {
                 (Some(left), Some(right)) if left.eq_ignore_ascii_case(&hostname) => Some(right),
                 (Some(left), Some(right)) if right.eq_ignore_ascii_case(&hostname) => Some(left),
@@ -1143,7 +1102,7 @@ impl Directory for LdapDirectory {
         let mut conn = self.service_conn()?;
         let values = self
             .principal_entry(&mut conn, principal, &["ipaPassKey"])?
-            .and_then(|e| e.attrs.get("ipapasskey").cloned())
+            .map(|e| e.values("ipaPassKey").to_vec())
             .unwrap_or_default();
         // `ipa passkeyconfig`: user verification is required unless
         // turned off, as FreeIPA and SSSD default to.
@@ -1156,8 +1115,7 @@ impl Directory for LdapDirectory {
         ) {
             Ok(entries) => entries
                 .first()
-                .and_then(|e| e.attrs.get("iparequireuserverification"))
-                .and_then(|v| v.first())
+                .and_then(|e| e.first("ipaRequireUserVerification"))
                 .is_none_or(|v| !v.eq_ignore_ascii_case("false")),
             Err(e) if e.code() == Some(NO_SUCH_OBJECT) => true,
             Err(e) => return Err(e.into()),
@@ -1180,11 +1138,7 @@ impl Directory for LdapDirectory {
         else {
             return Ok(None);
         };
-        Ok(entry
-            .attrs
-            .get(&LEASE_ATTR.to_lowercase())
-            .and_then(|v| v.first())
-            .and_then(|v| v.parse().ok()))
+        Ok(Self::lease_end(&entry))
     }
 
     fn purge_leases(&self, before: u64) -> Result<Vec<String>, DirectoryError> {
@@ -1198,23 +1152,13 @@ impl Directory for LdapDirectory {
         )?;
         let mut gone = Vec::new();
         for entry in leased {
-            let end: Option<u64> = entry
-                .attrs
-                .get(&LEASE_ATTR.to_lowercase())
-                .and_then(|v| v.first())
-                .and_then(|v| v.parse().ok());
-            if end.is_some_and(|end| end < before) {
+            if Self::lease_end(&entry).is_some_and(|end| end < before) {
                 // The entry carries its keys and escrow bindings; the
                 // directory's referential integrity drops its group
                 // memberships.  Only entries with a lease, which only the
                 // daemon sets, are removed.
                 conn.delete_s(&entry.dn)?;
-                let fqdn = entry
-                    .attrs
-                    .get("fqdn")
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or_else(|| entry.dn.clone());
+                let fqdn = entry.first("fqdn").unwrap_or(&entry.dn).to_owned();
                 eprintln!("kuipad: the lease of {fqdn} ended: host removed");
                 gone.push(fqdn);
             }
@@ -1228,12 +1172,7 @@ impl Directory for LdapDirectory {
             &[LEASE_ATTR],
         )?;
         for record in records {
-            let end: Option<u64> = record
-                .attrs
-                .get(&LEASE_ATTR.to_lowercase())
-                .and_then(|v| v.first())
-                .and_then(|v| v.parse().ok());
-            if end.is_some_and(|end| end < before) {
+            if Self::lease_end(&record).is_some_and(|end| end < before) {
                 conn.delete_s(&record.dn)?;
             }
         }
@@ -1256,10 +1195,8 @@ impl Directory for LdapDirectory {
         // `memberOf` lists the groups' DNs, indirect membership included;
         // a group is named by its `cn`.
         Ok(entry
-            .attrs
-            .get("memberof")
-            .into_iter()
-            .flatten()
+            .values("memberOf")
+            .iter()
             .filter_map(|dn| {
                 let rdn = dn.split(',').next()?;
                 let (attr, value) = rdn.split_once('=')?;
@@ -1280,7 +1217,7 @@ impl Directory for LdapDirectory {
         );
         let membership = or_filter(
             &["member"],
-            std::iter::once(&entry.dn).chain(entry.attrs.get("memberof").into_iter().flatten()),
+            std::iter::once(&entry.dn).chain(entry.values("memberOf")),
         )
         .ok_or("no member DN")?;
         Ok(!conn
@@ -1291,20 +1228,17 @@ impl Directory for LdapDirectory {
     fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
         let values = Self::seal_values(seal)?;
         let id = seal.id.to_string();
-        let mut attrs: Vec<(&str, Vec<&[u8]>)> = vec![
-            (
-                "objectClass",
-                vec![b"top".as_slice(), SEAL_CLASS.as_bytes()],
-            ),
-            ("cn", vec![id.as_bytes()]),
-            (SEAL_OWNER_ATTR, vec![seal.owner.as_bytes()]),
-            (SEAL_NAME_ATTR, vec![seal.name.as_bytes()]),
+        let mut attrs = vec![
+            Mod::add("objectClass", ["top", SEAL_CLASS]),
+            Mod::add("cn", [&id]),
+            Mod::add(SEAL_OWNER_ATTR, [&seal.owner]),
+            Mod::add(SEAL_NAME_ATTR, [&seal.name]),
         ];
         attrs.extend(
             values
                 .iter()
                 .filter(|(_, v)| !v.is_empty())
-                .map(|(attr, v)| (*attr, v.iter().map(String::as_bytes).collect())),
+                .map(|(attr, v)| Mod::add(attr, v)),
         );
         self.service_conn()?
             .add_s(&self.seal_dn(&seal.id), &attrs)?;
@@ -1324,21 +1258,11 @@ impl Directory for LdapDirectory {
 
     fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
         let values = Self::seal_values(seal)?;
-        let mut mods: Vec<(ModOp, &str, Vec<&[u8]>)> = values
+        let mut mods: Vec<Mod> = values
             .iter()
-            .map(|(attr, v)| {
-                (
-                    ModOp::Replace,
-                    *attr,
-                    v.iter().map(String::as_bytes).collect(),
-                )
-            })
+            .map(|(attr, v)| Mod::replace(attr, v))
             .collect();
-        mods.push((
-            ModOp::Replace,
-            SEAL_BINDING_ATTR,
-            seal.bindings.iter().map(String::as_bytes).collect(),
-        ));
+        mods.push(Mod::replace(SEAL_BINDING_ATTR, &seal.bindings));
         self.service_conn()?
             .modify_s(&self.seal_dn(&seal.id), &mods)?;
         eprintln!(
@@ -1379,12 +1303,9 @@ impl Directory for LdapDirectory {
         self.service_conn()?.add_s(
             &format!("cn={},{}", deposit.id, self.seal_dn(&deposit.seal)),
             &[
-                (
-                    "objectClass",
-                    vec![b"top".as_slice(), DEPOSIT_CLASS.as_bytes()],
-                ),
-                ("cn", vec![deposit.id.as_bytes()]),
-                (DEPOSIT_ATTR, vec![data.as_bytes()]),
+                Mod::add("objectClass", ["top", DEPOSIT_CLASS]),
+                Mod::add("cn", [&deposit.id]),
+                Mod::add(DEPOSIT_ATTR, [&data]),
             ],
         )?;
         Ok(())
@@ -1399,8 +1320,8 @@ impl Directory for LdapDirectory {
         )?;
         entries
             .iter()
-            .filter_map(|e| e.attrs.get(&DEPOSIT_ATTR.to_lowercase())?.first().cloned())
-            .map(|v| Ok(serde_json::from_str(&v)?))
+            .filter_map(|e| e.first(DEPOSIT_ATTR))
+            .map(|v| Ok(serde_json::from_str(v)?))
             .collect()
     }
 
@@ -1420,10 +1341,8 @@ impl Directory for LdapDirectory {
         // That device's escrow of this kind goes, the others stay: one
         // device may hold a recovery code and a shard blob at once.
         let old: Vec<&String> = entry
-            .attrs
-            .get(&DEVICE_ESCROW_ATTR.to_lowercase())
-            .into_iter()
-            .flatten()
+            .values(DEVICE_ESCROW_ATTR)
+            .iter()
             .filter(|v| {
                 serde_json::from_str::<DeviceEscrow>(v)
                     .is_ok_and(|e| e.device == escrow.device && e.kind == escrow.kind)
@@ -1432,13 +1351,9 @@ impl Directory for LdapDirectory {
         let new = serde_json::to_string(escrow)?;
         let mut mods = Vec::new();
         if !old.is_empty() {
-            mods.push((
-                ModOp::Delete,
-                DEVICE_ESCROW_ATTR,
-                old.iter().map(|v| v.as_bytes()).collect(),
-            ));
+            mods.push(Mod::delete(DEVICE_ESCROW_ATTR, old));
         }
-        mods.push((ModOp::Add, DEVICE_ESCROW_ATTR, vec![new.as_bytes()]));
+        mods.push(Mod::add(DEVICE_ESCROW_ATTR, [&new]));
         svc.modify_s(&entry.dn, &mods)?;
         Ok(())
     }
@@ -1450,10 +1365,8 @@ impl Directory for LdapDirectory {
             return Ok(Vec::new());
         };
         Ok(entry
-            .attrs
-            .get(&DEVICE_ESCROW_ATTR.to_lowercase())
-            .into_iter()
-            .flatten()
+            .values(DEVICE_ESCROW_ATTR)
+            .iter()
             .filter_map(|v| serde_json::from_str(v).ok())
             .collect())
     }
@@ -1468,10 +1381,8 @@ impl Directory for LdapDirectory {
         // The whole old set goes, keyed rows and code escrows of other
         // kinds stay.
         let old: Vec<&String> = entry
-            .attrs
-            .get(&DEVICE_ESCROW_ATTR.to_lowercase())
-            .into_iter()
-            .flatten()
+            .values(DEVICE_ESCROW_ATTR)
+            .iter()
             .filter(|v| {
                 serde_json::from_str::<DeviceEscrow>(v)
                     .is_ok_and(|e| e.kind == "shards" || e.kind == "shards-key")
@@ -1479,18 +1390,14 @@ impl Directory for LdapDirectory {
             .collect();
         let mut mods = Vec::new();
         if !old.is_empty() {
-            mods.push((
-                ModOp::Delete,
-                DEVICE_ESCROW_ATTR,
-                old.iter().map(|v| v.as_bytes()).collect(),
-            ));
+            mods.push(Mod::delete(DEVICE_ESCROW_ATTR, old));
         }
         let new: Vec<String> = rows
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<_, _>>()?;
         for value in &new {
-            mods.push((ModOp::Add, DEVICE_ESCROW_ATTR, vec![value.as_bytes()]));
+            mods.push(Mod::add(DEVICE_ESCROW_ATTR, [value]));
         }
         svc.modify_s(&entry.dn, &mods)?;
         Ok(())
@@ -1519,12 +1426,9 @@ impl Directory for LdapDirectory {
         self.service_conn()?.add_s(
             &self.release_dn(&request.seal, &request.id),
             &[
-                (
-                    "objectClass",
-                    vec![b"top".as_slice(), RELEASE_CLASS.as_bytes()],
-                ),
-                ("cn", vec![request.id.as_bytes()]),
-                (RELEASE_REQUEST_ATTR, vec![core.as_bytes()]),
+                Mod::add("objectClass", ["top", RELEASE_CLASS]),
+                Mod::add("cn", [&request.id]),
+                Mod::add(RELEASE_REQUEST_ATTR, [&core]),
             ],
         )?;
         Ok(())
@@ -1561,7 +1465,7 @@ impl Directory for LdapDirectory {
         // Added, never replaced: replicas merge what different servers add.
         self.service_conn()?.modify_s(
             &self.release_dn(id, request),
-            &[(ModOp::Add, attr, vec![value.as_bytes()])],
+            &[Mod::add(attr, [&value])],
         )?;
         Ok(())
     }
@@ -1610,11 +1514,8 @@ impl Directory for LdapDirectory {
         Ok(entries
             .iter()
             .filter_map(|e| {
-                let server = e.attrs.get("cn")?.first()?.clone();
-                let value = e
-                    .attrs
-                    .get(&SERVER_ESCROW_KEY_ATTR.to_lowercase())?
-                    .first()?;
+                let server = e.first("cn")?.to_owned();
+                let value = e.first(SERVER_ESCROW_KEY_ATTR)?;
                 let (alg, key) = value.split_once(' ')?;
                 let key = tang_pqc::ExchangeKey::from_bytes(
                     tang_pqc::KemAlg::from_id(alg.parse().ok()?).ok()?,
@@ -1639,11 +1540,7 @@ impl Directory for LdapDirectory {
         );
         self.service_conn()?.modify_s(
             &dn,
-            &[(
-                ModOp::Replace,
-                SERVER_ESCROW_KEY_ATTR,
-                vec![value.as_bytes()],
-            )],
+            &[Mod::replace(SERVER_ESCROW_KEY_ATTR, [&value])],
         )?;
         eprintln!("kuipad: published {server}'s escrow key {}", key.kid());
         Ok(())
@@ -1655,10 +1552,7 @@ impl Directory for LdapDirectory {
         else {
             return Ok(true);
         };
-        Ok(entry
-            .attrs
-            .get("nsaccountlock")
-            .is_some_and(|v| v.iter().any(|s| s.eq_ignore_ascii_case("true"))))
+        Ok(Self::is_locked(&entry))
     }
 
     fn spend_voucher(
@@ -1678,15 +1572,12 @@ impl Directory for LdapDirectory {
         let added = conn.add_s(
             &self.spent_dn(&spent),
             &[
-                (
-                    "objectClass",
-                    vec![b"top".as_slice(), SPENT_CLASS.as_bytes()],
-                ),
-                ("cn", vec![spent.as_bytes()]),
-                (VOUCHER_SPENT_ATTR, vec![spent.as_bytes()]),
-                (SPENT_HOST_ATTR, vec![fqdn.as_bytes()]),
-                (SPENT_REDEEMER_ATTR, vec![redeemer.as_bytes()]),
-                (LEASE_ATTR, vec![expires.as_bytes()]),
+                Mod::add("objectClass", ["top", SPENT_CLASS]),
+                Mod::add("cn", [&spent]),
+                Mod::add(VOUCHER_SPENT_ATTR, [&spent]),
+                Mod::add(SPENT_HOST_ATTR, [fqdn]),
+                Mod::add(SPENT_REDEEMER_ATTR, [redeemer]),
+                Mod::add(LEASE_ATTR, [&expires]),
             ],
         );
         match added {
@@ -1752,36 +1643,36 @@ impl Directory for LdapDirectory {
         if let Err(e) = conn.add_s(
             &dn,
             &[
-                (
+                Mod::add(
                     "objectClass",
-                    vec![
-                        b"top".as_slice(),
-                        b"ipaobject",
-                        b"nshost",
-                        b"ipahost",
-                        b"pkiuser",
-                        b"ipaservice",
-                        b"ipasshhost",
-                        b"ipaSshGroupOfPubKeys",
-                        b"krbprincipalaux",
-                        b"krbprincipal",
-                        b"ieee802device",
+                    [
+                        "top",
+                        "ipaobject",
+                        "nshost",
+                        "ipahost",
+                        "pkiuser",
+                        "ipaservice",
+                        "ipasshhost",
+                        "ipaSshGroupOfPubKeys",
+                        "krbprincipalaux",
+                        "krbprincipal",
+                        "ieee802device",
                     ],
                 ),
-                ("fqdn", vec![fqdn.as_bytes()]),
-                ("cn", vec![fqdn.as_bytes()]),
-                ("serverHostName", vec![short.as_bytes()]),
-                ("krbPrincipalName", vec![principal.as_bytes()]),
-                ("krbCanonicalName", vec![principal.as_bytes()]),
-                ("managedBy", vec![dn.as_bytes()]),
-                ("ipaUniqueID", vec![b"autogenerate".as_slice()]),
-                (VOUCHER_SPENT_ATTR, vec![spent.as_bytes()]),
+                Mod::add("fqdn", [fqdn]),
+                Mod::add("cn", [fqdn]),
+                Mod::add("serverHostName", [short]),
+                Mod::add("krbPrincipalName", [&principal]),
+                Mod::add("krbCanonicalName", [&principal]),
+                Mod::add("managedBy", [&dn]),
+                Mod::add("ipaUniqueID", ["autogenerate"]),
+                Mod::add(VOUCHER_SPENT_ATTR, [&spent]),
             ]
             .into_iter()
             .chain(lease.iter().flat_map(|(expiration, end)| {
                 [
-                    ("krbPrincipalExpiration", vec![expiration.as_bytes()]),
-                    (LEASE_ATTR, vec![end.as_bytes()]),
+                    Mod::add("krbPrincipalExpiration", [expiration]),
+                    Mod::add(LEASE_ATTR, [end]),
                 ]
             }))
             .collect::<Vec<_>>(),
@@ -1805,7 +1696,7 @@ impl Directory for LdapDirectory {
                     dn_escape(hostgroup),
                     self.cfg.basedn
                 ),
-                &[(ModOp::Add, "member", vec![dn.as_bytes()])],
+                &[Mod::add("member", [&dn])],
             )
         {
             // A host that is gone lets the record go, so a retry can work; one
@@ -1843,7 +1734,7 @@ impl Directory for LdapDirectory {
         let value = format!("{} {not_after}", hex(hash));
         self.service_conn()?.modify_s(
             &self.trusts_dn(),
-            &[(ModOp::Add, INVITATION_ATTR, vec![value.as_bytes()])],
+            &[Mod::add(INVITATION_ATTR, [&value])],
         )?;
         Ok(())
     }
@@ -1862,7 +1753,7 @@ impl Directory for LdapDirectory {
         self.service_conn()?
             .modify_s(
                 &self.trusts_dn(),
-                &[(ModOp::Delete, INVITATION_ATTR, vec![value.as_bytes()])],
+                &[Mod::delete(INVITATION_ATTR, [&value])],
             )
             .map_err(|_| "unknown or used trust invitation")?;
         let not_after: u64 = value[prefix.len()..].parse()?;
@@ -1964,14 +1855,12 @@ impl LdapDirectory {
         if entries.is_empty() {
             return Ok(None);
         }
-        let first = |e: &SearchEntry, attr: &str| {
-            e.attrs
-                .get(&attr.to_ascii_lowercase())
-                .and_then(|v| v.first().cloned())
-        };
-        Ok(entries
-            .first()
-            .and_then(|e| Some((first(e, SPENT_HOST_ATTR)?, first(e, SPENT_REDEEMER_ATTR)?))))
+        Ok(entries.first().and_then(|e| {
+            Some((
+                e.first(SPENT_HOST_ATTR)?.to_owned(),
+                e.first(SPENT_REDEEMER_ATTR)?.to_owned(),
+            ))
+        }))
     }
 
     fn spent_dn(&self, spent: &str) -> String {
@@ -1995,13 +1884,9 @@ impl LdapDirectory {
         let new = partner.to_json();
         let mut mods = Vec::new();
         if !old.is_empty() {
-            mods.push((
-                ModOp::Delete,
-                TRUSTED_ATTR,
-                old.iter().map(String::as_bytes).collect(),
-            ));
+            mods.push(Mod::delete(TRUSTED_ATTR, &old));
         }
-        mods.push((ModOp::Add, TRUSTED_ATTR, vec![new.as_bytes()]));
+        mods.push(Mod::add(TRUSTED_ATTR, [&new]));
         conn.modify_s(&self.trusts_dn(), &mods)?;
         Ok(())
     }
