@@ -90,8 +90,7 @@ fn admit_for<D>(
     if host.is_some_and(|h| !plausible_name(h)) {
         return Err(StatusCode::FORBIDDEN);
     }
-    let source =
-        limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
+    let source = limit::forwarded_source(headers);
     match host {
         Some(host) => app.limiter.check(host, source.as_deref()),
         None => app.limiter.check_source(source.as_deref()),
@@ -105,24 +104,31 @@ fn admit_for<D>(
     })
 }
 
+/// The operations that share one handler, `POST /ipa/ku/<path>/{id}`.  Only
+/// a host-keyed OTP is limited per host (inside [`exchange`]); Kerberos-only
+/// ones (registration, seals, keys, tlog lookups, signing) use the source's
+/// bucket alone.  Pins are a host refreshing its pins, as for a rekey.
+const OPERATIONS: [Operation; 9] = [
+    Operation::Join,
+    Operation::Rekey,
+    Operation::Stage,
+    Operation::Register,
+    Operation::Seal,
+    Operation::Keys,
+    Operation::Tlog,
+    Operation::Sign,
+    Operation::Pins,
+];
+
 /// The router.
 pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/ipa/ku/adv", get(advertisement::<D>))
-        .route("/ipa/ku/join/{kid}", post(join::<D>))
-        .route("/ipa/ku/rekey/{kid}", post(rekey::<D>))
-        .route("/ipa/ku/stage/{kid}", post(stage::<D>))
-        .route("/ipa/ku/register/{kid}", post(register::<D>))
-        .route("/ipa/ku/seal/{kid}", post(seal::<D>))
-        .route("/ipa/ku/keys/{kid}", post(keys::<D>))
         .route("/ipa/ku/rec/{kid}", post(recover::<D>))
         .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
         .route("/ipa/ku/peer/spend", post(peer_spend::<D>))
         .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
         .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
-        .route("/ipa/ku/tlog/{id}", post(tlog::<D>))
-        .route("/ipa/ku/sign/{kid}", post(sign::<D>))
-        .route("/ipa/ku/pins/{kid}", post(pins::<D>))
         .route("/ipa/ku/tlog/{id}/head", get(log_head::<D>))
         .route("/ipa/ku/tlog/{id}/cosign", post(log_cosign::<D>))
         .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves::<D>))
@@ -132,7 +138,21 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/tang/adv", get(tang_advertisement::<D>))
         .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for::<D>))
         .route("/ipa/ku/tang/key/{kid}", get(tang_exchange_key::<D>))
-        .route("/ipa/ku/tang/rec/{kid}", post(tang_recover::<D>))
+        .route("/ipa/ku/tang/rec/{kid}", post(tang_recover::<D>));
+    for op in OPERATIONS {
+        router = router.route(
+            &format!("/ipa/ku/{}/{{id}}", op.path()),
+            post(
+                move |State(app): State<Arc<App<D>>>,
+                      Path(kid): Path<String>,
+                      headers: HeaderMap,
+                      body: Bytes| async move {
+                    exchange(app, op, kid, &headers, body).await
+                },
+            ),
+        );
+    }
+    router
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(app)
 }
@@ -144,6 +164,17 @@ fn refused(what: &str, reason: &dyn std::fmt::Display) -> Response {
 
 fn binary(body: Vec<u8>, content_type: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+/// A `200` with `value` as JSON; a serialization failure is logged as `what`.
+fn json<T: serde::Serialize>(what: &str, value: &T) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(body) => binary(body, "application/json"),
+        Err(e) => {
+            eprintln!("kuipad: {what}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// The anchors a client asks for: `?anchor=<thumbprint>`, repeated, in
@@ -237,25 +268,17 @@ async fn anchor_log<D: Directory + Send + Sync + 'static>(
     if let Err(status) = admit_for(&app, "anchor log", None, &headers) {
         return status.into_response();
     }
-    let from = query
-        .unwrap_or_default()
-        .split('&')
-        .find_map(|p| p.strip_prefix("from="))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let [from] = numbers(query.as_deref(), ["from"]).unwrap_or([0]);
     let heads: Vec<_> = app
         .server
         .heads()
         .into_iter()
         .map(|h| h.to_json())
         .collect();
-    match serde_json::to_vec(&json!({ "entries": app.server.epoch_log(from), "heads": heads })) {
-        Ok(body) => binary(body, "application/json"),
-        Err(e) => {
-            eprintln!("kuipad: anchor log: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    json(
+        "anchor log",
+        &json!({ "entries": app.server.epoch_log(from), "heads": heads }),
+    )
 }
 
 /// One anchor's claim log (§4.9): `?from=<index>`, the leaves after that
@@ -271,25 +294,14 @@ async fn claim_log<D: Directory + Send + Sync + 'static>(
     if let Err(status) = admit_for(&app, "claim log", None, &headers) {
         return status.into_response();
     }
-    let from = query
-        .unwrap_or_default()
-        .split('&')
-        .find_map(|p| p.strip_prefix("from="))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let [from] = numbers(query.as_deref(), ["from"]).unwrap_or([0]);
     let Ok(anchor) = anchor.parse() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(page) = app.server.claim_log(&anchor, from) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match serde_json::to_vec(&page) {
-        Ok(body) => binary(body, "application/json"),
-        Err(e) => {
-            eprintln!("kuipad: claim log: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    json("claim log", &page)
 }
 
 /// The `u64` query parameters `names`, in order; `None` if one is missing
@@ -315,13 +327,7 @@ fn ledger_for<'a, D>(app: &'a App<D>, id: &str) -> Option<&'a crate::ledger::Fil
 
 fn hashes_json(what: &str, hashes: &[kuipa_enroll::merkle::Hash]) -> Response {
     let hashes: Vec<String> = hashes.iter().map(|h| b64::encode(h)).collect();
-    match serde_json::to_vec(&json!({ what: hashes })) {
-        Ok(body) => binary(body, "application/json"),
-        Err(e) => {
-            eprintln!("kuipad: log {what}: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    json(&format!("log {what}"), &json!({ what: hashes }))
 }
 
 /// The log's current signed head (`IPLS`, DESIGN-tlog.md §3).  Public:
@@ -373,10 +379,7 @@ async fn log_cosign<D: Directory + Send + Sync + 'static>(
                 "kuipad: tlog cosign: head of {} leaves now has {n} trusted cosignatures",
                 submitted.head.size
             );
-            binary(
-                json!({ "cosignatures": n }).to_string().into_bytes(),
-                "application/json",
-            )
+            json("tlog cosign", &json!({ "cosignatures": n }))
         }
         crate::ledger::Cosigned::Stale => StatusCode::CONFLICT.into_response(),
         crate::ledger::Cosigned::Untrusted => {
@@ -401,13 +404,7 @@ async fn log_leaves<D: Directory + Send + Sync + 'static>(
         .iter()
         .map(|l| b64::encode(&l.to_bytes()))
         .collect();
-    match serde_json::to_vec(&json!({ "from": from, "leaves": leaves })) {
-        Ok(body) => binary(body, "application/json"),
-        Err(e) => {
-            eprintln!("kuipad: log leaves: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    json("log leaves", &json!({ "from": from, "leaves": leaves }))
 }
 
 /// `?index=<i>&size=<n>`: the inclusion path of leaf `i` in the tree of
@@ -519,14 +516,8 @@ async fn tang_recover<D: Directory + Send + Sync + 'static>(
     let Some(tang) = app.tang.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let source =
-        limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
-    if app.limiter.check_source(source.as_deref()).is_err() {
-        eprintln!(
-            "kuipad: tang recovery: rate limited (source {})",
-            source.as_deref().unwrap_or("unknown")
-        );
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    if let Err(status) = admit_for(&app, "tang recovery", None, &headers) {
+        return status.into_response();
     }
     let request = match tang_pqc::RecoveryRequest::from_bytes(&body) {
         Ok(r) if r.kid().to_string() == kid => r,
@@ -603,94 +594,6 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
         Ok(Err((false, reason))) => refused(&what, &reason),
         Err(e) => refused(&what, &e),
     }
-}
-
-async fn join<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    exchange(app, Operation::Join, kid, &headers, body).await
-}
-
-async fn rekey<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    exchange(app, Operation::Rekey, kid, &headers, body).await
-}
-
-async fn stage<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    exchange(app, Operation::Stage, kid, &headers, body).await
-}
-
-async fn register<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    exchange(app, Operation::Register, kid, &headers, body).await
-}
-
-async fn seal<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    exchange(app, Operation::Seal, kid, &headers, body).await
-}
-
-async fn keys<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    // Like registration and seal operations: only ever
-    // Kerberos-authenticated, so only the source's bucket applies.
-    exchange(app, Operation::Keys, kid, &headers, body).await
-}
-
-async fn tlog<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    // A lookup of the caller's own entries: Kerberos-only, like seal
-    // operations.
-    exchange(app, Operation::Tlog, kid, &headers, body).await
-}
-
-async fn sign<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    // Kerberos-only, like seal operations: the source's bucket applies.
-    exchange(app, Operation::Sign, kid, &headers, body).await
-}
-
-async fn pins<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    // A host refreshing its pins: the host's bucket applies, as for a
-    // rekey.
-    exchange(app, Operation::Pins, kid, &headers, body).await
 }
 
 async fn recover<D: Directory + Send + Sync + 'static>(
@@ -778,11 +681,8 @@ async fn peer_spend<D: Directory + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let source =
-        limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
-    if app.limiter.check_source(source.as_deref()).is_err() {
-        eprintln!("kuipad: peer spend: rate limited");
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    if let Err(status) = admit_for(&app, "peer spend", None, &headers) {
+        return status.into_response();
     }
     let Some(peers) = &app.peers else {
         return StatusCode::NOT_FOUND.into_response();
@@ -813,11 +713,8 @@ async fn peer_sync<D: Directory + Send + Sync + 'static>(
     // Syncs arrive from other servers, which the GSS-API token check in
     // `handle` authenticates; the cost of that check is still bounded by
     // the per-source rate limit, like every other route.
-    let source =
-        limit::forwarded_source(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()));
-    if app.limiter.check_source(source.as_deref()).is_err() {
-        eprintln!("kuipad: peer sync: rate limited");
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    if let Err(status) = admit_for(&app, "peer sync", None, &headers) {
+        return status.into_response();
     }
     let Some(peers) = &app.peers else {
         return StatusCode::NOT_FOUND.into_response();
