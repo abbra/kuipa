@@ -29,7 +29,7 @@
 //! Exit status: 0 success, 1 error, 2 usage.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -58,7 +58,7 @@ enum Command {
     Keygen {
         /// Key file to write.
         #[arg(long, value_name = "FILE")]
-        key: String,
+        key: PathBuf,
         /// Signature algorithm: ml-dsa-44, ml-dsa-65 or ml-dsa-87.
         #[arg(long, value_name = "ALG", default_value = "ml-dsa-65")]
         alg: String,
@@ -67,25 +67,25 @@ enum Command {
     Quota {
         /// Quota file to update.
         #[arg(long, value_name = "FILE")]
-        quota: String,
+        quota: PathBuf,
         /// Maximum number of vouchers.
         #[arg(long, value_name = "N")]
-        limit: String,
+        limit: u64,
     },
     /// Sign the blinded request on standard input; print the response.
     Sign {
         /// The voucher key.
         #[arg(long, value_name = "FILE")]
-        key: String,
+        key: PathBuf,
         /// The quota file to count against.
         #[arg(long, value_name = "FILE")]
-        quota: String,
+        quota: PathBuf,
     },
     /// Blind a voucher for a host; print the request for `sign`.
     Request {
         /// File holding the issuer's public JWK (what `keygen` printed).
         #[arg(long, value_name = "FILE")]
-        public: String,
+        public: PathBuf,
         /// The realm the voucher admits a host to.
         #[arg(long, value_name = "REALM")]
         realm: String,
@@ -102,7 +102,7 @@ enum Command {
         hostgroup: Option<String>,
         /// Days the voucher is valid from now.
         #[arg(long, value_name = "N", default_value = "7")]
-        days: String,
+        days: u64,
         /// The host lives this many hours from its join, and the realm
         /// then removes it (`DESIGN-ci.md` §1): for CI runners.
         #[arg(long, value_name = "HOURS")]
@@ -114,13 +114,13 @@ enum Command {
         /// State file `finish` needs: the unblinding is kept there, not
         /// on the issuer.
         #[arg(long, value_name = "FILE")]
-        state: String,
+        state: PathBuf,
     },
     /// Unblind the response on standard input; print the voucher.
     Finish {
         /// The state file written by `request`.
         #[arg(long, value_name = "FILE")]
-        state: String,
+        state: PathBuf,
     },
     /// Print the claims of the voucher on standard input, as JSON.
     Show,
@@ -146,14 +146,14 @@ fn run(command: Command) -> Result<(), Error> {
     match command {
         Command::Keygen { key, alg: name } => {
             let alg = alg(&name)?;
-            println!("{}", voucher::keygen(Path::new(&key), alg)?);
+            println!("{}", voucher::keygen(&key, alg)?);
         }
         Command::Quota { quota, limit } => {
-            let q = voucher::set_quota(Path::new(&quota), limit.parse()?)?;
+            let q = voucher::set_quota(&quota, limit)?;
             println!("{} of {} issued", q.issued, q.limit);
         }
         Command::Sign { key, quota } => {
-            let response = voucher::sign(Path::new(&key), Path::new(&quota), &stdin_text()?)?;
+            let response = voucher::sign(&key, &quota, &stdin_text()?)?;
             println!("{response}");
         }
         Command::Request {
@@ -167,7 +167,6 @@ fn run(command: Command) -> Result<(), Error> {
             binding,
             state,
         } => {
-            let days: u64 = days.parse()?;
             let lease = match lease_hours {
                 Some(0) => return Err("--lease-hours must be at least 1".into()),
                 Some(h) => h.checked_mul(3600).ok_or("--lease-hours is too large")?,
@@ -197,12 +196,12 @@ fn run(command: Command) -> Result<(), Error> {
             let request = voucher::request(
                 &kuipa_tools::paths::read(&public)?,
                 &claims,
-                Path::new(&state),
+                &state,
             )?;
             println!("{request}");
         }
         Command::Finish { state } => {
-            let v = voucher::finish(Path::new(&state), &stdin_text()?)?;
+            let v = voucher::finish(&state, &stdin_text()?)?;
             println!("{}", String::from_utf8_lossy(v.encode().as_ref()));
         }
         Command::Show => {
