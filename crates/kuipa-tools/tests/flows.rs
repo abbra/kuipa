@@ -2129,7 +2129,7 @@ fn trusted_realms_pins_and_uses_the_partners_heads() {
     // next refresh verifies with no signature served.
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, _, mut delegation) = server_keys(&anchor, "trustA1.example.test");
-    let info = trust_info_of(&anchor);
+    let info = info_for("trustA1.example.test", &anchor);
     let claim = delegation.claim().unwrap();
     let vouch = SignedVouch::issue(
         &anchor,
@@ -2225,24 +2225,6 @@ fn trusted_realms_pins_and_uses_the_partners_heads() {
         keys,
         delegation,
     });
-}
-
-/// A's realm info for the trust test: this one server, so the
-/// advertisement lists what the deployment names.
-fn trust_info_of(anchor: &SigningKey) -> RealmInfo {
-    RealmInfo {
-        realm: REALM.into(),
-        domain: "example.test".into(),
-        basedn: "dc=example,dc=test".into(),
-        server: "trustA1.example.test".into(),
-        servers: vec!["trustA1.example.test".into()],
-        ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![PKINIT.to_vec()],
-        anchors: vec![*anchor.public().thumbprint()],
-        heads: Vec::new(),
-        trusts: Vec::new(),
-        kdc_proxy: None,
-    }
 }
 
 /// The running mirror and what the origin served it.
@@ -2343,7 +2325,7 @@ fn a_mirror_serves_what_it_cached_and_no_authenticated_route() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let pin = *anchor.public().thumbprint();
     let (keys, _, mut delegation) = server_keys(&anchor, "mirror1.example.test");
-    let info = mirror_info_of(&anchor);
+    let info = info_for("mirror1.example.test", &anchor);
     let claim = delegation.claim().unwrap();
     let vouch = SignedVouch::issue(
         &anchor,
@@ -2436,23 +2418,6 @@ fn a_mirror_serves_what_it_cached_and_no_authenticated_route() {
     });
 }
 
-/// The realm info for the mirror test's single server.
-fn mirror_info_of(anchor: &SigningKey) -> RealmInfo {
-    RealmInfo {
-        realm: REALM.into(),
-        domain: "example.test".into(),
-        basedn: "dc=example,dc=test".into(),
-        server: "mirror1.example.test".into(),
-        servers: vec!["mirror1.example.test".into()],
-        ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![PKINIT.to_vec()],
-        anchors: vec![*anchor.public().thumbprint()],
-        heads: Vec::new(),
-        trusts: Vec::new(),
-        kdc_proxy: None,
-    }
-}
-
 /// A frozen pin's head, and the server that answers for it.
 struct FrozenHead {
     anchor: SigningKey,
@@ -2502,7 +2467,7 @@ fn frozen_head_tail(state: FrozenHead) {
                 vouchers: Vec::new(),
                 retired: Vec::new(),
             },
-            info_of(&anchor),
+            info_for("frozen1.example.test", &anchor),
             d.clone(),
         ));
         server.publish(d, vec![*anchor.public().thumbprint()], vs);
@@ -2571,7 +2536,7 @@ fn a_frozen_pin_refuses_what_its_head_does_not_prove() {
     // back to the signature.
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, _, mut delegation) = server_keys(&anchor, "frozen1.example.test");
-    let info = info_of(&anchor);
+    let info = info_for("frozen1.example.test", &anchor);
     let claim = delegation.claim().unwrap();
     let vouch = SignedVouch::issue(
         &anchor,
@@ -2638,24 +2603,6 @@ fn a_frozen_pin_refuses_what_its_head_does_not_prove() {
     frozen_head_tail(FrozenHead { anchor, head, url });
 }
 
-/// The realm info of `server_keys`, for a second server of the same
-/// test realm.
-fn info_of(anchor: &SigningKey) -> RealmInfo {
-    RealmInfo {
-        realm: REALM.into(),
-        domain: "example.test".into(),
-        basedn: "dc=example,dc=test".into(),
-        server: "frozen1.example.test".into(),
-        servers: vec!["frozen1.example.test".into()],
-        ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![PKINIT.to_vec()],
-        anchors: vec![*anchor.public().thumbprint()],
-        heads: Vec::new(),
-        trusts: Vec::new(),
-        kdc_proxy: None,
-    }
-}
-
 #[test]
 fn the_claim_log_carries_the_heads_signed_vouch() {
     // DESIGN-claim-logs.md §4: the public claim-log page carries the
@@ -2681,7 +2628,7 @@ fn the_claim_log_carries_the_heads_signed_vouch() {
     vouches.insert(pin, vouch);
     let server = Arc::new(EnrollServer::new(
         keys,
-        claim_log_info_of(&anchor),
+        info_for("claimlog1.example.test", &anchor),
         delegation.clone(),
     ));
     server.publish(delegation, vec![pin], vouches);
@@ -2726,23 +2673,6 @@ fn the_claim_log_carries_the_heads_signed_vouch() {
         page_vouch.vouch().root
     );
     kuipa_tools::net::clear_thread_endpoints();
-}
-
-/// The realm info for the claim-log test's single server.
-fn claim_log_info_of(anchor: &SigningKey) -> RealmInfo {
-    RealmInfo {
-        realm: REALM.into(),
-        domain: "example.test".into(),
-        basedn: "dc=example,dc=test".into(),
-        server: "claimlog1.example.test".into(),
-        servers: vec!["claimlog1.example.test".into()],
-        ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![PKINIT.to_vec()],
-        anchors: vec![*anchor.public().thumbprint()],
-        heads: Vec::new(),
-        trusts: Vec::new(),
-        kdc_proxy: None,
-    }
 }
 
 /// The leaves of `anchor`'s claim log, read page by page up to `size`,
@@ -2894,7 +2824,7 @@ fn a_window_grows_only_through_a_consistent_log() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let pin = *anchor.public().thumbprint();
     let (keys, _, mut delegation) = server_keys(&anchor, "window1.example.test");
-    let info = window_info_of(&anchor);
+    let info = info_for("window1.example.test", &anchor);
     let claim = delegation.claim().unwrap();
     let v1 = SignedVouch::issue(
         &anchor,
@@ -2998,23 +2928,6 @@ fn a_window_grows_only_through_a_consistent_log() {
     kuipa_tools::net::clear_thread_endpoints();
 }
 
-/// The realm info for the window test's single server.
-fn window_info_of(anchor: &SigningKey) -> RealmInfo {
-    RealmInfo {
-        realm: REALM.into(),
-        domain: "example.test".into(),
-        basedn: "dc=example,dc=test".into(),
-        server: "window1.example.test".into(),
-        servers: vec!["window1.example.test".into()],
-        ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![PKINIT.to_vec()],
-        anchors: vec![*anchor.public().thumbprint()],
-        heads: Vec::new(),
-        trusts: Vec::new(),
-        kdc_proxy: None,
-    }
-}
-
 /// The anchor's current published vouch, for extending its log.
 fn vouch_of(server: &Arc<EnrollServer>, anchor: tang_pqc::Thumbprint) -> SignedVouch {
     server.vouches().remove(&anchor).expect("a published vouch")
@@ -3030,7 +2943,10 @@ fn audit_reports_coverage_and_split_views() {
     let pin = *anchor.public().thumbprint();
     let (keys, _, mut delegation) = server_keys(&anchor, "audit1.example.test");
     let signing = SigningKey::from_jwk(keys.signing.to_jwk().unwrap().as_ref()).unwrap();
-    let info = audit_info_of(&anchor);
+    let info = RealmInfo {
+        servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
+        ..info_for("audit1.example.test", &anchor)
+    };
     let claim = delegation.claim().unwrap();
     let v1 = SignedVouch::issue(
         &anchor,
@@ -3116,7 +3032,10 @@ fn audit_reports_coverage_and_split_views() {
             vouchers: Vec::new(),
             retired: Vec::new(),
         },
-        audit_info_of(&anchor),
+        RealmInfo {
+            servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
+            ..info_for("audit1.example.test", &anchor)
+        },
         forked,
     ));
     server2.publish(delegation.clone(), vec![pin], forked_vouches);
@@ -3138,23 +3057,6 @@ fn audit_reports_coverage_and_split_views() {
         "a split view is not clean"
     );
     kuipa_tools::net::clear_thread_endpoints();
-}
-
-/// The realm info for the audit tests' servers.
-fn audit_info_of(anchor: &SigningKey) -> RealmInfo {
-    RealmInfo {
-        realm: REALM.into(),
-        domain: "example.test".into(),
-        basedn: "dc=example,dc=test".into(),
-        server: "audit1.example.test".into(),
-        servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
-        ca_certs: vec![CA.to_vec()],
-        pkinit_anchors: vec![PKINIT.to_vec()],
-        anchors: vec![*anchor.public().thumbprint()],
-        heads: Vec::new(),
-        trusts: Vec::new(),
-        kdc_proxy: None,
-    }
 }
 
 /// An enrolled host's state and CA, for a flow that works from stored
@@ -3186,6 +3088,11 @@ fn info_named(server: &str, anchors: &[tang_pqc::Thumbprint]) -> RealmInfo {
         trusts: Vec::new(),
         kdc_proxy: None,
     }
+}
+
+/// [`info_named`] for one anchor key.
+fn info_for(server: &str, anchor: &SigningKey) -> RealmInfo {
+    info_named(server, &[*anchor.public().thumbprint()])
 }
 
 /// What the `kuipa` CLI puts on the wire from a pin file: the live
@@ -4408,7 +4315,7 @@ fn a_host_pins_what_its_anchors_logs_retired() {
     vouches.insert(pin, v2.clone());
     let server = Arc::new(EnrollServer::new(
         keys,
-        window_info_of(&anchor),
+        info_for("window1.example.test", &anchor),
         delegation.clone(),
     ));
     server.publish(delegation, vec![pin], vouches);
