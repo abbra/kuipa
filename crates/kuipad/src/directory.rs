@@ -147,30 +147,11 @@ const INVITATION_ATTR: &str = "ipaKUTrustInvitation";
 /// Trusted realms, JSON (new schema).
 const TRUSTED_ATTR: &str = "ipaKUTrustedRealm";
 
-/// What the directory side takes from the daemon configuration.
-#[derive(Clone, Debug)]
-struct Config {
-    /// LDAPI URI, e.g. `ldapi://%2Frun%2Fslapd-EXAMPLE-TEST.socket`.
-    pub ldap_uri: String,
-    /// Base DN.
-    pub basedn: String,
-    /// Kerberos realm.
-    pub realm: String,
-    /// The daemon's principal, e.g. `ipa-ku/ipa1.example.test@EXAMPLE.TEST`.
-    pub principal: String,
-    /// The daemon's keytab.
-    pub keytab: String,
-    /// Obtain credentials through gssproxy.
-    pub gssproxy: bool,
-    /// PEM file with the IPA CA chain (`/etc/ipa/ca.crt`).
-    pub ca_file: String,
-    /// Enctypes the realm allows, strongest first.
-    pub enctypes: Vec<Enctype>,
-}
-
 /// The LDAP-backed directory.
 pub struct LdapDirectory {
-    cfg: Config,
+    cfg: crate::config::Config,
+    /// The enctypes the realm allows, strongest first.
+    enctypes: Vec<Enctype>,
     server_cred: GssServerCred,
     /// The `keys` operation's handlers (§18.5), if the daemon serves it.
     keys: Option<std::sync::Arc<crate::keys::Keys>>,
@@ -222,16 +203,8 @@ impl LdapDirectory {
             GssServerCred::acquire(&cfg.service, &cfg.keytab)?
         };
         Ok(Self {
-            cfg: Config {
-                ldap_uri: cfg.ldap_uri.clone(),
-                basedn: cfg.basedn.clone(),
-                realm: cfg.realm.clone(),
-                principal: cfg.principal.clone(),
-                keytab: cfg.keytab.clone(),
-                gssproxy: cfg.gssproxy,
-                ca_file: cfg.ca_file.clone(),
-                enctypes: cfg.enctypes.iter().copied().map(Enctype).collect(),
-            },
+            cfg: cfg.clone(),
+            enctypes: cfg.enctypes.iter().copied().map(Enctype).collect(),
             server_cred,
             keys: None,
             initiator: std::sync::Mutex::new(()),
@@ -367,7 +340,7 @@ impl LdapDirectory {
         let chosen: Vec<_> = requested
             .iter()
             .copied()
-            .filter(|e| self.cfg.enctypes.contains(e))
+            .filter(|e| self.enctypes.contains(e))
             .collect();
         if chosen.is_empty() {
             return Err("no allowed enctype requested".into());
@@ -648,7 +621,7 @@ impl LdapDirectory {
         {
             return Err(e.into());
         }
-        let request = getkeytab::encode_keys(principal, &self.cfg.enctypes, Some(password))?;
+        let request = getkeytab::encode_keys(principal, &self.enctypes, Some(password))?;
         conn.extended_operation(KEYTAB_GET_OID, Some(request.as_ref()))?;
         Ok(())
     }

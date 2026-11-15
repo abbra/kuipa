@@ -15,7 +15,7 @@ use crate::Error;
 pub const DEFAULT_PATH: &str = "/etc/ipa/kuipad.json";
 
 /// The configuration file.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Kerberos realm.
@@ -117,7 +117,7 @@ fn default_enctypes() -> Vec<i32> {
 }
 
 /// One trusted realm.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustConfig {
     /// Its Kerberos realm.
@@ -159,7 +159,7 @@ impl TrustConfig {
 }
 
 /// A realm's KDC proxies (MS-KKDCP, FreeIPA's `/KdcProxy`).
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KdcProxyConfig {
     /// The proxy URLs, `https://<host>[:<port>][/<path>]`.
@@ -182,7 +182,7 @@ impl KdcProxyConfig {
 }
 
 /// The `keys` operation's configuration (§18.5).
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysConfig {
     /// Whether the operation is served; default true when the section is
@@ -198,7 +198,7 @@ pub struct KeysConfig {
 }
 
 /// One namespace's handler.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandlerConfig {
     /// The executable.
