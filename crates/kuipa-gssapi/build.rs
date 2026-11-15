@@ -1,3 +1,5 @@
+//! Link configuration for kuipa-gssapi.
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

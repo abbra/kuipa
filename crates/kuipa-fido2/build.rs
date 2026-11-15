@@ -1,3 +1,5 @@
+//! Link configuration for kuipa-fido2.
+
 fn main() {
     // libfido2 ships a pkg-config file everywhere it is packaged; fall back
     // to the bare library name for hand-built installs.

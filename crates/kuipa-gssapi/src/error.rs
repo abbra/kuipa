@@ -15,8 +15,11 @@ pub enum GssError {
     /// This typically indicates an empty or structurally invalid service name.
     #[error("gss_import_name failed: {detail}")]
     ImportName {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
@@ -28,8 +31,11 @@ pub enum GssError {
     /// service principal, or the Kerberos libraries are not installed.
     #[error("gss_acquire_cred_from failed: {detail}")]
     AcquireCred {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
@@ -39,8 +45,11 @@ pub enum GssError {
     /// wrong service principal, the token was replayed, or it was forged.
     #[error("gss_accept_sec_context failed: {detail}")]
     AcceptContext {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
@@ -48,8 +57,11 @@ pub enum GssError {
     /// printable string.
     #[error("gss_display_name failed: {detail}")]
     DisplayName {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
@@ -76,8 +88,10 @@ pub enum GssError {
     /// the missing path explicitly rather than surfacing an opaque minor status.
     #[error("keytab file not readable: {path}: {source}")]
     KeytabNotReadable {
+        /// Path involved.
         path: String,
         #[source]
+        /// Underlying I/O error.
         source: std::io::Error,
     },
 
@@ -100,8 +114,11 @@ pub enum GssError {
     /// target service principal does not exist in the Kerberos database.
     #[error("gss_init_sec_context failed: {detail}")]
     InitContext {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
@@ -112,44 +129,64 @@ pub enum GssError {
     /// is not configured.
     #[error("gss_acquire_cred_impersonate_name failed: {detail}")]
     ImpersonateCred {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
     /// Credential export via FILE: ccache failed.
     #[error("credential export failed: {detail}")]
     ExportCred {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
     /// `gss_store_cred_into` failed to write the credential to the named cache.
     #[error("gss_store_cred_into failed: {detail}")]
     StoreCred {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
     /// `gss_krb5_ccache_name` failed to set the thread-local credential cache.
     #[error("gss_krb5_ccache_name failed: {detail}")]
     SetCcache {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
     /// A libkrb5 function failed (TGT acquisition or ccache operation).
     #[error("krb5 error in {msg}: code {code:#010x}")]
-    Krb5 { code: i32, msg: &'static str },
+    Krb5 {
+        /// libkrb5 error code.
+        code: i32,
+        /// The failing operation.
+        msg: &'static str,
+    },
 
     /// `gss_pseudo_random` failed, or the mechanism returned a short output.
     #[error("gss_pseudo_random failed: {detail}")]
     PseudoRandom {
+        /// GSS major status code.
         major: OmUint32,
+        /// Mechanism-specific minor status code.
         minor: OmUint32,
+        /// Formatted status text.
         detail: String,
     },
 
@@ -168,8 +205,11 @@ pub enum GssError {
     /// libkrb5 rejected a request, with its own message.
     #[error("{msg}: {detail}")]
     Krb5Detail {
+        /// Numeric error code.
         code: i32,
+        /// Message.
         msg: &'static str,
+        /// Formatted status text.
         detail: String,
     },
 
@@ -177,14 +217,20 @@ pub enum GssError {
     /// collected: there was no terminal to ask on, or the asking failed.
     /// `detail` says which method was wanted and why it could not be had.
     #[error("pre-authentication: {detail}")]
-    Preauth { detail: String },
+    Preauth {
+        /// Which method was wanted and why it could not be had.
+        detail: String,
+    },
 
     /// The Kerberos library this build is linked against has no equivalent of
     /// `feature`.  Heimdal lacks MIT's credential-store, S4U2Self, responder
     /// and thread-local-ccache extensions; builds that ask for one of them
     /// fail here rather than half-working.
     #[error("{feature} is not supported by the Kerberos library this build uses")]
-    Unsupported { feature: &'static str },
+    Unsupported {
+        /// The missing capability.
+        feature: &'static str,
+    },
 }
 
 const GSS_S_CALL_INACCESSIBLE_READ: OmUint32 = 0x0100_0000;

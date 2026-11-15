@@ -13,3 +13,13 @@ thiserror = "2"
 
 [build-dependencies]
 pkg-config = "0.3"
+
+# Same as the workspace lints minus `unsafe_code = "forbid"`: Cargo cannot
+# override a single inherited lint, and these crates are raw FFI bindings.
+[lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+incompatible_msrv = "deny"

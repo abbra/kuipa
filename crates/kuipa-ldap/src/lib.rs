@@ -27,14 +27,24 @@ pub use conn::{ExtendedResult, LdapConnection, ModOp, SearchEntry};
 use libc::c_int;
 use thiserror::Error;
 
+/// Error from an LDAP operation.
 #[derive(Debug, Error)]
 pub enum LdapError {
+    /// The server (or libldap) returned a non-success result.
     #[error("LDAP protocol error {code}: {msg}")]
-    Protocol { code: c_int, msg: String },
+    Protocol {
+        /// LDAP result code.
+        code: c_int,
+        /// Server diagnostic message.
+        msg: String,
+    },
+    /// TLS setup failed.
     #[error("TLS error: {0}")]
     Tls(String),
+    /// An argument contained an interior NUL byte.
     #[error("NUL byte in argument: {0}")]
     NulByte(String),
+    /// A background task panicked.
     #[error("background task panicked")]
     TaskPanic,
 }
@@ -74,7 +84,9 @@ impl Scope {
 pub enum Auth {
     /// LDAP simple bind: DN + cleartext password.
     Simple {
+        /// Bind DN.
         bind_dn: String,
+        /// Bind password.
         password: native_ossl::util::SecretBuf,
     },
     /// SASL GSSAPI bind using the Kerberos ticket-granting ticket in the

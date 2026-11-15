@@ -67,7 +67,9 @@ pub const fn is_mit_kerberos() -> bool {
 /// when the credential handle becomes stale.
 #[derive(Debug, Clone)]
 pub enum GssCredMode {
+    /// gssproxy.
     GssProxy { service: String },
+    /// Keytab.
     Keytab { service: String, keytab: String },
 }
 
@@ -101,10 +103,13 @@ pub enum Impersonation {
 #[derive(Debug, Clone)]
 pub enum InitiatorCredMode {
     GssProxy {
+        /// Credential usage.
         impersonation: Impersonation,
     },
     Keytab {
+        /// Keytab path.
         keytab: String,
+        /// Credential cache name.
         ccache: Option<String>,
     },
 }
@@ -679,6 +684,8 @@ impl std::fmt::Debug for GssClientCred {
 // which Send does not imply. Concurrent shared access requires MIT Kerberos
 // (see cfg-gated Sync impl below).
 unsafe impl Send for GssClientCred {}
+// SAFETY: MIT Kerberos documents gss_cred_id_t as thread-safe for concurrent
+// use (the credential is internally locked); same reasoning as `GssServerCred`.
 #[cfg(mit_kerberos)]
 unsafe impl Sync for GssClientCred {}
 
@@ -2242,7 +2249,9 @@ pub enum AcceptStep {
     /// (e.g. `"user@REALM"`).  `out_token` is the optional mutual-authentication
     /// response; encode it as `WWW-Authenticate: Negotiate <base64>` if non-empty.
     Complete {
+        /// Token to send to the peer, possibly empty.
         out_token: Vec<u8>,
+        /// Authenticated client principal.
         principal: String,
     },
     /// The mechanism needs another round-trip.  Send `out_token` as
@@ -2250,7 +2259,9 @@ pub enum AcceptStep {
     /// [`GssServerContext::step`] with the client's next `Authorization: Negotiate`
     /// token.  `ctx` must be kept alive between the two HTTP requests.
     Continue {
+        /// Token to send to the peer, possibly empty.
         out_token: Vec<u8>,
+        /// Context to resume with the peer's next token.
         ctx: GssServerContext,
     },
 }
@@ -2543,7 +2554,9 @@ pub enum InitStep {
     /// server; if the server replies with `WWW-Authenticate: Negotiate <base64>`,
     /// decode the server token and pass it to [`GssClientContext::step`] on `ctx`.
     Continue {
+        /// Token to send to the peer.
         token: Vec<u8>,
+        /// Context to resume with the peer's next token.
         ctx: GssClientContext,
     },
 }
