@@ -85,7 +85,7 @@ fn stdin() -> Result<Vec<u8>, Error> {
 }
 
 fn encrypt(config: &str) -> Result<(), Error> {
-    let config = Config::parse(config)?;
+    let config: Config = config.parse()?;
     let jwe = tang_pqc_clevis::encrypt(&config, &stdin()?)?;
     println!("{jwe}");
     Ok(())
@@ -101,9 +101,8 @@ fn decrypt() -> Result<(), Error> {
 fn adv(url: &str, ca: Option<&str>) -> Result<(), Error> {
     let config = Config {
         url: url.to_owned(),
-        thp: None,
-        adv: None,
         ca: ca.map(PathBuf::from),
+        ..Config::default()
     };
     for thp in tang_pqc_clevis::signing_keys(&config)? {
         println!("{thp}");

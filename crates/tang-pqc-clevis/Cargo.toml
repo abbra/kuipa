@@ -24,12 +24,8 @@ serde_json.workspace = true
 synta-certificate = { version = "0.5.1", default-features = false, features = ["std", "derive"] }
 tang-pqc.workspace = true
 
-[lints.rust]
-unsafe_code = "deny"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-incompatible_msrv = "deny"
+[lints]
+workspace = true
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }

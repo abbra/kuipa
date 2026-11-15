@@ -26,11 +26,11 @@
 //! Other members, such as the `binding` that `clevis luks regen` passes back,
 //! are ignored.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use native_ossl::cipher::{AeadDecryptCtx, AeadEncryptCtx, CipherAlg};
 use native_ossl::util::SecretBuf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -38,6 +38,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_native_ossl::cert_verifier::OsslServerCertVerifier;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tang_pqc::primitives::{TAG_LEN, open_with, seal_with};
 use tang_pqc::{Binding, ExchangeKey, RecoveryResponse, SignedAdvertisement, Thumbprint, b64};
 
 /// The pin's name, in the JWE header.
@@ -47,10 +48,9 @@ pub const PIN: &str = "tang-pqc";
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const IV_LEN: usize = 12;
-const TAG_LEN: usize = 16;
 
 /// The pin configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     /// The Tang URL, e.g. `https://ipa1.example.test/ipa/ku/tang`.
     pub url: String,
@@ -62,13 +62,13 @@ pub struct Config {
     pub ca: Option<PathBuf>,
 }
 
-impl Config {
-    /// Parse the pin's JSON argument.
-    ///
-    /// # Errors
-    ///
-    /// Malformed JSON or a missing `url`.
-    pub fn parse(json: &str) -> Result<Self, Error> {
+/// Parse the pin's JSON argument.
+///
+/// Fails on malformed JSON or a missing `url`.
+impl FromStr for Config {
+    type Err = Error;
+
+    fn from_str(json: &str) -> Result<Self, Error> {
         let config: Self =
             serde_json::from_str(json).map_err(|e| format!("bad configuration: {e}"))?;
         if config.url.is_empty() {
@@ -76,7 +76,9 @@ impl Config {
         }
         Ok(config)
     }
+}
 
+impl Config {
     fn base(&self) -> &str {
         self.url.trim_end_matches('/')
     }
@@ -131,7 +133,7 @@ impl ServerCertVerifier for AnyCertificate {
     }
 }
 
-fn client(ca: Option<&PathBuf>) -> Result<reqwest::blocking::Client, Error> {
+fn client(ca: Option<&Path>) -> Result<reqwest::blocking::Client, Error> {
     let _ = rustls_native_ossl::default_provider().install_default();
     let provider = Arc::new(rustls_native_ossl::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -207,7 +209,7 @@ pub fn advertisement(config: &Config) -> Result<SignedAdvertisement, Error> {
         return Ok(SignedAdvertisement::from_json(&std::fs::read(file)?)?);
     }
     get_adv(
-        &client(config.ca.as_ref())?,
+        &client(config.ca.as_deref())?,
         &format!("{}/adv", config.base()),
     )?
     .ok_or_else(|| format!("{}/adv: not found", config.base()).into())
@@ -249,7 +251,7 @@ pub fn encrypt(config: &Config, plaintext: &[u8]) -> Result<String, Error> {
         // After a rotation the pinned key is retired: Tang servers sign
         // `adv/{thp}` with it too.
         Err(_) if config.adv.is_none() => get_adv(
-            &client(config.ca.as_ref())?,
+            &client(config.ca.as_deref())?,
             &format!("{}/adv/{pinned}", config.base()),
         )?
         .ok_or("the advertisement is not signed by the pinned key")?
@@ -274,20 +276,13 @@ pub fn encrypt(config: &Config, plaintext: &[u8]) -> Result<String, Error> {
     let protected = b64::encode(header.to_string().as_bytes());
     let mut iv = [0u8; IV_LEN];
     native_ossl::rand::Rand::fill(&mut iv)?;
-    let alg = CipherAlg::fetch(c"AES-256-GCM", None)?;
-    let mut ctx = AeadEncryptCtx::new(&alg, key.as_ref(), &iv, None)?;
-    ctx.set_aad(protected.as_bytes())?;
-    let mut ciphertext = vec![0u8; plaintext.len()];
-    let n = ctx.update(plaintext, &mut ciphertext)?;
-    let n = n + ctx.finalize(&mut ciphertext[n..])?;
-    ciphertext.truncate(n);
-    let mut tag = [0u8; TAG_LEN];
-    ctx.tag(&mut tag)?;
+    let sealed = seal_with(key.as_ref(), &iv, Some(protected.as_bytes()), plaintext)?;
+    let (ciphertext, tag) = sealed.split_at(plaintext.len());
     Ok(format!(
         "{protected}..{}.{}.{}",
         b64::encode(&iv),
-        b64::encode(&ciphertext),
-        b64::encode(&tag)
+        b64::encode(ciphertext),
+        b64::encode(tag)
     ))
 }
 
@@ -341,11 +336,15 @@ fn parse(jwe: &str) -> Result<Jwe, Error> {
 /// does not authenticate.
 pub fn decrypt(jwe: &str) -> Result<SecretBuf, Error> {
     let jwe = parse(jwe)?;
-    let (iv, ciphertext, tag) = (&jwe.iv, &jwe.ciphertext, &jwe.tag);
-    if iv.len() != IV_LEN || tag.len() != TAG_LEN {
+    let iv: [u8; IV_LEN] = jwe
+        .iv
+        .as_slice()
+        .try_into()
+        .map_err(|_| "not a tang-pqc JWE")?;
+    if jwe.tag.len() != TAG_LEN {
         return Err("not a tang-pqc JWE".into());
     }
-    let http = client(jwe.ca.as_ref())?;
+    let http = client(jwe.ca.as_deref())?;
     let base = jwe.url.trim_end_matches('/');
     let kid = jwe.binding.kid();
     let key = http
@@ -361,15 +360,11 @@ pub fn decrypt(jwe: &str) -> Result<SecretBuf, Error> {
         .send()?
         .error_for_status()?;
     let key = pending.finish(&RecoveryResponse::from_bytes(&body(response)?)?)?;
-    let alg = CipherAlg::fetch(c"AES-256-GCM", None)?;
-    let mut ctx = AeadDecryptCtx::new(&alg, key.as_ref(), iv, None)?;
-    ctx.set_aad(jwe.protected.as_bytes())?;
-    let mut out = SecretBuf::with_len(ciphertext.len());
-    let n = ctx.update(ciphertext, out.as_mut_slice())?;
-    ctx.set_tag(tag)?;
-    ctx.finalize(&mut out.as_mut_slice()[n..])
-        .map_err(|_| "the JWE does not authenticate")?;
-    Ok(out)
+    let sealed = [jwe.ciphertext.as_slice(), &jwe.tag].concat();
+    Ok(
+        open_with(key.as_ref(), &iv, Some(jwe.protected.as_bytes()), &sealed)
+            .map_err(|_| "the JWE does not authenticate")?,
+    )
 }
 
 #[cfg(test)]
@@ -378,10 +373,12 @@ mod tests {
 
     #[test]
     fn configuration() {
-        let c = Config::parse(r#"{"url":"http://t/","thp":"x","binding":"ignored"}"#).unwrap();
+        let c = r#"{"url":"http://t/","thp":"x","binding":"ignored"}"#
+            .parse::<Config>()
+            .unwrap();
         assert_eq!(c.base(), "http://t");
-        assert!(Config::parse(r#"{"thp":"x"}"#).is_err());
-        assert!(Config::parse(r#"{"url":""}"#).is_err());
+        assert!(r#"{"thp":"x"}"#.parse::<Config>().is_err());
+        assert!(r#"{"url":""}"#.parse::<Config>().is_err());
     }
 
     #[test]
