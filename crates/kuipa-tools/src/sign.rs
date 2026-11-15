@@ -8,8 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kuipa_enroll::join::{AuthType, Operation, Prepared};
-use kuipa_enroll::keytab::Enctype;
+use kuipa_enroll::join::Operation;
 use kuipa_enroll::realm::Deployment;
 use kuipa_enroll::sign::{Bundle, Digest, DigestAlg, Request};
 use kuipa_gssapi::GssClientCred;
@@ -102,18 +101,7 @@ pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Ve
         },
         known,
         Operation::Sign,
-        |adv| {
-            let p = Prepared::new(
-                adv,
-                Operation::Sign,
-                &public.fqdn,
-                AuthType::Kerberos,
-                &Enctype::DEFAULT,
-            )?;
-            let target = format!("ipa-ku@{}", adv.server());
-            let (token, binding) = flows::gss_token(&cred, &target, &p.channel_binding()?)?;
-            Ok(p.with_kerberos(binding).seal(&token, &[], &extra)?)
-        },
+        |adv| flows::kerberos_request(adv, Operation::Sign, &public.fqdn, &cred, &[], &extra),
         |pending, response, adv| Ok(pending.finish_sign(response, adv, asked)?),
     )?;
     Ok(bundles)

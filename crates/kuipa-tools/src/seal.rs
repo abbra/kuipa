@@ -1264,16 +1264,7 @@ impl<'a> SealClient<'a> {
                 known,
                 Operation::Tlog,
                 |adv| {
-                    let p = Prepared::new(
-                        adv,
-                        Operation::Tlog,
-                        &public.fqdn,
-                        AuthType::Kerberos,
-                        &Enctype::DEFAULT,
-                    )?;
-                    let target = format!("ipa-ku@{}", adv.server());
-                    let (token, binding) = flows::gss_token(&cred, &target, &p.channel_binding()?)?;
-                    Ok(p.with_kerberos(binding).seal(&token, &[], &extra)?)
+                    flows::kerberos_request(adv, Operation::Tlog, &public.fqdn, &cred, &[], &extra)
                 },
                 |pending, response, adv| Ok(pending.finish_tlog(response, adv, &policy)?),
             )?;

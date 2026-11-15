@@ -472,6 +472,22 @@ fn trace_enrollment(server: &str, e: &Enrollment) {
     );
 }
 
+/// A Kerberos-authenticated request of `op` for `fqdn`, sealed to `adv`.
+pub(crate) fn kerberos_request(
+    adv: &VerifiedRealm,
+    op: Operation,
+    fqdn: &str,
+    cred: &GssClientCred,
+    registrations: &[kuipa_enroll::escrow::BindingHash],
+    extra: &[u8],
+) -> Result<(Request, PendingJoin), Error> {
+    let p = Prepared::new(adv, op, fqdn, AuthType::Kerberos, &Enctype::DEFAULT)?;
+    let target = format!("ipa-ku@{}", adv.server());
+    let (token, binding) = gss_token(cred, &target, &p.channel_binding()?)?;
+    Ok(p.with_kerberos(binding)
+        .seal(&token, registrations, extra)?)
+}
+
 /// Make a one-message Kerberos token for `target` (`ipa-ku@<server>`, or
 /// the principal `ipa-ku/<server>@REALM`) bound to `cb`, and the binding
 /// its context derives: only the real `ipa-ku/<server>` derives it too, so
@@ -1545,16 +1561,14 @@ pub fn rotate_keys(paths: &Paths, protect: Option<(Holder, Option<&str>)>) -> Re
         known,
         Operation::Rekey,
         |adv| {
-            let p = Prepared::new(
+            kerberos_request(
                 adv,
                 Operation::Rekey,
                 &state.fqdn,
-                AuthType::Kerberos,
-                &Enctype::DEFAULT,
-            )?;
-            let target = format!("ipa-ku@{}", adv.server());
-            let (token, binding) = gss_token(&cred, &target, &p.channel_binding()?)?;
-            Ok(p.with_kerberos(binding).seal(&token, &registrations, &[])?)
+                &cred,
+                &registrations,
+                &[],
+            )
         },
     )?;
     // §4.8: the watermark advances only through the verified chain, never
@@ -1859,18 +1873,7 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
         },
         known,
         Operation::Keys,
-        |adv| {
-            let p = Prepared::new(
-                adv,
-                Operation::Keys,
-                &state.fqdn,
-                AuthType::Kerberos,
-                &Enctype::DEFAULT,
-            )?;
-            let target = format!("ipa-ku@{}", adv.server());
-            let (token, binding) = gss_token(&cred, &target, &p.channel_binding()?)?;
-            Ok(p.with_kerberos(binding).seal(&token, &[], &extra)?)
-        },
+        |adv| kerberos_request(adv, Operation::Keys, &state.fqdn, &cred, &[], &extra),
         |pending, response, adv| Ok(pending.finish_keys(response, adv)?),
     )?;
     tracing::debug!(
@@ -1973,16 +1976,14 @@ fn register(
         known,
         Operation::Register,
         |adv| {
-            let p = Prepared::new(
+            kerberos_request(
                 adv,
                 Operation::Register,
                 &state.fqdn,
-                AuthType::Kerberos,
-                &Enctype::DEFAULT,
-            )?;
-            let target = format!("ipa-ku@{}", adv.server());
-            let (token, binding) = gss_token(&cred, &target, &p.channel_binding()?)?;
-            Ok(p.with_kerberos(binding).seal(&token, bindings, &extra)?)
+                &cred,
+                bindings,
+                &extra,
+            )
         },
         |pending, response, adv| Ok(pending.finish_register(response, adv, params)?),
     )?;
@@ -2468,18 +2469,7 @@ fn refresh_pins(
         },
         known,
         Operation::Pins,
-        |adv| {
-            let p = Prepared::new(
-                adv,
-                Operation::Pins,
-                &state.fqdn,
-                AuthType::Kerberos,
-                &Enctype::DEFAULT,
-            )?;
-            let target = format!("ipa-ku@{}", adv.server());
-            let (token, binding) = gss_token(&cred, &target, &p.channel_binding()?)?;
-            Ok(p.with_kerberos(binding).seal(&token, &[], &[])?)
-        },
+        |adv| kerberos_request(adv, Operation::Pins, &state.fqdn, &cred, &[], &[]),
         |pending, response, adv| Ok(pending.finish_pins(response, adv)?),
     )?;
     let heads = answer
