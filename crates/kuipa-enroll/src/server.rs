@@ -7,12 +7,11 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::SystemTime;
 
 use tang_pqc::wire::Writer;
 #[cfg(test)]
 use tang_pqc::{Policy, VerifyingKey};
-use tang_pqc::{SignedAdvertisement, Thumbprint, unix_seconds};
+use tang_pqc::{SignedAdvertisement, Thumbprint};
 
 use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::{Delegation, HeadPin, SignedVouch};
@@ -1325,7 +1324,7 @@ impl EnrollServer {
     /// Append an event about `subject` to the ledger, committed, and sign
     /// a receipt for where it landed (none when the ledger keeps no log).
     fn record(&self, kind: Kind, subject: &[u8], body: &[u8]) -> Result<Option<Receipt>, Refusal> {
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let opening = Opening::new(kind, now, subject, body.to_vec())?;
         let Some(a) = self.ledger.append(opening)? else {
             return Ok(None);
@@ -1594,7 +1593,7 @@ impl EnrollServer {
         wanted: &[Thumbprint],
         heads: &[HeadPin],
     ) -> crate::Result<SignedAdvertisement> {
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let published = self.published();
         let epoch = published
             .epoch
@@ -1797,7 +1796,7 @@ impl EnrollServer {
             .find(|k| k.thumbprint() == voucher.key())
             .ok_or_else(|| Refusal::because("unknown voucher key"))?;
         let ephemeral = crate::voucher::binding(ephemeral_key)?;
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let claims = voucher.verify(key, &self.info.realm, fqdn, &ephemeral, now)?;
         let lease = voucher_lease(claims, now, directory)?;
         let (home, me) = (&claims.server, &self.info.server);
@@ -1870,7 +1869,7 @@ impl EnrollServer {
             .iter()
             .find(|k| k.thumbprint() == voucher.key())
             .ok_or_else(|| Refusal::because("unknown voucher key"))?;
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let claims = voucher.verify_for_spend(key, &self.info.realm, &request.fqdn, now)?;
         if !claims.server.eq_ignore_ascii_case(me) {
             return Err(Refusal::because("the voucher belongs to another server"));
@@ -1914,7 +1913,7 @@ impl EnrollServer {
             (crate::bundle::Mode::Secret, _) => Recipient::Secret,
             _ => Recipient::SignedOnly,
         };
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let (bundle, secret) = Bundle::create(
             &self.keys,
             &self.delegation().select(&[]),
@@ -1971,7 +1970,7 @@ impl EnrollServer {
         if caller.realm() != self.info.realm && matches!(op, SealOp::Create { .. }) {
             owner_permitted(&caller, directory)?;
         }
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let mut event = seal_event(&op);
         // Whoever loses a device or their membership must not open files
         // sealed for offline sessions from now on: a new epoch starts.
@@ -2206,7 +2205,7 @@ impl EnrollServer {
         }
         let leaves = asked.leaves(tree)?;
         let batch_root = merkle::root(&leaves)?;
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let opening = Opening::new(
             Kind::STATEMENT,
             now,
@@ -2289,7 +2288,7 @@ impl EnrollServer {
                 .as_bytes()
                 .to_vec()
         };
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let head = self.ledger.signed_head(&self.keys.signing, now)?;
         let entries = match &head {
             Some(h) => {
@@ -3624,7 +3623,7 @@ impl EnrollServer {
             return Err(Refusal::because("the request and its realm disagree"));
         }
         partner.validate_for(&self.info.realm, &self.anchors())?;
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let delegation = body
             .delegation
             .verify_at(&partner.anchors, &self.policy, now)?;
@@ -3827,7 +3826,7 @@ impl EnrollServer {
         if seal.state != State::Enabled {
             return Err(Refusal::because("the seal is revoked"));
         }
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         if seal.policy.not_after.is_some_and(|t| now > t) {
             return Err(Refusal::because("the seal has expired"));
         }

@@ -500,7 +500,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
-    use tang_pqc::{ExchangeKeyPair, Policy, SignatureAlg, SignedAdvertisement, unix_seconds};
+    use tang_pqc::{ExchangeKeyPair, Policy, SignatureAlg, SignedAdvertisement};
 
     use super::*;
     use crate::EnrollServer;
@@ -510,7 +510,7 @@ mod tests {
     use crate::server::{Directory, DirectoryError, Staged};
 
     fn now() -> u64 {
-        unix_seconds(SystemTime::now())
+        tang_pqc::now()
     }
 
     /// A directory that only keeps invitations and trusts.

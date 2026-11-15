@@ -1102,7 +1102,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn now() -> u64 {
-        unix_seconds(SystemTime::now())
+        tang_pqc::now()
     }
 
     pub(crate) fn test_realm(server: &str) -> TestRealm {

@@ -445,7 +445,7 @@ pub fn decode(buf: &[u8]) -> Result<SignedEpoch> {
 
 #[cfg(test)]
 mod tests {
-    use tang_pqc::{SignatureAlg, unix_seconds};
+    use tang_pqc::SignatureAlg;
 
     use super::*;
 
@@ -458,7 +458,7 @@ mod tests {
     }
 
     fn succession(old: &SigningKey, new: &Thumbprint) -> SignedSuccession {
-        let now = unix_seconds(std::time::SystemTime::now());
+        let now = tang_pqc::now();
         SignedSuccession::issue(old, "R", new, now - 60, now + 86_400).unwrap()
     }
 
