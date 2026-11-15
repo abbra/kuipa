@@ -70,7 +70,7 @@ const MEMBER_EPOCH: &str = "epoch";
 /// PKINIT) before an administrator using an external IdP or a passkey can
 /// `kinit`, and the IPA CA lets it verify the server's TLS certificate as
 /// soon as the advertisement is verified.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealmInfo {
     /// Kerberos realm.
     pub realm: String,
@@ -84,37 +84,45 @@ pub struct RealmInfo {
     pub servers: Vec<String>,
     /// The IPA CA chain (DER), each a CA certificate
     /// ([`check_ca`](crate::certs::check_ca)).
+    #[serde(with = "b64::bytes_vec")]
     pub ca_certs: Vec<Vec<u8>>,
     /// The PKINIT trust anchors (DER) clients need for anonymous PKINIT,
     /// each a CA certificate.
+    #[serde(with = "b64::bytes_vec")]
     pub pkinit_anchors: Vec<Vec<u8>>,
     /// Current realm anchors.
     pub anchors: Vec<Thumbprint>,
     /// The anchors' current vouch heads (§4.9), when this server knows
     /// them: what a client pins instead of — or beside — the
     /// thumbprint, to check a delegation with no signature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub heads: Vec<HeadPin>,
     /// Realms this realm trusts, with the anchors it vouches for (§17).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusts: Vec<TrustedRealm>,
     /// This realm's KDC proxies, when its KDCs are not reachable
     /// directly: what a trusting realm's hosts use to reach them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kdc_proxy: Option<KdcProxy>,
 }
 
 /// How a realm's KDCs are reached when they are not reachable directly:
 /// MS-KKDCP proxies (FreeIPA's `/KdcProxy`) over HTTPS.  A host's
 /// `krb5.conf` then lists the proxy URLs as the realm's `kdc`s.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KdcProxy {
     /// The proxy URLs, `https://<host>[:<port>][/<path>]`, in order.
     pub urls: Vec<String>,
-    /// What authenticates the proxies' TLS certificates.
+    /// What authenticates the proxies' TLS certificates; absent on the
+    /// wire for the default, the realm's own CA.
+    #[serde(default, skip_serializing_if = "ProxyCa::is_realm")]
     pub ca: ProxyCa,
 }
 
 /// The certificates a host trusts for a KDC proxy's TLS server (krb5's
 /// `http_anchors`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProxyCa {
     /// The realm's own IPA CA, from its verified advertisement: a proxy
     /// on the IPA servers themselves.
@@ -125,6 +133,14 @@ pub enum ProxyCa {
 }
 
 impl ProxyCa {
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if signature"
+    )]
+    fn is_realm(&self) -> bool {
+        *self == Self::Realm
+    }
+
     /// The wire and configuration name.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -192,36 +208,10 @@ pub(crate) fn is_safe_proxy_url(url: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~' | b'/'))
 }
 
-#[derive(Serialize, Deserialize)]
-struct KdcProxyJson {
-    urls: Vec<String>,
-    /// Absent for the default, the realm's own CA.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ca: Option<String>,
-}
-
-impl From<&KdcProxy> for KdcProxyJson {
-    fn from(p: &KdcProxy) -> Self {
-        Self {
-            urls: p.urls.clone(),
-            ca: (p.ca != ProxyCa::Realm).then(|| p.ca.as_str().to_owned()),
-        }
-    }
-}
-
-impl KdcProxyJson {
-    fn parse(self) -> Option<KdcProxy> {
-        Some(KdcProxy {
-            ca: self.ca.map_or(Ok(ProxyCa::Realm), |c| c.parse()).ok()?,
-            urls: self.urls,
-        })
-    }
-}
-
 /// A trusted realm, as the advertising realm vouches for it (§17): where
 /// to find its servers and which of its anchors to pin, for that realm
 /// only.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedRealm {
     /// Its Kerberos realm.
     pub realm: String,
@@ -237,10 +227,12 @@ pub struct TrustedRealm {
     /// anchors, so its next refresh verifies with no signature.
     /// Empty where unknown (an older partner, or none of its anchors
     /// vouched yet).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub heads: Vec<HeadPin>,
     /// The KDC proxies this realm's hosts use for it, when its KDCs are
     /// not reachable directly.  `None`: its KDCs, or the proxies its
     /// own advertisement names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kdc_proxy: Option<KdcProxy>,
 }
 
@@ -252,7 +244,7 @@ impl TrustedRealm {
     /// Never: the form has only strings.
     #[must_use]
     pub fn to_json(&self) -> String {
-        serde_json::to_string(&TrustJson::from(self)).expect("serialisable")
+        serde_json::to_string(self).expect("serialisable")
     }
 
     /// Parse the JSON form.
@@ -261,9 +253,9 @@ impl TrustedRealm {
     ///
     /// [`Error::Malformed`].
     pub fn from_json(json: &[u8]) -> Result<Self> {
-        serde_json::from_slice::<TrustJson>(json)
+        serde_json::from_slice::<Self>(json)
             .ok()
-            .and_then(TrustJson::parse)
+            .filter(|t| t.kdc_proxy.as_ref().is_none_or(|p| p.validate().is_ok()))
             .ok_or(Error::Malformed("trusted realm"))
     }
 
@@ -303,55 +295,6 @@ impl TrustedRealm {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct TrustJson {
-    realm: String,
-    domain: String,
-    servers: Vec<String>,
-    anchors: Vec<String>,
-    /// Absent in older advertisements: the realm's partners carried no
-    /// heads (DESIGN-claim-logs.md §3).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    heads: Vec<serde_json::Value>,
-    /// Absent when its KDCs are reached directly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kdc_proxy: Option<KdcProxyJson>,
-}
-
-impl From<&TrustedRealm> for TrustJson {
-    fn from(t: &TrustedRealm) -> Self {
-        Self {
-            realm: t.realm.clone(),
-            domain: t.domain.clone(),
-            servers: t.servers.clone(),
-            anchors: t.anchors.iter().map(ToString::to_string).collect(),
-            heads: t.heads.iter().map(HeadPin::to_json).collect(),
-            kdc_proxy: t.kdc_proxy.as_ref().map(KdcProxyJson::from),
-        }
-    }
-}
-
-impl TrustJson {
-    fn parse(self) -> Option<TrustedRealm> {
-        Some(TrustedRealm {
-            anchors: parse_anchors(&self.anchors)?,
-            heads: self
-                .heads
-                .iter()
-                .map(HeadPin::from_json)
-                .collect::<Result<_>>()
-                .ok()?,
-            kdc_proxy: match self.kdc_proxy {
-                Some(p) => Some(p.parse().filter(|p| p.validate().is_ok())?),
-                None => None,
-            },
-            realm: self.realm,
-            domain: self.domain,
-            servers: self.servers,
-        })
-    }
-}
-
 /// Whether `name` is safe as a realm, domain or host name in generated
 /// Kerberos configuration and file names: 1–253 characters of ASCII
 /// letters, digits, `.`, `-` and `_`, not starting with `.` or `-`.
@@ -364,48 +307,9 @@ pub fn is_safe_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
-#[derive(Serialize, Deserialize)]
-struct InfoJson {
-    realm: String,
-    domain: String,
-    basedn: String,
-    server: String,
-    servers: Vec<String>,
-    ca_certs: Vec<String>,
-    pkinit_anchors: Vec<String>,
-    anchors: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    heads: Vec<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    trusts: Vec<TrustJson>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kdc_proxy: Option<KdcProxyJson>,
-}
-
-fn parse_anchors(items: &[String]) -> Option<Vec<Thumbprint>> {
-    items.iter().map(|a| a.parse().ok()).collect()
-}
-
-fn decode_all(items: &[String]) -> Option<Vec<Vec<u8>>> {
-    items.iter().map(|c| b64::decode(c).ok()).collect()
-}
-
 impl RealmInfo {
     fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(InfoJson {
-            realm: self.realm.clone(),
-            domain: self.domain.clone(),
-            basedn: self.basedn.clone(),
-            server: self.server.clone(),
-            servers: self.servers.clone(),
-            ca_certs: self.ca_certs.iter().map(|c| b64::encode(c)).collect(),
-            pkinit_anchors: self.pkinit_anchors.iter().map(|c| b64::encode(c)).collect(),
-            anchors: self.anchors.iter().map(ToString::to_string).collect(),
-            heads: self.heads.iter().map(HeadPin::to_json).collect(),
-            trusts: self.trusts.iter().map(TrustJson::from).collect(),
-            kdc_proxy: self.kdc_proxy.as_ref().map(KdcProxyJson::from),
-        })
-        .expect("serialisable")
+        serde_json::to_value(self).expect("serialisable")
     }
 
     /// Check the names, certificates and trusted realms: every name must be
@@ -457,36 +361,7 @@ impl RealmInfo {
 
     /// Parse and [`validate`](Self::validate).
     fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let malformed = || Error::Malformed("realm info");
-        let j = InfoJson::deserialize(value).map_err(|_| malformed())?;
-        let trusts = j
-            .trusts
-            .into_iter()
-            .map(TrustJson::parse)
-            .collect::<Option<_>>()
-            .ok_or_else(malformed)?;
-        let kdc_proxy = match j.kdc_proxy {
-            Some(p) => Some(p.parse().ok_or_else(malformed)?),
-            None => None,
-        };
-        let info = Self {
-            kdc_proxy,
-            ca_certs: decode_all(&j.ca_certs).ok_or_else(malformed)?,
-            pkinit_anchors: decode_all(&j.pkinit_anchors).ok_or_else(malformed)?,
-            anchors: parse_anchors(&j.anchors).ok_or_else(malformed)?,
-            heads: j
-                .heads
-                .iter()
-                .map(HeadPin::from_json)
-                .collect::<Result<_>>()
-                .map_err(|_| malformed())?,
-            trusts,
-            realm: j.realm,
-            domain: j.domain,
-            basedn: j.basedn,
-            server: j.server,
-            servers: j.servers,
-        };
+        let info = Self::deserialize(value).map_err(|_| Error::Malformed("realm info"))?;
         info.validate()?;
         Ok(info)
     }
@@ -732,7 +607,7 @@ impl VerifiedRealm {
         Ok(Self {
             info,
             delegation,
-            head_proofs,
+            head_proofs: head_proofs.to_vec(),
             proved_heads,
             claim,
             adv,

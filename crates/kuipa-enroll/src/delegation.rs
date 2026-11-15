@@ -534,15 +534,12 @@ impl SignedVouch {
             return Ok(None);
         }
         let prefix = &self.leaves[..n];
-        Ok(Some(HeadProof::new(
-            *anchor,
-            index as u64,
-            head.0,
-            merkle::path(prefix, index)?
-                .iter()
-                .map(|h| b64::encode(h))
-                .collect(),
-        )))
+        Ok(Some(HeadProof {
+            anchor: *anchor,
+            index: index as u64,
+            path: merkle::path(prefix, index)?,
+            size: head.0,
+        }))
     }
 
     /// Encode: `IPSV ‖ 2 ‖ vouch ‖ signature ‖ n(u64) ‖ [entry]`, an
@@ -955,14 +952,14 @@ impl Proof {
 /// root)` of its claim log when the pin was written.  Nothing in it is
 /// secret, and nothing in it is trusted until the whole pin is: it comes
 /// from the same out-of-band channel as the thumbprint it extends.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadPin {
     /// The anchor whose claim log this head names.
     pub anchor: Thumbprint,
-    /// The number of leaves in the log at the pinned head.
-    pub size: u64,
     /// The tree hash over those leaves.
     pub root: Hash,
+    /// The number of leaves in the log at the pinned head.
+    pub size: u64,
 }
 
 impl HeadPin {
@@ -972,45 +969,20 @@ impl HeadPin {
         let v = vouch.vouch();
         Self {
             anchor: *anchor,
-            size: v.size,
             root: v.root,
+            size: v.size,
         }
     }
 
     /// The JSON form, as thumbprints are on the wire: `{"anchor": …,
-    /// "size": …, "root": …}` with base64url strings.
+    /// "root": …, "size": …}` with base64url strings.
+    ///
+    /// # Panics
+    ///
+    /// Never: the form has only strings and a number.
     #[must_use]
     pub fn to_json(&self) -> Value {
-        serde_json::json!({
-            "anchor": self.anchor.to_string(),
-            "size": self.size,
-            "root": b64::encode(&self.root),
-        })
-    }
-
-    /// Parse the JSON form.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Malformed`] for anything else.
-    pub fn from_json(value: &Value) -> Result<Self> {
-        let malformed = || Error::Malformed("head pin");
-        let anchor = value
-            .get("anchor")
-            .and_then(Value::as_str)
-            .and_then(|a| a.parse().ok())
-            .ok_or_else(malformed)?;
-        let size = value
-            .get("size")
-            .and_then(Value::as_u64)
-            .ok_or_else(malformed)?;
-        let root = value
-            .get("root")
-            .and_then(Value::as_str)
-            .and_then(|r| b64::decode(r).ok())
-            .and_then(|r| Hash::from_slice(&r).ok())
-            .ok_or_else(malformed)?;
-        Ok(Self { anchor, size, root })
+        serde_json::to_value(self).expect("serialisable")
     }
 
     /// Check `proof` for `claim` against this head: the proof must be by
@@ -1028,7 +1000,7 @@ impl HeadPin {
                 &claim.leaf(self.root.alg())?,
                 proof.index,
                 self.size,
-                &proof.decode_path()?,
+                &proof.path,
                 &self.root,
             )?)
     }
@@ -1038,88 +1010,23 @@ impl HeadPin {
 /// position in the claim log, the size of the prefix the pinned head
 /// names, and the inclusion path within that prefix.  No key, no
 /// signature — it verifies only against a pinned [`HeadPin`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadProof {
     /// The anchor's thumbprint.
-    anchor: String,
+    anchor: Thumbprint,
     /// The claim's leaf index in the claim log.
     index: u64,
+    /// The inclusion path, leaf level first.
+    path: Vec<Hash>,
     /// The size of the prefix the pinned head names.
     size: u64,
-    /// The inclusion path (base64url hashes), leaf level first.
-    path: Vec<String>,
-    /// The parsed `anchor`, private.
-    parsed_anchor: Thumbprint,
 }
 
 impl HeadProof {
     /// The anchor's thumbprint, unverified.
     #[must_use]
     pub fn anchor(&self) -> &Thumbprint {
-        &self.parsed_anchor
-    }
-
-    /// Parse `anchor` once, on construction.
-    fn new(anchor: Thumbprint, index: u64, size: u64, path: Vec<String>) -> Self {
-        Self {
-            anchor: anchor.to_string(),
-            index,
-            size,
-            path,
-            parsed_anchor: anchor,
-        }
-    }
-
-    /// The JSON form, as it appears in a delegation: the anchor, the
-    /// index, the prefix size and the path.
-    #[must_use]
-    pub fn to_json(&self) -> Value {
-        serde_json::json!({
-            "anchor": self.anchor,
-            "index": self.index,
-            "size": self.size,
-            "path": self.path,
-        })
-    }
-
-    /// Parse the JSON form.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Malformed`] for anything else.
-    pub fn from_json(value: &Value) -> Result<Self> {
-        let malformed = || Error::Malformed("head proof");
-        let anchor = value
-            .get("anchor")
-            .and_then(Value::as_str)
-            .and_then(|a| a.parse().ok())
-            .ok_or_else(malformed)?;
-        let index = value
-            .get("index")
-            .and_then(Value::as_u64)
-            .ok_or_else(malformed)?;
-        let size = value
-            .get("size")
-            .and_then(Value::as_u64)
-            .ok_or_else(malformed)?;
-        let path = value
-            .get("path")
-            .and_then(Value::as_array)
-            .map(|p| {
-                p.iter()
-                    .filter_map(|h| h.as_str().map(str::to_owned))
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(malformed)?;
-        Ok(Self::new(anchor, index, size, path))
-    }
-
-    fn decode_path(&self) -> Result<Vec<Hash>> {
-        self.path
-            .iter()
-            .map(|h| b64::decode(h).ok().and_then(|b| Hash::from_slice(&b).ok()))
-            .collect::<Option<_>>()
-            .ok_or(Error::Malformed("head proof path"))
+        &self.anchor
     }
 
     /// Check it for `claim` against the pinned `heads`, returning the
@@ -1154,7 +1061,7 @@ pub struct Delegation {
     /// anchor's signature proof (a head proof subsumes it, for a client
     /// that can check it).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    head_proofs: Vec<serde_json::Value>,
+    head_proofs: Vec<HeadProof>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     successions: Vec<SignedSuccession>,
 }
@@ -1283,24 +1190,16 @@ impl Delegation {
     /// subsume for a client that can check them (§4.9).
     pub(crate) fn add_head_proofs(&mut self, proofs: impl IntoIterator<Item = HeadProof>) {
         for p in proofs {
-            if self
-                .head_proofs
-                .iter()
-                .any(|q| HeadProof::from_json(q).is_ok_and(|q| *q.anchor() == *p.anchor()))
-            {
-                continue;
+            if self.head_proofs.iter().all(|q| q.anchor != p.anchor) {
+                self.head_proofs.push(p);
             }
-            self.head_proofs.push(p.to_json());
         }
     }
 
     /// The anchors whose head proofs it carries, **unverified**.
     #[must_use]
-    pub fn head_proofs(&self) -> Vec<HeadProof> {
-        self.head_proofs
-            .iter()
-            .filter_map(|v| HeadProof::from_json(v).ok())
-            .collect()
+    pub fn head_proofs(&self) -> &[HeadProof] {
+        &self.head_proofs
     }
 
     /// The vouch heads this delegation proves **by signature**: for each
@@ -1462,7 +1361,7 @@ impl Delegation {
             return Self {
                 claim: self.claim.clone(),
                 proofs: signed,
-                head_proofs: matching.iter().map(|p| p.to_json()).collect(),
+                head_proofs: matching.into_iter().cloned().collect(),
                 successions: Vec::new(),
             };
         }
@@ -1590,8 +1489,8 @@ impl Delegation {
             at,
         };
         let claim = self.claim()?;
-        let head_proofs = self.head_proofs();
-        if let Some(anchor) = head_proofs
+        if let Some(anchor) = self
+            .head_proofs
             .iter()
             .find_map(|p| p.check(&claim, heads, retired))
         {
@@ -2061,7 +1960,7 @@ mod tests {
             root: head1.1,
         };
         let mut dropped = Delegation::new(&claims[1]);
-        dropped.head_proofs = vec![old.to_json()];
+        dropped.head_proofs = vec![old];
         dropped
             .verify_at_with_heads(&[], &[pin1], &[], &Policy::default(), NOW + 2)
             .unwrap();
@@ -2343,16 +2242,19 @@ mod tests {
         assert!(!foreign.check(&c, &hp).unwrap());
         // A tampered path does not verify.
         let mut tampered = hp.clone();
-        tampered.path[0] = b64::encode(&[0; 32]);
+        tampered.path[0] = Hash::from_slice(&[0; 32]).unwrap();
         assert!(!head.check(&c, &tampered).unwrap());
         // A head proof for another claim does not verify for this one.
         let c2 = claim(&anchor, "t", &server);
         assert!(!head.check(&c2, &hp).unwrap());
 
         // JSON round trip keeps the proof.
-        let back = HeadProof::from_json(&hp.to_json()).unwrap();
+        let back: HeadProof = serde_json::from_value(serde_json::to_value(&hp).unwrap()).unwrap();
         assert_eq!(back, hp);
-        assert_eq!(HeadPin::from_json(&head.to_json()).unwrap(), head);
+        assert_eq!(
+            serde_json::from_value::<HeadPin>(head.to_json()).unwrap(),
+            head
+        );
     }
 
     /// The JSON members of a head pin and a head proof, byte for byte
@@ -2366,22 +2268,30 @@ mod tests {
         };
         let pin_json = serde_json::json!({"anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "size": 3, "root": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"});
         assert_eq!(pin.to_json(), pin_json);
-        assert_eq!(HeadPin::from_json(&pin_json).unwrap(), pin);
+        assert_eq!(serde_json::from_value::<HeadPin>(pin_json).unwrap(), pin);
         let proof_json = serde_json::json!({
             "anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "index": 1, "size": 3, "path": ["AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"],
         });
-        let proof = HeadProof::from_json(&proof_json).unwrap();
-        assert_eq!(proof.to_json(), proof_json);
-        assert_eq!(proof.to_json().to_string(), format!(
-            r#"{{"anchor":"{}","index":1,"path":["{}","{}"],"size":3}}"#,
-            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
-        ));
+        let proof: HeadProof = serde_json::from_value(proof_json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&proof).unwrap(), proof_json);
+        assert_eq!(
+            serde_json::to_string(&proof).unwrap(),
+            format!(
+                r#"{{"anchor":"{}","index":1,"path":["{}","{}"],"size":3}}"#,
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+                "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+                "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+            )
+        );
         for bad in [
             serde_json::json!({"anchor": "x", "size": 3, "root": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"}),
             serde_json::json!({"anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "size": 3, "root": "Zm9v"}),
             serde_json::json!({"anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "root": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"}),
         ] {
-            assert!(HeadPin::from_json(&bad).is_err(), "{bad}");
+            assert!(
+                serde_json::from_value::<HeadPin>(bad.clone()).is_err(),
+                "{bad}"
+            );
         }
     }
 

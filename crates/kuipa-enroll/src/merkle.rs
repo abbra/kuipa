@@ -141,6 +141,19 @@ impl TryFrom<Vec<u8>> for Hash {
     }
 }
 
+impl serde::Serialize for Hash {
+    /// As unpadded base64url.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        tang_pqc::b64::bytes::serialize(self, s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Hash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        tang_pqc::b64::bytes::deserialize(d)
+    }
+}
+
 impl std::ops::Deref for Hash {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
