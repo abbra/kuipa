@@ -76,8 +76,8 @@ mod ffi {
 
     #[link(name = "fido2")]
     unsafe extern "C" {
-        pub(crate) fn fido_init(flags: c_int);
-        pub(crate) fn fido_strerr(code: c_int) -> *const c_char;
+        pub(crate) safe fn fido_init(flags: c_int);
+        pub(crate) safe fn fido_strerr(code: c_int) -> *const c_char;
 
         pub(crate) fn fido_dev_info_new(n: usize) -> *mut fido_dev_info_t;
         pub(crate) fn fido_dev_info_free(list: *mut *mut fido_dev_info_t, n: usize);
@@ -86,16 +86,20 @@ mod ffi {
             ilen: usize,
             olen: *mut usize,
         ) -> c_int;
-        pub(crate) fn fido_dev_info_ptr(list: *const fido_dev_info_t, i: usize) -> *const fido_dev_info_t;
+        pub(crate) fn fido_dev_info_ptr(
+            list: *const fido_dev_info_t,
+            i: usize,
+        ) -> *const fido_dev_info_t;
         pub(crate) fn fido_dev_info_path(di: *const fido_dev_info_t) -> *const c_char;
-        pub(crate) fn fido_dev_info_manufacturer_string(di: *const fido_dev_info_t) -> *const c_char;
+        pub(crate) fn fido_dev_info_manufacturer_string(
+            di: *const fido_dev_info_t,
+        ) -> *const c_char;
         pub(crate) fn fido_dev_info_product_string(di: *const fido_dev_info_t) -> *const c_char;
 
-        pub(crate) fn fido_dev_new() -> *mut fido_dev_t;
+        pub(crate) safe fn fido_dev_new() -> *mut fido_dev_t;
         pub(crate) fn fido_dev_free(dev: *mut *mut fido_dev_t);
         pub(crate) fn fido_dev_open(dev: *mut fido_dev_t, path: *const c_char) -> c_int;
         pub(crate) fn fido_dev_close(dev: *mut fido_dev_t) -> c_int;
-        pub(crate) fn fido_dev_has_pin(dev: *const fido_dev_t) -> bool;
         pub(crate) fn fido_dev_get_assert(
             dev: *mut fido_dev_t,
             assert: *mut fido_assert_t,
@@ -107,7 +111,7 @@ mod ffi {
             pin: *const c_char,
         ) -> c_int;
 
-        pub(crate) fn fido_assert_new() -> *mut fido_assert_t;
+        pub(crate) safe fn fido_assert_new() -> *mut fido_assert_t;
         pub(crate) fn fido_assert_free(assert: *mut *mut fido_assert_t);
         pub(crate) fn fido_assert_set_rp(assert: *mut fido_assert_t, id: *const c_char) -> c_int;
         pub(crate) fn fido_assert_set_clientdata_hash(
@@ -134,8 +138,10 @@ mod ffi {
             assert: *const fido_assert_t,
             i: usize,
         ) -> *const c_uchar;
-        pub(crate) fn fido_assert_authdata_raw_len(assert: *const fido_assert_t, i: usize) -> usize;
-        pub(crate) fn fido_assert_sig_ptr(assert: *const fido_assert_t, i: usize) -> *const c_uchar;
+        pub(crate) fn fido_assert_authdata_raw_len(assert: *const fido_assert_t, i: usize)
+        -> usize;
+        pub(crate) fn fido_assert_sig_ptr(assert: *const fido_assert_t, i: usize)
+        -> *const c_uchar;
         pub(crate) fn fido_assert_sig_len(assert: *const fido_assert_t, i: usize) -> usize;
         pub(crate) fn fido_assert_hmac_secret_ptr(
             assert: *const fido_assert_t,
@@ -143,7 +149,7 @@ mod ffi {
         ) -> *const c_uchar;
         pub(crate) fn fido_assert_hmac_secret_len(assert: *const fido_assert_t, i: usize) -> usize;
 
-        pub(crate) fn fido_cred_new() -> *mut fido_cred_t;
+        pub(crate) safe fn fido_cred_new() -> *mut fido_cred_t;
         pub(crate) fn fido_cred_free(cred: *mut *mut fido_cred_t);
         pub(crate) fn fido_cred_set_type(cred: *mut fido_cred_t, cose_alg: c_int) -> c_int;
         pub(crate) fn fido_cred_set_clientdata_hash(
@@ -195,8 +201,7 @@ pub enum Error {
 
 impl Error {
     /// The `FIDO_ERR_*` code, for a libfido2 error.
-    #[must_use]
-    pub fn code(&self) -> Option<i32> {
+    fn code(&self) -> Option<i32> {
         match self {
             Self::Fido { code, .. } => Some(*code),
             _ => None,
@@ -221,13 +226,11 @@ impl Error {
     }
 }
 
-/// Convenience alias.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 fn init() {
     static INIT: Once = Once::new();
-    // SAFETY: fido_init only sets library-global flags; once.
-    INIT.call_once(|| unsafe { ffi::fido_init(0) });
+    INIT.call_once(|| ffi::fido_init(0));
 }
 
 fn check(what: &'static str, code: c_int) -> Result<()> {
@@ -399,8 +402,8 @@ impl Device {
     pub fn open(path: &str) -> Result<Self> {
         init();
         let path = CString::new(path)?;
-        // SAFETY: freed in Drop (or below on failure).
-        let mut dev = unsafe { ffi::fido_dev_new() };
+        // Freed in Drop (or below on failure).
+        let mut dev = ffi::fido_dev_new();
         if dev.is_null() {
             return Err(Error::Missing("a device handle"));
         }
@@ -413,13 +416,6 @@ impl Device {
             return Err(e);
         }
         Ok(Self { dev })
-    }
-
-    /// Whether a PIN is set on the authenticator.
-    #[must_use]
-    pub fn has_pin(&self) -> bool {
-        // SAFETY: an open handle.
-        unsafe { ffi::fido_dev_has_pin(self.dev) }
     }
 
     /// Get an assertion (`authenticatorGetAssertion`): waits for a touch.
@@ -437,84 +433,58 @@ impl Device {
     ) -> Result<Assertion> {
         let rp = CString::new(req.rp_id)?;
         let pin = pin.map(CString::new).transpose()?;
-        let assert = AssertHandle::new()?;
-        let a = assert.0;
-        // SAFETY: `a` is a fresh assertion; every buffer outlives the call
-        // that copies it.
-        unsafe {
-            check(
-                "set the relying party",
-                ffi::fido_assert_set_rp(a, rp.as_ptr()),
-            )?;
-            check(
-                "set the challenge",
-                ffi::fido_assert_set_clientdata_hash(a, req.client_data_hash.as_ptr(), 32),
-            )?;
-            for id in req.allow {
-                check(
-                    "allow a credential",
-                    ffi::fido_assert_allow_cred(a, id.as_ptr(), id.len()),
-                )?;
-            }
-            // A PIN verifies the user itself; without one, ask for the
-            // authenticator's own verification.
-            let uv = if req.user_verification && pin.is_none() {
-                ffi::FIDO_OPT_TRUE
-            } else {
-                ffi::FIDO_OPT_OMIT
-            };
-            check("ask for user verification", ffi::fido_assert_set_uv(a, uv))?;
-            if let Some(salt) = req.hmac_salt {
-                check(
-                    "ask for hmac-secret",
-                    ffi::fido_assert_set_extensions(a, ffi::FIDO_EXT_HMAC_SECRET),
-                )?;
-                check(
-                    "set the hmac-secret salt",
-                    ffi::fido_assert_set_hmac_salt(a, salt.as_ptr(), salt.len()),
-                )?;
-            }
-            check(
-                "get an assertion",
-                ffi::fido_dev_get_assert(self.dev, a, pin_ptr(pin.as_ref())),
-            )?;
-            if ffi::fido_assert_count(a) == 0 {
-                return Err(Error::Missing("an assertion"));
-            }
-            let hmac_secret = if req.hmac_salt.is_some() {
-                let secret = copy_out(
-                    ffi::fido_assert_hmac_secret_ptr(a, 0),
-                    ffi::fido_assert_hmac_secret_len(a, 0),
+        let assert = Handle::assertion()?;
+        assert.set_rp(&rp)?;
+        assert.set_challenge(req.client_data_hash)?;
+        for id in req.allow {
+            assert.allow(id)?;
+        }
+        // A PIN verifies the user itself; without one, ask for the
+        // authenticator's own verification.
+        let uv = req.user_verification && pin.is_none();
+        assert.set_uv(uv)?;
+        if let Some(salt) = req.hmac_salt {
+            assert.set_hmac_salt(salt)?;
+        }
+        // SAFETY: both handles are live; `pin` is null or a C string.
+        check("get an assertion", unsafe {
+            ffi::fido_dev_get_assert(self.dev, assert.ptr, pin_ptr(pin.as_ref()))
+        })?;
+        // SAFETY: the handle is live.
+        if unsafe { ffi::fido_assert_count(assert.ptr) } == 0 {
+            return Err(Error::Missing("an assertion"));
+        }
+        let hmac_secret = if req.hmac_salt.is_some() {
+            let secret = assert
+                .field(
+                    ffi::fido_assert_hmac_secret_ptr,
+                    ffi::fido_assert_hmac_secret_len,
                 )
                 .ok_or(Error::Missing("the hmac-secret output"))?;
-                Some(SecretBuf::new(secret))
-            } else {
-                None
-            };
-            Ok(Assertion {
-                // A single allowed credential may be left out of the answer.
-                credential_id: copy_out(
-                    ffi::fido_assert_id_ptr(a, 0),
-                    ffi::fido_assert_id_len(a, 0),
-                )
+            Some(SecretBuf::new(secret))
+        } else {
+            None
+        };
+        Ok(Assertion {
+            // A single allowed credential may be left out of the answer.
+            credential_id: assert
+                .field(ffi::fido_assert_id_ptr, ffi::fido_assert_id_len)
                 .or_else(|| match req.allow {
                     [only] => Some(only.clone()),
                     _ => None,
                 })
                 .ok_or(Error::Missing("the credential ID"))?,
-                authenticator_data: copy_out(
-                    ffi::fido_assert_authdata_raw_ptr(a, 0),
-                    ffi::fido_assert_authdata_raw_len(a, 0),
+            authenticator_data: assert
+                .field(
+                    ffi::fido_assert_authdata_raw_ptr,
+                    ffi::fido_assert_authdata_raw_len,
                 )
                 .ok_or(Error::Missing("the authenticator data"))?,
-                signature: copy_out(
-                    ffi::fido_assert_sig_ptr(a, 0),
-                    ffi::fido_assert_sig_len(a, 0),
-                )
+            signature: assert
+                .field(ffi::fido_assert_sig_ptr, ffi::fido_assert_sig_len)
                 .ok_or(Error::Missing("the signature"))?,
-                hmac_secret,
-            })
-        }
+            hmac_secret,
+        })
     }
 
     /// Make a credential (`authenticatorMakeCredential`), trying
@@ -538,70 +508,16 @@ impl Device {
         native_ossl::rand::Rand::fill(&mut cdh).map_err(|_| Error::Missing("randomness"))?;
         let mut last = Error::Missing("an algorithm to try");
         for &alg in req.algorithms {
-            let cred = CredHandle::new()?;
-            let c = cred.0;
-            // SAFETY: `c` is a fresh credential; every buffer outlives the
-            // call that copies it.
-            let made = unsafe {
-                check("set the algorithm", ffi::fido_cred_set_type(c, alg))
-                    .and_then(|()| {
-                        check(
-                            "set the challenge",
-                            ffi::fido_cred_set_clientdata_hash(c, cdh.as_ptr(), cdh.len()),
-                        )
-                    })
-                    .and_then(|()| {
-                        check(
-                            "set the relying party",
-                            ffi::fido_cred_set_rp(c, rp.as_ptr(), rp_name.as_ptr()),
-                        )
-                    })
-                    .and_then(|()| {
-                        check(
-                            "set the user",
-                            ffi::fido_cred_set_user(
-                                c,
-                                req.user_id.as_ptr(),
-                                req.user_id.len(),
-                                user.as_ptr(),
-                                user.as_ptr(),
-                                std::ptr::null(),
-                            ),
-                        )
-                    })
-                    .and_then(|()| {
-                        check(
-                            "make it non-discoverable",
-                            ffi::fido_cred_set_rk(c, ffi::FIDO_OPT_OMIT),
-                        )
-                    })
-                    .and_then(|()| {
-                        if req.hmac_secret {
-                            check(
-                                "ask for hmac-secret",
-                                ffi::fido_cred_set_extensions(c, ffi::FIDO_EXT_HMAC_SECRET),
-                            )
-                        } else {
-                            Ok(())
-                        }
-                    })
-                    .and_then(|()| {
-                        check(
-                            "make a credential",
-                            ffi::fido_dev_make_cred(self.dev, c, pin_ptr(pin.as_ref())),
-                        )
-                    })
-            };
+            let cred = Handle::credential()?;
+            let made = cred.set_type(alg).and_then(|()| {
+                cred.set_up(&rp, &rp_name, &user, req, &cdh)?;
+                // SAFETY: both handles are live; `pin` is null or a C string.
+                check("make a credential", unsafe {
+                    ffi::fido_dev_make_cred(self.dev, cred.ptr, pin_ptr(pin.as_ref()))
+                })
+            });
             match made {
-                Ok(()) => {
-                    // SAFETY: a credential the device just made.
-                    let id =
-                        unsafe { copy_out(ffi::fido_cred_id_ptr(c), ffi::fido_cred_id_len(c)) }
-                            .ok_or(Error::Missing("the credential ID"))?;
-                    // SAFETY: as above.
-                    let alg = unsafe { ffi::fido_cred_type(c) };
-                    return Ok(Credential { id, alg });
-                }
+                Ok(()) => return cred.made(),
                 // An algorithm this libfido2 or this authenticator lacks:
                 // the next one.  Nothing was asked of the user yet.
                 Err(e)
@@ -633,45 +549,171 @@ impl Drop for Device {
 // it; `&self` methods are not used concurrently (`Device` is not `Sync`).
 unsafe impl Send for Device {}
 
-struct AssertHandle(*mut ffi::fido_assert_t);
+/// An owned libfido2 assertion or credential, freed on drop (libfido2 wipes
+/// secrets such as the hmac-secret output on free).
+struct Handle<T> {
+    ptr: *mut T,
+    free: unsafe extern "C" fn(*mut *mut T),
+}
 
-impl AssertHandle {
-    fn new() -> Result<Self> {
-        // SAFETY: freed in Drop.
-        let a = unsafe { ffi::fido_assert_new() };
-        if a.is_null() {
-            Err(Error::Missing("an assertion handle"))
+impl<T> Handle<T> {
+    fn new(
+        alloc: extern "C" fn() -> *mut T,
+        free: unsafe extern "C" fn(*mut *mut T),
+        what: &'static str,
+    ) -> Result<Self> {
+        let ptr = alloc();
+        if ptr.is_null() {
+            Err(Error::Missing(what))
         } else {
-            Ok(Self(a))
+            Ok(Self { ptr, free })
         }
     }
 }
 
-impl Drop for AssertHandle {
-    fn drop(&mut self) {
-        // SAFETY: allocated in `new`, freed once; it wipes the hmac-secret.
-        unsafe { ffi::fido_assert_free(&raw mut self.0) };
-    }
-}
-
-struct CredHandle(*mut ffi::fido_cred_t);
-
-impl CredHandle {
-    fn new() -> Result<Self> {
-        // SAFETY: freed in Drop.
-        let c = unsafe { ffi::fido_cred_new() };
-        if c.is_null() {
-            Err(Error::Missing("a credential handle"))
-        } else {
-            Ok(Self(c))
-        }
-    }
-}
-
-impl Drop for CredHandle {
+impl<T> Drop for Handle<T> {
     fn drop(&mut self) {
         // SAFETY: allocated in `new`, freed once.
-        unsafe { ffi::fido_cred_free(&raw mut self.0) };
+        unsafe { (self.free)(&raw mut self.ptr) };
+    }
+}
+
+impl Handle<ffi::fido_assert_t> {
+    fn assertion() -> Result<Self> {
+        Self::new(
+            ffi::fido_assert_new,
+            ffi::fido_assert_free,
+            "an assertion handle",
+        )
+    }
+
+    fn set_rp(&self, rp: &CStr) -> Result<()> {
+        // SAFETY: a live handle; libfido2 copies the string.
+        check("set the relying party", unsafe {
+            ffi::fido_assert_set_rp(self.ptr, rp.as_ptr())
+        })
+    }
+
+    fn set_challenge(&self, hash: &[u8; 32]) -> Result<()> {
+        // SAFETY: a live handle; libfido2 copies the 32 bytes.
+        check("set the challenge", unsafe {
+            ffi::fido_assert_set_clientdata_hash(self.ptr, hash.as_ptr(), hash.len())
+        })
+    }
+
+    fn allow(&self, id: &[u8]) -> Result<()> {
+        // SAFETY: a live handle; libfido2 copies the ID.
+        check("allow a credential", unsafe {
+            ffi::fido_assert_allow_cred(self.ptr, id.as_ptr(), id.len())
+        })
+    }
+
+    fn set_uv(&self, uv: bool) -> Result<()> {
+        let uv = if uv {
+            ffi::FIDO_OPT_TRUE
+        } else {
+            ffi::FIDO_OPT_OMIT
+        };
+        // SAFETY: a live handle.
+        check("ask for user verification", unsafe {
+            ffi::fido_assert_set_uv(self.ptr, uv)
+        })
+    }
+
+    fn set_hmac_salt(&self, salt: &[u8; 32]) -> Result<()> {
+        // SAFETY: a live handle.
+        check("ask for hmac-secret", unsafe {
+            ffi::fido_assert_set_extensions(self.ptr, ffi::FIDO_EXT_HMAC_SECRET)
+        })?;
+        // SAFETY: a live handle; libfido2 copies the salt.
+        check("set the hmac-secret salt", unsafe {
+            ffi::fido_assert_set_hmac_salt(self.ptr, salt.as_ptr(), salt.len())
+        })
+    }
+
+    /// A copy of one field of assertion 0, which must exist.
+    fn field(
+        &self,
+        ptr: unsafe extern "C" fn(*const ffi::fido_assert_t, usize) -> *const c_uchar,
+        len: unsafe extern "C" fn(*const ffi::fido_assert_t, usize) -> usize,
+    ) -> Option<Vec<u8>> {
+        // SAFETY: a live handle with an assertion at index 0 (`fido_assert_count`
+        // was checked); libfido2 owns the bytes.
+        unsafe { copy_out(ptr(self.ptr, 0), len(self.ptr, 0)) }
+    }
+}
+
+impl Handle<ffi::fido_cred_t> {
+    fn credential() -> Result<Self> {
+        Self::new(
+            ffi::fido_cred_new,
+            ffi::fido_cred_free,
+            "a credential handle",
+        )
+    }
+
+    fn set_type(&self, alg: i32) -> Result<()> {
+        // SAFETY: a live handle.
+        check("set the algorithm", unsafe {
+            ffi::fido_cred_set_type(self.ptr, alg)
+        })
+    }
+
+    /// Everything but the algorithm: challenge, relying party, user, and the
+    /// non-discoverable and `hmac-secret` options.
+    fn set_up(
+        &self,
+        rp: &CStr,
+        rp_name: &CStr,
+        user: &CStr,
+        req: &CredentialRequest<'_>,
+        cdh: &[u8; 32],
+    ) -> Result<()> {
+        // SAFETY: a live handle; libfido2 copies every buffer.
+        check("set the challenge", unsafe {
+            ffi::fido_cred_set_clientdata_hash(self.ptr, cdh.as_ptr(), cdh.len())
+        })?;
+        // SAFETY: as above.
+        check("set the relying party", unsafe {
+            ffi::fido_cred_set_rp(self.ptr, rp.as_ptr(), rp_name.as_ptr())
+        })?;
+        // SAFETY: as above.
+        check("set the user", unsafe {
+            ffi::fido_cred_set_user(
+                self.ptr,
+                req.user_id.as_ptr(),
+                req.user_id.len(),
+                user.as_ptr(),
+                user.as_ptr(),
+                std::ptr::null(),
+            )
+        })?;
+        // SAFETY: as above.
+        check("make it non-discoverable", unsafe {
+            ffi::fido_cred_set_rk(self.ptr, ffi::FIDO_OPT_OMIT)
+        })?;
+        if req.hmac_secret {
+            // SAFETY: as above.
+            check("ask for hmac-secret", unsafe {
+                ffi::fido_cred_set_extensions(self.ptr, ffi::FIDO_EXT_HMAC_SECRET)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The credential the device just made.
+    fn made(&self) -> Result<Credential> {
+        // SAFETY: a live handle that `fido_dev_make_cred` filled.
+        let id = unsafe {
+            copy_out(
+                ffi::fido_cred_id_ptr(self.ptr),
+                ffi::fido_cred_id_len(self.ptr),
+            )
+        }
+        .ok_or(Error::Missing("the credential ID"))?;
+        // SAFETY: as above.
+        let alg = unsafe { ffi::fido_cred_type(self.ptr) };
+        Ok(Credential { id, alg })
     }
 }
 
