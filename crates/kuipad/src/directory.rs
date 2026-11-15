@@ -453,7 +453,10 @@ impl LdapDirectory {
             depositors: members(SEAL_DEPOSITOR_ATTR),
             devices,
             state,
-            unlocks: Self::unlock_counts(entry).iter().map(|(_, n)| n).sum(),
+            unlocks: Self::counts(entry, SEAL_UNLOCKS_ATTR)
+                .iter()
+                .map(|(_, n)| n)
+                .sum(),
             session_keys: entry
                 .attrs
                 .get(&SEAL_SESSION_KEY_ATTR.to_lowercase())
@@ -481,11 +484,11 @@ impl LdapDirectory {
         entries.iter().map(Self::seal_from).collect()
     }
 
-    /// The per-server release counts on a seal entry.
-    fn unlock_counts(entry: &kuipa_ldap::SearchEntry) -> Vec<(String, u64)> {
+    /// The per-server counts `<server> <n>` in `attr` of an entry.
+    fn counts(entry: &kuipa_ldap::SearchEntry, attr: &str) -> Vec<(String, u64)> {
         entry
             .attrs
-            .get(&SEAL_UNLOCKS_ATTR.to_lowercase())
+            .get(&attr.to_lowercase())
             .into_iter()
             .flatten()
             .filter_map(|v| {
@@ -493,6 +496,38 @@ impl LdapDirectory {
                 Some((server.to_owned(), n.parse().ok()?))
             })
             .collect()
+    }
+
+    /// Add one to `server`'s count in `attr` of the `class` entry `dn`,
+    /// unless the total has reached `limit`; whether it did.  Only this
+    /// server's value changes, so replicas never conflict: the total is the
+    /// sum of every server's own count.
+    fn bump(
+        &self,
+        dn: &str,
+        class: &str,
+        attr: &str,
+        server: &str,
+        limit: Option<u64>,
+        missing: &str,
+    ) -> Result<bool, DirectoryError> {
+        let mut svc = self.service_conn()?;
+        let entries = svc.search(dn, Scope::Base, &format!("(objectClass={class})"), &[attr])?;
+        let entry = entries.first().ok_or(missing)?;
+        let counts = Self::counts(entry, attr);
+        if limit.is_some_and(|l| counts.iter().map(|(_, n)| n).sum::<u64>() >= l) {
+            return Ok(false);
+        }
+        let own = counts.iter().find(|(s, _)| s == server).map(|(_, n)| *n);
+        let new = format!("{server} {}", own.unwrap_or(0) + 1);
+        let mut mods = Vec::new();
+        let old = own.map(|n| format!("{server} {n}"));
+        if let Some(old) = &old {
+            mods.push((ModOp::Delete, attr, vec![old.as_bytes()]));
+        }
+        mods.push((ModOp::Add, attr, vec![new.as_bytes()]));
+        svc.modify_s(dn, &mods)?;
+        Ok(true)
     }
 
     /// The `kind:name` values of who approves `seal`'s releases.
@@ -534,9 +569,9 @@ impl LdapDirectory {
             .filter_map(approval)
             .collect();
         request.denied = values(RELEASE_DENIED_ATTR).iter().find_map(approval);
-        request.uses = values(RELEASE_USES_ATTR)
+        request.uses = Self::counts(entry, RELEASE_USES_ATTR)
             .iter()
-            .filter_map(|v| v.rsplit_once(' ')?.1.parse::<u64>().ok())
+            .map(|(_, n)| n)
             .sum();
         Ok(request)
     }
@@ -1579,39 +1614,14 @@ impl Directory for LdapDirectory {
         server: &str,
         limit: u64,
     ) -> Result<bool, DirectoryError> {
-        let mut svc = self.service_conn()?;
-        let dn = self.release_dn(id, request);
-        let entries = svc.search(
-            &dn,
-            Scope::Base,
-            &format!("(objectClass={RELEASE_CLASS})"),
-            &[RELEASE_USES_ATTR],
-        )?;
-        let entry = entries.first().ok_or("no such release request")?;
-        let counts: Vec<(String, u64)> = entry
-            .attrs
-            .get(&RELEASE_USES_ATTR.to_lowercase())
-            .into_iter()
-            .flatten()
-            .filter_map(|v| {
-                let (s, n) = v.rsplit_once(' ')?;
-                Some((s.to_owned(), n.parse().ok()?))
-            })
-            .collect();
-        if counts.iter().map(|(_, n)| n).sum::<u64>() >= limit {
-            return Ok(false);
-        }
-        // As for unlock counts: each server replaces only its own value.
-        let own = counts.iter().find(|(s, _)| s == server).map(|(_, n)| *n);
-        let new = format!("{server} {}", own.unwrap_or(0) + 1);
-        let mut mods = Vec::new();
-        let old = own.map(|n| format!("{server} {n}"));
-        if let Some(old) = &old {
-            mods.push((ModOp::Delete, RELEASE_USES_ATTR, vec![old.as_bytes()]));
-        }
-        mods.push((ModOp::Add, RELEASE_USES_ATTR, vec![new.as_bytes()]));
-        svc.modify_s(&dn, &mods)?;
-        Ok(true)
+        self.bump(
+            &self.release_dn(id, request),
+            RELEASE_CLASS,
+            RELEASE_USES_ATTR,
+            server,
+            Some(limit),
+            "no such release request",
+        )
     }
 
     fn seal_unlock(
@@ -1620,31 +1630,14 @@ impl Directory for LdapDirectory {
         server: &str,
         limit: Option<u64>,
     ) -> Result<bool, DirectoryError> {
-        let mut svc = self.service_conn()?;
-        let dn = self.seal_dn(id);
-        let entries = svc.search(
-            &dn,
-            Scope::Base,
-            &format!("(objectClass={SEAL_CLASS})"),
-            &[SEAL_UNLOCKS_ATTR],
-        )?;
-        let entry = entries.first().ok_or("no such seal")?;
-        let counts = Self::unlock_counts(entry);
-        if limit.is_some_and(|l| counts.iter().map(|(_, n)| n).sum::<u64>() >= l) {
-            return Ok(false);
-        }
-        // Only this server's value changes, so replicas never conflict:
-        // the total is the sum of every server's own count.
-        let own = counts.iter().find(|(s, _)| s == server).map(|(_, n)| *n);
-        let old = own.map(|n| format!("{server} {n}"));
-        let new = format!("{server} {}", own.unwrap_or(0) + 1);
-        let mut mods = Vec::new();
-        if let Some(old) = &old {
-            mods.push((ModOp::Delete, SEAL_UNLOCKS_ATTR, vec![old.as_bytes()]));
-        }
-        mods.push((ModOp::Add, SEAL_UNLOCKS_ATTR, vec![new.as_bytes()]));
-        svc.modify_s(&dn, &mods)?;
-        Ok(true)
+        self.bump(
+            &self.seal_dn(id),
+            SEAL_CLASS,
+            SEAL_UNLOCKS_ATTR,
+            server,
+            limit,
+            "no such seal",
+        )
     }
 
     fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
