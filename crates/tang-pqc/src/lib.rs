@@ -67,6 +67,6 @@ pub use alg::{KemAlg, SignatureAlg};
 pub use client::{Binding, BindingContext, KEY_LEN, Key, PendingRecovery};
 pub use error::{Error, Result};
 pub use keys::{ExchangeKey, ExchangeKeyPair, SigningKey, Thumbprint, VerifyingKey};
-pub use policy::{Policy, unix_seconds};
+pub use policy::{Policy, now, unix_seconds};
 pub use protocol::{OpenedRequest, RecoveryRequest, RecoveryResponse};
 pub use server::{DEFAULT_ADVERTISEMENT_VALIDITY, Server};

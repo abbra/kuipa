@@ -23,9 +23,7 @@ fn setup() -> Setup {
     }
 }
 
-fn now() -> u64 {
-    tang_pqc::unix_seconds(std::time::SystemTime::now())
-}
+use tang_pqc::now;
 
 fn signed(s: &Setup) -> SignedAdvertisement {
     AdvertisementBuilder::new(&[&s.signing])

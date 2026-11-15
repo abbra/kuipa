@@ -516,9 +516,7 @@ mod tests {
 
     const DAY: u64 = 24 * 3600;
 
-    fn now() -> u64 {
-        unix_seconds(SystemTime::now())
-    }
+    use crate::policy::now;
 
     fn fresh() -> Lifetime {
         let now = now();

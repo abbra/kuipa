@@ -131,7 +131,12 @@ impl Policy {
     /// # Errors
     ///
     /// [`Error::StaleAdvertisement`], [`Error::Policy`] or [`Error::Malformed`].
-    pub(crate) fn check_freshness(&self, iat: Option<u64>, exp: Option<u64>, now: u64) -> Result<()> {
+    pub(crate) fn check_freshness(
+        &self,
+        iat: Option<u64>,
+        exp: Option<u64>,
+        now: u64,
+    ) -> Result<()> {
         let (iat, exp) = match (iat, exp) {
             (Some(iat), Some(exp)) => (iat, exp),
             (None, None) if !self.require_expiry => return Ok(()),
@@ -156,12 +161,17 @@ impl Policy {
     }
 }
 
-/// Seconds since the Unix epoch (0 for earlier times).
 /// Seconds since the Unix epoch (0 before it).
 #[must_use]
 pub fn unix_seconds(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// [`unix_seconds`] of the current time.
+#[must_use]
+pub fn now() -> u64 {
+    unix_seconds(SystemTime::now())
 }
 
 #[cfg(test)]

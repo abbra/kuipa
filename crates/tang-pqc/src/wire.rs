@@ -55,6 +55,19 @@ impl Writer {
         self
     }
 
+    /// A `u8` count followed by each item as written by `put`.
+    ///
+    /// # Panics
+    ///
+    /// For 256 items or more.
+    pub fn list<T>(&mut self, items: &[T], mut put: impl FnMut(&mut Self, &T)) -> &mut Self {
+        self.u8(u8::try_from(items.len()).expect("list shorter than 256 items"));
+        for item in items {
+            put(self, item);
+        }
+        self
+    }
+
     /// A length-prefixed UTF-8 string.
     pub fn str(&mut self, s: &str) -> &mut Self {
         self.bytes(s.as_bytes())
@@ -169,6 +182,15 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// A `u8` count followed by that many items, each read by `get`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`], or whatever `get` returns.
+    pub fn list<T>(&mut self, mut get: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
+        (0..self.u8()?).map(|_| get(self)).collect()
+    }
+
     /// A length-prefixed UTF-8 string.
     ///
     /// # Errors
@@ -218,6 +240,25 @@ mod tests {
         let truncated = Writer::new(*b"TEST").bytes(b"abc").finish();
         let mut r = Reader::new(&truncated[..truncated.len() - 1], *b"TEST", "test").unwrap();
         assert!(r.bytes().is_err());
+    }
+
+    #[test]
+    fn lists_round_trip() {
+        let enc = Writer::new(*b"TEST")
+            .list(&[1u64, 2, 3], |w, v| {
+                w.u64(*v);
+            })
+            .finish();
+        let mut r = Reader::new(&enc, *b"TEST", "test").unwrap();
+        assert_eq!(r.list(Reader::u64).unwrap(), [1, 2, 3]);
+        r.finish().unwrap();
+        // Count says 3 but only two items follow.
+        assert!(
+            Reader::new(&enc[..enc.len() - 8], *b"TEST", "test")
+                .unwrap()
+                .list(Reader::u64)
+                .is_err()
+        );
     }
 
     #[test]

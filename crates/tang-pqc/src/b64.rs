@@ -85,9 +85,27 @@ pub fn decode(text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decode strictly into exactly `N` bytes.
+///
+/// # Errors
+///
+/// [`Error::Malformed`] as for [`decode`], or when the length is not `N`.
+pub fn decode_array<const N: usize>(text: &str) -> Result<[u8; N]> {
+    decode(text)?
+        .try_into()
+        .map_err(|_| Error::Malformed("base64url"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_array_checks_the_length() {
+        assert_eq!(decode_array::<3>("Zm9v").unwrap(), *b"foo");
+        assert!(decode_array::<2>("Zm9v").is_err());
+        assert!(decode_array::<3>("Zm9").is_err());
+    }
 
     /// RFC 4648 §10 vectors, unpadded.
     #[test]

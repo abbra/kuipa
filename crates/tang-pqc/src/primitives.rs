@@ -11,6 +11,7 @@ use native_ossl::cipher::{AeadDecryptCtx, AeadEncryptCtx, CipherAlg};
 use native_ossl::digest::DigestAlg;
 use native_ossl::kdf::HkdfBuilder;
 use native_ossl::pkey::{DecapCtx, EncapCtx, Pkey, Private, Public};
+use native_ossl::rand::Rand;
 use native_ossl::util::SecretBuf;
 
 use crate::error::{Error, Result};
@@ -167,6 +168,17 @@ pub fn sha384(parts: &[&[u8]]) -> Result<[u8; SHA384_LEN]> {
     Ok(out)
 }
 
+/// `n` random bytes from OpenSSL's private DRBG, in a wiping buffer.
+///
+/// # Errors
+///
+/// An OpenSSL error.
+pub fn random_secret(n: usize) -> Result<SecretBuf> {
+    let mut buf = SecretBuf::with_len(n);
+    Rand::fill_private(buf.as_mut_slice())?;
+    Ok(buf)
+}
+
 fn aes_256_gcm() -> Result<CipherAlg> {
     Ok(CipherAlg::fetch(c"AES-256-GCM", None)?)
 }
@@ -310,6 +322,13 @@ pub(crate) fn decapsulate(key: &Pkey<Private>, ciphertext: &[u8]) -> Result<Secr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_secrets_have_the_length_and_differ() {
+        let (a, b) = (random_secret(32).unwrap(), random_secret(32).unwrap());
+        assert_eq!(a.as_ref().len(), 32);
+        assert_ne!(a.as_ref(), b.as_ref());
+    }
 
     #[test]
     fn seal_open_round_trip() {

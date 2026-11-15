@@ -1,12 +1,11 @@
 //! Server side (the Tang daemon).
 
 use std::sync::{PoisonError, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::adv::{Lifetime, SignedAdvertisement};
 use crate::error::{Error, Result};
 use crate::keys::{ExchangeKey, ExchangeKeyPair, SigningKey, Thumbprint};
-use crate::policy::unix_seconds;
 use crate::primitives::Domain;
 use crate::protocol::{RecoveryRequest, RecoveryResponse};
 
@@ -91,7 +90,7 @@ impl Server {
         if validity.as_secs() == 0 {
             return Err(Error::Policy("advertisement validity must be at least 1 s"));
         }
-        let now = unix_seconds(SystemTime::now());
+        let now = crate::policy::now();
         let adv = sign_advertisement(&signing_keys, &exchange_keys, validity, now)?;
         Ok(Self {
             signing_keys,
@@ -121,7 +120,7 @@ impl Server {
     ///
     /// An OpenSSL error if re-signing fails.
     pub fn advertisement(&self) -> Result<SignedAdvertisement> {
-        let now = unix_seconds(SystemTime::now());
+        let now = crate::policy::now();
         let refresh_after = self.validity.as_secs() / 2;
         {
             let current = self

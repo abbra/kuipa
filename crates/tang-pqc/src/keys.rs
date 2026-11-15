@@ -9,7 +9,6 @@ use native_ossl::params::{ParamBuilder, Params};
 use native_ossl::pkey::{KeygenCtx, MessageSigner, MessageVerifier, Pkey, Private, Public};
 use native_ossl::pkey_builder::RawKeyBuilder;
 use native_ossl::pkey_params;
-use native_ossl::rand::Rand;
 use native_ossl::util::SecretBuf;
 
 use crate::alg::{KemAlg, SignatureAlg};
@@ -44,13 +43,6 @@ fn exported_seed(pkey: &Pkey<Private>, len: usize) -> Result<SecretBuf> {
         Ok(seed) if seed.len() == len => Ok(SecretBuf::from_slice(seed)),
         _ => Err(Error::SeedUnavailable),
     }
-}
-
-/// A fresh seed from OpenSSL's private DRBG.
-fn random_seed(len: usize) -> Result<SecretBuf> {
-    let mut seed = SecretBuf::with_len(len);
-    Rand::fill_private(seed.as_mut_slice())?;
-    Ok(seed)
 }
 
 /// FIPS 203 / FIPS 204 key generation from a given seed.
@@ -140,12 +132,9 @@ impl FromStr for Thumbprint {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let bytes = b64::decode(s).map_err(|_| Error::Malformed("thumbprint"))?;
-        Ok(Self(
-            bytes
-                .try_into()
-                .map_err(|_| Error::Malformed("thumbprint"))?,
-        ))
+        b64::decode_array(s)
+            .map(Self)
+            .map_err(|_| Error::Malformed("thumbprint"))
     }
 }
 
@@ -290,7 +279,7 @@ impl ExchangeKeyPair {
     /// `alg`, or an OpenSSL error if key generation fails.
     pub fn generate(alg: KemAlg) -> Result<Self> {
         alg.ensure_allowed()?;
-        Self::from_seed(alg, random_seed(KemAlg::SEED_LEN)?)
+        Self::from_seed(alg, primitives::random_secret(KemAlg::SEED_LEN)?)
     }
 
     /// Generate a key pair with the first KEM in [`KemAlg::PREFERENCE`] that
@@ -610,7 +599,7 @@ impl SigningKey {
     /// `alg`, or an OpenSSL error if key generation fails.
     pub fn generate(alg: SignatureAlg) -> Result<Self> {
         alg.ensure_allowed()?;
-        Self::from_seed(alg, random_seed(SignatureAlg::SEED_LEN)?)
+        Self::from_seed(alg, primitives::random_secret(SignatureAlg::SEED_LEN)?)
     }
 
     /// Generate a key pair with the first algorithm in
