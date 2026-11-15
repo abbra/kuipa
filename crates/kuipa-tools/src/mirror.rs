@@ -33,92 +33,88 @@ pub(crate) const MAX_HEADS: usize = 64;
 /// What the mirror holds: the public bytes it serves, and the queries
 /// it has seen (to fetch head answers for at the next sync).
 #[derive(Default)]
-pub struct Cache {
+pub struct Cache(RwLock<Inner>);
+
+#[derive(Default)]
+struct Inner {
     /// The plain advertisement, as received.
-    advertisement: RwLock<Option<Vec<u8>>>,
+    advertisement: Option<Vec<u8>>,
     /// Advertisements by their full query string, as received: the
     /// head-proof answers clients ask for by name.
-    heads: RwLock<BTreeMap<String, Vec<u8>>>,
+    heads: BTreeMap<String, Vec<u8>>,
     /// Head queries clients asked and no sync has fetched yet.
-    wanted: RwLock<BTreeSet<String>>,
+    wanted: BTreeSet<String>,
     /// The anchor log, as received.
-    anchor_log: RwLock<Option<Vec<u8>>>,
+    anchor_log: Option<Vec<u8>>,
     /// Claim-log pages by `(anchor, from)`, as received.
-    claim_log: RwLock<BTreeMap<(String, u64), Vec<u8>>>,
+    claim_log: BTreeMap<(String, u64), Vec<u8>>,
 }
 
 impl Cache {
+    fn read<R>(&self, f: impl FnOnce(&Inner) -> R) -> R {
+        f(&self.0.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn write<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        f(&mut self.0.write().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// The plain advertisement bytes, as received.
     #[must_use]
     pub fn advertisement(&self) -> Option<Vec<u8>> {
-        self.advertisement
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.read(|c| c.advertisement.clone())
     }
     /// A cached head-proof answer for `query`, verbatim.
     #[must_use]
     pub fn head_answer(&self, query: &str) -> Option<Vec<u8>> {
-        self.heads
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(query)
-            .cloned()
+        self.read(|c| c.heads.get(query).cloned())
     }
     /// Remember a `head=` query for the next sync, dropping the oldest
     /// past [`MAX_WANTED`].
     pub fn remember_wanted(&self, query: &str) {
-        let mut wanted = self.wanted.write().unwrap_or_else(PoisonError::into_inner);
-        wanted.insert(query.to_owned());
-        while wanted.len() > MAX_WANTED {
-            wanted.pop_first();
-        }
+        self.write(|c| {
+            c.wanted.insert(query.to_owned());
+            while c.wanted.len() > MAX_WANTED {
+                c.wanted.pop_first();
+            }
+        });
     }
     /// The anchor log bytes, as received.
     #[must_use]
     pub fn anchor_log(&self) -> Option<Vec<u8>> {
-        self.anchor_log
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.read(|c| c.anchor_log.clone())
     }
     /// One cached claim-log page, verbatim.
     #[must_use]
     pub fn claim_log(&self, anchor: &str, from: u64) -> Option<Vec<u8>> {
-        self.claim_log
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&(anchor.to_owned(), from))
-            .cloned()
+        self.read(|c| c.claim_log.get(&(anchor.to_owned(), from)).cloned())
     }
     /// Cache a head-proof answer, dropping the oldest past
     /// [`MAX_HEADS`].
     fn put_head(&self, query: String, bytes: Vec<u8>) {
-        let mut heads = self.heads.write().unwrap_or_else(PoisonError::into_inner);
-        heads.insert(query, bytes);
-        while heads.len() > MAX_HEADS {
-            heads.pop_first();
-        }
+        self.write(|c| {
+            c.heads.insert(query, bytes);
+            while c.heads.len() > MAX_HEADS {
+                c.heads.pop_first();
+            }
+        });
     }
     /// Cache one page of `(anchor, from)`, replacing the older page at
     /// the same position when a newer verified one arrives.
     fn put_page(&self, anchor: &str, from: u64, bytes: Vec<u8>) {
-        self.claim_log
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((anchor.to_owned(), from), bytes);
+        self.write(|c| c.claim_log.insert((anchor.to_owned(), from), bytes));
     }
 
     /// The pages cached for `anchor`, in `from` order.
     #[cfg(test)]
     fn cached_pages(&self, anchor: &str) -> Vec<(u64, Vec<u8>)> {
-        self.claim_log
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|((a, _), _)| a == anchor)
-            .map(|((_, from), bytes)| (*from, bytes.clone()))
-            .collect()
+        self.read(|c| {
+            c.claim_log
+                .iter()
+                .filter(|((a, _), _)| a == anchor)
+                .map(|((_, from), bytes)| (*from, bytes.clone()))
+                .collect()
+        })
     }
 }
 
@@ -176,25 +172,18 @@ pub fn sync(origin: &Endpoint, cache: &Cache) -> Result<(), Error> {
     // The anchor log, with the heads the pages just walked.
     let entries = origin.anchor_log(0)?;
     let log = serde_json::to_vec(&serde_json::json!({ "entries": entries, "heads": walked }))?;
-    *cache
-        .anchor_log
-        .write()
-        .unwrap_or_else(PoisonError::into_inner) = Some(log);
-    // Publish the advertisement *after* its pages: a reader that sees
-    // it must also see the claim logs it names, so a round is served
-    // whole and never half-synced.
-    *cache
-        .advertisement
-        .write()
-        .unwrap_or_else(PoisonError::into_inner) = Some(bytes);
+    // The advertisement goes in *after* its pages (put by the walks
+    // above) and with the anchor log, in one step: a reader that sees it
+    // must also see the claim logs it names.
+    cache.write(|c| {
+        c.anchor_log = Some(log);
+        c.advertisement = Some(bytes);
+    });
 
     // The head queries clients asked for: fetch and cache the origin's
     // answers, so the next client with the same query gets the
     // head-proof advertisement.
-    let wanted: Vec<String> =
-        std::mem::take(&mut *cache.wanted.write().unwrap_or_else(PoisonError::into_inner))
-            .into_iter()
-            .collect();
+    let wanted = cache.write(|c| std::mem::take(&mut c.wanted));
     for query in wanted {
         if let Ok(answer) = origin.advertisement_query(query.as_str()) {
             cache.put_head(query, answer);
@@ -290,15 +279,12 @@ pub fn store(cache: &Cache, dir: &Path) -> Result<(), Error> {
     if let Some(bytes) = cache.anchor_log() {
         std::fs::write(dir.join("anchor-log"), bytes)?;
     }
-    for ((anchor, from), bytes) in cache
-        .claim_log
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-    {
-        std::fs::write(dir.join(format!("claim-log-{anchor}-{from}")), bytes)?;
-    }
-    Ok(())
+    cache.read(|c| {
+        for ((anchor, from), bytes) in &c.claim_log {
+            std::fs::write(dir.join(format!("claim-log-{anchor}-{from}")), bytes)?;
+        }
+        Ok(())
+    })
 }
 
 /// The cache directory: `--data` as the operator gave it, used as-is;
@@ -464,10 +450,7 @@ mod tests {
         for i in 0..200 {
             cache.remember_wanted(&format!("head=a.{i}.r"));
         }
-        let wanted = cache
-            .wanted
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wanted = cache.read(|c| c.wanted.clone());
         assert_eq!(wanted.len(), super::MAX_WANTED);
         assert!(
             !wanted.contains("head=a.0.r"),
@@ -477,11 +460,7 @@ mod tests {
         for i in 0..100 {
             cache.put_head(format!("q{i}"), vec![u8::try_from(i).unwrap_or(255)]);
         }
-        let heads = cache
-            .heads
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
+        let heads = cache.read(|c| c.heads.len());
         assert_eq!(heads, super::MAX_HEADS);
         assert!(cache.head_answer("q0").is_none());
         assert!(cache.head_answer("q99").is_some());
