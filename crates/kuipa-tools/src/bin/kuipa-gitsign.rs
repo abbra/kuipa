@@ -102,12 +102,12 @@ fn verify(args: &[String]) -> Result<bool, Error> {
         .ok_or("--verify needs the signature file")?;
     let bundle = Bundle::from_bytes(&dearmor(&std::fs::read_to_string(file)?)?)?;
     let host = Paths::from_env();
-    let pins = kuipa_tools::sign::Pins::of_host(&host)?;
+    let (realm, anchors) = kuipa_tools::sign::host_pins(&host)?;
     status(fd, "NEWSIG");
     match bundle.verify(
         &payload()?,
-        &pins.realm,
-        &pins.anchors,
+        &realm,
+        &anchors,
         &tang_pqc::Policy::from_system()?,
     ) {
         Ok(v) => {

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kuipa_enroll::delegation::Pinned;
 use kuipa_enroll::join::Operation;
 use kuipa_enroll::realm::Deployment;
 use kuipa_enroll::sign::{Bundle, Digest, DigestAlg, Request};
@@ -55,11 +56,11 @@ pub fn sign_files(
         written.push(json!({ "file": file, "signature": out }));
     }
     let first = bundles.first().ok_or("the server answered no bundle")?;
-    let pins = Pins::of_host(host)?;
+    let (realm, anchors) = host_pins(host)?;
     let v = first.verify_digest(
         &asked.digests[0],
-        &pins.realm,
-        &pins.anchors,
+        &realm,
+        &anchors,
         &tang_pqc::Policy::from_system()?,
     )?;
     Ok(json!({
@@ -92,7 +93,7 @@ pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Ve
     let (bundles, _) = flows::exchange_with(
         &Deployment::servers(&public.servers),
         &trust,
-        pinned.pins(&public.realm),
+        (&public.realm, pinned.windows.pinned()),
         known,
         Operation::Sign,
         |adv| flows::kerberos_request(adv, Operation::Sign, &public.fqdn, &cred, &[], &extra),
@@ -101,32 +102,19 @@ pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Ve
     Ok(bundles)
 }
 
-/// The anchors to verify against when this host has none of its own (a new
-/// host in a restore): the realm, and the thumbprints a person carries.
-#[derive(Clone)]
-pub struct Pins {
-    /// The realm the statement must be for.
-    pub realm: String,
-    /// The trusted anchors.
-    pub anchors: Vec<tang_pqc::Thumbprint>,
-}
-
-impl Pins {
-    /// This host's realm and pinned anchors.
-    ///
-    /// # Errors
-    ///
-    /// The host is not enrolled, or its pins are unreadable.
-    pub fn of_host(host: &Paths) -> Result<Self, Error> {
-        Ok(Self {
-            realm: PublicState::load(host)?.realm,
-            anchors: paths::read_anchors(host)?,
-        })
-    }
+/// This host's realm and its pinned anchors: what its statements verify
+/// against.
+///
+/// # Errors
+///
+/// The host is not enrolled, or its pins are unreadable.
+pub fn host_pins(host: &Paths) -> Result<(String, Vec<tang_pqc::Thumbprint>), Error> {
+    Ok((PublicState::load(host)?.realm, paths::read_anchors(host)?))
 }
 
 /// `kuipa sign verify`: check `file` against its bundle (`signature`,
-/// else `<file>.kusig`) offline, with this host's pinned anchors, or `pins`; and
+/// else `<file>.kusig`) offline, with this host's pinned anchors, or `pins`
+/// (a realm and its anchors); and
 /// when given, that the signer is `signer` and the purpose `purpose`.
 /// `ok` is false for a mismatch of either.
 ///
@@ -137,22 +125,31 @@ pub fn verify_file(
     host: &Paths,
     file: &Path,
     signature: Option<&Path>,
-    pins: Option<&Pins>,
+    pins: Option<(&str, Pinned<'_>)>,
     signer: Option<&str>,
     purpose: Option<&str>,
 ) -> Result<Value, Error> {
     let sig = signature.map_or_else(|| bundle_path(file), Path::to_path_buf);
     let bundle =
         Bundle::from_bytes(&std::fs::read(&sig).map_err(|e| format!("{}: {e}", sig.display()))?)?;
-    let pins = match pins {
-        Some(p) => std::borrow::Cow::Borrowed(p),
-        None => std::borrow::Cow::Owned(Pins::of_host(host)?),
+    let own;
+    let (realm, pinned) = if let Some(p) = pins {
+        p
+    } else {
+        own = host_pins(host)?;
+        (
+            own.0.as_str(),
+            Pinned {
+                anchors: &own.1,
+                ..Pinned::default()
+            },
+        )
     };
     let data = std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let v = bundle.verify_digest(
         &Digest::of_reader(bundle.digest().alg, data)?,
-        &pins.realm,
-        &pins.anchors,
+        realm,
+        pinned.anchors,
         &tang_pqc::Policy::from_system()?,
     )?;
     let principal = v.principal.to_string();

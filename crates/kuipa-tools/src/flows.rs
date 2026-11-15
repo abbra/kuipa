@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use kuipa_enroll::Enrollment;
 use kuipa_enroll::bundle::{Bundle, Opener};
-use kuipa_enroll::delegation::{Delegation, HeadPin};
+use kuipa_enroll::delegation::{Delegation, HeadPin, Pinned};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::epoch::verify_chain;
 use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, Sealed, Sealer};
@@ -106,34 +106,16 @@ pub(crate) fn now() -> SystemTime {
 /// What this host's anchors file pins: one read of the file, so the
 /// windows and the epoch watermark come from the same contents.
 pub(crate) struct HostPins {
-    pub(crate) anchors: Vec<Thumbprint>,
-    heads: Vec<HeadPin>,
-    retired: Vec<Hash>,
-    frozen: Vec<Thumbprint>,
+    pub(crate) windows: paths::Windows,
     pub(crate) epoch: Option<Epoch>,
 }
 
 impl HostPins {
     pub(crate) fn load(path: &Path) -> Result<Self, Error> {
-        let (anchors, heads, retired, frozen) = paths::pinned_windows(path)?;
-        let epoch = paths::read_epoch_from(path)?;
         Ok(Self {
-            anchors,
-            heads,
-            retired,
-            frozen,
-            epoch,
+            windows: paths::pinned_windows(path)?,
+            epoch: paths::read_epoch_from(path)?,
         })
-    }
-
-    pub(crate) fn pins<'a>(&'a self, realm: &'a str) -> Pins<'a> {
-        Pins {
-            realm,
-            anchors: &self.anchors,
-            heads: &self.heads,
-            retired: &self.retired,
-            frozen: &self.frozen,
-        }
     }
 }
 
@@ -180,49 +162,6 @@ fn check_deployment(
 /// a client that knows two of a realm's anchors refuses it.
 const MIN_PROVING_ANCHORS: usize = 2;
 
-/// The heads pinned for `anchor`, oldest first: what a head proof for
-/// that anchor must check against — no other anchor's head says anything
-/// about this one (§1.4, DESIGN-claim-logs.md §2).
-#[must_use]
-fn window_of(heads: &[HeadPin], anchor: &Thumbprint) -> Vec<HeadPin> {
-    heads
-        .iter()
-        .filter(|h| &h.anchor == anchor)
-        .copied()
-        .collect()
-}
-
-/// Whether `adv` carries, for anchor `a`, a head proof that checks
-/// against one of `window`'s heads (§2): what a frozen pin accepts,
-/// and nothing else.
-fn head_proves(adv: &VerifiedRealm, a: &Thumbprint, window: &[HeadPin]) -> bool {
-    adv.head_proofs().iter().any(|p| {
-        p.anchor() == a
-            && window
-                .iter()
-                .any(|h| h.check(adv.claim(), p).unwrap_or(false))
-    })
-}
-
-/// The frozen pins' §2 gate: **every** frozen anchor must be served a
-/// proof that checks against one of its own pinned heads — a
-/// signature, or another anchor's proof of the same claim, is exactly
-/// what the freeze removes.  A frozen anchor with no head pinned has
-/// nothing that could prove the claim and refuses likewise; the
-/// refusal names the freeze.
-fn frozen_gate(
-    advertisement: &VerifiedRealm,
-    wanted: &[HeadPin],
-    frozen: &[Thumbprint],
-) -> Result<(), Error> {
-    for f in frozen {
-        if !head_proves(advertisement, f, &window_of(wanted, f)) {
-            return Err(format!("frozen: the pinned head of {f} does not prove this claim").into());
-        }
-    }
-    Ok(())
-}
-
 /// One quorum anchor's own proof of the claim (§4.4): a frozen anchor
 /// is asked with its window and can only answer head-wise (§2); the
 /// others take the signature path as before.
@@ -230,31 +169,31 @@ fn quorum_proof(
     endpoint: &Endpoint,
     realm: &str,
     a: &Thumbprint,
-    window: &[HeadPin],
+    heads: &[HeadPin],
     retired: &[Hash],
     frozen: bool,
 ) -> Result<VerifiedRealm, Error> {
-    if frozen {
-        let adv = endpoint.advertisement_with_heads(std::slice::from_ref(a), window)?;
-        Ok(VerifiedRealm::verify_with_heads(
-            &adv,
-            realm,
-            std::slice::from_ref(a),
-            window,
-            retired,
-            &Policy::from_system()?,
-            now(),
-        )?)
+    let anchors = std::slice::from_ref(a);
+    // No other anchor's head says anything about this one (§1.4).
+    let window: Vec<HeadPin> = if frozen {
+        heads.iter().filter(|h| &h.anchor == a).copied().collect()
     } else {
-        let adv = endpoint.advertisement(std::slice::from_ref(a))?;
-        Ok(VerifiedRealm::verify(
-            &adv,
-            realm,
-            std::slice::from_ref(a),
-            &Policy::from_system()?,
-            now(),
-        )?)
-    }
+        Vec::new()
+    };
+    let adv = endpoint.advertisement_with_heads(anchors, &window)?;
+    let pinned = Pinned {
+        anchors,
+        heads: &window,
+        retired,
+        frozen: &[],
+    };
+    Ok(VerifiedRealm::verify_pinned(
+        &adv,
+        realm,
+        &pinned,
+        &Policy::from_system()?,
+        now(),
+    )?)
 }
 
 /// Whether a quorum proof counts (§4.4): only for the claim it is a
@@ -282,27 +221,16 @@ fn count_proof(
     }
 }
 
-/// What a server's advertisement is verified against: the realm, its
-/// pinned anchors, and the heads, retired claims and frozen anchors that
-/// travel with them.
-#[derive(Clone, Copy)]
-pub(crate) struct Pins<'a> {
-    pub(crate) realm: &'a str,
-    pub(crate) anchors: &'a [Thumbprint],
-    pub(crate) heads: &'a [HeadPin],
-    pub(crate) retired: &'a [Hash],
-    pub(crate) frozen: &'a [Thumbprint],
-}
-
-/// Fetch and verify one server's advertisement.
+/// Fetch and verify one server's advertisement of `realm` against
+/// `pinned`.
 pub(crate) fn verified(
     server: &str,
     trust: &Trust,
-    pinned: Pins<'_>,
+    realm: &str,
+    pinned: Pinned<'_>,
     known: Option<Epoch>,
 ) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), Error> {
-    let Pins {
-        realm,
+    let Pinned {
         anchors,
         heads,
         retired,
@@ -318,12 +246,16 @@ pub(crate) fn verified(
     // server tries each pinned head in turn (§1.4), and a claim only
     // under the newest head has no proof under the oldest.
     let adv = endpoint.advertisement_with_heads(&pins, &wanted_heads)?;
-    let advertisement = VerifiedRealm::verify_with_heads(
+    // The frozen anchors' §2 gate is part of the verification.
+    let advertisement = VerifiedRealm::verify_pinned(
         &adv,
         realm,
-        &pins,
-        &wanted_heads,
-        retired,
+        &Pinned {
+            anchors: &pins,
+            heads: &wanted_heads,
+            retired,
+            frozen,
+        },
         &Policy::from_system()?,
         now(),
     )
@@ -331,7 +263,6 @@ pub(crate) fn verified(
         tracing::debug!(server = %server, "advertisement rejected: {e}");
         format!("advertisement: {e}")
     })?;
-    frozen_gate(&advertisement, &wanted_heads, frozen)?;
     trace_advertisement(server, &advertisement);
     for (old, new) in advertisement.succeeded() {
         tracing::debug!(server = %server, "pinned anchor {old} was rotated: succeeded by {new}");
@@ -356,8 +287,7 @@ pub(crate) fn verified(
             // counts only by its own pinned head (§2).
             let in_advertisement = advertisement.proven_by().iter().find(|p| p.anchor == *a);
             let counts = in_advertisement.is_some_and(|p| {
-                !frozen.contains(a)
-                    || (p.head && head_proves(&advertisement, a, &window_of(&wanted_heads, a)))
+                !frozen.contains(a) || (p.head && advertisement.head_proves(a, &wanted_heads))
             });
             if counts {
                 tracing::debug!(server = %server, "claim also proven by pinned anchor {a}, in the same advertisement");
@@ -367,12 +297,18 @@ pub(crate) fn verified(
             // A frozen anchor counts head-wise only (§2); a signature
             // proof, even a valid one for this very claim, is what the
             // freeze removes.
-            let window = window_of(&wanted_heads, a);
-            let proof = quorum_proof(&endpoint, realm, a, &window, retired, frozen.contains(a));
+            let proof = quorum_proof(
+                &endpoint,
+                realm,
+                a,
+                &wanted_heads,
+                retired,
+                frozen.contains(a),
+            );
             match proof {
                 Ok(proof) => {
                     if frozen.contains(a)
-                        && (proof.head_anchor() != Some(*a) || !head_proves(&proof, a, &window))
+                        && (proof.head_anchor() != Some(*a) || !proof.head_proves(a, &wanted_heads))
                     {
                         tracing::debug!(
                             server = %server,
@@ -565,7 +501,7 @@ fn path_for(op: Operation, request: &Request) -> String {
 fn exchange(
     deployment: &Deployment,
     trust: &Trust,
-    pinned: Pins<'_>,
+    pins: (&str, Pinned<'_>),
     known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -573,7 +509,7 @@ fn exchange(
     exchange_with(
         deployment,
         trust,
-        pinned,
+        pins,
         known,
         op,
         build,
@@ -589,7 +525,7 @@ fn exchange(
 pub(crate) fn exchange_with<T>(
     deployment: &Deployment,
     trust: &Trust,
-    pinned: Pins<'_>,
+    pins: (&str, Pinned<'_>),
     known: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
     op: Operation,
     mut build: impl FnMut(&VerifiedRealm) -> Result<(Request, PendingJoin), Error>,
@@ -597,7 +533,7 @@ pub(crate) fn exchange_with<T>(
 ) -> Result<(T, VerifiedRealm), Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
-        let (endpoint, adv, _) = match verified(server, trust, pinned, known) {
+        let (endpoint, adv, _) = match verified(server, trust, pins.0, pins.1, known) {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!(server = %server, "skipped, trying the next server: {e}");
@@ -986,8 +922,7 @@ pub fn enroll_online(
     }
     // What the pinned windows' logs retired (DESIGN-tlog.md §8); none for
     // pins from an enrollment string.
-    let (_, _, retired, _) = paths::pinned_windows(&paths.anchors())?;
-    let retired = retired.as_slice();
+    let retired = paths::pinned_windows(&paths.anchors())?.retired;
     if anchors.is_empty() {
         return Err("no anchor to verify the realm with".into());
     }
@@ -1006,13 +941,15 @@ pub fn enroll_online(
     let (enrollment, adv) = exchange(
         deployment,
         &Trust::FirstContact,
-        Pins {
+        (
             realm,
-            anchors,
-            heads,
-            retired,
-            frozen,
-        },
+            Pinned {
+                anchors,
+                heads,
+                retired: &retired,
+                frozen,
+            },
+        ),
         None,
         op,
         |adv| {
@@ -1492,7 +1429,7 @@ pub(crate) fn all_servers(state: &State, trust: &Trust, host: &HostPins) -> Vec<
         .servers
         .iter()
         .filter_map(|s| {
-            verified(s, trust, host.pins(&state.realm), None)
+            verified(s, trust, &state.realm, host.windows.pinned(), None)
                 .ok()
                 .map(|(_, v, _)| v)
                 .filter(|v| check_deployment(s, v, &deployment).is_ok())
@@ -1572,7 +1509,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<(Holder, Option<&str>)>) -> Re
     let (enrollment, adv) = exchange(
         &Deployment::servers(&state.servers),
         &trust,
-        host.pins(&state.realm),
+        (&state.realm, host.windows.pinned()),
         known,
         Operation::Rekey,
         |adv| {
@@ -1879,7 +1816,7 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
     let (answer, _) = exchange_with(
         &Deployment::servers(&state.servers),
         &trust,
-        host.pins(&state.realm),
+        (&state.realm, host.windows.pinned()),
         known,
         Operation::Keys,
         |adv| kerberos_request(adv, Operation::Keys, &state.fqdn, &cred, &[], &extra),
@@ -1975,7 +1912,7 @@ fn register(
     let ((), adv) = exchange_with(
         &Deployment::servers(&state.servers),
         &trust,
-        host.pins(&state.realm),
+        (&state.realm, host.windows.pinned()),
         known,
         Operation::Register,
         |adv| {
@@ -2324,7 +2261,7 @@ pub fn check(paths: &Paths, only: &[String]) -> Result<Value, Error> {
         .iter()
         .filter(|s| only.is_empty() || only.contains(s))
     {
-        match verified(server, &trust, host.pins(&state.realm), known).and_then(
+        match verified(server, &trust, &state.realm, host.windows.pinned(), known).and_then(
             |(e, adv, advance)| {
                 adv.check_deployment(&Deployment::servers(&state.servers))?;
                 Ok((e, adv, advance))
@@ -2453,7 +2390,7 @@ fn refresh_pins(
     let (answer, adv) = exchange_with(
         &Deployment::servers(servers),
         trust,
-        host.pins(&state.realm),
+        (&state.realm, host.windows.pinned()),
         known,
         Operation::Pins,
         |adv| kerberos_request(adv, Operation::Pins, &state.fqdn, &cred, &[], &[]),
@@ -2505,12 +2442,11 @@ pub fn advertisements(
         let detail = match verified(
             server,
             &trust,
-            Pins {
-                realm,
+            realm,
+            Pinned {
                 anchors,
                 heads,
-                retired: &[],
-                frozen: &[],
+                ..Pinned::default()
             },
             None,
         )
@@ -2800,12 +2736,11 @@ pub fn realm_info(
         verified(
             server,
             &Trust::FirstContact,
-            Pins {
-                realm,
+            realm,
+            Pinned {
                 anchors,
                 heads,
-                retired: &[],
-                frozen: &[],
+                ..Pinned::default()
             },
             None,
         )
@@ -2828,12 +2763,10 @@ pub fn realm_info_first_use(deployment: &Deployment, dir: &Path) -> Result<Value
         verified(
             server,
             &Trust::FirstContact,
-            Pins {
-                realm: &realm,
+            &realm,
+            Pinned {
                 anchors: &anchors,
-                heads: &[],
-                retired: &[],
-                frozen: &[],
+                ..Pinned::default()
             },
             None,
         )
@@ -2885,12 +2818,11 @@ pub fn adopt(
         match verified(
             server,
             &Trust::FirstContact,
-            Pins {
-                realm,
+            realm,
+            Pinned {
                 anchors,
                 heads,
-                retired: &[],
-                frozen: &[],
+                ..Pinned::default()
             },
             None,
         ) {
@@ -3149,8 +3081,8 @@ fn refresh_trust(
             match verified(
                 s,
                 &Trust::FirstContact,
-                Pins {
-                    realm: &t.realm,
+                &t.realm,
+                Pinned {
                     anchors: &t.anchors,
                     heads: &heads,
                     retired: &retired,
@@ -3217,32 +3149,21 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
     let state = State::load(paths)?;
     // This host's own pins, windows and freezes included: the fetch of
     // its own realm is verified under them like any other (§1.4, §2).
-    let (anchors, own_heads, own_retired, own_frozen) = paths::pinned_windows(&paths.anchors())?;
+    let windows = paths::pinned_windows(&paths.anchors())?;
     let trust = ca_trust(paths)?;
     let mut skipped = Vec::new();
     let own = state
         .servers
         .iter()
-        .find_map(|s| {
-            match verified(
-                s,
-                &trust,
-                Pins {
-                    realm: &state.realm,
-                    anchors: &anchors,
-                    heads: &own_heads,
-                    retired: &own_retired,
-                    frozen: &own_frozen,
-                },
-                None,
-            ) {
+        .find_map(
+            |s| match verified(s, &trust, &state.realm, windows.pinned(), None) {
                 Ok((_, v, _)) => Some(v),
                 Err(e) => {
                     skipped.push(format!("{s}: {e}"));
                     None
                 }
-            }
-        })
+            },
+        )
         .ok_or_else(|| {
             Outcome::RetryLater(format!(
                 "no usable server of {}: {}",
@@ -3260,7 +3181,7 @@ pub fn trusted_realms(paths: &Paths) -> Result<Value, Error> {
     let mut realms = Vec::new();
     let mut failed = Vec::new();
     for t in &listed {
-        let (row, failure) = refresh_trust(paths, &state.realm, &anchors, t)?;
+        let (row, failure) = refresh_trust(paths, &state.realm, &windows.anchors, t)?;
         if let Some(why) = failure {
             failed.push(why);
         }

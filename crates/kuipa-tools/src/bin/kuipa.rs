@@ -107,6 +107,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use kuipa_enroll::delegation::Pinned;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::keytab::Principal;
 use kuipa_enroll::realm::Deployment;
@@ -116,7 +117,6 @@ use kuipa_tools::preauth::prompt;
 use kuipa_tools::text::Rows;
 use native_ossl::util::SecretBuf;
 use serde_json::Value;
-use tang_pqc::Thumbprint;
 
 #[derive(Parser)]
 #[command(
@@ -425,12 +425,17 @@ struct PinsInput {
 }
 
 impl PinsInput {
-    /// The anchors given, if any.
-    fn pins(&self) -> Option<kuipa_tools::sign::Pins> {
-        let realm = self.realm.as_ref()?;
-        (!self.anchor.is_empty()).then(|| kuipa_tools::sign::Pins {
-            realm: realm.clone(),
-            anchors: self.anchor.clone(),
+    /// The realm and anchors given, if any.
+    fn pins(&self) -> Option<(&str, Pinned<'_>)> {
+        let realm = self.realm.as_deref()?;
+        (!self.anchor.is_empty()).then(|| {
+            (
+                realm,
+                Pinned {
+                    anchors: &self.anchor,
+                    ..Pinned::default()
+                },
+            )
         })
     }
 }
@@ -1523,21 +1528,23 @@ impl Args {
             // the string's single anchor of the day it was issued.
             let enrolled = paths::State::load(paths).is_ok_and(|s| s.realm == string.realm());
             // Retired claims are read where the pins are used (enroll_online).
-            let (pinned, pinned_heads, _, frozen) = if enrolled {
+            let pinned = if enrolled {
                 paths::pinned_windows(&paths.anchors())?
             } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                paths::Windows::default()
             };
-            let string_head = string.head();
             let pins = Pins {
                 realm: string.realm().to_owned(),
-                anchors: if pinned.is_empty() {
-                    vec![*string.anchor()]
-                } else {
-                    pinned
+                windows: paths::Windows {
+                    anchors: if pinned.anchors.is_empty() {
+                        vec![*string.anchor()]
+                    } else {
+                        pinned.anchors
+                    },
+                    heads: pinned.heads.into_iter().chain(string.head()).collect(),
+                    retired: Vec::new(),
+                    frozen: pinned.frozen,
                 },
-                heads: pinned_heads.into_iter().chain(string_head).collect(),
-                frozen,
             };
             return Ok((pins, secrets));
         }
@@ -1554,12 +1561,12 @@ impl Args {
             };
             return Err(format!("--realm: {why} pinned anchors in {}", file.display()).into());
         }
-        let (anchors, heads, _, frozen) = paths::pinned_windows(&file)?;
         let pins = Pins {
             realm: realm.to_owned(),
-            anchors,
-            heads,
-            frozen,
+            windows: paths::Windows {
+                retired: Vec::new(),
+                ..paths::pinned_windows(&file)?
+            },
         };
         Ok((pins, self.secrets(false, want_password)?))
     }
@@ -1628,21 +1635,16 @@ struct Secrets {
     password: Option<Secret>,
 }
 
-/// The realm to enroll in and the anchors that must vouch for its
-/// servers, with the windows pinned beside them and which of those pins
-/// are frozen.
+/// The realm to enroll in and what must vouch for its servers: the
+/// anchors, the vouch heads pinned with them (§4.9: an enrolled host's
+/// pin file carries a window per anchor, DESIGN-claim-logs.md §1, and a
+/// v2 enrollment string one for its anchor) and the frozen anchors
+/// (DESIGN-claim-logs.md §2), whose heads are the only acceptable proofs
+/// for this command.  Retired claims are read where the pins are used
+/// (`enroll_online`).
 struct Pins {
     realm: String,
-    anchors: Vec<Thumbprint>,
-    /// The vouch heads pinned with them (§4.9), if any: an enrolled
-    /// host's pin file carries them next to the thumbprints — a window
-    /// per anchor (DESIGN-claim-logs.md §1) — and a v2 enrollment
-    /// string carries one for its anchor.
-    heads: Vec<kuipa_enroll::delegation::HeadPin>,
-    /// The anchors whose pins are frozen (DESIGN-claim-logs.md §2):
-    /// their heads are the only acceptable proofs, with no signature
-    /// fallback, for this command.
-    frozen: Vec<Thumbprint>,
+    windows: paths::Windows,
 }
 
 /// `kuipa enroll` against a server: the authentication comes from the
@@ -1688,9 +1690,9 @@ fn enroll_online_from_args(args: &Args, paths: &Paths) -> Result<Value, Error> {
     flows::enroll_online(
         paths,
         &pins.realm,
-        &pins.anchors,
-        &pins.heads,
-        &pins.frozen,
+        &pins.windows.anchors,
+        &pins.windows.heads,
+        &pins.windows.frozen,
         flows::Host {
             fqdn: &fqdn,
             auth: &auth,
@@ -1736,8 +1738,8 @@ fn run(args: &Args) -> Result<Value, Error> {
             flows::adopt(
                 &paths,
                 &pins.realm,
-                &pins.anchors,
-                &pins.heads,
+                &pins.windows.anchors,
+                &pins.windows.heads,
                 &fqdn,
                 &deployment,
             )
@@ -1760,7 +1762,13 @@ fn run(args: &Args) -> Result<Value, Error> {
                 }
             } else {
                 let (pins, _) = args.pins(&paths, false)?;
-                flows::realm_info(&pins.realm, &pins.anchors, &pins.heads, &deployment, dir)
+                flows::realm_info(
+                    &pins.realm,
+                    &pins.windows.anchors,
+                    &pins.windows.heads,
+                    &deployment,
+                    dir,
+                )
             }
         }
         "complete" => flows::complete(&paths),
@@ -1773,8 +1781,8 @@ fn run(args: &Args) -> Result<Value, Error> {
             let (pins, _) = args.pins(&paths, false)?;
             Ok(flows::advertisements(
                 &pins.realm,
-                &pins.anchors,
-                &pins.heads,
+                &pins.windows.anchors,
+                &pins.windows.heads,
                 &deployment,
             ))
         }
@@ -2605,7 +2613,7 @@ fn run_sign(paths: &Paths, action: &SignAction) -> Result<Value, Error> {
             paths,
             file,
             signature.as_deref(),
-            pins.pins().as_ref(),
+            pins.pins(),
             signer.as_deref(),
             purpose.as_deref(),
         ),
@@ -2678,7 +2686,7 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
                         paths,
                         f,
                         None,
-                        pins.as_ref(),
+                        pins,
                         signer.as_deref(),
                         Some("ipa-backup"),
                     )?;

@@ -764,7 +764,7 @@ impl<'a> SealClient<'a> {
         let (reply, _) = flows::exchange_with(
             &Deployment::servers(&public.servers),
             &trust,
-            pinned.pins(&public.realm),
+            (&public.realm, pinned.windows.pinned()),
             known,
             Operation::Seal,
             |adv| {
@@ -788,7 +788,7 @@ impl<'a> SealClient<'a> {
         for d in std::mem::take(&mut reply.descriptors) {
             let v = d.verify(
                 &public.realm,
-                &pinned.anchors,
+                &pinned.windows.anchors,
                 &tang_pqc::Policy::from_system()?,
             )?;
             let reference = reference_for(v.seal(), me.as_deref());
@@ -1252,7 +1252,7 @@ impl<'a> SealClient<'a> {
             let (answer, _) = flows::exchange_with(
                 &deployment,
                 &trust,
-                pinned.pins(&public.realm),
+                (&public.realm, pinned.windows.pinned()),
                 known,
                 Operation::Tlog,
                 |adv| {
@@ -1357,8 +1357,13 @@ impl<'a> SealClient<'a> {
         let mut cache = Vec::new();
         let mut verified = Vec::new();
         for server in &public.servers {
-            let Ok((_, v, _)) = flows::verified(server, &trust, pinned.pins(&public.realm), known)
-            else {
+            let Ok((_, v, _)) = flows::verified(
+                server,
+                &trust,
+                &public.realm,
+                pinned.windows.pinned(),
+                known,
+            ) else {
                 continue;
             };
             // What was just verified is what sealing keeps: no second fetch.

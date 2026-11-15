@@ -663,33 +663,11 @@ impl VerifiedRealm {
         Ok(verified)
     }
 
-    /// [`verify_pinned`](Self::verify_pinned) with no frozen anchors.
-    ///
-    /// # Errors
-    ///
-    /// As [`verify`](Self::verify).
-    pub fn verify_with_heads(
-        adv: &SignedAdvertisement,
-        realm: &str,
-        anchors: &[Thumbprint],
-        heads: &[HeadPin],
-        retired: &[crate::merkle::Hash],
-        policy: &Policy,
-        now: SystemTime,
-    ) -> Result<Self> {
-        let pinned = Pinned {
-            anchors,
-            heads,
-            retired,
-            frozen: &[],
-        };
-        Self::verify_pinned(adv, realm, &pinned, policy, now)
-    }
-
     /// Whether it carries, for `anchor`, a head proof that checks against
     /// one of `anchor`'s pinned `heads` (§2): what a frozen pin accepts,
     /// and nothing else.
-    fn head_proves(&self, anchor: &Thumbprint, heads: &[HeadPin]) -> bool {
+    #[must_use]
+    pub fn head_proves(&self, anchor: &Thumbprint, heads: &[HeadPin]) -> bool {
         self.head_proofs.iter().any(|p| {
             p.anchor() == anchor
                 && heads

@@ -9,7 +9,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use kuipa_enroll::delegation::CLOCK_SKEW;
+use kuipa_enroll::delegation::{CLOCK_SKEW, Pinned};
 use kuipa_enroll::merkle::Hash;
 use serde::{Deserialize, Serialize};
 
@@ -532,14 +532,32 @@ pub fn read_pins_or_none(path: &Path) -> Result<Vec<Pin>, Error> {
 }
 
 /// What a pin file hands to verification: the live anchors, every head
-/// of their windows oldest first, and the anchors that are frozen
-/// (DESIGN-claim-logs.md §1.2).
-pub type Windows = (
-    Vec<tang_pqc::Thumbprint>,
-    Vec<kuipa_enroll::delegation::HeadPin>,
-    Vec<Hash>,
-    Vec<tang_pqc::Thumbprint>,
-);
+/// of their windows oldest first, the claims their logs retired, and the
+/// anchors that are frozen (DESIGN-claim-logs.md §1.2).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Windows {
+    /// The live anchors.
+    pub anchors: Vec<tang_pqc::Thumbprint>,
+    /// Every head of their windows, oldest first.
+    pub heads: Vec<kuipa_enroll::delegation::HeadPin>,
+    /// The claims their logs retired.
+    pub retired: Vec<Hash>,
+    /// The anchors that are frozen.
+    pub frozen: Vec<tang_pqc::Thumbprint>,
+}
+
+impl Windows {
+    /// What a verification checks against.
+    #[must_use]
+    pub fn pinned(&self) -> Pinned<'_> {
+        Pinned {
+            anchors: &self.anchors,
+            heads: &self.heads,
+            retired: &self.retired,
+            frozen: &self.frozen,
+        }
+    }
+}
 
 /// What a pin file says this host trusts: the live anchors, every head of
 /// their windows oldest first (§1.4: the whole window travels so the
@@ -575,7 +593,12 @@ pub fn pinned_windows(path: &Path) -> Result<Windows, Error> {
     retired.sort_unstable();
     retired.dedup();
     let frozen = pins.iter().filter(|p| p.frozen).map(|p| p.anchor).collect();
-    Ok((anchors, heads, retired, frozen))
+    Ok(Windows {
+        anchors,
+        heads,
+        retired,
+        frozen,
+    })
 }
 
 /// Every pin in an anchors file, `<thumbprint> [<expiry> [<size>
@@ -1306,7 +1329,12 @@ mod tests {
         ];
         write_anchor_pins(&path, "test", &pins, None).unwrap();
         assert_eq!(live_pins(&path).unwrap(), vec![pins[0].clone()]);
-        let (anchors, heads, _, frozen) = pinned_windows(&path).unwrap();
+        let Windows {
+            anchors,
+            heads,
+            frozen,
+            ..
+        } = pinned_windows(&path).unwrap();
         assert_eq!(anchors, vec![live]);
         assert_eq!(
             heads,
@@ -1327,10 +1355,7 @@ mod tests {
         assert_eq!(frozen, vec![live], "an expired frozen pin is no freeze");
         // No file at all is nothing pinned; a malformed one is an error.
         fs::remove_file(&path).unwrap();
-        assert_eq!(
-            pinned_windows(&path).unwrap(),
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-        );
+        assert_eq!(pinned_windows(&path).unwrap(), Windows::default());
         fs::write(&path, format!("{live} +5\n")).unwrap();
         assert!(
             pinned_windows(&path).is_err(),
@@ -1354,7 +1379,7 @@ mod tests {
         };
         write_anchor_pins(&path, "test", std::slice::from_ref(&pin), None).unwrap();
         assert_eq!(read_anchor_pins(&path).unwrap(), vec![pin.clone()]);
-        let (_, _, retired, _) = pinned_windows(&path).unwrap();
+        let retired = pinned_windows(&path).unwrap().retired;
         assert_eq!(retired, vec![test_hash(5), test_hash(6)]);
         // A retired line needs a pinned anchor and at least one claim, once.
         let leaf = tang_pqc::Thumbprint::from_bytes([5; 32]);
