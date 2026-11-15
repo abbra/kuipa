@@ -19,7 +19,7 @@ use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::escrow::EscrowRequest;
 use kuipa_enroll::join::{AuthType, Operation, Request};
-use kuipa_enroll::server::Directory;
+use kuipa_enroll::server::{Directory, Ledger};
 use kuipa_enroll::trust::TrustRequest;
 use serde_json::json;
 use tang_pqc::{Thumbprint, b64};

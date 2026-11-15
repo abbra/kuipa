@@ -237,63 +237,6 @@ impl FileLedger {
         Ok(merkle::consistency(hashes, old)?)
     }
 
-    /// The head being published, signed with `key`; none while nothing
-    /// has been published.
-    ///
-    /// Every period of [`with_head_interval`](Self::with_head_interval)
-    /// gets one head, signed when it is first asked for, over the leaves
-    /// appended before the period began: the leaves of the period itself
-    /// wait for the next.  With an interval of zero, the head covers
-    /// every leaf and is re-signed when the log grows or the signature is
-    /// older than [`HEAD_INTERVAL`].
-    ///
-    /// # Errors
-    ///
-    /// An OpenSSL error, or a key of another category than the log's.
-    pub fn signed_head(&self, key: &SigningKey, now: u64) -> Result<Option<SignedHead>, Error> {
-        if TreeHash::for_signer(key.public().alg()) != self.id.alg() {
-            return Err(format!(
-                "log {} is not hashed as a {} key signs",
-                self.id,
-                key.public().alg().jose_name()
-            )
-            .into());
-        }
-        let mut inner = self.inner();
-        let interval = self.head_interval.as_secs();
-        // The period to publish a new head for, if the one being published
-        // is not this period's, and the size it covers.
-        let (period, size) = if let Some(period) = now.checked_div(interval) {
-            let current = inner.head.as_ref().is_some_and(|(_, p)| *p == period);
-            (
-                (!current).then_some(period),
-                size_before(&inner, period * interval),
-            )
-        } else {
-            // No schedule: every append, and an hourly re-signing.
-            let fresh = inner.head.as_ref().is_some_and(|(h, _)| {
-                h.head.size == inner.log.size()
-                    && now.saturating_sub(h.head.time) < HEAD_INTERVAL.as_secs()
-            });
-            ((!fresh).then_some(0), inner.log.size())
-        };
-        if let Some(period) = period {
-            inner.head = match usize::try_from(size)? {
-                0 => None,
-                n => {
-                    let head = Head {
-                        log: self.id,
-                        size,
-                        root: merkle::root(&inner.log.hashes()[..n])?,
-                        time: now,
-                    };
-                    Some((SignedHead::issue(key, head)?, period))
-                }
-            };
-        }
-        Ok(inner.head.as_ref().map(|(h, _)| h.clone()))
-    }
-
     /// Accept cosignatures by `witnesses` only (none by default).
     #[must_use]
     pub fn with_witnesses(mut self, witnesses: Vec<VerifyingKey>) -> Self {
@@ -374,7 +317,6 @@ impl Ledger for FileLedger {
     fn append(&self, opening: Opening) -> Result<Option<Appended>, DirectoryError> {
         let leaf = opening.leaf(self.id.alg())?;
         let bytes = leaf.to_bytes();
-        let len = u32::try_from(bytes.len())?;
         let month_of = month(opening.time)?;
         let appended = {
             let mut inner = self.inner();
@@ -384,9 +326,7 @@ impl Ledger for FileLedger {
             // until its month expires.
             let o = opening.to_bytes();
             let mut record = Vec::with_capacity(12 + o.len());
-            record.extend_from_slice(&u32::try_from(o.len() + 8)?.to_be_bytes());
-            record.extend_from_slice(&position.to_be_bytes());
-            record.extend_from_slice(&o);
+            frame(&mut record, &[&position.to_be_bytes(), &o])?;
             let mut month_file = OpenOptions::new()
                 .append(true)
                 .create(true)
@@ -396,8 +336,7 @@ impl Ledger for FileLedger {
             month_file.sync_data()?;
 
             let mut record = Vec::with_capacity(4 + bytes.len());
-            record.extend_from_slice(&len.to_be_bytes());
-            record.extend_from_slice(&bytes);
+            frame(&mut record, &[&bytes])?;
             inner.file.write_all(&record)?;
             inner.file.sync_data()?;
             let index = inner.log.append(&leaf)?;
@@ -415,12 +354,60 @@ impl Ledger for FileLedger {
         Ok(Some(appended))
     }
 
-    fn signed_head(
-        &self,
-        key: &SigningKey,
-        now: u64,
-    ) -> Result<Option<SignedHead>, DirectoryError> {
-        FileLedger::signed_head(self, key, now)
+    /// The head being published, signed with `key`; none while nothing
+    /// has been published.
+    ///
+    /// Every period of [`with_head_interval`](FileLedger::with_head_interval)
+    /// gets one head, signed when it is first asked for, over the leaves
+    /// appended before the period began: the leaves of the period itself
+    /// wait for the next.  With an interval of zero, the head covers
+    /// every leaf and is re-signed when the log grows or the signature is
+    /// older than [`HEAD_INTERVAL`].
+    ///
+    /// An error for an OpenSSL failure, or a key of another category than
+    /// the log's.
+    fn signed_head(&self, key: &SigningKey, now: u64) -> Result<Option<SignedHead>, Error> {
+        if TreeHash::for_signer(key.public().alg()) != self.id.alg() {
+            return Err(format!(
+                "log {} is not hashed as a {} key signs",
+                self.id,
+                key.public().alg().jose_name()
+            )
+            .into());
+        }
+        let mut inner = self.inner();
+        let interval = self.head_interval.as_secs();
+        // The period to publish a new head for, if the one being published
+        // is not this period's, and the size it covers.
+        let (period, size) = if let Some(period) = now.checked_div(interval) {
+            let current = inner.head.as_ref().is_some_and(|(_, p)| *p == period);
+            (
+                (!current).then_some(period),
+                size_before(&inner, period * interval),
+            )
+        } else {
+            // No schedule: every append, and an hourly re-signing.
+            let fresh = inner.head.as_ref().is_some_and(|(h, _)| {
+                h.head.size == inner.log.size()
+                    && now.saturating_sub(h.head.time) < HEAD_INTERVAL.as_secs()
+            });
+            ((!fresh).then_some(0), inner.log.size())
+        };
+        if let Some(period) = period {
+            inner.head = match usize::try_from(size)? {
+                0 => None,
+                n => {
+                    let head = Head {
+                        log: self.id,
+                        size,
+                        root: merkle::root(&inner.log.hashes()[..n])?,
+                        time: now,
+                    };
+                    Some((SignedHead::issue(key, head)?, period))
+                }
+            };
+        }
+        Ok(inner.head.as_ref().map(|(h, _)| h.clone()))
     }
 
     fn find(
@@ -527,6 +514,16 @@ fn records(bytes: &[u8], max: usize) -> Result<(Vec<&[u8]>, u64), Error> {
     Ok((out, at as u64))
 }
 
+/// Append a record: `u32` length, then `parts`.
+fn frame(out: &mut Vec<u8>, parts: &[&[u8]]) -> Result<(), Error> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    out.extend_from_slice(&u32::try_from(len)?.to_be_bytes());
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+    Ok(())
+}
+
 /// Read every month's openings, keeping those whose leaf was written and
 /// rewriting a file that holds any other: an opening synced before a crash
 /// kept its leaf from the disk.
@@ -563,8 +560,7 @@ fn read_openings(dir: &Path, leaves: &[Leaf]) -> Result<BTreeMap<u64, Opening>, 
                 )
                 .into());
             }
-            kept.extend_from_slice(&u32::try_from(record.len())?.to_be_bytes());
-            kept.extend_from_slice(record);
+            frame(&mut kept, &[record])?;
             openings.insert(position, opening);
         }
         if dropped {
