@@ -10,6 +10,11 @@ token buckets:
 | per host | a burst of 10, then 2 a minute | the host's name for joins, rekeys and staging; the principal for unsealing a host's or service's keytab or file; for opening a user's seal file, whoever opens it (checked once the server knows who, so each member of a shared seal has their own allowance) |
 | per address | a burst of 60, then 30 a minute | the client's address, from httpd's `X-Forwarded-For` |
 
+A host's bucket is charged only by a failed OTP join, since only an OTP can
+be guessed: charging unauthenticated requests would let anyone lock a named
+host out of rekey or unseal. The public advertisement, anchor-log and
+claim-log routes use the per-address bucket.
+
 Registrations and users' seal operations use only the per-address bucket:
 they are always Kerberos-authenticated, so there is nothing to guess, and
 the users of one host must not share that host's allowance.
