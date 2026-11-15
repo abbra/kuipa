@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tang_pqc::wire::Writer;
 #[cfg(test)]
@@ -1411,10 +1411,7 @@ impl EnrollServer {
         anchors: Vec<Thumbprint>,
         vouches: HashMap<Thumbprint, SignedVouch>,
     ) {
-        let mut p = self
-            .published
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut p = self.write();
         if p.delegation != delegation || p.anchors != anchors || p.vouches != vouches {
             p.delegation = delegation;
             p.anchors = anchors;
@@ -1425,10 +1422,7 @@ impl EnrollServer {
 
     /// Replace the trusted realms this server advertises (§17).
     pub fn publish_trusts(&self, trusts: Vec<TrustedRealm>) {
-        let mut p = self
-            .published
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut p = self.write();
         if p.trusts != trusts {
             p.trusts = trusts;
             p.advertisements.clear();
@@ -1438,20 +1432,13 @@ impl EnrollServer {
     /// The trusted realms this server publishes.
     #[must_use]
     pub fn trusts(&self) -> Vec<TrustedRealm> {
-        self.published
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .trusts
-            .clone()
+        self.read().trusts.clone()
     }
 
     /// Replace the anchor epoch log (§4.8): the whole chain, oldest
     /// first, as maintained by the anchor exchange.
     pub fn publish_epoch(&self, chain: Vec<SignedEpoch>) {
-        let mut p = self
-            .published
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut p = self.write();
         if p.epoch != chain {
             p.epoch = chain;
             p.advertisements.clear();
@@ -1461,7 +1448,7 @@ impl EnrollServer {
     /// The head of this server's anchor epoch log, if it has one.
     #[must_use]
     pub fn epoch_head(&self) -> Option<(u64, crate::epoch::EpochHead)> {
-        self.published()
+        self.read()
             .epoch
             .last()
             .and_then(|e| e.statement().ok())
@@ -1472,7 +1459,7 @@ impl EnrollServer {
     /// [`MAX_EPOCH_FETCH`]: the answer to `GET anchor-log` (§4.8).
     #[must_use]
     pub fn epoch_log(&self, from: u64) -> Vec<SignedEpoch> {
-        let p = self.published();
+        let p = self.read();
         p.epoch
             .iter()
             .skip_while(|e| e.statement().is_ok_and(|s| s.seq() <= from))
@@ -1484,40 +1471,34 @@ impl EnrollServer {
     /// The current delegation, with every signature.
     #[must_use]
     pub fn delegation(&self) -> Delegation {
-        self.published().delegation
+        self.read().delegation.clone()
     }
 
     /// The trusted anchors.
     #[must_use]
     pub fn anchors(&self) -> Vec<Thumbprint> {
-        self.published().anchors
+        self.read().anchors.clone()
     }
 
     /// A trusted anchor's signed vouch, if it published one (§4.9).
     #[must_use]
     pub fn vouch(&self, anchor: &Thumbprint) -> Option<SignedVouch> {
-        self.published().vouches.get(anchor).cloned()
+        self.read().vouches.get(anchor).cloned()
     }
 
     /// The trusted anchors' signed vouches (§4.9), by thumbprint.
     #[must_use]
     pub fn vouches(&self) -> HashMap<Thumbprint, SignedVouch> {
-        self.published().vouches
+        self.read().vouches.clone()
     }
 
     /// The trusted anchors' current vouch heads (§4.9).
     #[must_use]
     pub fn heads(&self) -> Vec<HeadPin> {
-        let p = self.published();
+        let p = self.read();
         p.anchors
             .iter()
-            .filter_map(|a| {
-                p.vouches.get(a).map(|v| HeadPin {
-                    anchor: *a,
-                    size: v.vouch().size,
-                    root: v.vouch().root,
-                })
-            })
+            .filter_map(|a| p.vouches.get(a).map(|v| HeadPin::of(a, v)))
             .collect()
     }
 
@@ -1547,11 +1528,16 @@ impl EnrollServer {
         })
     }
 
-    fn published(&self) -> Published {
+    fn read(&self) -> RwLockReadGuard<'_, Published> {
         self.published
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Published> {
+        self.published
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The server's keys.
@@ -1594,7 +1580,7 @@ impl EnrollServer {
         heads: &[HeadPin],
     ) -> crate::Result<SignedAdvertisement> {
         let now = tang_pqc::now();
-        let published = self.published();
+        let published = self.read().clone();
         let epoch = published
             .epoch
             .last()
@@ -1647,11 +1633,7 @@ impl EnrollServer {
                 let mut heads: Vec<HeadPin> = published
                     .vouches
                     .iter()
-                    .map(|(a, v)| HeadPin {
-                        anchor: *a,
-                        size: v.vouch().size,
-                        root: v.vouch().root,
-                    })
+                    .map(|(a, v)| HeadPin::of(a, v))
                     .collect();
                 heads.sort_by_key(|h| h.anchor);
                 heads
@@ -1666,10 +1648,7 @@ impl EnrollServer {
             now + ADVERTISEMENT_VALIDITY,
             epoch,
         )?;
-        let mut p = self
-            .published
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut p = self.write();
         if p.delegation == published.delegation
             && p.anchors == published.anchors
             && p.trusts == published.trusts
@@ -3537,7 +3516,7 @@ impl EnrollServer {
     /// The trusted anchors, and each one's current vouch head where it
     /// published one: what an enrollment and a pins refresh deliver.
     fn anchors_and_heads(&self) -> crate::payload::AnchorHeads {
-        let p = self.published();
+        let p = self.read();
         let heads = p
             .anchors
             .iter()

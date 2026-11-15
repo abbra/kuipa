@@ -966,6 +966,17 @@ pub struct HeadPin {
 }
 
 impl HeadPin {
+    /// The head `vouch` of `anchor`'s claim log proves.
+    #[must_use]
+    pub fn of(anchor: &Thumbprint, vouch: &SignedVouch) -> Self {
+        let v = vouch.vouch();
+        Self {
+            anchor: *anchor,
+            size: v.size,
+            root: v.root,
+        }
+    }
+
     /// The JSON form, as thumbprints are on the wire: `{"anchor": …,
     /// "size": …, "root": …}` with base64url strings.
     #[must_use]
