@@ -11,9 +11,10 @@ The calls block, so use them from blocking code or from
 `tokio::task::spawn_blocking`.
 
 ```rust
-use kuipa_ldap::{Auth, LdapConnection, Scope};
+use kuipa_ldap::{Auth, LdapConnection, Scope, Tls};
+use std::time::Duration;
 
-let mut conn = LdapConnection::connect("ldapi://%2Frun%2Fslapd-EXAMPLE-COM.socket", None, false, 10)?;
+let mut conn = LdapConnection::connect("ldapi://%2Frun%2Fslapd-EXAMPLE-COM.socket", Tls::Off, Some(Duration::from_secs(10)))?;
 conn.bind(&Auth::Gssapi)?;
 for e in conn.search("cn=accounts,dc=example,dc=com", Scope::Subtree, "(fqdn=web1.example.com)", &["cn"])? {
     println!("{}: {:?}", e.dn, e.attrs);

@@ -12,13 +12,27 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr;
+use std::time::Duration;
 
 use libc::{c_char, c_int, c_void, timeval};
 use tracing::debug;
 
 use crate::ffi::{self, BerElement, LDAP, berval};
 use crate::{Auth, LdapError, NO_SUCH_OBJECT, Scope};
+
+/// How [`LdapConnection::connect`] secures an `ldap://` connection.
+#[derive(Debug, Clone, Copy)]
+pub enum Tls<'a> {
+    /// No TLS (`ldaps://` URIs still use it).
+    Off,
+    /// STARTTLS, verified against the system trust store.
+    StartTls,
+    /// STARTTLS, verified against the PEM CA file at this path.
+    CaFile(&'a Path),
+}
 
 // ── SASL interact callback ────────────────────────────────────────────────────
 
@@ -114,37 +128,25 @@ impl LdapConnection {
     /// Open an LDAP connection to `uri` (e.g. `"ldap://host:389"` or
     /// `"ldaps://host:636"`).
     ///
-    /// When `tls_ca_cert_file` is `Some(path)`, the PEM file at `path` is
-    /// used to verify the server's TLS certificate.  For `ldap://` URIs with a
-    /// CA cert, STARTTLS is negotiated before any credentials are sent.  For
-    /// `ldaps://` URIs the TLS handshake happens immediately on connect.
+    /// `tls` only matters for `ldap://` URIs: [`Tls::StartTls`] and
+    /// [`Tls::CaFile`] negotiate STARTTLS before any credentials are sent
+    /// (`CaFile` verifies the server against the PEM file, `StartTls` against
+    /// the system trust store).  `ldaps://` URIs do the TLS handshake on
+    /// connect whatever `tls` says.  For GSSAPI binds over plain `ldap://`
+    /// pass [`Tls::Off`]: GSSAPI provides its own cryptographic protection.
     ///
-    /// When `force_starttls` is `true`, STARTTLS is negotiated on `ldap://` URIs
-    /// even when no explicit CA cert is given (the system trust store is used).
-    /// Ignored for `ldaps://` URIs (TLS is implicit) and has no effect when the
-    /// URI already triggers STARTTLS via `tls_ca_cert_file`.
-    ///
-    /// For GSSAPI binds over plain `ldap://`, pass `tls_ca_cert_file = None` and
-    /// `force_starttls = false`: GSSAPI provides its own cryptographic protection.
-    ///
-    /// `timeout_secs` sets both the TCP-level connect timeout and the default
-    /// operation timeout (`LDAP_OPT_NETWORK_TIMEOUT` + `LDAP_OPT_TIMEOUT`).
-    /// Pass 0 to use the OS default (no finite timeout).
+    /// `timeout` sets both the TCP-level connect timeout and the default
+    /// operation timeout (`LDAP_OPT_NETWORK_TIMEOUT` + `LDAP_OPT_TIMEOUT`);
+    /// `None` leaves the OS default (no finite timeout).
     ///
     /// # Errors
     ///
     /// Returns [`LdapError::Protocol`] if `ldap_initialize` or protocol setup fails,
     /// [`LdapError::Tls`] if the CA file cannot be read or TLS/STARTTLS negotiation fails, and
-    /// [`LdapError::NulByte`] if `tls_ca_cert_file` has an interior NUL.
-    pub fn connect(
-        uri: &str,
-        tls_ca_cert_file: Option<&str>,
-        force_starttls: bool,
-        timeout_secs: u64,
-    ) -> Result<Self, LdapError> {
-        let needs_tls = tls_ca_cert_file.is_some() || uri.starts_with("ldaps://") || force_starttls;
-        let starttls = needs_tls && uri.starts_with("ldap://");
-        debug!(uri, tls = needs_tls, starttls, "LDAP connect");
+    /// [`LdapError::NulByte`] if the CA file path has an interior NUL.
+    pub fn connect(uri: &str, tls: Tls<'_>, timeout: Option<Duration>) -> Result<Self, LdapError> {
+        let starttls = !matches!(tls, Tls::Off) && uri.starts_with("ldap://");
+        debug!(uri, ?tls, starttls, "LDAP connect");
 
         let uri_c = CString::new(uri)?;
         let mut ld: *mut LDAP = ptr::null_mut();
@@ -174,10 +176,10 @@ impl LdapConnection {
         }
 
         // Set connect and operation timeouts to prevent indefinite blocking.
-        if timeout_secs > 0 {
+        if let Some(timeout) = timeout {
             let tv = timeval {
-                tv_sec: timeout_secs as libc::time_t,
-                tv_usec: 0,
+                tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_usec: timeout.subsec_micros().into(),
             };
             // SAFETY: conn.ld is non-null; tv is a valid stack-allocated timeval whose address is valid for the duration of this call.
             let rc = unsafe {
@@ -203,10 +205,11 @@ impl LdapConnection {
             }
         }
 
-        if let Some(ca_path) = tls_ca_cert_file {
+        if let Tls::CaFile(ca_path) = tls {
+            let shown = ca_path.display();
             std::fs::metadata(ca_path)
-                .map_err(|e| LdapError::Tls(format!("cannot read TLS CA cert '{ca_path}': {e}")))?;
-            let path_c = CString::new(ca_path)?;
+                .map_err(|e| LdapError::Tls(format!("cannot read TLS CA cert '{shown}': {e}")))?;
+            let path_c = CString::new(ca_path.as_os_str().as_bytes())?;
             // SAFETY: conn.ld is non-null; path_c is a valid NUL-terminated C string produced by CString::new and lives for the duration of this call.
             let rc = unsafe {
                 ffi::ldap_set_option(
@@ -217,7 +220,7 @@ impl LdapConnection {
             };
             if rc == ffi::LDAP_OPT_ERROR {
                 return Err(LdapError::Tls(format!(
-                    "ldap_set_option(CACERTFILE, '{ca_path}') failed"
+                    "ldap_set_option(CACERTFILE, '{shown}') failed"
                 )));
             }
             // Rebuild the TLS context so the new CA takes effect.
@@ -650,25 +653,14 @@ impl LdapConnection {
 
     /// Perform a synchronous LDAP modify operation on the entry at `dn`.
     ///
-    /// Each element of `mods` is `(op, attr_name, values)`.  Use
-    /// [`ModOp::Add`] to append values or [`ModOp::Delete`] to remove them.
-    /// Passing an empty `values` vec with `Delete` removes the entire attribute.
-    ///
     /// # Errors
     ///
     /// Returns [`LdapError::Protocol`] if the server rejects the modify;
     /// [`LdapError::NulByte`] if `dn` or any attribute name has an interior
     /// NUL.
-    pub fn modify_s(
-        &mut self,
-        dn: &str,
-        mods: &[(ModOp, &str, Vec<&[u8]>)],
-    ) -> Result<(), LdapError> {
+    pub fn modify_s(&mut self, dn: &str, mods: &[Mod<'_>]) -> Result<(), LdapError> {
         let dn_c = CString::new(dn)?;
-        let mut mods = Mods::new(
-            mods.iter()
-                .map(|(op, a, v)| (op.as_int(), *a, v.as_slice())),
-        )?;
+        let mut mods = Mods::new(mods.iter().map(|m| (m.op.as_int(), m.attr, &m.values[..])))?;
         // SAFETY: self.ld is non-null; dn_c is a valid NUL-terminated C string;
         // mods.ptrs is a NULL-terminated array of LDAPMod pointers whose backing
         // storage `mods` owns until after the call returns.
@@ -684,22 +676,20 @@ impl LdapConnection {
         check(rc, "ldap_modify_ext_s")
     }
 
-    /// Add a new LDAP entry.
-    ///
-    /// `attrs` is a list of `(attr_name, values)` pairs.  All attributes are
-    /// added with `LDAP_MOD_ADD | LDAP_MOD_BVALUES`, so values are binary-safe.
+    /// Add a new LDAP entry with the given attributes (binary-safe values);
+    /// each `attrs` item's `op` is ignored, build them with [`Mod::add`].
     ///
     /// # Errors
     ///
     /// Returns [`LdapError::Protocol`] if the server rejects the add;
     /// [`LdapError::NulByte`] if `dn` or any attribute name has an interior
     /// NUL.
-    pub fn add_s(&mut self, dn: &str, attrs: &[(&str, Vec<&[u8]>)]) -> Result<(), LdapError> {
+    pub fn add_s(&mut self, dn: &str, attrs: &[Mod<'_>]) -> Result<(), LdapError> {
         let dn_c = CString::new(dn)?;
         let mut mods = Mods::new(
             attrs
                 .iter()
-                .map(|(a, v)| (ffi::LDAP_MOD_ADD, *a, v.as_slice())),
+                .map(|m| (ffi::LDAP_MOD_ADD, m.attr, &m.values[..])),
         )?;
         // SAFETY: as in `modify_s`.
         let rc = unsafe {
@@ -757,6 +747,66 @@ impl ModOp {
     }
 }
 
+/// One change in [`LdapConnection::modify_s`], or one attribute of
+/// [`LdapConnection::add_s`] (built with [`Mod::add`]).
+#[derive(Debug, Clone)]
+pub struct Mod<'a> {
+    /// What to do with the values.
+    pub op: ModOp,
+    /// Attribute name.
+    pub attr: &'a str,
+    /// Values; with [`ModOp::Delete`] none removes the whole attribute.
+    pub values: Vec<&'a [u8]>,
+}
+
+impl<'a> Mod<'a> {
+    /// Add `values` to `attr`.
+    pub fn add<T: AsRef<[u8]> + ?Sized + 'a>(
+        attr: &'a str,
+        values: impl IntoIterator<Item = &'a T>,
+    ) -> Self {
+        Self::new(ModOp::Add, attr, values)
+    }
+
+    /// Delete `values` from `attr`.
+    pub fn delete<T: AsRef<[u8]> + ?Sized + 'a>(
+        attr: &'a str,
+        values: impl IntoIterator<Item = &'a T>,
+    ) -> Self {
+        Self::new(ModOp::Delete, attr, values)
+    }
+
+    /// Replace all values of `attr` with `values`.
+    pub fn replace<T: AsRef<[u8]> + ?Sized + 'a>(
+        attr: &'a str,
+        values: impl IntoIterator<Item = &'a T>,
+    ) -> Self {
+        Self::new(ModOp::Replace, attr, values)
+    }
+
+    /// Remove `attr` altogether.
+    #[must_use]
+    pub fn remove(attr: &'a str) -> Self {
+        Self {
+            op: ModOp::Delete,
+            attr,
+            values: Vec::new(),
+        }
+    }
+
+    fn new<T: AsRef<[u8]> + ?Sized + 'a>(
+        op: ModOp,
+        attr: &'a str,
+        values: impl IntoIterator<Item = &'a T>,
+    ) -> Self {
+        Self {
+            op,
+            attr,
+            values: values.into_iter().map(AsRef::as_ref).collect(),
+        }
+    }
+}
+
 // ── SearchEntry ───────────────────────────────────────────────────────────────
 
 /// One LDAP entry returned from a search.
@@ -777,6 +827,28 @@ pub struct SearchEntry {
     /// Always populated, even when [`attrs`][Self::attrs] contains the
     /// same value as valid UTF-8.
     pub bin_attrs: HashMap<String, Vec<Vec<u8>>>,
+}
+
+impl SearchEntry {
+    /// The values of `attr` (any case); empty when the entry has none.
+    #[must_use]
+    pub fn values(&self, attr: &str) -> &[String] {
+        self.attrs
+            .get(&attr.to_ascii_lowercase())
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The first value of `attr` (any case).
+    #[must_use]
+    pub fn first(&self, attr: &str) -> Option<&str> {
+        self.values(attr).first().map(String::as_str)
+    }
+
+    /// Whether the entry has `attr` (any case), whatever its values.
+    #[must_use]
+    pub fn has(&self, attr: &str) -> bool {
+        self.bin_attrs.contains_key(&attr.to_ascii_lowercase())
+    }
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -1014,7 +1086,7 @@ mod tests {
         // ldap_initialize merely parses the URI; the error surfaces on first I/O.
         // A search against a host that is not listening should fail quickly.
         let mut conn =
-            LdapConnection::connect("ldap://127.0.0.1:38999", None, false, 5).expect("initialize");
+            LdapConnection::connect("ldap://127.0.0.1:38999", Tls::Off, Some(Duration::from_secs(5))).expect("initialize");
         let err = conn
             .search("dc=test", Scope::Base, "(objectClass=*)", &[])
             .expect_err("search to closed port should fail");
@@ -1028,9 +1100,8 @@ mod tests {
     fn connect_with_nonexistent_ca_cert_returns_tls_error() {
         let err = LdapConnection::connect(
             "ldap://127.0.0.1:389",
-            Some("/nonexistent/ca.pem"),
-            false,
-            5,
+            Tls::CaFile(Path::new("/nonexistent/ca.pem")),
+            Some(Duration::from_secs(5)),
         )
         .expect_err("should fail on missing CA cert");
         assert!(
@@ -1049,7 +1120,7 @@ mod tests {
     #[test]
     fn nul_byte_in_argument_is_rejected() {
         let mut conn =
-            LdapConnection::connect("ldap://127.0.0.1:38999", None, false, 5).expect("initialize");
+            LdapConnection::connect("ldap://127.0.0.1:38999", Tls::Off, Some(Duration::from_secs(5))).expect("initialize");
         let err = conn
             .delete_s("uid=a\0,dc=test")
             .expect_err("NUL byte must be rejected");
@@ -1098,6 +1169,17 @@ mod tests {
             assert!((*(*m.ptrs[1]).mod_vals).is_null());
         }
         assert!(Mods::new([(0, "c\0n", &[][..])].into_iter()).is_err());
+    }
+
+    #[test]
+    fn search_entry_lookup_ignores_case() {
+        let mut e = SearchEntry::default();
+        e.attrs.insert("memberof".into(), vec!["a".into(), "b".into()]);
+        e.bin_attrs.insert("memberof".into(), vec![b"a".to_vec()]);
+        assert_eq!(e.values("memberOf"), ["a", "b"]);
+        assert_eq!(e.first("MEMBEROF"), Some("a"));
+        assert!(e.has("memberOf"));
+        assert!(e.values("cn").is_empty() && e.first("cn").is_none() && !e.has("cn"));
     }
 
     #[test]

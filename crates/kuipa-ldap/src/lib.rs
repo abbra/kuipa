@@ -6,10 +6,11 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use kuipa_ldap::{Auth, LdapConnection, Scope};
+//! use std::time::Duration;
+//! use kuipa_ldap::{Auth, LdapConnection, Scope, Tls};
 //!
 //! # fn example() -> Result<(), kuipa_ldap::LdapError> {
-//! let mut conn = LdapConnection::connect("ldapi://%2Frun%2Fslapd-EXAMPLE-COM.socket", None, false, 10)?;
+//! let mut conn = LdapConnection::connect("ldapi://%2Frun%2Fslapd-EXAMPLE-COM.socket", Tls::Off, Some(Duration::from_secs(10)))?;
 //! conn.bind(&Auth::Gssapi)?;
 //! for e in conn.search("cn=accounts,dc=example,dc=com", Scope::Subtree, "(fqdn=web1.example.com)", &["cn"])? {
 //!     println!("{}: {:?}", e.dn, e.attrs);
@@ -22,7 +23,7 @@
 mod conn;
 mod ffi;
 
-pub use conn::{ExtendedResult, LdapConnection, ModOp, SearchEntry};
+pub use conn::{ExtendedResult, LdapConnection, Mod, ModOp, SearchEntry, Tls};
 
 use libc::c_int;
 use thiserror::Error;
