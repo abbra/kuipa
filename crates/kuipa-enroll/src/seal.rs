@@ -1427,6 +1427,9 @@ impl Descriptor {
         if key.thumbprint() != &delegation.key {
             return Err(Error::Mismatch("descriptor signer"));
         }
+        if !policy.allows_signature(key.alg()) {
+            return Err(Error::UntrustedAnchor);
+        }
         key.verify_with_context(&self.signed_part(), DESCRIPTOR_CONTEXT, &self.signature)?;
         // The owner may be a user of a trusted realm the realm permits
         // (`Limits::trusted_owners`): the realm vouches for the descriptor.
@@ -2235,6 +2238,9 @@ impl SessionToken {
         if key.thumbprint() != &delegation.key {
             return Err(Error::Mismatch("session signer"));
         }
+        if !policy.allows_signature(key.alg()) {
+            return Err(Error::UntrustedAnchor);
+        }
         key.verify_with_context(&self.signed_part(), SESSION_CONTEXT, &self.signature)?;
         Ok(())
     }
@@ -2890,6 +2896,62 @@ mod tests {
             session_keys: Vec::new(),
             bindings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_signer_under_a_forbidden_algorithm_is_refused() {
+        use tang_pqc::SignatureAlg;
+        let anchor = SigningKey::generate(SignatureAlg::MlDsa87).unwrap();
+        let signer = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
+        let delegation = Delegation::issue(
+            &anchor,
+            "EXAMPLE.TEST",
+            "ipa.example.test",
+            signer.public(),
+            NOW - 60,
+            NOW + 3600,
+        )
+        .unwrap();
+        let anchors = [*anchor.public().thumbprint()];
+        // The anchor's algorithm is allowed; only the delegated signer's is not.
+        let only_87 = CryptoPolicy::default().with_signature_algs(&[SignatureAlg::MlDsa87]);
+        let seal = seal_with(Vec::new());
+
+        let d = Descriptor::sign(&signer, &delegation, "EXAMPLE.TEST", &seal, NOW, 60).unwrap();
+        d.verify("EXAMPLE.TEST", &anchors, &CryptoPolicy::default())
+            .unwrap();
+        assert!(matches!(
+            d.verify("EXAMPLE.TEST", &anchors, &only_87),
+            Err(Error::UntrustedAnchor)
+        ));
+
+        let token = SessionToken::sign(
+            &signer,
+            &delegation,
+            seal.id,
+            "alice@EXAMPLE.TEST",
+            *anchor.public().thumbprint(),
+            NOW + 60,
+        )
+        .unwrap();
+        let expected = SessionFor {
+            seal: &seal.id,
+            holder: "alice@EXAMPLE.TEST",
+            device: &anchors[0],
+        };
+        token
+            .check(
+                "EXAMPLE.TEST",
+                &anchors,
+                &CryptoPolicy::default(),
+                expected,
+                NOW,
+            )
+            .unwrap();
+        assert!(matches!(
+            token.check("EXAMPLE.TEST", &anchors, &only_87, expected, NOW),
+            Err(Error::UntrustedAnchor)
+        ));
     }
 
     #[test]
