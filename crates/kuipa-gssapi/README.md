@@ -10,13 +10,12 @@ Safe Rust bindings to the MIT Kerberos GSSAPI library, as kuipa uses it.
 * An in-process, FAST-armoured `kinit` for every pre-authentication method
   FreeIPA offers: a password, an OTP token value and PIN, a RADIUS or IdP
   answer, a passkey PIN — each asked for through a `Preauth` front end
-* Per-thread credential caches
 
 ```rust
 let cred = kuipa_gssapi::GssServerCred::acquire("HTTP", "/etc/httpd/http.keytab")?;
 match kuipa_gssapi::accept_token(&cred, &token, None)? {
     kuipa_gssapi::AcceptStep::Complete { out_token, principal } => { /* authenticated */ }
-    kuipa_gssapi::AcceptStep::Continue { out_token, ctx } => { /* send out_token back */ }
+    kuipa_gssapi::AcceptStep::Continue { .. } => { /* needs another round trip: refuse */ }
 }
 ```
 

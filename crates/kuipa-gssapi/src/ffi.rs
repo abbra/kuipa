@@ -3,9 +3,9 @@
 //! Only the subset needed for server-side SPNEGO acceptance is declared here.
 //! All pointer types use opaque enum structs to prevent accidental dereferencing.
 
-use libc::{c_char, c_int, c_long, c_uint, c_void, size_t};
 #[cfg(test)]
 use std::ffi::CStr;
+use std::ffi::{c_char, c_int, c_long, c_uint, c_void};
 use std::ptr;
 
 pub(crate) type OmUint32 = u32;
@@ -29,8 +29,19 @@ pub(crate) type GssOidSetT = *mut GssOidSetStruct;
 /// Variable-length byte buffer used for tokens and name strings.
 #[repr(C)]
 pub(crate) struct GssBufferDesc {
-    pub length: size_t,
+    pub length: usize,
     pub value: *mut c_void,
+}
+
+impl GssBufferDesc {
+    /// A read-only view of `bytes`; it must outlive every call the result is passed to.
+    pub(crate) fn borrowing(bytes: &[u8]) -> Self {
+        Self {
+            length: bytes.len(),
+            // GSS-API never writes through an input buffer (RFC 2744 §2).
+            value: bytes.as_ptr().cast_mut().cast(),
+        }
+    }
 }
 
 /// OID descriptor: a DER-encoded object identifier.
@@ -119,8 +130,7 @@ static GSS_MECH_KRB5_OID_BYTES: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0
 pub(crate) fn gss_mech_krb5() -> GssOidDesc {
     GssOidDesc {
         length: 9,
-        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-        elements: GSS_MECH_KRB5_OID_BYTES.as_ptr() as *mut c_void,
+        elements: GSS_MECH_KRB5_OID_BYTES.as_ptr().cast_mut().cast(),
     }
 }
 
@@ -139,8 +149,7 @@ static GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES: [u8; 10] =
 pub(crate) fn gss_c_nt_hostbased_service() -> GssOidDesc {
     GssOidDesc {
         length: 6,
-        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-        elements: GSS_C_NT_HOSTBASED_SERVICE_OID_BYTES.as_ptr() as *mut c_void,
+        elements: GSS_C_NT_HOSTBASED_SERVICE_OID_BYTES.as_ptr().cast_mut().cast(),
     }
 }
 
@@ -148,8 +157,7 @@ pub(crate) fn gss_c_nt_hostbased_service() -> GssOidDesc {
 pub(crate) fn gss_krb5_nt_principal_name() -> GssOidDesc {
     GssOidDesc {
         length: 10,
-        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-        elements: GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES.as_ptr() as *mut c_void,
+        elements: GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES.as_ptr().cast_mut().cast(),
     }
 }
 
@@ -291,7 +299,7 @@ pub(crate) type Krb5Deltat = c_long;
 #[cfg(mit_kerberos)]
 pub(crate) type Krb5DataLength = c_uint;
 #[cfg(heimdal_kerberos)]
-pub(crate) type Krb5DataLength = size_t;
+pub(crate) type Krb5DataLength = usize;
 
 /// Opaque profile handle (`profile_t`), MIT's profile API.
 #[cfg(mit_kerberos)]
@@ -442,7 +450,7 @@ extern "C" {
     pub(crate) fn krb5_responder_otp_set_answer(
         context: Krb5Context,
         rctx: Krb5ResponderContext,
-        ti: size_t,
+        ti: usize,
         value: *const c_char,
         pin: *const c_char,
     ) -> c_int;

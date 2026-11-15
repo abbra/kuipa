@@ -21,9 +21,9 @@
 //!         // `principal` is e.g. "user@REALM"
 //!         // `out_token` is the optional mutual-auth response (may be empty)
 //!     }
-//!     kuipa_gssapi::AcceptStep::Continue { out_token, ctx } => {
-//!         // Send `out_token` as `WWW-Authenticate: Negotiate <base64>` with 401.
-//!         // On the next request, call `ctx.step(...)` with the client's new token.
+//!     kuipa_gssapi::AcceptStep::Continue { .. } => {
+//!         // The mechanism wants another round trip, which this crate does
+//!         // not carry across calls: refuse the request.
 //!     }
 //! }
 //! ```
@@ -86,16 +86,9 @@ static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// without writing it.
 ///
 /// Drop releases the credential handle via `gss_release_cred`.
+#[derive(Debug)]
 pub struct GssServerCred {
     raw: ffi::GssCredIdT,
-}
-
-impl std::fmt::Debug for GssServerCred {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GssServerCred")
-            .field("raw", &self.raw)
-            .finish()
-    }
 }
 
 // SAFETY: gss_cred_id_t is a pointer owned exclusively by this struct.
@@ -191,13 +184,7 @@ impl GssServerCred {
 
         // Import "service_name" as a host-based service name.
         let svc_oid = ffi::gss_c_nt_hostbased_service();
-        let svc_buf = ffi::GssBufferDesc {
-            length: svc_cstr.to_bytes().len(),
-            // SAFETY: gss_import_name treats input_name_buffer as read-only per
-            // RFC 2744 §2; *const → *mut cast is safe for C APIs with that contract.
-            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-            value: svc_cstr.as_ptr() as *mut _,
-        };
+        let svc_buf = ffi::GssBufferDesc::borrowing(svc_cstr.to_bytes());
         let mut svc_name: ffi::GssNameT = ptr::null_mut();
         // SAFETY: all arguments are valid: minor points to a local u32, svc_buf
         // wraps a valid CString slice, svc_oid is a well-formed OID descriptor,
@@ -609,16 +596,9 @@ fn cred_principal_name(cred: ffi::GssCredIdT) -> Option<String> {
 /// this for initiator credentials).
 ///
 /// Drop releases the credential handle via `gss_release_cred`.
+#[derive(Debug)]
 pub struct GssClientCred {
     raw: ffi::GssCredIdT,
-}
-
-impl std::fmt::Debug for GssClientCred {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GssClientCred")
-            .field("raw", &self.raw)
-            .finish()
-    }
 }
 
 // SAFETY: gss_cred_id_t is a pointer owned exclusively by this struct.
@@ -1002,12 +982,7 @@ impl GssClientCred {
 
         // Import the user principal as a Kerberos principal name.
         let principal_oid = ffi::gss_krb5_nt_principal_name();
-        let principal_buf = ffi::GssBufferDesc {
-            length: principal_cstr.to_bytes().len(),
-            // SAFETY: gss_import_name treats the buffer as read-only.
-            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-            value: principal_cstr.as_ptr() as *mut _,
-        };
+        let principal_buf = ffi::GssBufferDesc::borrowing(principal_cstr.to_bytes());
         let mut user_name: ffi::GssNameT = ptr::null_mut();
         // SAFETY: minor, principal_buf, and principal_oid are valid stack values;
         // user_name is a valid output pointer.
@@ -1484,7 +1459,8 @@ fn acquire_initiator_from_ccache(ccache_name: &CStr) -> Result<ffi::GssCredIdT, 
 ///
 /// Drop releases the context handle via `gss_delete_sec_context` and the target
 /// name via `gss_release_name`.
-pub struct GssClientContext {
+#[derive(Debug)]
+pub(crate) struct GssClientContext {
     raw: ffi::GssCtxIdT,
     target_name: ffi::GssNameT,
     /// Use the Kerberos V5 mechanism directly instead of SPNEGO.
@@ -1494,16 +1470,6 @@ pub struct GssClientContext {
 // SAFETY: moving a partially-initialised context to another thread is safe —
 // only one thread ever calls step() at a time (no Sync impl).
 unsafe impl Send for GssClientContext {}
-
-impl std::fmt::Debug for GssClientContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GssClientContext")
-            .field("raw", &self.raw)
-            .field("target_name", &self.target_name)
-            .field("krb5", &self.krb5)
-            .finish()
-    }
-}
 
 impl Drop for GssClientContext {
     fn drop(&mut self) {
@@ -1535,19 +1501,14 @@ impl GssClientContext {
     ///
     /// - [`GssError::NulInTargetName`] — `target_service` contains a NUL byte.
     /// - [`GssError::ImportName`] — `gss_import_name` rejected the name.
-    pub fn new(target_service: &str) -> Result<Self, GssError> {
+    pub(crate) fn new(target_service: &str) -> Result<Self, GssError> {
         Self::with_name_type(target_service, &ffi::gss_c_nt_hostbased_service())
     }
 
     fn with_name_type(target_service: &str, svc_oid: &ffi::GssOidDesc) -> Result<Self, GssError> {
         let svc_cstr = CString::new(target_service).map_err(|_| GssError::NulInTargetName)?;
         let mut minor: ffi::OmUint32 = 0;
-        let svc_buf = ffi::GssBufferDesc {
-            length: svc_cstr.to_bytes().len(),
-            // SAFETY: gss_import_name treats the buffer as read-only.
-            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-            value: svc_cstr.as_ptr() as *mut _,
-        };
+        let svc_buf = ffi::GssBufferDesc::borrowing(svc_cstr.to_bytes());
         let mut target_name: ffi::GssNameT = ptr::null_mut();
         // SAFETY: svc_buf wraps a live CString; target_name is a valid output pointer.
         let major = unsafe {
@@ -1585,7 +1546,7 @@ impl GssClientContext {
     /// # Errors
     ///
     /// As for [`new`](Self::new).
-    pub fn new_krb5(target: &str) -> Result<Self, GssError> {
+    pub(crate) fn new_krb5(target: &str) -> Result<Self, GssError> {
         let name_type = if target.contains('/') {
             ffi::gss_krb5_nt_principal_name()
         } else {
@@ -1603,7 +1564,7 @@ impl GssClientContext {
     ///
     /// [`GssError::PseudoRandom`] if the context is not established or the
     /// mechanism cannot derive them.
-    pub fn pseudo_random(&self, input: &[u8], len: usize) -> Result<Vec<u8>, GssError> {
+    pub(crate) fn pseudo_random(&self, input: &[u8], len: usize) -> Result<Vec<u8>, GssError> {
         pseudo_random(self.raw, input, len)
     }
 
@@ -1626,7 +1587,7 @@ impl GssClientContext {
     ///
     /// - [`GssError::InitContext`] — `gss_init_sec_context` returned a status
     ///   other than `GSS_S_COMPLETE` or `GSS_S_CONTINUE_NEEDED`.
-    pub fn step(
+    pub(crate) fn step(
         &mut self,
         cred: &GssClientCred,
         input_token: Option<&[u8]>,
@@ -1638,12 +1599,7 @@ impl GssClientContext {
         let input_ptr: *const ffi::GssBufferDesc = match input_token {
             None => ptr::null(),
             Some(data) => {
-                input_storage = ffi::GssBufferDesc {
-                    length: data.len(),
-                    // SAFETY: gss_init_sec_context treats input_token as read-only.
-                    #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-                    value: data.as_ptr() as *mut _,
-                };
+                input_storage = ffi::GssBufferDesc::borrowing(data);
                 &raw const input_storage
             }
         };
@@ -1657,12 +1613,7 @@ impl GssClientContext {
                     initiator_address: ffi::gss_c_no_buffer(),
                     acceptor_addrtype: ffi::GSS_C_AF_UNSET,
                     acceptor_address: ffi::gss_c_no_buffer(),
-                    application_data: ffi::GssBufferDesc {
-                        length: data.len(),
-                        // SAFETY: application_data is treated as read-only.
-                        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-                        value: data.as_ptr() as *mut _,
-                    },
+                    application_data: ffi::GssBufferDesc::borrowing(data),
                 };
                 &raw const bindings_storage
             }
@@ -1739,7 +1690,7 @@ impl GssClientContext {
 
 /// Result of one GSSAPI server-side accept step.
 ///
-/// Returned by [`accept_token`] and [`GssServerContext::step`].
+/// Returned by [`accept_token`].
 #[derive(Debug)]
 pub enum AcceptStep {
     /// Exchange is complete.  `principal` is the authenticated client identity
@@ -1751,15 +1702,12 @@ pub enum AcceptStep {
         /// Authenticated client principal.
         principal: String,
     },
-    /// The mechanism needs another round-trip.  Send `out_token` as
-    /// `WWW-Authenticate: Negotiate <base64>` with `401 Unauthorized`, then call
-    /// [`GssServerContext::step`] with the client's next `Authorization: Negotiate`
-    /// token.  `ctx` must be kept alive between the two HTTP requests.
+    /// The mechanism needs another round-trip, which this crate does not
+    /// carry across calls (the context is dropped).  Callers treat it as a
+    /// failed exchange.
     Continue {
-        /// Token to send to the peer, possibly empty.
+        /// Token the peer would have been sent, possibly empty.
         out_token: Vec<u8>,
-        /// Context to resume with the peer's next token.
-        ctx: GssServerContext,
     },
 }
 
@@ -1770,21 +1718,14 @@ pub enum AcceptStep {
 /// [`GssServerContext::step`] with the client's next token to advance the exchange.
 ///
 /// Drop releases the context handle via `gss_delete_sec_context`.
-pub struct GssServerContext {
+#[derive(Debug)]
+pub(crate) struct GssServerContext {
     raw: ffi::GssCtxIdT,
 }
 
 // SAFETY: moving a partially-initialized server context to another thread is
 // safe — only one thread ever calls step() at a time (no Sync impl).
 unsafe impl Send for GssServerContext {}
-
-impl std::fmt::Debug for GssServerContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GssServerContext")
-            .field("raw", &self.raw)
-            .finish()
-    }
-}
 
 impl Drop for GssServerContext {
     fn drop(&mut self) {
@@ -1819,7 +1760,7 @@ impl GssServerContext {
     /// - [`GssError::AcceptContext`] — `gss_accept_sec_context` rejected the token.
     /// - [`GssError::DisplayName`] — the principal name could not be converted.
     /// - [`GssError::InvalidUtf8`] — the principal name is not valid UTF-8.
-    pub fn step(
+    pub(crate) fn step(
         self,
         cred: &GssServerCred,
         input_token: &[u8],
@@ -1843,13 +1784,7 @@ impl GssServerContext {
     ) -> Result<(AcceptStep, Option<Vec<u8>>), GssError> {
         let mut minor: ffi::OmUint32 = 0;
 
-        let input_buf = ffi::GssBufferDesc {
-            length: input_token.len(),
-            // SAFETY: gss_accept_sec_context treats input_token_buffer as read-only
-            // per RFC 2744 §2; *const → *mut cast is safe for C APIs with that contract.
-            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-            value: input_token.as_ptr() as *mut _,
-        };
+        let input_buf = ffi::GssBufferDesc::borrowing(input_token);
         let mut output_buf = ffi::gss_c_no_buffer();
         let mut src_name: ffi::GssNameT = ptr::null_mut();
         let mut ret_flags: ffi::OmUint32 = 0;
@@ -1926,17 +1861,7 @@ impl GssServerContext {
                     // SAFETY: src_name is valid (may be set even on CONTINUE_NEEDED).
                     unsafe { ffi::gss_release_name(&raw mut minor, &raw mut src_name) };
                 }
-                // Transfer self.raw to a new GssServerContext for the caller to persist.
-                // Setting self.raw to null prevents Drop from double-freeing.
-                let raw = self.raw;
-                self.raw = ffi::GSS_C_NO_CONTEXT;
-                Ok((
-                    AcceptStep::Continue {
-                        out_token,
-                        ctx: GssServerContext { raw },
-                    },
-                    None,
-                ))
+                Ok((AcceptStep::Continue { out_token }, None))
             }
 
             _ => {
@@ -2027,13 +1952,7 @@ fn channel_bindings(data: &[u8]) -> ffi::GssChannelBindingsStruct {
         initiator_address: ffi::gss_c_no_buffer(),
         acceptor_addrtype: ffi::GSS_C_AF_UNSET,
         acceptor_address: ffi::gss_c_no_buffer(),
-        application_data: ffi::GssBufferDesc {
-            length: data.len(),
-            // SAFETY: gss_accept_sec_context treats application_data as
-            // read-only; *const → *mut cast is safe per RFC 2744 §2.
-            #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-            value: data.as_ptr() as *mut _,
-        },
+        application_data: ffi::GssBufferDesc::borrowing(data),
     }
 }
 
@@ -2047,14 +1966,12 @@ pub enum InitStep {
     /// The exchange is complete after the first token.  Encode `token` as
     /// `Authorization: Negotiate <base64>` and send it.
     Complete(Vec<u8>),
-    /// The mechanism needs at least one more round-trip.  Send `token` to the
-    /// server; if the server replies with `WWW-Authenticate: Negotiate <base64>`,
-    /// decode the server token and pass it to [`GssClientContext::step`] on `ctx`.
+    /// The mechanism needs at least one more round-trip, which this crate
+    /// does not carry across calls (the context is dropped).  Callers treat
+    /// it as a failed exchange.
     Continue {
-        /// Token to send to the peer.
+        /// The first token, which the peer cannot complete the exchange with.
         token: Vec<u8>,
-        /// Context to resume with the peer's next token.
-        ctx: GssClientContext,
     },
 }
 
@@ -2105,11 +2022,7 @@ fn impersonate_with_server_cred_mit(
     let mut minor: ffi::OmUint32 = 0;
 
     let principal_oid = ffi::gss_krb5_nt_principal_name();
-    let principal_buf = ffi::GssBufferDesc {
-        length: principal_cstr.to_bytes().len(),
-        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-        value: principal_cstr.as_ptr() as *mut _,
-    };
+    let principal_buf = ffi::GssBufferDesc::borrowing(principal_cstr.to_bytes());
     let mut user_name: ffi::GssNameT = ptr::null_mut();
     // SAFETY: minor, principal_buf, and principal_oid are valid stack values.
     let major = unsafe {
@@ -2183,8 +2096,8 @@ fn impersonate_with_server_cred_mit(
 ///
 /// Returns [`InitStep::Complete`] when the token is ready to send and no
 /// further steps are expected.  Returns [`InitStep::Continue`] when the
-/// mechanism (e.g. IAKERB) requires additional round-trips; use the bundled
-/// [`GssClientContext`] to drive the exchange to completion.
+/// mechanism (e.g. IAKERB) requires additional round-trips, which are not
+/// supported.
 ///
 /// # Errors
 ///
@@ -2201,7 +2114,7 @@ pub fn init_token(
     if complete {
         Ok(InitStep::Complete(token))
     } else {
-        Ok(InitStep::Continue { token, ctx })
+        Ok(InitStep::Continue { token })
     }
 }
 
@@ -2210,12 +2123,7 @@ pub fn init_token(
 /// `len` bytes of RFC 4401 output from the established context `raw`.
 fn pseudo_random(raw: ffi::GssCtxIdT, input: &[u8], len: usize) -> Result<Vec<u8>, GssError> {
     let mut minor: ffi::OmUint32 = 0;
-    let in_buf = ffi::GssBufferDesc {
-        length: input.len(),
-        // SAFETY: gss_pseudo_random treats prf_in as read-only.
-        #[allow(clippy::as_ptr_cast_mut)] // gss_buffer_desc.value is void *; GSS-API only reads it
-        value: input.as_ptr() as *mut _,
-    };
+    let in_buf = ffi::GssBufferDesc::borrowing(input);
     let mut out_buf = ffi::gss_c_no_buffer();
     let wanted = isize::try_from(len).map_err(|_| GssError::PseudoRandom {
         major: 0,
@@ -2349,9 +2257,7 @@ pub fn accept_bound_delegated(
 /// (e.g. ML-DSA).
 ///
 /// Returns [`AcceptStep::Complete`] when the client is authenticated.
-/// Returns [`AcceptStep::Continue`] when the mechanism needs another round-trip;
-/// send the enclosed token in `WWW-Authenticate: Negotiate` with `401` and call
-/// [`GssServerContext::step`] with the client's response.
+/// Returns [`AcceptStep::Continue`] when the mechanism needs another round-trip.
 ///
 /// # Errors
 ///

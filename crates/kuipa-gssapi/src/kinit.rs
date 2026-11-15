@@ -53,10 +53,11 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr;
 
-use libc::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 use crate::error::GssError;
 use crate::ffi;
+use native_ossl::util::SecretBuf;
 
 /// A libkrb5 context made from one configuration file.
 struct Context(ffi::Krb5Context);
@@ -283,10 +284,14 @@ impl Context {
             );
         }
         let asked = password.map_or_else(
-            || answers.cstring("Password", answers.ask("Password", true)),
+            || {
+                answers
+                    .cstring("Password", answers.ask("Password", true))
+                    .map(cleansed)
+            },
             |_| None,
         );
-        let password = password.or(asked.as_deref());
+        let password = password.or(asked.as_ref().map(secret_cstr));
         let step = Step::new(self, client, Some(answers), &opt, Some(password))?;
         // SAFETY: every handle is live; the C strings outlive the exchange.
         unsafe {
@@ -302,9 +307,6 @@ impl Context {
         step.get("armoured AS exchange")?;
         step.report_last_request();
         step.store(out, "krb5_init_creds_store")?;
-        if let Some(asked) = asked {
-            wipe(asked.into_bytes());
-        }
         Ok(())
     }
 }
@@ -934,7 +936,8 @@ pub fn ticket(
     let password = secret
         .map(CString::new)
         .transpose()
-        .map_err(|_| GssError::NulInPassword)?;
+        .map_err(|_| GssError::NulInPassword)?
+        .map(cleansed);
     let service = CString::new(service).map_err(|_| GssError::NulInTargetName)?;
     let realm = principal
         .rsplit_once('@')
@@ -1013,7 +1016,7 @@ pub fn ticket(
             }
             ctx.init_creds(
                 &client,
-                password.as_deref(),
+                password.as_ref().map(secret_cstr),
                 Some(&service),
                 &opt,
                 Some(&mut answers),
@@ -1023,7 +1026,7 @@ pub fn ticket(
         #[cfg(heimdal_kerberos)]
         ctx.exchange(
             &client,
-            password.as_deref(),
+            password.as_ref().map(secret_cstr),
             Target {
                 service: &service,
                 realm,
@@ -1034,9 +1037,6 @@ pub fn ticket(
         )
     })();
     armour.destroy();
-    if let Some(password) = password {
-        wipe(password.into_bytes());
-    }
     // A question nobody could answer is the reason the exchange failed, and
     // says more than libkrb5's "preauthentication failed".
     match (result, answers.reason()) {
@@ -1045,13 +1045,13 @@ pub fn ticket(
     }
 }
 
-/// Overwrite a copy of a secret before freeing it.
-fn wipe(mut bytes: Vec<u8>) {
-    for b in &mut bytes {
-        // SAFETY: b is a valid, aligned byte of the vector.
-        unsafe { ptr::write_volatile(b, 0) };
-    }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+/// Hold a secret C string so that it is cleansed on drop, early returns included.
+fn cleansed(c: CString) -> SecretBuf {
+    SecretBuf::new(c.into_bytes_with_nul())
+}
+
+fn secret_cstr(b: &SecretBuf) -> &CStr {
+    CStr::from_bytes_with_nul(b.as_ref()).expect("built from a CString")
 }
 
 #[cfg(test)]
