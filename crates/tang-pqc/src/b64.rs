@@ -8,20 +8,18 @@ use crate::error::{Error, Result};
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Length of the unpadded encoding of `n` bytes.
-/// Length of the encoding of `n` bytes.
 #[must_use]
-pub const fn encoded_len(n: usize) -> usize {
+pub(crate) const fn encoded_len(n: usize) -> usize {
     (n * 4).div_ceil(3)
 }
 
 /// Encode into `out`, which must be exactly [`encoded_len`] bytes.  Lets
 /// secrets be encoded straight into a wiping buffer.
-/// Encode into `out`, which must be exactly [`encoded_len`] bytes.
 ///
 /// # Panics
 ///
 /// If `out` has the wrong length.
-pub fn encode_into(data: &[u8], out: &mut [u8]) {
+pub(crate) fn encode_into(data: &[u8], out: &mut [u8]) {
     assert_eq!(out.len(), encoded_len(data.len()), "base64url output size");
     let mut pos = 0;
     for chunk in data.chunks(3) {

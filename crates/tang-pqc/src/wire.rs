@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 
 /// Wire format version.
-pub const VERSION: u8 = 1;
+const VERSION: u8 = 1;
 
 /// Encoder for one message.
 pub struct Writer(Vec<u8>);

@@ -634,7 +634,7 @@ impl SigningKey {
     /// # Errors
     ///
     /// [`Error::UnsupportedKey`] if it is not an ML-DSA key.
-    pub fn from_pkey(pkey: Pkey<Private>) -> Result<Self> {
+    pub(crate) fn from_pkey(pkey: Pkey<Private>) -> Result<Self> {
         let public = VerifyingKey::from_pkey(Pkey::<Public>::from(pkey.clone()))?;
         Ok(Self {
             pkey,

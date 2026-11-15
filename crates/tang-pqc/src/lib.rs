@@ -53,12 +53,12 @@ mod adv;
 mod alg;
 pub mod b64;
 mod client;
-pub mod error;
+mod error;
 mod jwk;
 mod keys;
 mod policy;
 pub mod primitives;
-pub mod protocol;
+mod protocol;
 mod server;
 pub mod wire;
 

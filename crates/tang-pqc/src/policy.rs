@@ -96,13 +96,6 @@ impl Policy {
         self
     }
 
-    /// Reject advertisements whose `exp − iat` exceeds `max`.
-    #[must_use]
-    pub fn with_max_validity(mut self, max: Duration) -> Self {
-        self.max_validity = max;
-        self
-    }
-
     /// Tolerated difference between client and server clocks.
     #[must_use]
     pub fn with_clock_skew(mut self, skew: Duration) -> Self {
@@ -130,7 +123,6 @@ impl Policy {
         self.signature_algs.contains(&alg)
     }
 
-    /// Check a signed `iat`/`exp` pair (Unix seconds) against `now`.
     /// Check a validity period `iat`/`exp` (Unix seconds) against `now`:
     /// both or neither must be present, the period must not exceed the
     /// maximum validity, and `now` must fall inside it, within the clock
@@ -139,7 +131,7 @@ impl Policy {
     /// # Errors
     ///
     /// [`Error::StaleAdvertisement`], [`Error::Policy`] or [`Error::Malformed`].
-    pub fn check_freshness(&self, iat: Option<u64>, exp: Option<u64>, now: u64) -> Result<()> {
+    pub(crate) fn check_freshness(&self, iat: Option<u64>, exp: Option<u64>, now: u64) -> Result<()> {
         let (iat, exp) = match (iat, exp) {
             (Some(iat), Some(exp)) => (iat, exp),
             (None, None) if !self.require_expiry => return Ok(()),

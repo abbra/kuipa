@@ -30,7 +30,7 @@ const CTY_JWK_SET: &str = "jwk-set+json";
 /// one is either broken or hostile, and parsing it — let alone verifying a
 /// signature per JWS `signatures` entry — costs CPU and memory before the
 /// pinned key's signature rejects it.
-pub const MAX_ADVERTISEMENT_BYTES: usize = 256 * 1024;
+const MAX_ADVERTISEMENT_BYTES: usize = 256 * 1024;
 
 /// Most JWS signatures in one advertisement.  Real servers emit one to a
 /// handful (one per current signing key).
