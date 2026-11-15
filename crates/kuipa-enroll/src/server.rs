@@ -1246,6 +1246,69 @@ struct StartedSession {
     receipts: Vec<Receipt>,
 }
 
+/// What a seal operation came to.
+enum Outcome {
+    /// An answer that concerns no descriptor.
+    Side(Reply),
+    /// Seals to describe, as they stand.
+    Seals(Vec<Seal>),
+    /// A seal the operation changed, to record and store.
+    Changed(Seal),
+    /// A session an unlock started.
+    Session(StartedSession),
+}
+
+impl Outcome {
+    fn side(reply: Reply) -> Self {
+        Self::Side(reply)
+    }
+}
+
+/// The caller's seals, to log each device action in every seal where they
+/// hold the device.
+struct DeviceLog<'a> {
+    server: &'a EnrollServer,
+    seals: Vec<Seal>,
+    me: String,
+    receipts: Vec<Receipt>,
+}
+
+impl<'a> DeviceLog<'a> {
+    fn new(
+        server: &'a EnrollServer,
+        caller: &Principal,
+        directory: &dyn Directory,
+    ) -> Result<Self, Refusal> {
+        Ok(Self {
+            server,
+            seals: list_seals(caller, directory)?,
+            me: caller.to_string(),
+            receipts: Vec::new(),
+        })
+    }
+
+    fn holds(&self, device: &str) -> bool {
+        !holders_of(&self.seals, &self.me, device).is_empty()
+    }
+
+    fn log(&mut self, device: &str, action: SealAction) -> Result<(), Refusal> {
+        for id in holders_of(&self.seals, &self.me, device) {
+            let zero = merkle::Hash::zero(self.server.tree_hash());
+            self.receipts
+                .extend(self.server.record_seal(&id, action, Some(device), zero)?);
+        }
+        Ok(())
+    }
+
+    fn reply(self, escrows: Vec<DeviceEscrow>) -> Outcome {
+        Outcome::side(Reply {
+            receipts: self.receipts,
+            escrows,
+            ..Reply::default()
+        })
+    }
+}
+
 /// One IPA server.
 #[derive(Debug)]
 pub struct EnrollServer {
@@ -1924,6 +1987,9 @@ impl EnrollServer {
     /// Answer a seal operation (§7.6): authenticate the caller by their
     /// ticket, check their role in the seal, apply the owner's limits,
     /// store, and answer with signed descriptors.
+    // One flat dispatch over every operation, so a new `SealOp` variant is a
+    // compile error here rather than a panic.
+    #[allow(clippy::too_many_lines)]
     fn seal_op(
         &self,
         request: &Request,
@@ -1947,61 +2013,241 @@ impl EnrollServer {
         // Whoever loses a device or their membership must not open files
         // sealed for offline sessions from now on: a new epoch starts.
         let rotate = matches!(op, SealOp::RemoveDevice { .. } | SealOp::Unshare { .. });
+        let require_log = matches!(op, SealOp::AdminRevoke { .. });
         let mut receipts = Vec::new();
-        // What the operations that concern no descriptor answer.
-        let mut side = Reply::default();
-        let (seals, session, released) = match op {
-            op @ (SealOp::Request { .. }
-            | SealOp::Pending { .. }
-            | SealOp::Approve { .. }
-            | SealOp::Deny { .. }
-            | SealOp::EscrowCode { .. }
-            | SealOp::RecoverCode
-            | SealOp::EscrowShards { .. }
-            | SealOp::EnrollShards { .. }
-            | SealOp::RecoverShards
-            | SealOp::Deposit { .. }
-            | SealOp::Deposits { .. }
-            | SealOp::FetchDeposit { .. }
-            | SealOp::RetireDeposit { .. }
-            | SealOp::RecoverySettings
-            | SealOp::DeviceKey { .. }
-            | SealOp::Deliver { .. }
-            | SealOp::Passkeys) => {
-                side = self.side_op(&caller, op, now, directory)?;
-                (Vec::new(), None, None)
+        let outcome = match op {
+            SealOp::Request {
+                name,
+                bindings,
+                reason,
+            } => {
+                let (requests, receipts) =
+                    self.make_request(&caller, &name, bindings, reason, now, directory)?;
+                Outcome::side(Reply {
+                    receipts,
+                    requests,
+                    ..Reply::default()
+                })
             }
-            op @ SealOp::Unlock { .. } => {
-                let started = self.start_session(&caller, &op, &cb, now, directory)?;
+            SealOp::Pending { name } => Outcome::side(Reply {
+                requests: self.pending_requests(&caller, name.as_deref(), now, directory)?,
+                ..Reply::default()
+            }),
+            SealOp::Approve { name, id } => {
+                let (requests, receipts) =
+                    self.mark_request(&caller, &name, &id, false, now, directory)?;
+                Outcome::side(Reply {
+                    receipts,
+                    requests,
+                    ..Reply::default()
+                })
+            }
+            SealOp::Deny { name, id } => {
+                let (requests, receipts) =
+                    self.mark_request(&caller, &name, &id, true, now, directory)?;
+                Outcome::side(Reply {
+                    receipts,
+                    requests,
+                    ..Reply::default()
+                })
+            }
+            SealOp::EscrowCode { device, blob } => {
+                self.escrow_code(&caller, device, blob, now, directory)?
+            }
+            SealOp::RecoverCode => self.recover_code(&caller, directory)?,
+            SealOp::EscrowShards {
+                registration,
+                blobs,
+            } => self.escrow_shards(&caller, &registration, &blobs, now, directory)?,
+            SealOp::EnrollShards { blobs } => self.enroll_shards(&caller, blobs, now, directory)?,
+            SealOp::RecoverShards => self.recover_shards(&caller, directory)?,
+            SealOp::Deposit {
+                name,
+                kind,
+                subject,
+                sealed,
+            } => {
+                let (deposits, receipts) =
+                    self.make_deposit(&caller, &name, kind, subject, sealed, now, directory)?;
+                Outcome::side(Reply {
+                    receipts,
+                    deposits,
+                    ..Reply::default()
+                })
+            }
+            SealOp::Deposits { name } => {
+                let me = caller.to_string();
+                let (seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                let deposits = directory
+                    .deposits(&seal.id)?
+                    .into_iter()
+                    .filter(|d| role >= Role::Member || d.depositor == me)
+                    .map(|mut d| {
+                        d.sealed.clear();
+                        d
+                    })
+                    .collect();
+                Outcome::side(Reply {
+                    deposits,
+                    ..Reply::default()
+                })
+            }
+            SealOp::FetchDeposit { name, id } => {
+                let (seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                need_member(role)?;
+                Outcome::side(Reply {
+                    deposits: vec![find_deposit(&seal, &id, directory)?],
+                    ..Reply::default()
+                })
+            }
+            SealOp::RetireDeposit { name, id } => {
+                let (mut seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                let deposit = find_deposit(&seal, &id, directory)?;
+                if deposit.depositor != caller.to_string() {
+                    need(role, Role::Manager, "retire another's deposit")?;
+                }
+                Outcome::side(Reply {
+                    receipts: self.retire_deposits(&mut seal, &[deposit], directory)?,
+                    ..Reply::default()
+                })
+            }
+            SealOp::RecoverySettings => Outcome::side(Reply {
+                recovery: directory.recovery_settings()?,
+                ..Reply::default()
+            }),
+            SealOp::DeviceKey { user, device } => {
+                Outcome::side(self.device_key(&caller, &user, &device, directory)?)
+            }
+            SealOp::Deliver { user, device, blob } => {
+                Outcome::side(self.deliver(&caller, &user, device, blob, now, directory)?)
+            }
+            SealOp::Passkeys => Outcome::side(Reply {
+                passkeys: Some(PasskeyInfo::of(
+                    &self.info.domain,
+                    &directory.passkeys(&caller)?,
+                )),
+                ..Reply::default()
+            }),
+            SealOp::Unlock {
+                name,
+                device,
+                offline,
+                passkey,
+            } => Outcome::Session(self.start_session(
+                &caller,
+                &name,
+                &device,
+                offline,
+                passkey.as_deref(),
+                &cb,
+                now,
+                directory,
+            )?),
+            SealOp::List => Outcome::Seals(list_seals(&caller, directory)?),
+            SealOp::Show { name } => {
+                Outcome::Seals(vec![self.resolve_seal(&caller, &name, directory)?.0])
+            }
+            SealOp::Create { name, policy } => Outcome::Seals(Self::create_seal(
+                &caller,
+                name,
+                policy,
+                now,
+                directory,
+                &mut |seal| self.record_op(&mut event, &mut receipts, require_log, seal),
+            )?),
+            SealOp::Register { name, add, retire } => {
+                let (mut seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                need_member(role)?;
+                register_bindings(&mut seal, add, &retire)?;
+                Outcome::Changed(seal)
+            }
+            SealOp::SetPolicy { name, mut policy } => {
+                let (mut seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                need(role, Role::Manager, "change its policy")?;
+                limits_for(&seal.owner, directory)?.apply(&mut policy, now)?;
+                normalize_approvers(&mut policy, &self.info.realm)?;
+                seal.policy = policy;
+                Outcome::Changed(seal)
+            }
+            SealOp::Share {
+                name,
+                managers,
+                members,
+                depositors,
+            } => {
+                let (mut seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                need(role, Role::Manager, "share it")?;
+                let limits = limits_for(&seal.owner, directory)?;
+                self.share(&mut seal, [&managers, &members, &depositors], &limits)?;
+                Outcome::Changed(seal)
+            }
+            SealOp::Unshare {
+                name,
+                managers,
+                members,
+                depositors,
+            } => {
+                let (mut seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                self.unshare(&mut seal, &caller, role, [&managers, &members, &depositors])?;
+                Outcome::Changed(seal)
+            }
+            SealOp::AddDevice {
+                name,
+                label,
+                kind,
+                alg,
+                key,
+            } => Outcome::Changed(
+                self.add_device(&caller, &name, &label, kind, alg, &key, now, directory)?,
+            ),
+            SealOp::RemoveDevice { name, id } => {
+                Outcome::Changed(self.remove_device(&caller, &name, &id, directory)?)
+            }
+            SealOp::Revoke { name } => {
+                let (mut seal, role) = self.resolve_seal(&caller, &name, directory)?;
+                need(role, Role::Manager, "revoke it")?;
+                seal.state = State::Revoked;
+                Outcome::Changed(seal)
+            }
+            SealOp::AdminRevoke { owner, name } => {
+                Outcome::Changed(Self::admin_revoke_seal(&caller, &owner, &name, directory)?)
+            }
+        };
+        let (seals, session, released, mut side) = match outcome {
+            Outcome::Side(reply) => (Vec::new(), None, None, reply),
+            Outcome::Session(started) => {
                 receipts.extend(started.receipts);
                 // Nothing is released before the answer, which waits for
                 // the record.
                 if let Some((action, device)) = event.take() {
                     receipts.extend(self.record_change(&started.seal, action, device)?);
                 }
-                (vec![started.seal], Some(started.token), started.released)
+                (
+                    vec![started.seal],
+                    Some(started.token),
+                    started.released,
+                    Reply::default(),
+                )
             }
-            op => {
-                let require_log = matches!(op, SealOp::AdminRevoke { .. });
-                // A change is recorded before the directory stores it, so a
-                // failed append leaves the seal as it was.
-                let mut record = |seal: &Seal| {
-                    if let Some((action, device)) = event.take() {
-                        let receipt = self.record_change(seal, action, device)?;
-                        if require_log && receipt.is_none() {
-                            return Err(Refusal::because(
-                                "seal administration requires a transparency log",
-                            ));
-                        }
-                        receipts.extend(receipt);
-                    }
-                    Ok(())
-                };
-                let mut seals = self.apply_seal_op(&caller, op, now, directory, &mut record)?;
+            Outcome::Seals(mut seals) => {
                 for v in &mut seals {
                     receipts.extend(self.settle_seal(v, now, rotate, directory)?);
                 }
-                (seals, None, None)
+                (seals, None, None, Reply::default())
+            }
+            Outcome::Changed(mut seal) => {
+                // A change is recorded before the directory stores it, so a
+                // failed append leaves the seal as it was.
+                self.record_op(&mut event, &mut receipts, require_log, &seal)?;
+                directory.seal_update(&seal)?;
+                if require_log {
+                    eprintln!(
+                        "kuipad: {caller} administratively revoked seal {} ({}) owned by {}",
+                        seal.id, seal.name, seal.owner
+                    );
+                }
+                receipts.extend(self.settle_seal(&mut seal, now, rotate, directory)?);
+                (vec![seal], None, None, Reply::default())
             }
         };
         let descriptors = self.public_descriptors(&seals, now, directory)?;
@@ -2353,24 +2599,18 @@ impl EnrollServer {
     /// once the caller may start the session and before anything is
     /// released, so departed members' devices are gone and the keys come
     /// from the epochs that follow.
+    #[allow(clippy::too_many_arguments)]
     fn start_session(
         &self,
         caller: &Principal,
-        op: &SealOp,
+        name: &str,
+        device: &str,
+        offline: bool,
+        passkey: Option<&str>,
         cb: &[u8; 32],
         now: u64,
         directory: &dyn Directory,
     ) -> Result<StartedSession, Refusal> {
-        let SealOp::Unlock {
-            name,
-            device,
-            offline,
-            passkey,
-        } = op
-        else {
-            unreachable!("only unlock starts a session");
-        };
-        let offline = *offline;
         let (mut seal, role) = self.resolve_seal(caller, name, directory)?;
         need_member(role)?;
         if seal.state != State::Enabled {
@@ -2379,9 +2619,8 @@ impl EnrollServer {
         // A session stands in for the passkey factor, so starting one
         // needs an assertion, bound to this exchange.
         if seal.policy.factors.passkey {
-            let assertion = passkey
-                .as_deref()
-                .ok_or_else(|| Refusal::because("the seal needs the caller's passkey"))?;
+            let assertion =
+                passkey.ok_or_else(|| Refusal::because("the seal needs the caller's passkey"))?;
             let assertion = tang_pqc::b64::decode(assertion).map_err(Error::from)?;
             self.check_passkey(
                 caller,
@@ -2507,36 +2746,6 @@ impl EnrollServer {
             Ok((seal, approves))
         } else {
             Err(missing_seal(caller, reference))
-        }
-    }
-
-    /// Answer the operations on release requests (`DESIGN-approvals.md`):
-    /// make one, list the open ones, approve or deny one.  Each change is
-    /// logged before it is stored.
-    fn release_op(
-        &self,
-        caller: &Principal,
-        op: SealOp,
-        now: u64,
-        directory: &dyn Directory,
-    ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
-        match op {
-            SealOp::Request {
-                name,
-                bindings,
-                reason,
-            } => self.make_request(caller, &name, bindings, reason, now, directory),
-            SealOp::Pending { name } => Ok((
-                self.pending_requests(caller, name.as_deref(), now, directory)?,
-                Vec::new(),
-            )),
-            SealOp::Approve { name, id } => {
-                self.mark_request(caller, &name, &id, false, now, directory)
-            }
-            SealOp::Deny { name, id } => {
-                self.mark_request(caller, &name, &id, true, now, directory)
-            }
-            _ => unreachable!("only release-request operations"),
         }
     }
 
@@ -2687,249 +2896,172 @@ impl EnrollServer {
         Ok((vec![request], receipts))
     }
 
-    /// Answer `escrow-code` and `recover-code` (`DESIGN-recovery.md` §2):
-    /// keep or return the caller's device keys under recovery codes; shard
-    /// sets are answered by `shards_op`.  Each is logged in every seal
-    /// where the caller holds the device, so a seal's watchers see that its
-    /// device can be recovered, and when it was fetched.
-    fn escrow_op(
+    /// `escrow-code`: keep the caller's device key under a recovery code
+    /// (`DESIGN-recovery.md` §2).  Each device action is logged in every
+    /// seal where the caller holds the device, so a seal's watchers see
+    /// that its device can be recovered, and when it was fetched.
+    fn escrow_code(
         &self,
         caller: &Principal,
-        op: SealOp,
+        device: String,
+        blob: String,
         now: u64,
         directory: &dyn Directory,
-    ) -> Result<(Vec<DeviceEscrow>, Vec<Receipt>), Refusal> {
-        let me = caller.to_string();
-        let seals = list_seals(caller, directory)?;
-        let held = |device: &str| holders_of(&seals, &me, device);
-        let mut receipts = Vec::new();
-        let mut log = |device: &str, action: SealAction| -> Result<(), Refusal> {
-            for id in held(device) {
-                let zero = merkle::Hash::zero(self.tree_hash());
-                receipts.extend(self.record_seal(&id, action, Some(device), zero)?);
-            }
-            Ok(())
-        };
-        match op {
-            SealOp::EscrowCode { device, blob } => {
-                if held(&device).is_empty() {
-                    return Err(Refusal::because(
-                        "register the device in a seal before escrowing it",
-                    ));
-                }
-                let bytes = tang_pqc::b64::decode(&blob).map_err(Error::from)?;
-                if bytes.is_empty() || bytes.len() > crate::seal::MAX_ESCROW_BLOB {
-                    return Err(Refusal::because(
-                        "an escrowed key of no or too great a size",
-                    ));
-                }
-                let escrow = DeviceEscrow {
-                    device,
-                    kind: "code".into(),
-                    blob,
-                    added: now,
-                };
-                log(&escrow.device, SealAction::EscrowCode)?;
-                directory.device_escrow_set(caller, &escrow)?;
-                eprintln!("kuipad: {caller} escrowed device {}", escrow.device);
-                Ok((vec![escrow], receipts))
-            }
-            SealOp::RecoverCode => {
-                let escrows = directory.device_escrows(caller)?;
-                // Logged before anything is answered.
-                for e in &escrows {
-                    log(&e.device, SealAction::RecoverCode)?;
-                }
-                eprintln!(
-                    "kuipad: {caller} fetched {} escrowed device key(s)",
-                    escrows.len()
-                );
-                Ok((escrows, receipts))
-            }
-            op @ (SealOp::EscrowShards { .. }
-            | SealOp::EnrollShards { .. }
-            | SealOp::RecoverShards) => self.shards_op(caller, op, now, directory),
-            _ => unreachable!("only escrow operations"),
+    ) -> Result<Outcome, Refusal> {
+        let mut log = DeviceLog::new(self, caller, directory)?;
+        if !log.holds(&device) {
+            return Err(Refusal::because(
+                "register the device in a seal before escrowing it",
+            ));
         }
-    }
-
-    /// Answer the operations on recovery shard sets
-    /// (`DESIGN-recovery.md` §2.1): replace, join and fetch a set.  Like
-    /// the code operations, each device action is logged in every seal
-    /// where the caller holds the device.
-    fn shards_op(
-        &self,
-        caller: &Principal,
-        op: SealOp,
-        now: u64,
-        directory: &dyn Directory,
-    ) -> Result<(Vec<DeviceEscrow>, Vec<Receipt>), Refusal> {
-        let me = caller.to_string();
-        let seals = list_seals(caller, directory)?;
-        let held = |device: &str| holders_of(&seals, &me, device);
-        let mut receipts = Vec::new();
-        let mut log = |device: &str, action: SealAction| -> Result<(), Refusal> {
-            for id in held(device) {
-                let zero = merkle::Hash::zero(self.tree_hash());
-                receipts.extend(self.record_seal(&id, action, Some(device), zero)?);
-            }
-            Ok(())
-        };
-        match op {
-            SealOp::EscrowShards {
-                registration,
-                blobs,
-            } => {
-                let rows = shard_rows(&registration, &seals, &me, now, &blobs)?;
-                for row in &rows[1..] {
-                    log(&row.device, SealAction::EscrowShards)?;
-                }
-                directory.shards_replace(caller, &rows)?;
-                eprintln!(
-                    "kuipad: {caller} registered recovery shard set {:05x} with {} device key(s)",
-                    registration.set,
-                    rows.len() - 1
-                );
-                Ok((rows, receipts))
-            }
-            SealOp::EnrollShards { blobs } => {
-                if !directory
-                    .device_escrows(caller)?
-                    .iter()
-                    .any(|e| e.kind == "shards-key")
-                {
-                    return Err(Refusal::because("no recovery shard set to join"));
-                }
-                let mut rows = Vec::new();
-                for (device, blob) in blobs {
-                    if held(&device).is_empty() {
-                        return Err(Refusal::because(
-                            "register the device in a seal before blobbing its key",
-                        ));
-                    }
-                    delivery_ok(&blob)?;
-                    let row = DeviceEscrow {
-                        device,
-                        kind: "shards".into(),
-                        blob,
-                        added: now,
-                    };
-                    log(&row.device, SealAction::EnrollShards)?;
-                    directory.device_escrow_set(caller, &row)?;
-                    rows.push(row);
-                }
-                eprintln!(
-                    "kuipad: {caller} blobbed {} device key(s) to their shard set",
-                    rows.len()
-                );
-                Ok((rows, receipts))
-            }
-            SealOp::RecoverShards => {
-                let rows: Vec<DeviceEscrow> = directory
-                    .device_escrows(caller)?
-                    .into_iter()
-                    .filter(|e| e.kind == "shards-key" || e.kind == "shards")
-                    .collect();
-                // Logged before anything is answered.
-                for e in rows.iter().filter(|e| e.kind == "shards") {
-                    log(&e.device, SealAction::RecoverShards)?;
-                }
-                eprintln!(
-                    "kuipad: {caller} fetched their shard set and {} device key(s)",
-                    rows.iter().filter(|e| e.kind == "shards").count()
-                );
-                Ok((rows, receipts))
-            }
-            _ => unreachable!("only shard operations"),
+        let bytes = tang_pqc::b64::decode(&blob).map_err(Error::from)?;
+        if bytes.is_empty() || bytes.len() > crate::seal::MAX_ESCROW_BLOB {
+            return Err(Refusal::because(
+                "an escrowed key of no or too great a size",
+            ));
         }
-    }
-
-    /// Answer the operations on release requests, device escrows and
-    /// deposits, which concern no descriptor.
-    fn side_op(
-        &self,
-        caller: &Principal,
-        op: SealOp,
-        now: u64,
-        directory: &dyn Directory,
-    ) -> Result<Reply, Refusal> {
-        Ok(match op {
-            op @ (SealOp::Request { .. }
-            | SealOp::Pending { .. }
-            | SealOp::Approve { .. }
-            | SealOp::Deny { .. }) => {
-                let (requests, receipts) = self.release_op(caller, op, now, directory)?;
-                Reply {
-                    receipts,
-                    requests,
-                    ..Reply::default()
-                }
-            }
-            op @ (SealOp::RecoverySettings | SealOp::DeviceKey { .. } | SealOp::Deliver { .. }) => {
-                self.recovery_op(caller, op, now, directory)?
-            }
-            SealOp::Passkeys => Reply {
-                passkeys: Some(PasskeyInfo::of(
-                    &self.info.domain,
-                    &directory.passkeys(caller)?,
-                )),
-                ..Reply::default()
-            },
-            op @ (SealOp::EscrowCode { .. }
-            | SealOp::RecoverCode
-            | SealOp::EscrowShards { .. }
-            | SealOp::EnrollShards { .. }
-            | SealOp::RecoverShards) => {
-                let (escrows, receipts) = self.escrow_op(caller, op, now, directory)?;
-                Reply {
-                    receipts,
-                    escrows,
-                    ..Reply::default()
-                }
-            }
-            op => {
-                let (deposits, receipts) = self.deposit_op(caller, op, now, directory)?;
-                Reply {
-                    receipts,
-                    deposits,
-                    ..Reply::default()
-                }
-            }
-        })
-    }
-
-    /// Answer the recovery operations (`DESIGN-recovery.md` §4): the
-    /// realm's settings, a user's device's public key, and a delivery to
-    /// it.  The last two are for members of the realm's device seal: the
-    /// helpdesk.
-    fn recovery_op(
-        &self,
-        caller: &Principal,
-        op: SealOp,
-        now: u64,
-        directory: &dyn Directory,
-    ) -> Result<Reply, Refusal> {
-        let settings = directory.recovery_settings()?;
-        let (user, device) = match &op {
-            SealOp::RecoverySettings => {
-                return Ok(Reply {
-                    recovery: settings,
-                    ..Reply::default()
-                });
-            }
-            SealOp::DeviceKey { user, device } | SealOp::Deliver { user, device, .. } => {
-                // A bare name is a user of this realm, as a seal's owner is.
-                let user: Principal = if user.contains('@') {
-                    user.parse()?
-                } else {
-                    format!("{user}@{}", self.info.realm).parse()?
-                };
-                (user, device.clone())
-            }
-            _ => unreachable!("only recovery operations"),
+        let escrow = DeviceEscrow {
+            device,
+            kind: "code".into(),
+            blob,
+            added: now,
         };
-        let settings =
-            settings.ok_or_else(|| Refusal::because("the realm has no device recovery"))?;
+        log.log(&escrow.device, SealAction::EscrowCode)?;
+        directory.device_escrow_set(caller, &escrow)?;
+        eprintln!("kuipad: {caller} escrowed device {}", escrow.device);
+        Ok(log.reply(vec![escrow]))
+    }
+
+    /// `recover-code`: return the caller's device keys escrowed under
+    /// recovery codes.
+    fn recover_code(
+        &self,
+        caller: &Principal,
+        directory: &dyn Directory,
+    ) -> Result<Outcome, Refusal> {
+        let mut log = DeviceLog::new(self, caller, directory)?;
+        let escrows = directory.device_escrows(caller)?;
+        // Logged before anything is answered.
+        for e in &escrows {
+            log.log(&e.device, SealAction::RecoverCode)?;
+        }
+        eprintln!(
+            "kuipad: {caller} fetched {} escrowed device key(s)",
+            escrows.len()
+        );
+        Ok(log.reply(escrows))
+    }
+
+    /// `escrow-shards`: replace the caller's recovery shard set
+    /// (`DESIGN-recovery.md` §2.1), logging each device action like the
+    /// code operations.
+    fn escrow_shards(
+        &self,
+        caller: &Principal,
+        registration: &ShardsRegistration,
+        blobs: &[(String, String)],
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Outcome, Refusal> {
+        let mut log = DeviceLog::new(self, caller, directory)?;
+        let rows = shard_rows(registration, &log.seals, &log.me, now, blobs)?;
+        for row in &rows[1..] {
+            log.log(&row.device, SealAction::EscrowShards)?;
+        }
+        directory.shards_replace(caller, &rows)?;
+        eprintln!(
+            "kuipad: {caller} registered recovery shard set {:05x} with {} device key(s)",
+            registration.set,
+            rows.len() - 1
+        );
+        Ok(log.reply(rows))
+    }
+
+    /// `enroll-shards`: add blobs for more devices to the caller's current
+    /// shard set.
+    fn enroll_shards(
+        &self,
+        caller: &Principal,
+        blobs: Vec<(String, String)>,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Outcome, Refusal> {
+        let mut log = DeviceLog::new(self, caller, directory)?;
+        if !directory
+            .device_escrows(caller)?
+            .iter()
+            .any(|e| e.kind == "shards-key")
+        {
+            return Err(Refusal::because("no recovery shard set to join"));
+        }
+        let mut rows = Vec::new();
+        for (device, blob) in blobs {
+            if !log.holds(&device) {
+                return Err(Refusal::because(
+                    "register the device in a seal before blobbing its key",
+                ));
+            }
+            delivery_ok(&blob)?;
+            let row = DeviceEscrow {
+                device,
+                kind: "shards".into(),
+                blob,
+                added: now,
+            };
+            log.log(&row.device, SealAction::EnrollShards)?;
+            directory.device_escrow_set(caller, &row)?;
+            rows.push(row);
+        }
+        eprintln!(
+            "kuipad: {caller} blobbed {} device key(s) to their shard set",
+            rows.len()
+        );
+        Ok(log.reply(rows))
+    }
+
+    /// `recover-shards`: the caller's shard registration and device-key
+    /// blobs.
+    fn recover_shards(
+        &self,
+        caller: &Principal,
+        directory: &dyn Directory,
+    ) -> Result<Outcome, Refusal> {
+        let mut log = DeviceLog::new(self, caller, directory)?;
+        let rows: Vec<DeviceEscrow> = directory
+            .device_escrows(caller)?
+            .into_iter()
+            .filter(|e| e.kind == "shards-key" || e.kind == "shards")
+            .collect();
+        // Logged before anything is answered.
+        for e in rows.iter().filter(|e| e.kind == "shards") {
+            log.log(&e.device, SealAction::RecoverShards)?;
+        }
+        eprintln!(
+            "kuipad: {caller} fetched their shard set and {} device key(s)",
+            rows.iter().filter(|e| e.kind == "shards").count()
+        );
+        Ok(log.reply(rows))
+    }
+
+    /// The recovery operations on a user's device (`DESIGN-recovery.md`
+    /// §4) are for members of the realm's device seal: the helpdesk.  The
+    /// user, the seals holding their `device`, and that device.
+    fn recovery_target(
+        &self,
+        caller: &Principal,
+        user: &str,
+        device: &str,
+        directory: &dyn Directory,
+    ) -> Result<(Principal, Vec<Seal>, crate::seal::Device), Refusal> {
+        let settings = directory
+            .recovery_settings()?
+            .ok_or_else(|| Refusal::because("the realm has no device recovery"))?;
+        // A bare name is a user of this realm, as a seal's owner is.
+        let user: Principal = if user.contains('@') {
+            user.parse()?
+        } else {
+            format!("{user}@{}", self.info.realm).parse()?
+        };
         let helpdesk = self.find_seal(caller, &settings.device_seal, directory)?;
         if !helpdesk.opens(caller, &groups_for(&helpdesk, caller, directory)?) {
             return Err(Refusal::because(
@@ -2951,16 +3083,37 @@ impl EnrollServer {
             .find(|d| d.id == device)
             .cloned()
             .ok_or_else(|| Refusal::because(format!("{user} has registered no device {device}")))?;
-        let SealOp::Deliver { blob, .. } = op else {
-            return Ok(Reply {
-                devices: vec![registered.held_by(&me)],
-                ..Reply::default()
-            });
-        };
-        let bytes = tang_pqc::b64::decode(&blob).map_err(Error::from)?;
-        if !bytes.starts_with(b"IPDD") || bytes.len() > crate::seal::MAX_ESCROW_BLOB {
-            return Err(Refusal::because("not a device delivery"));
-        }
+        Ok((user, seals, registered))
+    }
+
+    /// `device-key`: the public key of `user`'s `device`, to deliver to.
+    fn device_key(
+        &self,
+        caller: &Principal,
+        user: &str,
+        device: &str,
+        directory: &dyn Directory,
+    ) -> Result<Reply, Refusal> {
+        let (user, _, registered) = self.recovery_target(caller, user, device, directory)?;
+        Ok(Reply {
+            devices: vec![registered.held_by(&user.to_string())],
+            ..Reply::default()
+        })
+    }
+
+    /// `deliver`: keep `blob`, a recovered key sealed to `user`'s
+    /// `device`, on their entry until they fetch it.
+    fn deliver(
+        &self,
+        caller: &Principal,
+        user: &str,
+        device: String,
+        blob: String,
+        now: u64,
+        directory: &dyn Directory,
+    ) -> Result<Reply, Refusal> {
+        let (user, seals, _) = self.recovery_target(caller, user, &device, directory)?;
+        delivery_ok(&blob)?;
         let mut receipts = Vec::new();
         for v in &seals {
             let zero = merkle::Hash::zero(self.tree_hash());
@@ -2984,69 +3137,21 @@ impl EnrollServer {
         })
     }
 
-    /// Answer the deposit operations (`DESIGN-recovery.md` §3): deposit,
-    /// list, fetch one, retire one.
-    fn deposit_op(
-        &self,
-        caller: &Principal,
-        op: SealOp,
-        now: u64,
-        directory: &dyn Directory,
-    ) -> Result<(Vec<Deposit>, Vec<Receipt>), Refusal> {
-        let me = caller.to_string();
-        match op {
-            op @ SealOp::Deposit { .. } => self.make_deposit(caller, op, now, directory),
-            SealOp::Deposits { name } => {
-                let (seal, role) = self.resolve_seal(caller, &name, directory)?;
-                let listed = directory
-                    .deposits(&seal.id)?
-                    .into_iter()
-                    .filter(|d| role >= Role::Member || d.depositor == me)
-                    .map(|mut d| {
-                        d.sealed.clear();
-                        d
-                    })
-                    .collect();
-                Ok((listed, Vec::new()))
-            }
-            SealOp::FetchDeposit { name, id } => {
-                let (seal, role) = self.resolve_seal(caller, &name, directory)?;
-                need_member(role)?;
-                Ok((vec![find_deposit(&seal, &id, directory)?], Vec::new()))
-            }
-            SealOp::RetireDeposit { name, id } => {
-                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
-                let deposit = find_deposit(&seal, &id, directory)?;
-                if deposit.depositor != me {
-                    need(role, Role::Manager, "retire another's deposit")?;
-                }
-                let receipts = self.retire_deposits(&mut seal, &[deposit], directory)?;
-                Ok((Vec::new(), receipts))
-            }
-            _ => unreachable!("only deposit operations"),
-        }
-    }
-
     /// `deposit`: keep a file sealed to the seal, in place of the
     /// depositor's earlier one of the same kind and subject.
+    #[allow(clippy::too_many_arguments)]
     fn make_deposit(
         &self,
         caller: &Principal,
-        op: SealOp,
+        name: &str,
+        kind: crate::seal::DepositKind,
+        subject: std::collections::BTreeMap<String, String>,
+        sealed: String,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vec<Deposit>, Vec<Receipt>), Refusal> {
-        let SealOp::Deposit {
-            name,
-            kind,
-            subject,
-            sealed,
-        } = op
-        else {
-            unreachable!("only deposit");
-        };
         // Any role deposits, a depositor's included.
-        let (mut seal, _) = self.resolve_seal(caller, &name, directory)?;
+        let (mut seal, _) = self.resolve_seal(caller, name, directory)?;
         if seal.state != State::Enabled {
             return Err(Refusal::because("the seal is revoked"));
         }
@@ -3300,24 +3405,19 @@ impl EnrollServer {
 
     /// `add-device`: register a device key of the caller's in a seal,
     /// held by them.
+    #[allow(clippy::too_many_arguments)]
     fn add_device(
         &self,
         caller: &Principal,
-        op: SealOp,
+        name: &str,
+        label: &str,
+        kind: crate::seal::DeviceType,
+        alg: u8,
+        key: &str,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<Seal, Refusal> {
-        let SealOp::AddDevice {
-            name,
-            label,
-            kind,
-            alg,
-            key,
-        } = op
-        else {
-            unreachable!("only add-device");
-        };
-        let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
+        let (mut seal, role) = self.resolve_seal(caller, name, directory)?;
         need_member(role)?;
         let me = caller.to_string();
         if seal.devices.len() >= 255 {
@@ -3330,11 +3430,11 @@ impl EnrollServer {
         }
         let public = tang_pqc::ExchangeKey::from_bytes(
             tang_pqc::KemAlg::from_id(alg).map_err(Error::from)?,
-            &tang_pqc::b64::decode(&key).map_err(Error::from)?,
+            &tang_pqc::b64::decode(key).map_err(Error::from)?,
         )
         .map_err(Error::from)?;
         // No attestation is verified yet: every device is `any`.
-        let device = crate::seal::Device::new(&public, &label, kind, now).held_by(&me);
+        let device = crate::seal::Device::new(&public, label, kind, now).held_by(&me);
         self.check_device_deposit(caller, &device, directory)?;
         if seal.devices.iter().any(|d| d.id == device.id) {
             return Err(Refusal::because("device already registered"));
@@ -3421,100 +3521,25 @@ impl EnrollServer {
         Ok(seal)
     }
 
-    fn apply_seal_op(
+    /// Record what the operation changes in the ledger, once: `seal` after
+    /// it.  `require_log` refuses where this server keeps no log.
+    fn record_op(
         &self,
-        caller: &Principal,
-        op: SealOp,
-        now: u64,
-        directory: &dyn Directory,
-        record: &mut dyn FnMut(&Seal) -> Result<(), Refusal>,
-    ) -> Result<Vec<Seal>, Refusal> {
-        let admin_revoke = matches!(&op, SealOp::AdminRevoke { .. });
-        let seal = match op {
-            SealOp::List => return list_seals(caller, directory),
-            SealOp::Unlock { .. }
-            | SealOp::Passkeys
-            | SealOp::Request { .. }
-            | SealOp::Pending { .. }
-            | SealOp::Approve { .. }
-            | SealOp::Deny { .. }
-            | SealOp::EscrowCode { .. }
-            | SealOp::RecoverCode
-            | SealOp::EscrowShards { .. }
-            | SealOp::EnrollShards { .. }
-            | SealOp::RecoverShards
-            | SealOp::Deposit { .. }
-            | SealOp::Deposits { .. }
-            | SealOp::FetchDeposit { .. }
-            | SealOp::RetireDeposit { .. }
-            | SealOp::RecoverySettings
-            | SealOp::DeviceKey { .. }
-            | SealOp::Deliver { .. } => unreachable!("answered by seal_op"),
-            SealOp::Create { name, policy } => {
-                return Self::create_seal(caller, name, policy, now, directory, record);
+        event: &mut Option<(SealAction, Option<String>)>,
+        receipts: &mut Vec<Receipt>,
+        require_log: bool,
+        seal: &Seal,
+    ) -> Result<(), Refusal> {
+        if let Some((action, device)) = event.take() {
+            let receipt = self.record_change(seal, action, device)?;
+            if require_log && receipt.is_none() {
+                return Err(Refusal::because(
+                    "seal administration requires a transparency log",
+                ));
             }
-            SealOp::Show { name } => {
-                return Ok(vec![self.resolve_seal(caller, &name, directory)?.0]);
-            }
-            SealOp::Register { name, add, retire } => {
-                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
-                need_member(role)?;
-                register_bindings(&mut seal, add, &retire)?;
-                seal
-            }
-            SealOp::SetPolicy { name, mut policy } => {
-                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
-                need(role, Role::Manager, "change its policy")?;
-                limits_for(&seal.owner, directory)?.apply(&mut policy, now)?;
-                normalize_approvers(&mut policy, &self.info.realm)?;
-                seal.policy = policy;
-                seal
-            }
-            SealOp::Share {
-                name,
-                managers,
-                members,
-                depositors,
-            } => {
-                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
-                need(role, Role::Manager, "share it")?;
-                let limits = limits_for(&seal.owner, directory)?;
-                self.share(&mut seal, [&managers, &members, &depositors], &limits)?;
-                seal
-            }
-            SealOp::Unshare {
-                name,
-                managers,
-                members,
-                depositors,
-            } => {
-                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
-                self.unshare(&mut seal, caller, role, [&managers, &members, &depositors])?;
-                seal
-            }
-            op @ SealOp::AddDevice { .. } => self.add_device(caller, op, now, directory)?,
-            SealOp::RemoveDevice { name, id } => {
-                self.remove_device(caller, &name, &id, directory)?
-            }
-            SealOp::Revoke { name } => {
-                let (mut seal, role) = self.resolve_seal(caller, &name, directory)?;
-                need(role, Role::Manager, "revoke it")?;
-                seal.state = State::Revoked;
-                seal
-            }
-            SealOp::AdminRevoke { owner, name } => {
-                Self::admin_revoke_seal(caller, &owner, &name, directory)?
-            }
-        };
-        record(&seal)?;
-        directory.seal_update(&seal)?;
-        if admin_revoke {
-            eprintln!(
-                "kuipad: {caller} administratively revoked seal {} ({}) owned by {}",
-                seal.id, seal.name, seal.owner
-            );
+            receipts.extend(receipt);
         }
-        Ok(vec![seal])
+        Ok(())
     }
 
     /// The trusted anchors, and each one's current vouch head where it
