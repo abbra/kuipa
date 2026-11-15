@@ -738,6 +738,11 @@ pub fn read_epoch_from(
 /// optional epoch watermark (§4.8).
 type AnchorsFile = (Vec<Pin>, Option<(u64, kuipa_enroll::epoch::EpochHead)>);
 
+/// A malformed `line` of the pin file `path`: `<path>: <what> in "<line>"`.
+fn bad(path: &Path, line: &str, what: &str) -> Error {
+    format!("{}: {what} in {line:?}", path.display()).into()
+}
+
 fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
     let text = fs::read_to_string(path)?;
     let mut pins = Vec::new();
@@ -762,12 +767,12 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
             let seq = fields
                 .next()
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("{}: bad epoch sequence in {l:?}", path.display()))?;
+                .ok_or_else(|| bad(path, l, "bad epoch sequence"))?;
             let head: kuipa_enroll::epoch::EpochHead = fields
                 .next()
                 .and_then(|f| tang_pqc::b64::decode(f).ok())
                 .and_then(|h| h.try_into().ok())
-                .ok_or_else(|| format!("{}: bad epoch hash in {l:?}", path.display()))?;
+                .ok_or_else(|| bad(path, l, "bad epoch hash"))?;
             if fields.next().is_some() {
                 return Err(format!("{}: unexpected text after {l:?}", path.display()).into());
             }
@@ -779,12 +784,12 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
         }
         let anchor: tang_pqc::Thumbprint = first
             .parse()
-            .map_err(|_| format!("{}: malformed anchor thumbprint in {l:?}", path.display()))?;
+            .map_err(|_| bad(path, l, "malformed anchor thumbprint"))?;
         // One line per anchor: two lines for one anchor would say two
         // different things about it, and the file is an administrator's
         // assertion that must round-trip.
         if pins.iter().any(|p: &Pin| p.anchor == anchor) {
-            return Err(format!("{}: duplicate anchor in {l:?}", path.display()).into());
+            return Err(bad(path, l, "duplicate anchor"));
         }
         // The rest is `[<expiry>] [<size> <root>]… [frozen]`: an expiry
         // is a decimal number, a head is a number followed by a
@@ -827,7 +832,7 @@ fn read_anchors_file(path: &Path) -> Result<AnchorsFile, Error> {
             // head covers is what the pin accepts, so a frozen pin with
             // no head — even one with an expiry — must fail at parse,
             // not refuse every server at runtime.
-            return Err(format!("{}: frozen without a head in {l:?}", path.display()).into());
+            return Err(bad(path, l, "frozen without a head"));
         }
         if heads.len() > MAX_HEAD_WINDOW {
             return Err(format!(
@@ -868,34 +873,32 @@ fn parse_retired<'a>(
     let anchor: tang_pqc::Thumbprint = fields
         .next()
         .and_then(|a| a.parse().ok())
-        .ok_or_else(|| format!("{}: bad retired anchor in {line:?}", path.display()))?;
+        .ok_or_else(|| bad(path, line, "bad retired anchor"))?;
     let leaves: Vec<Hash> = fields
         .map(|f| parse_root(f, line, path))
         .collect::<Result<_, _>>()?;
     if leaves.is_empty() {
-        return Err(format!("{}: no retired claims in {line:?}", path.display()).into());
+        return Err(bad(path, line, "no retired claims"));
     }
     Ok((anchor, leaves))
 }
 
 fn parse_expiry(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
     if !is_number(field) {
-        return Err(format!("{}: bad expiry in {line:?}", path.display()).into());
+        return Err(bad(path, line, "bad expiry"));
     }
-    field
-        .parse()
-        .map_err(|_| format!("{}: bad expiry in {line:?}", path.display()).into())
+    field.parse().map_err(|_| bad(path, line, "bad expiry"))
 }
 
 fn parse_size(field: &str, line: &str, path: &Path) -> Result<u64, Error> {
     if !is_number(field) {
-        return Err(format!("{}: bad head size in {line:?}", path.display()).into());
+        return Err(bad(path, line, "bad head size"));
     }
     let size = field
         .parse()
-        .map_err(|_| format!("{}: bad head size in {line:?}", path.display()))?;
+        .map_err(|_| bad(path, line, "bad head size"))?;
     if size == 0 {
-        return Err(format!("{}: zero head size in {line:?}", path.display()).into());
+        return Err(bad(path, line, "zero head size"));
     }
     Ok(size)
 }
@@ -925,7 +928,7 @@ fn looks_like_head(first: &str, second: &str) -> bool {
 /// A malformed size or root.
 fn parse_pairs(fields: &[&str], line: &str, path: &Path) -> Result<Vec<(u64, Hash)>, Error> {
     if !fields.len().is_multiple_of(2) {
-        return Err(format!("{}: odd head fields in {line:?}", path.display()).into());
+        return Err(bad(path, line, "odd head fields"));
     }
     fields
         .chunks(2)
@@ -947,7 +950,7 @@ fn parse_pairs(fields: &[&str], line: &str, path: &Path) -> Result<Vec<(u64, Has
 fn check_window(heads: &[(u64, Hash)], line: &str, path: &Path) -> Result<(), Error> {
     for pair in heads.windows(2) {
         if pair[1].0 <= pair[0].0 {
-            return Err(format!("{}: head sizes must grow in {line:?}", path.display()).into());
+            return Err(bad(path, line, "head sizes must grow"));
         }
     }
     Ok(())
@@ -961,8 +964,7 @@ fn decode_hash(field: &str) -> Option<Hash> {
 }
 
 fn parse_root(field: &str, line: &str, path: &Path) -> Result<Hash, Error> {
-    decode_hash(field)
-        .ok_or_else(|| format!("{}: bad head root in {line:?}", path.display()).into())
+    decode_hash(field).ok_or_else(|| bad(path, line, "bad head root"))
 }
 
 /// Write the pinned anchors.
