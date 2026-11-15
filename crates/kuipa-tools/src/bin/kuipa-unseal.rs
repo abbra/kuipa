@@ -34,10 +34,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use kuipa_tools::flows::{self, Outcome};
+use kuipa_tools::flows;
 use kuipa_tools::output::Output;
 use kuipa_tools::paths::{self, Error, Paths, State};
-use kuipa_tools::trace;
 
 #[derive(Parser)]
 #[command(
@@ -69,18 +68,7 @@ struct Args {
     #[arg(long, requires = "out")]
     force: bool,
     #[command(flatten)]
-    tracing: Tracing,
-}
-
-#[derive(clap::Args)]
-struct Tracing {
-    /// Trace each request and decision on standard error.
-    #[arg(long)]
-    verbose: bool,
-    /// Trace with wire details (`$KUIPA_TRACE` overrides with `tracing`
-    /// filter directives).
-    #[arg(long)]
-    trace: bool,
+    tracing: kuipa_tools::cli::Tracing,
 }
 
 /// The loader protocol: gssproxy passes a memfd as fd 3.
@@ -143,24 +131,6 @@ fn run(args: &Args) -> Result<(), Error> {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    trace::init(if args.tracing.trace {
-        trace::Level::Details
-    } else if args.tracing.verbose {
-        trace::Level::Steps
-    } else {
-        trace::Level::Off
-    });
-    match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("kuipa-unseal: {e}");
-            if e.downcast_ref::<Outcome>()
-                .is_some_and(|o| matches!(o, Outcome::RetryLater(_)))
-            {
-                ExitCode::from(75)
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-    }
+    args.tracing.init();
+    kuipa_tools::cli::finish("kuipa-unseal", run(&args))
 }

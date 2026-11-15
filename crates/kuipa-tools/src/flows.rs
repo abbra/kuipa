@@ -90,6 +90,14 @@ impl std::fmt::Display for Outcome {
 
 impl std::error::Error for Outcome {}
 
+impl Outcome {
+    /// Whether `e` says to try again later.
+    #[must_use]
+    pub fn is_retry(e: &Error) -> bool {
+        matches!(e.downcast_ref::<Self>(), Some(Self::RetryLater(_)))
+    }
+}
+
 pub(crate) fn now() -> SystemTime {
     SystemTime::now()
 }
@@ -1762,9 +1770,7 @@ pub fn unseal_all(paths: &Paths) -> Result<Value, Error> {
     let mut failed = Vec::new();
     let mut retry = false;
     let mut note = |what: String, e: Error| {
-        retry |= e
-            .downcast_ref::<Outcome>()
-            .is_some_and(|o| matches!(o, Outcome::RetryLater(_)));
+        retry |= Outcome::is_retry(&e);
         failed.push(format!("{what}: {e}"));
     };
     if state.holder == Holder::File {

@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod backup;
+pub mod cli;
 pub mod dns;
 pub mod escrow;
 pub mod flows;

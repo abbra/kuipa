@@ -112,7 +112,6 @@ use kuipa_enroll::realm::Deployment;
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::{self, Error, Paths};
 use kuipa_tools::preauth::prompt;
-use kuipa_tools::trace;
 use native_ossl::util::SecretBuf;
 use serde_json::Value;
 use tang_pqc::Thumbprint;
@@ -133,13 +132,8 @@ struct Cli {
     /// Print the result as one JSON object instead of text.
     #[arg(long, global = true)]
     json: bool,
-    /// Trace each request, decision and file written on standard error.
-    #[arg(long, global = true)]
-    verbose: bool,
-    /// Trace with wire details (`$KUIPA_TRACE` overrides with `tracing`
-    /// filter directives).
-    #[arg(long, global = true)]
-    trace: bool,
+    #[command(flatten)]
+    tracing: kuipa_tools::cli::Tracing,
     #[command(subcommand)]
     command: Command,
 }
@@ -1937,7 +1931,7 @@ fn render_sign(value: &Value) {
             text(&value["purpose"]),
             text(&value["server"]),
             text(&value["log"]),
-            &value["index"]
+            value["index"]
         );
         return;
     }
@@ -1953,7 +1947,7 @@ fn render_sign(value: &Value) {
         text(&value["purpose"]),
         text(&value["server"]),
         text(&value["log"]),
-        &value["index"]
+        value["index"]
     );
 }
 
@@ -2029,7 +2023,7 @@ fn render_tlog(value: &Value) {
         }
         println!(
             "A head needs {} of {} trusted witnesses' cosignatures.",
-            &value["required"],
+            value["required"],
             list.len()
         );
         return;
@@ -2136,7 +2130,7 @@ fn pending_rows(value: &Value, done: &str) {
     let Some(pending) = value.get("pending").filter(|p| !p.is_null()) else {
         return;
     };
-    println!("  {done} for {}:", &pending["fqdn"]);
+    println!("  {done} for {}:", pending["fqdn"]);
     let mut rows = Rows {
         indent: 2,
         ..Rows::default()
@@ -2233,7 +2227,7 @@ fn render_advertisement(value: &Value, paths: &Paths) {
     for s in list(&value["servers"]) {
         println!();
         let server = s["server"].as_str().unwrap_or("server");
-        if &s["ok"] == &Value::Bool(false) {
+        if s["ok"] == Value::Bool(false) {
             println!(
                 "{server}: {}",
                 s["error"].as_str().unwrap_or("unusable")
@@ -2292,7 +2286,7 @@ fn render_advertisement(value: &Value, paths: &Paths) {
         for l in landmarks {
             println!(
                 "    sequence {} head {} (follows {})",
-                &l["seq"],
+                l["seq"],
                 l["head"].as_str().unwrap_or(""),
                 l["prev"].as_str().unwrap_or("")
             );
@@ -2389,7 +2383,7 @@ fn anchor_index_rows(value: &Value) {
 
 fn render_status(value: &Value, paths: &Paths) {
     println!("What kuipa has installed for {}", this_host(paths));
-    if &value["enrolled"] == &Value::Bool(false) {
+    if value["enrolled"] == Value::Bool(false) {
         println!(
             "  enrolled: no{}",
             match &value["prepared"] {
@@ -2477,7 +2471,7 @@ fn render_check(value: &Value, paths: &Paths) {
     println!("  servers:");
     for s in list(&value["servers"]) {
         let server = s["server"].as_str().unwrap_or("server");
-        if &s["ok"] == &Value::Bool(false) {
+        if s["ok"] == Value::Bool(false) {
             println!(
                 "    {server}: {}",
                 s["error"].as_str().unwrap_or("unusable")
@@ -3357,7 +3351,7 @@ fn render_recovery(value: &Value) -> bool {
             "This host's device {} is registered in {} seal(s), and {} file(s) are resealed to it.",
             value["device"].as_str().unwrap_or("?"),
             list(&value["seals"]).len(),
-            &value["resealed"]
+            value["resealed"]
         );
         match value["retired"].as_str() {
             Some(old) => println!("Device {old} is retired: it opens nothing any more."),
@@ -3541,13 +3535,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let paths = Paths::from_env();
     krb5_config_fallback(&paths);
-    trace::init(if cli.trace {
-        trace::Level::Details
-    } else if cli.verbose {
-        trace::Level::Steps
-    } else {
-        trace::Level::Off
-    });
+    cli.tracing.init();
     let args = cli.args();
     tracing::debug!("kuipa {}", args.command);
     if let Some(dir) = advertisement_cache(&paths) {
@@ -3581,9 +3569,10 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("kuipa {}: {e}", args.command);
-            match e.downcast_ref::<Outcome>() {
-                Some(Outcome::RetryLater(_)) => ExitCode::from(75),
-                _ => ExitCode::FAILURE,
+            if Outcome::is_retry(&e) {
+                ExitCode::from(75)
+            } else {
+                ExitCode::FAILURE
             }
         }
     }

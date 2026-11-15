@@ -228,11 +228,5 @@ fn run(command: Command) -> Result<(), Error> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli.command) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("kuipa-voucher: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    kuipa_tools::cli::finish("kuipa-voucher", run(cli.command))
 }
