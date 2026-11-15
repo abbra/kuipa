@@ -1893,7 +1893,7 @@ impl<'a> SealClient<'a> {
             return Err("a token's key never leaves the token: it has no shards".into());
         };
         let mut seed = [0u8; 32];
-        Rand::fill(&mut seed)?;
+        Rand::fill_private(&mut seed)?;
         let params = shards::SetParams::new(threshold, shares, false);
         let salt = shards::new_salt().map_err(|e| e.to_string())?;
         let hidden = shards::mask(
