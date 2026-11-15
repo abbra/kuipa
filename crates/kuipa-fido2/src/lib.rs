@@ -55,108 +55,108 @@ pub mod cose {
 mod ffi {
     use std::ffi::{c_char, c_int, c_uchar};
 
-    pub enum fido_dev_t {}
-    pub enum fido_dev_info_t {}
-    pub enum fido_assert_t {}
-    pub enum fido_cred_t {}
+    pub(crate) enum fido_dev_t {}
+    pub(crate) enum fido_dev_info_t {}
+    pub(crate) enum fido_assert_t {}
+    pub(crate) enum fido_cred_t {}
 
-    pub const FIDO_OK: c_int = 0;
-    pub const FIDO_ERR_UNSUPPORTED_ALGORITHM: c_int = 0x26;
-    pub const FIDO_ERR_NO_CREDENTIALS: c_int = 0x2e;
-    pub const FIDO_ERR_PIN_INVALID: c_int = 0x31;
-    pub const FIDO_ERR_PIN_BLOCKED: c_int = 0x32;
-    pub const FIDO_ERR_PIN_REQUIRED: c_int = 0x36;
+    pub(crate) const FIDO_OK: c_int = 0;
+    pub(crate) const FIDO_ERR_UNSUPPORTED_ALGORITHM: c_int = 0x26;
+    pub(crate) const FIDO_ERR_NO_CREDENTIALS: c_int = 0x2e;
+    pub(crate) const FIDO_ERR_PIN_INVALID: c_int = 0x31;
+    pub(crate) const FIDO_ERR_PIN_BLOCKED: c_int = 0x32;
+    pub(crate) const FIDO_ERR_PIN_REQUIRED: c_int = 0x36;
     /// libfido2's own: what `fido_cred_set_type` answers for an algorithm
     /// it was built without.
-    pub const FIDO_ERR_INVALID_ARGUMENT: c_int = -7;
-    pub const FIDO_EXT_HMAC_SECRET: c_int = 0x01;
+    pub(crate) const FIDO_ERR_INVALID_ARGUMENT: c_int = -7;
+    pub(crate) const FIDO_EXT_HMAC_SECRET: c_int = 0x01;
     /// `fido_opt_t`.
-    pub const FIDO_OPT_OMIT: c_int = 0;
-    pub const FIDO_OPT_TRUE: c_int = 2;
+    pub(crate) const FIDO_OPT_OMIT: c_int = 0;
+    pub(crate) const FIDO_OPT_TRUE: c_int = 2;
 
     #[link(name = "fido2")]
     unsafe extern "C" {
-        pub fn fido_init(flags: c_int);
-        pub fn fido_strerr(code: c_int) -> *const c_char;
+        pub(crate) fn fido_init(flags: c_int);
+        pub(crate) fn fido_strerr(code: c_int) -> *const c_char;
 
-        pub fn fido_dev_info_new(n: usize) -> *mut fido_dev_info_t;
-        pub fn fido_dev_info_free(list: *mut *mut fido_dev_info_t, n: usize);
-        pub fn fido_dev_info_manifest(
+        pub(crate) fn fido_dev_info_new(n: usize) -> *mut fido_dev_info_t;
+        pub(crate) fn fido_dev_info_free(list: *mut *mut fido_dev_info_t, n: usize);
+        pub(crate) fn fido_dev_info_manifest(
             list: *mut fido_dev_info_t,
             ilen: usize,
             olen: *mut usize,
         ) -> c_int;
-        pub fn fido_dev_info_ptr(list: *const fido_dev_info_t, i: usize) -> *const fido_dev_info_t;
-        pub fn fido_dev_info_path(di: *const fido_dev_info_t) -> *const c_char;
-        pub fn fido_dev_info_manufacturer_string(di: *const fido_dev_info_t) -> *const c_char;
-        pub fn fido_dev_info_product_string(di: *const fido_dev_info_t) -> *const c_char;
+        pub(crate) fn fido_dev_info_ptr(list: *const fido_dev_info_t, i: usize) -> *const fido_dev_info_t;
+        pub(crate) fn fido_dev_info_path(di: *const fido_dev_info_t) -> *const c_char;
+        pub(crate) fn fido_dev_info_manufacturer_string(di: *const fido_dev_info_t) -> *const c_char;
+        pub(crate) fn fido_dev_info_product_string(di: *const fido_dev_info_t) -> *const c_char;
 
-        pub fn fido_dev_new() -> *mut fido_dev_t;
-        pub fn fido_dev_free(dev: *mut *mut fido_dev_t);
-        pub fn fido_dev_open(dev: *mut fido_dev_t, path: *const c_char) -> c_int;
-        pub fn fido_dev_close(dev: *mut fido_dev_t) -> c_int;
-        pub fn fido_dev_has_pin(dev: *const fido_dev_t) -> bool;
-        pub fn fido_dev_get_assert(
+        pub(crate) fn fido_dev_new() -> *mut fido_dev_t;
+        pub(crate) fn fido_dev_free(dev: *mut *mut fido_dev_t);
+        pub(crate) fn fido_dev_open(dev: *mut fido_dev_t, path: *const c_char) -> c_int;
+        pub(crate) fn fido_dev_close(dev: *mut fido_dev_t) -> c_int;
+        pub(crate) fn fido_dev_has_pin(dev: *const fido_dev_t) -> bool;
+        pub(crate) fn fido_dev_get_assert(
             dev: *mut fido_dev_t,
             assert: *mut fido_assert_t,
             pin: *const c_char,
         ) -> c_int;
-        pub fn fido_dev_make_cred(
+        pub(crate) fn fido_dev_make_cred(
             dev: *mut fido_dev_t,
             cred: *mut fido_cred_t,
             pin: *const c_char,
         ) -> c_int;
 
-        pub fn fido_assert_new() -> *mut fido_assert_t;
-        pub fn fido_assert_free(assert: *mut *mut fido_assert_t);
-        pub fn fido_assert_set_rp(assert: *mut fido_assert_t, id: *const c_char) -> c_int;
-        pub fn fido_assert_set_clientdata_hash(
+        pub(crate) fn fido_assert_new() -> *mut fido_assert_t;
+        pub(crate) fn fido_assert_free(assert: *mut *mut fido_assert_t);
+        pub(crate) fn fido_assert_set_rp(assert: *mut fido_assert_t, id: *const c_char) -> c_int;
+        pub(crate) fn fido_assert_set_clientdata_hash(
             assert: *mut fido_assert_t,
             ptr: *const c_uchar,
             len: usize,
         ) -> c_int;
-        pub fn fido_assert_allow_cred(
+        pub(crate) fn fido_assert_allow_cred(
             assert: *mut fido_assert_t,
             ptr: *const c_uchar,
             len: usize,
         ) -> c_int;
-        pub fn fido_assert_set_uv(assert: *mut fido_assert_t, uv: c_int) -> c_int;
-        pub fn fido_assert_set_extensions(assert: *mut fido_assert_t, ext: c_int) -> c_int;
-        pub fn fido_assert_set_hmac_salt(
+        pub(crate) fn fido_assert_set_uv(assert: *mut fido_assert_t, uv: c_int) -> c_int;
+        pub(crate) fn fido_assert_set_extensions(assert: *mut fido_assert_t, ext: c_int) -> c_int;
+        pub(crate) fn fido_assert_set_hmac_salt(
             assert: *mut fido_assert_t,
             ptr: *const c_uchar,
             len: usize,
         ) -> c_int;
-        pub fn fido_assert_count(assert: *const fido_assert_t) -> usize;
-        pub fn fido_assert_id_ptr(assert: *const fido_assert_t, i: usize) -> *const c_uchar;
-        pub fn fido_assert_id_len(assert: *const fido_assert_t, i: usize) -> usize;
-        pub fn fido_assert_authdata_raw_ptr(
+        pub(crate) fn fido_assert_count(assert: *const fido_assert_t) -> usize;
+        pub(crate) fn fido_assert_id_ptr(assert: *const fido_assert_t, i: usize) -> *const c_uchar;
+        pub(crate) fn fido_assert_id_len(assert: *const fido_assert_t, i: usize) -> usize;
+        pub(crate) fn fido_assert_authdata_raw_ptr(
             assert: *const fido_assert_t,
             i: usize,
         ) -> *const c_uchar;
-        pub fn fido_assert_authdata_raw_len(assert: *const fido_assert_t, i: usize) -> usize;
-        pub fn fido_assert_sig_ptr(assert: *const fido_assert_t, i: usize) -> *const c_uchar;
-        pub fn fido_assert_sig_len(assert: *const fido_assert_t, i: usize) -> usize;
-        pub fn fido_assert_hmac_secret_ptr(
+        pub(crate) fn fido_assert_authdata_raw_len(assert: *const fido_assert_t, i: usize) -> usize;
+        pub(crate) fn fido_assert_sig_ptr(assert: *const fido_assert_t, i: usize) -> *const c_uchar;
+        pub(crate) fn fido_assert_sig_len(assert: *const fido_assert_t, i: usize) -> usize;
+        pub(crate) fn fido_assert_hmac_secret_ptr(
             assert: *const fido_assert_t,
             i: usize,
         ) -> *const c_uchar;
-        pub fn fido_assert_hmac_secret_len(assert: *const fido_assert_t, i: usize) -> usize;
+        pub(crate) fn fido_assert_hmac_secret_len(assert: *const fido_assert_t, i: usize) -> usize;
 
-        pub fn fido_cred_new() -> *mut fido_cred_t;
-        pub fn fido_cred_free(cred: *mut *mut fido_cred_t);
-        pub fn fido_cred_set_type(cred: *mut fido_cred_t, cose_alg: c_int) -> c_int;
-        pub fn fido_cred_set_clientdata_hash(
+        pub(crate) fn fido_cred_new() -> *mut fido_cred_t;
+        pub(crate) fn fido_cred_free(cred: *mut *mut fido_cred_t);
+        pub(crate) fn fido_cred_set_type(cred: *mut fido_cred_t, cose_alg: c_int) -> c_int;
+        pub(crate) fn fido_cred_set_clientdata_hash(
             cred: *mut fido_cred_t,
             ptr: *const c_uchar,
             len: usize,
         ) -> c_int;
-        pub fn fido_cred_set_rp(
+        pub(crate) fn fido_cred_set_rp(
             cred: *mut fido_cred_t,
             id: *const c_char,
             name: *const c_char,
         ) -> c_int;
-        pub fn fido_cred_set_user(
+        pub(crate) fn fido_cred_set_user(
             cred: *mut fido_cred_t,
             user_id: *const c_uchar,
             user_id_len: usize,
@@ -164,11 +164,11 @@ mod ffi {
             display_name: *const c_char,
             icon: *const c_char,
         ) -> c_int;
-        pub fn fido_cred_set_extensions(cred: *mut fido_cred_t, ext: c_int) -> c_int;
-        pub fn fido_cred_set_rk(cred: *mut fido_cred_t, rk: c_int) -> c_int;
-        pub fn fido_cred_id_ptr(cred: *const fido_cred_t) -> *const c_uchar;
-        pub fn fido_cred_id_len(cred: *const fido_cred_t) -> usize;
-        pub fn fido_cred_type(cred: *const fido_cred_t) -> c_int;
+        pub(crate) fn fido_cred_set_extensions(cred: *mut fido_cred_t, ext: c_int) -> c_int;
+        pub(crate) fn fido_cred_set_rk(cred: *mut fido_cred_t, rk: c_int) -> c_int;
+        pub(crate) fn fido_cred_id_ptr(cred: *const fido_cred_t) -> *const c_uchar;
+        pub(crate) fn fido_cred_id_len(cred: *const fido_cred_t) -> usize;
+        pub(crate) fn fido_cred_type(cred: *const fido_cred_t) -> c_int;
     }
 }
 

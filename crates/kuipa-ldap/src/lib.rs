@@ -19,8 +19,8 @@
 //! # }
 //! ```
 
-pub mod conn;
-pub mod ffi;
+mod conn;
+mod ffi;
 
 pub use conn::{ExtendedResult, LdapConnection, ModOp, SearchEntry};
 

@@ -8,31 +8,32 @@
 //! `OpenLDAP` 2.6 on x86-64 Linux.
 
 #![allow(non_camel_case_types, dead_code)]
+#![allow(clippy::upper_case_acronyms, clippy::struct_field_names)] // names mirror the C headers
 
 use libc::{c_char, c_int, c_uint, c_ulong, c_void, timeval};
 
 // ── Primitive type aliases ────────────────────────────────────────────────────
 
 /// Length type used in BER/LDAP structures (`unsigned long` on LP64).
-pub type ber_len_t = c_ulong;
+pub(crate) type ber_len_t = c_ulong;
 
 // ── Opaque handle types ───────────────────────────────────────────────────────
 
 /// Opaque LDAP session handle; never dereferenced in Rust.
 #[repr(C)]
-pub struct LDAP {
+pub(crate) struct LDAP {
     _opaque: [u8; 0],
 }
 
 /// Opaque LDAP message / result set handle.
 #[repr(C)]
-pub struct LDAPMessage {
+pub(crate) struct LDAPMessage {
     _opaque: [u8; 0],
 }
 
 /// Opaque BER element cursor, used when iterating attributes.
 #[repr(C)]
-pub struct BerElement {
+pub(crate) struct BerElement {
     _opaque: [u8; 0],
 }
 
@@ -42,7 +43,7 @@ pub struct BerElement {
 ///
 /// Layout verified: size 16, align 8, `bv_len` at offset 0, `bv_val` at 8.
 #[repr(C)]
-pub struct berval {
+pub(crate) struct berval {
     pub bv_len: ber_len_t,
     pub bv_val: *mut c_char,
 }
@@ -52,7 +53,7 @@ pub struct berval {
 /// Layout verified: size 32, align 8.
 /// Fields: `ldctl_oid` at 0, `ldctl_value` at 8, `ldctl_iscritical` at 24.
 #[repr(C)]
-pub struct LDAPControl {
+pub(crate) struct LDAPControl {
     /// OID of the control (NUL-terminated C string; owned by libldap).
     pub ldctl_oid: *mut c_char,
     /// DER-encoded control value.
@@ -66,7 +67,7 @@ pub struct LDAPControl {
 /// Layout verified: size 48, align 8 on LP64 (Linux/macOS x86-64/aarch64).
 /// The compile-time assertions below confirm this at build time.
 #[repr(C)]
-pub struct sasl_interact {
+pub(crate) struct sasl_interact {
     /// Callback identifier.  `SASL_CB_LIST_END` (0) terminates the array.
     pub id: c_ulong,
     pub challenge: *const c_char,
@@ -91,32 +92,32 @@ const _: () = {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// LDAP operation succeeded.
-pub const LDAP_SUCCESS: c_int = 0;
+pub(crate) const LDAP_SUCCESS: c_int = 0;
 
 /// Returned by `ldap_sasl_bind` / `ldap_sasl_interactive_bind` when more
 /// round-trips are needed to complete a multi-step SASL exchange.
-pub const LDAP_SASL_BIND_IN_PROGRESS: c_int = 0x0e;
+pub(crate) const LDAP_SASL_BIND_IN_PROGRESS: c_int = 0x0e;
 
 /// `ldap_set_option` / `ldap_get_option` return this on failure.
-pub const LDAP_OPT_ERROR: c_int = -1;
+pub(crate) const LDAP_OPT_ERROR: c_int = -1;
 
 /// Option: `LDAPv3` protocol version (`int *` argument).
-pub const LDAP_OPT_PROTOCOL_VERSION: c_int = 0x0011;
+pub(crate) const LDAP_OPT_PROTOCOL_VERSION: c_int = 0x0011;
 
 /// Option: socket file descriptor of the current connection (`int *` out-argument).
-pub const LDAP_OPT_DESC: c_int = 0x0001;
+pub(crate) const LDAP_OPT_DESC: c_int = 0x0001;
 
 /// Option: path to a PEM CA certificate file for TLS (`char *` argument).
-pub const LDAP_OPT_X_TLS_CACERTFILE: c_int = 0x6002;
+pub(crate) const LDAP_OPT_X_TLS_CACERTFILE: c_int = 0x6002;
 
 /// Option: rebuild the OpenLDAP-internal TLS context after option changes (`int *` argument).
-pub const LDAP_OPT_X_TLS_NEWCTX: c_int = 0x600f;
+pub(crate) const LDAP_OPT_X_TLS_NEWCTX: c_int = 0x600f;
 
 /// Option: TCP-level connect timeout (`struct timeval *` argument).
-pub const LDAP_OPT_NETWORK_TIMEOUT: c_int = 0x5010;
+pub(crate) const LDAP_OPT_NETWORK_TIMEOUT: c_int = 0x5010;
 
 /// Option: default timeout for synchronous operations (`struct timeval *` argument).
-pub const LDAP_OPT_TIMEOUT: c_int = 0x5014;
+pub(crate) const LDAP_OPT_TIMEOUT: c_int = 0x5014;
 
 /// Option: pass a `gss_cred_id_t` to the SASL GSSAPI plugin.
 ///
@@ -126,38 +127,38 @@ pub const LDAP_OPT_TIMEOUT: c_int = 0x5014;
 /// instead of calling `gss_acquire_cred(GSS_C_NO_CREDENTIAL)`.  Used to inject
 /// an S4U2Self impersonated credential so the GSSAPI exchange runs as the target
 /// user rather than the service account.
-pub const LDAP_OPT_X_SASL_GSS_CREDS: c_int = 0x610d;
+pub(crate) const LDAP_OPT_X_SASL_GSS_CREDS: c_int = 0x610d;
 
 /// SASL flag: do not interact with the user; fail on any prompt.
-pub const LDAP_SASL_QUIET: c_uint = 2;
+pub(crate) const LDAP_SASL_QUIET: c_uint = 2;
 
 /// `ldap_result` `all` flag: wait for the entire result chain.
-pub const LDAP_MSG_ALL: c_int = 1;
+pub(crate) const LDAP_MSG_ALL: c_int = 1;
 
 /// LDAP search scope: the base object only.
-pub const LDAP_SCOPE_BASE: c_int = 0x0000;
+pub(crate) const LDAP_SCOPE_BASE: c_int = 0x0000;
 
 /// LDAP search scope: immediate children of the base only.
-pub const LDAP_SCOPE_ONELEVEL: c_int = 0x0001;
+pub(crate) const LDAP_SCOPE_ONELEVEL: c_int = 0x0001;
 
 /// LDAP search scope: the base object and all descendants.
-pub const LDAP_SCOPE_SUBTREE: c_int = 0x0002;
+pub(crate) const LDAP_SCOPE_SUBTREE: c_int = 0x0002;
 
 /// Sentinel value that terminates a `sasl_interact_t` array.
-pub const SASL_CB_LIST_END: c_ulong = 0;
+pub(crate) const SASL_CB_LIST_END: c_ulong = 0;
 
 /// LDAP attribute modification operation: add values.
-pub const LDAP_MOD_ADD: c_int = 0x0000;
+pub(crate) const LDAP_MOD_ADD: c_int = 0x0000;
 
 /// LDAP attribute modification operation: delete values (or entire attribute if values is empty).
-pub const LDAP_MOD_DELETE: c_int = 0x0001;
+pub(crate) const LDAP_MOD_DELETE: c_int = 0x0001;
 
 /// Replace all values of an attribute.
-pub const LDAP_MOD_REPLACE: c_int = 0x0002;
+pub(crate) const LDAP_MOD_REPLACE: c_int = 0x0002;
 
 /// Modifier flag: treat `mod_vals` as a NULL-terminated `**berval` (binary-safe).
 /// Must be OR'd with `LDAP_MOD_ADD` or `LDAP_MOD_DELETE`.
-pub const LDAP_MOD_BVALUES: c_int = 0x0080;
+pub(crate) const LDAP_MOD_BVALUES: c_int = 0x0080;
 
 /// One attribute modification descriptor passed to `ldap_modify_ext_s`.
 ///
@@ -165,7 +166,7 @@ pub const LDAP_MOD_BVALUES: c_int = 0x0080;
 /// NULL-terminated `**berval`.  The `mod_vals` field must remain valid for the
 /// entire duration of the `ldap_modify_ext_s` call.
 #[repr(C)]
-pub struct LDAPMod {
+pub(crate) struct LDAPMod {
     /// Operation flags: `LDAP_MOD_ADD | LDAP_MOD_BVALUES` or `LDAP_MOD_DELETE | LDAP_MOD_BVALUES`.
     pub mod_op: c_int,
     /// NUL-terminated attribute name (e.g. `b"ipapasskey\0"`).
@@ -182,7 +183,7 @@ pub struct LDAPMod {
 /// a SASL prompt.  Our implementation (`sasl_interact_noop`) always provides
 /// empty answers, which is correct for GSSAPI (TGT in ccache) and EXTERNAL
 /// (client certificate in TLS).
-pub type SaslInteractProc = Option<
+pub(crate) type SaslInteractProc = Option<
     unsafe extern "C" fn(
         ld: *mut LDAP,
         flags: c_uint,
@@ -198,20 +199,20 @@ extern "C" {
 
     /// Initialise an LDAP session handle for `url` without opening a TCP
     /// connection yet.  Writes the new handle into `*ldp`.
-    pub fn ldap_initialize(ldp: *mut *mut LDAP, url: *const c_char) -> c_int;
+    pub(crate) fn ldap_initialize(ldp: *mut *mut LDAP, url: *const c_char) -> c_int;
 
     /// Set a session option.  `invalue` is option-specific; see `LDAP_OPT_*`.
-    pub fn ldap_set_option(ld: *mut LDAP, option: c_int, invalue: *const c_void) -> c_int;
+    pub(crate) fn ldap_set_option(ld: *mut LDAP, option: c_int, invalue: *const c_void) -> c_int;
 
     /// Read a session option into `outvalue`.  `outvalue` is option-specific;
     /// see `LDAP_OPT_*`.  Use [`LDAP_OPT_DESC`] to get the underlying socket fd.
-    pub fn ldap_get_option(ld: *mut LDAP, option: c_int, outvalue: *mut c_void) -> c_int;
+    pub(crate) fn ldap_get_option(ld: *mut LDAP, option: c_int, outvalue: *mut c_void) -> c_int;
 
     /// Upgrade a plain `ldap://` connection to TLS using STARTTLS.
     ///
     /// There is no non-blocking form of this operation in `OpenLDAP`; it always
     /// completes the full TLS handshake before returning.
-    pub fn ldap_start_tls_s(
+    pub(crate) fn ldap_start_tls_s(
         ld: *mut LDAP,
         serverctrls: *mut *mut LDAPControl,
         clientctrls: *mut *mut LDAPControl,
@@ -220,7 +221,7 @@ extern "C" {
     /// Close the connection and free the session handle.
     ///
     /// There is no non-blocking form of unbind in `OpenLDAP`.
-    pub fn ldap_unbind_ext_s(
+    pub(crate) fn ldap_unbind_ext_s(
         ld: *mut LDAP,
         serverctrls: *mut *mut LDAPControl,
         clientctrls: *mut *mut LDAPControl,
@@ -234,7 +235,7 @@ extern "C" {
     /// name (e.g. `"PLAIN"`) for SASL.  `cred` carries the password as a
     /// `berval`.  Writes the message ID of the sent request into `*msgidp`;
     /// collect the result with [`ldap_result`].
-    pub fn ldap_sasl_bind(
+    pub(crate) fn ldap_sasl_bind(
         ld: *mut LDAP,
         dn: *const c_char,
         mechanism: *const c_char,
@@ -254,7 +255,7 @@ extern "C" {
     /// [`LDAP_SASL_BIND_IN_PROGRESS`]; collect the partial result with
     /// [`ldap_result`] and call this function again with that result as `result`.
     /// Keep looping until the return value is [`LDAP_SUCCESS`].
-    pub fn ldap_sasl_interactive_bind(
+    pub(crate) fn ldap_sasl_interactive_bind(
         ld: *mut LDAP,
         dn: *const c_char,
         sasl_mechanism: *const c_char,
@@ -275,7 +276,7 @@ extern "C" {
     /// `attrs` is a NULL-terminated array of attribute name strings; pass
     /// `NULL` to request all attributes.  Writes the message ID of the
     /// sent request into `*msgidp`; collect results with [`ldap_result`].
-    pub fn ldap_search_ext(
+    pub(crate) fn ldap_search_ext(
         ld: *mut LDAP,
         base: *const c_char,
         scope: c_int,
@@ -304,7 +305,7 @@ extern "C" {
     ///   written to `*result` and must be freed with [`ldap_msgfree`].
     /// - `0`   — timed out; no result yet.
     /// - `< 0` — error.
-    pub fn ldap_result(
+    pub(crate) fn ldap_result(
         ld: *mut LDAP,
         msgid: c_int,
         all: c_int,
@@ -315,16 +316,16 @@ extern "C" {
     // ── Result iteration ──────────────────────────────────────────────────────
 
     /// Return the first entry in a result chain.
-    pub fn ldap_first_entry(ld: *mut LDAP, chain: *mut LDAPMessage) -> *mut LDAPMessage;
+    pub(crate) fn ldap_first_entry(ld: *mut LDAP, chain: *mut LDAPMessage) -> *mut LDAPMessage;
 
     /// Return the next entry after `entry`.
-    pub fn ldap_next_entry(ld: *mut LDAP, entry: *mut LDAPMessage) -> *mut LDAPMessage;
+    pub(crate) fn ldap_next_entry(ld: *mut LDAP, entry: *mut LDAPMessage) -> *mut LDAPMessage;
 
     /// Return the count of entries in a result chain.
-    pub fn ldap_count_entries(ld: *mut LDAP, chain: *mut LDAPMessage) -> c_int;
+    pub(crate) fn ldap_count_entries(ld: *mut LDAP, chain: *mut LDAPMessage) -> c_int;
 
     /// Return the DN of `entry` as a malloc'd C string; free with [`ldap_memfree`].
-    pub fn ldap_get_dn(ld: *mut LDAP, entry: *mut LDAPMessage) -> *mut c_char;
+    pub(crate) fn ldap_get_dn(ld: *mut LDAP, entry: *mut LDAPMessage) -> *mut c_char;
 
     // ── Attribute iteration ───────────────────────────────────────────────────
 
@@ -332,14 +333,14 @@ extern "C" {
     ///
     /// Writes a `BerElement` cursor into `*ber`; the caller must free it with
     /// `ber_free(*ber, 0)` when done iterating.
-    pub fn ldap_first_attribute(
+    pub(crate) fn ldap_first_attribute(
         ld: *mut LDAP,
         entry: *mut LDAPMessage,
         ber: *mut *mut BerElement,
     ) -> *mut c_char;
 
     /// Advance the `BerElement` cursor and return the next attribute name.
-    pub fn ldap_next_attribute(
+    pub(crate) fn ldap_next_attribute(
         ld: *mut LDAP,
         entry: *mut LDAPMessage,
         ber: *mut BerElement,
@@ -348,39 +349,39 @@ extern "C" {
     /// Return all values of `attr` in `entry` as a NULL-terminated `berval**`.
     ///
     /// Values are binary-safe.  Free with [`ldap_value_free_len`].
-    pub fn ldap_get_values_len(
+    pub(crate) fn ldap_get_values_len(
         ld: *mut LDAP,
         entry: *mut LDAPMessage,
         attr: *const c_char,
     ) -> *mut *mut berval;
 
     /// Free a `berval**` returned by [`ldap_get_values_len`].
-    pub fn ldap_value_free_len(vals: *mut *mut berval);
+    pub(crate) fn ldap_value_free_len(vals: *mut *mut berval);
 
     // ── Memory management ─────────────────────────────────────────────────────
 
     /// Free a string allocated by libldap (e.g. DN, attribute name).
-    pub fn ldap_memfree(p: *mut c_void);
+    pub(crate) fn ldap_memfree(p: *mut c_void);
 
     /// Free a `BerElement` cursor allocated by [`ldap_first_attribute`].
     ///
     /// Pass `freebuf = 0` when the element was created by attribute iteration
     /// (libldap owns the underlying buffer).
-    pub fn ber_free(ber: *mut BerElement, freebuf: c_int);
+    pub(crate) fn ber_free(ber: *mut BerElement, freebuf: c_int);
 
     /// Free an entire result chain returned by a search or `ldap_result`.
-    pub fn ldap_msgfree(lm: *mut LDAPMessage) -> c_int;
+    pub(crate) fn ldap_msgfree(lm: *mut LDAPMessage) -> c_int;
 
     /// Free a NULL-terminated array of `LDAPControl *` (e.g. returned by
     /// [`ldap_parse_result`]).
-    pub fn ldap_controls_free(ctrls: *mut *mut LDAPControl);
+    pub(crate) fn ldap_controls_free(ctrls: *mut *mut LDAPControl);
 
     // ── Error handling ────────────────────────────────────────────────────────
 
     /// Convert an LDAP result code to a human-readable C string.
     ///
     /// The returned pointer is statically allocated; do not free it.
-    pub fn ldap_err2string(err: c_int) -> *mut c_char;
+    pub(crate) fn ldap_err2string(err: c_int) -> *mut c_char;
 
     /// Perform a synchronous LDAP modify operation.
     ///
@@ -390,7 +391,7 @@ extern "C" {
     ///
     /// Returns `LDAP_SUCCESS` on success; call `ldap_parse_result` on failure
     /// to obtain a human-readable diagnostic message.
-    pub fn ldap_modify_ext_s(
+    pub(crate) fn ldap_modify_ext_s(
         ld: *mut LDAP,
         dn: *const c_char,
         mods: *mut *mut LDAPMod,
@@ -403,7 +404,7 @@ extern "C" {
     /// `attrs` is a NULL-terminated array of `*mut LDAPMod` where each element
     /// uses `LDAP_MOD_ADD | LDAP_MOD_BVALUES`.  Returns `LDAP_SUCCESS` on
     /// success.
-    pub fn ldap_add_ext_s(
+    pub(crate) fn ldap_add_ext_s(
         ld: *mut LDAP,
         dn: *const c_char,
         attrs: *mut *mut LDAPMod,
@@ -415,7 +416,7 @@ extern "C" {
     ///
     /// Returns `LDAP_SUCCESS` on success; `LDAP_NO_SUCH_OBJECT` if the DN does
     /// not exist.
-    pub fn ldap_delete_ext_s(
+    pub(crate) fn ldap_delete_ext_s(
         ld: *mut LDAP,
         dn: *const c_char,
         sctrls: *mut *mut LDAPControl,
@@ -423,7 +424,7 @@ extern "C" {
     ) -> c_int;
 
     /// Send an extended operation request (RFC 4511 §4.12).
-    pub fn ldap_extended_operation(
+    pub(crate) fn ldap_extended_operation(
         ld: *mut LDAP,
         reqoid: *const c_char,
         reqdata: *mut berval,
@@ -433,7 +434,7 @@ extern "C" {
     ) -> c_int;
 
     /// Extract the response OID and value of an extended operation result.
-    pub fn ldap_parse_extended_result(
+    pub(crate) fn ldap_parse_extended_result(
         ld: *mut LDAP,
         res: *mut LDAPMessage,
         retoidp: *mut *mut c_char,
@@ -442,13 +443,13 @@ extern "C" {
     ) -> c_int;
 
     /// Free a `berval` allocated by libldap.
-    pub fn ber_bvfree(bv: *mut berval);
+    pub(crate) fn ber_bvfree(bv: *mut berval);
 
     /// Extract error code, matched DN, diagnostic message, and server controls
     /// from a result message.
     ///
     /// When `freeit` is non-zero, `res` is freed by this call.
-    pub fn ldap_parse_result(
+    pub(crate) fn ldap_parse_result(
         ld: *mut LDAP,
         res: *mut LDAPMessage,
         errcodep: *mut c_int,
