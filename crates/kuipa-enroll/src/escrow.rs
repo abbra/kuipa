@@ -846,10 +846,13 @@ impl EscrowRequest {
     ///
     /// An OpenSSL error.
     pub(crate) fn ticket_binding(&self) -> Result<[u8; crate::join::CHANNEL_BINDING_LEN]> {
-        let digest = primitives::digest(
-            self.request.alg().hash(),
-            &[b"ipa-ku-enroll/v1 seal unlock", &self.bare()],
-        )?;
+        self.challenge(b"ipa-ku-enroll/v1 seal unlock")
+    }
+
+    /// `H(label ‖ the request without its token and assertion)`, as a
+    /// channel binding.
+    fn challenge(&self, label: &[u8]) -> Result<[u8; crate::join::CHANNEL_BINDING_LEN]> {
+        let digest = primitives::digest(self.request.alg().hash(), &[label, &self.bare()])?;
         Ok(crate::join::channel_binding_of(&digest))
     }
 
@@ -863,11 +866,7 @@ impl EscrowRequest {
     ///
     /// An OpenSSL error.
     pub(crate) fn passkey_challenge(&self) -> Result<[u8; 32]> {
-        let digest = primitives::digest(
-            self.request.alg().hash(),
-            &[b"ipa-ku-enroll/v1 seal passkey", &self.bare()],
-        )?;
-        Ok(crate::join::channel_binding_of(&digest))
+        self.challenge(b"ipa-ku-enroll/v1 seal passkey")
     }
 
     /// The principal.
