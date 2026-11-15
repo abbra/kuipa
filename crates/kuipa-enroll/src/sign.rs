@@ -151,7 +151,7 @@ impl Digest {
                 Ok(0) => break,
                 Ok(n) => ctx.update(&buf[..n])?,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(Error::Io(e.to_string())),
+                Err(e) => return Err(e.into()),
             }
         }
         let mut value = vec![0u8; md.output_len()];

@@ -49,10 +49,6 @@ pub struct Recipient {
     pub set: u32,
 }
 
-fn io(e: &std::io::Error) -> Error {
-    Error::Io(e.to_string())
-}
-
 /// The hash of everything derived from the file key: the strongest of the
 /// recipients' suite hashes.
 fn data_hash(algs: impl IntoIterator<Item = KemAlg>) -> &'static CStr {
@@ -92,7 +88,7 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
             Ok(0) => break,
             Ok(m) => n += m,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(io(&e)),
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(n)
@@ -136,8 +132,8 @@ pub fn seal_stream(
     let (key, prefix) = data_key(k.as_ref(), &header, hash)?;
 
     let len = u32::try_from(header.len()).map_err(|_| Error::Malformed("backup header"))?;
-    out.write_all(&len.to_be_bytes()).map_err(|e| io(&e))?;
-    out.write_all(&header).map_err(|e| io(&e))?;
+    out.write_all(&len.to_be_bytes())?;
+    out.write_all(&header)?;
 
     // One byte past the chunk tells whether this one is the last.
     let size = 1usize << chunk_log2;
@@ -149,14 +145,14 @@ pub fn seal_stream(
         let take = got.min(size);
         let sealed =
             primitives::seal_chunk(key.as_ref(), &prefix, counter, &header, last, &buf[..take])?;
-        out.write_all(&sealed).map_err(|e| io(&e))?;
+        out.write_all(&sealed)?;
         if last {
             break;
         }
         buf[0] = buf[size];
         carry = 1;
     }
-    out.flush().map_err(|e| io(&e))
+    Ok(out.flush()?)
 }
 
 /// Open a container with the recovery key pair it was sealed to, writing
@@ -221,14 +217,14 @@ pub fn open_stream(key: &ExchangeKeyPair, mut input: impl Read, mut out: impl Wr
         let plain =
             primitives::open_chunk(dkey.as_ref(), &prefix, counter, &header, last, &buf[..take])
                 .map_err(|_| Error::BadResponse)?;
-        out.write_all(plain.as_ref()).map_err(|e| io(&e))?;
+        out.write_all(plain.as_ref())?;
         if last {
             break;
         }
         buf[0] = buf[size];
         carry = 1;
     }
-    out.flush().map_err(|e| io(&e))
+    Ok(out.flush()?)
 }
 
 #[cfg(test)]

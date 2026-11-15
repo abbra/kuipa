@@ -16,8 +16,9 @@ pub enum Error {
     Expired,
     /// The advertisement does not belong to the expected realm.
     WrongRealm,
-    /// A value does not match what the verified advertisement promises (for
-    /// example a CA certificate whose hash is not advertised).
+    /// A value does not match what was expected: what the verified
+    /// advertisement promises (a CA certificate whose hash is not
+    /// advertised), a log's pinned head, a keytab's principal.
     Mismatch(&'static str),
     /// The server refused the request.  Deliberately carries no detail: the
     /// server answers every failure after decapsulation the same way.
@@ -27,7 +28,7 @@ pub enum Error {
     /// A recipient key or secret cannot open this bundle.
     WrongRecipient,
     /// Reading or writing a stream failed.
-    Io(String),
+    Io(std::io::Error),
     /// A required item is missing (e.g. no join key in the advertisement).
     Missing(&'static str),
     /// The operation needs an explicit opt-in (e.g. a signed-only bundle).
@@ -63,7 +64,7 @@ impl fmt::Display for Error {
             Self::UntrustedAnchor => f.write_str("not signed by a trusted realm anchor"),
             Self::Expired => f.write_str("expired or not yet valid"),
             Self::WrongRealm => f.write_str("advertisement is for another realm"),
-            Self::Mismatch(what) => write!(f, "{what} does not match the advertisement"),
+            Self::Mismatch(what) => write!(f, "{what} does not match what is expected"),
             Self::Refused => f.write_str("the server refused the request"),
             Self::BadResponse => f.write_str("the server response is not valid for this request"),
             Self::WrongRecipient => f.write_str("this key or secret cannot open the bundle"),
@@ -82,6 +83,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Crypto(e) => Some(e),
+            Self::Io(e) => Some(e),
             _ => None,
         }
     }
@@ -93,6 +95,12 @@ impl From<tang_pqc::Error> for Error {
             tang_pqc::Error::Malformed(what) => Self::Malformed(what),
             e => Self::Crypto(e),
         }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
     }
 }
 

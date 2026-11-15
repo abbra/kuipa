@@ -144,7 +144,12 @@ impl std::fmt::Display for SpendError {
     }
 }
 
-impl std::error::Error for SpendError {}
+impl std::error::Error for SpendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let (Self::Refused(e) | Self::Unavailable(e)) = self;
+        Some(e.as_ref())
+    }
+}
 
 /// Asks a voucher's home server to spend or release its salt.
 pub trait VoucherSpender: Send + Sync + std::fmt::Debug {
