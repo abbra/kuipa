@@ -344,13 +344,8 @@ enum SignAction {
         /// The signature (default `<file>.kusig`).
         #[arg(long)]
         signature: Option<std::path::PathBuf>,
-        /// Verify against these anchors and not this host's, for a host that
-        /// is not enrolled (repeatable; needs --realm).
-        #[arg(long, value_name = "THUMBPRINT", requires = "realm")]
-        anchor: Vec<String>,
-        /// The realm the statement must be for, with --anchor.
-        #[arg(long, requires = "anchor")]
-        realm: Option<String>,
+        #[command(flatten)]
+        pins: PinsInput,
         /// Require this signer (`alice` or `alice@REALM`).
         #[arg(long)]
         signer: Option<String>,
@@ -392,13 +387,8 @@ enum BackupAction {
         /// terminal.
         #[arg(long)]
         force: bool,
-        /// Trust these anchors and not this host's, for a host that is not
-        /// enrolled (repeatable; from the realm card).
-        #[arg(long, value_name = "THUMBPRINT", requires = "realm")]
-        anchor: Vec<String>,
-        /// The realm the signature must be for, with --anchor.
-        #[arg(long, requires = "anchor")]
-        realm: Option<String>,
+        #[command(flatten)]
+        pins: PinsInput,
         /// Another file to check against its own `<file>.kusig` (the
         /// backup's `header`).
         #[arg(long, value_name = "FILE")]
@@ -422,6 +412,56 @@ enum BackupAction {
     },
 }
 
+/// Anchors given on the command line for a host that is not enrolled.
+#[derive(clap::Args)]
+struct PinsInput {
+    /// Trust these anchors and not this host's, for a host that is not
+    /// enrolled (repeatable; from the realm card; needs --realm).
+    #[arg(long, value_name = "THUMBPRINT", requires = "realm")]
+    anchor: Vec<tang_pqc::Thumbprint>,
+    /// The realm the statement must be for, with --anchor.
+    #[arg(long, requires = "anchor")]
+    realm: Option<String>,
+}
+
+impl PinsInput {
+    /// The anchors given, if any.
+    fn pins(&self) -> Option<kuipa_tools::sign::Pins> {
+        let realm = self.realm.as_ref()?;
+        (!self.anchor.is_empty()).then(|| kuipa_tools::sign::Pins {
+            realm: realm.clone(),
+            anchors: self.anchor.clone(),
+        })
+    }
+}
+
+/// The recovery passphrase of a new recovery key or shard set.
+#[derive(clap::Args)]
+struct RecoveryPass {
+    /// Read the recovery passphrase from this file (asked for twice
+    /// otherwise; it is part of the key, and kuipa asks for at least 16
+    /// characters).
+    #[arg(long, value_name = "FILE")]
+    recovery_file: Option<String>,
+    /// Accept a shorter recovery passphrase than kuipa advises.
+    #[arg(long)]
+    weak_passphrase: bool,
+    /// Make papers with no recovery passphrase at all: the papers alone
+    /// are then the key.
+    #[arg(long)]
+    no_passphrase: bool,
+}
+
+impl RecoveryPass {
+    fn read(&self) -> Result<SecretBuf, Error> {
+        recovery_passphrase(
+            self.recovery_file.as_deref(),
+            self.weak_passphrase,
+            self.no_passphrase,
+        )
+    }
+}
+
 /// `kuipa backup key` subcommands.
 #[derive(Subcommand)]
 enum BackupKeyAction {
@@ -437,16 +477,8 @@ enum BackupKeyAction {
         /// How many papers to print (at most 16).
         #[arg(long, value_name = "M", default_value_t = 3)]
         shares: u8,
-        /// Read the recovery passphrase from this file (asked for twice
-        /// otherwise; at least 16 characters).
-        #[arg(long, value_name = "FILE")]
-        recovery_file: Option<String>,
-        /// Accept a shorter recovery passphrase than kuipa advises.
-        #[arg(long)]
-        weak_passphrase: bool,
-        /// Make papers with no passphrase: the papers alone are then the key.
-        #[arg(long)]
-        no_passphrase: bool,
+        #[command(flatten)]
+        recovery: RecoveryPass,
         /// Where to write the recipient file the backup hosts keep.
         #[arg(long, short, value_name = "FILE")]
         out: std::path::PathBuf,
@@ -914,18 +946,8 @@ enum RecoveryShardsAction {
         /// How many papers to print (at most 16).
         #[arg(long, value_name = "M", default_value_t = 5)]
         shares: u8,
-        /// Read the recovery passphrase from this file (asked for twice
-        /// otherwise; it is part of the key, and kuipa asks for at least
-        /// 16 characters).
-        #[arg(long, value_name = "FILE")]
-        recovery_file: Option<String>,
-        /// Accept a shorter recovery passphrase than kuipa advises.
-        #[arg(long)]
-        weak_passphrase: bool,
-        /// Make papers with no recovery passphrase at all: the papers
-        /// alone are then the key.
-        #[arg(long)]
-        no_passphrase: bool,
+        #[command(flatten)]
+        recovery: RecoveryPass,
         #[command(flatten)]
         pw: DevicePass,
     },
@@ -2573,24 +2595,6 @@ fn with_passkey_pin<'a>(
     Ok(client.with_passkey_pin(security_key_pin(file, "passkey PIN (empty if none)")?))
 }
 
-/// `kuipa keys fetch` (§18.4): the value on standard output, or in a
-/// file with `--out`.  Standard output only when it is not a terminal,
-/// as `kuipa-unseal` does (§10.5).
-/// The anchors given on the command line, if any.
-fn pins(realm: Option<&str>, anchors: &[String]) -> Result<Option<kuipa_tools::sign::Pins>, Error> {
-    let (Some(realm), false) = (realm, anchors.is_empty()) else {
-        return Ok(None);
-    };
-    Ok(Some(kuipa_tools::sign::Pins {
-        realm: realm.to_owned(),
-        anchors: anchors
-            .iter()
-            .map(|a| a.parse())
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("not an anchor thumbprint: {e}"))?,
-    }))
-}
-
 fn run_sign(paths: &Paths, action: &SignAction) -> Result<Value, Error> {
     match action {
         SignAction::Blob { purpose, files } => {
@@ -2599,15 +2603,14 @@ fn run_sign(paths: &Paths, action: &SignAction) -> Result<Value, Error> {
         SignAction::Verify {
             file,
             signature,
-            anchor,
-            realm,
+            pins,
             signer,
             purpose,
         } => kuipa_tools::sign::verify_file(
             paths,
             file,
             signature.as_deref(),
-            pins(realm.as_deref(), anchor)?.as_ref(),
+            pins.pins().as_ref(),
             signer.as_deref(),
             purpose.as_deref(),
         ),
@@ -2625,14 +2628,11 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
                     realm,
                     threshold,
                     shares,
-                    recovery_file,
-                    weak_passphrase,
-                    no_passphrase,
+                    recovery,
                     out,
                 },
         } => {
-            let pass =
-                recovery_passphrase(recovery_file.as_deref(), *weak_passphrase, *no_passphrase)?;
+            let pass = recovery.read()?;
             let made = backup::create_key(realm, pass.as_ref(), *threshold, *shares)?;
             made.file.write(out)?;
             Ok(serde_json::json!({
@@ -2668,8 +2668,7 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
             file,
             out,
             force,
-            anchor,
-            realm,
+            pins,
             also,
             signer,
             no_verify,
@@ -2678,7 +2677,7 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
             let target = kuipa_tools::output::Output::check(out, *force)?;
             let mut verified = Vec::new();
             if !no_verify {
-                let pins = pins(realm.as_deref(), anchor)?;
+                let pins = pins.pins();
                 for f in std::iter::once(file).chain(also) {
                     let v = kuipa_tools::sign::verify_file(
                         paths,
@@ -2751,6 +2750,9 @@ fn run_tlog(paths: &Paths, action: &TlogAction) -> Result<Value, Error> {
     }
 }
 
+/// `kuipa keys fetch` (§18.4): the value on standard output, or in a
+/// file with `--out`.  Standard output only when it is not a terminal,
+/// as `kuipa-unseal` does (§10.5).
 fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
     let KeysAction::Fetch {
         name,
@@ -2886,16 +2888,13 @@ fn run_recovery_shards(
         RecoveryShardsAction::Create {
             threshold,
             shares,
-            recovery_file,
-            weak_passphrase,
-            no_passphrase,
+            recovery,
             pw,
         } => {
             if *threshold > *shares {
                 return Err("--threshold cannot be more than --shares".into());
             }
-            let recovery =
-                recovery_passphrase(recovery_file.as_deref(), *weak_passphrase, *no_passphrase)?;
+            let recovery = recovery.read()?;
             // The device key keeps its own passphrase: the recovery
             // passphrase only hides the seed (DESIGN-recovery.md §2.1).
             let device = passphrase(pw.passphrase_file.as_deref(), false)?;
