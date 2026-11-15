@@ -30,8 +30,7 @@ use kuipa_enroll::epoch::SignedEpoch;
 use kuipa_enroll::realm::ServerKeys;
 use tang_pqc::{ExchangeKeyPair, SigningKey, Thumbprint, VerifyingKey};
 
-/// Errors from the key store.
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+use crate::Error;
 
 /// Read a private key file into a wiping buffer: the bytes hold the seed,
 /// and must not linger in freed heap memory once the key is parsed.

@@ -29,7 +29,7 @@ use tang_pqc::{
     unix_seconds,
 };
 
-use crate::keystore::Error;
+use crate::Error;
 
 /// The Tang key directory.
 pub struct TangKeys {

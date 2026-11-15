@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use agirru_crdt::GenerationClock;
@@ -38,9 +38,7 @@ use tang_pqc::{Policy, SigningKey, Thumbprint, unix_seconds};
 use tokio::sync::{Notify, RwLock};
 
 use crate::keystore::KeyStore;
-
-/// Errors from the exchange.
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+use crate::{Error, lock};
 
 /// Produces GSS-API tokens from this server's `ipa-ku/<fqdn>` key.
 pub trait Initiator: Send + Sync {
@@ -173,10 +171,6 @@ fn failed_chain(e: &(dyn std::error::Error + 'static)) -> PeerError {
 
 fn now() -> u64 {
     unix_seconds(SystemTime::now())
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 const MAX_SYNC_BYTES: usize = 1024 * 1024;

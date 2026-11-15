@@ -31,8 +31,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tang_pqc::{Policy, SignedAdvertisement, Thumbprint};
 
-/// Errors.
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+use crate::Error;
 
 /// Accepts any server certificate, still checking handshake signatures.
 #[derive(Debug)]

@@ -20,18 +20,18 @@ use synta::der::decoder::Decoder;
 use synta::der::encoder::Encoder;
 use synta::{Encoding, Integer, OctetStringRef, Tag, tag::TAG_SEQUENCE};
 
-use kuipa_enroll::keytab::Enctype;
+use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 
 /// `KEYTAB_GET_OID`: get (and optionally generate) keys.
-pub const KEYTAB_GET_OID: &str = "2.16.840.1.113730.3.8.10.5";
+pub(crate) const KEYTAB_GET_OID: &str = "2.16.840.1.113730.3.8.10.5";
 /// `JOIN_OID`: the enrollment extended operation (`ipa-join`).
-pub const JOIN_OID: &str = "2.16.840.1.113730.3.8.10.3";
+pub(crate) const JOIN_OID: &str = "2.16.840.1.113730.3.8.10.3";
 
 const SEQUENCE: Tag = Tag::universal_constructed(TAG_SEQUENCE);
 
 /// Errors decoding or encoding the control.
 #[derive(Debug)]
-pub struct Asn1Error(String);
+pub(crate) struct Asn1Error(String);
 
 impl std::fmt::Display for Asn1Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,50 +48,48 @@ impl From<synta::Error> for Asn1Error {
 }
 
 /// One key from a `GKReply`.
-pub struct ReplyKey {
-    /// Encryption type.
-    pub enctype: Enctype,
-    /// Key bytes.
-    pub key: SecretBuf,
+struct ReplyKey {
+    enctype: Enctype,
+    key: SecretBuf,
 }
 
 /// A decoded `GKReply`.
-pub struct Reply {
-    /// The new key version number.
-    pub kvno: u32,
-    /// The keys.
-    pub keys: Vec<ReplyKey>,
+pub(crate) struct Reply {
+    kvno: u32,
+    keys: Vec<ReplyKey>,
 }
 
-/// Encode `newkeys` for server-side generation (no password): the request
-/// `ipa-getkeytab` sends for `-p principal` with the given enctypes.
+impl Reply {
+    /// The keytab for `principal`, every key stamped `timestamp`.
+    pub(crate) fn into_keytab(self, principal: Principal, timestamp: u32) -> Keytab {
+        let kvno = self.kvno;
+        Keytab::new(
+            principal,
+            self.keys
+                .into_iter()
+                .map(|k| KeytabEntry {
+                    kvno,
+                    enctype: k.enctype,
+                    key: k.key,
+                    timestamp,
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Encode `newkeys`: server-side generation with no `password`, or keys
+/// derived from it on the server (the realm's salt).  The request
+/// `ipa-getkeytab -p` / `-P` sends.
 ///
 /// # Errors
 ///
 /// An encoding error.
-pub fn encode_new_keys(principal: &str, enctypes: &[Enctype]) -> Result<Vec<u8>, Asn1Error> {
-    encode(principal, enctypes, None)
-}
-
-/// Encode `newkeys` with keys derived from `password` on the server (the
-/// realm's salt): the request `ipa-getkeytab -P` sends.
-///
-/// # Errors
-///
-/// An encoding error.
-pub fn encode_password_keys(
-    principal: &str,
-    enctypes: &[Enctype],
-    password: &[u8],
-) -> Result<SecretBuf, Asn1Error> {
-    Ok(SecretBuf::new(encode(principal, enctypes, Some(password))?))
-}
-
-fn encode(
+pub(crate) fn encode_keys(
     principal: &str,
     enctypes: &[Enctype],
     password: Option<&[u8]>,
-) -> Result<Vec<u8>, Asn1Error> {
+) -> Result<SecretBuf, Asn1Error> {
     let mut e = Encoder::new(Encoding::Der);
     e.start_constructed_no_guard(Tag::context_specific_constructed(0))?; // newkeys
     e.start_constructed_no_guard(SEQUENCE)?;
@@ -112,7 +110,7 @@ fn encode(
     }
     e.end_constructed()?;
     e.end_constructed()?;
-    Ok(e.finish()?)
+    Ok(SecretBuf::new(e.finish()?))
 }
 
 fn explicit<'a>(d: &mut Decoder<'a>, n: u32) -> Result<Decoder<'a>, Asn1Error> {
@@ -128,7 +126,7 @@ fn int32(d: &mut Decoder<'_>) -> Result<i32, Asn1Error> {
 /// # Errors
 ///
 /// [`Asn1Error`] for anything but a well-formed reply.
-pub fn decode_reply(bytes: &[u8]) -> Result<Reply, Asn1Error> {
+pub(crate) fn decode_reply(bytes: &[u8]) -> Result<Reply, Asn1Error> {
     let mut top = Decoder::new(bytes, Encoding::Der);
     let mut choice = explicit(&mut top, 2)?;
     let mut reply = choice.enter_constructed(SEQUENCE)?;
@@ -156,16 +154,16 @@ mod tests {
 
     #[test]
     fn password_keys_carry_the_password() {
-        let der = encode_password_keys("krbtgt/B@A", &[Enctype(18)], b"pw").unwrap();
+        let der = encode_keys("krbtgt/B@A", &[Enctype(18)], Some(b"pw")).unwrap();
         let der = der.as_ref();
         assert_eq!(&der[der.len() - 6..], &[0xa2, 0x04, 0x04, 0x02, b'p', b'w']);
-        let plain = encode_new_keys("krbtgt/B@A", &[Enctype(18)]).unwrap();
-        assert_eq!(der.len(), plain.len() + 6);
+        let plain = encode_keys("krbtgt/B@A", &[Enctype(18)], None).unwrap();
+        assert_eq!(der.len(), plain.as_ref().len() + 6);
     }
 
     #[test]
     fn new_keys_matches_hand_encoding() {
-        let der = encode_new_keys("host/a@R", &[Enctype(18), Enctype(17)]).unwrap();
+        let der = encode_keys("host/a@R", &[Enctype(18), Enctype(17)], None).unwrap();
         let expected: Vec<u8> = [
             &[0xa0, 0x18, 0x30, 0x16][..],
             &[0xa0, 0x0a, 0x04, 0x08],
@@ -173,7 +171,7 @@ mod tests {
             &[0xa1, 0x08, 0x30, 0x06, 0x02, 0x01, 18, 0x02, 0x01, 17],
         ]
         .concat();
-        assert_eq!(der, expected);
+        assert_eq!(der.as_ref(), &expected[..]);
     }
 
     #[test]

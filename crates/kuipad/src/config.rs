@@ -9,7 +9,7 @@ use kuipa_enroll::realm::{KdcProxy, ProxyCa, RealmInfo, TrustedRealm};
 use serde::Deserialize;
 use tang_pqc::Thumbprint;
 
-use crate::directory;
+use crate::{Error, directory};
 
 /// Default configuration path.
 pub const DEFAULT_PATH: &str = "/etc/ipa/kuipad.json";
@@ -220,9 +220,6 @@ fn default_peer_interval() -> u64 {
 fn default_listen() -> String {
     "unix:/run/ipa/kuipad.sock".into()
 }
-
-/// Errors loading the configuration.
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 impl Config {
     /// Read and parse.

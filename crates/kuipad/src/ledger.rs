@@ -32,7 +32,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use kuipa_enroll::merkle::{self, Hash, TreeHash};
@@ -41,9 +41,7 @@ use kuipa_enroll::tlog::{self, Entry, Head, Leaf, Log, LogId, Opening, SignedHea
 use tang_pqc::{Policy, SigningKey, VerifyingKey};
 
 use crate::keystore::write_private;
-
-/// Errors from the store.
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+use crate::{Error, lock};
 
 /// How long a signed head is served before it is signed again, even when
 /// nothing was appended: heads carry their time, and monitors want a
@@ -154,7 +152,7 @@ impl FileLedger {
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.inner)
     }
 
     /// Publish a head once per `interval`: a head covers what was appended

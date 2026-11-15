@@ -34,7 +34,7 @@ use std::time::SystemTime;
 
 use kuipa_enroll::escrow::{Kind, RegisterParams, SealId};
 use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
-use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
+use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::passkey::UserPasskeys;
 use kuipa_enroll::seal::{
     Approval, Deposit, Device, DeviceEscrow, Limits, Members, RecoverySettings, ReleaseRequest,
@@ -232,10 +232,7 @@ impl LdapDirectory {
     /// A connection bound as the daemon itself.  Requests run on several
     /// threads; its ccache is private and used by one of them at a time.
     fn service_conn(&self) -> Result<LdapConnection, DirectoryError> {
-        let _guard = self
-            .initiator
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock(&self.initiator);
         let mut conn = self.connect()?;
         if self.cfg.gssproxy {
             conn.bind(&Auth::Gssapi)?;
@@ -343,8 +340,8 @@ impl LdapDirectory {
         principal: &str,
         requested: &[Enctype],
     ) -> Result<Keytab, DirectoryError> {
-        let request = getkeytab::encode_new_keys(principal, &self.enctypes(requested)?)?;
-        let result = conn.extended_operation(KEYTAB_GET_OID, Some(&request))?;
+        let request = getkeytab::encode_keys(principal, &self.enctypes(requested)?, None)?;
+        let result = conn.extended_operation(KEYTAB_GET_OID, Some(request.as_ref()))?;
         let reply = result
             .controls
             .iter()
@@ -353,20 +350,7 @@ impl LdapDirectory {
         let reply = getkeytab::decode_reply(&reply.1)?;
         let timestamp =
             u32::try_from(tang_pqc::unix_seconds(SystemTime::now())).unwrap_or(u32::MAX);
-        let principal: Principal = principal.parse()?;
-        Ok(Keytab::new(
-            principal,
-            reply
-                .keys
-                .into_iter()
-                .map(|k| KeytabEntry {
-                    kvno: reply.kvno,
-                    enctype: k.enctype,
-                    key: k.key,
-                    timestamp,
-                })
-                .collect(),
-        ))
+        Ok(reply.into_keytab(principal.parse()?, timestamp))
     }
 
     fn seals_dn(&self) -> String {
@@ -594,7 +578,7 @@ impl LdapDirectory {
                 return Err(e.into());
             }
         }
-        let request = getkeytab::encode_password_keys(principal, &self.cfg.enctypes, password)?;
+        let request = getkeytab::encode_keys(principal, &self.cfg.enctypes, Some(password))?;
         conn.extended_operation(KEYTAB_GET_OID, Some(request.as_ref()))?;
         Ok(())
     }
