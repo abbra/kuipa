@@ -392,6 +392,10 @@ enum BackupAction {
         /// Where to write it (`-` for standard output).
         #[arg(long, short, value_name = "FILE")]
         out: String,
+        /// With `--out -`, write to standard output even when it is a
+        /// terminal.
+        #[arg(long)]
+        force: bool,
         /// Trust these anchors and not this host's, for a host that is not
         /// enrolled (repeatable; from the realm card).
         #[arg(long, value_name = "THUMBPRINT", requires = "realm")]
@@ -490,16 +494,21 @@ enum TlogAction {
 #[derive(Subcommand)]
 enum KeysAction {
     /// Fetch a secret named `<namespace>/<nickname>` (`dm`, `ra`, `ca`,
-    /// `ca_wrapped`, `lwca`, `akamu`) and print its value on standard output.
+    /// `ca_wrapped`, `lwca`, `akamu`) and print its value on standard output
+    /// (refused on a terminal unless `--force`).
     Fetch {
         /// The secret, as `<namespace>/<nickname>`.
         name: String,
         /// The wrap algorithm, for `ca_wrapped` only.
         #[arg(long, value_name = "ALG")]
         alg: Option<String>,
-        /// Write the value to a file instead of standard output.
-        #[arg(long, value_name = "FILE")]
-        out: Option<String>,
+        /// Write the value to a file (mode 0600) instead of standard output.
+        #[arg(long, value_name = "FILE", default_value = "-")]
+        out: String,
+        /// With `--out -`, write to standard output even when it is a
+        /// terminal.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -2774,6 +2783,7 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
         BackupAction::Open {
             file,
             out,
+            force,
             anchor,
             realm,
             also,
@@ -2781,6 +2791,7 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
             no_verify,
             recovery_file,
         } => {
+            let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
             let mut verified = Vec::new();
             if !no_verify {
                 let pins = pins(realm.as_deref(), anchor)?;
@@ -2808,14 +2819,18 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
             let (key, _) = backup::recover_key(&words, pass.as_ref())?;
             let input =
                 std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
-            if out == "-" {
-                backup::open_stream(&key, input, std::io::stdout().lock())?;
-                return Ok(serde_json::json!({ "quiet": true }));
+            match target {
+                kuipa_tools::output::Output::Stdout => {
+                    backup::open_stream(&key, input, std::io::stdout().lock())?;
+                    Ok(serde_json::json!({ "quiet": true }))
+                }
+                kuipa_tools::output::Output::File(path) => {
+                    backup::open_file(&key, input, path)?;
+                    Ok(
+                        serde_json::json!({ "opened": out, "verified": verified, "signature_skipped": no_verify }),
+                    )
+                }
             }
-            backup::open_file(&key, input, std::path::Path::new(out))?;
-            Ok(
-                serde_json::json!({ "opened": out, "verified": verified, "signature_skipped": no_verify }),
-            )
         }
         BackupAction::Card { recipient } => {
             let public = kuipa_tools::paths::PublicState::load(paths)?;
@@ -2853,20 +2868,15 @@ fn run_tlog(paths: &Paths, action: &TlogAction) -> Result<Value, Error> {
 }
 
 fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
-    let KeysAction::Fetch { name, alg, out } = action;
-    let value = flows::keys_fetch(paths, name, alg.as_deref())?;
-    if let Some(path) = out {
-        if std::path::Path::new(path).exists() {
-            return Err(format!("{path} already exists").into());
-        }
-        std::fs::write(path, &value)?;
-    } else {
-        use std::io::Write as _;
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&value)?;
-        stdout.flush()?;
-    }
-    Ok(serde_json::json!({ "quiet": true }))
+    let KeysAction::Fetch {
+        name,
+        alg,
+        out,
+        force,
+    } = action;
+    let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
+    target.write(&flows::keys_fetch(paths, name, alg.as_deref())?)?;
+    Ok(serde_json::json!({ "quiet": matches!(target, kuipa_tools::output::Output::Stdout) }))
 }
 
 /// `kuipa seal open`.

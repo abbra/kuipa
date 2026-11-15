@@ -594,3 +594,15 @@ fn plain_http_goes_through_http_proxy() {
         "{seen:?}: {stderr}"
     );
 }
+
+#[test]
+fn keys_fetch_and_backup_open_check_their_output_target_first() {
+    let kuipa = env!("CARGO_BIN_EXE_kuipa");
+    for args in [
+        &["keys", "fetch", "dm/DMHash", "--out", "/dev/stdout"][..],
+        &["backup", "open", "x.kuipa", "--out", "/dev/stdout"][..],
+    ] {
+        let stderr = run(kuipa, args);
+        assert!(stderr.contains("use `--out -`"), "{args:?}: {stderr}");
+    }
+}

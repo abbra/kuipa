@@ -218,14 +218,16 @@ pinned head.  Exits 1 on a problem.
 Write protected keytabs back in plain form and remove *kuipa*'s state from this
 host.
 
-## keys fetch _NAME_ [--alg _ALG_] [--out _FILE_]
+## keys fetch _NAME_ [--alg _ALG_] [--out _FILE_|-] [--force]
 
 Fetch a named secret from the realm's servers, authenticated by this
 host's keytab: *NAME* is *<namespace>/<nickname>*, one of *dm/DMHash*,
 *ra/ipaCert*, *ca/<nickname>*, *ca_wrapped/<nickname>* or
 *lwca/<nickname>*.  This is how a promoting replica receives the
 Directory Manager password hash, the RA agent key and the CA subsystem
-keys.  The value is written to standard output, or to *FILE*.  For
+keys.  The value is written to standard output (the default, or *--out -*; a
+terminal is refused unless *--force*), or to *FILE*, replaced atomically
+with mode 0600.  For
 *ca_wrapped* only, *--alg* names the wrap algorithm: *aes-256-cbc-pad*
 or *aes-256-wrap*.  A host outside the realm's server list, or without
 the CA role for the wrapped CA keys, is refused.
@@ -515,11 +517,13 @@ make the key _FILE_ names.
 Seal standard input to up to four recovery keys.  The output is written
 atomically, mode 0600.
 
-## backup open _FILE_ --out _FILE_|- [--also _FILE_]... [--realm _R_ --anchor _THUMBPRINT_]... [--signer _S_] [--no-verify] [--recovery-file _F_]
+## backup open _FILE_ --out _FILE_|- [--also _FILE_]... [--realm _R_ --anchor _THUMBPRINT_]... [--signer _S_] [--no-verify] [--recovery-file _F_] [--force]
 
 Check _FILE_ and each *--also* file against their *.kusig* bundles (the
 purpose must be *ipa-backup*), then read the papers from standard input,
-make the recovery key, and write the backup out.  Nothing contacts a
+make the recovery key, and write the backup out.  *--out -* is standard
+output, refused on a terminal unless *--force*; a file is written
+atomically, mode 0600.  Nothing contacts a
 server; on a host that is not enrolled give the realm and its anchors
 from the realm card.  A damaged file leaves no output behind.
 
