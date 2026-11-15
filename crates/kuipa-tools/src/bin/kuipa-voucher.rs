@@ -28,7 +28,6 @@
 //!
 //! Exit status: 0 success, 1 error, 2 usage.
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -36,7 +35,6 @@ use clap::{Parser, Subcommand};
 use kuipa_enroll::voucher::{Claims, Voucher};
 use kuipa_tools::paths::Error;
 use kuipa_tools::voucher;
-use native_ossl::util::SecretBuf;
 use tang_pqc::{SignatureAlg, b64};
 
 #[derive(Parser)]
@@ -126,14 +124,10 @@ enum Command {
     Show,
 }
 
-fn stdin() -> Result<SecretBuf, Error> {
-    let mut buf = Vec::new();
-    std::io::stdin().read_to_end(&mut buf)?;
-    Ok(SecretBuf::new(buf))
-}
-
 fn stdin_text() -> Result<String, Error> {
-    Ok(String::from_utf8(stdin()?.as_ref().to_vec())?)
+    Ok(String::from_utf8(
+        kuipa_tools::cli::stdin_all()?.as_ref().to_vec(),
+    )?)
 }
 
 fn alg(name: &str) -> Result<SignatureAlg, Error> {
@@ -201,7 +195,7 @@ fn run(command: Command) -> Result<(), Error> {
             println!("{}", String::from_utf8_lossy(v.encode().as_ref()));
         }
         Command::Show => {
-            let v = Voucher::parse(stdin()?.as_ref())?;
+            let v = Voucher::parse(kuipa_tools::cli::stdin_all()?.as_ref())?;
             let c = v.claims();
             println!(
                 "{}",

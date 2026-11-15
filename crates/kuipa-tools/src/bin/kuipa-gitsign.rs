@@ -21,7 +21,7 @@
 //! Forges show these signatures as unverified: they know gpg, ssh and
 //! S/MIME signatures, not kuipa's.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::ExitCode;
 
 use kuipa_enroll::sign::{Bundle, Digest, DigestAlg, Request};
@@ -72,9 +72,7 @@ fn status(fd: u32, line: &str) {
 }
 
 fn payload() -> Result<Vec<u8>, Error> {
-    let mut data = Vec::new();
-    std::io::stdin().read_to_end(&mut data)?;
-    Ok(data)
+    Ok(kuipa_tools::cli::stdin_all()?.as_ref().to_vec())
 }
 
 fn sign(args: &[String]) -> Result<(), Error> {

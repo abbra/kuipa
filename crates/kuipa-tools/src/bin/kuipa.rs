@@ -102,7 +102,7 @@
 //! Exit status: 0 success, 75 retry later, 1 needs an administrator or
 //! another error, 2 usage.
 
-use std::io::{IsTerminal, Read};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -797,12 +797,9 @@ fn run_escrow(paths: &Paths, action: &EscrowAction) -> Result<Value, Error> {
             uuid,
             keytab,
         } => {
-            let input = if let Some(path) = key_file {
-                SecretBuf::new(kuipa_tools::paths::read(path)?)
-            } else {
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
-                SecretBuf::new(buf)
+            let input = match key_file {
+                Some(path) => SecretBuf::new(kuipa_tools::paths::read(path)?),
+                None => kuipa_tools::cli::stdin_all()?,
             };
             let by = kuipa_tools::escrow::Depositor {
                 paths,
@@ -1442,9 +1439,7 @@ impl Args {
         let interactive = need_stdin && std::io::stdin().is_terminal();
         let mut piped = Vec::new().into_iter();
         if need_stdin && !interactive {
-            let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
-            let buf = SecretBuf::new(buf);
+            let buf = kuipa_tools::cli::stdin_all()?;
             piped = buf
                 .as_ref()
                 .split(|&b| b == b'\n')

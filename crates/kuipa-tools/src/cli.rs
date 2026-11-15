@@ -1,6 +1,9 @@
 //! What the command-line tools share: the tracing flags and the exit status.
 
+use std::io::Read;
 use std::process::ExitCode;
+
+use native_ossl::util::SecretBuf;
 
 use crate::flows::Outcome;
 use crate::paths::Error;
@@ -46,4 +49,15 @@ pub fn finish(prog: &str, result: Result<(), Error>) -> ExitCode {
             }
         }
     }
+}
+
+/// Everything on standard input, kept off the heap's free list unwiped.
+///
+/// # Errors
+///
+/// A read error.
+pub fn stdin_all() -> Result<SecretBuf, Error> {
+    let mut buf = Vec::new();
+    std::io::stdin().read_to_end(&mut buf)?;
+    Ok(SecretBuf::new(buf))
 }
