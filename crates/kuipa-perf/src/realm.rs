@@ -123,28 +123,19 @@ pub fn realm_with(profile: &Profile, ca: CaKind) -> Realm {
 
 fn server_keys(signing: SigningKey) -> ServerKeys {
     ServerKeys {
-        signing,
         join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).expect("join key")],
         escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).expect("escrow key")],
-        trust: Vec::new(),
-        vouchers: Vec::new(),
-        retired: Vec::new(),
+        ..ServerKeys::new(signing)
     }
 }
 
 fn info(anchor: &SigningKey, fqdn: &str, servers: &[String], cas: &[Vec<u8>]) -> RealmInfo {
     RealmInfo {
-        realm: REALM.into(),
-        domain: DOMAIN.into(),
-        basedn: "dc=example,dc=test".into(),
-        server: fqdn.into(),
         servers: servers.to_vec(),
         ca_certs: cas.to_vec(),
         pkinit_anchors: cas.to_vec(),
         anchors: vec![*anchor.public().thumbprint()],
-        heads: Vec::new(),
-        trusts: Vec::new(),
-        kdc_proxy: None,
+        ..RealmInfo::new(REALM, DOMAIN, "dc=example,dc=test", fqdn)
     }
 }
 

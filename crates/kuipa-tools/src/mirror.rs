@@ -394,25 +394,21 @@ mod tests {
         .unwrap();
         let thp = *anchor.public().thumbprint();
         let info = RealmInfo {
-            realm: "EXAMPLE.TEST".into(),
-            domain: "example.test".into(),
-            basedn: "dc=example,dc=test".into(),
-            server: "ipa1.example.test".into(),
             servers: vec!["ipa1.example.test".into()],
             ca_certs: vec![b"not really a certificate".to_vec()],
             pkinit_anchors: vec![b"pkinit anchor".to_vec()],
             anchors: vec![thp],
-            heads: Vec::new(),
-            trusts: Vec::new(),
-            kdc_proxy: None,
+            ..RealmInfo::new(
+                "EXAMPLE.TEST",
+                "example.test",
+                "dc=example,dc=test",
+                "ipa1.example.test",
+            )
         };
         let keys = ServerKeys {
-            signing,
             join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
             escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-            trust: Vec::new(),
-            vouchers: Vec::new(),
-            retired: Vec::new(),
+            ..ServerKeys::new(signing)
         };
         let server = EnrollServer::new(keys, info, delegation.clone());
         let leaf = delegation
