@@ -272,7 +272,7 @@ pub fn split_view(servers: &[String]) -> Result<Value, Error> {
                 server: server.clone(),
                 anchors: Vec::new(),
                 heads: Vec::new(),
-                error: Some(why),
+                error: Some(why.to_string()),
             });
             continue;
         }
@@ -335,21 +335,14 @@ pub fn split_view(servers: &[String]) -> Result<Value, Error> {
 /// # Errors
 ///
 /// A message naming what failed to parse or verify.
-fn self_consistent(adv: &tang_pqc::SignedAdvertisement, now: SystemTime) -> Result<(), String> {
+fn self_consistent(adv: &tang_pqc::SignedAdvertisement, now: SystemTime) -> Result<(), Error> {
     let delegation = Delegation::from_value(
-        adv.unverified_member("delegation")
-            .map_err(|e| e.to_string())?
-            .ok_or("no delegation member".to_owned())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let claim = delegation.claim().map_err(|e| e.to_string())?;
-    adv.verify_at(
-        &claim.key,
-        &Policy::from_system().map_err(|e| e.to_string())?,
-        now,
-    )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+        adv.unverified_member("delegation")?
+            .ok_or("no delegation member")?,
+    )?;
+    let claim = delegation.claim()?;
+    adv.verify_at(&claim.key, &Policy::from_system()?, now)?;
+    Ok(())
 }
 
 /// Where the views disagree: an anchor served at different roots, an
@@ -662,7 +655,7 @@ pub(crate) fn advertised_log(
 fn replay_served(
     endpoint: &Endpoint,
     head: &kuipa_enroll::tlog::Head,
-) -> Result<Result<(Vec<kuipa_enroll::tlog::Leaf>, kuipa_enroll::tlog::Log), String>, Error> {
+) -> Result<Result<(Vec<kuipa_enroll::tlog::Leaf>, kuipa_enroll::tlog::Log), Error>, Error> {
     let mut leaves = Vec::new();
     while (leaves.len() as u64) < head.size {
         let page = endpoint.tlog_leaves(&head.log, leaves.len() as u64)?;
@@ -677,11 +670,12 @@ fn replay_served(
             "the head names {} leaves, the log serves {}",
             head.size,
             leaves.len()
-        )));
+        )
+        .into()));
     }
     let replayed = match kuipa_enroll::tlog::Log::replay(head.log, &leaves) {
         Ok(l) => l,
-        Err(e) => return Ok(Err(format!("the leaves break the log's rules: {e}"))),
+        Err(e) => return Ok(Err(format!("the leaves break the log's rules: {e}").into())),
     };
     if replayed.root()? != head.root {
         return Ok(Err("the head is not the root of the leaves served".into()));

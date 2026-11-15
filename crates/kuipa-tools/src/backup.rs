@@ -91,16 +91,15 @@ pub fn create_key(
     let mut seed = [0u8; 32];
     Rand::fill_private(&mut seed)?;
     let params = shards::SetParams::new(threshold, shares, kem_1024);
-    let salt = shards::new_salt().map_err(|e| e.to_string())?;
+    let salt = shards::new_salt()?;
     let hidden = shards::mask(
         &seed,
         &String::from_utf8_lossy(recovery),
         &salt,
         params.iterations,
-    )
-    .map_err(|e| e.to_string())?;
-    let made = shards::make_shares(&hidden, salt, params).map_err(|e| e.to_string())?;
-    let pair = shards::recovery_key(&seed, kem_1024).map_err(|e| e.to_string())?;
+    )?;
+    let made = shards::make_shares(&hidden, salt, params)?;
+    let pair = shards::recovery_key(&seed, kem_1024)?;
     let file = RecipientFile {
         realm: realm.to_owned(),
         key_id: pair.public().kid().to_string(),
@@ -138,15 +137,14 @@ pub fn recover_key(
     recovery: &[u8],
 ) -> Result<(ExchangeKeyPair, Vec<Value>), Error> {
     let (read, report) = SealClient::gather_shares(words)?;
-    let combined = shards::combine(&read).map_err(|e| e.to_string())?;
+    let combined = shards::combine(&read)?;
     let seed = shards::mask(
         &combined.hidden,
         &String::from_utf8_lossy(recovery),
         &combined.salt,
         combined.iterations,
-    )
-    .map_err(|e| e.to_string())?;
-    let pair = shards::recovery_key(&seed, combined.kem_1024).map_err(|e| e.to_string())?;
+    )?;
+    let pair = shards::recovery_key(&seed, combined.kem_1024)?;
     Ok((pair, report))
 }
 

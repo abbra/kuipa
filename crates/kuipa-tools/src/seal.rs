@@ -1568,10 +1568,9 @@ impl<'a> SealClient<'a> {
         let Some(registration) = registration_of(&rows) else {
             return Ok(None);
         };
-        let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())
-            .map_err(|e| e.to_string())?;
+        let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())?;
         let device = key.public().kid().to_string();
-        let blob = kuipa_enroll::seal::seal_delivery(&public, key).map_err(|e| e.to_string())?;
+        let blob = kuipa_enroll::seal::seal_delivery(&public, key)?;
         self.op_with_session(&SealOp::EnrollShards {
             blobs: vec![(device, tang_pqc::b64::encode(&blob))],
         })?;
@@ -1883,16 +1882,15 @@ impl<'a> SealClient<'a> {
         let mut seed = [0u8; 32];
         Rand::fill_private(&mut seed)?;
         let params = shards::SetParams::new(threshold, shares, false);
-        let salt = shards::new_salt().map_err(|e| e.to_string())?;
+        let salt = shards::new_salt()?;
         let hidden = shards::mask(
             &seed,
             &String::from_utf8_lossy(recovery),
             &salt,
             params.iterations,
-        )
-        .map_err(|e| e.to_string())?;
-        let made = shards::make_shares(&hidden, salt, params).map_err(|e| e.to_string())?;
-        let pair = shards::recovery_key(&seed, false).map_err(|e| e.to_string())?;
+        )?;
+        let made = shards::make_shares(&hidden, salt, params)?;
+        let pair = shards::recovery_key(&seed, false)?;
         let registration = ShardsRegistration {
             key: pair.public().kid().to_string(),
             set: made[0].header.set_id,
@@ -1900,7 +1898,7 @@ impl<'a> SealClient<'a> {
         };
         let device = key.public().kid().to_string();
         let blob =
-            kuipa_enroll::seal::seal_delivery(pair.public(), &key).map_err(|e| e.to_string())?;
+            kuipa_enroll::seal::seal_delivery(pair.public(), &key)?;
         self.op_with_session(&SealOp::EscrowShards {
             registration: registration.clone(),
             blobs: vec![(device.clone(), tang_pqc::b64::encode(&blob))],
@@ -1937,10 +1935,9 @@ impl<'a> SealClient<'a> {
         };
         let rows = self.op_with_session(&SealOp::RecoverShards)?.reply.escrows;
         let registration = registration_of(&rows).ok_or("no recovery shard set is registered")?;
-        let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())
-            .map_err(|e| e.to_string())?;
+        let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())?;
         let device = key.public().kid().to_string();
-        let blob = kuipa_enroll::seal::seal_delivery(&public, &key).map_err(|e| e.to_string())?;
+        let blob = kuipa_enroll::seal::seal_delivery(&public, &key)?;
         self.op_with_session(&SealOp::EnrollShards {
             blobs: vec![(device.clone(), tang_pqc::b64::encode(&blob))],
         })?;
@@ -1965,7 +1962,7 @@ impl<'a> SealClient<'a> {
             // the page's own header against the length.
             let total = shards::DATA_WORDS + usize::from(shards::DEFAULT_PARITY);
             let symbols = shards::parse_lines(text, total);
-            let (share, repair) = Share::from_symbols(&symbols).map_err(|e| e.to_string())?;
+            let (share, repair) = Share::from_symbols(&symbols)?;
             if let Some(first) = read.first()
                 && first.header.set_id != share.header.set_id
             {
@@ -2076,15 +2073,14 @@ impl<'a> SealClient<'a> {
         Error,
     > {
         let (read, report) = Self::gather_shares(words)?;
-        let combined = shards::combine(&read).map_err(|e| e.to_string())?;
+        let combined = shards::combine(&read)?;
         let seed = shards::mask(
             &combined.hidden,
             &String::from_utf8_lossy(recovery),
             &combined.salt,
             combined.iterations,
-        )
-        .map_err(|e| e.to_string())?;
-        let pair = shards::recovery_key(&seed, combined.kem_1024).map_err(|e| e.to_string())?;
+        )?;
+        let pair = shards::recovery_key(&seed, combined.kem_1024)?;
         let rows = self.op_with_session(&SealOp::RecoverShards)?.reply.escrows;
         let registration = registration_of(&rows).ok_or("no recovery shard set is registered")?;
         if pair.public().kid().to_string() != registration.key {

@@ -174,12 +174,12 @@ fn frozen_gate(
     advertisement: &VerifiedRealm,
     wanted: &[HeadPin],
     frozen: &[Thumbprint],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     for f in frozen {
         if !head_proves(advertisement, f, &window_of(wanted, f)) {
             return Err(format!(
                 "frozen: the pinned head of {f} does not prove this claim"
-            ));
+            ).into());
         }
     }
     Ok(())
@@ -195,37 +195,27 @@ fn quorum_proof(
     window: &[HeadPin],
     retired: &[Hash],
     frozen: bool,
-) -> Result<VerifiedRealm, String> {
+) -> Result<VerifiedRealm, Error> {
     if frozen {
-        endpoint
-            .advertisement_with_heads(std::slice::from_ref(a), window)
-            .map_err(|e| e.to_string())
-            .and_then(|adv| {
-                VerifiedRealm::verify_with_heads(
-                    &adv,
-                    realm,
-                    std::slice::from_ref(a),
-                    window,
-                    retired,
-                    &Policy::from_system().map_err(|e| e.to_string())?,
-                    now(),
-                )
-                .map_err(|e| e.to_string())
-            })
+        let adv = endpoint.advertisement_with_heads(std::slice::from_ref(a), window)?;
+        Ok(VerifiedRealm::verify_with_heads(
+            &adv,
+            realm,
+            std::slice::from_ref(a),
+            window,
+            retired,
+            &Policy::from_system()?,
+            now(),
+        )?)
     } else {
-        endpoint
-            .advertisement(std::slice::from_ref(a))
-            .map_err(|e| e.to_string())
-            .and_then(|adv| {
-                VerifiedRealm::verify(
-                    &adv,
-                    realm,
-                    std::slice::from_ref(a),
-                    &Policy::from_system().map_err(|e| e.to_string())?,
-                    now(),
-                )
-                .map_err(|e| e.to_string())
-            })
+        let adv = endpoint.advertisement(std::slice::from_ref(a))?;
+        Ok(VerifiedRealm::verify(
+            &adv,
+            realm,
+            std::slice::from_ref(a),
+            &Policy::from_system()?,
+            now(),
+        )?)
     }
 }
 
@@ -272,7 +262,7 @@ pub(crate) fn verified(
     trust: &Trust,
     pinned: Pins<'_>,
     known: Option<Epoch>,
-) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), String> {
+) -> Result<(Endpoint, VerifiedRealm, Option<Epoch>), Error> {
     let Pins {
         realm,
         anchors,
@@ -280,7 +270,7 @@ pub(crate) fn verified(
         retired,
         frozen,
     } = pinned;
-    let endpoint = Endpoint::new(server, trust).map_err(|e| e.to_string())?;
+    let endpoint = Endpoint::new(server, trust)?;
     let mut pins: Vec<Thumbprint> = anchors.to_vec();
     pins.sort_unstable();
     pins.dedup();
@@ -290,15 +280,14 @@ pub(crate) fn verified(
     // server tries each pinned head in turn (§1.4), and a claim only
     // under the newest head has no proof under the oldest.
     let adv = endpoint
-        .advertisement_with_heads(&pins, &wanted_heads)
-        .map_err(|e| e.to_string())?;
+        .advertisement_with_heads(&pins, &wanted_heads)?;
     let advertisement = VerifiedRealm::verify_with_heads(
         &adv,
         realm,
         &pins,
         &wanted_heads,
         retired,
-        &Policy::from_system().map_err(|e| e.to_string())?,
+        &Policy::from_system()?,
         now(),
     )
     .map_err(|e| {
@@ -366,7 +355,7 @@ pub(crate) fn verified(
                 "its claim is proven by {} of the {} anchors known here; the realm's anchors must vouch for it by two distinct ones, run kuipa check",
                 proven.len(),
                 pins.len(),
-            ));
+            ).into());
         }
         quorum = true;
     }
@@ -385,7 +374,7 @@ fn watermark_after(
     anchors: &[Thumbprint],
     known: Option<Epoch>,
     quorum: bool,
-) -> Result<Option<Epoch>, String> {
+) -> Result<Option<Epoch>, Error> {
     let Some((seq, hash)) = known else {
         // The first sighting through a proved quorum (§4.4) is a safe
         // watermark: from here on a frozen server fails below.
@@ -395,17 +384,17 @@ fn watermark_after(
         None => {
             return Err(format!(
                 "reports no anchor epoch log, but this host has seen the realm at sequence {seq}: this server's kuipad is too old, or its anchor exchange is not running",
-            ));
+            ).into());
         }
         Some((theirs, _)) if theirs < seq => {
             return Err(format!(
                 "its anchor log stops at sequence {theirs}, behind the {seq} this host verified: the anchor key may have been replaced and this server left behind",
-            ));
+            ).into());
         }
         Some((theirs, theirs_head)) if theirs == seq && theirs_head != hash => {
             return Err(format!(
                 "its anchor log at sequence {theirs} differs from the one this host verified: the two have forked, run kuipa check",
-            ));
+            ).into());
         }
         Some((theirs, theirs_head)) if theirs > seq => {
             // §4.8: follow the log page by page — a server answers at
@@ -413,19 +402,19 @@ fn watermark_after(
             // the advertisement claims.
             let mut reached = (seq, hash);
             while reached.0 < theirs {
-                let entries = endpoint.anchor_log(reached.0).map_err(|e| e.to_string())?;
+                let entries = endpoint.anchor_log(reached.0)?;
                 reached = verify_chain(
                     &entries,
                     realm,
                     anchors,
                     Some(reached),
-                    &Policy::from_system().map_err(|e| e.to_string())?,
+                    &Policy::from_system()?,
                 )?;
             }
             if reached != (theirs, theirs_head) {
                 return Err(format!(
                     "its anchor log at sequence {theirs} commits to an entry its advertisement does not name: the two have forked",
-                ));
+                ).into());
             }
             return Ok(Some(reached));
         }
@@ -2367,9 +2356,8 @@ pub fn check(paths: &Paths, only: &[String]) -> Result<Value, Error> {
             known,
         )
         .and_then(|(e, adv, advance)| {
-            adv.check_deployment(&Deployment::servers(&state.servers))
-                .map(|()| (e, adv, advance))
-                .map_err(|e| e.to_string())
+            adv.check_deployment(&Deployment::servers(&state.servers))?;
+            Ok((e, adv, advance))
         }) {
             Ok((_, adv, advance)) => {
                 // The furthest verified advance wins: a server that
@@ -2383,7 +2371,7 @@ pub fn check(paths: &Paths, only: &[String]) -> Result<Value, Error> {
             }
             Err(e) => {
                 problems.push(format!("{server}: {e}"));
-                servers.push(json!({ "server": server, "ok": false, "error": e }));
+                servers.push(json!({ "server": server, "ok": false, "error": e.to_string() }));
             }
         }
     }
@@ -2573,16 +2561,15 @@ pub fn advertisements(
             None,
         )
         .and_then(|(endpoint, adv, _)| {
-            adv.check_deployment(deployment)
-                .map(|()| (endpoint, adv))
-                .map_err(|e| e.to_string())
+            adv.check_deployment(deployment)?;
+            Ok((endpoint, adv))
         }) {
             Ok((endpoint, adv)) => advertisement_detail(server, &endpoint, &adv, realm, anchors),
             Err(e) => Err(e),
         };
         match detail {
             Ok(value) => servers.push(value),
-            Err(e) => servers.push(json!({ "server": server, "ok": false, "error": e })),
+            Err(e) => servers.push(json!({ "server": server, "ok": false, "error": e.to_string() })),
         }
     }
     // Inverse index of the same verified facts, keyed by thumbprint: one
@@ -2718,7 +2705,7 @@ fn advertisement_detail(
     adv: &VerifiedRealm,
     realm: &str,
     anchors: &[Thumbprint],
-) -> Result<Value, String> {
+) -> Result<Value, Error> {
     let landmarks = landmark_chain(endpoint, adv, realm, anchors)?;
     let info = adv.info();
     let now = unix_seconds(now());
@@ -2783,22 +2770,21 @@ fn landmark_chain(
     adv: &VerifiedRealm,
     realm: &str,
     anchors: &[Thumbprint],
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, Error> {
     let Some((head_seq, head)) = adv.epoch() else {
         return Ok(Vec::new());
     };
-    let policy = Policy::from_system().map_err(|e| e.to_string())?;
+    let policy = Policy::from_system()?;
     let mut out = Vec::new();
     let mut reached: Option<(u64, kuipa_enroll::epoch::EpochHead)> = None;
     while reached != Some((head_seq, head)) {
         let page = endpoint
-            .anchor_log(reached.map_or(0, |(seq, _)| seq))
-            .map_err(|e| e.to_string())?;
+            .anchor_log(reached.map_or(0, |(seq, _)| seq))?;
         if page.is_empty() {
             return Err(format!(
                 "its anchor log ends at sequence {}, not the {head_seq} its advertisement names",
                 reached.map_or(0, |(seq, _)| seq),
-            ));
+            ).into());
         }
         reached = Some(verify_chain(&page, realm, anchors, reached, &policy)?);
         for signed in &page {
@@ -2825,7 +2811,7 @@ fn landmark_chain(
                         )?;
                         Ok(format!("{} -> {}", st.old, st.new))
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
+                    .collect::<Result<Vec<_>, Error>>()?,
             }));
         }
     }
@@ -2998,17 +2984,17 @@ pub fn adopt(
 ///
 /// shortcut: the advertisement is fetched twice, once here and once
 /// verified; a second answer signed by other anchors is refused.
-fn first_use_anchors(server: &str) -> Result<(String, Vec<Thumbprint>), String> {
-    let endpoint = Endpoint::new(server, &Trust::FirstContact).map_err(|e| e.to_string())?;
-    let adv = endpoint.advertisement(&[]).map_err(|e| e.to_string())?;
+fn first_use_anchors(server: &str) -> Result<(String, Vec<Thumbprint>), Error> {
+    let endpoint = Endpoint::new(server, &Trust::FirstContact)?;
+    let adv = endpoint.advertisement(&[])?;
     let delegation = adv
         .unverified_member("delegation")
         .ok()
         .flatten()
         .and_then(|v| Delegation::from_value(v).ok())
         .ok_or("the advertisement carries no delegation")?;
-    let claim = delegation.claim().map_err(|e| e.to_string())?;
-    let anchors = delegation.signers(&Policy::from_system().map_err(|e| e.to_string())?);
+    let claim = delegation.claim()?;
+    let anchors = delegation.signers(&Policy::from_system()?);
     if anchors.is_empty() {
         return Err("no anchor signs its delegation".into());
     }
@@ -3020,7 +3006,7 @@ fn first_use_anchors(server: &str) -> Result<(String, Vec<Thumbprint>), String> 
 fn realm_info_with(
     deployment: &Deployment,
     dir: &std::path::Path,
-    verify: impl Fn(&str) -> Result<VerifiedRealm, String>,
+    verify: impl Fn(&str) -> Result<VerifiedRealm, Error>,
 ) -> Result<Value, Error> {
     let mut skipped = Vec::new();
     for server in &deployment.servers {
