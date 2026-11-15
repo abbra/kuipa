@@ -206,7 +206,14 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
         devices pruned at every seal operation; user-seal releases
         rate-limited per opener.
   - [ ] Attestation for the `hardware-wrapped` and `hardware-bound` levels.
-- [ ] TPM factor for sealed keytabs and `kuipa prepare --tpm` (§7.1, §8.2).
+- [x] TPM factor for sealed keytabs and files (`kuipa protect --tpm`),
+      `kuipa prepare --tpm`, and the user-seal `tpm` device (§7.1, §8.2,
+      §7.6.2): `systemd-creds` as the backend, no PCRs unless
+      `--tpm-pcrs`; ci-freeipa's qemu backend has `vm.tpm` for the real
+      checks.
+- [ ] TPM-sealed keytabs through gssproxy's loader under SELinux enforcing
+      (`gssproxy_t` running `systemd-creds` and reaching `/dev/tpmrm0`):
+      not checked.
 - [x] Secrets transport (§18): the `keys` operation in `kuipa-enroll`
       (`IPKG`/`IPKR`) and its route in kuipad; handler execution with
       runas and the static namespace policy checked against `cn=masters`
