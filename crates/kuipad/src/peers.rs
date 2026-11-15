@@ -303,18 +303,105 @@ fn repair_concurrency(members: usize) -> usize {
     (MAX_CONCURRENT_REPAIRS / members.saturating_sub(1).max(1)).max(1)
 }
 
+/// What woke the repair loop: a retry tick (only peers whose backoff is
+/// over), an ordinary round (the fanout), or a comprehensive sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Round {
+    Retry,
+    Ordinary,
+    Sweep,
+}
+
+/// A repair in flight.
+struct Active {
+    peer: String,
+    started: Instant,
+}
+
+/// A peer that answered busy: when to try again, and how many times we have.
+struct Retry {
+    at: Instant,
+    attempts: u8,
+}
+
+/// Which peers wait for, run and back off from repair.
+#[derive(Default)]
+struct Scheduler {
+    pending: VecDeque<String>,
+    active: HashMap<tokio::task::Id, Active>,
+    retries: HashMap<String, Retry>,
+    cursor: Option<usize>,
+}
+
+impl Scheduler {
+    fn enqueue(&mut self, me: &str, peer: &str) {
+        if peer != me
+            && !self.pending.iter().any(|p| p == peer)
+            && !self.active.values().any(|a| a.peer == peer)
+        {
+            self.pending.push_back(peer.to_owned());
+        }
+    }
+
+    /// Queue the peers whose backoff is over and, but for a retry tick,
+    /// the round's selection of `members`.
+    fn queue(&mut self, me: &str, members: &BTreeSet<String>, round: Round) {
+        let due: Vec<String> = self
+            .retries
+            .iter()
+            .filter(|(_, retry)| retry.at <= Instant::now())
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in &due {
+            self.enqueue(me, peer);
+        }
+        if round != Round::Retry {
+            for peer in selected_peers(members, me, &mut self.cursor, round) {
+                if !self.retries.contains_key(peer) {
+                    self.enqueue(me, peer);
+                }
+            }
+        }
+    }
+
+    /// Record how a repair with `peer` ended: a busy peer is retried after a
+    /// jittered exponential delay, up to [`MAX_BUSY_RETRIES`] times.
+    fn finished(&mut self, me: &str, peer: &str, busy: bool) {
+        let attempts = self.retries.get(peer).map_or(0, |retry| retry.attempts);
+        if busy && attempts < MAX_BUSY_RETRIES {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (me, peer, attempts).hash(&mut hash);
+            let delay = 250 * (1u64 << attempts) + hash.finish() % 250;
+            self.retries.insert(
+                peer.to_owned(),
+                Retry {
+                    at: Instant::now() + Duration::from_millis(delay),
+                    attempts: attempts + 1,
+                },
+            );
+        } else {
+            self.retries.remove(peer);
+        }
+    }
+}
+
 fn selected_peers<'a>(
     members: &'a BTreeSet<String>,
     me: &str,
     cursor: &mut Option<usize>,
-    sweep: bool,
+    round: Round,
 ) -> Vec<&'a String> {
     let mut peers: Vec<_> = members.iter().filter(|peer| peer.as_str() != me).collect();
     if !peers.is_empty() {
         let len = peers.len();
         let start = *cursor
             .get_or_insert_with(|| members.iter().position(|peer| peer == me).unwrap_or(0) % len);
-        let count = if sweep { len } else { GOSSIP_FANOUT.min(len) };
+        let count = if round == Round::Sweep {
+            len
+        } else {
+            GOSSIP_FANOUT.min(len)
+        };
         peers.rotate_left(start % len);
         peers.truncate(count);
         *cursor = Some((start + count) % len);
@@ -426,7 +513,7 @@ struct Probe {
     retries: std::sync::atomic::AtomicUsize,
     busy: std::sync::atomic::AtomicUsize,
     idle: AtomicBool,
-    control: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<bool>>>,
+    control: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Round>>>,
 }
 
 /// The running exchange.
@@ -570,7 +657,7 @@ impl Peers {
         #[cfg(test)]
         let mut control = lock(&self.probe.control).take();
         #[cfg(not(test))]
-        let mut control: Option<tokio::sync::mpsc::UnboundedReceiver<bool>> = None;
+        let mut control: Option<tokio::sync::mpsc::UnboundedReceiver<Round>> = None;
         #[cfg(test)]
         let automatic = control.is_none();
         #[cfg(not(test))]
@@ -586,25 +673,23 @@ impl Peers {
         for timer in [&mut ordinary, &mut comprehensive, &mut retry_tick] {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         }
-        let mut pending: VecDeque<String> = VecDeque::new();
+        let mut scheduler = Scheduler::default();
         let mut running = tokio::task::JoinSet::new();
-        let mut active: HashMap<tokio::task::Id, (String, Instant)> = HashMap::new();
-        let mut retries: HashMap<String, (Instant, u8)> = HashMap::new();
-        let mut cursor = None;
         let mut base_concurrency = 1;
         loop {
             #[cfg(test)]
             self.probe.idle.store(
-                pending.is_empty() && running.is_empty() && retries.is_empty(),
+                scheduler.pending.is_empty() && running.is_empty() && scheduler.retries.is_empty(),
                 Ordering::Release,
             );
-            let stalled = active
+            let stalled = scheduler
+                .active
                 .values()
-                .filter(|(_, started)| started.elapsed() >= REPAIR_STALL_DELAY)
+                .filter(|active| active.started.elapsed() >= REPAIR_STALL_DELAY)
                 .count();
             let concurrency = (base_concurrency + stalled).min(MAX_CONCURRENT_REPAIRS);
             while running.len() < concurrency {
-                let Some(peer) = pending.pop_front() else {
+                let Some(peer) = scheduler.pending.pop_front() else {
                     break;
                 };
                 let worker = self.clone();
@@ -613,30 +698,36 @@ impl Peers {
                 #[cfg(test)]
                 {
                     self.probe.started.fetch_add(1, Ordering::Relaxed);
-                    if retries.contains_key(&peer) {
+                    if scheduler.retries.contains_key(&peer) {
                         self.probe.retries.fetch_add(1, Ordering::Relaxed);
                     }
                     self.probe.peak.fetch_max(running.len(), Ordering::Relaxed);
                 }
-                active.insert(task.id(), (peer, Instant::now()));
+                scheduler.active.insert(
+                    task.id(),
+                    Active {
+                        peer,
+                        started: Instant::now(),
+                    },
+                );
             }
-            let sweep = tokio::select! {
-                _ = ordinary.tick(), if automatic => Some(false),
-                _ = comprehensive.tick(), if automatic => Some(true),
-                () = self.exchange.repair_trigger.notified(), if automatic => Some(false),
+            let round = tokio::select! {
+                _ = ordinary.tick(), if automatic => Round::Ordinary,
+                _ = comprehensive.tick(), if automatic => Round::Sweep,
+                () = self.exchange.repair_trigger.notified(), if automatic => Round::Ordinary,
                 command = async { control.as_mut().expect("manual control").recv().await }, if !automatic => {
                     match command {
-                        Some(sweep) => {
+                        Some(round) => {
                             #[cfg(test)]
                             self.probe.idle.store(false, Ordering::Release);
-                            Some(sweep)
+                            round
                         }
                         None => return,
                     }
                 },
-                _ = retry_tick.tick() => None,
+                _ = retry_tick.tick() => Round::Retry,
                 Some(result) = running.join_next_with_id(), if !running.is_empty() => {
-                    self.finish_repair(result, &mut active, &mut retries);
+                    self.finish_repair(result, &mut scheduler);
                     continue;
                 }
             };
@@ -647,50 +738,12 @@ impl Peers {
                 .snapshots
                 .retain(|peer| members.contains(peer));
             let neighbors = self.exchange.neighbors();
-            pending.retain(|peer| neighbors.contains(peer));
-            retries.retain(|peer, _| neighbors.contains(peer));
-            self.queue_repairs(
-                &neighbors,
-                &mut pending,
-                &active,
-                &retries,
-                &mut cursor,
-                sweep,
-            );
+            scheduler.pending.retain(|peer| neighbors.contains(peer));
+            scheduler.retries.retain(|peer, _| neighbors.contains(peer));
+            scheduler.queue(&self.exchange.settings.me, &neighbors, round);
             #[cfg(test)]
-            if !automatic && sweep.is_some() {
+            if !automatic && round != Round::Retry {
                 self.probe.rounds.fetch_add(1, Ordering::Release);
-            }
-        }
-    }
-
-    fn queue_repairs(
-        &self,
-        members: &BTreeSet<String>,
-        pending: &mut VecDeque<String>,
-        active: &HashMap<tokio::task::Id, (String, Instant)>,
-        retries: &HashMap<String, (Instant, u8)>,
-        cursor: &mut Option<usize>,
-        sweep: Option<bool>,
-    ) {
-        let mut enqueue = |peer: &String| {
-            if peer != &self.exchange.settings.me
-                && !pending.contains(peer)
-                && !active.values().any(|(running, _)| running == peer)
-            {
-                pending.push_back(peer.clone());
-            }
-        };
-        for (peer, (at, _)) in retries {
-            if *at <= Instant::now() {
-                enqueue(peer);
-            }
-        }
-        if let Some(sweep) = sweep {
-            for peer in selected_peers(members, &self.exchange.settings.me, cursor, sweep) {
-                if !retries.contains_key(peer) {
-                    enqueue(peer);
-                }
             }
         }
     }
@@ -698,8 +751,7 @@ impl Peers {
     fn finish_repair(
         &self,
         result: Result<(tokio::task::Id, Result<(), Error>), tokio::task::JoinError>,
-        active: &mut HashMap<tokio::task::Id, (String, Instant)>,
-        retries: &mut HashMap<String, (Instant, u8)>,
+        scheduler: &mut Scheduler,
     ) {
         let id = match &result {
             Ok((id, _)) => *id,
@@ -712,34 +764,19 @@ impl Peers {
             }
             self.probe.completed.fetch_add(1, Ordering::Release);
         }
-        if let Some((peer, _)) = active.remove(&id) {
-            match result {
-                Ok((_, result)) => {
-                    let busy = result.as_ref().err().is_some_and(|error| {
-                        matches!(error.downcast_ref::<PeerError>(), Some(PeerError::Busy))
-                    });
-                    if busy {
-                        let attempts = retries.get(&peer).map_or(0, |(_, n)| *n);
-                        if attempts < MAX_BUSY_RETRIES {
-                            use std::hash::{Hash, Hasher};
-                            let mut hash = std::collections::hash_map::DefaultHasher::new();
-                            (&self.exchange.settings.me, &peer, attempts).hash(&mut hash);
-                            let delay = 250 * (1u64 << attempts) + hash.finish() % 250;
-                            retries.insert(
-                                peer.clone(),
-                                (Instant::now() + Duration::from_millis(delay), attempts + 1),
-                            );
-                        } else {
-                            retries.remove(&peer);
-                        }
-                    } else {
-                        retries.remove(&peer);
-                    }
-                    self.exchange
-                        .note(&peer, &result.map(|()| Vec::new()).map_err(failed));
-                }
-                Err(error) => self.exchange.note(&peer, &Err(failed(error))),
+        let Some(Active { peer, .. }) = scheduler.active.remove(&id) else {
+            return;
+        };
+        match result {
+            Ok((_, result)) => {
+                let busy = result.as_ref().err().is_some_and(|error| {
+                    matches!(error.downcast_ref::<PeerError>(), Some(PeerError::Busy))
+                });
+                scheduler.finished(&self.exchange.settings.me, &peer, busy);
+                self.exchange
+                    .note(&peer, &result.map(|()| Vec::new()).map_err(failed));
             }
+            Err(error) => self.exchange.note(&peer, &Err(failed(error))),
         }
     }
 
@@ -2000,16 +2037,16 @@ mod tests {
         let mut cursor = None;
         let mut seen = BTreeSet::new();
         for _ in 0..4 {
-            let selected = selected_peers(&members, "node-00", &mut cursor, false);
+            let selected = selected_peers(&members, "node-00", &mut cursor, Round::Ordinary);
             assert_eq!(selected.len(), GOSSIP_FANOUT);
             seen.extend(selected.into_iter().cloned());
         }
         assert_eq!(seen.len(), members.len() - 1);
-        let sweep = selected_peers(&members, "node-00", &mut cursor, true);
+        let sweep = selected_peers(&members, "node-00", &mut cursor, Round::Sweep);
         assert_eq!(sweep.len(), members.len() - 1);
         assert_eq!(members.len(), 13);
         let unequal: BTreeSet<_> = members.iter().skip(3).cloned().collect();
-        let sweep = selected_peers(&unequal, "node-00", &mut cursor, true);
+        let sweep = selected_peers(&unequal, "node-00", &mut cursor, Round::Sweep);
         assert_eq!(sweep.len(), unequal.len());
     }
 
@@ -2041,7 +2078,8 @@ mod tests {
         let names = ["a", "b", "c"];
         for source in 0..2 {
             let mut cursor = None;
-            let targets = selected_peers(&neighbors[source], names[source], &mut cursor, true);
+            let targets =
+                selected_peers(&neighbors[source], names[source], &mut cursor, Round::Sweep);
             assert!(
                 targets
                     .iter()
@@ -2953,7 +2991,7 @@ mod tests {
         );
         let mut cursor = None;
         let neighbors = exchange.neighbors();
-        let selected = selected_peers(&neighbors, "local", &mut cursor, true)
+        let selected = selected_peers(&neighbors, "local", &mut cursor, Round::Sweep)
             .into_iter()
             .cloned()
             .collect::<BTreeSet<_>>();

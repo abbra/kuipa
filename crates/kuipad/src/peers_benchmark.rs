@@ -669,7 +669,9 @@ async fn measure_scheduler_repair() {
                     .collect();
                 let started = Instant::now();
                 for control in &controls {
-                    control.send(sweep).expect("repair scheduler stopped");
+                    control
+                        .send(if sweep { Round::Sweep } else { Round::Ordinary })
+                        .expect("repair scheduler stopped");
                 }
                 tokio::time::timeout(Duration::from_secs(timeout_secs), async {
                     loop {
