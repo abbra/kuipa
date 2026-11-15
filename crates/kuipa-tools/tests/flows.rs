@@ -15,7 +15,7 @@ use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use kuipa_enroll::epoch::{AnchorEpoch, SignedEpoch};
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::merkle::TreeHash;
-use kuipa_enroll::payload::{Enrollment, RealmConfig};
+use kuipa_enroll::{Enrollment, RealmConfig};
 use kuipa_enroll::realm::{Deployment, KdcProxy, ProxyCa, RealmInfo, ServerKeys};
 use kuipa_enroll::server::{Directory, DirectoryError, Staged};
 use kuipa_tools::flows::{self, Auth, Outcome};

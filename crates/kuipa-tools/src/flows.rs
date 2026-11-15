@@ -18,7 +18,7 @@ use kuipa_enroll::join::{
 use kuipa_enroll::keys::{KeysFetch, Namespace, WrapAlg};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::merkle::Hash;
-use kuipa_enroll::payload::Enrollment;
+use kuipa_enroll::Enrollment;
 use kuipa_enroll::realm::{
     Deployment, KdcProxy, TrustedRealm, VerifiedRealm, krb5_proxied_realm_section,
     krb5_realm_section,
@@ -1707,8 +1707,8 @@ fn open_tpm_share(sealed: &Sealed, what: &str) -> Result<Option<SecretBuf>, Erro
 
 /// What a failed unseal means: a server problem is worth retrying, a TPM
 /// share that does not fit is not.
-fn unseal_failed(e: kuipa_enroll::error::Error, what: &str) -> Error {
-    use kuipa_enroll::error::Error as E;
+fn unseal_failed(e: kuipa_enroll::Error, what: &str) -> Error {
+    use kuipa_enroll::Error as E;
     match e {
         E::Policy(_) | E::Missing(_) => e.into(),
         _ => Outcome::RetryLater(format!("no server could unseal {what}")).into(),
