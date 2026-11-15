@@ -22,8 +22,8 @@ use agirru_engine::snapshot::{
     self, SnapshotLimits, SnapshotReplica, SnapshotRequest, SnapshotResponse, SnapshotServer,
 };
 use agirru_engine::{
-    CborCodec, DurableState, GossipConfig, GossipEngine, GossipHooks, GossipRuntime, Membership,
-    SendOutcome, Storage, Transport,
+    CborCodec, Codec, DurableState, GossipConfig, GossipEngine, GossipHooks, GossipRuntime,
+    Membership, SendOutcome, Storage, Transport,
 };
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::anchors::{self, AnchorState, Entry, PeerSync, Trust};
@@ -253,14 +253,12 @@ enum ResponseBody {
     Snapshot(SnapshotResponse),
 }
 
-fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::new();
-    ciborium::into_writer(value, &mut out)?;
-    Ok(out)
+fn encode<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) -> Result<Vec<u8>, Error> {
+    Ok(Codec::<T>::encode(&CborCodec, value)?)
 }
 
-fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
-    Ok(ciborium::from_reader(bytes)?)
+fn decode<T: serde::Serialize + serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
+    Ok(Codec::<T>::decode(&CborCodec, bytes)?)
 }
 
 /// A sender's own delegation, as sync context.
