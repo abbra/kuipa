@@ -91,7 +91,10 @@ pub trait Directory {
         fqdn: &str,
         otp: &[u8],
         enctypes: &[Enctype],
-    ) -> Result<Keytab, DirectoryError>;
+    ) -> Result<Keytab, DirectoryError> {
+        let _ = (fqdn, otp, enctypes);
+        Err("OTP joins are not supported by this directory".into())
+    }
 
     /// Accept `token` with channel bindings `cb`, join as the caller.
     /// Returns the keys and the binding derived from the accepted context
@@ -107,7 +110,10 @@ pub trait Directory {
         token: &[u8],
         cb: &[u8; 32],
         enctypes: &[Enctype],
-    ) -> Result<(Keytab, KerberosBinding), DirectoryError>;
+    ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
+        let _ = (fqdn, token, cb, enctypes);
+        Err("joins are not supported by this directory".into())
+    }
 
     /// Accept `token` from `host/<fqdn>` itself and rotate its keys.  If
     /// the host is staged, clear the staged state and the principal
@@ -122,7 +128,10 @@ pub trait Directory {
         token: &[u8],
         cb: &[u8; 32],
         enctypes: &[Enctype],
-    ) -> Result<(Keytab, KerberosBinding), DirectoryError>;
+    ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
+        let _ = (fqdn, token, cb, enctypes);
+        Err("rekeys are not supported by this directory".into())
+    }
 
     /// Accept an administrator's `token`, create or reset the host entry,
     /// create keys and record `staged`.
@@ -137,7 +146,10 @@ pub trait Directory {
         cb: &[u8; 32],
         enctypes: &[Enctype],
         staged: &Staged,
-    ) -> Result<(Keytab, KerberosBinding), DirectoryError>;
+    ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
+        let _ = (fqdn, token, cb, enctypes, staged);
+        Err("staging is not supported by this directory".into())
+    }
 
     /// Replace the registered keytab escrow bindings of `principal`.
     ///
@@ -148,7 +160,10 @@ pub trait Directory {
         &self,
         principal: &Principal,
         bindings: &[BindingHash],
-    ) -> Result<(), DirectoryError>;
+    ) -> Result<(), DirectoryError> {
+        let _ = (principal, bindings);
+        Err("escrow registration is not supported by this directory".into())
+    }
 
     /// Is `binding` registered for `principal` in its `kind` set, and is
     /// the principal's entry enabled (not locked)?
@@ -161,7 +176,10 @@ pub trait Directory {
         principal: &Principal,
         kind: escrow::Kind,
         binding: &BindingHash,
-    ) -> Result<bool, DirectoryError>;
+    ) -> Result<bool, DirectoryError> {
+        let _ = (principal, kind, binding);
+        Err("escrow is not supported by this directory".into())
+    }
 
     /// Accept `token` from `params.principal` itself (any principal of the
     /// realm with an entry: host, service or user) and change its escrow
@@ -222,19 +240,23 @@ pub trait Directory {
         Ok(None)
     }
 
-    /// The IPA CA chain (DER).
+    /// The IPA CA chain (DER); none by default.
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError>;
+    fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
+        Ok(Vec::new())
+    }
 
-    /// The realm's servers, for the client's configuration.
+    /// The realm's servers, for the client's configuration; none by default.
     ///
     /// # Errors
     ///
     /// Any failure.
-    fn servers(&self) -> Result<Vec<String>, DirectoryError>;
+    fn servers(&self) -> Result<Vec<String>, DirectoryError> {
+        Ok(Vec::new())
+    }
 
     /// Direct replication topology neighbors of `hostname`.
     ///

@@ -499,10 +499,8 @@ mod tests {
 
     use super::*;
     use crate::EnrollServer;
-    use crate::escrow::BindingHash;
-    use crate::keytab::{Enctype, Keytab, Principal};
     use crate::realm::{RealmInfo, ServerKeys};
-    use crate::server::{Directory, DirectoryError, Staged};
+    use crate::server::{Directory, DirectoryError};
 
     fn now() -> u64 {
         tang_pqc::now()
@@ -516,59 +514,6 @@ mod tests {
     }
 
     impl Directory for Trusts {
-        fn join_with_otp(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[Enctype],
-        ) -> Result<Keytab, DirectoryError> {
-            unreachable!()
-        }
-        fn join_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-        ) -> Result<(Keytab, crate::join::KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn rekey_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-        ) -> Result<(Keytab, crate::join::KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn stage_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-            _: &Staged,
-        ) -> Result<(Keytab, crate::join::KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn register_escrow(&self, _: &Principal, _: &[BindingHash]) -> Result<(), DirectoryError> {
-            unreachable!()
-        }
-        fn escrow_allowed(
-            &self,
-            _: &Principal,
-            _: crate::escrow::Kind,
-            _: &BindingHash,
-        ) -> Result<bool, DirectoryError> {
-            unreachable!()
-        }
-        fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
-            unreachable!()
-        }
-        fn servers(&self) -> Result<Vec<String>, DirectoryError> {
-            unreachable!()
-        }
         fn add_trust_invitation(
             &self,
             hash: &[u8; 48],
