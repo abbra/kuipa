@@ -2317,7 +2317,9 @@ impl GssServerContext {
         input_token: &[u8],
         channel_binding: Option<&[u8]>,
     ) -> Result<AcceptStep, GssError> {
-        Ok(self.step_prf(cred, input_token, channel_binding, None)?.0)
+        Ok(self
+            .step_prf(cred, input_token, channel_binding, None, &mut None)?
+            .0)
     }
 
     /// [`step`](Self::step), and on completion also `prf.1` bytes of
@@ -2329,6 +2331,7 @@ impl GssServerContext {
         input_token: &[u8],
         channel_binding: Option<&[u8]>,
         prf: Option<(&[u8], usize)>,
+        delegated: &mut Option<GssClientCred>,
     ) -> Result<(AcceptStep, Option<Vec<u8>>), GssError> {
         let mut minor: ffi::OmUint32 = 0;
 
@@ -2370,10 +2373,12 @@ impl GssServerContext {
             )
         };
 
-        // Release delegated credential immediately — never used.
+        // The delegated credential (a forwarded TGT, or the service ticket kept
+        // for S4U2Proxy) goes to the caller that asked for it; others drop it.
         if !delegated_cred.is_null() {
-            // SAFETY: set by gss_accept_sec_context.
-            unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut delegated_cred) };
+            *delegated = Some(GssClientCred {
+                raw: delegated_cred,
+            });
         }
 
         // Copy and release the output token.
@@ -2786,6 +2791,26 @@ pub fn accept_bound(
     prf_input: &[u8],
     len: usize,
 ) -> Result<(String, Vec<u8>), GssError> {
+    let (principal, derived, _) =
+        accept_bound_delegated(cred, input_token, channel_binding, prf_input, len)?;
+    Ok((principal, derived))
+}
+
+/// [`accept_bound`], and the credential the client delegated, if any: a
+/// forwarded TGT, or (constrained delegation) the ticket the client
+/// presented, usable as the evidence of S4U2Proxy.
+///
+/// # Errors
+///
+/// As for [`accept_bound`].
+pub fn accept_bound_delegated(
+    cred: &GssServerCred,
+    input_token: &[u8],
+    channel_binding: &[u8],
+    prf_input: &[u8],
+    len: usize,
+) -> Result<(String, Vec<u8>, Option<GssClientCred>), GssError> {
+    let mut delegated = None;
     let (step, derived) = GssServerContext {
         raw: ffi::GSS_C_NO_CONTEXT,
     }
@@ -2794,9 +2819,12 @@ pub fn accept_bound(
         input_token,
         Some(channel_binding),
         Some((prf_input, len)),
+        &mut delegated,
     )?;
     match (step, derived) {
-        (AcceptStep::Complete { principal, .. }, Some(derived)) => Ok((principal, derived)),
+        (AcceptStep::Complete { principal, .. }, Some(derived)) => {
+            Ok((principal, derived, delegated))
+        }
         _ => Err(GssError::NotComplete),
     }
 }
