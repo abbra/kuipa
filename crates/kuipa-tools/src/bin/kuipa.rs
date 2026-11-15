@@ -1794,6 +1794,18 @@ fn krb5_config_fallback(paths: &Paths) {
 // which server vouched for what.  The JSON keys alone read the same on
 // every host and never say where a value came from.
 
+/// What the repair of each paper of a recovery set found.
+fn paper_lines(repaired: &Value) {
+    for s in list(repaired) {
+        println!(
+            "  paper {}: {} unreadable word(s), {} wrong word(s) repaired",
+            s["index"].as_u64().unwrap_or(0),
+            s["erased"].as_u64().unwrap_or(0),
+            s["wrong"].as_u64().unwrap_or(0)
+        );
+    }
+}
+
 /// Strings a flow collected, one per line under `heading`'s indent.
 fn items(values: &Value, indent: &str) {
     for item in values.as_array().into_iter().flatten() {
@@ -1937,14 +1949,7 @@ fn render_backup(value: &Value) {
             "Those papers recover the key {}: the passphrase and the key id match.",
             text(&value["recovery_key"])
         );
-        for s in list(&value["repaired"]) {
-            println!(
-                "  paper {}: {} unreadable word(s), {} wrong word(s) repaired",
-                s["index"].as_u64().unwrap_or(0),
-                s["erased"].as_u64().unwrap_or(0),
-                s["wrong"].as_u64().unwrap_or(0)
-            );
-        }
+        paper_lines(&value["repaired"]);
     }
 }
 
@@ -3199,14 +3204,7 @@ fn render_recovery(value: &Value) -> bool {
             "Those papers would recover the set for key {}: the passphrase and the key id match.",
             value["recovery_key"].as_str().unwrap_or("?")
         );
-        for s in list(&value["repaired"]) {
-            println!(
-                "  paper {}: {} unreadable word(s), {} wrong word(s) repaired",
-                s["index"].as_u64().unwrap_or(0),
-                s["erased"].as_u64().unwrap_or(0),
-                s["wrong"].as_u64().unwrap_or(0),
-            );
-        }
+        paper_lines(&value["repaired"]);
     } else if value["hint"].is_string() {
         println!(
             "The set covers several devices ({}): run again with --device.",
@@ -3230,14 +3228,7 @@ fn render_recovery(value: &Value) -> bool {
         println!(
             "Device {device} is recovered on this host. Run `kuipa seal recover finish FILE.sealed…` to reseal your files to this host's own device."
         );
-        for s in list(&value["repaired"]) {
-            println!(
-                "  paper {}: {} unreadable, {} wrong",
-                s["index"].as_u64().unwrap_or(0),
-                s["erased"].as_u64().unwrap_or(0),
-                s["wrong"].as_u64().unwrap_or(0),
-            );
-        }
+        paper_lines(&value["repaired"]);
     } else if value["resealed"].is_number() && value["device"].is_string() {
         println!(
             "This host's device {} is registered in {} seal(s), and {} file(s) are resealed to it.",
