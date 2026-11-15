@@ -137,12 +137,9 @@ fn stdin_text() -> Result<String, Error> {
 }
 
 fn alg(name: &str) -> Result<SignatureAlg, Error> {
-    match name.to_ascii_lowercase().as_str() {
-        "ml-dsa-44" => Ok(SignatureAlg::MlDsa44),
-        "ml-dsa-65" => Ok(SignatureAlg::MlDsa65),
-        "ml-dsa-87" => Ok(SignatureAlg::MlDsa87),
-        _ => Err(format!("unknown algorithm {name:?}").into()),
-    }
+    name.to_ascii_uppercase()
+        .parse()
+        .map_err(|_| format!("unknown algorithm {name:?}").into())
 }
 
 fn run(command: Command) -> Result<(), Error> {

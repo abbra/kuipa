@@ -74,10 +74,10 @@ enum Command {
 
 fn algorithm(name: Option<&str>) -> Result<SignatureAlg, Error> {
     match name {
-        Some("ml-dsa-44") => Ok(SignatureAlg::MlDsa44),
-        Some("ml-dsa-65") => Ok(SignatureAlg::MlDsa65),
-        Some("ml-dsa-87") => Ok(SignatureAlg::MlDsa87),
-        Some(other) => Err(format!("unknown algorithm {other:?}").into()),
+        Some(other) => other
+            .to_ascii_uppercase()
+            .parse()
+            .map_err(|_| format!("unknown algorithm {other:?}").into()),
         // The witness role defaults to ML-DSA-44; a policy without it
         // (CNSA 2.0) falls back to what it allows.
         None => match SignatureAlg::MlDsa44.allowed_by_system() {

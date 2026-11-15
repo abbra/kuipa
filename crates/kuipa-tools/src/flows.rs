@@ -1818,15 +1818,9 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
     let (namespace, nickname) = name
         .split_once('/')
         .ok_or("name the secret as <namespace>/<nickname>")?;
-    let namespace = match namespace {
-        "dm" => Namespace::Dm,
-        "ra" => Namespace::Ra,
-        "ca" => Namespace::Ca,
-        "ca_wrapped" => Namespace::CaWrapped,
-        "lwca" | "lwca-store" => Namespace::LwcaStore,
-        "akamu" => Namespace::Akamu,
-        _ => return Err("namespace must be dm, ra, ca, ca_wrapped, lwca or akamu".into()),
-    };
+    let namespace: Namespace = namespace
+        .parse()
+        .map_err(|_| "namespace must be dm, ra, ca, ca_wrapped, lwca or akamu")?;
     if nickname.is_empty() && namespace != Namespace::Dm && namespace != Namespace::Ra {
         return Err("the nickname is empty".into());
     }
