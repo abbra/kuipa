@@ -94,6 +94,28 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
     Ok(n)
 }
 
+/// Hand `each` the chunks of `input` of `size` bytes, with their counter and
+/// whether each is the last.  One byte of lookahead tells that.
+fn for_chunks(
+    mut input: impl Read,
+    size: usize,
+    mut each: impl FnMut(u64, bool, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut buf = vec![0u8; size + 1];
+    let mut carry = 0;
+    for counter in 0u64.. {
+        let got = carry + fill(&mut input, &mut buf[carry..])?;
+        let last = got <= size;
+        each(counter, last, &buf[..got.min(size)])?;
+        if last {
+            break;
+        }
+        buf[0] = buf[size];
+        carry = 1;
+    }
+    Ok(())
+}
+
 /// Seal `input` to every recipient, writing the container to `out`.
 ///
 /// # Errors
@@ -102,7 +124,7 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
 pub fn seal_stream(
     recipients: &[Recipient],
     chunk_log2: u8,
-    mut input: impl Read,
+    input: impl Read,
     mut out: impl Write,
 ) -> Result<()> {
     if recipients.is_empty() || recipients.len() > MAX_RECIPIENTS {
@@ -135,23 +157,10 @@ pub fn seal_stream(
     out.write_all(&len.to_be_bytes())?;
     out.write_all(&header)?;
 
-    // One byte past the chunk tells whether this one is the last.
-    let size = 1usize << chunk_log2;
-    let mut buf = vec![0u8; size + 1];
-    let mut carry = 0;
-    for counter in 0u64.. {
-        let got = carry + fill(&mut input, &mut buf[carry..])?;
-        let last = got <= size;
-        let take = got.min(size);
-        let sealed =
-            primitives::seal_chunk(key.as_ref(), &prefix, counter, &header, last, &buf[..take])?;
-        out.write_all(&sealed)?;
-        if last {
-            break;
-        }
-        buf[0] = buf[size];
-        carry = 1;
-    }
+    for_chunks(input, 1usize << chunk_log2, |counter, last, chunk| {
+        let sealed = primitives::seal_chunk(key.as_ref(), &prefix, counter, &header, last, chunk)?;
+        Ok(out.write_all(&sealed)?)
+    })?;
     Ok(out.flush()?)
 }
 
@@ -207,23 +216,16 @@ pub fn open_stream(key: &ExchangeKeyPair, mut input: impl Read, mut out: impl Wr
     let k = primitives::open(kek.as_ref(), wrap).map_err(|_| Error::BadResponse)?;
     let (dkey, prefix) = data_key(k.as_ref(), &header, data_hash(algs))?;
 
-    let size = (1usize << chunk_log2) + primitives::TAG_LEN;
-    let mut buf = vec![0u8; size + 1];
-    let mut carry = 0;
-    for counter in 0u64.. {
-        let got = carry + fill(&mut input, &mut buf[carry..])?;
-        let last = got <= size;
-        let take = got.min(size);
-        let plain =
-            primitives::open_chunk(dkey.as_ref(), &prefix, counter, &header, last, &buf[..take])
-                .map_err(|_| Error::BadResponse)?;
-        out.write_all(plain.as_ref())?;
-        if last {
-            break;
-        }
-        buf[0] = buf[size];
-        carry = 1;
-    }
+    for_chunks(
+        input,
+        (1usize << chunk_log2) + primitives::TAG_LEN,
+        |counter, last, chunk| {
+            let plain =
+                primitives::open_chunk(dkey.as_ref(), &prefix, counter, &header, last, chunk)
+                    .map_err(|_| Error::BadResponse)?;
+            Ok(out.write_all(plain.as_ref())?)
+        },
+    )?;
     Ok(out.flush()?)
 }
 
