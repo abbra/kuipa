@@ -30,6 +30,9 @@
 //!   [`MAX_SUCCESSION_HOPS`] of them.  They use the context
 //!   `ipa-ku-enroll/v1 succession`.
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tang_pqc::wire::{Reader, Writer};
@@ -1003,6 +1006,38 @@ impl HeadPin {
                 &proof.path,
                 &self.root,
             )?)
+    }
+}
+
+/// Most anchors, and most head pins, a client names in one `GET adv`.
+pub const MAX_WANTED: usize = 16;
+
+/// The query form of a pin, `<thumbprint>.<size>.<root>`, the root as
+/// base64url, as `GET adv?head=` carries it.
+impl fmt::Display for HeadPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{}.{}",
+            self.anchor,
+            self.size,
+            b64::encode(&self.root)
+        )
+    }
+}
+
+impl FromStr for HeadPin {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let malformed = || Error::Malformed("head pin");
+        let (anchor, rest) = s.split_once('.').ok_or_else(malformed)?;
+        let (size, root) = rest.split_once('.').ok_or_else(malformed)?;
+        Ok(Self {
+            anchor: anchor.parse().map_err(|_| malformed())?,
+            size: size.parse().map_err(|_| malformed())?,
+            root: Hash::from_slice(&b64::decode(root).map_err(|_| malformed())?)?,
+        })
     }
 }
 
@@ -2408,6 +2443,19 @@ mod tests {
         let pin_json = serde_json::json!({"anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "size": 3, "root": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"});
         assert_eq!(pin.to_json(), pin_json);
         assert_eq!(serde_json::from_value::<HeadPin>(pin_json).unwrap(), pin);
+        // The query form, `<thumbprint>.<size>.<root>`.
+        let query = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE.3.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
+        assert_eq!(pin.to_string(), query);
+        assert_eq!(query.parse::<HeadPin>().unwrap(), pin);
+        for bad in [
+            "",
+            "x.3.AgIC",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE.3",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE.x.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE.3.AgIC",
+        ] {
+            assert!(bad.parse::<HeadPin>().is_err(), "{bad}");
+        }
         let proof_json = serde_json::json!({
             "anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "index": 1, "size": 3, "path": ["AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"],
         });

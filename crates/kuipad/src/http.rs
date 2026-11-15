@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kuipa_enroll::EnrollServer;
-use kuipa_enroll::delegation::HeadPin;
+use kuipa_enroll::delegation::{HeadPin, MAX_WANTED};
 use kuipa_enroll::escrow::EscrowRequest;
 use kuipa_enroll::join::{AuthType, Operation, Request};
 use kuipa_enroll::server::{Ledger, SharedDirectory};
@@ -35,9 +35,6 @@ const BODY_LIMIT: usize = 1024 * 1024;
 
 /// Most leaves in one page of `GET tlog/{id}/leaves`.
 const MAX_LOG_PAGE: usize = 4096;
-
-/// Most anchors a client may name in `GET adv`.
-const MAX_WANTED_ANCHORS: usize = 16;
 
 /// Longest host name or principal accepted in a request.  Well-formed
 /// names are far shorter; longer ones serve only to bloat logs and the
@@ -222,7 +219,7 @@ fn wanted_anchors(query: Option<&str>) -> Vec<Thumbprint> {
         .unwrap_or_default()
         .split('&')
         .filter_map(|p| p.strip_prefix("anchor=")?.parse().ok())
-        .take(MAX_WANTED_ANCHORS)
+        .take(MAX_WANTED)
         .collect()
 }
 
@@ -234,19 +231,10 @@ fn wanted_heads(query: Option<&str>) -> Vec<HeadPin> {
     query
         .unwrap_or_default()
         .split('&')
-        .filter_map(|p| p.strip_prefix("head="))
-        .filter_map(|h| {
-            let (anchor, rest) = h.split_once('.')?;
-            let (size, root) = rest.split_once('.')?;
-            Some(HeadPin {
-                anchor: anchor.parse().ok()?,
-                size: size.parse().ok()?,
-                root: b64::decode(root).ok().and_then(|r| r.try_into().ok())?,
-            })
-        })
+        .filter_map(|p| p.strip_prefix("head=")?.parse::<HeadPin>().ok())
         // A zero-size log has no head: no proof backs it (§4.9).
         .filter(|h| h.size > 0)
-        .take(MAX_WANTED_ANCHORS)
+        .take(MAX_WANTED)
         .collect()
 }
 
@@ -765,7 +753,7 @@ mod tests {
         );
         assert_eq!(wanted_anchors(None).len(), 0);
         let many = format!("anchor={a}&").repeat(40);
-        assert_eq!(wanted_anchors(Some(&many)).len(), MAX_WANTED_ANCHORS);
+        assert_eq!(wanted_anchors(Some(&many)).len(), MAX_WANTED);
     }
 
     #[test]
