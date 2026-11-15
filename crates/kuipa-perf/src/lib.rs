@@ -14,7 +14,7 @@ pub mod realm;
 
 pub use certs::chain;
 pub use dir::{ADMIN, BenchDirectory, HOST, REALM, fake_binding, gss_token};
-pub use ledger::{Ledger, ledger as anchor_ledger};
+pub use ledger::Ledger;
 pub use prng::SplitMix64;
-pub use profile::{CaKind, Profile};
+pub use profile::{CaKind, Profile, ProfileKind};
 pub use realm::{DOMAIN, Realm, now, server_name};

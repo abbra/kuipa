@@ -149,35 +149,30 @@ pub fn ledger(claims: usize, anchors: usize, leaves: usize) -> Ledger {
             .put(Entry::Claim(claim.clone()), REALM, &policy, now(), &clock)
             .expect("admit claim");
     }
-    let leaf_set: Vec<Hash> = claims
-        .iter()
-        .map(|c| c.leaf(alg).unwrap_or_else(|e| panic!("leaf: {e}")))
-        .chain(filler.iter().copied())
-        .collect();
-    for anchor in &anchors {
-        let vouch = SignedVouch::issue(
-            anchor,
-            REALM,
-            leaf_set.iter().copied(),
-            now() - 60,
-            now() + VOUCH_VALIDITY,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("vouch: {e}"));
-        state
-            .put(Entry::Vouch(vouch), REALM, &policy, now(), &clock)
-            .expect("admit vouch");
-    }
-    Ledger {
+    let mut ledger = Ledger {
+        members: (0..n).map(server_name).collect(),
         anchors,
         claims,
         state,
-        members: (0..n).map(server_name).collect(),
         filler,
         alg,
         clock,
         policy,
+    };
+    for i in 0..ledger.anchors.len() {
+        let vouch = ledger.vouch(i);
+        ledger
+            .state
+            .put(
+                Entry::Vouch(vouch),
+                REALM,
+                &ledger.policy,
+                now(),
+                &ledger.clock,
+            )
+            .expect("admit vouch");
     }
+    ledger
 }
 
 #[cfg(test)]

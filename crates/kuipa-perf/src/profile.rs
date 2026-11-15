@@ -4,6 +4,8 @@
 //! production is the default.  Profiles are *fixture sizes* — benches scale
 //! around them (a scaling bench still sweeps its own parameter axis).
 
+use std::str::FromStr;
+
 use serde_json::{Value, json};
 
 /// Which certificate authority the fixture realm carries.
@@ -29,11 +31,53 @@ impl CaKind {
     }
 }
 
+/// A named set of fixture sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileKind {
+    /// The smallest sizes, for a quick run.
+    Smoke,
+    /// What a typical deployment looks like.
+    Production,
+    /// `Production` with an ML-DSA-65 CA.
+    PqProduction,
+    /// A deep realm, for scaling.
+    Large,
+}
+
+impl ProfileKind {
+    /// The name `KUIPA_BENCH_PROFILE` and the result metadata use.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Smoke => "smoke",
+            Self::Production => "production",
+            Self::PqProduction => "pqproduction",
+            Self::Large => "large",
+        }
+    }
+}
+
+impl FromStr for ProfileKind {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        [
+            Self::Smoke,
+            Self::Production,
+            Self::PqProduction,
+            Self::Large,
+        ]
+        .into_iter()
+        .find(|k| k.name() == name)
+        .ok_or_else(|| format!("unknown profile '{name}'"))
+    }
+}
+
 /// The sizes a benchmark run works at.
 #[derive(Clone, Debug)]
 pub struct Profile {
-    /// The profile name (`smoke`, `production`, …).
-    pub name: String,
+    /// Which profile this is.
+    pub kind: ProfileKind,
     /// Enroll servers in the fixture realm.
     pub servers: usize,
     /// CA certificates the advertisement carries (and a client checks).
@@ -53,42 +97,27 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// The base sizes shared by `production` and `pqproduction`.
+    /// The sizes of `kind`.
     #[must_use]
-    fn base(name: &str) -> Self {
-        match name {
-            "smoke" => Self {
-                name: name.into(),
-                servers: 2,
-                ca_certs: 1,
-                dir_cas: 1,
-                keytab_entries: 1,
-                escrow_servers: 2,
-                leaves: 3,
-                attested: 1,
-                ca: CaKind::EcP256,
-            },
-            "large" => Self {
-                name: name.into(),
-                servers: 8,
-                ca_certs: 4,
-                dir_cas: 4,
-                keytab_entries: 6,
-                escrow_servers: 8,
-                leaves: 64,
-                attested: 7,
-                ca: CaKind::EcP256,
-            },
-            _ => Self {
-                name: name.into(),
-                servers: 4,
-                ca_certs: 1,
-                dir_cas: 2,
-                keytab_entries: 4,
-                escrow_servers: 4,
-                leaves: 8,
-                attested: 3,
-                ca: CaKind::EcP256,
+    pub fn new(kind: ProfileKind) -> Self {
+        let (servers, ca_certs, dir_cas, keytab_entries, leaves, attested) = match kind {
+            ProfileKind::Smoke => (2, 1, 1, 1, 3, 1),
+            ProfileKind::Large => (8, 4, 4, 6, 64, 7),
+            ProfileKind::Production | ProfileKind::PqProduction => (4, 1, 2, 4, 8, 3),
+        };
+        Self {
+            kind,
+            servers,
+            ca_certs,
+            dir_cas,
+            keytab_entries,
+            escrow_servers: servers,
+            leaves,
+            attested,
+            ca: if kind == ProfileKind::PqProduction {
+                CaKind::MlDsa65
+            } else {
+                CaKind::EcP256
             },
         }
     }
@@ -96,14 +125,7 @@ impl Profile {
     /// The profile named by `name`, or `None` if unknown.
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
-        let mut p = match name {
-            "smoke" | "production" | "pqproduction" | "large" => Self::base(name),
-            _ => return None,
-        };
-        if name == "pqproduction" {
-            p.ca = CaKind::MlDsa65;
-        }
-        Some(p)
+        name.parse().ok().map(Self::new)
     }
 
     /// The profile named by `KUIPA_BENCH_PROFILE`, or `production`.
@@ -114,12 +136,13 @@ impl Profile {
     #[must_use]
     pub fn from_env() -> Self {
         let raw = std::env::var("KUIPA_BENCH_PROFILE").unwrap_or_default();
-        let name = if raw.is_empty() {
-            "production"
-        } else {
-            raw.as_str()
-        };
-        Self::named(name).unwrap_or_else(|| panic!("unknown KUIPA_BENCH_PROFILE '{name}'"))
+        if raw.is_empty() {
+            return Self::new(ProfileKind::Production);
+        }
+        Self::new(
+            raw.parse()
+                .unwrap_or_else(|e| panic!("KUIPA_BENCH_PROFILE: {e}")),
+        )
     }
 
     /// A profile with `ca_certs` CA certificates, in the advertisement and
@@ -142,20 +165,13 @@ impl Profile {
         self
     }
 
-    /// A profile whose anchors vouch for `leaves` claims.
-    #[must_use]
-    pub fn with_leaves(mut self, leaves: usize) -> Self {
-        self.leaves = leaves;
-        self
-    }
-
     /// Sizes to sweep, each a multiple of `base`: `smoke` stays shallow and
     /// `large` goes deep, so one bench file serves both.
     #[must_use]
     pub fn sweep(&self, base: usize) -> Vec<usize> {
-        let mults: &[usize] = match self.name.as_str() {
-            "smoke" => &[1, 4],
-            "large" => &[1, 4, 16, 64],
+        let mults: &[usize] = match self.kind {
+            ProfileKind::Smoke => &[1, 4],
+            ProfileKind::Large => &[1, 4, 16, 64],
             _ => &[1, 4, 16],
         };
         mults.iter().map(|m| base * m).collect()
@@ -165,7 +181,7 @@ impl Profile {
     #[must_use]
     pub fn metadata(&self) -> Value {
         json!({
-            "profile": self.name,
+            "profile": self.kind.name(),
             "ca": self.ca.name(),
             "servers": self.servers,
             "ca_certs": self.ca_certs,

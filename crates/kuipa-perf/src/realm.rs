@@ -20,7 +20,6 @@ use kuipa_enroll::realm::{RealmInfo, ServerKeys, VerifiedRealm};
 use kuipa_enroll::server::Directory;
 use tang_pqc::{
     ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SignedAdvertisement, SigningKey, Thumbprint,
-    unix_seconds,
 };
 
 use crate::certs;
@@ -30,11 +29,7 @@ use crate::profile::{CaKind, Profile};
 /// The domain the fixture realm uses.
 pub const DOMAIN: &str = "example.test";
 
-/// Seconds since the epoch, as the protocol clocks use.
-#[must_use]
-pub fn now() -> u64 {
-    unix_seconds(SystemTime::now())
-}
+pub use tang_pqc::now;
 
 /// The FQDN of fixture server `i`.
 #[must_use]
