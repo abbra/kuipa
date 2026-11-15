@@ -1,66 +1,16 @@
 //! Opt-in loopback measurement of the bounded-concurrency repair scheduler.
 
 use super::*;
-use kuipa_enroll::escrow::{self, BindingHash};
-use kuipa_enroll::join::KerberosBinding;
-use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::realm::{RealmInfo, ServerKeys};
-use kuipa_enroll::server::{DirectoryError, Staged};
+use kuipa_enroll::server::DirectoryError;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 struct DirectoryStub;
 impl Directory for DirectoryStub {
-    fn join_with_otp(&self, _: &str, _: &[u8], _: &[Enctype]) -> Result<Keytab, DirectoryError> {
-        unreachable!()
-    }
-    fn join_with_gss(
-        &self,
-        _: &str,
-        _: &[u8],
-        _: &[u8; 32],
-        _: &[Enctype],
-    ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-        unreachable!()
-    }
-    fn rekey_with_gss(
-        &self,
-        _: &str,
-        _: &[u8],
-        _: &[u8; 32],
-        _: &[Enctype],
-    ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-        unreachable!()
-    }
-    fn stage_with_gss(
-        &self,
-        _: &str,
-        _: &[u8],
-        _: &[u8; 32],
-        _: &[Enctype],
-        _: &Staged,
-    ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-        unreachable!()
-    }
-    fn register_escrow(&self, _: &Principal, _: &[BindingHash]) -> Result<(), DirectoryError> {
-        unreachable!()
-    }
-    fn escrow_allowed(
-        &self,
-        _: &Principal,
-        _: escrow::Kind,
-        _: &BindingHash,
-    ) -> Result<bool, DirectoryError> {
-        unreachable!()
-    }
-    fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
-        unreachable!()
-    }
-    fn servers(&self) -> Result<Vec<String>, DirectoryError> {
-        unreachable!()
-    }
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         if token.len() < 32 || &token[..32] != cb {
             return Err("bad channel binding".into());

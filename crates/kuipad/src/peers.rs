@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
+use crate::trust::capped_body;
 use agirru_crdt::GenerationClock;
 use agirru_engine::context::{Attached, Context, ContextError, ContextReceiver, ContextSender};
 use agirru_engine::repair::{self, IndexCache, RepairError, Replica};
@@ -31,7 +32,7 @@ use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
 use kuipa_enroll::merkle::TreeHash;
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::spend::{MAX_SPEND_BYTES, SpendError, SpendOp, SpendRequest, VoucherSpender};
-use tang_pqc::{Policy, SigningKey, Thumbprint, unix_seconds};
+use tang_pqc::{Policy, SigningKey, Thumbprint, now};
 use tokio::sync::{Notify, RwLock};
 
 use crate::keystore::KeyStore;
@@ -166,8 +167,18 @@ fn failed_chain(e: &(dyn std::error::Error + 'static)) -> PeerError {
     PeerError::Failed(text)
 }
 
-fn now() -> u64 {
-    unix_seconds(SystemTime::now())
+/// What `/anchor-log` answers; its `heads` are not needed here.
+#[derive(serde::Deserialize)]
+struct AnchorLogPage {
+    entries: Vec<SignedEpoch>,
+}
+
+/// A sync whose sender is authenticated: it, the delegation it attests
+/// and the epoch window it carries.
+struct Authenticated {
+    sync: PeerSync,
+    own: Delegation,
+    chain: Vec<Vec<u8>>,
 }
 
 const MAX_SYNC_BYTES: usize = 1024 * 1024;
@@ -971,7 +982,11 @@ impl Peers {
             .repair_permits
             .try_acquire()
             .map_err(|_| PeerError::Busy)?;
-        let (sync, own, sync_chain) = self.authenticate_sync(body).await?;
+        let Authenticated {
+            sync,
+            own,
+            chain: sync_chain,
+        } = self.authenticate_sync(body).await?;
         #[cfg(test)]
         #[expect(deprecated, reason = "try_update needs a newer MSRV than 1.89")]
         let busy = (self.probe.busy)
@@ -1010,10 +1025,7 @@ impl Peers {
         Ok(bytes)
     }
 
-    async fn authenticate_sync(
-        &self,
-        body: &[u8],
-    ) -> Result<(PeerSync, Delegation, Vec<Vec<u8>>), Error> {
+    async fn authenticate_sync(&self, body: &[u8]) -> Result<Authenticated, Error> {
         let x = &self.exchange;
         let sync = PeerSync::from_bytes(body)?;
         let cb = PeerSync::channel_binding(
@@ -1073,7 +1085,11 @@ impl Peers {
         let sync_chain_value = sync_chain.value().0.clone();
         x.own_seen.accept(&sync.sender, own);
         x.chain_seen.accept(&sync.sender, sync_chain);
-        Ok((sync, own_attested, sync_chain_value))
+        Ok(Authenticated {
+            sync,
+            own: own_attested,
+            chain: sync_chain_value,
+        })
     }
 
     async fn merge_peer_epoch(&self, sync: &PeerSync, sync_chain: &[Vec<u8>]) -> Result<(), Error> {
@@ -1476,7 +1492,7 @@ impl Exchange {
     }
 
     async fn post_sync(&self, peer: &str, body: Vec<u8>) -> Result<Vec<u8>, PeerError> {
-        let mut response = self
+        let response = self
             .client
             .post(self.url(peer))
             .header("content-type", "application/vnd.ipa-ku.peer-sync")
@@ -1486,13 +1502,9 @@ impl Exchange {
             .map_err(|e| failed_chain(&e))?;
         match response.status() {
             reqwest::StatusCode::OK => {
-                let mut body = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(|e| failed_chain(&e))? {
-                    if chunk.len() > MAX_SYNC_BYTES.saturating_sub(body.len()) {
-                        return Err(failed("peer repair response exceeds size limit"));
-                    }
-                    body.extend_from_slice(&chunk);
-                }
+                let body = capped_body(response, MAX_SYNC_BYTES)
+                    .await
+                    .map_err(|e| failed_chain(&*e))?;
                 if body.is_empty() {
                     return Err(failed("the peer answered with no state"));
                 }
@@ -1525,7 +1537,7 @@ impl Exchange {
                 (t.seq(), t.head().unwrap_or(epoch::GENESIS))
             });
         loop {
-            let mut response = self
+            let response = self
                 .client
                 .get(format!("{}/anchor-log?from={}", self.base(peer), seq))
                 .send()
@@ -1533,15 +1545,8 @@ impl Exchange {
             if !response.status().is_success() {
                 return Err(format!("HTTP {}", response.status()).into());
             }
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await? {
-                if chunk.len() > MAX_SYNC_BYTES.saturating_sub(body.len()) {
-                    return Err("anchor log page exceeds size limit".into());
-                }
-                body.extend_from_slice(&chunk);
-            }
-            let body: serde_json::Value = serde_json::from_slice(&body)?;
-            let entries: Vec<SignedEpoch> = serde_json::from_value(body["entries"].clone())?;
+            let body = capped_body(response, MAX_SYNC_BYTES).await?;
+            let AnchorLogPage { entries } = serde_json::from_slice(&body)?;
             if entries.len() > epoch::MAX_EPOCH_FETCH {
                 return Err("anchor log page has too many entries".into());
             }
@@ -1954,6 +1959,7 @@ impl Peers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn rotating_fanout_is_bounded_and_sweeps_retain_membership() {
@@ -2167,73 +2173,7 @@ mod tests {
         signed.statement().unwrap().head().unwrap()
     }
 
-    use kuipa_enroll::escrow::{self, BindingHash};
-    use kuipa_enroll::join::KerberosBinding;
-    use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
-    use kuipa_enroll::server::{DirectoryError, Staged};
-    struct UnusedDirectory;
-    impl Directory for UnusedDirectory {
-        fn join_with_otp(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[Enctype],
-        ) -> Result<Keytab, DirectoryError> {
-            unreachable!()
-        }
-        fn join_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn rekey_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn stage_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-            _: &Staged,
-        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn register_escrow(&self, _: &Principal, _: &[BindingHash]) -> Result<(), DirectoryError> {
-            unreachable!()
-        }
-        fn escrow_allowed(
-            &self,
-            _: &Principal,
-            _: escrow::Kind,
-            _: &BindingHash,
-        ) -> Result<bool, DirectoryError> {
-            unreachable!()
-        }
-        fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
-            unreachable!()
-        }
-        fn servers(&self) -> Result<Vec<String>, DirectoryError> {
-            unreachable!()
-        }
-        fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
-            if token != cb {
-                return Err("bad channel binding".into());
-            }
-            Ok("ipa-ku/peer@R".into())
-        }
-    }
-
+    use kuipa_enroll::server::DirectoryError;
     #[derive(Default)]
     struct TopologyDirectory {
         servers: Mutex<Vec<String>>,
@@ -2241,58 +2181,14 @@ mod tests {
     }
 
     impl Directory for TopologyDirectory {
-        fn join_with_otp(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[Enctype],
-        ) -> Result<Keytab, DirectoryError> {
-            unreachable!()
-        }
-        fn join_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn rekey_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn stage_with_gss(
-            &self,
-            _: &str,
-            _: &[u8],
-            _: &[u8; 32],
-            _: &[Enctype],
-            _: &Staged,
-        ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-            unreachable!()
-        }
-        fn register_escrow(&self, _: &Principal, _: &[BindingHash]) -> Result<(), DirectoryError> {
-            unreachable!()
-        }
-        fn escrow_allowed(
-            &self,
-            _: &Principal,
-            _: escrow::Kind,
-            _: &BindingHash,
-        ) -> Result<bool, DirectoryError> {
-            unreachable!()
-        }
-        fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
-            unreachable!()
-        }
         fn servers(&self) -> Result<Vec<String>, DirectoryError> {
             Ok(lock(&self.servers).clone())
+        }
+        fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+            if token != cb {
+                return Err("bad channel binding".into());
+            }
+            Ok("ipa-ku/peer@R".into())
         }
         fn topology_peers(&self, _: &str) -> Result<Vec<String>, DirectoryError> {
             lock(&self.peers)
@@ -2623,7 +2519,7 @@ mod tests {
             exchange.settings.clone(),
             None,
             server.clone(),
-            Arc::new(UnusedDirectory),
+            Arc::new(TopologyDirectory::default()),
             Arc::new(UnusedInitiator),
             KeyStore::new(dir),
         )
@@ -2800,7 +2696,7 @@ mod tests {
             },
             None,
             server.clone(),
-            Arc::new(UnusedDirectory),
+            Arc::new(TopologyDirectory::default()),
             Arc::new(UnusedInitiator),
             KeyStore::new(dir),
             reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -3076,7 +2972,7 @@ mod tests {
             exchange.settings.clone(),
             None,
             server.clone(),
-            Arc::new(UnusedDirectory),
+            Arc::new(TopologyDirectory::default()),
             Arc::new(UnusedInitiator),
             KeyStore::new(dir),
         )
@@ -3208,7 +3104,7 @@ mod tests {
             exchange.settings.clone(),
             None,
             server.clone(),
-            Arc::new(UnusedDirectory),
+            Arc::new(TopologyDirectory::default()),
             Arc::new(UnusedInitiator),
             KeyStore::new(dir),
         )
@@ -3305,7 +3201,7 @@ mod tests {
             settings,
             None,
             server.clone(),
-            Arc::new(UnusedDirectory),
+            Arc::new(TopologyDirectory::default()),
             Arc::new(UnusedInitiator),
             KeyStore::new(peer_dir),
         )

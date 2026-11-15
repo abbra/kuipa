@@ -325,7 +325,7 @@ async fn log_head<D: Directory + Send + Sync + 'static>(
     let Some(ledger) = ledger_for(&app, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    let now = tang_pqc::now();
     match ledger.signed_head(&app.server.keys().signing, now) {
         Ok(Some(head)) => binary(head.to_bytes(), "application/octet-stream"),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -707,24 +707,14 @@ async fn peer_sync<D: Directory + Send + Sync + 'static>(
     };
     match peers.handle(&body).await {
         Ok(state) => binary(state, "application/vnd.ipa-ku.peer-sync"),
-        Err(e)
-            if matches!(
-                e.downcast_ref::<crate::peers::PeerError>(),
-                Some(crate::peers::PeerError::Busy)
-            ) =>
-        {
-            tracing::warn!("peer sync: {e}");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
-        Err(e)
-            if matches!(
-                e.downcast_ref::<crate::peers::PeerError>(),
-                Some(crate::peers::PeerError::NeedContext)
-            ) =>
-        {
-            StatusCode::CONFLICT.into_response()
-        }
-        Err(e) => refused("peer sync", &e),
+        Err(e) => match e.downcast_ref::<crate::peers::PeerError>() {
+            Some(crate::peers::PeerError::Busy) => {
+                tracing::warn!("peer sync: {e}");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+            Some(crate::peers::PeerError::NeedContext) => StatusCode::CONFLICT.into_response(),
+            _ => refused("peer sync", &e),
+        },
     }
 }
 
