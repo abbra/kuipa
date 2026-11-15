@@ -576,34 +576,32 @@ follow from it — the daemon never gets more than its operations need:
 | realm settings (`recovery`, `vouchers`, `seal-limits`, `sign-policy`) | the daemon reads; the framework writes | daemon: read only; administrators: write |
 | keys operation (§18) | the daemon reads | none — reads `cn=masters` and `ipaConfigString`, both already readable |
 
-### 8.2 The daemon group
+### 8.2 The daemon principals
 
-FreeIPA's precedent for service principals with directory rights is the
-Certificate Managers group (`cn=Certificate Managers`, holding the
-`dogtag/*` principals). kuipa mirrors it with a group holding every
-server's daemon principal:
+Every IPA server runs kuipad, so every IPA server's `ipa-ku/<fqdn>`
+service principal is a daemon; there is no separate group. The installer
+(`kuipadinstance`) creates the principal with `service-add`, so it is
+managed by that server's host, and a replica gets its own at
+`ipa-replica-install`. Every ACI below binds with a wildcard `userdn`
+over `ipa-ku/*`, as FreeIPA's CIFS ACIs do for `cifs/*`.
 
-```
-dn: cn=kuipa servers,cn=groups,cn=accounts,$SUFFIX
-objectClass: top
-objectClass: groupOfNames
-objectClass: ipausergroup
-objectClass: nestedGroup
-cn: kuipa servers
-description: kuipad daemons (ipa-ku/<server> principals)
-member: krbprincipalname=ipa-ku/ipa1.example.test@EXAMPLE.TEST,cn=services,cn=accounts,$SUFFIX
-```
-
-Every ACI below binds as this group; a new replica is added by putting
-its `ipa-ku/<fqdn>` principal in the group (installer step, as
-`ipa-replica-manage` does for Certificate Managers).
+An ACI cannot follow `managedBy` to the `ipaservers` host group, and
+FreeIPA's "Hosts can add own services" ACI lets any enrolled host create
+`ipa-ku/<its fqdn>`, which the wildcard would then trust. So two deny ACIs
+bound the name: adding or changing an `ipa-ku/*` principal is refused to
+everyone outside the `ipaservers` host group, administrators included, so
+only an IPA server's host can create one, and by FreeIPA's own rule only
+for its own fqdn; deleting is refused to hosts outside `ipaservers`, so
+administrators can still remove a removed server's principals. A deny
+overrides every allow; the Directory Manager (the first master's
+installer) is not subject to ACIs.
 
 ### 8.3 ACIs for the daemon
 
 Raw ACIs, installed under `cn=etc` / the suffix (FreeIPA
-`install/updates/*.update` style). `$SUFFIX` is the base DN; the group
-DN below is abbreviated `$KUIPA_GROUP` =
-`cn=kuipa servers,cn=groups,cn=accounts,$SUFFIX`.
+`install/updates/*.update` style). `$SUFFIX` is the base DN; the daemon
+principals are abbreviated `$KUIPA_DAEMONS` =
+`krbprincipalname=ipa-ku/*@$REALM,cn=services,cn=accounts,$SUFFIX`.
 
 **Escrow bindings on principal entries** (hosts by FQDN, services and
 users by principal name under `cn=accounts`; §7.5). Read includes the
@@ -616,7 +614,7 @@ aci: (targetfilter = "(objectClass=ipaKUPrincipalEscrow)")
                  ipaKUDeviceEscrow")
   (version 3.0; acl "kuipa daemons manage escrow state on principals";
   allow (write, read, search, compare)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 ```
 
 **First contact and staging on host entries** (the OTP as Kerberos key
@@ -628,7 +626,7 @@ aci: (target = "ldap:///fqdn=*,cn=computers,cn=accounts,$SUFFIX")
   (targetattr = "userPassword || krbPrincipalExpiration || enrolledBy")
   (version 3.0; acl "kuipa daemons finish enrollment on hosts";
   allow (write, read, search, compare)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 ```
 
 **Voucher joins** — adding hosts exactly as `host-add` lays them out,
@@ -644,19 +642,19 @@ aci: (target = "ldap:///fqdn=*,cn=computers,cn=accounts,$SUFFIX")
                  memberOf || userClass || ipaClientVersion")
   (version 3.0; acl "kuipa daemons add hosts for voucher joins";
   allow (add, write)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 
 aci: (target = "ldap:///cn=*,cn=hostgroups,cn=accounts,$SUFFIX")
   (targetattr = "member")
   (version 3.0; acl "kuipa daemons add voucher hosts to host groups";
   allow (write)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 
 aci: (target = "ldap:///cn=*,cn=vouchers,cn=kuipa,cn=etc,$SUFFIX")
   (targetattr = "objectClass || cn || ipaKUVoucherSpent || ipaKUVoucherHost || ipaKUVoucherRedeemer || ipaKULease")
   (version 3.0; acl "kuipa daemons record and purge spent voucher salts";
   allow (add, delete, read, search, compare)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 ```
 
 `krbPrincipalKey` write is what `KEYTAB_GET` checks, exactly as the
@@ -671,7 +669,7 @@ aci: (target = "ldap:///fqdn=*,cn=computers,cn=accounts,$SUFFIX")
   (targetfilter = "(ipaKULease=*)")
   (version 3.0; acl "kuipa daemons purge expired leases";
   allow (delete)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 ```
 
 **The seal subtree** — full control of seals, deposits and releases;
@@ -688,7 +686,7 @@ aci: (target = "ldap:///cn=seals,cn=kuipa,cn=etc,$SUFFIX")
                  ipaKUReleaseDenied || ipaKUReleaseUses")
   (version 3.0; acl "kuipa daemons manage seals";
   allow (add, delete, write, read, search, compare)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 ```
 
 **Server escrow keys** — a daemon replaces only its own key. The `cn`
@@ -717,7 +715,7 @@ aci: (target = "ldap:///cn=trusts,cn=kuipa,cn=etc,$SUFFIX")
   (targetattr = "ipaKUTrustInvitation || ipaKUTrustedRealm")
   (version 3.0; acl "kuipa daemons manage trust invitations and partners";
   allow (write, read, search, compare)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 
 aci: (target = "ldap:///cn=*,cn=kerberos,$SUFFIX")
   (targetfilter = "(objectClass=krbPrincipal)")
@@ -725,7 +723,7 @@ aci: (target = "ldap:///cn=*,cn=kerberos,$SUFFIX")
                  krbPrincipalKey || krbPasswordExpiration")
   (version 3.0; acl "kuipa daemons create cross-realm krbtgt principals";
   allow (add, write)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 ```
 
 **Realm settings — read only.** The daemon reads `ipaKURecovery`,
@@ -738,7 +736,7 @@ aci: (target = "ldap:///cn=*,cn=kuipa,cn=etc,$SUFFIX")
                  ipaKUSignPolicy")
   (version 3.0; acl "kuipa daemons read realm settings";
   allow (read, search, compare)
-  groupdn = "ldap:///$KUIPA_GROUP";)
+  userdn = "ldap:///$KUIPA_DAEMONS";)
 ```
 
 ### 8.4 Self-service ACIs
