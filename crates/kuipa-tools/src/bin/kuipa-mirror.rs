@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long)]
     data: Option<PathBuf>,
     /// Seconds between syncs (default 60).
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
 }
 
@@ -73,7 +73,7 @@ fn run(cli: &Cli) -> Result<(), kuipa_tools::paths::Error> {
     // Fail fast when the origin is unusable, before binding.
     let origin = Endpoint::new(&cli.origin, &Trust::FirstContact)?;
     let synced = Arc::clone(&cache);
-    let interval = cli.interval.max(1);
+    let interval = cli.interval;
     std::thread::spawn(move || {
         loop {
             if let Err(e) = mirror::sync(&origin, &synced) {

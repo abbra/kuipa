@@ -64,7 +64,7 @@ enum Command {
         #[arg(long, allow_hyphen_values = true)]
         anchor: Vec<String>,
         /// Seconds between passes (default 60).
-        #[arg(long, default_value = "60")]
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         interval: u64,
         /// One pass, then exit.
         #[arg(long)]
@@ -169,7 +169,7 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_secs((*interval).max(1)));
+                std::thread::sleep(Duration::from_secs(*interval));
             }
         }
     }
