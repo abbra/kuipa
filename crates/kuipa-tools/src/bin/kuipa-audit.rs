@@ -88,7 +88,7 @@ enum Command {
         /// Anchors to verify the advertisement with; repeatable.
         /// Default: this host's pinned anchors.
         #[arg(long, allow_hyphen_values = true)]
-        anchor: Vec<String>,
+        anchor: Vec<tang_pqc::Thumbprint>,
         /// Record the verified head in this file, and require the next
         /// run's log to extend it.
         #[arg(long, value_name = "FILE")]
@@ -104,93 +104,98 @@ enum Command {
     },
 }
 
+/// Why a run stopped: bad arguments (exit 2) or a failed audit (1).
+enum Fail {
+    Usage(String),
+    Error(String),
+}
+
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ClaimLog { .. } => "claim-log",
+            Self::Coverage { .. } => "coverage",
+            Self::SplitView { .. } => "split-view",
+            Self::Tlog { .. } => "tlog",
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let (value, clean) = match &cli.command {
+    match run(&cli.command) {
+        Ok((value, clean)) => {
+            if cli.json {
+                println!("{value}");
+            } else {
+                render(&cli.command, &value);
+            }
+            if clean {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            }
+        }
+        Err(fail) => {
+            let (msg, status) = match fail {
+                Fail::Usage(m) => (m, ExitCode::from(2)),
+                Fail::Error(m) => (m, ExitCode::FAILURE),
+            };
+            eprintln!("kuipa-audit {}: {msg}", cli.command.name());
+            status
+        }
+    }
+}
+
+/// The report and whether it is clean.
+fn run(command: &Command) -> Result<(serde_json::Value, bool), Fail> {
+    let failed = |e: kuipa_tools::paths::Error| Fail::Error(e.to_string());
+    match command {
         Command::ClaimLog {
             server,
             anchor,
             from,
-        } => match audit::claim_log(server, anchor, from.unwrap_or(0)) {
-            Ok(v) => (v, true),
-            Err(e) => {
-                eprintln!("kuipa-audit claim-log: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
+        } => Ok((
+            audit::claim_log(server, anchor, from.unwrap_or(0)).map_err(failed)?,
+            true,
+        )),
         Command::Coverage {
             server,
             anchor,
             pinned_head,
-        } => match heads(pinned_head) {
-            Ok(heads) => match audit::coverage(server, &heads) {
-                Ok(v) => {
-                    let clean = audit::clean(&v);
-                    if let Some(only) = filtered(&v, anchor) {
-                        (only, clean)
-                    } else {
-                        (v, clean)
-                    }
-                }
-                Err(e) => {
-                    eprintln!("kuipa-audit coverage: {e}");
-                    return ExitCode::FAILURE;
-                }
-            },
-            Err(e) => {
-                eprintln!("kuipa-audit coverage: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
+        } => {
+            let heads = heads(pinned_head).map_err(Fail::Error)?;
+            let v = audit::coverage(server, &heads).map_err(failed)?;
+            let clean = audit::clean(&v);
+            Ok((filtered(&v, anchor).unwrap_or(v), clean))
+        }
         Command::Tlog {
             server,
             anchor,
             state,
             witness,
             required,
-        } => match tlog(server, anchor, witness, *required, state.as_deref()) {
-            Ok(report) => report,
-            Err(status) => return status,
-        },
+        } => tlog(server, anchor, witness, *required, state.as_deref()),
         Command::SplitView { server } => {
             if server.is_empty() {
-                eprintln!("kuipa-audit split-view: --server is required (repeat for each)");
-                return ExitCode::from(2);
+                return Err(Fail::Usage("--server is required (repeat for each)".into()));
             }
-            match audit::split_view(server) {
-                Ok(v) => {
-                    let clean = audit::clean(&v);
-                    (v, clean)
-                }
-                Err(e) => {
-                    eprintln!("kuipa-audit split-view: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
+            let v = audit::split_view(server).map_err(failed)?;
+            let clean = audit::clean(&v);
+            Ok((v, clean))
         }
-    };
-    if cli.json {
-        println!("{value}");
-    } else {
-        render(&cli.command, &value);
-    }
-    if clean {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(2)
     }
 }
 
-/// `kuipa-audit tlog`: the report and whether it is clean, or the exit
-/// status for bad arguments (2) or a failed audit (1), reported.
+/// `kuipa-audit tlog`.
 fn tlog(
     server: &str,
-    anchor: &[String],
+    anchors: &[tang_pqc::Thumbprint],
     witness: &[std::path::PathBuf],
     required: usize,
     state: Option<&std::path::Path>,
-) -> Result<(serde_json::Value, bool), ExitCode> {
-    let witnesses: Result<Vec<tang_pqc::VerifyingKey>, String> = witness
+) -> Result<(serde_json::Value, bool), Fail> {
+    let witnesses = witness
         .iter()
         .map(|p| {
             std::fs::read(p)
@@ -198,23 +203,10 @@ fn tlog(
                 .and_then(|b| tang_pqc::VerifyingKey::from_jwk_json(&b).map_err(|e| e.to_string()))
                 .map_err(|e| format!("{}: {e}", p.display()))
         })
-        .collect();
-    let witnesses = witnesses.map_err(|e| {
-        eprintln!("kuipa-audit tlog: {e}");
-        ExitCode::from(2)
-    })?;
-    let anchors: Vec<tang_pqc::Thumbprint> = anchor
-        .iter()
-        .map(|a| a.parse())
-        .collect::<Result<_, _>>()
-        .map_err(|_| {
-            eprintln!("kuipa-audit tlog: bad --anchor thumbprint");
-            ExitCode::from(2)
-        })?;
-    let v = audit::tlog(server, &anchors, &witnesses, state).map_err(|e| {
-        eprintln!("kuipa-audit tlog: {e}");
-        ExitCode::FAILURE
-    })?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Fail::Usage)?;
+    let v =
+        audit::tlog(server, anchors, &witnesses, state).map_err(|e| Fail::Error(e.to_string()))?;
     let cosigners = v["witnesses"].as_array().map_or(0, Vec::len);
     let clean = !v["state"]
         .as_str()
