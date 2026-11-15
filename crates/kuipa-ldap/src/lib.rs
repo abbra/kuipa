@@ -47,6 +47,24 @@ pub enum LdapError {
     NulByte(#[from] std::ffi::NulError),
 }
 
+/// LDAP result code 16: the attribute to delete is not there.
+pub const NO_SUCH_ATTRIBUTE: i32 = 16;
+/// LDAP result code 32: the entry is not there.
+pub const NO_SUCH_OBJECT: i32 = 32;
+/// LDAP result code 68: the entry is there already.
+pub const ALREADY_EXISTS: i32 = 68;
+
+impl LdapError {
+    /// The LDAP result code, for a [`Protocol`](Self::Protocol) error.
+    #[must_use]
+    pub fn code(&self) -> Option<i32> {
+        match self {
+            Self::Protocol { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+}
+
 /// LDAP search scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {

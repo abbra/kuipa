@@ -18,7 +18,7 @@ use libc::{c_char, c_int, c_void, timeval};
 use tracing::debug;
 
 use crate::ffi::{self, berval, BerElement, LDAP};
-use crate::{Auth, LdapError, Scope};
+use crate::{Auth, LdapError, Scope, NO_SUCH_OBJECT};
 
 // ── SASL interact callback ────────────────────────────────────────────────────
 
@@ -274,11 +274,7 @@ impl LdapConnection {
 
     fn bind_simple(&mut self, bind_dn: &str, password: &[u8]) -> Result<(), LdapError> {
         let dn_c = CString::new(bind_dn)?;
-        let pw_bytes = password;
-        let mut pw_bv = berval {
-            bv_len: pw_bytes.len() as ffi::ber_len_t,
-            bv_val: pw_bytes.as_ptr() as *mut c_char,
-        };
+        let mut pw_bv = berval_of(password);
         let mut msgid: c_int = -1;
         // SAFETY: self.ld is non-null; dn_c and pw_bv are valid for this call; null mechanism pointer selects simple bind per the OpenLDAP API contract.
         let rc = unsafe {
@@ -293,7 +289,8 @@ impl LdapConnection {
             )
         };
         check(rc, "ldap_sasl_bind (simple)")?;
-        self.collect_result(msgid, "simple bind")
+        let msg = self.wait(msgid, "simple bind")?;
+        self.parse(&msg, "simple bind").map(drop)
     }
 
     /// Authenticate using GSSAPI with an S4U2Self impersonated credential.
@@ -343,25 +340,14 @@ impl LdapConnection {
         const MAX_SASL_ROUNDS: u32 = 10;
         debug!(mech = %mech.to_string_lossy(), "SASL bind starting");
 
-        let mut result: *mut ffi::LDAPMessage = ptr::null_mut();
+        // The previous round's partial response; freed on drop each round.
+        let mut result: Option<Message> = None;
         let mut rmech: *const c_char = ptr::null();
-        let mut iterations: u32 = 0;
-        loop {
-            if iterations >= MAX_SASL_ROUNDS {
-                if !result.is_null() {
-                    // SAFETY: result is null-checked immediately above; it was obtained from ldap_result and has not yet been freed.
-                    unsafe { ffi::ldap_msgfree(result) };
-                }
-                return Err(LdapError::Protocol {
-                    code: -1,
-                    msg: format!("GSSAPI SASL bind exceeded {MAX_SASL_ROUNDS} rounds; aborting"),
-                });
-            }
-            iterations += 1;
+        for _ in 0..MAX_SASL_ROUNDS {
             let mut msgid: c_int = -1;
             // SAFETY: self.ld is non-null; c"" is a valid static NUL-terminated
-            // string; mech points to a valid CStr; result is either null (first
-            // call) or a valid partial LDAPMessage* from ldap_result;
+            // string; mech points to a valid CStr; the result pointer is either
+            // null (first call) or a valid partial LDAPMessage* from ldap_result;
             // sasl_interact_gssapi satisfies the callback signature; defaults is
             // either null or a valid gss_cred_id_t pointer whose lifetime exceeds
             // this call.
@@ -375,17 +361,12 @@ impl LdapConnection {
                     ffi::LDAP_SASL_QUIET,
                     Some(sasl_interact_gssapi),
                     defaults,
-                    result, // NULL on first call; partial result on subsequent calls
+                    result.as_ref().map_or(ptr::null_mut(), |m| m.0), // NULL on first call
                     &raw mut rmech,
                     &raw mut msgid,
                 )
             };
-            // Free the previous partial result, if any.
-            if !result.is_null() {
-                // SAFETY: result is null-checked immediately above; it was obtained from ldap_result and ownership passes to ldap_msgfree here.
-                unsafe { ffi::ldap_msgfree(result) };
-                result = ptr::null_mut();
-            }
+            drop(result.take());
             if rc == ffi::LDAP_SUCCESS {
                 return Ok(());
             }
@@ -393,214 +374,62 @@ impl LdapConnection {
                 return check(rc, "GSSAPI bind");
             }
             // More round-trips needed; collect the partial response.
-            // SAFETY: self.ld is non-null; msgid is the value written by ldap_sasl_interactive_bind above; null timeout blocks until a result arrives.
-            let rc2 = unsafe {
-                ffi::ldap_result(
-                    self.ld,
-                    msgid,
-                    ffi::LDAP_MSG_ALL,
-                    ptr::null_mut(), // block until result arrives
-                    &raw mut result,
-                )
-            };
-            if rc2 <= 0 {
-                if !result.is_null() {
-                    // SAFETY: result is null-checked immediately above; it was obtained from ldap_result on error and has not yet been freed.
-                    unsafe { ffi::ldap_msgfree(result) };
-                }
-                return Err(LdapError::Protocol {
-                    code: rc2,
-                    msg: "ldap_result during GSSAPI exchange failed".into(),
-                });
-            }
+            result = Some(self.wait(msgid, "GSSAPI exchange")?);
         }
+        Err(LdapError::Protocol {
+            code: -1,
+            msg: format!("GSSAPI SASL bind exceeded {MAX_SASL_ROUNDS} rounds; aborting"),
+        })
     }
 
-    /// Wait (blocking) for the result of a previously sent request identified
-    /// by `msgid`, then assert it succeeded at both the transport and protocol
-    /// level.
+    /// Block until the complete response to `msgid` arrives.
     ///
     /// `ldap_result` returns the message *type* (> 0) on success, 0 on timeout
     /// or connection drop, and < 0 on error.  The protocol-level result code
-    /// (e.g. `LDAP_INVALID_CREDENTIALS`) is embedded in the message body and
-    /// must be extracted with `ldap_parse_result` before the message is freed.
-    fn collect_result(&mut self, msgid: c_int, context: &str) -> Result<(), LdapError> {
+    /// (e.g. `LDAP_INVALID_CREDENTIALS`) is inside the message; [`Self::parse`]
+    /// extracts it.
+    fn wait(&self, msgid: c_int, context: &str) -> Result<Message, LdapError> {
         let mut res: *mut ffi::LDAPMessage = ptr::null_mut();
-        // SAFETY: self.ld is non-null; msgid was obtained from a preceding ldap_sasl_bind call; null timeout blocks until a result arrives.
+        // SAFETY: self.ld is non-null; msgid comes from a request just sent on
+        // this connection; a null timeout blocks until the complete result arrives.
         let rc = unsafe {
             ffi::ldap_result(
                 self.ld,
                 msgid,
                 ffi::LDAP_MSG_ALL,
-                ptr::null_mut(), // NULL timeout → block until result arrives
+                ptr::null_mut(),
                 &raw mut res,
             )
         };
+        // Wrapped before the check so a message written on error is freed too.
+        let msg = Message(res);
         if rc <= 0 {
-            // rc == 0: timeout / connection dropped; rc < 0: local error.
-            if !res.is_null() {
-                // SAFETY: res is null-checked immediately above; it was written by ldap_result and has not yet been freed.
-                unsafe { ffi::ldap_msgfree(res) };
-            }
             return Err(LdapError::Protocol {
                 code: rc,
                 msg: format!("ldap_result for {context} failed"),
             });
         }
-        // Extract the LDAP protocol result code from the message body.
-        // freeit=1: ldap_parse_result takes ownership of `res` and frees it.
-        let mut errcode: c_int = ffi::LDAP_SUCCESS;
-        // SAFETY: self.ld is non-null; res is a valid LDAPMessage* from ldap_result (rc > 0 checked above); freeit=1 transfers ownership of res to ldap_parse_result.
-        let parse_rc = unsafe {
-            ffi::ldap_parse_result(
-                self.ld,
-                res,
-                &raw mut errcode,
-                ptr::null_mut(), // matcheddnp — not needed
-                ptr::null_mut(), // diagmsgp  — not needed
-                ptr::null_mut(), // referralsp — not needed
-                ptr::null_mut(), // serverctrls — not needed
-                1,               // freeit: ldap_parse_result frees `res`
-            )
-        };
-        if parse_rc != ffi::LDAP_SUCCESS {
-            return Err(LdapError::Protocol {
-                code: parse_rc,
-                msg: format!(
-                    "{context}: ldap_parse_result failed: {}",
-                    err_string(parse_rc)
-                ),
-            });
-        }
-        if errcode != ffi::LDAP_SUCCESS {
-            return Err(LdapError::Protocol {
-                code: errcode,
-                msg: format!("{context}: {}", err_string(errcode)),
-            });
-        }
-        Ok(())
+        Ok(msg)
     }
 
-    // ── Extended operations ───────────────────────────────────────────────────
-
-    /// Perform an extended operation (RFC 4511 §4.12) and return its response
-    /// value and the response controls.
+    /// Assert `msg` carries `LDAP_SUCCESS` and return its response controls.
     ///
-    /// FreeIPA's `KEYTAB_GET` operation returns its reply in a response
-    /// control rather than in the response value, so both are returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LdapError::Protocol`] if the extended request is rejected,
-    /// `ldap_result` times out, or the result code is not
-    /// `LDAP_SUCCESS`; [`LdapError::NulByte`] if `oid` has an interior NUL.
-    pub fn extended_operation(
-        &mut self,
-        oid: &str,
-        value: Option<&[u8]>,
-    ) -> Result<ExtendedResult, LdapError> {
-        let oid_c = CString::new(oid)?;
-        let mut req_bv = value.map(|v| ffi::berval {
-            bv_len: v.len() as ffi::ber_len_t,
-            bv_val: v.as_ptr() as *mut c_char,
-        });
-        let req_ptr = req_bv.as_mut().map_or(ptr::null_mut(), ptr::from_mut);
-        let mut msgid: c_int = -1;
-        // SAFETY: self.ld is non-null; oid_c and the request berval (pointing
-        // into `value`) outlive the call, which copies them into the request.
-        let rc = unsafe {
-            ffi::ldap_extended_operation(
-                self.ld,
-                oid_c.as_ptr(),
-                req_ptr,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &raw mut msgid,
-            )
-        };
-        check(rc, "ldap_extended_operation")?;
-
-        let mut res: *mut ffi::LDAPMessage = ptr::null_mut();
-        // SAFETY: self.ld is non-null; msgid comes from the call above; a null
-        // timeout blocks until the result arrives.
-        let rc = unsafe {
-            ffi::ldap_result(
-                self.ld,
-                msgid,
-                ffi::LDAP_MSG_ALL,
-                ptr::null_mut(),
-                &raw mut res,
-            )
-        };
-        if rc <= 0 {
-            if !res.is_null() {
-                // SAFETY: res was written by ldap_result and not yet freed.
-                unsafe { ffi::ldap_msgfree(res) };
-            }
-            return Err(LdapError::Protocol {
-                code: rc,
-                msg: "ldap_result for extended operation failed".into(),
-            });
-        }
-
-        let mut retoid: *mut c_char = ptr::null_mut();
-        let mut retdata: *mut ffi::berval = ptr::null_mut();
-        // SAFETY: res is a valid result message; freeit=0 keeps it for the
-        // ldap_parse_result call below.
-        let rc = unsafe {
-            ffi::ldap_parse_extended_result(self.ld, res, &raw mut retoid, &raw mut retdata, 0)
-        };
-        // SAFETY: retoid/retdata are either null or allocated by libldap;
-        // they are copied and then freed exactly once.
-        let (response_oid, response_value) = unsafe {
-            let oid =
-                (!retoid.is_null()).then(|| CStr::from_ptr(retoid).to_string_lossy().into_owned());
-            let value = (!retdata.is_null()).then(|| berval_bytes(&*retdata));
-            if !retoid.is_null() {
-                ffi::ldap_memfree(retoid.cast());
-            }
-            if !retdata.is_null() {
-                ffi::ber_bvfree(retdata);
-            }
-            (oid, value)
-        };
-        if rc != ffi::LDAP_SUCCESS {
-            // SAFETY: res is still owned by us.
-            unsafe { ffi::ldap_msgfree(res) };
-            return Err(LdapError::Protocol {
-                code: rc,
-                msg: format!("ldap_parse_extended_result: {}", err_string(rc)),
-            });
-        }
-
-        let controls = self.parse_result_controls(res, &format!("extended operation {oid}"))?;
-        Ok(ExtendedResult {
-            oid: response_oid,
-            value: response_value,
-            controls,
-        })
-    }
-
-    /// Parse a result message (freeing it) and return its response controls.
-    fn parse_result_controls(
-        &mut self,
-        res: *mut ffi::LDAPMessage,
-        context: &str,
-    ) -> Result<Vec<(String, Vec<u8>)>, LdapError> {
+    /// Borrows `msg` (`freeit = 0`) so a search result can still be walked.
+    fn parse(&self, msg: &Message, context: &str) -> Result<Vec<(String, Vec<u8>)>, LdapError> {
         let mut errcode: c_int = ffi::LDAP_SUCCESS;
         let mut diag: *mut c_char = ptr::null_mut();
         let mut ctrls: *mut *mut ffi::LDAPControl = ptr::null_mut();
-        // SAFETY: res is valid; freeit=1 transfers ownership of res.
+        // SAFETY: self.ld is non-null; msg.0 is a valid message from ldap_result.
         let parse_rc = unsafe {
             ffi::ldap_parse_result(
                 self.ld,
-                res,
+                msg.0,
                 &raw mut errcode,
                 ptr::null_mut(),
                 &raw mut diag,
                 ptr::null_mut(),
                 &raw mut ctrls,
-                1,
+                0,
             )
         };
         // SAFETY: diag and ctrls are null or allocated by libldap; copied
@@ -626,7 +455,10 @@ impl LdapConnection {
         if parse_rc != ffi::LDAP_SUCCESS {
             return Err(LdapError::Protocol {
                 code: parse_rc,
-                msg: format!("ldap_parse_result: {}", err_string(parse_rc)),
+                msg: format!(
+                    "{context}: ldap_parse_result failed: {}",
+                    err_string(parse_rc)
+                ),
             });
         }
         if errcode != ffi::LDAP_SUCCESS {
@@ -640,6 +472,74 @@ impl LdapConnection {
             });
         }
         Ok(controls)
+    }
+
+    // ── Extended operations ───────────────────────────────────────────────────
+
+    /// Perform an extended operation (RFC 4511 §4.12) and return its response
+    /// value and the response controls.
+    ///
+    /// FreeIPA's `KEYTAB_GET` operation returns its reply in a response
+    /// control rather than in the response value, so both are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LdapError::Protocol`] if the extended request is rejected,
+    /// `ldap_result` times out, or the result code is not
+    /// `LDAP_SUCCESS`; [`LdapError::NulByte`] if `oid` has an interior NUL.
+    pub fn extended_operation(
+        &mut self,
+        oid: &str,
+        value: Option<&[u8]>,
+    ) -> Result<ExtendedResult, LdapError> {
+        let oid_c = CString::new(oid)?;
+        let mut req_bv = value.map(berval_of);
+        let req_ptr = req_bv.as_mut().map_or(ptr::null_mut(), ptr::from_mut);
+        let mut msgid: c_int = -1;
+        // SAFETY: self.ld is non-null; oid_c and the request berval (pointing
+        // into `value`) outlive the call, which copies them into the request.
+        let rc = unsafe {
+            ffi::ldap_extended_operation(
+                self.ld,
+                oid_c.as_ptr(),
+                req_ptr,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &raw mut msgid,
+            )
+        };
+        check(rc, "ldap_extended_operation")?;
+        let msg = self.wait(msgid, "extended operation")?;
+
+        let mut retoid: *mut c_char = ptr::null_mut();
+        let mut retdata: *mut ffi::berval = ptr::null_mut();
+        // SAFETY: msg.0 is a valid result message; freeit=0 keeps it for
+        // the parse below.
+        let rc = unsafe {
+            ffi::ldap_parse_extended_result(self.ld, msg.0, &raw mut retoid, &raw mut retdata, 0)
+        };
+        // SAFETY: retoid/retdata are either null or allocated by libldap;
+        // they are copied and then freed exactly once.
+        let (response_oid, response_value) = unsafe {
+            let oid =
+                (!retoid.is_null()).then(|| CStr::from_ptr(retoid).to_string_lossy().into_owned());
+            let value = (!retdata.is_null()).then(|| berval_bytes(&*retdata));
+            if !retoid.is_null() {
+                ffi::ldap_memfree(retoid.cast());
+            }
+            if !retdata.is_null() {
+                ffi::ber_bvfree(retdata);
+            }
+            (oid, value)
+        };
+        check(rc, "ldap_parse_extended_result")?;
+
+        let controls = self.parse(&msg, &format!("extended operation {oid}"))?;
+        Ok(ExtendedResult {
+            oid: response_oid,
+            value: response_value,
+            controls,
+        })
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -661,8 +561,10 @@ impl LdapConnection {
     /// # Errors
     ///
     /// Returns [`LdapError::Protocol`] if the search request or result
-    /// retrieval fails; [`LdapError::NulByte`] if `base`, `filter`, or any
-    /// entry of `attrs` has an interior NUL.
+    /// retrieval fails, or the server's result code is not success (for
+    /// example [`NO_SUCH_OBJECT`] when `base` is absent);
+    /// [`LdapError::NulByte`] if `base`, `filter`, or any entry of `attrs`
+    /// has an interior NUL.
     pub fn search(
         &mut self,
         base: &str,
@@ -676,8 +578,10 @@ impl LdapConnection {
         let filter_c = CString::new(filter)?;
 
         // Build a NULL-terminated *mut *mut c_char array for the attribute list.
-        let attr_cstrings: Vec<CString> =
-            attrs.iter().map(|a| CString::new(*a)).collect::<Result<_, _>>()?;
+        let attr_cstrings: Vec<CString> = attrs
+            .iter()
+            .map(|a| CString::new(*a))
+            .collect::<Result<_, _>>()?;
         let mut attr_ptrs: Vec<*mut c_char> = attr_cstrings
             .iter()
             .map(|s| s.as_ptr().cast_mut())
@@ -709,35 +613,30 @@ impl LdapConnection {
         };
         check(rc, "ldap_search_ext")?;
 
-        let mut res: *mut ffi::LDAPMessage = ptr::null_mut();
-        // SAFETY: self.ld is non-null; msgid was obtained from ldap_search_ext above; null timeout blocks until the complete result chain arrives.
-        let rc = unsafe {
-            ffi::ldap_result(
-                self.ld,
-                msgid,
-                ffi::LDAP_MSG_ALL,
-                ptr::null_mut(), // block until complete result arrives
-                &raw mut res,
-            )
-        };
-        if rc <= 0 {
-            if !res.is_null() {
-                // SAFETY: res is null-checked immediately above; it was written by ldap_result and has not yet been freed.
-                unsafe { ffi::ldap_msgfree(res) };
-            }
-            return Err(LdapError::Protocol {
-                code: rc,
-                msg: "ldap_result for search failed".into(),
-            });
-        }
+        let msg = self.wait(msgid, "search")?;
+        self.parse(&msg, "search")?;
+        // SAFETY: self.ld is non-null; msg.0 is a valid result chain that
+        // outlives the call; collect_entries does not free it.
+        Ok(unsafe { collect_entries(self.ld, msg.0) })
+    }
 
-        // `res` now owns the result chain; walk it and build SearchEntry values.
-        // SAFETY: self.ld is non-null; res is a valid result chain from ldap_result (rc > 0 checked above); collect_entries requires the caller to free res afterwards.
-        let entries = unsafe { collect_entries(self.ld, res) };
-        // Free the entire result chain.
-        // SAFETY: res is a valid LDAPMessage* returned by ldap_result; collect_entries does not free it (per its contract), so this is the single owner freeing it.
-        unsafe { ffi::ldap_msgfree(res) };
-        Ok(entries)
+    /// [`search`](Self::search), but an absent `base` ([`NO_SUCH_OBJECT`])
+    /// yields no entries instead of an error.
+    ///
+    /// # Errors
+    ///
+    /// As [`search`](Self::search), except [`NO_SUCH_OBJECT`].
+    pub fn search_if_exists(
+        &mut self,
+        base: &str,
+        scope: Scope,
+        filter: &str,
+        attrs: &[&str],
+    ) -> Result<Vec<SearchEntry>, LdapError> {
+        match self.search(base, scope, filter, attrs) {
+            Err(e) if e.code() == Some(NO_SUCH_OBJECT) => Ok(Vec::new()),
+            r => r,
+        }
     }
 
     // ── Modify ────────────────────────────────────────────────────────────────
@@ -747,9 +646,6 @@ impl LdapConnection {
     /// Each element of `mods` is `(op, attr_name, values)`.  Use
     /// [`ModOp::Add`] to append values or [`ModOp::Delete`] to remove them.
     /// Passing an empty `values` vec with `Delete` removes the entire attribute.
-    ///
-    /// All allocations needed by libldap are on the stack for the duration of
-    /// the call; nothing escapes.
     ///
     /// # Errors
     ///
@@ -762,64 +658,18 @@ impl LdapConnection {
         mods: &[(ModOp, &str, Vec<&[u8]>)],
     ) -> Result<(), LdapError> {
         let dn_c = CString::new(dn)?;
-
-        // For each modification we need:
-        //   - CString for the attribute name
-        //   - Vec<berval> for the values (pointers into the caller's slices)
-        //   - Vec<*mut berval> (NULL-terminated) pointing into the berval vec
-        //   - ffi::LDAPMod tying the above together
-        //
-        // All these live on the stack and must outlive the ldap_modify_ext_s call.
-        // We build them separately so we can take pointers into them safely.
-        let mut attr_cstrings: Vec<CString> = Vec::with_capacity(mods.len());
-        let mut berval_vecs: Vec<Vec<ffi::berval>> = Vec::with_capacity(mods.len());
-        let mut bvptr_vecs: Vec<Vec<*mut ffi::berval>> = Vec::with_capacity(mods.len());
-        let mut ldap_mods: Vec<ffi::LDAPMod> = Vec::with_capacity(mods.len());
-
-        for (_op, attr, values) in mods {
-            attr_cstrings.push(CString::new(*attr)?);
-            let bvs: Vec<ffi::berval> = values
-                .iter()
-                .map(|v| ffi::berval {
-                    bv_len: v.len() as ffi::ber_len_t,
-                    bv_val: v.as_ptr() as *mut c_char,
-                })
-                .collect();
-            berval_vecs.push(bvs);
-        }
-
-        // Build pointer-to-berval vecs now that berval_vecs is fully populated
-        // (and won't be reallocated).
-        for bvs in &mut berval_vecs {
-            let mut ptrs: Vec<*mut ffi::berval> = bvs.iter_mut().map(ptr::from_mut).collect();
-            ptrs.push(ptr::null_mut()); // NULL sentinel
-            bvptr_vecs.push(ptrs);
-        }
-
-        // Build LDAPMod array, referencing into attr_cstrings and bvptr_vecs.
-        // This must happen after all Vec pushes so pointers are stable.
-        for (i, (op, _attr, _values)) in mods.iter().enumerate() {
-            ldap_mods.push(ffi::LDAPMod {
-                mod_op: op.as_int() | ffi::LDAP_MOD_BVALUES,
-                mod_type: attr_cstrings[i].as_ptr().cast_mut(),
-                mod_vals: bvptr_vecs[i].as_mut_ptr(),
-            });
-        }
-
-        // NULL-terminated array of *mut LDAPMod.
-        let mut mod_ptrs: Vec<*mut ffi::LDAPMod> =
-            ldap_mods.iter_mut().map(ptr::from_mut).collect();
-        mod_ptrs.push(ptr::null_mut());
-
+        let mut mods = Mods::new(
+            mods.iter()
+                .map(|(op, a, v)| (op.as_int(), *a, v.as_slice())),
+        )?;
         // SAFETY: self.ld is non-null; dn_c is a valid NUL-terminated C string;
-        // mod_ptrs is a NULL-terminated array of valid LDAPMod pointers; all
-        // backing allocations (attr_cstrings, berval_vecs, bvptr_vecs, ldap_mods)
-        // remain on the stack and live until after ldap_modify_ext_s returns.
+        // mods.ptrs is a NULL-terminated array of LDAPMod pointers whose backing
+        // storage `mods` owns until after the call returns.
         let rc = unsafe {
             ffi::ldap_modify_ext_s(
                 self.ld,
                 dn_c.as_ptr(),
-                mod_ptrs.as_mut_ptr(),
+                mods.ptrs.as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             )
@@ -839,52 +689,17 @@ impl LdapConnection {
     /// NUL.
     pub fn add_s(&mut self, dn: &str, attrs: &[(&str, Vec<&[u8]>)]) -> Result<(), LdapError> {
         let dn_c = CString::new(dn)?;
-
-        let mut attr_cstrings: Vec<CString> = Vec::with_capacity(attrs.len());
-        let mut berval_vecs: Vec<Vec<ffi::berval>> = Vec::with_capacity(attrs.len());
-        let mut bvptr_vecs: Vec<Vec<*mut ffi::berval>> = Vec::with_capacity(attrs.len());
-        let mut ldap_mods: Vec<ffi::LDAPMod> = Vec::with_capacity(attrs.len());
-
-        for (_attr, values) in attrs {
-            let bvs: Vec<ffi::berval> = values
+        let mut mods = Mods::new(
+            attrs
                 .iter()
-                .map(|v| ffi::berval {
-                    bv_len: v.len() as ffi::ber_len_t,
-                    bv_val: v.as_ptr() as *mut c_char,
-                })
-                .collect();
-            berval_vecs.push(bvs);
-        }
-
-        for (attr, _values) in attrs {
-            attr_cstrings.push(CString::new(*attr)?);
-        }
-
-        for bvs in &mut berval_vecs {
-            let mut ptrs: Vec<*mut ffi::berval> = bvs.iter_mut().map(ptr::from_mut).collect();
-            ptrs.push(ptr::null_mut());
-            bvptr_vecs.push(ptrs);
-        }
-
-        for (i, _) in attrs.iter().enumerate() {
-            ldap_mods.push(ffi::LDAPMod {
-                mod_op: ffi::LDAP_MOD_ADD | ffi::LDAP_MOD_BVALUES,
-                mod_type: attr_cstrings[i].as_ptr().cast_mut(),
-                mod_vals: bvptr_vecs[i].as_mut_ptr(),
-            });
-        }
-
-        let mut mod_ptrs: Vec<*mut ffi::LDAPMod> =
-            ldap_mods.iter_mut().map(ptr::from_mut).collect();
-        mod_ptrs.push(ptr::null_mut());
-
-        // SAFETY: self.ld is non-null; all backing allocations remain valid for
-        // the duration of the ldap_add_ext_s call.
+                .map(|(a, v)| (ffi::LDAP_MOD_ADD, *a, v.as_slice())),
+        )?;
+        // SAFETY: as in `modify_s`.
         let rc = unsafe {
             ffi::ldap_add_ext_s(
                 self.ld,
                 dn_c.as_ptr(),
-                mod_ptrs.as_mut_ptr(),
+                mods.ptrs.as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             )
@@ -958,6 +773,83 @@ pub struct SearchEntry {
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+/// An owned `LDAPMessage` chain, freed with `ldap_msgfree` on drop.
+struct Message(*mut ffi::LDAPMessage);
+
+impl Drop for Message {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: self.0 came from ldap_result and is owned by this wrapper.
+            unsafe { ffi::ldap_msgfree(self.0) };
+        }
+    }
+}
+
+/// Borrow `v` as a `berval`; libldap only reads through it.
+fn berval_of(v: &[u8]) -> berval {
+    berval {
+        bv_len: v.len() as ffi::ber_len_t,
+        bv_val: v.as_ptr().cast_mut().cast(),
+    }
+}
+
+/// A NULL-terminated `LDAPMod *` array for `ldap_add_ext_s`/`ldap_modify_ext_s`,
+/// with the storage the pointers refer to.
+struct Mods {
+    /// Points into the fields below, which are never touched after `new`.
+    ptrs: Vec<*mut ffi::LDAPMod>,
+    _entries: Vec<ffi::LDAPMod>,
+    _bvptrs: Vec<Vec<*mut berval>>,
+    _bvals: Vec<Vec<berval>>,
+    _names: Vec<CString>,
+}
+
+impl Mods {
+    /// `items` are `(mod_op, attribute, values)`; `LDAP_MOD_BVALUES` is added.
+    fn new<'a>(
+        items: impl Iterator<Item = (c_int, &'a str, &'a [&'a [u8]])>,
+    ) -> Result<Self, LdapError> {
+        let (mut ops, mut names, mut bvals) = (Vec::new(), Vec::new(), Vec::new());
+        for (op, attr, values) in items {
+            ops.push(op | ffi::LDAP_MOD_BVALUES);
+            names.push(CString::new(attr)?);
+            bvals.push(values.iter().map(|v| berval_of(v)).collect::<Vec<_>>());
+        }
+        // The inner vectors' heap buffers do not move when the outer ones do.
+        let mut bvptrs: Vec<Vec<*mut berval>> = bvals
+            .iter_mut()
+            .map(|bvs| {
+                bvs.iter_mut()
+                    .map(ptr::from_mut)
+                    .chain([ptr::null_mut()])
+                    .collect()
+            })
+            .collect();
+        let mut mods: Vec<ffi::LDAPMod> = ops
+            .iter()
+            .zip(&names)
+            .zip(&mut bvptrs)
+            .map(|((&mod_op, name), vals)| ffi::LDAPMod {
+                mod_op,
+                mod_type: name.as_ptr().cast_mut(),
+                mod_vals: vals.as_mut_ptr(),
+            })
+            .collect();
+        let ptrs = mods
+            .iter_mut()
+            .map(ptr::from_mut)
+            .chain([ptr::null_mut()])
+            .collect();
+        Ok(Self {
+            ptrs,
+            _entries: mods,
+            _bvptrs: bvptrs,
+            _bvals: bvals,
+            _names: names,
+        })
+    }
+}
 
 /// Walk the libldap result chain and decode each entry's attributes.
 ///
@@ -1158,8 +1050,13 @@ mod tests {
     fn nul_byte_in_argument_is_rejected() {
         let mut conn =
             LdapConnection::connect("ldap://127.0.0.1:38999", None, false, 5).expect("initialize");
-        let err = conn.delete_s("uid=a\0,dc=test").expect_err("NUL byte must be rejected");
-        assert!(matches!(err, LdapError::NulByte(_)), "unexpected variant: {err:?}");
+        let err = conn
+            .delete_s("uid=a\0,dc=test")
+            .expect_err("NUL byte must be rejected");
+        assert!(
+            matches!(err, LdapError::NulByte(_)),
+            "unexpected variant: {err:?}"
+        );
     }
 
     #[test]
@@ -1177,6 +1074,30 @@ mod tests {
     fn ldap_error_display_tls() {
         let e = LdapError::Tls("cert verify failed".into());
         assert!(e.to_string().contains("cert verify failed"));
+    }
+
+    #[test]
+    fn mods_array_is_null_terminated_and_binary_safe() {
+        let (a, b): (&[u8], &[u8]) = (b"x", b"\0y");
+        let m = Mods::new(
+            [
+                (ffi::LDAP_MOD_ADD, "cn", &[a, b][..]),
+                (ffi::LDAP_MOD_DELETE, "sn", &[][..]),
+            ]
+            .into_iter(),
+        )
+        .expect("no NUL in names");
+        assert_eq!(m.ptrs.len(), 3);
+        assert!(m.ptrs[2].is_null());
+        // SAFETY: ptrs[0] points into `m`'s storage, alive here.
+        unsafe {
+            let first = &*m.ptrs[0];
+            assert_eq!(first.mod_op, ffi::LDAP_MOD_ADD | ffi::LDAP_MOD_BVALUES);
+            assert_eq!(berval_bytes(&**first.mod_vals.add(1)), b"\0y");
+            assert!((*first.mod_vals.add(2)).is_null());
+            assert!((*(*m.ptrs[1]).mod_vals).is_null());
+        }
+        assert!(Mods::new([(0, "c\0n", &[][..])].into_iter()).is_err());
     }
 
     #[test]
