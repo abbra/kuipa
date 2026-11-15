@@ -314,6 +314,9 @@ fn write_device_key(
 pub fn read_device_key(user: &UserPaths, passphrase: &[u8]) -> Result<ExchangeKeyPair, Error> {
     let bytes = fs::read(user.device_key())
         .map_err(|_| "this host has no device key: run `kuipa seal device add SEAL` first")?;
+    if tpm_wrapped(&bytes) {
+        return unprotect_tpm(&bytes);
+    }
     unprotect_key(&bytes, passphrase)
 }
 
@@ -2471,19 +2474,28 @@ impl<'a> SealClient<'a> {
         let file = SealedFile::from_bytes(sealed)?;
         let session = Self::session_for(file.seal_id());
         let unwrapped;
-        let device: Option<&dyn DeviceKey> =
-            if let Some(k) = session.as_ref().and_then(|l| l.key.as_ref()) {
-                Some(k)
-            } else if file.devices().is_empty() && session.is_none() {
-                None
-            } else {
-                let passphrase = passphrase
-                    .ok_or("the file needs this host's device key: give its passphrase or PIN")?;
-                unwrapped =
-                    self.user
-                        .device_for(&file.devices(), passphrase, self.authenticator)?;
-                Some(unwrapped.as_device())
+        let device: Option<&dyn DeviceKey> = if let Some(k) =
+            session.as_ref().and_then(|l| l.key.as_ref())
+        {
+            Some(k)
+        } else if file.devices().is_empty() && session.is_none() {
+            None
+        } else {
+            // A TPM device has no passphrase.
+            let passphrase = match passphrase {
+                Some(p) => p,
+                None if self.user.tpm_device() => &[],
+                None => {
+                    return Err(
+                        "the file needs this host's device key: give its passphrase or PIN".into(),
+                    );
+                }
             };
+            unwrapped = self
+                .user
+                .device_for(&file.devices(), passphrase, self.authenticator)?;
+            Some(unwrapped.as_device())
+        };
         let trust = flows::ca_trust(self.host)?;
         // A passkey only when the seal asks for one: each takes a touch.
         let passkey_info = if session.is_none() && self.needs_passkey(sealed) {
