@@ -33,7 +33,9 @@
 use std::time::Duration;
 
 use kuipa_enroll::escrow::{Kind, RegisterParams, SealId};
-use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
+use kuipa_enroll::join::{
+    ChannelBinding, KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input,
+};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::passkey::UserPasskeys;
 use kuipa_enroll::seal::{
@@ -42,7 +44,7 @@ use kuipa_enroll::seal::{
 };
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{
-    BrokeredKey, Directory, DirectoryError, Staged, VoucherJoinError, VoucherRefused,
+    BrokeredKey, Directory, DirectoryError, Mark, Staged, Use, VoucherJoinError, VoucherRefused,
 };
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
 use kuipa_ldap::{
@@ -279,7 +281,7 @@ impl LdapDirectory {
     fn accept_kerberos(
         &self,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<(String, Vec<u8>, Option<GssClientCred>), DirectoryError> {
         Ok(kuipa_gssapi::accept_bound_delegated(
             &self.server_cred,
@@ -294,7 +296,7 @@ impl LdapDirectory {
     fn accept_bound(
         &self,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<(String, KerberosBinding), DirectoryError> {
         let (principal, derived, _) = self.accept_kerberos(token, cb)?;
         Ok((principal, KerberosBinding::new(&derived)?))
@@ -308,7 +310,7 @@ impl LdapDirectory {
     fn accept_conn(
         &self,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<(String, KerberosBinding, Option<LdapConnection>), DirectoryError> {
         let (caller, derived, delegated) = self.accept_kerberos(token, cb)?;
         let binding = KerberosBinding::new(&derived)?;
@@ -479,13 +481,13 @@ impl LdapDirectory {
         server: &str,
         limit: Option<u64>,
         missing: &str,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         let mut svc = self.service_conn()?;
         let entries = svc.search(dn, Scope::Base, &format!("(objectClass={class})"), &[attr])?;
         let entry = entries.first().ok_or(missing)?;
         let counts = Self::counts(entry, attr);
         if limit.is_some_and(|l| counts.iter().map(|(_, n)| n).sum::<u64>() >= l) {
-            return Ok(false);
+            return Ok(Use::LimitReached);
         }
         let own = counts.iter().find(|(s, _)| s == server).map(|(_, n)| *n);
         let new = format!("{server} {}", own.unwrap_or(0) + 1);
@@ -496,7 +498,7 @@ impl LdapDirectory {
         }
         mods.push(Mod::add(attr, [&new]));
         svc.modify_s(dn, &mods)?;
-        Ok(true)
+        Ok(Use::Counted)
     }
 
     /// The `kind:name` values of who approves `seal`'s releases.
@@ -774,7 +776,7 @@ impl Directory for LdapDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         enctypes: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let (caller, binding, presented) = self.accept_conn(token, cb)?;
@@ -790,7 +792,7 @@ impl Directory for LdapDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         enctypes: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let (caller, binding) = self.accept_bound(token, cb)?;
@@ -801,7 +803,7 @@ impl Directory for LdapDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         enctypes: &[Enctype],
         staged: &Staged,
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
@@ -875,7 +877,7 @@ impl Directory for LdapDirectory {
         params: &RegisterParams,
         bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<KerberosBinding, DirectoryError> {
         let (caller, binding) = self.accept_bound(token, cb)?;
         let principal = &params.principal;
@@ -969,14 +971,14 @@ impl Directory for LdapDirectory {
         Ok(peers)
     }
 
-    fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+    fn accept_peer(&self, token: &[u8], cb: &ChannelBinding) -> Result<String, DirectoryError> {
         match kuipa_gssapi::accept_token(&self.server_cred, token, Some(cb))? {
             AcceptStep::Complete { principal, .. } => Ok(principal),
             AcceptStep::Continue { .. } => Err("GSS-API exchange needs more than one token".into()),
         }
     }
 
-    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+    fn accept_user(&self, token: &[u8], cb: &ChannelBinding) -> Result<Accepted, DirectoryError> {
         let (principal, binding) = self.accept_bound(token, cb)?;
         Ok(Accepted {
             principal,
@@ -1044,7 +1046,7 @@ impl Directory for LdapDirectory {
     fn fetch_key_via_broker(
         &self,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         fetch: &kuipa_enroll::keys::KeysFetch,
     ) -> Result<Option<BrokeredKey>, DirectoryError> {
         let Some(keys) = self.keys.as_ref().filter(|k| k.has_broker()) else {
@@ -1419,10 +1421,10 @@ impl Directory for LdapDirectory {
         id: &SealId,
         request: &str,
         approval: &Approval,
-        deny: bool,
+        mark: Mark,
     ) -> Result<(), DirectoryError> {
         let value = approval.to_string();
-        let attr = if deny {
+        let attr = if mark == Mark::Deny {
             RELEASE_DENIED_ATTR
         } else {
             RELEASE_APPROVAL_ATTR
@@ -1439,7 +1441,7 @@ impl Directory for LdapDirectory {
         request: &str,
         server: &str,
         limit: u64,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         self.bump(
             &self.release_dn(id, request),
             RELEASE_CLASS,
@@ -1455,7 +1457,7 @@ impl Directory for LdapDirectory {
         id: &SealId,
         server: &str,
         limit: Option<u64>,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         self.bump(
             &self.seal_dn(id),
             SEAL_CLASS,

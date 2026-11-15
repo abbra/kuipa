@@ -344,6 +344,9 @@ pub const KERBEROS_BINDING_LEN: usize = 32;
 /// The length of every channel binding kuipa hands GSS-API.
 pub(crate) const CHANNEL_BINDING_LEN: usize = 32;
 
+/// A channel binding: the digest of the TLS session a request is bound to.
+pub type ChannelBinding = [u8; CHANNEL_BINDING_LEN];
+
 /// A channel binding from `digest`: its first [`CHANNEL_BINDING_LEN`]
 /// bytes (a SHA-256 digest whole, a SHA-384 one truncated, as SP 800-107
 /// allows).
@@ -352,7 +355,7 @@ pub(crate) const CHANNEL_BINDING_LEN: usize = 32;
 ///
 /// For a digest shorter than a channel binding.
 #[must_use]
-pub(crate) fn channel_binding_of(digest: &[u8]) -> [u8; CHANNEL_BINDING_LEN] {
+pub(crate) fn channel_binding_of(digest: &[u8]) -> ChannelBinding {
     let mut cb = [0u8; CHANNEL_BINDING_LEN];
     cb.copy_from_slice(&digest[..CHANNEL_BINDING_LEN]);
     cb
@@ -361,7 +364,7 @@ pub(crate) fn channel_binding_of(digest: &[u8]) -> [u8; CHANNEL_BINDING_LEN] {
 /// The GSS-API pseudo-random function input for the [`KerberosBinding`] of
 /// an exchange with channel binding `cb`.
 #[must_use]
-pub fn kerberos_prf_input(cb: &[u8; CHANNEL_BINDING_LEN]) -> Vec<u8> {
+pub fn kerberos_prf_input(cb: &ChannelBinding) -> Vec<u8> {
     [b"ipa-ku-enroll/v1 rsp".as_slice(), cb].concat()
 }
 

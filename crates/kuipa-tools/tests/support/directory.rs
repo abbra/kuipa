@@ -8,12 +8,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use kuipa_enroll::escrow::{Kind, RegisterParams, SealId};
-use kuipa_enroll::join::{KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input};
+use kuipa_enroll::join::{
+    ChannelBinding, KERBEROS_BINDING_LEN, KerberosBinding, kerberos_prf_input,
+};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::realm::TrustedRealm;
 use kuipa_enroll::seal::{Approval, ReleaseRequest, Seal};
 use kuipa_enroll::server::{
-    Accepted, Directory, DirectoryError, Staged, VoucherJoinError, VoucherRefused,
+    Accepted, Directory, DirectoryError, Mark, Staged, Use, VoucherJoinError, VoucherRefused,
 };
 use kuipa_gssapi::{AcceptStep, GssServerCred};
 
@@ -131,7 +133,7 @@ impl KdcDirectory {
 
     /// Accept a token for any of the servers (the request does not say
     /// which one it was made for; a real daemon has a single credential).
-    fn accept(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+    fn accept(&self, token: &[u8], cb: &ChannelBinding) -> Result<String, DirectoryError> {
         let mut last = None;
         for cred in &self.creds {
             match kuipa_gssapi::accept_token(cred, token, Some(cb)) {
@@ -147,7 +149,7 @@ impl KdcDirectory {
     fn accept_bound(
         &self,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<(String, KerberosBinding), DirectoryError> {
         let mut last = None;
         for cred in &self.creds {
@@ -318,7 +320,7 @@ impl Directory for KdcDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         _: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let (caller, binding) = self.accept_bound(token, cb)?;
@@ -330,7 +332,7 @@ impl Directory for KdcDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         _: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let host = Principal::host(fqdn, &self.realm.name).to_string();
@@ -348,7 +350,7 @@ impl Directory for KdcDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         _: &[Enctype],
         _: &Staged,
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
@@ -392,7 +394,7 @@ impl Directory for KdcDirectory {
         params: &RegisterParams,
         bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<KerberosBinding, DirectoryError> {
         let (caller, binding) = self.accept_bound(token, cb)?;
         let principal = params.principal.to_string();
@@ -428,11 +430,11 @@ impl Directory for KdcDirectory {
         self.servers()
     }
 
-    fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+    fn accept_peer(&self, token: &[u8], cb: &ChannelBinding) -> Result<String, DirectoryError> {
         self.accept(token, cb)
     }
 
-    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+    fn accept_user(&self, token: &[u8], cb: &ChannelBinding) -> Result<Accepted, DirectoryError> {
         let (principal, binding) = self.accept_bound(token, cb)?;
         Ok(Accepted {
             principal,
@@ -535,9 +537,9 @@ impl Directory for KdcDirectory {
         id: &SealId,
         server: &str,
         limit: Option<u64>,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         if limit.is_some_and(|l| self.total(id) >= l) {
-            return Ok(false);
+            return Ok(Use::LimitReached);
         }
         *self
             .unlocks
@@ -545,7 +547,7 @@ impl Directory for KdcDirectory {
             .unwrap()
             .entry((*id, server.to_owned()))
             .or_default() += 1;
-        Ok(true)
+        Ok(Use::Counted)
     }
 
     fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
@@ -745,13 +747,13 @@ impl Directory for KdcDirectory {
         id: &SealId,
         request: &str,
         approval: &Approval,
-        deny: bool,
+        mark: Mark,
     ) -> Result<(), DirectoryError> {
         let mut releases = self.releases.lock().unwrap();
         let r = releases
             .get_mut(&(*id, request.to_owned()))
             .ok_or("no such request")?;
-        if deny {
+        if mark == Mark::Deny {
             r.denied = Some(approval.clone());
         } else {
             r.approvals.push(approval.clone());
@@ -765,7 +767,7 @@ impl Directory for KdcDirectory {
         request: &str,
         server: &str,
         limit: u64,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         let mut uses = self.release_uses.lock().unwrap();
         let total: u64 = uses
             .iter()
@@ -773,12 +775,12 @@ impl Directory for KdcDirectory {
             .map(|(_, n)| n)
             .sum();
         if total >= limit {
-            return Ok(false);
+            return Ok(Use::LimitReached);
         }
         *uses
             .entry((*id, request.to_owned(), server.to_owned()))
             .or_default() += 1;
-        Ok(true)
+        Ok(Use::Counted)
     }
 
     fn add_trust_invitation(&self, hash: &[u8; 48], not_after: u64) -> Result<(), DirectoryError> {

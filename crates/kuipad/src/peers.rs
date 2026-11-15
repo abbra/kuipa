@@ -2154,6 +2154,7 @@ mod tests {
         signed.statement().unwrap().head().unwrap()
     }
 
+    use kuipa_enroll::join::ChannelBinding;
     use kuipa_enroll::server::{Directory, DirectoryError};
     #[derive(Default)]
     struct TopologyDirectory {
@@ -2165,7 +2166,7 @@ mod tests {
         fn servers(&self) -> Result<Vec<String>, DirectoryError> {
             Ok(lock(&self.servers).clone())
         }
-        fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+        fn accept_peer(&self, token: &[u8], cb: &ChannelBinding) -> Result<String, DirectoryError> {
             if token != cb {
                 return Err("bad channel binding".into());
             }

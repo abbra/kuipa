@@ -19,7 +19,8 @@ use crate::epoch::{MAX_EPOCH_FETCH, SignedEpoch};
 use crate::error::Error;
 use crate::escrow::{self, BindingHash, EscrowRequest, RegisterParams};
 use crate::join::{
-    AuthType, KerberosBinding, Operation, Request, RequestBody, Response, channel_binding,
+    AuthType, ChannelBinding, KerberosBinding, Operation, Request, RequestBody, Response,
+    channel_binding,
 };
 use crate::keytab::{Enctype, Keytab, Principal};
 use crate::merkle;
@@ -74,6 +75,26 @@ pub struct BrokeredKey {
     pub value: Vec<u8>,
 }
 
+/// How a release request is marked ([`Directory::release_mark`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// One more approval.
+    Approve,
+    /// The request's denial.
+    Deny,
+}
+
+/// What counting one use against a limit found ([`Directory::release_use`],
+/// [`Directory::seal_unlock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Use {
+    /// The use was counted.
+    Counted,
+    /// The uses, summed over all servers, had reached the limit: nothing
+    /// was counted.
+    LimitReached,
+}
+
 /// The directory operations behind the protocol, implemented by the daemon
 /// over LDAPI and GSSAPI (§11.4).
 ///
@@ -108,7 +129,7 @@ pub trait Directory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         enctypes: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let _ = (fqdn, token, cb, enctypes);
@@ -126,7 +147,7 @@ pub trait Directory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         enctypes: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let _ = (fqdn, token, cb, enctypes);
@@ -143,7 +164,7 @@ pub trait Directory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         enctypes: &[Enctype],
         staged: &Staged,
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
@@ -196,7 +217,7 @@ pub trait Directory {
         params: &RegisterParams,
         bindings: &[BindingHash],
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<KerberosBinding, DirectoryError> {
         let _ = (params, bindings, token, cb);
         Err("escrow registration outside a rekey is not supported by this directory".into())
@@ -233,7 +254,7 @@ pub trait Directory {
     fn fetch_key_via_broker(
         &self,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         fetch: &crate::keys::KeysFetch,
     ) -> Result<Option<BrokeredKey>, DirectoryError> {
         let _ = (token, cb, fetch);
@@ -274,7 +295,7 @@ pub trait Directory {
     /// # Errors
     ///
     /// Any refusal; by default seals are not supported.
-    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+    fn accept_user(&self, token: &[u8], cb: &ChannelBinding) -> Result<Accepted, DirectoryError> {
         let _ = (token, cb);
         Err("seals are not supported by this directory".into())
     }
@@ -422,8 +443,8 @@ pub trait Directory {
         Ok(Vec::new())
     }
 
-    /// Add `approval` to request `request` of seal `id`, or with `deny`
-    /// record it as the request's denial.  Values are only ever added, so
+    /// Add `approval` to request `request` of seal `id`, or with
+    /// [`Mark::Deny`] record it as the request's denial.  Values are only ever added, so
     /// replicas merge them.
     ///
     /// # Errors
@@ -434,15 +455,16 @@ pub trait Directory {
         id: &escrow::SealId,
         request: &str,
         approval: &Approval,
-        deny: bool,
+        mark: Mark,
     ) -> Result<(), DirectoryError> {
-        let _ = (id, request, approval, deny);
+        let _ = (id, request, approval, mark);
         Err("approvals are not supported by this directory".into())
     }
 
     /// Count one use of request `request` of seal `id` by `server`, unless
     /// its uses, summed over all servers, have reached `limit`: then count
-    /// nothing and answer `false` (as [`seal_unlock`](Self::seal_unlock)).
+    /// nothing and answer [`Use::LimitReached`] (as
+    /// [`seal_unlock`](Self::seal_unlock)).
     ///
     /// # Errors
     ///
@@ -453,7 +475,7 @@ pub trait Directory {
         request: &str,
         server: &str,
         limit: u64,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         let _ = (id, request, server, limit);
         Err("approvals are not supported by this directory".into())
     }
@@ -550,7 +572,7 @@ pub trait Directory {
 
     /// Count one release of seal `id` by `server` (§7.6.7), unless the
     /// seal's releases, summed over all servers, have reached `limit`:
-    /// then count nothing and answer `false`.
+    /// then count nothing and answer [`Use::LimitReached`].
     ///
     /// # Errors
     ///
@@ -560,10 +582,10 @@ pub trait Directory {
         id: &escrow::SealId,
         server: &str,
         limit: Option<u64>,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         let _ = (id, server);
         match limit {
-            None => Ok(true),
+            None => Ok(Use::Counted),
             Some(_) => Err("unlock limits are not supported by this directory".into()),
         }
     }
@@ -609,7 +631,7 @@ pub trait Directory {
     /// # Errors
     ///
     /// Any failure; by default the exchange is not supported.
-    fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+    fn accept_peer(&self, token: &[u8], cb: &ChannelBinding) -> Result<String, DirectoryError> {
         let _ = (token, cb);
         Err("the anchor exchange is not supported".into())
     }
@@ -1013,7 +1035,7 @@ struct Call<'a> {
     t: &'a [u8],
     body: &'a RequestBody,
     directory: &'a dyn Directory,
-    cb: [u8; 32],
+    cb: ChannelBinding,
 }
 
 impl<'a> Call<'a> {
@@ -1731,7 +1753,7 @@ impl EnrollServer {
         &self,
         request: &Request,
         body: &RequestBody,
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         directory: &dyn Directory,
     ) -> Result<(native_ossl::util::SecretBuf, KerberosBinding), Refusal> {
         let params = StageParams::from_bytes(&body.extra)?;
@@ -1828,7 +1850,7 @@ impl EnrollServer {
             }),
             SealOp::Approve { name, id } => {
                 let (requests, receipts) =
-                    self.mark_request(&caller, &name, &id, false, now, directory)?;
+                    self.mark_request(&caller, &name, &id, Mark::Approve, now, directory)?;
                 Outcome::side(Reply {
                     receipts,
                     requests,
@@ -1837,7 +1859,7 @@ impl EnrollServer {
             }
             SealOp::Deny { name, id } => {
                 let (requests, receipts) =
-                    self.mark_request(&caller, &name, &id, true, now, directory)?;
+                    self.mark_request(&caller, &name, &id, Mark::Deny, now, directory)?;
                 Outcome::side(Reply {
                     receipts,
                     requests,
@@ -2375,7 +2397,7 @@ impl EnrollServer {
         device: &str,
         offline: bool,
         passkey: Option<&str>,
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<StartedSession, Refusal> {
@@ -2420,7 +2442,9 @@ impl EnrollServer {
         }
         let device = registered.thumbprint()?;
         let released = if offline {
-            if !directory.seal_unlock(&seal.id, &self.info.server, seal.policy.max_unlocks)? {
+            if directory.seal_unlock(&seal.id, &self.info.server, seal.policy.max_unlocks)?
+                == Use::LimitReached
+            {
                 return Err(Refusal::because("the seal's unlock limit is reached"));
             }
             let keys = seal
@@ -2603,13 +2627,13 @@ impl EnrollServer {
         Ok(open)
     }
 
-    /// `approve` (or with `deny`, `deny`) request `id` of seal `name`.
+    /// `approve` or `deny` (as `mark` says) request `id` of seal `name`.
     fn mark_request(
         &self,
         caller: &Principal,
         name: &str,
         id: &str,
-        deny: bool,
+        mark: Mark,
         now: u64,
         directory: &dyn Directory,
     ) -> Result<(Vec<ReleaseRequest>, Vec<Receipt>), Refusal> {
@@ -2635,28 +2659,31 @@ impl EnrollServer {
         if request.requester == me {
             return Err(Refusal::because("no one approves their own request"));
         }
-        if !deny && request.approvals.iter().any(|a| a.approver == me) {
+        if mark == Mark::Approve && request.approvals.iter().any(|a| a.approver == me) {
             return Err(Refusal::because("already approved"));
         }
         let approval = Approval {
             approver: me.clone(),
             at: now,
         };
-        let action = if deny {
-            SealAction::Deny
-        } else {
-            SealAction::Approve
+        let action = match mark {
+            Mark::Approve => SealAction::Approve,
+            Mark::Deny => SealAction::Deny,
         };
         let digest = self.log_digest(&[request.id.as_bytes(), b" ", me.as_bytes()])?;
         receipts.extend(self.record_seal(&seal.id, action, None, digest)?);
-        directory.release_mark(&seal.id, &request.id, &approval, deny)?;
+        directory.release_mark(&seal.id, &request.id, &approval, mark)?;
         eprintln!(
             "kuipad: {caller} {} release {} of seal {}",
-            if deny { "denied" } else { "approved" },
+            if mark == Mark::Deny {
+                "denied"
+            } else {
+                "approved"
+            },
             request.id,
             seal.id
         );
-        if deny {
+        if mark == Mark::Deny {
             request.denied = Some(approval);
         } else {
             request.approvals.push(approval);
@@ -3058,7 +3085,9 @@ impl EnrollServer {
                 approvals.m
             )));
         }
-        if !directory.release_use(&seal.id, &release.id, &self.info.server, approvals.uses())? {
+        if directory.release_use(&seal.id, &release.id, &self.info.server, approvals.uses())?
+            == Use::LimitReached
+        {
             return Err(Refusal::because("the release request is used up"));
         }
         Ok(())
@@ -3660,7 +3689,9 @@ impl EnrollServer {
             ));
         }
         self.check_release(&seal, request, &who, &binding, now, directory)?;
-        if !directory.seal_unlock(request.seal(), &self.info.server, seal.policy.max_unlocks)? {
+        if directory.seal_unlock(request.seal(), &self.info.server, seal.policy.max_unlocks)?
+            == Use::LimitReached
+        {
             return Err(Refusal::because("the seal's unlock limit is reached"));
         }
         self.record_release(request, device, &opened)?;

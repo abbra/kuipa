@@ -11,7 +11,7 @@ use kuipa_enroll::bundle::{Bundle, Mode, Opener, StageParams};
 use kuipa_enroll::delegation::{Claim, Delegation, SignedVouch, VOUCH_VALIDITY};
 use kuipa_enroll::escrow::{EscrowRequest, Kind, RegisterParams, SealId, Sealed, Sealer};
 use kuipa_enroll::join::{
-    AuthType, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
+    AuthType, ChannelBinding, KerberosBinding, Operation, PendingJoin, Prepared, Request, Response,
 };
 use kuipa_enroll::keytab::{Enctype, Keytab, KeytabEntry, Principal};
 use kuipa_enroll::merkle::TreeHash;
@@ -23,7 +23,7 @@ use kuipa_enroll::seal::{
     TicketDelegation, Unlock, VerifiedDescriptor,
 };
 use kuipa_enroll::server::{
-    Accepted, Appended, Directory, DirectoryError, Ledger, Staged, parse_stage_result,
+    Accepted, Appended, Directory, DirectoryError, Ledger, Mark, Staged, Use, parse_stage_result,
 };
 use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, SealAction, SealEvent, SignedHead};
 use kuipa_enroll::{EnrollServer, Error};
@@ -89,7 +89,7 @@ struct MemoryDirectory {
 }
 
 impl MemoryDirectory {
-    fn accept(token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+    fn accept(token: &[u8], cb: &ChannelBinding) -> Result<String, DirectoryError> {
         let (name, rest) = token.split_at(token.iter().position(|&b| b == 0).ok_or("bad token")?);
         if &rest[1..] != cb {
             return Err("channel binding mismatch".into());
@@ -97,7 +97,7 @@ impl MemoryDirectory {
         Ok(String::from_utf8(name.to_vec())?)
     }
 
-    fn binding(&self, who: &str, cb: &[u8; 32]) -> KerberosBinding {
+    fn binding(&self, who: &str, cb: &ChannelBinding) -> KerberosBinding {
         fake_binding(if self.impostor.get() { "impostor" } else { who }, cb)
     }
 
@@ -140,7 +140,7 @@ impl Directory for MemoryDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         _: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let who = Self::accept(token, cb)?;
@@ -154,7 +154,7 @@ impl Directory for MemoryDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         _: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let who = Self::accept(token, cb)?;
@@ -169,7 +169,7 @@ impl Directory for MemoryDirectory {
         &self,
         fqdn: &str,
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
         _: &[Enctype],
         staged: &Staged,
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
@@ -212,7 +212,7 @@ impl Directory for MemoryDirectory {
         params: &RegisterParams,
         bindings: &[kuipa_enroll::escrow::BindingHash],
         token: &[u8],
-        cb: &[u8; 32],
+        cb: &ChannelBinding,
     ) -> Result<KerberosBinding, DirectoryError> {
         let who = Self::accept(token, cb)?;
         if who != params.principal.to_string() {
@@ -236,7 +236,7 @@ impl Directory for MemoryDirectory {
 
     /// A token's name may end in ` via svc1,svc2`: the services a
     /// delegated ticket passed through.
-    fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
+    fn accept_user(&self, token: &[u8], cb: &ChannelBinding) -> Result<Accepted, DirectoryError> {
         let who = Self::accept(token, cb)?;
         let (principal, transited) = match who.split_once(" via ") {
             Some((p, via)) => (p.to_owned(), via.split(',').map(str::to_owned).collect()),
@@ -443,13 +443,13 @@ impl Directory for MemoryDirectory {
         id: &SealId,
         request: &str,
         approval: &seal::Approval,
-        deny: bool,
+        mark: Mark,
     ) -> Result<(), DirectoryError> {
         let mut releases = self.releases.borrow_mut();
         let r = releases
             .get_mut(&(*id, request.to_owned()))
             .ok_or("no such request")?;
-        if deny {
+        if mark == Mark::Deny {
             r.denied = Some(approval.clone());
         } else {
             r.approvals.push(approval.clone());
@@ -463,7 +463,7 @@ impl Directory for MemoryDirectory {
         request: &str,
         server: &str,
         limit: u64,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         let mut uses = self.release_uses.borrow_mut();
         let total: u64 = uses
             .iter()
@@ -471,12 +471,12 @@ impl Directory for MemoryDirectory {
             .map(|(_, n)| n)
             .sum();
         if total >= limit {
-            return Ok(false);
+            return Ok(Use::LimitReached);
         }
         *uses
             .entry((*id, request.to_owned(), server.to_owned()))
             .or_default() += 1;
-        Ok(true)
+        Ok(Use::Counted)
     }
 
     fn seal_limits(&self) -> Result<seal::Limits, DirectoryError> {
@@ -528,7 +528,7 @@ impl Directory for MemoryDirectory {
         id: &SealId,
         server: &str,
         limit: Option<u64>,
-    ) -> Result<bool, DirectoryError> {
+    ) -> Result<Use, DirectoryError> {
         let total: u64 = self
             .unlocks
             .borrow()
@@ -537,14 +537,14 @@ impl Directory for MemoryDirectory {
             .map(|(_, n)| n)
             .sum();
         if limit.is_some_and(|l| total >= l) {
-            return Ok(false);
+            return Ok(Use::LimitReached);
         }
         *self
             .unlocks
             .borrow_mut()
             .entry((*id, server.to_owned()))
             .or_default() += 1;
-        Ok(true)
+        Ok(Use::Counted)
     }
 
     fn ca_certificates(&self) -> Result<Vec<Vec<u8>>, DirectoryError> {
@@ -2155,11 +2155,7 @@ fn seal_events_are_logged_with_receipts() {
         };
         receipt.verify(&log_key, &Policy::default()).unwrap();
         assert_eq!(receipt.index, index);
-        assert!(
-            receipt
-                .proven_by(&head, &log.inclusion(index).unwrap())
-                .unwrap()
-        );
+        assert!(receipt.proven_by(&head, &log.inclusion(index).unwrap()));
     }
     let v = added.descriptors[0]
         .verify(REALM, &anchors, &Policy::default())

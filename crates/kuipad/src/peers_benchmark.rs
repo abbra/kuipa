@@ -1,6 +1,7 @@
 //! Opt-in loopback measurement of the bounded-concurrency repair scheduler.
 
 use super::*;
+use kuipa_enroll::join::ChannelBinding;
 use kuipa_enroll::realm::{RealmInfo, ServerKeys};
 use kuipa_enroll::server::{Directory, DirectoryError};
 use std::pin::Pin;
@@ -11,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 struct DirectoryStub;
 impl Directory for DirectoryStub {
-    fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
+    fn accept_peer(&self, token: &[u8], cb: &ChannelBinding) -> Result<String, DirectoryError> {
         if token.len() < 32 || &token[..32] != cb {
             return Err("bad channel binding".into());
         }
