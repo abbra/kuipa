@@ -30,7 +30,7 @@ use kuipa_enroll::delegation::{
 };
 use kuipa_enroll::epoch::{self, AnchorEpoch, SignedEpoch};
 use kuipa_enroll::merkle::TreeHash;
-use kuipa_enroll::server::Directory;
+use kuipa_enroll::server::SharedDirectory;
 use kuipa_enroll::spend::{MAX_SPEND_BYTES, SpendError, SpendOp, SpendRequest, VoucherSpender};
 use tang_pqc::{Policy, SigningKey, Thumbprint, now};
 use tokio::sync::{Notify, RwLock};
@@ -470,7 +470,7 @@ pub(crate) struct Exchange {
     anchor: Option<SigningKey>,
     policy: Policy,
     server: Arc<EnrollServer>,
-    directory: Arc<dyn Directory + Send + Sync>,
+    directory: SharedDirectory,
     initiator: Arc<dyn Initiator>,
     store: KeyStore,
     state: Arc<RwLock<AnchorState>>,
@@ -590,7 +590,7 @@ impl Peers {
         settings: Settings,
         anchor: Option<SigningKey>,
         server: Arc<EnrollServer>,
-        directory: Arc<dyn Directory + Send + Sync>,
+        directory: SharedDirectory,
         initiator: Arc<dyn Initiator>,
         store: KeyStore,
     ) -> Result<Arc<Self>, Error> {
@@ -1256,7 +1256,7 @@ impl Exchange {
         settings: Settings,
         anchor: Option<SigningKey>,
         server: Arc<EnrollServer>,
-        directory: Arc<dyn Directory + Send + Sync>,
+        directory: SharedDirectory,
         initiator: Arc<dyn Initiator>,
         store: KeyStore,
         client: reqwest::Client,
@@ -2154,7 +2154,7 @@ mod tests {
         signed.statement().unwrap().head().unwrap()
     }
 
-    use kuipa_enroll::server::DirectoryError;
+    use kuipa_enroll::server::{Directory, DirectoryError};
     #[derive(Default)]
     struct TopologyDirectory {
         servers: Mutex<Vec<String>>,

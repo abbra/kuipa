@@ -42,7 +42,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use kuipa_enroll::EnrollServer;
-use kuipa_enroll::server::Directory as _;
+use kuipa_enroll::server::{Directory as _, SharedDirectory};
 use kuipad::config::{self, Config};
 use kuipad::directory::LdapDirectory;
 use kuipad::http::{App, router};
@@ -194,7 +194,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     if let Some(keys) = &keys_service {
         ldap.serve_keys(keys.clone());
     }
-    let directory = Arc::new(ldap);
+    let directory: SharedDirectory = Arc::new(ldap);
     let servers = directory.servers().unwrap_or_else(|e| {
         tracing::warn!("cannot list servers ({e}); advertising only this one");
         vec![cfg.server.clone()]
@@ -235,24 +235,18 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     )?;
     server.set_voucher_spender(peers.voucher_spender());
     tokio::spawn(peers.clone().run());
-    spawn_maintenance(
-        &cfg,
-        &server,
-        &(directory.clone() as Arc<dyn kuipa_enroll::Directory + Send + Sync>),
-    )?;
+    spawn_maintenance(&cfg, &server, &directory)?;
     let tang = TangKeys::new(&cfg.key_dir).server()?.map(Arc::new);
     if tang.is_some() {
         tracing::info!("serving post-quantum Tang at /ipa/ku/tang");
     }
-    let app = router(Arc::new(App {
-        server,
-        directory,
-        peers: Some(peers),
-        limiter: kuipad::limit::Limiter::new(cfg.rate_limit),
-        tang,
-        keys: keys_service,
-        ledger: Some(ledger),
-    }));
+    let app = App::new(server, directory)
+        .with_tang(tang)
+        .with_keys(keys_service)
+        .with_limiter(kuipad::limit::Limiter::new(cfg.rate_limit))
+        .with_peers(peers)
+        .with_ledger(ledger);
+    let app = router(Arc::new(app));
 
     listen(app, &cfg.listen).await
 }
@@ -266,7 +260,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
 fn spawn_maintenance(
     cfg: &Config,
     server: &Arc<EnrollServer>,
-    directory: &Arc<dyn kuipa_enroll::Directory + Send + Sync>,
+    directory: &SharedDirectory,
 ) -> Result<(), Error> {
     let (server, trusts) = (server.clone(), directory.clone());
     let configured = cfg.trusted_realms()?;
@@ -285,7 +279,7 @@ fn spawn_maintenance(
 /// Remove leased hosts (DESIGN-ci.md §1) an hour after their lease, which
 /// lets a job that is still running finish logging; the KDC stopped
 /// issuing them tickets when it ended.  Every five minutes, forever.
-async fn purge_ended_leases(directory: Arc<dyn kuipa_enroll::Directory + Send + Sync>) {
+async fn purge_ended_leases(directory: SharedDirectory) {
     loop {
         let directory = directory.clone();
         let purged = tokio::task::spawn_blocking(move || {

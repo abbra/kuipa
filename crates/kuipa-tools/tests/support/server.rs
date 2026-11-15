@@ -7,7 +7,6 @@ use std::sync::Arc;
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::realm::{RealmInfo, ServerKeys};
-use kuipa_enroll::server::Directory;
 use kuipad::http::{App, router};
 use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, VerifyingKey, now};
 
@@ -45,24 +44,8 @@ pub(crate) fn enroll_server(
     (anchor, Arc::new(EnrollServer::new(keys, info, delegation)))
 }
 
-/// The bare enroll server behind an app with no peers, Tang, keys or ledger.
-pub(crate) fn app<D>(server: Arc<EnrollServer>, directory: D) -> App<D> {
-    App {
-        server,
-        directory,
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        keys: None,
-        ledger: None,
-    }
-}
-
 /// Serve `app` on `listener` in a background runtime.
-pub(crate) fn serve<D: Directory + Send + Sync + 'static>(
-    listener: std::net::TcpListener,
-    app: Arc<App<D>>,
-) {
+pub(crate) fn serve(listener: std::net::TcpListener, app: Arc<App>) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
@@ -74,7 +57,7 @@ pub(crate) fn serve<D: Directory + Send + Sync + 'static>(
 }
 
 /// Serve `app` on a free local port; its URL.
-pub(crate) fn spawn<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> String {
+pub(crate) fn spawn(app: Arc<App>) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     serve(listener, app);

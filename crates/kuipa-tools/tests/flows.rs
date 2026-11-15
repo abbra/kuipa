@@ -209,15 +209,15 @@ fn server_keys(anchor: &SigningKey, fqdn: &str) -> (ServerKeys, RealmInfo, Deleg
 
 /// Serve `app` as server `name` for this test's thread: the client dials
 /// `name`, as it would in a real deployment, and reaches the test server.
-fn serve_as(name: &str, app: Arc<App<Dir>>) -> String {
+fn serve_as(name: &str, app: Arc<App>) -> String {
     let url = server::spawn(app);
     kuipa_tools::net::set_thread_endpoint(name, &url);
     name.to_owned()
 }
 
 /// The bare enroll server behind an otherwise-empty app.
-fn app(server: Arc<EnrollServer>, directory: Dir) -> Arc<App<Dir>> {
-    Arc::new(server::app(server, directory))
+fn app(server: Arc<EnrollServer>, directory: impl Into<Arc<Dir>>) -> Arc<App> {
+    Arc::new(App::new(server, directory.into()))
 }
 
 /// Make server `name` unreachable for this test's thread (nothing listens
@@ -807,16 +807,19 @@ fn guessing_is_rate_limited_per_host() {
         .insert(HOST.into(), b"Secret123".to_vec());
     let url = serve_as(
         "ipa1.example.test",
-        Arc::new(App {
-            limiter: Limiter::new(Limits {
+        Arc::new(
+            App::new(
+                Arc::new(EnrollServer::new(keys, info, delegation)),
+                Arc::new(dir),
+            )
+            .with_limiter(Limiter::new(Limits {
                 per_host: Rate {
                     burst: 1.0,
                     per_minute: 0.01,
                 },
                 ..Limits::default()
-            }),
-            ..server::app(Arc::new(EnrollServer::new(keys, info, delegation)), dir)
-        }),
+            })),
+        ),
     );
     let guess = |otp: &[u8]| {
         let mut s = string(&anchor, otp);
@@ -1459,9 +1462,8 @@ fn offline_enrollment_from_a_bundle() {
 /// pre-provisioned instead of an enrollment string.  Password and Kerberos
 /// OTP joins need a KDC: `tests/kdc.rs`.
 /// Stage the OTP at the directory and name it as an LDAP-OTP authentication.
-fn ldap_otp_auth(app: &App<Dir>) -> Auth {
-    app.directory
-        .otps
+fn ldap_otp_auth(ldap: &Dir) -> Auth {
+    ldap.otps
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
@@ -1470,7 +1472,7 @@ fn ldap_otp_auth(app: &App<Dir>) -> Auth {
 
 /// Without an enrollment string, the realm's anchor pre-provisioned is enough
 /// for both steps, and a second unrelated anchor changes what the host requires.
-fn ldap_bootstrap_checks(anchor: &SigningKey, paths: &TempRoot, url: String, app: &App<Dir>) {
+fn ldap_bootstrap_checks(anchor: &SigningKey, paths: &TempRoot, url: String, ldap: &Dir) {
     let dir = paths.dir.join("krb5");
     // No enrollment string: the realm's anchor pre-provisioned in
     // /etc/ipa/ku-anchors (an image) is enough for both steps.
@@ -1493,7 +1495,7 @@ fn ldap_bootstrap_checks(anchor: &SigningKey, paths: &TempRoot, url: String, app
         &[],
         flows::Host {
             fqdn: HOST,
-            auth: &ldap_otp_auth(app),
+            auth: &ldap_otp_auth(ldap),
         },
         &Deployment::servers(std::slice::from_ref(&url)),
     )
@@ -1512,7 +1514,7 @@ fn ldap_bootstrap_checks(anchor: &SigningKey, paths: &TempRoot, url: String, app
         &[],
         flows::Host {
             fqdn: HOST,
-            auth: &ldap_otp_auth(app),
+            auth: &ldap_otp_auth(ldap),
         },
         &Deployment::servers(std::slice::from_ref(&url)),
     )
@@ -1527,7 +1529,7 @@ fn ldap_bootstrap_checks(anchor: &SigningKey, paths: &TempRoot, url: String, app
         &[],
         flows::Host {
             fqdn: HOST,
-            auth: &ldap_otp_auth(app),
+            auth: &ldap_otp_auth(ldap),
         },
         &Deployment::servers(&[url]),
     )
@@ -1542,11 +1544,14 @@ fn ldap_bootstrap_checks(anchor: &SigningKey, paths: &TempRoot, url: String, app
 fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
-    let app = app(
-        Arc::new(EnrollServer::new(keys, info, delegation)),
-        Dir::default(),
+    let ldap = Arc::new(Dir::default());
+    let url = serve_as(
+        "ipa1.example.test",
+        app(
+            Arc::new(EnrollServer::new(keys, info, delegation)),
+            ldap.clone(),
+        ),
     );
-    let url = serve_as("ipa1.example.test", app.clone());
     let s = EnrollmentString::new(
         REALM,
         *anchor.public().thumbprint(),
@@ -1605,7 +1610,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
             &[],
             flows::Host {
                 fqdn: HOST,
-                auth: &ldap_otp_auth(&app),
+                auth: &ldap_otp_auth(&ldap),
             },
             &Deployment::servers(std::slice::from_ref(&url)),
         )
@@ -1624,7 +1629,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     flows::leave(&paths).unwrap();
     assert!(!paths.krb5_conf().exists());
 
-    ldap_bootstrap_checks(&anchor, &paths, url, &app);
+    ldap_bootstrap_checks(&anchor, &paths, url, &ldap);
 }
 
 /// A host that knows two of a realm's anchors requires the claim to be
@@ -1652,13 +1657,15 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
     )
     .unwrap();
     delegation.add(vouch.proof(&claim, other.public()).unwrap());
-    let ipa1_app = app(
-        Arc::new(EnrollServer::new(keys, info, delegation)),
-        Dir::default(),
+    let ipa1_dir = Arc::new(Dir::default());
+    let ipa1 = serve_as(
+        "ipa1.example.test",
+        app(
+            Arc::new(EnrollServer::new(keys, info, delegation)),
+            ipa1_dir.clone(),
+        ),
     );
-    let ipa1 = serve_as("ipa1.example.test", ipa1_app.clone());
-    ipa1_app
-        .directory
+    ipa1_dir
         .otps
         .lock()
         .unwrap()
@@ -1668,11 +1675,14 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
     // its own; only that one anchor vouches for it.
     let (keys, mut info, delegation) = server_keys(&anchor, "thief.example.test");
     info.servers.push("thief.example.test".into());
-    let thief_app = app(
-        Arc::new(EnrollServer::new(keys, info, delegation)),
-        Dir::default(),
+    let thief_dir = Arc::new(Dir::default());
+    let thief = serve_as(
+        "thief.example.test",
+        app(
+            Arc::new(EnrollServer::new(keys, info, delegation)),
+            thief_dir.clone(),
+        ),
     );
-    let thief = serve_as("thief.example.test", thief_app.clone());
 
     // Two anchors pinned: the thief is skipped before any secret leaves
     // the host, and the real server serves the join.
@@ -1723,8 +1733,7 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
 
     // One anchor pinned: the thief passes for the realm and serves the
     // join — the residual §4.4 documents.
-    thief_app
-        .directory
+    thief_dir
         .otps
         .lock()
         .unwrap()
@@ -1753,13 +1762,13 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
 fn serve_tang(keys: &kuipad::tang::TangKeys) -> String {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (server_keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
-    server::spawn(Arc::new(App {
-        tang: keys.server().unwrap().map(Arc::new),
-        ..server::app(
+    server::spawn(Arc::new(
+        App::new(
             Arc::new(EnrollServer::new(server_keys, info, delegation)),
-            Dir::default(),
+            Arc::new(Dir::default()),
         )
-    }))
+        .with_tang(keys.server().unwrap().map(Arc::new)),
+    ))
 }
 
 /// The signed advertisement at `path` under Tang's `url`.
@@ -4007,10 +4016,9 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
             .with_head_interval(std::time::Duration::ZERO),
     );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
-    let url = server::spawn(Arc::new(App {
-        ledger: Some(ledger.clone()),
-        ..server::app(server, Dir::default())
-    }));
+    let url = server::spawn(Arc::new(
+        App::new(server, Arc::new(Dir::default())).with_ledger(ledger.clone()),
+    ));
     let _ = rustls_native_ossl::default_provider().install_default();
     let http = reqwest::blocking::Client::new();
     let base = format!("{url}/ipa/ku/tlog/{}", ledger.id());
@@ -4103,10 +4111,9 @@ fn tlog_server(
             .with_witnesses(witnesses.iter().map(|w| w.public().clone()).collect()),
     );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
-    let url = server::spawn(Arc::new(App {
-        ledger: Some(ledger.clone()),
-        ..server::app(server, Dir::default())
-    }));
+    let url = server::spawn(Arc::new(
+        App::new(server, Arc::new(Dir::default())).with_ledger(ledger.clone()),
+    ));
     kuipa_tools::net::set_thread_endpoint(fqdn, &url);
     ledger
 }
@@ -4324,10 +4331,10 @@ fn a_kept_advertisement_is_fetched_conditionally() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let fqdn = "cached1.example.test";
     let (keys, info, delegation) = server_keys(&anchor, fqdn);
-    let app = Arc::new(server::app(
+    let app = app(
         Arc::new(EnrollServer::new(keys, info, delegation)),
         Dir::default(),
-    ));
+    );
     // What the server saw: each advertisement request's If-None-Match, and
     // the status it answered.
     let seen: Seen = Arc::default();

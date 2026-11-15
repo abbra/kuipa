@@ -42,7 +42,6 @@ use kuipad::keystore::KeyStore;
 use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
-use support::server;
 use tang_pqc::{
     ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, Thumbprint, VerifyingKey, now,
 };
@@ -88,7 +87,7 @@ impl Preauth for Scripted {
 }
 
 /// Serve the daemon's router on `listener`, and run its anchor exchange.
-fn spawn(listener: std::net::TcpListener, app: Arc<App<Arc<KdcDirectory>>>) {
+fn spawn(listener: std::net::TcpListener, app: Arc<App>) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
@@ -361,24 +360,24 @@ fn start_ipa_server(
     .unwrap();
     spawn(
         listener,
-        Arc::new(App {
-            peers: Some(peers),
-            // Generous: a refusal in this test is the policy's, never
-            // the rate limit's.
-            limiter: kuipad::limit::Limiter::new(kuipad::limit::Limits {
-                per_host: kuipad::limit::Rate {
-                    burst: 1000.0,
-                    per_minute: 1000.0,
-                },
-                // Every request comes from 127.0.0.1.
-                per_source: kuipad::limit::Rate {
-                    burst: 1000.0,
-                    per_minute: 1000.0,
-                },
-            }),
-            ledger: Some(ledger),
-            ..server::app(server.clone(), directory.clone())
-        }),
+        Arc::new(
+            App::new(server.clone(), directory.clone())
+                .with_peers(peers)
+                // Generous: a refusal in this test is the policy's, never
+                // the rate limit's.
+                .with_limiter(kuipad::limit::Limiter::new(kuipad::limit::Limits {
+                    per_host: kuipad::limit::Rate {
+                        burst: 1000.0,
+                        per_minute: 1000.0,
+                    },
+                    // Every request comes from 127.0.0.1.
+                    per_source: kuipad::limit::Rate {
+                        burst: 1000.0,
+                        per_minute: 1000.0,
+                    },
+                }))
+                .with_ledger(ledger),
+        ),
     );
     (server, own_anchor)
 }

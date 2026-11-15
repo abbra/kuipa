@@ -19,7 +19,7 @@ use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::escrow::EscrowRequest;
 use kuipa_enroll::join::{AuthType, Operation, Request};
-use kuipa_enroll::server::{Directory, Ledger};
+use kuipa_enroll::server::{Ledger, SharedDirectory};
 use kuipa_enroll::trust::TrustRequest;
 use serde_json::json;
 use tang_pqc::{Thumbprint, b64};
@@ -45,11 +45,11 @@ const MAX_WANTED_ANCHORS: usize = 16;
 const MAX_NAME: usize = 256;
 
 /// Shared state.
-pub struct App<D> {
+pub struct App {
     /// The protocol server.
     pub server: Arc<EnrollServer>,
     /// The directory.
-    pub directory: D,
+    pub directory: SharedDirectory,
     /// The anchor exchange, if this server takes part in one.
     pub peers: Option<Arc<Peers>>,
     /// Rate limits.
@@ -62,8 +62,60 @@ pub struct App<D> {
     pub ledger: Option<Arc<crate::ledger::FileLedger>>,
 }
 
+impl App {
+    /// The protocol server over `directory`, with default rate limits and
+    /// no peers, Tang, keys or ledger.
+    #[must_use]
+    pub fn new(server: Arc<EnrollServer>, directory: SharedDirectory) -> Self {
+        Self {
+            server,
+            directory,
+            peers: None,
+            limiter: Limiter::default(),
+            tang: None,
+            keys: None,
+            ledger: None,
+        }
+    }
+
+    /// Take part in the anchor exchange through `peers`.
+    #[must_use]
+    pub fn with_peers(mut self, peers: Arc<Peers>) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    /// Apply `limiter` to requests.
+    #[must_use]
+    pub fn with_limiter(mut self, limiter: Limiter) -> Self {
+        self.limiter = limiter;
+        self
+    }
+
+    /// Serve post-quantum Tang, if `tang` has keys.
+    #[must_use]
+    pub fn with_tang(mut self, tang: Option<Arc<Tang>>) -> Self {
+        self.tang = tang;
+        self
+    }
+
+    /// Serve the `keys` operation, if `keys` is enabled.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Option<Arc<crate::keys::Keys>>) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// Keep and serve the transparency log `ledger`.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Arc<crate::ledger::FileLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+}
+
 /// Admit a request for `host`, or the status (`429`) to answer.
-fn admit<D>(app: &App<D>, what: &str, host: &str, headers: &HeaderMap) -> Result<(), StatusCode> {
+fn admit(app: &App, what: &str, host: &str, headers: &HeaderMap) -> Result<(), StatusCode> {
     admit_for(app, what, Some(host), headers)
 }
 
@@ -81,8 +133,8 @@ fn plausible_name(name: &str) -> bool {
 /// operations that are only ever Kerberos-authenticated (registration,
 /// seal operations), where there is nothing to guess, and whose many
 /// users on one host must not share that host's allowance.
-fn admit_for<D>(
-    app: &App<D>,
+fn admit_for(
+    app: &App,
     what: &str,
     host: Option<&str>,
     headers: &HeaderMap,
@@ -105,31 +157,31 @@ fn admit_for<D>(
 }
 
 /// The router.
-pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router {
+pub fn router(app: Arc<App>) -> Router {
     let mut router = Router::new()
-        .route("/ipa/ku/adv", get(advertisement::<D>))
-        .route("/ipa/ku/rec/{kid}", post(recover::<D>))
-        .route("/ipa/ku/peer/sync", post(peer_sync::<D>))
-        .route("/ipa/ku/peer/spend", post(peer_spend::<D>))
-        .route("/ipa/ku/anchor-log", get(anchor_log::<D>))
-        .route("/ipa/ku/claim-log/{anchor}", get(claim_log::<D>))
-        .route("/ipa/ku/tlog/{id}/head", get(log_head::<D>))
-        .route("/ipa/ku/tlog/{id}/cosign", post(log_cosign::<D>))
-        .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves::<D>))
-        .route("/ipa/ku/tlog/{id}/proof", get(log_proof::<D>))
-        .route("/ipa/ku/tlog/{id}/consistency", get(log_consistency::<D>))
-        .route("/ipa/ku/trust/{kid}", post(establish_trust::<D>))
-        .route("/ipa/ku/tang/adv", get(tang_advertisement::<D>))
-        .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for::<D>))
-        .route("/ipa/ku/tang/key/{kid}", get(tang_exchange_key::<D>))
-        .route("/ipa/ku/tang/rec/{kid}", post(tang_recover::<D>));
+        .route("/ipa/ku/adv", get(advertisement))
+        .route("/ipa/ku/rec/{kid}", post(recover))
+        .route("/ipa/ku/peer/sync", post(peer_sync))
+        .route("/ipa/ku/peer/spend", post(peer_spend))
+        .route("/ipa/ku/anchor-log", get(anchor_log))
+        .route("/ipa/ku/claim-log/{anchor}", get(claim_log))
+        .route("/ipa/ku/tlog/{id}/head", get(log_head))
+        .route("/ipa/ku/tlog/{id}/cosign", post(log_cosign))
+        .route("/ipa/ku/tlog/{id}/leaves", get(log_leaves))
+        .route("/ipa/ku/tlog/{id}/proof", get(log_proof))
+        .route("/ipa/ku/tlog/{id}/consistency", get(log_consistency))
+        .route("/ipa/ku/trust/{kid}", post(establish_trust))
+        .route("/ipa/ku/tang/adv", get(tang_advertisement))
+        .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for))
+        .route("/ipa/ku/tang/key/{kid}", get(tang_exchange_key))
+        .route("/ipa/ku/tang/rec/{kid}", post(tang_recover));
     // Only a host-keyed OTP is limited per host (inside `exchange`);
     // Kerberos-only operations use the source's bucket alone.
     for op in Operation::ALL {
         router = router.route(
             &format!("/ipa/ku/{}/{{id}}", op.path()),
             post(
-                move |State(app): State<Arc<App<D>>>,
+                move |State(app): State<Arc<App>>,
                       Path(kid): Path<String>,
                       headers: HeaderMap,
                       body: Bytes| async move {
@@ -198,8 +250,8 @@ fn wanted_heads(query: Option<&str>) -> Vec<HeadPin> {
         .collect()
 }
 
-async fn advertisement<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn advertisement(
+    State(app): State<Arc<App>>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -246,8 +298,8 @@ async fn advertisement<D: Directory + Send + Sync + 'static>(
 /// A fetched piece of the anchor epoch log (§4.8): `?from=<seq>`, the
 /// entries after that sequence number, oldest first.  Public, like the
 /// advertisement.
-async fn anchor_log<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn anchor_log(
+    State(app): State<Arc<App>>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -271,8 +323,8 @@ async fn anchor_log<D: Directory + Send + Sync + 'static>(
 /// index, oldest first, with the head they lead to.  Public, like the
 /// anchor log: leaves are content-addressed claims, verifiable against
 /// any head that follows them.
-async fn claim_log<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn claim_log(
+    State(app): State<Arc<App>>,
     Path(anchor): Path<String>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
@@ -306,7 +358,7 @@ fn numbers<const N: usize>(query: Option<&str>, names: [&str; N]) -> Option<[u64
 }
 
 /// This server's log, if `id` names it.
-fn ledger_for<'a, D>(app: &'a App<D>, id: &str) -> Option<&'a crate::ledger::FileLedger> {
+fn ledger_for<'a>(app: &'a App, id: &str) -> Option<&'a crate::ledger::FileLedger> {
     let ledger = app.ledger.as_deref()?;
     (id.parse::<kuipa_enroll::tlog::LogId>().ok()? == ledger.id()).then_some(ledger)
 }
@@ -318,10 +370,7 @@ fn hashes_json(what: &str, hashes: &[kuipa_enroll::merkle::Hash]) -> Response {
 
 /// The log's current signed head (`IPLS`, DESIGN-tlog.md §3).  Public:
 /// heads and leaves are what monitors and witnesses check.
-async fn log_head<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(id): Path<String>,
-) -> Response {
+async fn log_head(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     let Some(ledger) = ledger_for(&app, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -340,8 +389,8 @@ async fn log_head<D: Directory + Send + Sync + 'static>(
 /// cosignature, DESIGN-tlog.md §4): JSON `{cosignatures}` (the trusted
 /// ones the served head now carries) when one was added, `409` for a head no longer served (fetch it again), `403` for
 /// no trusted cosignature.  Rate limited by source like seal operations.
-async fn log_cosign<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn log_cosign(
+    State(app): State<Arc<App>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -376,8 +425,8 @@ async fn log_cosign<D: Directory + Send + Sync + 'static>(
 
 /// `?from=<index>`: up to [`MAX_LOG_PAGE`] leaves (`IPLF`, base64url),
 /// oldest first.  Leaves name no subject, only its index.
-async fn log_leaves<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn log_leaves(
+    State(app): State<Arc<App>>,
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
@@ -395,8 +444,8 @@ async fn log_leaves<D: Directory + Send + Sync + 'static>(
 
 /// `?index=<i>&size=<n>`: the inclusion path of leaf `i` in the tree of
 /// `n` leaves — the size of a head the client holds.
-async fn log_proof<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn log_proof(
+    State(app): State<Arc<App>>,
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
@@ -414,8 +463,8 @@ async fn log_proof<D: Directory + Send + Sync + 'static>(
 
 /// `?from=<m>&size=<n>`: the proof that the tree of `m` leaves is a
 /// prefix of the tree of `n`.
-async fn log_consistency<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn log_consistency(
+    State(app): State<Arc<App>>,
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
@@ -439,9 +488,7 @@ fn jose(adv: &tang_pqc::SignedAdvertisement) -> Response {
         .into_response()
 }
 
-async fn tang_advertisement<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-) -> Response {
+async fn tang_advertisement(State(app): State<Arc<App>>) -> Response {
     let Some(tang) = &app.tang else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -454,10 +501,7 @@ async fn tang_advertisement<D: Directory + Send + Sync + 'static>(
     }
 }
 
-async fn tang_advertisement_for<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(thp): Path<String>,
-) -> Response {
+async fn tang_advertisement_for(State(app): State<Arc<App>>, Path(thp): Path<String>) -> Response {
     let (Some(tang), Ok(thp)) = (&app.tang, thp.parse::<Thumbprint>()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -473,10 +517,7 @@ async fn tang_advertisement_for<D: Directory + Send + Sync + 'static>(
 
 /// The public exchange key `kid`, advertised or retired, as a JWK; `404`
 /// for a key this server does not have.
-async fn tang_exchange_key<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    Path(kid): Path<String>,
-) -> Response {
+async fn tang_exchange_key(State(app): State<Arc<App>>, Path(kid): Path<String>) -> Response {
     let (Some(tang), Ok(kid)) = (&app.tang, kid.parse::<Thumbprint>()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -493,8 +534,8 @@ async fn tang_exchange_key<D: Directory + Send + Sync + 'static>(
 /// Tang's answers: `404` for a key this server does not have, `400` for a
 /// request that does not parse, match or open under it, `429` when rate
 /// limited.
-async fn tang_recover<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn tang_recover(
+    State(app): State<Arc<App>>,
     Path(kid): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -525,8 +566,8 @@ async fn tang_recover<D: Directory + Send + Sync + 'static>(
 }
 
 /// Decode, check the path `kid`, and run the (blocking) handler.
-async fn exchange<D: Directory + Send + Sync + 'static>(
-    app: Arc<App<D>>,
+async fn exchange(
+    app: Arc<App>,
     op: Operation,
     kid: String,
     headers: &HeaderMap,
@@ -557,7 +598,7 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     let limiter_app = app.clone();
     let result = tokio::task::spawn_blocking(move || {
         app.server
-            .handle(&request, &app.directory)
+            .handle(&request, &*app.directory)
             .map(|r| r.to_bytes())
             .map_err(|e| (e.is_unavailable(), e.to_string()))
     })
@@ -582,8 +623,8 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     }
 }
 
-async fn recover<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn recover(
+    State(app): State<Arc<App>>,
     Path(kid): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -612,7 +653,7 @@ async fn recover<D: Directory + Send + Sync + 'static>(
             ok
         };
         app.server
-            .recover_admitted(&request, &app.directory, &admit)
+            .recover_admitted(&request, &*app.directory, &admit)
             .map(|r| r.to_bytes())
             .map_err(|e| (e.to_string(), limited.get()))
     })
@@ -628,8 +669,8 @@ async fn recover<D: Directory + Send + Sync + 'static>(
     }
 }
 
-async fn establish_trust<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
+async fn establish_trust(
+    State(app): State<Arc<App>>,
     Path(kid): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -645,7 +686,7 @@ async fn establish_trust<D: Directory + Send + Sync + 'static>(
     }
     let result = tokio::task::spawn_blocking(move || {
         app.server
-            .establish_trust(&request, &app.directory)
+            .establish_trust(&request, &*app.directory)
             .map(|r| r.to_bytes())
             .map_err(|e| e.to_string())
     })
@@ -662,11 +703,7 @@ async fn establish_trust<D: Directory + Send + Sync + 'static>(
 
 /// `POST /ipa/ku/peer/spend`: another server asks this one, the home of a
 /// voucher, to spend or release its salt (§9).
-async fn peer_spend<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn peer_spend(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(status) = admit_for(&app, "peer spend", None, &headers) {
         return status.into_response();
     }
@@ -691,11 +728,7 @@ async fn peer_spend<D: Directory + Send + Sync + 'static>(
     }
 }
 
-async fn peer_sync<D: Directory + Send + Sync + 'static>(
-    State(app): State<Arc<App<D>>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn peer_sync(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     // Syncs arrive from other servers, which the GSS-API token check in
     // `handle` authenticates; the cost of that check is still bounded by
     // the per-source rate limit, like every other route.

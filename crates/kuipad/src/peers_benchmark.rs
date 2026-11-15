@@ -2,7 +2,7 @@
 
 use super::*;
 use kuipa_enroll::realm::{RealmInfo, ServerKeys};
-use kuipa_enroll::server::DirectoryError;
+use kuipa_enroll::server::{Directory, DirectoryError};
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll};

@@ -21,6 +21,7 @@ use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::Invitation;
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::{self, Paths};
+use kuipad::http::App;
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
 use support::server;
@@ -65,7 +66,7 @@ fn server(
     }
     server::serve(
         listener,
-        Arc::new(server::app(server.clone(), directory.clone())),
+        Arc::new(App::new(server.clone(), directory.clone())),
     );
     (server, *anchor.public().thumbprint(), directory)
 }

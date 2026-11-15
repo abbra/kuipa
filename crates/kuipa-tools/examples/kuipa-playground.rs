@@ -617,15 +617,10 @@ fn start_trusted(
         kdc_proxy: None,
     };
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &[TRUSTED_SERVER], &[]));
-    let app = Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        directory: directory.clone(),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        keys: None,
-        ledger: None,
-    });
+    let app = Arc::new(App::new(
+        Arc::new(EnrollServer::new(keys, info, delegation)),
+        directory.clone(),
+    ));
     let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let url = format!("http://{}", listener.local_addr()?);
     rt.spawn(async move { axum::serve(listener, router(app)).await });
@@ -762,15 +757,13 @@ fn start_servers(
             initiator,
             KeyStore::new(key_dir),
         )?;
-        let app = Arc::new(App {
-            server: enroll.clone(),
-            directory: directory.clone(),
-            peers: Some(peers.clone()),
-            limiter: session_limiter(),
-            tang,
-            keys: None,
-            ledger: Some(ledger),
-        });
+        let app = Arc::new(
+            App::new(enroll.clone(), directory.clone())
+                .with_peers(peers.clone())
+                .with_limiter(session_limiter())
+                .with_tang(tang)
+                .with_ledger(ledger),
+        );
         rt.spawn(peers.run());
         rt.spawn(async move { axum::serve(listener, router(app)).await });
         servers.push(enroll);
@@ -880,15 +873,7 @@ fn start_chain_servers(
             vec![*anchor.public().thumbprint()],
             std::collections::HashMap::new(),
         );
-        let app = Arc::new(App {
-            server: enroll,
-            directory: directory.clone(),
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            keys: None,
-            ledger: None,
-        });
+        let app = Arc::new(App::new(enroll, directory.clone()));
         rt.spawn(async move { axum::serve(listener, router(app)).await });
     }
     Ok(endpoints)

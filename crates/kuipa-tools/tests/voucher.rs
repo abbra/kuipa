@@ -23,6 +23,7 @@ use kuipa_enroll::{Directory as _, EnrollServer};
 use kuipa_tools::flows::{self, Auth};
 use kuipa_tools::paths::Paths;
 use kuipa_tools::voucher;
+use kuipad::http::App;
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
 use support::server;
@@ -115,7 +116,7 @@ impl Ipa {
         let vouchers = vec![VerifyingKey::from_jwk_json(public.as_bytes()).unwrap()];
         let (anchor, server) = server::enroll_server(info, false, vouchers, 1);
         let directory = Arc::new(KdcDirectory::new(realm.clone(), &[name], &[]));
-        let url = server::spawn(Arc::new(server::app(server.clone(), directory.clone())));
+        let url = server::spawn(Arc::new(App::new(server.clone(), directory.clone())));
         kuipa_tools::net::set_thread_endpoint(name, &url);
         let string = EnrollmentString::new(
             REALM,

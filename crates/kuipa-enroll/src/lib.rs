@@ -47,4 +47,4 @@ pub mod voucher;
 
 pub use error::{Error, Result};
 pub use payload::{Enrollment, PinsAnswer, RealmConfig};
-pub use server::{Directory, EnrollServer};
+pub use server::{Directory, EnrollServer, SharedDirectory};
