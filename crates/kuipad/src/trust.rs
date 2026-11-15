@@ -25,79 +25,17 @@ use kuipa_enroll::delegation::HeadPin;
 use kuipa_enroll::realm::{TrustedRealm, VerifiedRealm};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::{self, Established, Invitation, TrustResponse};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use tang_pqc::{Policy, SignedAdvertisement, Thumbprint};
 
 use crate::Error;
 
-/// Accepts any server certificate, still checking handshake signatures.
-#[derive(Debug)]
-struct FirstContact(Arc<rustls::crypto::CryptoProvider>);
-
-impl ServerCertVerifier for FirstContact {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 /// A client that verifies TLS against `ca` (DER), or accepts any
 /// certificate without one.
-fn client(ca: Option<&[Vec<u8>]>) -> Result<reqwest::Client, Error> {
-    let _ = rustls_native_ossl::default_provider().install_default();
-    let provider = Arc::new(rustls_native_ossl::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?
-        .dangerous();
-    let config = match ca {
-        Some(certs) => builder
-            .with_custom_certificate_verifier(Arc::new(kuipa_enroll::tls::server_verifier(certs)?)),
-        None => builder.with_custom_certificate_verifier(Arc::new(FirstContact(provider))),
-    };
+pub(crate) fn client(ca: Option<&[Vec<u8>]>) -> Result<reqwest::Client, Error> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
-        .tls_backend_preconfigured(config.with_no_client_auth())
+        .tls_backend_preconfigured(kuipa_enroll::tls::client_config(ca)?)
         .build()?)
 }
 

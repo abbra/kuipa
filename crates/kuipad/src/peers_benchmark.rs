@@ -434,28 +434,9 @@ async fn measure_scheduler_repair() {
             let started = Instant::now();
             store.store_peer_state(&initial).unwrap();
             initial_store_ns += started.elapsed().as_nanos();
-            let info = RealmInfo {
-                realm: "R".into(),
-                domain: "example.test".into(),
-                basedn: "dc=example,dc=test".into(),
-                server: name.clone(),
-                servers: vec![],
-                ca_certs: vec![],
-                pkinit_anchors: vec![],
-                anchors: vec![],
-                heads: vec![],
-                trusts: vec![],
-                kdc_proxy: None,
-            };
+            let info = RealmInfo::new("R", "example.test", "dc=example,dc=test", name.clone());
             let server = Arc::new(EnrollServer::new(
-                ServerKeys {
-                    signing: key,
-                    join: vec![],
-                    escrow: vec![],
-                    trust: vec![],
-                    vouchers: vec![],
-                    retired: vec![],
-                },
+                ServerKeys::new(key),
                 info,
                 Delegation::new(&claim),
             ));

@@ -161,14 +161,7 @@ impl KeyStore {
     /// I/O or a malformed key.
     pub fn load(&self) -> Result<ServerKeys, Error> {
         let signing = SigningKey::from_jwk(read_private(&self.path("signing.jwk"))?.as_ref())?;
-        let mut keys = ServerKeys {
-            signing,
-            join: Vec::new(),
-            escrow: Vec::new(),
-            trust: Vec::new(),
-            vouchers: Vec::new(),
-            retired: Vec::new(),
-        };
+        let mut keys = ServerKeys::new(signing);
         for name in self.names()? {
             if let Some((role, retired)) = Role::of(&name) {
                 let key = ExchangeKeyPair::from_jwk(read_private(&self.path(&name))?.as_ref())?;

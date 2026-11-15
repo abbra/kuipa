@@ -580,25 +580,6 @@ pub fn initial_delegation(
     Ok(d)
 }
 
-fn http_client(settings: &Settings) -> Result<reqwest::Client, Error> {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls_native_ossl::default_provider().install_default();
-    });
-    let provider = Arc::new(rustls_native_ossl::default_provider());
-    let verifier = kuipa_enroll::tls::server_verifier(&settings.ca_certs)?;
-    let tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    Ok(reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .tls_backend_preconfigured(tls)
-        .build()?)
-}
-
 impl Peers {
     /// Set up the exchange for `server`, with the state from `store`.
     ///
@@ -613,7 +594,7 @@ impl Peers {
         initiator: Arc<dyn Initiator>,
         store: KeyStore,
     ) -> Result<Arc<Self>, Error> {
-        let client = http_client(&settings)?;
+        let client = crate::trust::client(Some(&settings.ca_certs))?;
         let mut exchange = Exchange::new(
             settings, anchor, server, directory, initiator, store, client,
         );
@@ -2657,28 +2638,10 @@ mod tests {
             iat: 1,
             exp: 1000,
         };
-        let info = RealmInfo {
-            realm: "R".into(),
-            domain: "example.test".into(),
-            basedn: "dc=example,dc=test".into(),
-            server: "local".into(),
-            servers: vec![],
-            ca_certs: vec![],
-            pkinit_anchors: vec![],
-            anchors: vec![*anchor.public().thumbprint()],
-            heads: vec![],
-            trusts: vec![],
-            kdc_proxy: None,
-        };
+        let mut info = RealmInfo::new("R", "example.test", "dc=example,dc=test", "local");
+        info.anchors = vec![*anchor.public().thumbprint()];
         let server = Arc::new(EnrollServer::new(
-            ServerKeys {
-                signing,
-                join: vec![],
-                escrow: vec![],
-                trust: vec![],
-                vouchers: vec![],
-                retired: vec![],
-            },
+            ServerKeys::new(signing),
             info,
             Delegation::new(&claim),
         ));
