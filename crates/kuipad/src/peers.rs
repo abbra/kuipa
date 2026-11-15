@@ -2631,191 +2631,119 @@ mod tests {
         assert_eq!(reopened.durable.snapshot().await.unwrap().1, saved);
     }
 
+    /// The state of the stand-in peer the tests run against.
+    #[derive(Default)]
     struct PeerTestRoutes {
-        target: Arc<Mutex<Option<Arc<Peers>>>>,
-        partitioned: Arc<AtomicBool>,
-        healthy_requests: Arc<std::sync::atomic::AtomicUsize>,
-        busy_requests: Arc<std::sync::atomic::AtomicUsize>,
-        selective_pushes: Arc<std::sync::atomic::AtomicUsize>,
-        summary_requests: Arc<std::sync::atomic::AtomicUsize>,
-        pause_chunk: Arc<std::sync::atomic::AtomicU8>,
-        chunk_started: Arc<Notify>,
-        chunk_resume: Arc<Notify>,
-        pages: Arc<Mutex<Vec<SignedEpoch>>>,
-        requested: Arc<Mutex<Vec<usize>>>,
-        pause: Arc<AtomicBool>,
-        started: Arc<Notify>,
-        resume: Arc<Notify>,
-        stalled: Arc<Notify>,
-        release: Arc<Notify>,
+        target: Mutex<Option<Arc<Peers>>>,
+        partitioned: AtomicBool,
+        healthy_requests: std::sync::atomic::AtomicUsize,
+        busy_requests: std::sync::atomic::AtomicUsize,
+        selective_pushes: std::sync::atomic::AtomicUsize,
+        summary_requests: std::sync::atomic::AtomicUsize,
+        pause_chunk: std::sync::atomic::AtomicU8,
+        chunk_started: Notify,
+        chunk_resume: Notify,
+        pages: Mutex<Vec<SignedEpoch>>,
+        requested: Mutex<Vec<usize>>,
+        pause: AtomicBool,
+        started: Notify,
+        resume: Notify,
+        stalled: Notify,
+        release: Notify,
     }
 
-    fn peer_test_routes(routes: &PeerTestRoutes) -> axum::Router {
-        let PeerTestRoutes {
-            target,
-            partitioned,
-            healthy_requests,
-            busy_requests,
-            selective_pushes,
-            summary_requests,
-            pause_chunk,
-            chunk_started,
-            chunk_resume,
-            ..
-        } = routes;
-        axum::Router::new().route(
-            "/ipa/ku/peer/sync",
-            axum::routing::post({
-                let target = target.clone();
-                let partitioned = partitioned.clone();
-                let healthy_requests = healthy_requests.clone();
-                let busy_requests = busy_requests.clone();
-                let selective_pushes = selective_pushes.clone();
-                let summary_requests = summary_requests.clone();
-                let pause_chunk = pause_chunk.clone();
-                let chunk_started = chunk_started.clone();
-                let chunk_resume = chunk_resume.clone();
-                move |body: axum::body::Bytes| {
-                    let target = target.clone();
-                    let blocked = partitioned.load(Ordering::SeqCst);
-                    let healthy_requests = healthy_requests.clone();
-                    let busy_requests = busy_requests.clone();
-                    let selective_pushes = selective_pushes.clone();
-                    let summary_requests = summary_requests.clone();
-                    let pause_chunk = pause_chunk.clone();
-                    let chunk_started = chunk_started.clone();
-                    let chunk_resume = chunk_resume.clone();
-                    async move {
-                        let local =
-                            PeerSync::from_bytes(&body).is_ok_and(|sync| sync.receiver == "local");
-                        if blocked {
-                            if local {
-                                busy_requests.fetch_add(1, Ordering::SeqCst);
-                            }
-                            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
-                        }
-                        if local {
-                            healthy_requests.fetch_add(1, Ordering::SeqCst);
-                        }
-                        let request = PeerSync::from_bytes(&body).ok().and_then(|sync| {
-                            decode::<Message<RequestBody>>(&sync.payload)
-                                .ok()
-                                .map(|m| m.body)
-                        });
-                        if matches!(
-                            request,
-                            Some(RequestBody::Repair(repair::Request::Buckets { .. }))
-                        ) {
-                            summary_requests.fetch_add(1, Ordering::SeqCst);
-                        }
-                        if matches!(
-                            &request,
-                            Some(RequestBody::Repair(repair::Request::Exchange { push, .. }))
-                                if !push.is_empty()
-                        ) {
-                            selective_pushes.fetch_add(1, Ordering::SeqCst);
-                        }
-                        let pause = match request {
-                            Some(RequestBody::Snapshot(SnapshotRequest::Fetch {
-                                offset, ..
-                            })) if offset > 0 => 1,
-                            Some(RequestBody::Snapshot(SnapshotRequest::Upload {
-                                offset, ..
-                            })) if offset > 0 => 2,
-                            _ => 0,
-                        };
-                        if pause != 0
-                            && pause_chunk
-                                .compare_exchange(pause, 0, Ordering::SeqCst, Ordering::SeqCst)
-                                .is_ok()
-                        {
-                            chunk_started.notify_one();
-                            chunk_resume.notified().await;
-                        }
-                        let target = lock(&target).clone();
-                        match target.unwrap().handle(&body).await {
-                            Ok(bytes) => (axum::http::StatusCode::OK, bytes),
-                            Err(e)
-                                if matches!(
-                                    e.downcast_ref::<PeerError>(),
-                                    Some(PeerError::NeedContext)
-                                ) =>
-                            {
-                                (axum::http::StatusCode::CONFLICT, Vec::new())
-                            }
-                            Err(_) => (axum::http::StatusCode::BAD_REQUEST, Vec::new()),
-                        }
-                    }
-                }
-            }),
-        )
+    type Routes = axum::extract::State<Arc<PeerTestRoutes>>;
+
+    async fn test_peer_sync(
+        axum::extract::State(routes): Routes,
+        body: axum::body::Bytes,
+    ) -> (axum::http::StatusCode, Vec<u8>) {
+        let local = PeerSync::from_bytes(&body).is_ok_and(|sync| sync.receiver == "local");
+        if routes.partitioned.load(Ordering::SeqCst) {
+            if local {
+                routes.busy_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
+        }
+        if local {
+            routes.healthy_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        let request = PeerSync::from_bytes(&body).ok().and_then(|sync| {
+            decode::<Message<RequestBody>>(&sync.payload)
+                .ok()
+                .map(|m| m.body)
+        });
+        if matches!(
+            request,
+            Some(RequestBody::Repair(repair::Request::Buckets { .. }))
+        ) {
+            routes.summary_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        if matches!(
+            &request,
+            Some(RequestBody::Repair(repair::Request::Exchange { push, .. })) if !push.is_empty()
+        ) {
+            routes.selective_pushes.fetch_add(1, Ordering::SeqCst);
+        }
+        let pause = match request {
+            Some(RequestBody::Snapshot(SnapshotRequest::Fetch { offset, .. })) if offset > 0 => 1,
+            Some(RequestBody::Snapshot(SnapshotRequest::Upload { offset, .. })) if offset > 0 => 2,
+            _ => 0,
+        };
+        if pause != 0
+            && routes
+                .pause_chunk
+                .compare_exchange(pause, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            routes.chunk_started.notify_one();
+            routes.chunk_resume.notified().await;
+        }
+        let target = lock(&routes.target).clone();
+        match target.unwrap().handle(&body).await {
+            Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+            Err(e) if matches!(e.downcast_ref::<PeerError>(), Some(PeerError::NeedContext)) => {
+                (axum::http::StatusCode::CONFLICT, Vec::new())
+            }
+            Err(_) => (axum::http::StatusCode::BAD_REQUEST, Vec::new()),
+        }
     }
 
-    fn bootstrap_test_routes(routes: &PeerTestRoutes) -> axum::Router {
-        let PeerTestRoutes {
-            pages,
-            requested,
-            pause,
-            started,
-            resume,
-            stalled,
-            release,
-            ..
-        } = routes;
+    async fn test_anchor_log(
+        axum::extract::State(routes): Routes,
+        axum::extract::RawQuery(query): axum::extract::RawQuery,
+    ) -> String {
+        let from: usize = query
+            .unwrap()
+            .strip_prefix("from=")
+            .unwrap()
+            .parse()
+            .unwrap();
+        lock(&routes.requested).push(from);
+        let entries = lock(&routes.pages)
+            .get(from)
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if routes.pause.load(Ordering::Relaxed) {
+            routes.started.notify_one();
+            routes.resume.notified().await;
+        }
+        serde_json::json!({ "entries": entries }).to_string()
+    }
+
+    async fn test_stall(axum::extract::State(routes): Routes) -> axum::http::StatusCode {
+        routes.stalled.notify_one();
+        routes.release.notified().await;
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
+
+    fn bootstrap_test_routes(routes: Arc<PeerTestRoutes>) -> axum::Router {
         axum::Router::new()
-            .route(
-                "/ipa/ku/anchor-log",
-                axum::routing::get({
-                    let pages = pages.clone();
-                    let requested = requested.clone();
-                    let pause = pause.clone();
-                    let started = started.clone();
-                    let resume = resume.clone();
-                    move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
-                        let pages = pages.clone();
-                        let requested = requested.clone();
-                        let pause = pause.clone();
-                        let started = started.clone();
-                        let resume = resume.clone();
-                        async move {
-                            let from: usize = query
-                                .unwrap()
-                                .strip_prefix("from=")
-                                .unwrap()
-                                .parse()
-                                .unwrap();
-                            lock(&requested).push(from);
-                            let entries = lock(&pages)
-                                .get(from)
-                                .cloned()
-                                .into_iter()
-                                .collect::<Vec<_>>();
-                            if pause.load(Ordering::Relaxed) {
-                                started.notify_one();
-                                resume.notified().await;
-                            }
-                            serde_json::json!({ "entries": entries }).to_string()
-                        }
-                    }
-                }),
-            )
-            .merge(peer_test_routes(routes))
-            .route(
-                "/stall/ipa/ku/peer/sync",
-                axum::routing::post({
-                    let stalled = stalled.clone();
-                    let release = release.clone();
-                    move || {
-                        let stalled = stalled.clone();
-                        let release = release.clone();
-                        async move {
-                            stalled.notify_one();
-                            release.notified().await;
-                            axum::http::StatusCode::SERVICE_UNAVAILABLE
-                        }
-                    }
-                }),
-            )
+            .route("/ipa/ku/anchor-log", axum::routing::get(test_anchor_log))
+            .route("/ipa/ku/peer/sync", axum::routing::post(test_peer_sync))
+            .route("/stall/ipa/ku/peer/sync", axum::routing::post(test_stall))
+            .with_state(routes)
     }
 
     fn bootstrap_exchange(
@@ -3389,41 +3317,12 @@ mod tests {
         let anchor = SigningKey::generate_preferred().unwrap();
         let first = epoch_at(epoch::GENESIS, 1, &[&anchor]);
         let second = epoch_at(head_of(&first), 2, &[&anchor]);
-        let pages = Arc::new(Mutex::new(vec![first.clone(), second.clone()]));
-        let requested = Arc::new(Mutex::new(Vec::new()));
-        let pause = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(Notify::new());
-        let resume = Arc::new(Notify::new());
-        let target: Arc<Mutex<Option<Arc<Peers>>>> = Arc::new(Mutex::new(None));
-        let partitioned = Arc::new(AtomicBool::new(true));
-        let stalled = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let healthy_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let busy_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let selective_pushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let summary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pause_chunk = Arc::new(std::sync::atomic::AtomicU8::new(0));
-        let chunk_started = Arc::new(Notify::new());
-        let chunk_resume = Arc::new(Notify::new());
-        let routes = PeerTestRoutes {
-            target: target.clone(),
-            partitioned: partitioned.clone(),
-            healthy_requests: healthy_requests.clone(),
-            busy_requests: busy_requests.clone(),
-            selective_pushes: selective_pushes.clone(),
-            summary_requests: summary_requests.clone(),
-            pause_chunk: pause_chunk.clone(),
-            chunk_started: chunk_started.clone(),
-            chunk_resume: chunk_resume.clone(),
-            pages: pages.clone(),
-            requested: requested.clone(),
-            pause: pause.clone(),
-            started: started.clone(),
-            resume: resume.clone(),
-            stalled: stalled.clone(),
-            release: release.clone(),
-        };
-        let app = bootstrap_test_routes(&routes);
+        let routes = Arc::new(PeerTestRoutes {
+            partitioned: AtomicBool::new(true),
+            pages: Mutex::new(vec![first.clone(), second.clone()]),
+            ..PeerTestRoutes::default()
+        });
+        let app = bootstrap_test_routes(routes.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -3440,7 +3339,7 @@ mod tests {
         let (server, exchange) = bootstrap_exchange(&anchor, address, &dir);
         check_epoch_catch_up(&anchor, first, second, &dir, &server, &exchange, &routes).await;
         let (peers, inbound, peer_claim) = check_peer_bootstrap(&dir, &server, &exchange).await;
-        *lock(&target) = Some(peers.clone());
+        *lock(&routes.target) = Some(peers.clone());
         let peer_dir = dir.join("peer");
         std::fs::create_dir(&peer_dir).unwrap();
         let sender = bootstrap_sender(
@@ -3455,7 +3354,7 @@ mod tests {
         let peers =
             check_large_upload(&sender, &peer_claim, &exchange, &server, &dir, &routes).await;
         check_large_download(&sender, &peers, &peer_claim, &dir, &peer_dir, &routes).await;
-        release.notify_waiters();
+        routes.release.notify_waiters();
         server_task.abort();
         std::fs::remove_dir_all(&dir).unwrap();
     }
