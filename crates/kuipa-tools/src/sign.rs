@@ -55,11 +55,11 @@ pub fn sign_files(
         written.push(json!({ "file": file, "signature": out }));
     }
     let first = bundles.first().ok_or("the server answered no bundle")?;
-    let public = PublicState::load(host)?;
+    let pins = Pins::of_host(host)?;
     let v = first.verify_digest(
         &asked.digests[0],
-        &public.realm,
-        &paths::read_anchors(host)?,
+        &pins.realm,
+        &pins.anchors,
         &tang_pqc::Policy::from_system()?,
     )?;
     Ok(json!({
@@ -103,11 +103,26 @@ pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Ve
 
 /// The anchors to verify against when this host has none of its own (a new
 /// host in a restore): the realm, and the thumbprints a person carries.
+#[derive(Clone)]
 pub struct Pins {
     /// The realm the statement must be for.
     pub realm: String,
     /// The trusted anchors.
     pub anchors: Vec<tang_pqc::Thumbprint>,
+}
+
+impl Pins {
+    /// This host's realm and pinned anchors.
+    ///
+    /// # Errors
+    ///
+    /// The host is not enrolled, or its pins are unreadable.
+    pub fn of_host(host: &Paths) -> Result<Self, Error> {
+        Ok(Self {
+            realm: PublicState::load(host)?.realm,
+            anchors: paths::read_anchors(host)?,
+        })
+    }
 }
 
 /// `kuipa sign verify`: check `file` against its bundle (`signature`,
@@ -129,15 +144,15 @@ pub fn verify_file(
     let sig = signature.map_or_else(|| bundle_path(file), Path::to_path_buf);
     let bundle =
         Bundle::from_bytes(&std::fs::read(&sig).map_err(|e| format!("{}: {e}", sig.display()))?)?;
-    let (realm, anchors) = match pins {
-        Some(p) => (p.realm.clone(), p.anchors.clone()),
-        None => (PublicState::load(host)?.realm, paths::read_anchors(host)?),
+    let pins = match pins {
+        Some(p) => std::borrow::Cow::Borrowed(p),
+        None => std::borrow::Cow::Owned(Pins::of_host(host)?),
     };
     let data = std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let v = bundle.verify_digest(
         &Digest::of_reader(bundle.digest().alg, data)?,
-        &realm,
-        &anchors,
+        &pins.realm,
+        &pins.anchors,
         &tang_pqc::Policy::from_system()?,
     )?;
     let principal = v.principal.to_string();

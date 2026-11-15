@@ -25,7 +25,7 @@ use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use kuipa_enroll::sign::{Bundle, Digest, DigestAlg, Request};
-use kuipa_tools::paths::{Error, Paths, PublicState};
+use kuipa_tools::paths::{Error, Paths};
 
 const BEGIN: &str = "-----BEGIN SIGNED MESSAGE-----";
 const END: &str = "-----END SIGNED MESSAGE-----";
@@ -104,13 +104,12 @@ fn verify(args: &[String]) -> Result<bool, Error> {
         .ok_or("--verify needs the signature file")?;
     let bundle = Bundle::from_bytes(&dearmor(&std::fs::read_to_string(file)?)?)?;
     let host = Paths::from_env();
-    let public = PublicState::load(&host)?;
-    let anchors = kuipa_tools::paths::read_anchors(&host)?;
+    let pins = kuipa_tools::sign::Pins::of_host(&host)?;
     status(fd, "NEWSIG");
     match bundle.verify(
         &payload()?,
-        &public.realm,
-        &anchors,
+        &pins.realm,
+        &pins.anchors,
         &tang_pqc::Policy::from_system()?,
     ) {
         Ok(v) => {
