@@ -273,7 +273,7 @@ impl Keys {
     ) -> std::io::Result<()> {
         for stream in listener.incoming() {
             if let Err(error) = Self::serve_request(stream?, handle) {
-                eprintln!("kuipad: custody broker request: {error}");
+                tracing::warn!("custody broker request: {error}");
             }
         }
         Ok(())
@@ -303,7 +303,7 @@ impl Keys {
                 response
             }
             Err(error) => {
-                eprintln!("kuipad: custody broker: {error}");
+                tracing::warn!("custody broker: {error}");
                 b"\x01custody export failed".to_vec()
             }
         };
@@ -317,7 +317,7 @@ impl Keys {
 /// decision).  The daemon logs to stderr for now; a file destination comes
 /// with deployment.
 pub(crate) fn audit(line: &str) {
-    eprintln!("kuipad: keys: {line}");
+    tracing::info!("keys: {line}");
 }
 
 /// The uid and primary gid of `user`, from `/etc/passwd` (no libc

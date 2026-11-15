@@ -161,6 +161,11 @@ Print the Tang signing keys' thumbprints.
 	overhead; failed exchanges are not included.  The logs can reveal
 	peer names and traffic patterns.
 
+	The daemon logs events, one per line, on standard error (the
+	journal under systemd).  Set *RUST_LOG* to *tracing* filter
+	directives (*warn*, *debug*, *kuipad=debug,kuipa_ldap=debug*) to
+	change the default, *info*.
+
 */var/lib/ipa/ku/*
 	The key directory (*key_dir*): the anchor and signing JWKs, the
 	join, escrow, trust, voucher and succession keys, the Tang keys,

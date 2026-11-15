@@ -429,9 +429,8 @@ impl LdapDirectory {
             .iter()
             .map(|d| serde_json::from_str::<Device>(d))
             .collect::<Result<_, _>>()?;
-        let members = |attr: &str| {
-            Members::from_entries(entry.values(attr).iter().map(String::as_str))
-        };
+        let members =
+            |attr: &str| Members::from_entries(entry.values(attr).iter().map(String::as_str));
         let state = match one(SEAL_STATE_ATTR)?.as_str() {
             "enabled" => State::Enabled,
             _ => State::Revoked,
@@ -632,7 +631,12 @@ impl LdapDirectory {
             &[
                 Mod::add(
                     "objectClass",
-                    ["top", "krbPrincipal", "krbPrincipalAux", "krbTicketPolicyAux"],
+                    [
+                        "top",
+                        "krbPrincipal",
+                        "krbPrincipalAux",
+                        "krbTicketPolicyAux",
+                    ],
                 ),
                 Mod::add("krbPrincipalName", [principal]),
                 Mod::add("krbCanonicalName", [principal]),
@@ -668,18 +672,18 @@ impl LdapDirectory {
         let dn = self.host_dn(fqdn);
         let mut svc = self.service_conn()?;
         let entry = svc.search(&dn, Scope::Base, "(objectClass=*)", &[STAGED_ATTR])?;
-        if entry
-            .first()
-            .is_some_and(|e| e.has(STAGED_ATTR))
-        {
+        if entry.first().is_some_and(|e| e.has(STAGED_ATTR)) {
             svc.modify_s(
                 &dn,
-                &[Mod::remove(STAGED_ATTR), Mod::remove("krbPrincipalExpiration")],
+                &[
+                    Mod::remove(STAGED_ATTR),
+                    Mod::remove("krbPrincipalExpiration"),
+                ],
             )?;
-            eprintln!("kuipad: first contact: {host} unstaged");
+            tracing::info!("first contact: {host} unstaged");
         }
         match svc.modify_s(&dn, &[Mod::remove("userPassword")]) {
-            Ok(()) => eprintln!("kuipad: first contact: {host}'s OTP consumed"),
+            Ok(()) => tracing::info!("first contact: {host}'s OTP consumed"),
             Err(e) if e.code() == Some(NO_SUCH_ATTRIBUTE) => {}
             Err(e) => return Err(e.into()),
         }
@@ -855,7 +859,7 @@ impl Directory for LdapDirectory {
                 Mod::replace("krbPrincipalExpiration", [&expiration]),
             ],
         )?;
-        eprintln!("kuipad: {caller} staged {principal} until {expiration}");
+        tracing::info!("{caller} staged {principal} until {expiration}");
         Ok((keytab, binding))
     }
 
@@ -941,8 +945,8 @@ impl Directory for LdapDirectory {
                 }
             }
         }
-        eprintln!(
-            "kuipad: {principal} registered {} {:?} escrow binding(s), retired {}",
+        tracing::info!(
+            "{principal} registered {} {:?} escrow binding(s), retired {}",
             bindings.len(),
             params.kind,
             params.retire.len()
@@ -1159,7 +1163,7 @@ impl Directory for LdapDirectory {
                 // daemon sets, are removed.
                 conn.delete_s(&entry.dn)?;
                 let fqdn = entry.first("fqdn").unwrap_or(&entry.dn).to_owned();
-                eprintln!("kuipad: the lease of {fqdn} ended: host removed");
+                tracing::info!("the lease of {fqdn} ended: host removed");
                 gone.push(fqdn);
             }
         }
@@ -1242,7 +1246,7 @@ impl Directory for LdapDirectory {
         );
         self.service_conn()?
             .add_s(&self.seal_dn(&seal.id), &attrs)?;
-        eprintln!("kuipad: {} created seal {id} ({})", seal.owner, seal.name);
+        tracing::info!("{} created seal {id} ({})", seal.owner, seal.name);
         Ok(())
     }
 
@@ -1265,8 +1269,8 @@ impl Directory for LdapDirectory {
         mods.push(Mod::replace(SEAL_BINDING_ATTR, &seal.bindings));
         self.service_conn()?
             .modify_s(&self.seal_dn(&seal.id), &mods)?;
-        eprintln!(
-            "kuipad: updated seal {} ({}) owned by {}: {}, {} device(s)",
+        tracing::info!(
+            "updated seal {} ({}) owned by {}: {}, {} device(s)",
             seal.id,
             seal.name,
             seal.owner,
@@ -1463,10 +1467,8 @@ impl Directory for LdapDirectory {
             RELEASE_APPROVAL_ATTR
         };
         // Added, never replaced: replicas merge what different servers add.
-        self.service_conn()?.modify_s(
-            &self.release_dn(id, request),
-            &[Mod::add(attr, [&value])],
-        )?;
+        self.service_conn()?
+            .modify_s(&self.release_dn(id, request), &[Mod::add(attr, [&value])])?;
         Ok(())
     }
 
@@ -1538,11 +1540,9 @@ impl Directory for LdapDirectory {
             key.alg().id(),
             tang_pqc::b64::encode(key.as_bytes())
         );
-        self.service_conn()?.modify_s(
-            &dn,
-            &[Mod::replace(SERVER_ESCROW_KEY_ATTR, [&value])],
-        )?;
-        eprintln!("kuipad: published {server}'s escrow key {}", key.kid());
+        self.service_conn()?
+            .modify_s(&dn, &[Mod::replace(SERVER_ESCROW_KEY_ATTR, [&value])])?;
+        tracing::info!("published {server}'s escrow key {}", key.kid());
         Ok(())
     }
 
@@ -1704,7 +1704,7 @@ impl Directory for LdapDirectory {
             let host_absent = match conn.delete_s(&dn) {
                 Ok(()) => true,
                 Err(de) => {
-                    eprintln!("kuipad: voucher {fqdn}: undo host after group failure: {de}");
+                    tracing::warn!("voucher {fqdn}: undo host after group failure: {de}");
                     false
                 }
             };
@@ -1713,11 +1713,10 @@ impl Directory for LdapDirectory {
                 host_absent,
             });
         }
-        match &lease {
-            Some((expiration, _)) => {
-                eprintln!("kuipad: voucher created host {fqdn}, leased until {expiration}");
-            }
-            None => eprintln!("kuipad: voucher created host {fqdn}"),
+        if let Some((expiration, _)) = &lease {
+            tracing::info!("voucher created host {fqdn}, leased until {expiration}");
+        } else {
+            tracing::info!("voucher created host {fqdn}");
         }
         self.new_keys(&mut conn, &principal, enctypes)
             .map_err(|error| VoucherJoinError {
@@ -1732,10 +1731,8 @@ impl Directory for LdapDirectory {
         not_after: u64,
     ) -> Result<(), DirectoryError> {
         let value = format!("{} {not_after}", hex(hash));
-        self.service_conn()?.modify_s(
-            &self.trusts_dn(),
-            &[Mod::add(INVITATION_ATTR, [&value])],
-        )?;
+        self.service_conn()?
+            .modify_s(&self.trusts_dn(), &[Mod::add(INVITATION_ATTR, [&value])])?;
         Ok(())
     }
 
@@ -1751,10 +1748,7 @@ impl Directory for LdapDirectory {
             .ok_or("unknown or used trust invitation")?;
         // Deleting the exact value fails for every server but one.
         self.service_conn()?
-            .modify_s(
-                &self.trusts_dn(),
-                &[Mod::delete(INVITATION_ATTR, [&value])],
-            )
+            .modify_s(&self.trusts_dn(), &[Mod::delete(INVITATION_ATTR, [&value])])
             .map_err(|_| "unknown or used trust invitation")?;
         let not_after: u64 = value[prefix.len()..].parse()?;
         if not_after <= tang_pqc::unix_seconds(SystemTime::now()) {
@@ -1776,7 +1770,7 @@ impl Directory for LdapDirectory {
         ] {
             self.cross_realm_principal(&mut conn, &principal, password.as_ref())?;
         }
-        eprintln!("kuipad: cross-realm keys for {} created", partner.realm);
+        tracing::info!("cross-realm keys for {} created", partner.realm);
         self.update_or_add(&mut conn, partner)
     }
 

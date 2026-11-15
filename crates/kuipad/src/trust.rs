@@ -209,7 +209,7 @@ pub async fn establish(
             match directory.record_trust(&established.partner, established.secret.as_ref()) {
                 Ok(()) => true,
                 Err(e) => {
-                    eprintln!("kuipad: cannot record the trust here ({e})");
+                    tracing::warn!("cannot record the trust here ({e})");
                     false
                 }
             };
@@ -248,11 +248,11 @@ pub async fn refresh(
     let recorded = match tokio::task::spawn_blocking(move || dir.trusted_realms()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            eprintln!("kuipad: trusts: cannot read the trusted realms: {e}");
+            tracing::warn!("trusts: cannot read the trusted realms: {e}");
             Vec::new()
         }
         Err(e) => {
-            eprintln!("kuipad: trusts: {e}");
+            tracing::warn!("trusts: {e}");
             Vec::new()
         }
     };
@@ -285,8 +285,8 @@ pub async fn refresh(
                                 }
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "kuipad: trusts: {} via {s}: head of {anchor}: {e}",
+                                tracing::warn!(
+                                    "trusts: {} via {s}: head of {anchor}: {e}",
                                     partner.realm
                                 );
                             }
@@ -294,8 +294,8 @@ pub async fn refresh(
                     }
                     let unbacked = info.heads.iter().filter(|h| !heads.contains(h)).count();
                     if unbacked > 0 {
-                        eprintln!(
-                            "kuipad: trusts: {}: unbacked heads not pinned ({unbacked})",
+                        tracing::warn!(
+                            "trusts: {}: unbacked heads not pinned ({unbacked})",
                             partner.realm
                         );
                     }
@@ -313,7 +313,7 @@ pub async fn refresh(
                     };
                     break;
                 }
-                Err(e) => eprintln!("kuipad: trusts: {} via {s}: {e}", partner.realm),
+                Err(e) => tracing::warn!("trusts: {} via {s}: {e}", partner.realm),
             }
         }
         let own = server.as_partner();
@@ -321,9 +321,9 @@ pub async fn refresh(
             let dir = directory.clone();
             let update = current.clone();
             match tokio::task::spawn_blocking(move || dir.update_trust(&update)).await {
-                Ok(Ok(())) => eprintln!("kuipad: trusts: refreshed {}", current.realm),
-                Ok(Err(e)) => eprintln!("kuipad: trusts: {}: {e}", current.realm),
-                Err(e) => eprintln!("kuipad: trusts: {e}"),
+                Ok(Ok(())) => tracing::info!("trusts: refreshed {}", current.realm),
+                Ok(Err(e)) => tracing::warn!("trusts: {}: {e}", current.realm),
+                Err(e) => tracing::warn!("trusts: {e}"),
             }
         } else {
             current = partner;

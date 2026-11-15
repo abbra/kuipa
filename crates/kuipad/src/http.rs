@@ -96,8 +96,8 @@ fn admit_for<D>(
         None => app.limiter.check_source(source.as_deref()),
     }
     .map_err(|limited| {
-        eprintln!(
-            "kuipad: {what}: rate limited ({limited:?}, source {})",
+        tracing::warn!(
+            "{what}: rate limited ({limited:?}, source {})",
             source.as_deref().unwrap_or("unknown")
         );
         StatusCode::TOO_MANY_REQUESTS
@@ -144,7 +144,7 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
 }
 
 fn refused(what: &str, reason: &dyn std::fmt::Display) -> Response {
-    eprintln!("kuipad: {what}: {reason}");
+    tracing::warn!("{what}: {reason}");
     StatusCode::FORBIDDEN.into_response()
 }
 
@@ -157,7 +157,7 @@ fn json<T: serde::Serialize>(what: &str, value: &T) -> Response {
     match serde_json::to_vec(value) {
         Ok(body) => binary(body, "application/json"),
         Err(e) => {
-            eprintln!("kuipad: {what}: {e}");
+            tracing::warn!("{what}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -237,7 +237,7 @@ async fn advertisement<D: Directory + Send + Sync + 'static>(
                 .into_response()
         }
         Err(e) => {
-            eprintln!("kuipad: advertisement: {e}");
+            tracing::warn!("advertisement: {e}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -330,7 +330,7 @@ async fn log_head<D: Directory + Send + Sync + 'static>(
         Ok(Some(head)) => binary(head.to_bytes(), "application/octet-stream"),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            eprintln!("kuipad: log head: {e}");
+            tracing::warn!("log head: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -361,8 +361,8 @@ async fn log_cosign<D: Directory + Send + Sync + 'static>(
     };
     match ledger.cosign(&submitted, &policy) {
         crate::ledger::Cosigned::Accepted(n) => {
-            eprintln!(
-                "kuipad: tlog cosign: head of {} leaves now has {n} trusted cosignatures",
+            tracing::info!(
+                "tlog cosign: head of {} leaves now has {n} trusted cosignatures",
                 submitted.head.size
             );
             json("tlog cosign", &json!({ "cosignatures": n }))
@@ -448,7 +448,7 @@ async fn tang_advertisement<D: Directory + Send + Sync + 'static>(
     match tang.advertisement() {
         Ok(adv) => jose(&adv),
         Err(e) => {
-            eprintln!("kuipad: tang advertisement: {e}");
+            tracing::warn!("tang advertisement: {e}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -465,7 +465,7 @@ async fn tang_advertisement_for<D: Directory + Send + Sync + 'static>(
         Ok(Some(adv)) => jose(&adv),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            eprintln!("kuipad: tang advertisement for {thp}: {e}");
+            tracing::warn!("tang advertisement for {thp}: {e}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -514,11 +514,11 @@ async fn tang_recover<D: Directory + Send + Sync + 'static>(
         Ok(Ok(response)) => binary(response.to_bytes(), "application/vnd.tang-pqc.rec-rsp"),
         Ok(Err(tang_pqc::Error::UnknownKey(_))) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
-            eprintln!("kuipad: tang recovery: {e}");
+            tracing::warn!("tang recovery: {e}");
             StatusCode::BAD_REQUEST.into_response()
         }
         Err(e) => {
-            eprintln!("kuipad: tang recovery: {e}");
+            tracing::warn!("tang recovery: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -551,7 +551,7 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     }
     let fqdn = request.fqdn().to_owned();
     if guessable && app.limiter.host_open(&fqdn).is_err() {
-        eprintln!("kuipad: {what}: rate limited (host)");
+        tracing::warn!("{what}: rate limited (host)");
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     let limiter_app = app.clone();
@@ -570,11 +570,11 @@ async fn exchange<D: Directory + Send + Sync + 'static>(
     }
     match result {
         Ok(Ok(body)) => {
-            eprintln!("kuipad: {what}: ok");
+            tracing::info!("{what}: ok");
             binary(body, "application/vnd.ipa-ku.join-rsp")
         }
         Ok(Err((true, reason))) => {
-            eprintln!("kuipad: {what}: {reason}");
+            tracing::warn!("{what}: {reason}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Ok(Err((false, reason))) => refused(&what, &reason),
@@ -620,7 +620,7 @@ async fn recover<D: Directory + Send + Sync + 'static>(
     match result {
         Ok(Ok(body)) => binary(body, "application/vnd.ipa-ku.rec-rsp"),
         Ok(Err((reason, true))) => {
-            eprintln!("kuipad: {what}: rate limited ({reason})");
+            tracing::warn!("{what}: rate limited ({reason})");
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
         Ok(Err((reason, false))) => refused(&what, &reason),
@@ -652,7 +652,7 @@ async fn establish_trust<D: Directory + Send + Sync + 'static>(
     .await;
     match result {
         Ok(Ok(body)) => {
-            eprintln!("kuipad: {what}: established");
+            tracing::info!("{what}: established");
             binary(body, "application/vnd.ipa-ku.trust-rsp")
         }
         Ok(Err(reason)) => refused(&what, &reason),
@@ -675,7 +675,7 @@ async fn peer_spend<D: Directory + Send + Sync + 'static>(
     };
     match peers.handle_spend(&body).await {
         Ok(()) => {
-            eprintln!("kuipad: peer spend: ok");
+            tracing::info!("peer spend: ok");
             StatusCode::OK.into_response()
         }
         // The home server's directory failed, or the salt may be recorded and the
@@ -684,7 +684,7 @@ async fn peer_spend<D: Directory + Send + Sync + 'static>(
             if e.downcast_ref::<kuipa_enroll::server::Refusal>()
                 .is_some_and(kuipa_enroll::server::Refusal::is_unavailable) =>
         {
-            eprintln!("kuipad: peer spend: {e}");
+            tracing::warn!("peer spend: {e}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(e) => refused("peer spend", &e),
@@ -713,7 +713,7 @@ async fn peer_sync<D: Directory + Send + Sync + 'static>(
                 Some(crate::peers::PeerError::Busy)
             ) =>
         {
-            eprintln!("kuipad: peer sync: {e}");
+            tracing::warn!("peer sync: {e}");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(e)

@@ -644,7 +644,7 @@ impl Peers {
         tokio::spawn(async move { worker.repair_loop().await });
         loop {
             if let Err(e) = self.refresh().await {
-                eprintln!("kuipad: anchor exchange: {e}");
+                tracing::warn!("anchor exchange: {e}");
             }
             tokio::select! {
                 () = self.exchange.changed.notified() => {}
@@ -916,8 +916,8 @@ impl Peers {
             if anchors::needs_vouch(current_vouch, &leaves, at, interval) {
                 let iat = anchors::next_vouch_iat(current_vouch, at);
                 let previous = current_vouch.cloned();
-                eprintln!(
-                    "kuipad: anchor exchange: vouching for {} claim(s) of {:?}",
+                tracing::info!(
+                    "anchor exchange: vouching for {} claim(s) of {:?}",
                     leaves.len(),
                     trust.servers().collect::<Vec<_>>()
                 );
@@ -954,8 +954,8 @@ impl Peers {
             x.store.store_delegation(&advertised)?;
         }
         if advertised != current || trusted != x.server.anchors() || x.server.vouches() != vouches {
-            eprintln!(
-                "kuipad: anchor exchange: trusted anchors: {}, proofs for this server's claim: {}",
+            tracing::info!(
+                "anchor exchange: trusted anchors: {}, proofs for this server's claim: {}",
                 trusted.len(),
                 advertised.proof_count()
             );
@@ -1118,8 +1118,8 @@ impl Peers {
             match outcome {
                 Merge::Conflict => {
                     if !x.forked.swap(true, Ordering::Relaxed) {
-                        eprintln!(
-                            "kuipad: anchor exchange: {}'s anchor log disagrees with ours at a sequence both have; this server will not extend its own until they are reconciled",
+                        tracing::warn!(
+                            "anchor exchange: {}'s anchor log disagrees with ours at a sequence both have; this server will not extend its own until they are reconciled",
                             sync.sender
                         );
                     }
@@ -1341,14 +1341,14 @@ impl Exchange {
                         topology.set_members(servers, &self.settings);
                         self.members_known.store(true, Ordering::Relaxed);
                     }
-                    Err(e) => eprintln!("kuipad: anchor exchange: cannot list servers: {e}"),
+                    Err(e) => tracing::warn!("anchor exchange: cannot list servers: {e}"),
                 }
                 match peers {
                     Ok(peers) => topology.set_neighbors(peers, &self.settings),
-                    Err(e) => eprintln!("kuipad: anchor exchange: cannot list topology peers: {e}"),
+                    Err(e) => tracing::warn!("anchor exchange: cannot list topology peers: {e}"),
                 }
             }
-            Err(e) => eprintln!("kuipad: anchor exchange: {e}"),
+            Err(e) => tracing::warn!("anchor exchange: {e}"),
         }
         topology.asked = Some(Instant::now());
     }
@@ -1373,13 +1373,13 @@ impl Exchange {
         match result {
             Ok(_) => {
                 if failures.remove(peer).is_some() {
-                    eprintln!("kuipad: anchor exchange: {peer} reachable again");
+                    tracing::info!("anchor exchange: {peer} reachable again");
                 }
             }
             Err(e) => {
                 let e = e.to_string();
                 if failures.get(peer) != Some(&e) {
-                    eprintln!("kuipad: anchor exchange: sync with {peer} failed: {e}");
+                    tracing::warn!("anchor exchange: sync with {peer} failed: {e}");
                     failures.insert(peer.to_owned(), e);
                 }
             }
@@ -1465,8 +1465,8 @@ impl Exchange {
                     if let (Some(started), Some((own_bytes, chain_bytes, token_bytes))) =
                         (started, sizes)
                     {
-                        eprintln!(
-                            "kuipad: peer sync size: peer={peer} request={request_bytes} payload={payload_bytes} delegation={own_bytes} token={token_bytes} epochs={chain_bytes} response={} elapsed_ms={}",
+                        tracing::info!(
+                            "peer sync size: peer={peer} request={request_bytes} payload={payload_bytes} delegation={own_bytes} token={token_bytes} epochs={chain_bytes} response={} elapsed_ms={}",
                             response.len(),
                             started.elapsed().as_millis()
                         );
@@ -1679,7 +1679,7 @@ impl GossipHooks<String, AnchorState> for Exchange {
     }
 
     async fn on_auth_rejected(&self, peer: &String) {
-        eprintln!("kuipad: anchor exchange: {peer} refused our sync");
+        tracing::warn!("anchor exchange: {peer} refused our sync");
     }
 }
 
@@ -1755,10 +1755,7 @@ fn mint_epoch(
     if seen.elapsed() < x.settings.interval {
         return Ok(());
     }
-    eprintln!(
-        "kuipad: anchor exchange: recording anchor epoch {}",
-        seq + 1
-    );
+    tracing::info!("anchor exchange: recording anchor epoch {}", seq + 1);
     let mut candidate = chain.clone();
     candidate.push(SignedEpoch::issue(anchor, &entry)?);
     // Store before committing in memory: a log that was not written

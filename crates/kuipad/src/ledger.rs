@@ -124,8 +124,8 @@ impl FileLedger {
             .open(&path)?;
         let (leaves, complete) = read_leaves(&fs::read(&path)?)?;
         if complete < file.metadata()?.len() {
-            eprintln!(
-                "kuipad: {}: dropping an incomplete record at byte {complete}",
+            tracing::warn!(
+                "{}: dropping an incomplete record at byte {complete}",
                 path.display()
             );
             file.set_len(complete)?;
@@ -564,8 +564,8 @@ fn read_openings(dir: &Path, leaves: &[Leaf]) -> Result<BTreeMap<u64, Opening>, 
             openings.insert(position, opening);
         }
         if dropped {
-            eprintln!(
-                "kuipad: {}: dropping openings of leaves never written",
+            tracing::warn!(
+                "{}: dropping openings of leaves never written",
                 path.display()
             );
             write_private(&path, &kept)?;

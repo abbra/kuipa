@@ -157,8 +157,8 @@ fn open_ledger(
             .with_retention(cfg.tlog_retention_months),
     );
     ledger.expire(tang_pqc::unix_seconds(std::time::SystemTime::now()))?;
-    eprintln!(
-        "kuipad: transparency log {} at /ipa/ku/tlog ({} leaves)",
+    tracing::info!(
+        "transparency log {} at /ipa/ku/tlog ({} leaves)",
         ledger.id(),
         ledger.size()
     );
@@ -188,7 +188,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     };
     let keys_service = open_keys_service(&cfg)?;
     if keys_service.is_some() {
-        eprintln!("kuipad: serving the keys operation at /ipa/ku/keys");
+        tracing::info!("serving the keys operation at /ipa/ku/keys");
     }
     let mut ldap = LdapDirectory::new(&cfg)?;
     if let Some(keys) = &keys_service {
@@ -196,7 +196,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     }
     let directory = Arc::new(ldap);
     let servers = directory.servers().unwrap_or_else(|e| {
-        eprintln!("kuipad: cannot list servers ({e}); advertising only this one");
+        tracing::warn!("cannot list servers ({e}); advertising only this one");
         vec![cfg.server.clone()]
     });
     let delegation = peers::initial_delegation(
@@ -242,7 +242,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     )?;
     let tang = TangKeys::new(&cfg.key_dir).server()?.map(Arc::new);
     if tang.is_some() {
-        eprintln!("kuipad: serving post-quantum Tang at /ipa/ku/tang");
+        tracing::info!("serving post-quantum Tang at /ipa/ku/tang");
     }
     let app = router(Arc::new(App {
         server,
@@ -294,7 +294,7 @@ async fn purge_ended_leases(directory: Arc<dyn kuipa_enroll::Directory + Send + 
         })
         .await;
         if let Ok(Err(e)) = purged {
-            eprintln!("kuipad: purging ended leases: {e}");
+            tracing::warn!("purging ended leases: {e}");
         }
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
     }
@@ -307,16 +307,16 @@ async fn listen(app: axum::Router, listen: &str) -> Result<(), Error> {
     if let Some(listener) = fds.take_unix_listener(0)? {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(listener)?;
-        eprintln!("kuipad: serving on the socket-activated Unix socket");
+        tracing::info!("serving on the socket-activated Unix socket");
         axum::serve(listener, app).await?;
     } else if let Some(path) = listen.strip_prefix("unix:") {
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path)?;
-        eprintln!("kuipad: serving on {path}");
+        tracing::info!("serving on {path}");
         axum::serve(listener, app).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        eprintln!("kuipad: serving on {listen}");
+        tracing::info!("serving on {listen}");
         axum::serve(listener, app).await?;
     }
     Ok(())
@@ -584,6 +584,17 @@ fn report(changes: &Changes) {
 }
 
 fn main() -> ExitCode {
+    // Standard error, one event per line without a timestamp (the journal
+    // adds its own); `RUST_LOG` overrides the default `info`.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .init();
     match parse_args().and_then(|a| run(&a)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

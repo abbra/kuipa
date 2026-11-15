@@ -23,6 +23,8 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-native-ossl = "0.3.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 listenfd = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 
 [lints.rust]
