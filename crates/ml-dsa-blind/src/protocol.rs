@@ -31,9 +31,6 @@ pub struct BlindRequest {
 }
 
 impl BlindRequest {
-    /// Encoded length in bytes.
-    pub const LEN: usize = MU_LEN;
-
     /// The 64-byte encoding (μ).
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; MU_LEN] {
@@ -52,14 +49,6 @@ impl BlindRequest {
             actual: bytes.len(),
         })?;
         Ok(Self { mu })
-    }
-}
-
-impl TryFrom<&[u8]> for BlindRequest {
-    type Error = Error;
-
-    fn try_from(bytes: &[u8]) -> Result<Self> {
-        Self::from_bytes(bytes)
     }
 }
 
@@ -260,9 +249,6 @@ pub struct BlindSignature {
 }
 
 impl BlindSignature {
-    /// Length of the salt prefix in bytes.
-    pub const SALT_LEN: usize = SALT_LEN;
-
     /// The blinding salt, now public.
     #[must_use]
     pub fn salt(&self) -> &[u8; SALT_LEN] {

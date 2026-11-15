@@ -62,14 +62,6 @@ impl Context {
     }
 }
 
-impl TryFrom<&[u8]> for Context {
-    type Error = Error;
-
-    fn try_from(bytes: &[u8]) -> Result<Self> {
-        Self::new(bytes)
-    }
-}
-
 /// Per-request blinding randomness.  Secret until the signature is finalised;
 /// [`SecretBuf`] wipes it with `OPENSSL_cleanse` on drop.
 pub(crate) struct Salt(SecretBuf);

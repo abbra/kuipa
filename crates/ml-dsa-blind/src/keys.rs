@@ -137,6 +137,7 @@ impl VerifyingKey {
     }
 
     /// The underlying OpenSSL key, e.g. for verifying with plain OpenSSL.
+    #[doc(hidden)]
     #[must_use]
     pub fn pkey(&self) -> &Pkey<Public> {
         &self.0.pkey
@@ -306,6 +307,7 @@ impl SigningKey {
     }
 
     /// The underlying OpenSSL key.
+    #[doc(hidden)]
     #[must_use]
     pub fn pkey(&self) -> &Pkey<Private> {
         &self.pkey
