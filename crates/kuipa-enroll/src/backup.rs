@@ -53,9 +53,8 @@ pub struct Recipient {
 /// recipients' suite hashes.
 fn data_hash(algs: impl IntoIterator<Item = KemAlg>) -> &'static CStr {
     algs.into_iter()
-        .map(KemAlg::hash)
-        .max_by_key(|h| primitives::digest_len(h))
-        .unwrap_or(primitives::SHA256)
+        .max()
+        .map_or(primitives::SHA256, KemAlg::hash)
 }
 
 fn kem_of(ct: &[u8]) -> Result<KemAlg> {

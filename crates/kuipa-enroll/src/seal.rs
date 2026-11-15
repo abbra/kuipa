@@ -78,11 +78,10 @@ fn suite(ct: &[u8]) -> Result<&'static std::ffi::CStr> {
 /// The hash of a derivation over several KEMs' shares: the strongest
 /// suite hash among them.
 fn strongest(algs: impl IntoIterator<Item = tang_pqc::KemAlg>) -> &'static std::ffi::CStr {
-    let strongest = algs
-        .into_iter()
-        .max_by_key(|a| primitives::digest_len(a.hash()))
-        .unwrap_or(tang_pqc::KemAlg::MlKem768);
-    strongest.hash()
+    algs.into_iter()
+        .max()
+        .unwrap_or(tang_pqc::KemAlg::MlKem768)
+        .hash()
 }
 
 /// What an attestation proved about a device key (§7.6.2).
