@@ -359,12 +359,14 @@ fn head_pinned_client_enrolls_without_any_signature() {
         "a signature proof was served to a head-pinned client:\n{body}"
     );
     // And it verifies against the pinned head with no signature at all.
-    kuipa_enroll::realm::VerifiedRealm::verify_with_heads(
+    kuipa_enroll::realm::VerifiedRealm::verify_pinned(
         &adv,
         REALM,
-        &[*anchor.public().thumbprint()],
-        &[s.head().unwrap()],
-        &[],
+        &kuipa_enroll::delegation::Pinned {
+            anchors: &[*anchor.public().thumbprint()],
+            heads: &[s.head().unwrap()],
+            ..Default::default()
+        },
         &tang_pqc::Policy::default(),
         std::time::SystemTime::now(),
     )
@@ -3085,8 +3087,8 @@ fn pins_for(
     Vec<kuipa_enroll::delegation::HeadPin>,
     Vec<tang_pqc::Thumbprint>,
 ) {
-    let (anchors, heads, _, frozen) = kuipa_tools::paths::pinned_windows(&paths.anchors()).unwrap();
-    (anchors, heads, frozen)
+    let w = kuipa_tools::paths::pinned_windows(&paths.anchors()).unwrap();
+    (w.anchors, w.heads, w.frozen)
 }
 
 /// Pin lines, oldest-first windows and freezes as written by hand.
@@ -4065,7 +4067,7 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
     let path = hashes(&json("proof?index=4&size=5")["path"]);
     assert!(new.head.includes(&leaves[4], 4, &path).unwrap());
     let proof = hashes(&json("consistency?from=2&size=5")["proof"]);
-    assert!(new.head.extends(&old.head, &proof).unwrap());
+    assert!(new.head.extends(&old.head, &proof));
 
     // Bad or missing numbers, sizes beyond the log, another log's id.
     assert_eq!(get("proof?index=1").status(), 400);
