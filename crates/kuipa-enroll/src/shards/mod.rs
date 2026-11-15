@@ -114,15 +114,6 @@ fn crypto(e: impl fmt::Display) -> Error {
     Error::Crypto(e.to_string())
 }
 
-/// The KEM a header's one bit names.
-fn kem_alg(kem_1024: bool) -> tang_pqc::KemAlg {
-    if kem_1024 {
-        tang_pqc::KemAlg::MlKem1024
-    } else {
-        tang_pqc::KemAlg::MlKem768
-    }
-}
-
 /// What the header of a share says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -155,17 +146,17 @@ pub struct Share {
 
 /// The seed recovered from enough shares: still hidden under the passphrase.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Combined {
+struct Combined {
     /// The hidden seed; [`mask`] with the passphrase gives the seed.
-    pub hidden: [u8; 32],
+    hidden: [u8; 32],
     /// The PBKDF2 salt.
-    pub salt: [u8; 16],
+    salt: [u8; 16],
     /// PBKDF2 iterations, in units of [`ITERATION_UNIT`].
-    pub iterations: u8,
+    iterations: u8,
     /// The set the shares belong to.
-    pub set_id: u32,
-    /// Whether the recovery key is ML-KEM-1024.
-    pub kem_1024: bool,
+    set_id: u32,
+    /// The KEM of the recovery key.
+    kem: tang_pqc::KemAlg,
 }
 
 struct BitWriter {
@@ -309,7 +300,11 @@ impl Share {
             return Err(Error::Malformed("unknown format version"));
         }
         let set_id = r.take(19);
-        let kem = kem_alg(r.take(1) == 1);
+        let kem = if r.take(1) == 1 {
+            tang_pqc::KemAlg::MlKem1024
+        } else {
+            tang_pqc::KemAlg::MlKem768
+        };
         let threshold = small(r.take(4) + 1);
         let shares = small(r.take(4) + 1);
         let index = small(r.take(4) + 1);
@@ -405,42 +400,32 @@ pub struct SetParams {
     pub iterations: u8,
     /// Check words per share.
     pub parity: u8,
-    /// Whether the recovery key is ML-KEM-1024 (CNSA 2.0) and not ML-KEM-768.
-    pub kem_1024: bool,
 }
 
 impl SetParams {
     /// A threshold of `threshold` out of `shares`, with the default cost and check words.
     #[must_use]
-    pub fn new(threshold: u8, shares: u8, kem_1024: bool) -> Self {
+    pub fn new(threshold: u8, shares: u8) -> Self {
         SetParams {
             threshold,
             shares,
             iterations: DEFAULT_ITERATIONS,
             parity: DEFAULT_PARITY,
-            kem_1024,
         }
     }
 }
 
-/// Makes a set of shares for a seed already hidden under the passphrase ([`mask`]).
+/// Makes a set of `kem` shares for a seed already hidden under the passphrase ([`mask`]).
 ///
 /// # Errors
 ///
 /// [`Error::Parameters`] for a threshold below 2, more shares than [`MAX_SHARES`] or fewer than the
 /// threshold, an iteration count or parity outside their ranges; [`Error::Crypto`] if OpenSSL has
 /// no random bytes.
-pub fn make_shares(
-    hidden: &[u8; 32],
-    salt: [u8; 16],
-    params: SetParams,
-) -> Result<Vec<Share>, Error> {
-    make_shares_with(hidden, salt, params, &mut random)
-}
-
 fn make_shares_with(
     hidden: &[u8; 32],
     salt: [u8; 16],
+    kem: tang_pqc::KemAlg,
     params: SetParams,
     fill: &mut dyn FnMut(&mut [u8]) -> Result<(), Error>,
 ) -> Result<Vec<Share>, Error> {
@@ -449,9 +434,7 @@ fn make_shares_with(
         shares,
         iterations,
         parity,
-        kem_1024,
     } = params;
-    let kem = kem_alg(kem_1024);
     if threshold < 2 {
         return Err(Error::Parameters(
             "the threshold is at least 2: one share would be the whole key",
@@ -500,7 +483,7 @@ fn make_shares_with(
 ///
 /// [`Error::Mixed`] when the shares are of different sets or disagree about the set,
 /// [`Error::NotEnough`] with fewer different shares than the threshold.
-pub fn combine(shares: &[Share]) -> Result<Combined, Error> {
+fn combine(shares: &[Share]) -> Result<Combined, Error> {
     let first = shares
         .first()
         .ok_or(Error::NotEnough { have: 0, need: 2 })?;
@@ -541,31 +524,27 @@ pub fn combine(shares: &[Share]) -> Result<Combined, Error> {
         salt: first.salt,
         iterations: h.iterations,
         set_id: h.set_id,
-        kem_1024: h.kem == tang_pqc::KemAlg::MlKem1024,
+        kem: h.kem,
     })
 }
 
-/// A new recovery key of `kem`, hidden under `passphrase` and split as `p` says (`p.kem_1024` is
-/// ignored: `kem` decides): the shares to print and the key pair they recover.
+/// A new recovery key of `kem`, hidden under `passphrase` and split as `params` says: the shares
+/// to print and the key pair they recover.
 ///
 /// # Errors
 ///
-/// As [`make_shares`], [`mask`] and [`recovery_key`].
+/// As [`make_shares_with`], [`mask`] and [`recovery_key`].
 pub fn new_set(
     passphrase: &str,
     kem: tang_pqc::KemAlg,
-    p: SetParams,
+    params: SetParams,
 ) -> Result<(Vec<Share>, tang_pqc::ExchangeKeyPair), Error> {
-    let params = SetParams {
-        kem_1024: kem == tang_pqc::KemAlg::MlKem1024,
-        ..p
-    };
     let mut seed = [0u8; 32];
     random(&mut seed)?;
     let salt = new_salt()?;
     let hidden = mask(&seed, passphrase, &salt, params.iterations)?;
-    let shares = make_shares(&hidden, salt, params)?;
-    Ok((shares, recovery_key(&seed, params.kem_1024)?))
+    let shares = make_shares_with(&hidden, salt, kem, params, &mut random)?;
+    Ok((shares, recovery_key(&seed, kem)?))
 }
 
 /// The recovery key `shares` of one set and `passphrase` make: [`combine`], [`mask`] and
@@ -577,7 +556,7 @@ pub fn new_set(
 pub fn recover(shares: &[Share], passphrase: &str) -> Result<tang_pqc::ExchangeKeyPair, Error> {
     let c = combine(shares)?;
     let seed = mask(&c.hidden, passphrase, &c.salt, c.iterations)?;
-    recovery_key(&seed, c.kem_1024)
+    recovery_key(&seed, c.kem)
 }
 
 /// A new random PBKDF2 salt.
@@ -585,7 +564,7 @@ pub fn recover(shares: &[Share], passphrase: &str) -> Result<tang_pqc::ExchangeK
 /// # Errors
 ///
 /// [`Error::Crypto`] if OpenSSL has no random bytes.
-pub fn new_salt() -> Result<[u8; 16], Error> {
+fn new_salt() -> Result<[u8; 16], Error> {
     let mut salt = [0u8; 16];
     random(&mut salt)?;
     Ok(salt)
@@ -593,7 +572,7 @@ pub fn new_salt() -> Result<[u8; 16], Error> {
 
 /// The passphrase as it is used: Unicode NFKC, so that it types the same on any keyboard.
 #[must_use]
-pub(crate) fn normalize_passphrase(passphrase: &str) -> String {
+fn normalize_passphrase(passphrase: &str) -> String {
     passphrase.nfkc().collect()
 }
 
@@ -605,7 +584,7 @@ pub(crate) fn normalize_passphrase(passphrase: &str) -> String {
 ///
 /// [`Error::Parameters`] for an iteration count outside its range, [`Error::Crypto`] if OpenSSL
 /// fails.
-pub fn mask(
+fn mask(
     seed: &[u8; 32],
     passphrase: &str,
     salt: &[u8; 16],
@@ -638,8 +617,10 @@ pub fn mask(
 /// # Errors
 ///
 /// [`Error::Crypto`] if OpenSSL fails or the system crypto policy disables the KEM.
-pub fn recovery_key(seed: &[u8; 32], kem_1024: bool) -> Result<tang_pqc::ExchangeKeyPair, Error> {
-    let alg = kem_alg(kem_1024);
+fn recovery_key(
+    seed: &[u8; 32],
+    alg: tang_pqc::KemAlg,
+) -> Result<tang_pqc::ExchangeKeyPair, Error> {
     let mut dz = [0u8; 64];
     RECOVERY_DOMAIN
         .hkdf(alg.hash(), &[seed], "seed", &[], &mut dz)

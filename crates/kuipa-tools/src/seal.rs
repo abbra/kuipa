@@ -1898,18 +1898,11 @@ impl<'a> SealClient<'a> {
             .user
             .device(device, self.authenticator)?
             .into_file("shards")?;
-        let mut seed = [0u8; 32];
-        Rand::fill_private(&mut seed)?;
-        let params = shards::SetParams::new(threshold, shares, false);
-        let salt = shards::new_salt()?;
-        let hidden = shards::mask(
-            &seed,
+        let (made, pair) = shards::new_set(
             &String::from_utf8_lossy(recovery),
-            &salt,
-            params.iterations,
+            KemAlg::MlKem768,
+            shards::SetParams::new(threshold, shares),
         )?;
-        let made = shards::make_shares(&hidden, salt, params)?;
-        let pair = shards::recovery_key(&seed, false)?;
         let registration = ShardsRegistration {
             key: pair.public().kid().to_string(),
             set: made[0].header.set_id,
@@ -2092,14 +2085,7 @@ impl<'a> SealClient<'a> {
         Error,
     > {
         let (read, report) = Self::gather_shares(words)?;
-        let combined = shards::combine(&read)?;
-        let seed = shards::mask(
-            &combined.hidden,
-            &String::from_utf8_lossy(recovery),
-            &combined.salt,
-            combined.iterations,
-        )?;
-        let pair = shards::recovery_key(&seed, combined.kem_1024)?;
+        let pair = shards::recover(&read, &String::from_utf8_lossy(recovery))?;
         let rows = self.op_with_session(&SealOp::RecoverShards)?.reply.escrows;
         let registration = registration_of(&rows).ok_or("no recovery shard set is registered")?;
         if pair.public().kid().to_string() != registration.key {

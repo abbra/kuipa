@@ -36,12 +36,12 @@ fn set(rng: &mut Lcg, threshold: u8, shares: u8, parity: u8) -> Vec<Share> {
     make_shares_with(
         &SEED,
         SALT,
+        tang_pqc::KemAlg::MlKem768,
         SetParams {
             threshold,
             shares,
             iterations: DEFAULT_ITERATIONS,
             parity,
-            kem_1024: false,
         },
         &mut |b| {
             rng.fill(b);
@@ -104,12 +104,12 @@ fn parameters_outside_what_a_share_can_say_are_refused() {
         make_shares_with(
             &SEED,
             SALT,
+            tang_pqc::KemAlg::MlKem768,
             SetParams {
                 threshold: t,
                 shares: m,
                 iterations: it,
                 parity: p,
-                kem_1024: false,
             },
             &mut |b| {
                 rng.fill(b);
@@ -219,9 +219,10 @@ fn the_whole_way_a_passphrase_then_shares_then_the_seed_back() {
     let shares = make_shares_with(
         &hidden,
         SALT,
+        tang_pqc::KemAlg::MlKem1024,
         SetParams {
             iterations: 1,
-            ..SetParams::new(3, 5, true)
+            ..SetParams::new(3, 5)
         },
         &mut |b| {
             rng.fill(b);
@@ -292,16 +293,19 @@ fn the_whole_way_a_passphrase_then_shares_then_the_seed_back() {
             combined.iterations,
         )
         .unwrap(),
-        combined.kem_1024,
+        combined.kem,
     )
     .unwrap();
     assert_eq!(
         made.public().kid(),
-        recovery_key(&SEED, true).unwrap().public().kid()
+        recovery_key(&SEED, tang_pqc::KemAlg::MlKem1024)
+            .unwrap()
+            .public()
+            .kid()
     );
     assert_ne!(
         made.public().kid(),
-        recovery_key(&SEED, false).unwrap().public().kid()
+        recovery_key(&SEED, tang_pqc::KemAlg::MlKem768).unwrap().public().kid()
     );
 }
 
@@ -365,25 +369,18 @@ fn a_share_has_these_words_for_these_parameters() {
 /// 64 bytes, which is what the private JWK carries as `priv`.
 #[test]
 fn a_seed_makes_this_key_for_each_kem() {
-    for (kem_1024, expected) in [
+    for (kem, expected) in [
         (
-            false,
+            tang_pqc::KemAlg::MlKem768,
             "oH38v8DHgrwhol2UA808M0GRbGHpdXI0BKPviWGRroq5pnJ2cYItxYtWV0_NghWNx21T6jx5Nd06WpDJIXjtrw",
         ),
         (
-            true,
+            tang_pqc::KemAlg::MlKem1024,
             "VgAP8VBp5am-M8lTFAgAUIUjBk-eeAauzd1HjYNYI1P828uLZbsS3PHJPSNvHF-E_PpG0Fz1dULDlXVEm99gGQ",
         ),
     ] {
-        let key = recovery_key(&SEED, kem_1024).unwrap();
-        assert_eq!(
-            key.public().alg().jose_name(),
-            if kem_1024 {
-                "ML-KEM-1024"
-            } else {
-                "ML-KEM-768"
-            }
-        );
+        let key = recovery_key(&SEED, kem).unwrap();
+        assert_eq!(key.public().alg(), kem);
         let jwk: serde_json::Value =
             serde_json::from_slice(key.to_jwk().unwrap().as_ref()).unwrap();
         assert_eq!(jwk["priv"].as_str().unwrap(), expected);
@@ -395,7 +392,7 @@ fn a_new_set_recovers_its_key_from_any_threshold_of_shares() {
     for kem in tang_pqc::KemAlg::ALL {
         let p = SetParams {
             iterations: 1,
-            ..SetParams::new(2, 3, !matches!(kem, tang_pqc::KemAlg::MlKem1024))
+            ..SetParams::new(2, 3)
         };
         let (shares, pair) = new_set("correct horse battery staple", kem, p).unwrap();
         assert_eq!(shares.len(), 3);

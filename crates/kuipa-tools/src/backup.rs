@@ -8,7 +8,6 @@ use std::path::Path;
 
 use kuipa_enroll::backup::{self, Recipient};
 use kuipa_enroll::shards::{self, Share};
-use native_ossl::rand::Rand;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tang_pqc::{ExchangeKey, ExchangeKeyPair, KemAlg, Policy};
@@ -87,19 +86,16 @@ pub fn create_key(
     threshold: u8,
     shares: u8,
 ) -> Result<NewSet, Error> {
-    let kem_1024 = !Policy::from_system()?.allows_kem(KemAlg::MlKem768);
-    let mut seed = [0u8; 32];
-    Rand::fill_private(&mut seed)?;
-    let params = shards::SetParams::new(threshold, shares, kem_1024);
-    let salt = shards::new_salt()?;
-    let hidden = shards::mask(
-        &seed,
+    let kem = if Policy::from_system()?.allows_kem(KemAlg::MlKem768) {
+        KemAlg::MlKem768
+    } else {
+        KemAlg::MlKem1024
+    };
+    let (made, pair) = shards::new_set(
         &String::from_utf8_lossy(recovery),
-        &salt,
-        params.iterations,
+        kem,
+        shards::SetParams::new(threshold, shares),
     )?;
-    let made = shards::make_shares(&hidden, salt, params)?;
-    let pair = shards::recovery_key(&seed, kem_1024)?;
     let file = RecipientFile {
         realm: realm.to_owned(),
         key_id: pair.public().kid().to_string(),
@@ -137,14 +133,7 @@ pub fn recover_key(
     recovery: &[u8],
 ) -> Result<(ExchangeKeyPair, Vec<Value>), Error> {
     let (read, report) = SealClient::gather_shares(words)?;
-    let combined = shards::combine(&read)?;
-    let seed = shards::mask(
-        &combined.hidden,
-        &String::from_utf8_lossy(recovery),
-        &combined.salt,
-        combined.iterations,
-    )?;
-    let pair = shards::recovery_key(&seed, combined.kem_1024)?;
+    let pair = shards::recover(&read, &String::from_utf8_lossy(recovery))?;
     Ok((pair, report))
 }
 
