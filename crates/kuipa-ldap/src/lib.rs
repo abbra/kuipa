@@ -29,12 +29,13 @@ use thiserror::Error;
 
 /// Error from an LDAP operation.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum LdapError {
     /// The server (or libldap) returned a non-success result.
     #[error("LDAP protocol error {code}: {msg}")]
     Protocol {
         /// LDAP result code.
-        code: c_int,
+        code: i32,
         /// Server diagnostic message.
         msg: String,
     },
@@ -43,16 +44,7 @@ pub enum LdapError {
     Tls(String),
     /// An argument contained an interior NUL byte.
     #[error("NUL byte in argument: {0}")]
-    NulByte(String),
-    /// A background task panicked.
-    #[error("background task panicked")]
-    TaskPanic,
-}
-
-impl From<std::ffi::NulError> for LdapError {
-    fn from(e: std::ffi::NulError) -> Self {
-        LdapError::NulByte(e.to_string())
-    }
+    NulByte(#[from] std::ffi::NulError),
 }
 
 /// LDAP search scope.

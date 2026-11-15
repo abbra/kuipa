@@ -11,7 +11,7 @@
 //! integrating with async runtimes.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, NulError};
+use std::ffi::{CStr, CString};
 use std::ptr;
 
 use libc::{c_char, c_int, c_void, timeval};
@@ -139,7 +139,7 @@ impl LdapConnection {
         let starttls = needs_tls && uri.starts_with("ldap://");
         debug!(uri, tls = needs_tls, starttls, "LDAP connect");
 
-        let uri_c = cstr(uri)?;
+        let uri_c = CString::new(uri)?;
         let mut ld: *mut LDAP = ptr::null_mut();
 
         // SAFETY: uri_c is a valid NUL-terminated C string produced by CString::new; ldap_initialize writes into &mut ld which is properly initialised to null.
@@ -199,7 +199,7 @@ impl LdapConnection {
         if let Some(ca_path) = tls_ca_cert_file {
             std::fs::metadata(ca_path)
                 .map_err(|e| LdapError::Tls(format!("cannot read TLS CA cert '{ca_path}': {e}")))?;
-            let path_c = cstr(ca_path)?;
+            let path_c = CString::new(ca_path)?;
             // SAFETY: conn.ld is non-null; path_c is a valid NUL-terminated C string produced by CString::new and lives for the duration of this call.
             let rc = unsafe {
                 ffi::ldap_set_option(
@@ -273,7 +273,7 @@ impl LdapConnection {
     }
 
     fn bind_simple(&mut self, bind_dn: &str, password: &[u8]) -> Result<(), LdapError> {
-        let dn_c = cstr(bind_dn)?;
+        let dn_c = CString::new(bind_dn)?;
         let pw_bytes = password;
         let mut pw_bv = berval {
             bv_len: pw_bytes.len() as ffi::ber_len_t,
@@ -499,7 +499,7 @@ impl LdapConnection {
         oid: &str,
         value: Option<&[u8]>,
     ) -> Result<ExtendedResult, LdapError> {
-        let oid_c = cstr(oid)?;
+        let oid_c = CString::new(oid)?;
         let mut req_bv = value.map(|v| ffi::berval {
             bv_len: v.len() as ffi::ber_len_t,
             bv_val: v.as_ptr() as *mut c_char,
@@ -672,12 +672,12 @@ impl LdapConnection {
     ) -> Result<Vec<SearchEntry>, LdapError> {
         debug!(base, ?scope, filter, "LDAP search");
 
-        let base_c = cstr(base)?;
-        let filter_c = cstr(filter)?;
+        let base_c = CString::new(base)?;
+        let filter_c = CString::new(filter)?;
 
         // Build a NULL-terminated *mut *mut c_char array for the attribute list.
         let attr_cstrings: Vec<CString> =
-            attrs.iter().map(|a| cstr(a)).collect::<Result<_, _>>()?;
+            attrs.iter().map(|a| CString::new(*a)).collect::<Result<_, _>>()?;
         let mut attr_ptrs: Vec<*mut c_char> = attr_cstrings
             .iter()
             .map(|s| s.as_ptr().cast_mut())
@@ -761,7 +761,7 @@ impl LdapConnection {
         dn: &str,
         mods: &[(ModOp, &str, Vec<&[u8]>)],
     ) -> Result<(), LdapError> {
-        let dn_c = cstr(dn)?;
+        let dn_c = CString::new(dn)?;
 
         // For each modification we need:
         //   - CString for the attribute name
@@ -777,7 +777,7 @@ impl LdapConnection {
         let mut ldap_mods: Vec<ffi::LDAPMod> = Vec::with_capacity(mods.len());
 
         for (_op, attr, values) in mods {
-            attr_cstrings.push(cstr(attr)?);
+            attr_cstrings.push(CString::new(*attr)?);
             let bvs: Vec<ffi::berval> = values
                 .iter()
                 .map(|v| ffi::berval {
@@ -826,60 +826,6 @@ impl LdapConnection {
         };
         check(rc, "ldap_modify_ext_s")
     }
-    /// LDAP simple bind that also sends the `OTP_REQUIRED_OID` client control.
-    ///
-    /// FreeIPA's `ipa-pwd-extop` plugin checks for this control and rejects the
-    /// bind if the password does not contain a valid OTP code suffix, even when
-    /// the password alone would be accepted.
-    ///
-    /// `credential` must be the concatenated `password+otp_code` string; the
-    /// caller is responsible for zeroing it after this call returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LdapError::Protocol`] if the bind request or result
-    /// retrieval fails or the server rejects the credentials;
-    /// [`LdapError::NulByte`] if `bind_dn` or `credential` has an interior
-    /// NUL.
-    pub fn bind_simple_otp_required(
-        &mut self,
-        bind_dn: &str,
-        credential: &str,
-    ) -> Result<(), LdapError> {
-        const OTP_REQUIRED_OID: &std::ffi::CStr = c"2.16.840.1.113730.3.8.10.7";
-
-        let dn_c = cstr(bind_dn)?;
-        let cred_bytes = credential.as_bytes();
-        let mut cred_bv = ffi::berval {
-            bv_len: cred_bytes.len() as ffi::ber_len_t,
-            bv_val: cred_bytes.as_ptr() as *mut c_char,
-        };
-        let mut ctrl = ffi::LDAPControl {
-            ldctl_oid: OTP_REQUIRED_OID.as_ptr().cast_mut(),
-            ldctl_value: ffi::berval {
-                bv_len: 0,
-                bv_val: ptr::null_mut(),
-            },
-            ldctl_iscritical: 0,
-        };
-        let mut ctrl_list: [*mut ffi::LDAPControl; 2] = [&raw mut ctrl, ptr::null_mut()];
-        let mut msgid: c_int = -1;
-        // SAFETY: self.ld is non-null; dn_c, cred_bv, and ctrl live for the
-        // duration of the call; OTP_REQUIRED_OID is a static C string.
-        let rc = unsafe {
-            ffi::ldap_sasl_bind(
-                self.ld,
-                dn_c.as_ptr(),
-                ptr::null(),
-                &raw mut cred_bv,
-                ptr::null_mut(),
-                ctrl_list.as_mut_ptr(),
-                &raw mut msgid,
-            )
-        };
-        check(rc, "ldap_sasl_bind (otp-required)")?;
-        self.collect_result(msgid, "otp-required bind")
-    }
 
     /// Add a new LDAP entry.
     ///
@@ -892,7 +838,7 @@ impl LdapConnection {
     /// [`LdapError::NulByte`] if `dn` or any attribute name has an interior
     /// NUL.
     pub fn add_s(&mut self, dn: &str, attrs: &[(&str, Vec<&[u8]>)]) -> Result<(), LdapError> {
-        let dn_c = cstr(dn)?;
+        let dn_c = CString::new(dn)?;
 
         let mut attr_cstrings: Vec<CString> = Vec::with_capacity(attrs.len());
         let mut berval_vecs: Vec<Vec<ffi::berval>> = Vec::with_capacity(attrs.len());
@@ -911,7 +857,7 @@ impl LdapConnection {
         }
 
         for (attr, _values) in attrs {
-            attr_cstrings.push(cstr(attr)?);
+            attr_cstrings.push(CString::new(*attr)?);
         }
 
         for bvs in &mut berval_vecs {
@@ -946,34 +892,6 @@ impl LdapConnection {
         check(rc, "ldap_add_ext_s")
     }
 
-    /// Query the LDAP rootDSE for the server's primary naming context.
-    ///
-    /// Prefers `defaultNamingContext` (set by FreeIPA / Active Directory) and falls
-    /// back to the first value of `namingContexts`.  Does not require a prior bind
-    /// (rootDSE is publicly readable in standard LDAP deployments).
-    ///
-    /// Returns `Ok(Some(suffix))` on success, `Ok(None)` when the server does not
-    /// advertise a naming context, and `Err` on connection/protocol failures.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`LdapError::Protocol`] from the rootDSE search.
-    pub fn fetch_naming_context(&mut self) -> Result<Option<String>, LdapError> {
-        let entries = self.search(
-            "",
-            Scope::Base,
-            "(objectClass=*)",
-            &["defaultNamingContext", "namingContexts"],
-        )?;
-        Ok(entries.into_iter().next().and_then(|e| {
-            e.attrs
-                .get("defaultnamingcontext")
-                .or_else(|| e.attrs.get("namingcontexts"))
-                .and_then(|v| v.first())
-                .cloned()
-        }))
-    }
-
     /// Delete an existing LDAP entry by DN.
     ///
     /// # Errors
@@ -982,7 +900,7 @@ impl LdapConnection {
     /// (including `NO_SUCH_OBJECT`); [`LdapError::NulByte`] if `dn` has an
     /// interior NUL.
     pub fn delete_s(&mut self, dn: &str) -> Result<(), LdapError> {
-        let dn_c = cstr(dn)?;
+        let dn_c = CString::new(dn)?;
         // SAFETY: self.ld is non-null; dn_c is a valid NUL-terminated string
         // that outlives the call.
         let rc = unsafe {
@@ -1139,11 +1057,6 @@ unsafe fn decode_bervals(vals_ptr: *mut *mut berval) -> (Vec<String>, Vec<Vec<u8
     (str_vals, bin_vals)
 }
 
-/// Convert an `&str` to a `CString`, mapping interior-NUL errors to `LdapError`.
-pub(crate) fn cstr(s: &str) -> Result<CString, LdapError> {
-    CString::new(s).map_err(|e: NulError| LdapError::NulByte(e.to_string()))
-}
-
 /// Convert an LDAP result code to an owned error message string.
 fn err_string(code: c_int) -> String {
     // SAFETY: ldap_err2string returns a pointer to a static string (never null
@@ -1242,18 +1155,11 @@ mod tests {
     }
 
     #[test]
-    fn cstr_valid_string_roundtrips() {
-        let c = cstr("uid=alice,dc=example,dc=com").expect("no NUL");
-        assert_eq!(c.to_str().unwrap(), "uid=alice,dc=example,dc=com");
-    }
-
-    #[test]
-    fn cstr_nul_byte_returns_nul_byte_error() {
-        let err = cstr("hel\0lo").expect_err("NUL byte must be rejected");
-        assert!(
-            matches!(err, LdapError::NulByte(_)),
-            "unexpected variant: {err:?}"
-        );
+    fn nul_byte_in_argument_is_rejected() {
+        let mut conn =
+            LdapConnection::connect("ldap://127.0.0.1:38999", None, false, 5).expect("initialize");
+        let err = conn.delete_s("uid=a\0,dc=test").expect_err("NUL byte must be rejected");
+        assert!(matches!(err, LdapError::NulByte(_)), "unexpected variant: {err:?}");
     }
 
     #[test]
@@ -1271,12 +1177,6 @@ mod tests {
     fn ldap_error_display_tls() {
         let e = LdapError::Tls("cert verify failed".into());
         assert!(e.to_string().contains("cert verify failed"));
-    }
-
-    #[test]
-    fn ldap_error_display_nul_byte() {
-        let e = LdapError::NulByte("interior NUL".into());
-        assert!(e.to_string().contains("interior NUL"));
     }
 
     #[test]

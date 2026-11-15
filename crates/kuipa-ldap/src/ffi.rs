@@ -7,7 +7,7 @@
 //! Struct layouts are verified against `libldap-sys 0.2` bindgen output for
 //! `OpenLDAP` 2.6 on x86-64 Linux.
 
-#![allow(non_camel_case_types, dead_code)]
+#![allow(non_camel_case_types)]
 #![allow(clippy::upper_case_acronyms, clippy::struct_field_names)] // names mirror the C headers
 
 use libc::{c_char, c_int, c_uint, c_ulong, c_void, timeval};
@@ -103,9 +103,6 @@ pub(crate) const LDAP_OPT_ERROR: c_int = -1;
 
 /// Option: `LDAPv3` protocol version (`int *` argument).
 pub(crate) const LDAP_OPT_PROTOCOL_VERSION: c_int = 0x0011;
-
-/// Option: socket file descriptor of the current connection (`int *` out-argument).
-pub(crate) const LDAP_OPT_DESC: c_int = 0x0001;
 
 /// Option: path to a PEM CA certificate file for TLS (`char *` argument).
 pub(crate) const LDAP_OPT_X_TLS_CACERTFILE: c_int = 0x6002;
@@ -203,10 +200,6 @@ extern "C" {
 
     /// Set a session option.  `invalue` is option-specific; see `LDAP_OPT_*`.
     pub(crate) fn ldap_set_option(ld: *mut LDAP, option: c_int, invalue: *const c_void) -> c_int;
-
-    /// Read a session option into `outvalue`.  `outvalue` is option-specific;
-    /// see `LDAP_OPT_*`.  Use [`LDAP_OPT_DESC`] to get the underlying socket fd.
-    pub(crate) fn ldap_get_option(ld: *mut LDAP, option: c_int, outvalue: *mut c_void) -> c_int;
 
     /// Upgrade a plain `ldap://` connection to TLS using STARTTLS.
     ///
@@ -320,9 +313,6 @@ extern "C" {
 
     /// Return the next entry after `entry`.
     pub(crate) fn ldap_next_entry(ld: *mut LDAP, entry: *mut LDAPMessage) -> *mut LDAPMessage;
-
-    /// Return the count of entries in a result chain.
-    pub(crate) fn ldap_count_entries(ld: *mut LDAP, chain: *mut LDAPMessage) -> c_int;
 
     /// Return the DN of `entry` as a malloc'd C string; free with [`ldap_memfree`].
     pub(crate) fn ldap_get_dn(ld: *mut LDAP, entry: *mut LDAPMessage) -> *mut c_char;
