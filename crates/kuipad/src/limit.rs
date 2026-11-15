@@ -14,10 +14,13 @@
 //! unthrottled.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 use std::time::Instant;
 
+use axum::http::HeaderMap;
 use serde::Deserialize;
+
+use crate::lock;
 
 /// One limit.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -60,6 +63,14 @@ struct Bucket {
     at: Instant,
 }
 
+impl Bucket {
+    /// Tokens held at `now`, refilled at `rate`.
+    fn level(&self, rate: Rate, now: Instant) -> f64 {
+        let minutes = now.duration_since(self.at).as_secs_f64() / 60.0;
+        (self.tokens + minutes * rate.per_minute).min(rate.burst)
+    }
+}
+
 /// Most buckets kept per table (hosts, sources): the tables evict beyond
 /// this, so memory cannot grow with the number of distinct keys a client
 /// sends.  Generous for real realms and client populations.
@@ -82,35 +93,40 @@ fn key(k: &str) -> &str {
     }
 }
 
-#[derive(Debug, Default)]
-struct Table {
-    buckets: HashMap<String, Bucket>,
+/// A host's bucket key: case-insensitive, truncated.
+fn host_key(host: &str) -> String {
+    key(host).to_ascii_lowercase()
 }
 
+/// Buckets by key, behind their own lock.
+#[derive(Debug, Default)]
+struct Table(Mutex<HashMap<String, Bucket>>);
+
 impl Table {
-    fn take(&mut self, key: &str, rate: Rate, now: Instant) -> bool {
+    fn take(&self, key: &str, rate: Rate, now: Instant) -> bool {
+        let mut buckets = lock(&self.0);
         // Cheap first pass: any table at the cap drops buckets that are
         // full again (idle), which is almost always enough.
-        if self.buckets.len() >= TABLE_CAP {
-            self.buckets.retain(|_, b| level(b, rate, now) < rate.burst);
+        if buckets.len() >= TABLE_CAP {
+            buckets.retain(|_, b| b.level(rate, now) < rate.burst);
         }
         // Still at the cap — a sustained flood of distinct names: evict
         // the least recently used until there is room.  The bucket being
         // taken now has the newest `at`, so it survives its own insertion.
-        while self.buckets.len() >= TABLE_CAP {
-            match self.buckets.iter().min_by_key(|(_, b)| b.at) {
+        while buckets.len() >= TABLE_CAP {
+            match buckets.iter().min_by_key(|(_, b)| b.at) {
                 Some((oldest, _)) if oldest != key => {
                     let oldest = oldest.clone();
-                    self.buckets.remove(&oldest);
+                    buckets.remove(&oldest);
                 }
                 _ => break,
             }
         }
-        let bucket = self.buckets.entry(key.to_owned()).or_insert(Bucket {
+        let bucket = buckets.entry(key.to_owned()).or_insert(Bucket {
             tokens: rate.burst,
             at: now,
         });
-        bucket.tokens = level(bucket, rate, now);
+        bucket.tokens = bucket.level(rate, now);
         bucket.at = now;
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -120,15 +136,17 @@ impl Table {
         }
     }
 
+    /// Whether `key` would be admitted, using nothing.
+    fn has_tokens(&self, key: &str, rate: Rate, now: Instant) -> bool {
+        lock(&self.0)
+            .get(key)
+            .is_none_or(|b| b.level(rate, now) >= 1.0)
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.buckets.len()
+        lock(&self.0).len()
     }
-}
-
-fn level(b: &Bucket, rate: Rate, now: Instant) -> f64 {
-    let minutes = now.duration_since(b.at).as_secs_f64() / 60.0;
-    (b.tokens + minutes * rate.per_minute).min(rate.burst)
 }
 
 /// What a refusal was for.
@@ -140,12 +158,23 @@ pub enum Limited {
     Source,
 }
 
+impl std::fmt::Display for Limited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Host => "too many requests for this host",
+            Self::Source => "too many requests from this source",
+        })
+    }
+}
+
+impl std::error::Error for Limited {}
+
 /// The rate limiter.
 #[derive(Debug, Default)]
 pub struct Limiter {
     limits: Limits,
-    hosts: Mutex<Table>,
-    sources: Mutex<Table>,
+    hosts: Table,
+    sources: Table,
 }
 
 impl Limiter {
@@ -176,9 +205,11 @@ impl Limiter {
     ///
     /// [`Limited::Source`] when it is empty.
     pub fn check_source(&self, source: Option<&str>) -> Result<(), Limited> {
-        let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
         let key = key(source.unwrap_or(UNSOURCED));
-        if sources.take(key, self.limits.per_source, Instant::now()) {
+        if self
+            .sources
+            .take(key, self.limits.per_source, Instant::now())
+        {
             Ok(())
         } else {
             Err(Limited::Source)
@@ -192,34 +223,26 @@ impl Limiter {
     ///
     /// [`Limited::Host`] when it is empty.
     pub fn host_open(&self, host: &str) -> Result<(), Limited> {
-        let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        let open = hosts
-            .buckets
-            .get(key(&host.to_ascii_lowercase()))
-            .is_none_or(|b| level(b, self.limits.per_host, Instant::now()) >= 1.0);
+        let open = self
+            .hosts
+            .has_tokens(&host_key(host), self.limits.per_host, Instant::now());
         if open { Ok(()) } else { Err(Limited::Host) }
     }
 
     /// Take one token from `host`'s bucket: called when a guessable
     /// credential (an OTP) failed, so that only failures use the allowance.
     pub fn charge_host(&self, host: &str) {
-        let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        hosts.take(
-            key(&host.to_ascii_lowercase()),
-            self.limits.per_host,
-            Instant::now(),
-        );
+        self.hosts
+            .take(&host_key(host), self.limits.per_host, Instant::now());
     }
 
     fn check_at(&self, host: &str, source: Option<&str>, now: Instant) -> Result<(), Limited> {
-        if let Some(source) = source {
-            let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
-            if !sources.take(key(source), self.limits.per_source, now) {
-                return Err(Limited::Source);
-            }
+        if let Some(source) = source
+            && !self.sources.take(key(source), self.limits.per_source, now)
+        {
+            return Err(Limited::Source);
         }
-        let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        if hosts.take(key(&host.to_ascii_lowercase()), self.limits.per_host, now) {
+        if self.hosts.take(&host_key(host), self.limits.per_host, now) {
             Ok(())
         } else {
             Err(Limited::Host)
@@ -229,10 +252,7 @@ impl Limiter {
     /// The state of both tables, for tests.
     #[cfg(test)]
     fn sizes(&self) -> (usize, usize) {
-        (
-            self.hosts.lock().unwrap().len(),
-            self.sources.lock().unwrap().len(),
-        )
+        (self.hosts.len(), self.sources.len())
     }
 }
 
@@ -240,8 +260,11 @@ impl Limiter {
 /// last entry is the one httpd itself saw, earlier ones are what the
 /// client claimed.
 #[must_use]
-pub fn forwarded_source(header: Option<&str>) -> Option<String> {
-    header?
+pub fn forwarded_source(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
         .rsplit(',')
         .next()
         .map(str::trim)
@@ -403,16 +426,20 @@ mod tests {
 
     #[test]
     fn source_from_forwarded_for() {
-        assert_eq!(forwarded_source(None), None);
+        let of = |v: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(v) = v {
+                h.insert("x-forwarded-for", v.parse().unwrap());
+            }
+            forwarded_source(&h)
+        };
+        assert_eq!(of(None), None);
+        assert_eq!(of(Some("203.0.113.1")).as_deref(), Some("203.0.113.1"));
         assert_eq!(
-            forwarded_source(Some("203.0.113.1")).as_deref(),
-            Some("203.0.113.1")
-        );
-        assert_eq!(
-            forwarded_source(Some("10.0.0.1, 203.0.113.1")).as_deref(),
+            of(Some("10.0.0.1, 203.0.113.1")).as_deref(),
             Some("203.0.113.1"),
             "the entry httpd added, not what the client claimed"
         );
-        assert_eq!(forwarded_source(Some("  ")), None);
+        assert_eq!(of(Some("  ")), None);
     }
 }
