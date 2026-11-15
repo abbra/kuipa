@@ -136,15 +136,14 @@ fn main() -> ExitCode {
             interval,
             once,
         } => {
-            let signing = match kuipa_tools::paths::read(key)
-                .and_then(|b| Ok(SigningKey::from_jwk(&b)?))
-            {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("kuipa-witness: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            let signing =
+                match kuipa_tools::paths::read(key).and_then(|b| Ok(SigningKey::from_jwk(&b)?)) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("kuipa-witness: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
             let anchors: Result<Vec<tang_pqc::Thumbprint>, _> =
                 anchor.iter().map(|a| a.parse()).collect();
             let Ok(anchors) = anchors else {

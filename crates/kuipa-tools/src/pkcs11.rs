@@ -39,7 +39,12 @@ impl TokenKey {
     ///
     /// The provider, the token or the key cannot be reached, or the key is
     /// not ML-KEM-768 or ML-KEM-1024.
-    pub(crate) fn open(module: &Path, uri: &str, pin: &[u8], scratch: &Path) -> Result<Self, Error> {
+    pub(crate) fn open(
+        module: &Path,
+        uri: &str,
+        pin: &[u8],
+        scratch: &Path,
+    ) -> Result<Self, Error> {
         let ctx = Arc::new(LibCtx::new()?);
         let conf = scratch.join(format!("pkcs11-{}.cnf", std::process::id()));
         std::fs::create_dir_all(scratch)?;

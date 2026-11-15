@@ -6,6 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 
+use kuipa_enroll::Enrollment;
 use kuipa_enroll::bundle::{Bundle, Opener};
 use kuipa_enroll::delegation::{Delegation, HeadPin};
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
@@ -18,7 +19,6 @@ use kuipa_enroll::join::{
 use kuipa_enroll::keys::{KeysFetch, Namespace, WrapAlg};
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::merkle::Hash;
-use kuipa_enroll::Enrollment;
 use kuipa_enroll::realm::{
     Deployment, KdcProxy, TrustedRealm, VerifiedRealm, krb5_proxied_realm_section,
     krb5_realm_section,
@@ -177,9 +177,7 @@ fn frozen_gate(
 ) -> Result<(), Error> {
     for f in frozen {
         if !head_proves(advertisement, f, &window_of(wanted, f)) {
-            return Err(format!(
-                "frozen: the pinned head of {f} does not prove this claim"
-            ).into());
+            return Err(format!("frozen: the pinned head of {f} does not prove this claim").into());
         }
     }
     Ok(())
@@ -279,8 +277,7 @@ pub(crate) fn verified(
     // The whole window travels, one head per line and all of them: the
     // server tries each pinned head in turn (§1.4), and a claim only
     // under the newest head has no proof under the oldest.
-    let adv = endpoint
-        .advertisement_with_heads(&pins, &wanted_heads)?;
+    let adv = endpoint.advertisement_with_heads(&pins, &wanted_heads)?;
     let advertisement = VerifiedRealm::verify_with_heads(
         &adv,
         realm,
@@ -2559,7 +2556,9 @@ pub fn advertisements(
         };
         match detail {
             Ok(value) => servers.push(value),
-            Err(e) => servers.push(json!({ "server": server, "ok": false, "error": e.to_string() })),
+            Err(e) => {
+                servers.push(json!({ "server": server, "ok": false, "error": e.to_string() }))
+            }
         }
     }
     // Inverse index of the same verified facts, keyed by thumbprint: one
@@ -2768,13 +2767,13 @@ fn landmark_chain(
     let mut out = Vec::new();
     let mut reached: Option<(u64, kuipa_enroll::epoch::EpochHead)> = None;
     while reached != Some((head_seq, head)) {
-        let page = endpoint
-            .anchor_log(reached.map_or(0, |(seq, _)| seq))?;
+        let page = endpoint.anchor_log(reached.map_or(0, |(seq, _)| seq))?;
         if page.is_empty() {
             return Err(format!(
                 "its anchor log ends at sequence {}, not the {head_seq} its advertisement names",
                 reached.map_or(0, |(seq, _)| seq),
-            ).into());
+            )
+            .into());
         }
         reached = Some(verify_chain(&page, realm, anchors, reached, &policy)?);
         for signed in &page {

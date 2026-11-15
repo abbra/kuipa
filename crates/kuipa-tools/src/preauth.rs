@@ -48,7 +48,11 @@ pub fn prompt(what: &str, hidden: bool) -> Result<SecretBuf, Error> {
 /// so it may be empty or start with a multi-byte character.
 fn capitalised(what: &str) -> String {
     let mut chars = what.chars();
-    let head: String = chars.next().into_iter().flat_map(char::to_uppercase).collect();
+    let head: String = chars
+        .next()
+        .into_iter()
+        .flat_map(char::to_uppercase)
+        .collect();
     head + chars.as_str()
 }
 

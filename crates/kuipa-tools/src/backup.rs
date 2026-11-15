@@ -197,7 +197,9 @@ fn opened(e: kuipa_enroll::Error) -> Error {
 /// A container that is not one, one the key is not a recipient of, or one
 /// that does not authenticate; `out` is not left behind.
 pub fn open_file(key: &ExchangeKeyPair, input: impl Read, out: &Path) -> Result<(), Error> {
-    write_atomic(out, 0o600, |f| backup::open_stream(key, input, f).map_err(opened))
+    write_atomic(out, 0o600, |f| {
+        backup::open_stream(key, input, f).map_err(opened)
+    })
 }
 
 /// Open a sealed backup into `out`, which cannot be taken back (a pipe):
@@ -228,7 +230,11 @@ mod tests {
         let sealed = dir.join("b.kuipa");
         let data = vec![7u8; 200_000];
         seal_file(&[file.recipient().unwrap()], &data[..], &sealed).unwrap();
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temporary file left");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temporary file left"
+        );
 
         let phrase = b"six honest words to open the papers";
         assert!(check(&words(&set, &[0, 2]), phrase, &file).is_ok());
@@ -253,7 +259,11 @@ mod tests {
         let out2 = dir.join("c.tar");
         assert!(open_file(&pair, fs::File::open(&sealed).unwrap(), &out2).is_err());
         assert!(!out2.exists());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "no temporary file left");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no temporary file left"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
