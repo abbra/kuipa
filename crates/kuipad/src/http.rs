@@ -104,22 +104,6 @@ fn admit_for<D>(
     })
 }
 
-/// The operations that share one handler, `POST /ipa/ku/<path>/{id}`.  Only
-/// a host-keyed OTP is limited per host (inside [`exchange`]); Kerberos-only
-/// ones (registration, seals, keys, tlog lookups, signing) use the source's
-/// bucket alone.  Pins are a host refreshing its pins, as for a rekey.
-const OPERATIONS: [Operation; 9] = [
-    Operation::Join,
-    Operation::Rekey,
-    Operation::Stage,
-    Operation::Register,
-    Operation::Seal,
-    Operation::Keys,
-    Operation::Tlog,
-    Operation::Sign,
-    Operation::Pins,
-];
-
 /// The router.
 pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router {
     let mut router = Router::new()
@@ -139,7 +123,9 @@ pub fn router<D: Directory + Send + Sync + 'static>(app: Arc<App<D>>) -> Router 
         .route("/ipa/ku/tang/adv/{thp}", get(tang_advertisement_for::<D>))
         .route("/ipa/ku/tang/key/{kid}", get(tang_exchange_key::<D>))
         .route("/ipa/ku/tang/rec/{kid}", post(tang_recover::<D>));
-    for op in OPERATIONS {
+    // Only a host-keyed OTP is limited per host (inside `exchange`);
+    // Kerberos-only operations use the source's bucket alone.
+    for op in Operation::ALL {
         router = router.route(
             &format!("/ipa/ku/{}/{{id}}", op.path()),
             post(
