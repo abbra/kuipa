@@ -1519,6 +1519,25 @@ pub struct Approval {
     pub at: u64,
 }
 
+impl fmt::Display for Approval {
+    /// `<approver> <at>`, as a directory stores it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.approver, self.at)
+    }
+}
+
+impl FromStr for Approval {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let (approver, at) = s.rsplit_once(' ').ok_or(Error::Malformed("approval"))?;
+        Ok(Self {
+            approver: approver.to_owned(),
+            at: at.parse().map_err(|_| Error::Malformed("approval"))?,
+        })
+    }
+}
+
 /// A request for the release of a file of a seal with approvals
 /// (`DESIGN-approvals.md` §2), as the directory keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1555,16 +1574,23 @@ impl ReleaseRequest {
         self.denied.is_none() && now <= self.not_after
     }
 
-    /// What the transparency log digests for the request: everything but
-    /// what the directory adds later.
+    /// The request without what the directory adds later: approvals, the
+    /// denial and the uses.
     #[must_use]
-    pub(crate) fn log_bytes(&self) -> Vec<u8> {
-        let core = Self {
+    pub fn core(&self) -> Self {
+        Self {
             approvals: Vec::new(),
             denied: None,
             uses: 0,
             ..self.clone()
-        };
+        }
+    }
+
+    /// What the transparency log digests for the request: everything but
+    /// what the directory adds later.
+    #[must_use]
+    pub(crate) fn log_bytes(&self) -> Vec<u8> {
+        let core = self.core();
         serde_json::to_vec(&core).unwrap_or_default()
     }
 
@@ -2897,6 +2923,18 @@ mod tests {
             token.check("EXAMPLE.TEST", &anchors, &only_87, expected, NOW),
             Err(Error::UntrustedAnchor)
         ));
+    }
+
+    #[test]
+    fn an_approval_round_trips_through_its_directory_value() {
+        let a = Approval {
+            approver: "bob@EXAMPLE.TEST".into(),
+            at: NOW,
+        };
+        assert_eq!(a.to_string(), format!("bob@EXAMPLE.TEST {NOW}"));
+        assert_eq!(a.to_string().parse::<Approval>().unwrap(), a);
+        assert!("bob@EXAMPLE.TEST".parse::<Approval>().is_err());
+        assert!("bob@EXAMPLE.TEST later".parse::<Approval>().is_err());
     }
 
     #[test]
