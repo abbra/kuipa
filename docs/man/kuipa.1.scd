@@ -204,9 +204,10 @@ key.
 
 Prints local *kuipa* configuration consistency.
 
-## check [--server _HOST_]
+## check [--server _HOST_]...
 
-Check this host's enrollment status against the realm: every server, the
+Check this host's enrollment status against the realm: every server (or only
+the ones named by repeated *--server*), the
 delegations, a *kinit*(1), the sealed keytabs and files.  Then refresh the
 pinned anchors and their vouch heads from a Kerberos-bound answer, as a key
 rotation does but without new keys, so later exchanges are proven by a

@@ -485,7 +485,7 @@ fn enroll_web1_with_otp(world: &Scenario) -> Vec<u32> {
         vec![first[0], first[0] + 1],
         "new kvno plus the previous one: {rotated}"
     );
-    let check = flows::check(a, None).unwrap();
+    let check = flows::check(a, &[]).unwrap();
     assert_eq!(check["ok"], true, "{check}");
     first
 }
@@ -501,7 +501,7 @@ fn protect_keytab(world: &Scenario, first: &[u32]) {
             .is_symlink()
     );
     assert_eq!(flows::unseal(a).unwrap().kvno(), Some(first[0] + 2));
-    assert_eq!(flows::check(a, None).unwrap()["ok"], true);
+    assert_eq!(flows::check(a, &[]).unwrap()["ok"], true);
 }
 
 fn protect_other_keytab_and_file(world: &Scenario) -> Copies {
@@ -582,7 +582,7 @@ fn restore_copies_at_boot(world: &Scenario, copies: &Copies) {
     assert_eq!(all["written"].as_array().unwrap().len(), 3, "{all}");
     assert_eq!(std::fs::read(&http).unwrap(), http_keys);
     assert_eq!(std::fs::read(&secret).unwrap(), b"token=second\n");
-    let check = flows::check(a, None).unwrap();
+    let check = flows::check(a, &[]).unwrap();
     assert_eq!(check["ok"], true, "{check}");
     assert_eq!(
         flows::status(a).unwrap()["protected"]

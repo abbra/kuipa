@@ -282,7 +282,8 @@ enum Command {
     Status,
     /// Check this host's enrollment against the realm.
     Check {
-        /// Server to check (default: those recorded at enrollment).
+        /// Server to check; repeat for several (default: those recorded at
+        /// enrollment).
         #[arg(long, value_name = "HOST")]
         server: Vec<String>,
     },
@@ -1718,7 +1719,7 @@ fn run(args: &Args) -> Result<Value, Error> {
             ))
         }
         "status" => flows::status(&paths),
-        "check" => flows::check(&paths, args.option("server")),
+        "check" => flows::check(&paths, &args.all("server")),
         "leave" => flows::leave(&paths),
         other => Err(format!("unknown command {other:?}").into()),
     }

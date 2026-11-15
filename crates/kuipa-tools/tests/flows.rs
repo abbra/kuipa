@@ -993,7 +993,7 @@ fn served_fork_is_refused(
         SignedEpoch::issue(new, &forked).unwrap(),
     ]);
     serve_as("ipa1.example.test", app(server4, Dir::default()));
-    let check = flows::check(paths, None).unwrap();
+    let check = flows::check(paths, &[]).unwrap();
     assert_eq!(check["servers"][0]["ok"], false);
     assert!(
         check["servers"][0]["error"]
@@ -1079,7 +1079,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
         SignedEpoch::issue(&new, &second).unwrap(),
     ]);
     serve_as("ipa1.example.test", app(server2, Dir::default()));
-    let check = flows::check(&paths, None).unwrap();
+    let check = flows::check(&paths, &[]).unwrap();
     assert_eq!(check["servers"][0]["ok"], true, "{check}");
     assert_eq!(
         kuipa_tools::paths::read_epoch_from(&paths.anchors()).unwrap(),
@@ -1093,7 +1093,7 @@ fn anchor_watermark_refuses_frozen_and_forking_logs() {
     let server3 = Arc::new(EnrollServer::new(keys3, info3, delegation3));
     server3.publish_epoch(vec![first_signed]);
     serve_as("ipa1.example.test", app(server3, Dir::default()));
-    let check = flows::check(&paths, None).unwrap();
+    let check = flows::check(&paths, &[]).unwrap();
     assert_eq!(check["servers"][0]["ok"], false);
     let error = check["servers"][0]["error"].as_str().unwrap();
     assert!(
@@ -1156,7 +1156,7 @@ fn a_long_anchor_log_is_read_page_by_page() {
     let server2 = Arc::new(EnrollServer::new(keys2, info2, delegation2));
     server2.publish_epoch(log.clone());
     serve_as("ipa1.example.test", app(server2, Dir::default()));
-    let check = flows::check(&paths, None).unwrap();
+    let check = flows::check(&paths, &[]).unwrap();
     assert_eq!(check["servers"][0]["ok"], true, "{check}");
     assert_eq!(
         kuipa_tools::paths::read_epoch_from(&paths.anchors()).unwrap(),
@@ -3254,7 +3254,7 @@ fn an_expired_pin_is_no_trust_at_all() {
         (Vec::new(), Vec::new(), Vec::new()),
         "an expired pin gives nothing to verify with"
     );
-    let out = flows::check(&paths, None).unwrap();
+    let out = flows::check(&paths, &[]).unwrap();
     assert_eq!(
         out["servers"][0]["ok"],
         serde_json::json!(false),
@@ -3277,13 +3277,13 @@ fn an_expired_pin_is_no_trust_at_all() {
     assert_eq!(anchors, vec![pin]);
     assert_eq!(frozen, vec![pin]);
     assert_eq!(heads.len(), 1);
-    let out = flows::check(&paths, None).unwrap();
+    let out = flows::check(&paths, &[]).unwrap();
     assert_eq!(out["servers"][0]["ok"], serde_json::json!(true), "{out}");
 
     // A corrupt pin file is an error, never "nothing pinned".
     std::fs::write(paths.anchors(), format!("{pin} +5\n")).unwrap();
     assert!(
-        flows::check(&paths, None).is_err(),
+        flows::check(&paths, &[]).is_err(),
         "a corrupt pin file fails closed"
     );
     kuipa_tools::net::clear_thread_endpoints();

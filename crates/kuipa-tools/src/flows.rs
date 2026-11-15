@@ -2336,13 +2336,13 @@ fn server_health(server: &str, adv: &VerifiedRealm) -> (Vec<String>, Value) {
 }
 
 /// `kuipa check`: would this host work right now?  Reports problems with
-/// the action that fixes them.
+/// the action that fixes them.  `only` limits it to those servers (none: all).
 ///
 /// # Errors
 ///
 /// Only for a host that is not enrolled; problems are reported in the
 /// result.
-pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
+pub fn check(paths: &Paths, only: &[String]) -> Result<Value, Error> {
     let state = State::load(paths)?;
     // The whole window travels and the frozen anchors are named: §1.4 and
     // §2 are enforced here, not left to what the server happens to serve.
@@ -2357,7 +2357,7 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
     for server in state
         .servers
         .iter()
-        .filter(|s| only.is_none_or(|o| o == s.as_str()))
+        .filter(|s| only.is_empty() || only.contains(s))
     {
         match verified(
             server,
@@ -2458,14 +2458,14 @@ pub fn check(paths: &Paths, only: Option<&str>) -> Result<Value, Error> {
 fn refresh_after_check(
     paths: &Paths,
     state: &State,
-    only: Option<&str>,
+    only: &[String],
     trust: &Trust,
     known: Option<Epoch>,
 ) -> Value {
     let scope: Vec<String> = state
         .servers
         .iter()
-        .filter(|s| only.is_none_or(|o| o == s.as_str()))
+        .filter(|s| only.is_empty() || only.contains(s))
         .cloned()
         .collect();
     match refresh_pins(paths, state, &scope, trust, known) {
