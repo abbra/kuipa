@@ -506,6 +506,16 @@ enum KeysAction {
     },
 }
 
+/// The device key's passphrase (or a token's or security key's PIN), from a
+/// file instead of the terminal.
+#[derive(clap::Args)]
+struct DevicePass {
+    /// Read the passphrase (or the token's or security key's PIN) from this
+    /// file.
+    #[arg(long, value_name = "FILE")]
+    passphrase_file: Option<String>,
+}
+
 /// `kuipa seal` subcommands.  A seal is named by its name when it is the
 /// user's own, and as `OWNER/NAME` when it is shared with them.
 #[derive(Subcommand)]
@@ -579,9 +589,8 @@ enum SealCommand {
         /// terminal.
         #[arg(long)]
         force: bool,
-        /// Read the device key's passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
         /// Read the PIN of the security key holding your IPA passkey from
         /// this file, for a seal with the passkey factor.
         #[arg(long, value_name = "FILE")]
@@ -595,9 +604,8 @@ enum SealCommand {
     /// once: write it down.  With it, a lost device's files can be opened
     /// again (`kuipa seal recover`).
     RecoveryCode {
-        /// Read the device key's passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
     /// Recover a lost device's key with its recovery code.
     Recover {
@@ -647,9 +655,8 @@ enum SealCommand {
         seal: String,
         /// The sealed files, rewritten in place.
         sealed: Vec<String>,
-        /// Read the device key's passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
         /// Read the PIN of the security key holding your IPA passkey from
         /// this file, for a seal with the passkey factor.
         #[arg(long, value_name = "FILE")]
@@ -660,9 +667,8 @@ enum SealCommand {
     Unlock {
         /// The seal.
         seal: String,
-        /// Read the device key's passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
         /// Read the PIN of the security key holding your IPA passkey from
         /// this file, for a seal with the passkey factor.
         #[arg(long, value_name = "FILE")]
@@ -833,17 +839,14 @@ enum RecoverAction {
         /// Read the recovery code from this file.
         #[arg(long, value_name = "FILE")]
         code_file: Option<String>,
-        /// Read this host's device passphrase (or the one to protect the
-        /// recovered key with) from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
     /// Print this host's device, for the helpdesk to deliver a lost
     /// device's key to (register it in a seal first).
     Helpdesk {
-        /// Read the device passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
     /// As the helpdesk: open a device deposit of the realm's device seal
     /// and deliver the key to the user's new device.
@@ -859,16 +862,14 @@ enum RecoverAction {
         /// The approved release request, for a seal with approvals.
         #[arg(long, value_name = "ID")]
         request: Option<String>,
-        /// Read this host's device passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
     /// Fetch the key the helpdesk delivered to this host's device, and keep
     /// it beside this host's own.
     Fetch {
-        /// Read the device passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
     /// Register this host's device wherever the recovered one is, and
     /// reseal the files to it; with --retire-old, also retire the
@@ -880,9 +881,8 @@ enum RecoverAction {
         /// files not resealed now stop opening.
         #[arg(long)]
         retire_old: bool,
-        /// Read the device passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
     /// Bring back a lost device's key with its paper shards: read the
     /// words of at least N papers ("?" for a word you cannot read), then
@@ -894,10 +894,8 @@ enum RecoverAction {
         /// Read the recovery passphrase from this file.
         #[arg(long, value_name = "FILE")]
         recovery_file: Option<String>,
-        /// Read this host's device passphrase (or the one to protect the
-        /// recovered key with) from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
 }
 
@@ -926,9 +924,8 @@ enum RecoveryShardsAction {
         /// alone are then the key.
         #[arg(long)]
         no_passphrase: bool,
-        /// Read the device key's passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
     /// Check papers without recovering: report what each repairs and
     /// whether the set would recover.  A paper backup is only as good as
@@ -941,9 +938,8 @@ enum RecoveryShardsAction {
     /// Cover this host's device key under the set already registered, so
     /// a device added after the papers were printed needs no new paper.
     Enroll {
-        /// Read the device key's passphrase from this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
     },
 }
 
@@ -999,10 +995,8 @@ enum DeviceAction {
     Add {
         /// The seal.
         seal: String,
-        /// Read the passphrase (or the token's or security key's PIN) from
-        /// this file.
-        #[arg(long, value_name = "FILE")]
-        passphrase_file: Option<String>,
+        #[command(flatten)]
+        pw: DevicePass,
         /// The ML-KEM key on a token, as a `pkcs11:` URI.
         #[arg(long, value_name = "URI", conflicts_with = "passkey")]
         pkcs11: Option<String>,
@@ -2866,7 +2860,7 @@ fn run_open(
         sealed,
         out,
         force,
-        passphrase_file,
+        pw,
         passkey_pin_file,
         request,
     } = action
@@ -2876,7 +2870,7 @@ fn run_open(
     let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
     let bytes = kuipa_tools::paths::read(sealed)?;
     let pass = kuipa_tools::seal::SealClient::needs_secret(&bytes)
-        .then(|| passphrase(passphrase_file.as_deref(), false))
+        .then(|| passphrase(pw.passphrase_file.as_deref(), false))
         .transpose()?;
     let needs_passkey = client.needs_passkey(&bytes);
     let client = with_passkey_pin(client, user, needs_passkey, passkey_pin_file.as_deref())?;
@@ -2982,7 +2976,7 @@ fn run_recovery_shards(
             recovery_file,
             weak_passphrase,
             no_passphrase,
-            passphrase_file,
+            pw,
         } => {
             if *threshold > *shares {
                 return Err("--threshold cannot be more than --shares".into());
@@ -2991,7 +2985,7 @@ fn run_recovery_shards(
                 recovery_passphrase(recovery_file.as_deref(), *weak_passphrase, *no_passphrase)?;
             // The device key keeps its own passphrase: the recovery
             // passphrase only hides the seed (DESIGN-recovery.md §2.1).
-            let device = passphrase(passphrase_file.as_deref(), false)?;
+            let device = passphrase(pw.passphrase_file.as_deref(), false)?;
             client.recovery_shards(recovery.as_ref(), device.as_ref(), *threshold, *shares)
         }
         RecoveryShardsAction::Check { recovery_file } => {
@@ -2999,9 +2993,8 @@ fn run_recovery_shards(
             let pass = recovery_passphrase(recovery_file.as_deref(), true, true)?;
             client.recovery_shards_check(&words, pass.as_ref())
         }
-        RecoveryShardsAction::Enroll { passphrase_file } => {
-            client.recovery_shards_enroll(passphrase(passphrase_file.as_deref(), false)?.as_ref())
-        }
+        RecoveryShardsAction::Enroll { pw } => client
+            .recovery_shards_enroll(passphrase(pw.passphrase_file.as_deref(), false)?.as_ref()),
     }
 }
 
@@ -3012,28 +3005,25 @@ fn run_recover(
     action: &RecoverAction,
 ) -> Result<Value, Error> {
     match action {
-        RecoverAction::Code {
-            code_file,
-            passphrase_file,
-        } => {
+        RecoverAction::Code { code_file, pw } => {
             let code = secret(code_file.as_deref(), "recovery code", false)?
                 .ok_or("no recovery code: give --code-file or run on a terminal")?;
             let code = std::str::from_utf8(code.as_ref()).map_err(|_| "not a recovery code")?;
             let first = !user.device_key().exists();
-            let pass = passphrase(passphrase_file.as_deref(), first)?;
+            let pass = passphrase(pw.passphrase_file.as_deref(), first)?;
             client.recover_code(code, pass.as_ref())
         }
-        RecoverAction::Helpdesk { passphrase_file } => {
-            client.recover_helpdesk(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        RecoverAction::Helpdesk { pw } => {
+            client.recover_helpdesk(passphrase(pw.passphrase_file.as_deref(), false)?.as_ref())
         }
         RecoverAction::Deliver {
             deposit,
             user,
             device,
             request,
-            passphrase_file,
+            pw,
         } => {
-            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            let pass = passphrase(pw.passphrase_file.as_deref(), false)?;
             client.deliver(
                 deposit,
                 (user, device),
@@ -3041,15 +3031,15 @@ fn run_recover(
                 request.as_deref(),
             )
         }
-        RecoverAction::Fetch { passphrase_file } => {
-            client.recover_fetch(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        RecoverAction::Fetch { pw } => {
+            client.recover_fetch(passphrase(pw.passphrase_file.as_deref(), false)?.as_ref())
         }
         RecoverAction::Finish {
             sealed,
             retire_old,
-            passphrase_file,
+            pw,
         } => {
-            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            let pass = passphrase(pw.passphrase_file.as_deref(), false)?;
             let files = sealed
                 .iter()
                 .map(std::fs::read)
@@ -3071,7 +3061,7 @@ fn run_recover(
         RecoverAction::Shards {
             device,
             recovery_file,
-            passphrase_file,
+            pw,
         } => {
             println!(
                 "Read the words of any of your papers, in any order: a word you cannot read is ?; a blank line ends a paper."
@@ -3083,7 +3073,7 @@ fn run_recover(
             // The passphrase that protects the recovered key here is the
             // device passphrase, as `recover code` asks for.
             let first = !user.device_key().exists();
-            let pass = passphrase(passphrase_file.as_deref(), first)?;
+            let pass = passphrase(pw.passphrase_file.as_deref(), first)?;
             client.recover_shards(&words, recovery.as_ref(), pass.as_ref(), device.as_deref())
         }
     }
@@ -3098,7 +3088,7 @@ fn run_seal_device(
     match action {
         DeviceAction::Add {
             seal,
-            passphrase_file,
+            pw,
             pkcs11,
             passkey,
             tpm,
@@ -3108,16 +3098,16 @@ fn run_seal_device(
                 client.add_tpm_device(seal)
             } else if *passkey {
                 let pin = security_key_pin(
-                    passphrase_file.as_deref(),
+                    pw.passphrase_file.as_deref(),
                     "security key PIN (empty if none)",
                 )?;
                 client.add_passkey_device(seal, pin.as_ref())
             } else if let Some(uri) = pkcs11 {
-                let pin = passphrase(passphrase_file.as_deref(), false)?;
+                let pin = passphrase(pw.passphrase_file.as_deref(), false)?;
                 client.add_token_device(seal, std::path::Path::new(module), uri, pin.as_ref())
             } else {
                 let first = !user.device_key().exists() && !user.token_device().exists();
-                let pass = passphrase(passphrase_file.as_deref(), first)?;
+                let pass = passphrase(pw.passphrase_file.as_deref(), first)?;
                 client.add_device(seal, pass.as_ref())
             }
         }
@@ -3159,10 +3149,10 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
         SealCommand::Reseal {
             seal,
             sealed,
-            passphrase_file,
+            pw,
             passkey_pin_file,
         } => {
-            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            let pass = passphrase(pw.passphrase_file.as_deref(), false)?;
             let needed = client.seal_needs_passkey(seal);
             let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
             for path in sealed {
@@ -3174,11 +3164,11 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
         }
         SealCommand::Unlock {
             seal,
-            passphrase_file,
+            pw,
             passkey_pin_file,
             offline,
         } => {
-            let pass = passphrase(passphrase_file.as_deref(), false)?;
+            let pass = passphrase(pw.passphrase_file.as_deref(), false)?;
             let needed = client.seal_needs_passkey(seal);
             let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
             client.unlock(
@@ -3204,8 +3194,8 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             reason,
         } => client.request(seal, &kuipa_tools::paths::read(sealed)?, reason),
         SealCommand::Pending { seal } => client.pending(seal.as_deref()),
-        SealCommand::RecoveryCode { passphrase_file } => {
-            client.recovery_code(passphrase(passphrase_file.as_deref(), false)?.as_ref())
+        SealCommand::RecoveryCode { pw } => {
+            client.recovery_code(passphrase(pw.passphrase_file.as_deref(), false)?.as_ref())
         }
         SealCommand::Recover { action } => run_recover(&client, &user, action),
         SealCommand::Approve { seal, id } => {
