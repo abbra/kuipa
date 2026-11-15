@@ -49,6 +49,20 @@ periodically (for example from `kuipa-rotate.timer`). Until it has run,
 the host has no configuration that would accept B's users. Details are in
 [Day-to-day host care](../host/care.md#trusted-realms).
 
+## Users of a trusted realm
+
+In FreeIPA, an Active Directory user with an ID override in the default
+trust view is a user of the IPA directory, and kuipad finds that override
+for them. Their override's groups decide their roles, and they may be named
+as `user@AD.REALM`. Such a user can enroll hosts with their ticket (kuipad
+acts with the ticket they presented, by S4U2Proxy), and take part in seals,
+signing and pins as a member, manager, depositor, approver, requester or
+signer. They own a seal only where the realm's
+[`trusted_owners` limit](limits.md#seals-of-trusted-realm-users) allows it. A user with no override is refused as
+unknown, and a bare name in the signing policy stays the realm's own, so
+`alice` does not admit `alice@AD.REALM`. AD holds the real lock state: a
+disabled AD user stays admitted until their ticket expires.
+
 ## Reaching a KDC through an HTTPS proxy
 
 Some realms expose only HTTPS: their KDCs are not reachable from other
