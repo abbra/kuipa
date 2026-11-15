@@ -42,6 +42,7 @@ use kuipad::keystore::KeyStore;
 use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
+use support::server;
 use tang_pqc::{
     ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, Thumbprint, VerifyingKey, now,
 };
@@ -361,8 +362,6 @@ fn start_ipa_server(
     spawn(
         listener,
         Arc::new(App {
-            server: server.clone(),
-            directory: directory.clone(),
             peers: Some(peers),
             // Generous: a refusal in this test is the policy's, never
             // the rate limit's.
@@ -377,9 +376,8 @@ fn start_ipa_server(
                     per_minute: 1000.0,
                 },
             }),
-            tang: None,
-            keys: None,
             ledger: Some(ledger),
+            ..server::app(server.clone(), directory.clone())
         }),
     );
     (server, own_anchor)

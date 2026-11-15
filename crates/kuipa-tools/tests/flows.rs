@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[path = "support/server.rs"]
+mod server;
+
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::bundle::{Bundle, Recipient};
 use kuipa_enroll::delegation::{Delegation, SignedVouch};
@@ -204,38 +207,17 @@ fn server_keys(anchor: &SigningKey, fqdn: &str) -> (ServerKeys, RealmInfo, Deleg
     )
 }
 
-/// Serve `router` on 127.0.0.1 in a background runtime; return its URL.
-fn spawn(app: Arc<App<Dir>>) -> String {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let listener = rt
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    std::thread::spawn(move || {
-        rt.block_on(async move { axum::serve(listener, router(app)).await.unwrap() });
-    });
-    url
-}
-
 /// Serve `app` as server `name` for this test's thread: the client dials
 /// `name`, as it would in a real deployment, and reaches the test server.
 fn serve_as(name: &str, app: Arc<App<Dir>>) -> String {
-    let url = spawn(app);
+    let url = server::spawn(app);
     kuipa_tools::net::set_thread_endpoint(name, &url);
     name.to_owned()
 }
 
 /// The bare enroll server behind an otherwise-empty app.
 fn app(server: Arc<EnrollServer>, directory: Dir) -> Arc<App<Dir>> {
-    Arc::new(App {
-        server,
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        keys: None,
-        ledger: None,
-        directory,
-    })
+    Arc::new(server::app(server, directory))
 }
 
 /// Make server `name` unreachable for this test's thread (nothing listens
@@ -715,7 +697,7 @@ fn realm_info_trust_first_use_is_explicit() {
         Arc::new(EnrollServer::new(keys, info, delegation)),
         Dir::default(),
     );
-    let url = spawn(honest);
+    let url = server::spawn(honest);
     kuipa_tools::net::set_thread_endpoint("ipa2.example.test", &url);
     let paths = root("trust-first-use");
     let krb5 = paths.dir.join("krb5");
@@ -791,7 +773,7 @@ fn realm_info_trust_first_use_is_explicit() {
 fn adopt_refuses_without_a_host_keytab() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
-    let url = spawn(app(
+    let url = server::spawn(app(
         Arc::new(EnrollServer::new(keys, info, delegation)),
         Dir::default(),
     ));
@@ -826,9 +808,6 @@ fn guessing_is_rate_limited_per_host() {
     let url = serve_as(
         "ipa1.example.test",
         Arc::new(App {
-            server: Arc::new(EnrollServer::new(keys, info, delegation)),
-            directory: dir,
-            peers: None,
             limiter: Limiter::new(Limits {
                 per_host: Rate {
                     burst: 1.0,
@@ -836,9 +815,7 @@ fn guessing_is_rate_limited_per_host() {
                 },
                 ..Limits::default()
             }),
-            tang: None,
-            keys: None,
-            ledger: None,
+            ..server::app(Arc::new(EnrollServer::new(keys, info, delegation)), dir)
         }),
     );
     let guess = |otp: &[u8]| {
@@ -1776,14 +1753,12 @@ fn stolen_anchor_refused_when_two_anchors_pinned() {
 fn serve_tang(keys: &kuipad::tang::TangKeys) -> String {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let (server_keys, info, delegation) = server_keys(&anchor, "ipa1.example.test");
-    spawn(Arc::new(App {
-        server: Arc::new(EnrollServer::new(server_keys, info, delegation)),
-        directory: Dir::default(),
-        peers: None,
-        limiter: Limiter::default(),
+    server::spawn(Arc::new(App {
         tang: keys.server().unwrap().map(Arc::new),
-        keys: None,
-        ledger: None,
+        ..server::app(
+            Arc::new(EnrollServer::new(server_keys, info, delegation)),
+            Dir::default(),
+        )
     }))
 }
 
@@ -2342,7 +2317,7 @@ fn a_mirror_serves_what_it_cached_and_no_authenticated_route() {
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
-    let origin = spawn(app(server, dir));
+    let origin = server::spawn(app(server, dir));
 
     // Run the mirror binary against the origin, on a free port.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2627,7 +2602,7 @@ fn the_claim_log_carries_the_heads_signed_vouch() {
         delegation.clone(),
     ));
     server.publish(delegation, vec![pin], vouches);
-    let url = spawn(app(server, Dir::default()));
+    let url = server::spawn(app(server, Dir::default()));
     kuipa_tools::net::set_thread_endpoint("claimlog1.example.test", &url);
 
     let _ = rustls_native_ossl::default_provider().install_default();
@@ -2841,7 +2816,7 @@ fn a_window_grows_only_through_a_consistent_log() {
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
-    let url = spawn(app(server.clone(), dir));
+    let url = server::spawn(app(server.clone(), dir));
     kuipa_tools::net::set_thread_endpoint("window1.example.test", &url);
 
     let paths = enroll_window_of_one(&anchor, head1);
@@ -2955,7 +2930,7 @@ fn audit_reports_coverage_and_split_views() {
     vouches.insert(pin, v1);
     let server = Arc::new(EnrollServer::new(keys, info, delegation.clone()));
     server.publish(delegation.clone(), vec![pin], vouches);
-    let url = spawn(app(server.clone(), Dir::default()));
+    let url = server::spawn(app(server.clone(), Dir::default()));
     kuipa_tools::net::set_thread_endpoint("audit1.example.test", &url);
 
     // Coverage: the served head is current for itself, stale for a
@@ -3028,7 +3003,7 @@ fn audit_reports_coverage_and_split_views() {
         forked,
     ));
     server2.publish(delegation.clone(), vec![pin], forked_vouches);
-    let url2 = spawn(app(server2, Dir::default()));
+    let url2 = server::spawn(app(server2, Dir::default()));
     kuipa_tools::net::set_thread_endpoint("audit2.example.test", &url2);
 
     let report = kuipa_tools::audit::split_view(&[
@@ -4032,14 +4007,9 @@ fn the_tlog_routes_serve_heads_leaves_and_proofs() {
             .with_head_interval(std::time::Duration::ZERO),
     );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
-    let url = spawn(Arc::new(App {
-        server,
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        keys: None,
+    let url = server::spawn(Arc::new(App {
         ledger: Some(ledger.clone()),
-        directory: Dir::default(),
+        ..server::app(server, Dir::default())
     }));
     let _ = rustls_native_ossl::default_provider().install_default();
     let http = reqwest::blocking::Client::new();
@@ -4133,14 +4103,9 @@ fn tlog_server(
             .with_witnesses(witnesses.iter().map(|w| w.public().clone()).collect()),
     );
     let server = Arc::new(EnrollServer::new(keys, info, delegation).with_ledger(ledger.clone()));
-    let url = spawn(Arc::new(App {
-        server,
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        keys: None,
+    let url = server::spawn(Arc::new(App {
         ledger: Some(ledger.clone()),
-        directory: Dir::default(),
+        ..server::app(server, Dir::default())
     }));
     kuipa_tools::net::set_thread_endpoint(fqdn, &url);
     ledger
@@ -4321,7 +4286,7 @@ fn a_host_pins_what_its_anchors_logs_retired() {
         .lock()
         .unwrap()
         .insert(HOST.into(), b"Secret123".to_vec());
-    let url = spawn(app(server, dir));
+    let url = server::spawn(app(server, dir));
     kuipa_tools::net::set_thread_endpoint("window1.example.test", &url);
 
     let paths = root("retired");
@@ -4359,15 +4324,10 @@ fn a_kept_advertisement_is_fetched_conditionally() {
     let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
     let fqdn = "cached1.example.test";
     let (keys, info, delegation) = server_keys(&anchor, fqdn);
-    let app = Arc::new(App {
-        server: Arc::new(EnrollServer::new(keys, info, delegation)),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        keys: None,
-        ledger: None,
-        directory: Dir::default(),
-    });
+    let app = Arc::new(server::app(
+        Arc::new(EnrollServer::new(keys, info, delegation)),
+        Dir::default(),
+    ));
     // What the server saw: each advertisement request's If-None-Match, and
     // the status it answered.
     let seen: Seen = Arc::default();

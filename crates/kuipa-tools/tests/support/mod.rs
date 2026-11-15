@@ -7,3 +7,4 @@ pub(crate) mod certs;
 pub(crate) mod directory;
 pub(crate) mod dns;
 pub(crate) mod kdc;
+pub(crate) mod server;

@@ -15,19 +15,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
-use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, VerifiedRealm};
+use kuipa_enroll::realm::{Deployment, RealmInfo, VerifiedRealm};
 use kuipa_enroll::spend::{SpendError, SpendOp, SpendRequest, VoucherSpender};
 use kuipa_enroll::voucher::{Claims, Voucher};
 use kuipa_enroll::{Directory as _, EnrollServer};
 use kuipa_tools::flows::{self, Auth};
 use kuipa_tools::paths::Paths;
 use kuipa_tools::voucher;
-use kuipad::http::{App, router};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
-use tang_pqc::{ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, VerifyingKey, b64, now};
+use support::server;
+use tang_pqc::{Policy, SignatureAlg, SigningKey, VerifyingKey, b64, now};
 
 const REALM: &str = "VOUCHER.TEST";
 const SERVER: &str = "ipa1.voucher.test";
@@ -100,17 +99,6 @@ impl Ipa {
 
     /// The same, as the IPA server `name`.
     fn start_named(realm: &Arc<Realm>, public: &str, name: &str) -> Self {
-        let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-        let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-        let delegation = Delegation::issue(
-            &anchor,
-            REALM,
-            name,
-            signing.public(),
-            now() - 60,
-            now() + 86400,
-        )
-        .unwrap();
         let info = RealmInfo {
             realm: REALM.into(),
             domain: "voucher.test".into(),
@@ -119,41 +107,16 @@ impl Ipa {
             servers: vec![name.into()],
             ca_certs: vec![realm.chain.ca_der.clone()],
             pkinit_anchors: vec![realm.chain.ca_der.clone()],
-            anchors: vec![*anchor.public().thumbprint()],
+            anchors: Vec::new(),
             heads: Vec::new(),
             trusts: Vec::new(),
             kdc_proxy: None,
         };
-        let keys = ServerKeys {
-            signing,
-            join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-            escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-            trust: Vec::new(),
-            vouchers: vec![VerifyingKey::from_jwk_json(public.as_bytes()).unwrap()],
-            retired: Vec::new(),
-        };
-        let server = Arc::new(EnrollServer::new(keys, info, delegation));
+        let vouchers = vec![VerifyingKey::from_jwk_json(public.as_bytes()).unwrap()];
+        let (anchor, server) = server::enroll_server(info, false, vouchers, 1);
         let directory = Arc::new(KdcDirectory::new(realm.clone(), &[name], &[]));
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let url = server::spawn(Arc::new(server::app(server.clone(), directory.clone())));
         kuipa_tools::net::set_thread_endpoint(name, &url);
-        let app = Arc::new(App {
-            server: server.clone(),
-            directory: directory.clone(),
-            peers: None,
-            limiter: kuipad::limit::Limiter::default(),
-            tang: None,
-            keys: None,
-            ledger: None,
-        });
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        std::thread::spawn(move || {
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                axum::serve(listener, router(app)).await.unwrap();
-            });
-        });
         let string = EnrollmentString::new(
             REALM,
             *anchor.public().thumbprint(),

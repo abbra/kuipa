@@ -15,17 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kuipa_enroll::EnrollServer;
-use kuipa_enroll::delegation::Delegation;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
-use kuipa_enroll::realm::{Deployment, RealmInfo, ServerKeys, TrustedRealm};
+use kuipa_enroll::realm::{Deployment, RealmInfo, TrustedRealm};
 use kuipa_enroll::server::Directory;
 use kuipa_enroll::trust::Invitation;
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::{self, Paths};
-use kuipad::http::{App, router};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
-use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, Thumbprint, now};
+use support::server;
+use tang_pqc::{Thumbprint, now};
 
 const A: &str = "A.TEST";
 const B: &str = "B.TEST";
@@ -42,17 +41,6 @@ fn server(
     otps: &[(&str, &[u8])],
     trusts: Vec<TrustedRealm>,
 ) -> (Arc<EnrollServer>, Thumbprint, Arc<KdcDirectory>) {
-    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-    let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-    let delegation = Delegation::issue(
-        &anchor,
-        &realm.name,
-        fqdn,
-        signing.public(),
-        now() - 60,
-        now() + 30 * 86400,
-    )
-    .unwrap();
     let info = RealmInfo {
         realm: realm.name.clone(),
         domain: realm.name.to_lowercase(),
@@ -61,21 +49,12 @@ fn server(
         servers: vec![fqdn.into()],
         ca_certs: vec![realm.chain.ca_der.clone()],
         pkinit_anchors: vec![realm.chain.ca_der.clone()],
-        anchors: vec![*anchor.public().thumbprint()],
+        anchors: Vec::new(),
         heads: Vec::new(),
         trusts,
         kdc_proxy: None,
     };
-    info.validate().unwrap();
-    let keys = ServerKeys {
-        signing,
-        join: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-        escrow: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-        trust: vec![ExchangeKeyPair::generate(KemAlg::MlKem768).unwrap()],
-        vouchers: Vec::new(),
-        retired: Vec::new(),
-    };
-    let server = Arc::new(EnrollServer::new(keys, info, delegation));
+    let (anchor, server) = server::enroll_server(info, true, Vec::new(), 30);
     let directory = Arc::new(KdcDirectory::new(realm.clone(), &[fqdn], &[]));
     for (host, otp) in otps {
         directory
@@ -84,23 +63,10 @@ fn server(
             .unwrap()
             .insert((*host).to_owned(), otp.to_vec());
     }
-    let app = Arc::new(App {
-        server: server.clone(),
-        directory: directory.clone(),
-        peers: None,
-        limiter: kuipad::limit::Limiter::default(),
-        tang: None,
-        keys: None,
-        ledger: None,
-    });
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    listener.set_nonblocking(true).unwrap();
-    std::thread::spawn(move || {
-        rt.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            axum::serve(listener, router(app)).await.unwrap();
-        });
-    });
+    server::serve(
+        listener,
+        Arc::new(server::app(server.clone(), directory.clone())),
+    );
     (server, *anchor.public().thumbprint(), directory)
 }
 
