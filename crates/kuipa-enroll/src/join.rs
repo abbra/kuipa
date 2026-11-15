@@ -66,7 +66,9 @@ pub enum Operation {
 }
 
 impl Operation {
-    const fn label(self) -> &'static str {
+    /// The endpoint path segment, `/ipa/ku/<path>/{kid}`.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
         match self {
             Self::Join => "join",
             Self::Rekey => "rekey",
@@ -80,23 +82,11 @@ impl Operation {
         }
     }
 
-    /// The endpoint path segment, `/ipa/ku/<label>/{kid}`.
-    #[must_use]
-    pub const fn path(self) -> &'static str {
-        self.label()
-    }
-
     const fn magic(self) -> [u8; 4] {
-        match self {
-            Self::Join
-            | Self::Rekey
-            | Self::Register
-            | Self::Seal
-            | Self::Keys
-            | Self::Tlog
-            | Self::Sign
-            | Self::Pins => *b"IPJQ",
-            Self::Stage => *b"IPSQ",
+        if matches!(self, Self::Stage) {
+            *b"IPSQ"
+        } else {
+            *b"IPJQ"
         }
     }
 }
@@ -268,7 +258,7 @@ impl Request {
     pub(crate) fn transcript(&self, signer: &Thumbprint) -> Result<Vec<u8>> {
         let hash = self.alg.hash();
         let mut w = Writer::new(*b"IPJT");
-        w.str(self.op.label())
+        w.str(self.op.path())
             .u8(self.alg.id())
             .fixed(self.kid.as_bytes())
             .fixed(signer.as_bytes())
@@ -659,6 +649,14 @@ impl PendingJoin {
         primitives::open(k.as_ref(), &response.sealed).map_err(|_| Error::BadResponse)
     }
 
+    /// [`open`](Self::open), after checking `realm` is the server this was sent to.
+    fn open_for(self, response: &Response, realm: &VerifiedRealm) -> Result<SecretBuf> {
+        if realm.signer() != &self.signer {
+            return Err(Error::Mismatch("server"));
+        }
+        self.open(response)
+    }
+
     /// Finish a registration (§7.5): decrypt the server's answer and check
     /// it registered for `params.principal`.
     ///
@@ -672,10 +670,7 @@ impl PendingJoin {
         realm: &VerifiedRealm,
         params: &crate::escrow::RegisterParams,
     ) -> Result<()> {
-        if realm.signer() != &self.signer {
-            return Err(Error::Mismatch("server"));
-        }
-        params.check_acknowledgement(self.open(response)?.as_ref())
+        params.check_acknowledgement(self.open_for(response, realm)?.as_ref())
     }
 
     /// Finish a seal operation (§7.6): decrypt the descriptors the server
@@ -690,10 +685,7 @@ impl PendingJoin {
         response: &Response,
         realm: &VerifiedRealm,
     ) -> Result<crate::seal::Reply> {
-        if realm.signer() != &self.signer {
-            return Err(Error::Mismatch("server"));
-        }
-        crate::seal::Reply::from_bytes(self.open(response)?.as_ref())
+        crate::seal::Reply::from_bytes(self.open_for(response, realm)?.as_ref())
     }
 
     /// Finish a `keys` fetch (§18.2): decrypt the answer's value.
@@ -707,10 +699,7 @@ impl PendingJoin {
         response: &Response,
         realm: &VerifiedRealm,
     ) -> Result<crate::keys::KeysAnswer> {
-        if realm.signer() != &self.signer {
-            return Err(Error::Mismatch("server"));
-        }
-        crate::keys::KeysAnswer::from_bytes(self.open(response)?.as_ref())
+        crate::keys::KeysAnswer::from_bytes(self.open_for(response, realm)?.as_ref())
     }
 
     /// Finish a `tlog` lookup: decrypt the answer and check it — the head's
@@ -728,10 +717,7 @@ impl PendingJoin {
         realm: &VerifiedRealm,
         policy: &tang_pqc::Policy,
     ) -> Result<crate::tlog::Answer> {
-        if realm.signer() != &self.signer {
-            return Err(Error::Mismatch("server"));
-        }
-        let answer = crate::tlog::Answer::from_bytes(self.open(response)?.as_ref())?;
+        let answer = crate::tlog::Answer::from_bytes(self.open_for(response, realm)?.as_ref())?;
         answer.verify(realm.signer(), policy)?;
         Ok(answer)
     }
@@ -749,10 +735,8 @@ impl PendingJoin {
         response: &Response,
         realm: &VerifiedRealm,
     ) -> Result<crate::payload::PinsAnswer> {
-        if realm.signer() != &self.signer {
-            return Err(Error::Mismatch("server"));
-        }
-        let answer = crate::payload::PinsAnswer::from_bytes(self.open(response)?.as_ref())?;
+        let answer =
+            crate::payload::PinsAnswer::from_bytes(self.open_for(response, realm)?.as_ref())?;
         if answer.realm != realm.info().realm || answer.issuer != realm.server() {
             return Err(Error::Mismatch("pins issuer"));
         }
@@ -774,10 +758,7 @@ impl PendingJoin {
         realm: &VerifiedRealm,
         request: &crate::sign::Request,
     ) -> Result<Vec<crate::sign::Bundle>> {
-        if realm.signer() != &self.signer {
-            return Err(Error::Mismatch("server"));
-        }
-        let answer = crate::sign::Answer::from_bytes(self.open(response)?.as_ref())?;
+        let answer = crate::sign::Answer::from_bytes(self.open_for(response, realm)?.as_ref())?;
         (0..request.digests.len())
             .map(|i| answer.bundle(request, i))
             .collect()
@@ -794,11 +775,8 @@ impl PendingJoin {
     /// anchors the advertisement does not vouch for, or an epoch watermark
     /// that disagrees with the server's advertised log.
     pub fn finish(self, response: &Response, realm: &VerifiedRealm) -> Result<Enrollment> {
-        if realm.signer() != &self.signer {
-            return Err(Error::Mismatch("server"));
-        }
         let expected = Principal::host(&self.fqdn, &self.realm);
-        let enrollment = Enrollment::from_bytes(self.open(response)?.as_ref())?;
+        let enrollment = Enrollment::from_bytes(self.open_for(response, realm)?.as_ref())?;
         if enrollment.keytab.principal() != &expected {
             return Err(Error::Mismatch("keytab principal"));
         }
