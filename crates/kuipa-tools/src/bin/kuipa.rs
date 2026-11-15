@@ -1557,6 +1557,24 @@ impl Args {
     }
 }
 
+/// A secret from the first line of `file`, else asked for on a terminal
+/// (twice with `confirm`); `None` with neither.
+fn secret(file: Option<&str>, what: &str, confirm: bool) -> Result<Option<SecretBuf>, Error> {
+    if let Some(path) = file {
+        return Ok(Some(first_line(&SecretBuf::new(kuipa_tools::paths::read(
+            path,
+        )?))));
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let first = prompt(what, true)?;
+    if confirm && prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
+        return Err("the passphrases differ".into());
+    }
+    Ok(Some(first))
+}
+
 fn first_line(bytes: &SecretBuf) -> SecretBuf {
     let first = bytes
         .as_ref()
@@ -2613,17 +2631,8 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
     if kuipa_tools::seal::UserPaths::from_env().is_ok_and(|u| u.passkey_device()) {
         return security_key_pin(file, "security key PIN (empty if none)");
     }
-    let value = match file {
-        Some(path) => first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?)),
-        None if std::io::stdin().is_terminal() => {
-            let first = prompt("device key passphrase or token PIN", true)?;
-            if confirm && prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
-                return Err("the passphrases differ".into());
-            }
-            first
-        }
-        None => return Err("no passphrase: give --passphrase-file or run on a terminal".into()),
-    };
+    let value = secret(file, "device key passphrase or token PIN", confirm)?
+        .ok_or("no passphrase: give --passphrase-file or run on a terminal")?;
     if value.as_ref().is_empty() {
         return Err("missing passphrase".into());
     }
@@ -2633,11 +2642,7 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
 /// A security key's PIN from `file`, or asked for on the terminal; empty
 /// for none, as it is without a terminal.
 fn security_key_pin(file: Option<&str>, what: &str) -> Result<SecretBuf, Error> {
-    match file {
-        Some(path) => Ok(first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?))),
-        None if std::io::stdin().is_terminal() => Ok(prompt(what, true)?),
-        None => Ok(SecretBuf::with_len(0)),
-    }
+    Ok(secret(file, what, false)?.unwrap_or_else(|| SecretBuf::with_len(0)))
 }
 
 /// `seal` with the PIN for the passkey factor when it will be `needed`:
@@ -2946,17 +2951,8 @@ fn read_words() -> Result<Vec<String>, Error> {
 /// offline at PBKDF2 cost (`DESIGN-recovery.md` §2.1); `weak` and
 /// `none` accept a short or empty one, which is the user's risk.
 fn recovery_passphrase(file: Option<&str>, weak: bool, none: bool) -> Result<SecretBuf, Error> {
-    let value = match file {
-        Some(path) => first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?)),
-        None if std::io::stdin().is_terminal() => {
-            let first = prompt("recovery passphrase", true)?;
-            if prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
-                return Err("the passphrases differ".into());
-            }
-            first
-        }
-        None => return Err("no passphrase: give --passphrase-file or run on a terminal".into()),
-    };
+    let value = secret(file, "recovery passphrase", true)?
+        .ok_or("no passphrase: give --passphrase-file or run on a terminal")?;
     let chars = String::from_utf8_lossy(value.as_ref()).chars().count();
     if chars == 0 && !none {
         return Err(
@@ -3020,13 +3016,8 @@ fn run_recover(
             code_file,
             passphrase_file,
         } => {
-            let code = match code_file {
-                Some(path) => first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?)),
-                None if std::io::stdin().is_terminal() => prompt("recovery code", true)?,
-                None => {
-                    return Err("no recovery code: give --code-file or run on a terminal".into());
-                }
-            };
+            let code = secret(code_file.as_deref(), "recovery code", false)?
+                .ok_or("no recovery code: give --code-file or run on a terminal")?;
             let code = std::str::from_utf8(code.as_ref()).map_err(|_| "not a recovery code")?;
             let first = !user.device_key().exists();
             let pass = passphrase(passphrase_file.as_deref(), first)?;
