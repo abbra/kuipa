@@ -19,12 +19,39 @@ use crate::error::{Error, Result};
 
 /// JWK member naming a key's role.
 pub(crate) const ROLE_MEMBER: &str = "ipa_use";
-/// Role of join (and rekey and stage) keys.
-pub(crate) const ROLE_JOIN: &str = "join";
-/// Role of sealed-keytab escrow keys.
-pub(crate) const ROLE_ESCROW: &str = "escrow";
-/// Role of the keys trust requests from other realms are sealed to (§17.4).
-pub(crate) const ROLE_TRUST: &str = "trust";
+
+/// What an advertised exchange key is for.
+#[derive(Clone, Copy)]
+enum KeyRole {
+    /// Join (and rekey and stage) keys.
+    Join,
+    /// Sealed-keytab escrow keys.
+    Escrow,
+    /// The keys trust requests from other realms are sealed to (§17.4).
+    Trust,
+}
+
+impl KeyRole {
+    const ALL: [Self; 3] = [Self::Join, Self::Escrow, Self::Trust];
+
+    /// The role as the JWK member names it.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Join => "join",
+            Self::Escrow => "escrow",
+            Self::Trust => "trust",
+        }
+    }
+
+    /// What is missing when none is advertised.
+    const fn missing(self) -> &'static str {
+        match self {
+            Self::Join => "join key",
+            Self::Escrow => "escrow key",
+            Self::Trust => "trust key",
+        }
+    }
+}
 
 const MEMBER_IPA: &str = "ipa";
 const MEMBER_DELEGATION: &str = "delegation";
@@ -500,14 +527,10 @@ impl ServerKeys {
     ) -> Result<SignedAdvertisement> {
         let signing = [&self.signing];
         let mut builder = AdvertisementBuilder::new(&signing);
-        for k in &self.join {
-            builder = builder.exchange_key_with(k.public(), ROLE_MEMBER, ROLE_JOIN);
-        }
-        for k in &self.escrow {
-            builder = builder.exchange_key_with(k.public(), ROLE_MEMBER, ROLE_ESCROW);
-        }
-        for k in &self.trust {
-            builder = builder.exchange_key_with(k.public(), ROLE_MEMBER, ROLE_TRUST);
+        for role in KeyRole::ALL {
+            for k in self.keys_for(role) {
+                builder = builder.exchange_key_with(k.public(), ROLE_MEMBER, role.as_str());
+            }
         }
         if !self.vouchers.is_empty() {
             let keys = self
@@ -535,31 +558,38 @@ impl ServerKeys {
             .sign()?)
     }
 
-    /// A join key by id, advertised or retired.
-    #[must_use]
-    pub fn join_key(&self, kid: &Thumbprint) -> Option<&ExchangeKeyPair> {
-        self.join
+    fn keys_for(&self, role: KeyRole) -> &[ExchangeKeyPair] {
+        match role {
+            KeyRole::Join => &self.join,
+            KeyRole::Escrow => &self.escrow,
+            KeyRole::Trust => &self.trust,
+        }
+    }
+
+    /// A key of `role` by id, advertised or retired.
+    fn key(&self, role: KeyRole, kid: &Thumbprint) -> Option<&ExchangeKeyPair> {
+        self.keys_for(role)
             .iter()
             .chain(&self.retired)
             .find(|k| k.public().kid() == kid)
+    }
+
+    /// A join key by id, advertised or retired.
+    #[must_use]
+    pub fn join_key(&self, kid: &Thumbprint) -> Option<&ExchangeKeyPair> {
+        self.key(KeyRole::Join, kid)
     }
 
     /// An escrow key by id, advertised or retired.
     #[must_use]
     pub fn escrow_key(&self, kid: &Thumbprint) -> Option<&ExchangeKeyPair> {
-        self.escrow
-            .iter()
-            .chain(&self.retired)
-            .find(|k| k.public().kid() == kid)
+        self.key(KeyRole::Escrow, kid)
     }
 
     /// A trust key by id, advertised or retired.
     #[must_use]
     pub(crate) fn trust_key(&self, kid: &Thumbprint) -> Option<&ExchangeKeyPair> {
-        self.trust
-            .iter()
-            .chain(&self.retired)
-            .find(|k| k.public().kid() == kid)
+        self.key(KeyRole::Trust, kid)
     }
 }
 
@@ -812,16 +842,20 @@ impl VerifiedRealm {
         self.delegation.exp
     }
 
+    fn key(&self, role: KeyRole) -> Result<&ExchangeKey> {
+        self.adv
+            .exchange_keys_where(ROLE_MEMBER, role.as_str())
+            .next()
+            .ok_or(Error::Missing(role.missing()))
+    }
+
     /// The join key to use.
     ///
     /// # Errors
     ///
     /// [`Error::Missing`] if none is advertised (or the policy allows none).
     pub fn join_key(&self) -> Result<&ExchangeKey> {
-        self.adv
-            .exchange_keys_where(ROLE_MEMBER, ROLE_JOIN)
-            .next()
-            .ok_or(Error::Missing("join key"))
+        self.key(KeyRole::Join)
     }
 
     /// The escrow key to bind sealed keytabs to.
@@ -830,10 +864,7 @@ impl VerifiedRealm {
     ///
     /// [`Error::Missing`] if none is advertised.
     pub fn escrow_key(&self) -> Result<&ExchangeKey> {
-        self.adv
-            .exchange_keys_where(ROLE_MEMBER, ROLE_ESCROW)
-            .next()
-            .ok_or(Error::Missing("escrow key"))
+        self.key(KeyRole::Escrow)
     }
 
     /// The voucher keys the realm accepts (§9).
@@ -854,10 +885,7 @@ impl VerifiedRealm {
     ///
     /// [`Error::Missing`] if none is advertised.
     pub fn trust_key(&self) -> Result<&ExchangeKey> {
-        self.adv
-            .exchange_keys_where(ROLE_MEMBER, ROLE_TRUST)
-            .next()
-            .ok_or(Error::Missing("trust key"))
+        self.key(KeyRole::Trust)
     }
 
     /// The underlying `tang-pqc` advertisement.
