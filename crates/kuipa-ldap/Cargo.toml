@@ -1,7 +1,7 @@
 [package]
 name = "kuipa-ldap"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Synchronous LDAP client (from ahdapa-ldap): simple, GSSAPI and S4U binds, search, modify, extended operations"

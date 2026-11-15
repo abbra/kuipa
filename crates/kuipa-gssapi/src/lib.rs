@@ -46,9 +46,9 @@ use std::ffi::c_char;
 use std::ffi::{CStr, CString};
 use std::ptr;
 
-use error::cstring;
 pub use error::GssError;
-pub use kinit::{ticket, NoPreauth, Preauth};
+use error::cstring;
+pub use kinit::{NoPreauth, Preauth, ticket};
 
 /// Whether this build links MIT Kerberos (the cfg `build.rs` sets):
 /// MS-KKDCP KDC proxies are MIT-only, Heimdal does not speak them.
@@ -324,42 +324,45 @@ impl GssServerCred {
         actual_mechs: *mut ffi::GssOidSetT,
         time_rec: *mut ffi::OmUint32,
     ) -> ffi::OmUint32 {
-        let major = ffi::gss_acquire_cred_from(
-            minor,
-            svc_name,
-            0, // GSS_C_INDEFINITE
-            ffi::GSS_C_NO_OID_SET,
-            ffi::GSS_C_BOTH,
-            cred_store,
-            cred_handle,
-            actual_mechs,
-            time_rec,
-        );
-        if major == ffi::GSS_S_COMPLETE {
-            return major;
+        // SAFETY: the caller's contract.
+        unsafe {
+            let major = ffi::gss_acquire_cred_from(
+                minor,
+                svc_name,
+                0, // GSS_C_INDEFINITE
+                ffi::GSS_C_NO_OID_SET,
+                ffi::GSS_C_BOTH,
+                cred_store,
+                cred_handle,
+                actual_mechs,
+                time_rec,
+            );
+            if major == ffi::GSS_S_COMPLETE {
+                return major;
+            }
+            // Defensively release a potentially non-null cred_handle on failure.
+            if !(*cred_handle).is_null() {
+                ffi::gss_release_cred(minor, cred_handle);
+                *cred_handle = ptr::null_mut();
+            }
+            if !(*actual_mechs).is_null() {
+                ffi::gss_release_oid_set(minor, actual_mechs);
+                *actual_mechs = ptr::null_mut();
+            }
+            let detail = status::format_gss_status(major, *minor);
+            tracing::warn!(%detail, "GSS_C_BOTH acquire failed, retrying with GSS_C_ACCEPT (S4U2Self will be unavailable)");
+            ffi::gss_acquire_cred_from(
+                minor,
+                svc_name,
+                0,
+                ffi::GSS_C_NO_OID_SET,
+                ffi::GSS_C_ACCEPT,
+                cred_store,
+                cred_handle,
+                actual_mechs,
+                time_rec,
+            )
         }
-        // Defensively release a potentially non-null cred_handle on failure.
-        if !(*cred_handle).is_null() {
-            ffi::gss_release_cred(minor, cred_handle);
-            *cred_handle = ptr::null_mut();
-        }
-        if !(*actual_mechs).is_null() {
-            ffi::gss_release_oid_set(minor, actual_mechs);
-            *actual_mechs = ptr::null_mut();
-        }
-        let detail = status::format_gss_status(major, *minor);
-        tracing::warn!(%detail, "GSS_C_BOTH acquire failed, retrying with GSS_C_ACCEPT (S4U2Self will be unavailable)");
-        ffi::gss_acquire_cred_from(
-            minor,
-            svc_name,
-            0,
-            ffi::GSS_C_NO_OID_SET,
-            ffi::GSS_C_ACCEPT,
-            cred_store,
-            cred_handle,
-            actual_mechs,
-            time_rec,
-        )
     }
 
     /// The Heimdal path: resolve the keytab and import it as an ACCEPT
@@ -1753,7 +1756,8 @@ impl GssServerContext {
         minor: *mut ffi::OmUint32,
         buf: *mut ffi::GssBufferDesc,
     ) -> Vec<u8> {
-        if (*buf).length == 0 || (*buf).value.is_null() {
+        // SAFETY: guaranteed by the caller.
+        if unsafe { (*buf).length == 0 || (*buf).value.is_null() } {
             return Vec::new();
         }
         // SAFETY: guaranteed by the caller.
@@ -1780,7 +1784,8 @@ impl GssServerContext {
         let major_dn =
             unsafe { ffi::gss_display_name(minor, src_name, &raw mut name_buf, ptr::null_mut()) };
         // Snapshot minor before gss_release_name overwrites it.
-        let dn_minor = *minor;
+        // SAFETY: guaranteed by the caller.
+        let dn_minor = unsafe { *minor };
         // SAFETY: src_name is valid; gss_release_name takes ownership.
         unsafe { ffi::gss_release_name(minor, &raw mut src_name) };
         if major_dn == ffi::GSS_S_COMPLETE && !name_buf.value.is_null() {

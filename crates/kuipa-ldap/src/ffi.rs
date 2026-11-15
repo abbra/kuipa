@@ -191,7 +191,7 @@ pub(crate) type SaslInteractProc = Option<
 
 // ── Extern "C" function declarations ─────────────────────────────────────────
 
-extern "C" {
+unsafe extern "C" {
     // ── Connection lifecycle ──────────────────────────────────────────────────
 
     /// Initialise an LDAP session handle for `url` without opening a TCP

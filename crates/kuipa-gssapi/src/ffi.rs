@@ -217,7 +217,7 @@ impl Default for Krb5Creds {
 // ── libkrb5 extern functions ───────────────────────────────────────────────────
 
 #[link(name = "krb5")]
-extern "C" {
+unsafe extern "C" {
     #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub(crate) fn krb5_init_context(context: *mut Krb5Context) -> c_int;
     pub(crate) fn krb5_free_context(context: Krb5Context);
@@ -389,7 +389,7 @@ impl Krb5Data {
 // its libkrb5.
 #[cfg(mit_kerberos)]
 #[link(name = "krb5")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn profile_init_path(filepath: *const c_char, ret_profile: *mut Profile) -> c_long;
     pub(crate) fn profile_release(profile: Profile);
     pub(crate) fn krb5_init_context_profile(
@@ -596,7 +596,7 @@ pub(crate) const KRB5_RESPONDER_OTP_FLAGS_SEPARATE_PIN: c_int = 0x0008;
 // Credential stores, S4U2Self and thread-local ccaches are MIT extensions:
 // Heimdal has none of them, so a Heimdal build must not reference them.
 #[cfg(mit_kerberos)]
-extern "C" {
+unsafe extern "C" {
     /// Acquire an initiator credential that impersonates `desired_name` (S4U2Self).
     ///
     /// `impersonator_cred_handle` must be an initiator (`GSS_C_INITIATE` or
@@ -688,11 +688,11 @@ impl Default for Krb5KtEntry {
 
 #[cfg(heimdal_kerberos)]
 #[link(name = "krb5")]
-extern "C" {
+unsafe extern "C" {
     /// Read `filenames`, a NULL-terminated array, as the whole configuration,
     /// replacing what the context loaded from the environment.
     pub(crate) fn krb5_set_config_files(context: Krb5Context, filenames: *mut *mut c_char)
-        -> c_int;
+    -> c_int;
 
     /// `krb5_init_creds_context`: one AS exchange, driven step by step.
     pub(crate) fn krb5_init_creds_init(
@@ -790,7 +790,7 @@ extern "C" {
 // last-request report.
 #[cfg(heimdal_kerberos)]
 #[link(name = "krb5")]
-extern "C" {
+unsafe extern "C" {
     /// Apply the configuration's default init-creds flags to `opt`.  Only
     /// `krb5_init_creds_init` given no options applies them itself, so kuipa
     /// has to, exactly as `kinit` does.
@@ -819,7 +819,7 @@ extern "C" {
 }
 
 #[cfg(heimdal_kerberos)]
-extern "C" {
+unsafe extern "C" {
     /// Acquire a credential for `desired_name` from the default ccache or
     /// keytab — with no credential store, the only way in on a plain name.
     pub(crate) fn gss_acquire_cred(
@@ -847,7 +847,7 @@ extern "C" {
 
 // ── GSSAPI extern functions ────────────────────────────────────────────────────
 
-extern "C" {
+unsafe extern "C" {
     /// Parse a host-based service name string into a `GssNameT`.
     pub(crate) fn gss_import_name(
         minor_status: *mut OmUint32,

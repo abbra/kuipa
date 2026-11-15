@@ -55,7 +55,7 @@ use std::ptr;
 
 use std::ffi::{c_char, c_int, c_void};
 
-use crate::error::{cstring, GssError};
+use crate::error::{GssError, cstring};
 use crate::ffi;
 use native_ossl::util::SecretBuf;
 
@@ -321,7 +321,7 @@ struct Principal<'a>(&'a Context, ffi::Krb5Principal);
 impl Drop for Principal<'_> {
     fn drop(&mut self) {
         // SAFETY: self.1 was made by krb5_parse_name in this context.
-        unsafe { ffi::krb5_free_principal(self.0 .0, self.1) };
+        unsafe { ffi::krb5_free_principal(self.0.0, self.1) };
     }
 }
 
@@ -332,7 +332,7 @@ impl Ccache<'_> {
     fn destroy(self) {
         // SAFETY: self.1 is a live ccache; destroy also closes it, so Drop
         // must not run.
-        unsafe { ffi::krb5_cc_destroy(self.0 .0, self.1) };
+        unsafe { ffi::krb5_cc_destroy(self.0.0, self.1) };
         std::mem::forget(self);
     }
 }
@@ -340,7 +340,7 @@ impl Ccache<'_> {
 impl Drop for Ccache<'_> {
     fn drop(&mut self) {
         // SAFETY: self.1 was resolved in this context.
-        unsafe { ffi::krb5_cc_close(self.0 .0, self.1) };
+        unsafe { ffi::krb5_cc_close(self.0.0, self.1) };
     }
 }
 
@@ -349,7 +349,7 @@ struct Options<'a>(&'a Context, ffi::Krb5GetInitCredsOpt);
 impl Drop for Options<'_> {
     fn drop(&mut self) {
         // SAFETY: self.1 was allocated in this context.
-        unsafe { ffi::krb5_get_init_creds_opt_free(self.0 .0, self.1) };
+        unsafe { ffi::krb5_get_init_creds_opt_free(self.0.0, self.1) };
     }
 }
 
@@ -721,7 +721,8 @@ unsafe extern "C" fn responder(
         // for this call.
         let question = questions[i].ptr;
         match handling {
-            Handling::Otp => otp_challenge(ctx, rctx, answers),
+            // SAFETY: ctx and rctx are live for this call; answers outlives it.
+            Handling::Otp => unsafe { otp_challenge(ctx, rctx, answers) },
             Handling::Plugin => {
                 // Answering with nothing makes the plugin that asked — a
                 // passkey plugin, say — collect the answer itself through
@@ -1195,8 +1196,10 @@ mod tests {
             refused: RefCell::new(None),
         };
         assert_eq!(answers.ask("OTP token value", true), None);
-        assert!(answers
-            .reason()
-            .is_some_and(|d| d.contains("OTP token value")));
+        assert!(
+            answers
+                .reason()
+                .is_some_and(|d| d.contains("OTP token value"))
+        );
     }
 }

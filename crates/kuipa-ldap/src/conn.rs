@@ -17,8 +17,8 @@ use std::ptr;
 use libc::{c_char, c_int, c_void, timeval};
 use tracing::debug;
 
-use crate::ffi::{self, berval, BerElement, LDAP};
-use crate::{Auth, LdapError, Scope, NO_SUCH_OBJECT};
+use crate::ffi::{self, BerElement, LDAP, berval};
+use crate::{Auth, LdapError, NO_SUCH_OBJECT, Scope};
 
 // ── SASL interact callback ────────────────────────────────────────────────────
 
@@ -45,7 +45,11 @@ pub(crate) unsafe extern "C" fn sasl_interact_gssapi(
     if defaults.is_null() {
         tracing::trace!("sasl_interact: no credential (defaults is null)");
     } else {
-        let rc = ffi::ldap_set_option(ld, ffi::LDAP_OPT_X_SASL_GSS_CREDS, defaults.cast_const());
+        // SAFETY: libldap passes the live session `ld`; `defaults` is the
+        // credential handle bind_gssapi_impl gave it, stored as-is.
+        let rc = unsafe {
+            ffi::ldap_set_option(ld, ffi::LDAP_OPT_X_SASL_GSS_CREDS, defaults.cast_const())
+        };
         if rc != ffi::LDAP_SUCCESS {
             // Fail rather than continue with whatever identity the
             // process would otherwise use: the bind must not proceed as
@@ -61,10 +65,13 @@ pub(crate) unsafe extern "C" fn sasl_interact_gssapi(
         return ffi::LDAP_SUCCESS;
     }
     let mut interact = interact_raw.cast::<ffi::sasl_interact>();
-    while (*interact).id != ffi::SASL_CB_LIST_END {
-        (*interact).result = c"".as_ptr().cast::<c_void>();
-        (*interact).len = 0;
-        interact = interact.add(1);
+    // SAFETY: as above.
+    unsafe {
+        while (*interact).id != ffi::SASL_CB_LIST_END {
+            (*interact).result = c"".as_ptr().cast::<c_void>();
+            (*interact).len = 0;
+            interact = interact.add(1);
+        }
     }
     ffi::LDAP_SUCCESS
 }
@@ -859,10 +866,13 @@ impl Mods {
 /// The caller must free `res` with `ldap_msgfree` after this function returns.
 unsafe fn collect_entries(ld: *mut LDAP, res: *mut ffi::LDAPMessage) -> Vec<SearchEntry> {
     let mut entries = Vec::new();
-    let mut entry = ffi::ldap_first_entry(ld, res);
-    while !entry.is_null() {
-        entries.push(decode_entry(ld, entry));
-        entry = ffi::ldap_next_entry(ld, entry);
+    // SAFETY: the caller's contract; every `entry` comes from ldap_first/next_entry.
+    unsafe {
+        let mut entry = ffi::ldap_first_entry(ld, res);
+        while !entry.is_null() {
+            entries.push(decode_entry(ld, entry));
+            entry = ffi::ldap_next_entry(ld, entry);
+        }
     }
     entries
 }
@@ -874,42 +884,45 @@ unsafe fn collect_entries(ld: *mut LDAP, res: *mut ffi::LDAPMessage) -> Vec<Sear
 /// `ld` and `entry` must be valid non-null pointers from `ldap_first/next_entry`.
 /// The caller retains ownership of both; this function does not free them.
 unsafe fn decode_entry(ld: *mut LDAP, entry: *mut ffi::LDAPMessage) -> SearchEntry {
-    let mut se = SearchEntry::default();
+    // SAFETY: the caller's contract; libldap owns what it hands out until the
+    // matching free below.
+    unsafe {
+        let mut se = SearchEntry::default();
 
-    // DN
-    let dn_ptr = ffi::ldap_get_dn(ld, entry);
-    if !dn_ptr.is_null() {
-        se.dn = CStr::from_ptr(dn_ptr).to_string_lossy().into_owned();
-        ffi::ldap_memfree(dn_ptr.cast::<c_void>());
-    }
-
-    // Attribute iteration
-    let mut ber: *mut BerElement = ptr::null_mut();
-    let mut attr_ptr = ffi::ldap_first_attribute(ld, entry, &raw mut ber);
-    while !attr_ptr.is_null() {
-        let attr_name = CStr::from_ptr(attr_ptr)
-            .to_string_lossy()
-            .to_ascii_lowercase();
-
-        let vals_ptr = ffi::ldap_get_values_len(ld, entry, attr_ptr);
-        if !vals_ptr.is_null() {
-            let (str_vals, bin_vals) = decode_bervals(vals_ptr);
-            se.attrs
-                .entry(attr_name.clone())
-                .or_default()
-                .extend(str_vals);
-            se.bin_attrs.entry(attr_name).or_default().extend(bin_vals);
-            ffi::ldap_value_free_len(vals_ptr);
+        // DN
+        let dn_ptr = ffi::ldap_get_dn(ld, entry);
+        if !dn_ptr.is_null() {
+            se.dn = CStr::from_ptr(dn_ptr).to_string_lossy().into_owned();
+            ffi::ldap_memfree(dn_ptr.cast::<c_void>());
         }
 
-        ffi::ldap_memfree(attr_ptr.cast::<c_void>());
-        attr_ptr = ffi::ldap_next_attribute(ld, entry, ber);
-    }
-    if !ber.is_null() {
-        ffi::ber_free(ber, 0);
-    }
+        // Attribute iteration
+        let mut ber: *mut BerElement = ptr::null_mut();
+        let mut attr_ptr = ffi::ldap_first_attribute(ld, entry, &raw mut ber);
+        while !attr_ptr.is_null() {
+            let attr_name = CStr::from_ptr(attr_ptr)
+                .to_string_lossy()
+                .to_ascii_lowercase();
 
-    se
+            let vals_ptr = ffi::ldap_get_values_len(ld, entry, attr_ptr);
+            if !vals_ptr.is_null() {
+                let (str_vals, bin_vals) = decode_bervals(vals_ptr);
+                se.attrs
+                    .entry(attr_name.clone())
+                    .or_default()
+                    .extend(str_vals);
+                se.bin_attrs.entry(attr_name).or_default().extend(bin_vals);
+                ffi::ldap_value_free_len(vals_ptr);
+            }
+
+            ffi::ldap_memfree(attr_ptr.cast::<c_void>());
+            attr_ptr = ffi::ldap_next_attribute(ld, entry, ber);
+        }
+        if !ber.is_null() {
+            ffi::ber_free(ber, 0);
+        }
+        se
+    }
 }
 
 /// Decode a NULL-terminated `berval**` into parallel string and byte vectors.
@@ -919,33 +932,20 @@ unsafe fn decode_entry(ld: *mut LDAP, entry: *mut ffi::LDAPMessage) -> SearchEnt
 /// `vals_ptr` must be a valid non-null pointer returned by `ldap_get_values_len`.
 /// The caller must free it with `ldap_value_free_len` after this function returns.
 unsafe fn decode_bervals(vals_ptr: *mut *mut berval) -> (Vec<String>, Vec<Vec<u8>>) {
-    let mut str_vals = Vec::new();
     let mut bin_vals = Vec::new();
-    let mut i = 0usize;
-    loop {
-        let bv = *vals_ptr.add(i);
-        if bv.is_null() {
-            break;
+    // SAFETY: the caller's contract; the array ends with a null pointer and
+    // every other element is a valid berval.
+    unsafe {
+        let mut i = 0usize;
+        while !(*vals_ptr.add(i)).is_null() {
+            bin_vals.push(berval_bytes(&**vals_ptr.add(i)));
+            i += 1;
         }
-        // SAFETY: bv_val is null or points to bv_len readable bytes; the
-        // null case yields an empty slice rather than UB, as in
-        // `berval_bytes`.
-        let bytes = if (*bv).bv_val.is_null() {
-            &[][..]
-        } else {
-            unsafe {
-                std::slice::from_raw_parts(
-                    (*bv).bv_val as *const u8,
-                    // A bv_len larger than `usize` cannot describe a readable
-                    // buffer on any real target; treat it as empty.
-                    usize::try_from((*bv).bv_len).unwrap_or(0),
-                )
-            }
-        };
-        bin_vals.push(bytes.to_vec());
-        str_vals.push(String::from_utf8_lossy(bytes).into_owned());
-        i += 1;
     }
+    let str_vals = bin_vals
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect();
     (str_vals, bin_vals)
 }
 
