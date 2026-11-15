@@ -103,6 +103,45 @@ pub(crate) fn now() -> SystemTime {
     SystemTime::now()
 }
 
+/// What this host's anchors file pins: one read of the file, so the
+/// windows and the epoch watermark come from the same contents.
+pub(crate) struct HostPins {
+    pub(crate) anchors: Vec<Thumbprint>,
+    heads: Vec<HeadPin>,
+    retired: Vec<Hash>,
+    frozen: Vec<Thumbprint>,
+    pub(crate) epoch: Option<Epoch>,
+}
+
+impl HostPins {
+    pub(crate) fn load(path: &Path) -> Result<Self, Error> {
+        let (anchors, heads, retired, frozen) = paths::pinned_windows(path)?;
+        let epoch = paths::read_epoch_from(path)?;
+        Ok(Self {
+            anchors,
+            heads,
+            retired,
+            frozen,
+            epoch,
+        })
+    }
+
+    pub(crate) fn pins<'a>(&'a self, realm: &'a str) -> Pins<'a> {
+        Pins {
+            realm,
+            anchors: &self.anchors,
+            heads: &self.heads,
+            retired: &self.retired,
+            frozen: &self.frozen,
+        }
+    }
+}
+
+/// The retry-later error for when every server was skipped.
+fn no_usable_server(skipped: &[String]) -> Error {
+    Outcome::RetryLater(format!("no usable server: {}", skipped.join("; "))).into()
+}
+
 /// The host's FQDN from the kernel.
 ///
 /// # Errors
@@ -622,7 +661,7 @@ pub(crate) fn exchange_with<T>(
             .into());
         }
     }
-    Err(Outcome::RetryLater(format!("no usable server: {}", skipped.join("; "))).into())
+    Err(no_usable_server(&skipped))
 }
 
 /// Merge `new` keys with the previous kvno of `old`, as `ipa-getkeytab`
@@ -1447,34 +1486,16 @@ fn locked_pins<T>(paths: &Paths, f: impl FnOnce() -> Result<T, Error>) -> Result
 /// Advertisements of every server of the realm that answers and describes
 /// the stored deployment, for sealing.  The pinned windows and the frozen
 /// anchors travel with the anchors, as for any verified fetch (§1.4, §2).
-pub(crate) fn all_servers(
-    state: &State,
-    trust: &Trust,
-    anchors: &[Thumbprint],
-    heads: &[HeadPin],
-    retired: &[Hash],
-    frozen: &[Thumbprint],
-) -> Vec<VerifiedRealm> {
+pub(crate) fn all_servers(state: &State, trust: &Trust, host: &HostPins) -> Vec<VerifiedRealm> {
     let deployment = Deployment::servers(&state.servers);
     state
         .servers
         .iter()
         .filter_map(|s| {
-            verified(
-                s,
-                trust,
-                Pins {
-                    realm: &state.realm,
-                    anchors,
-                    heads,
-                    retired,
-                    frozen,
-                },
-                None,
-            )
-            .ok()
-            .map(|(_, v, _)| v)
-            .filter(|v| check_deployment(s, v, &deployment).is_ok())
+            verified(s, trust, host.pins(&state.realm), None)
+                .ok()
+                .map(|(_, v, _)| v)
+                .filter(|v| check_deployment(s, v, &deployment).is_ok())
         })
         .collect()
 }
@@ -1503,8 +1524,8 @@ fn existing_tpm(sealed: &Path) -> Result<Option<kuipa_enroll::escrow::TpmShare>,
 pub fn rotate_keys(paths: &Paths, protect: Option<(Holder, Option<&str>)>) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
     let holder = protect.map_or(state.holder, |(h, _)| h);
-    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
-    let known = paths::read_epoch_from(&paths.anchors())?;
+    let host = HostPins::load(&paths.anchors())?;
+    let known = host.epoch;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm);
     let keytab_path = live_keytab(paths, &state);
@@ -1521,7 +1542,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<(Holder, Option<&str>)>) -> Re
     let (sealer, registrations) = if holder == Holder::None {
         (None, Vec::new())
     } else {
-        let servers = all_servers(&state, &trust, &anchors, &heads, &retired, &frozen);
+        let servers = all_servers(&state, &trust, &host);
         let refs: Vec<_> = servers.iter().collect();
         let (mut sealer, registered) = Sealer::prepare(&principal, Kind::Keytab, &refs)?;
         // The TPM factor stays through reseals; the share is fresh.  It is
@@ -1551,13 +1572,7 @@ pub fn rotate_keys(paths: &Paths, protect: Option<(Holder, Option<&str>)>) -> Re
     let (enrollment, adv) = exchange(
         &Deployment::servers(&state.servers),
         &trust,
-        Pins {
-            realm: &state.realm,
-            anchors: &anchors,
-            heads: &heads,
-            retired: &retired,
-            frozen: &frozen,
-        },
+        host.pins(&state.realm),
         known,
         Operation::Rekey,
         |adv| {
@@ -1851,8 +1866,8 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
         nickname: nickname.to_owned(),
         alg,
     };
-    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
-    let known = paths::read_epoch_from(&paths.anchors())?;
+    let host = HostPins::load(&paths.anchors())?;
+    let known = host.epoch;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm);
     let cred = GssClientCred::from_client_keytab(
@@ -1864,13 +1879,7 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
     let (answer, _) = exchange_with(
         &Deployment::servers(&state.servers),
         &trust,
-        Pins {
-            realm: &state.realm,
-            anchors: &anchors,
-            heads: &heads,
-            retired: &retired,
-            frozen: &frozen,
-        },
+        host.pins(&state.realm),
         known,
         Operation::Keys,
         |adv| kerberos_request(adv, Operation::Keys, &state.fqdn, &cred, &[], &extra),
@@ -1947,8 +1956,8 @@ fn register(
     params: &RegisterParams,
     bindings: &[kuipa_enroll::escrow::BindingHash],
 ) -> Result<String, Error> {
-    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
-    let known = paths::read_epoch_from(&paths.anchors())?;
+    let host = HostPins::load(&paths.anchors())?;
+    let known = host.epoch;
     let trust = ca_trust(paths)?;
     let cred = GssClientCred::from_client_keytab(
         keytab.to_str().ok_or("non-UTF-8 keytab path")?,
@@ -1966,13 +1975,7 @@ fn register(
     let ((), adv) = exchange_with(
         &Deployment::servers(&state.servers),
         &trust,
-        Pins {
-            realm: &state.realm,
-            anchors: &anchors,
-            heads: &heads,
-            retired: &retired,
-            frozen: &frozen,
-        },
+        host.pins(&state.realm),
         known,
         Operation::Register,
         |adv| {
@@ -2062,9 +2065,9 @@ fn protect_other(
         _ => Vec::new(),
     };
 
-    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let host = HostPins::load(&paths.anchors())?;
     let trust = ca_trust(paths)?;
-    let servers = all_servers(&state, &trust, &anchors, &heads, &retired, &frozen);
+    let servers = all_servers(&state, &trust, &host);
     let refs: Vec<_> = servers.iter().collect();
     let (sealer, registrations) = Sealer::prepare(&principal, kind_of(contents), &refs)?;
     let sealer = with_tpm_factor(sealer, tpm, existing.is_some(), &sealed_path)?;
@@ -2308,8 +2311,8 @@ pub fn check(paths: &Paths, only: &[String]) -> Result<Value, Error> {
     let state = State::load(paths)?;
     // The whole window travels and the frozen anchors are named: §1.4 and
     // §2 are enforced here, not left to what the server happens to serve.
-    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
-    let known = paths::read_epoch_from(&paths.anchors())?;
+    let host = HostPins::load(&paths.anchors())?;
+    let known = host.epoch;
     let trust = ca_trust(paths)?;
     let principal = Principal::host(&state.fqdn, &state.realm).to_string();
     let keytab_path = live_keytab(paths, &state);
@@ -2321,22 +2324,12 @@ pub fn check(paths: &Paths, only: &[String]) -> Result<Value, Error> {
         .iter()
         .filter(|s| only.is_empty() || only.contains(s))
     {
-        match verified(
-            server,
-            &trust,
-            Pins {
-                realm: &state.realm,
-                anchors: &anchors,
-                heads: &heads,
-                retired: &retired,
-                frozen: &frozen,
+        match verified(server, &trust, host.pins(&state.realm), known).and_then(
+            |(e, adv, advance)| {
+                adv.check_deployment(&Deployment::servers(&state.servers))?;
+                Ok((e, adv, advance))
             },
-            known,
-        )
-        .and_then(|(e, adv, advance)| {
-            adv.check_deployment(&Deployment::servers(&state.servers))?;
-            Ok((e, adv, advance))
-        }) {
+        ) {
             Ok((_, adv, advance)) => {
                 // The furthest verified advance wins: a server that
                 // advances nothing does not undo another's.
@@ -2449,7 +2442,7 @@ fn refresh_pins(
     trust: &Trust,
     known: Option<Epoch>,
 ) -> Result<bool, Error> {
-    let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
+    let host = HostPins::load(&paths.anchors())?;
     let principal = Principal::host(&state.fqdn, &state.realm);
     let keytab_path = live_keytab(paths, state);
     let cred = GssClientCred::from_client_keytab(
@@ -2460,13 +2453,7 @@ fn refresh_pins(
     let (answer, adv) = exchange_with(
         &Deployment::servers(servers),
         trust,
-        Pins {
-            realm: &state.realm,
-            anchors: &anchors,
-            heads: &heads,
-            retired: &retired,
-            frozen: &frozen,
-        },
+        host.pins(&state.realm),
         known,
         Operation::Pins,
         |adv| kerberos_request(adv, Operation::Pins, &state.fqdn, &cred, &[], &[]),
@@ -2941,7 +2928,7 @@ pub fn adopt(
             Err(e) => skipped.push(format!("{server}: {e}")),
         }
     }
-    Err(Outcome::RetryLater(format!("no usable server: {}", skipped.join("; "))).into())
+    Err(no_usable_server(&skipped))
 }
 
 /// The realm and anchors a server's advertisement names, unverified: the
@@ -2998,7 +2985,7 @@ fn realm_info_with(
             Err(e) => skipped.push(format!("{server}: {e}")),
         }
     }
-    Err(Outcome::RetryLater(format!("no usable server: {}", skipped.join("; "))).into())
+    Err(no_usable_server(&skipped))
 }
 
 /// The KDC proxies a trusted realm's KDCs are reached through, if any:

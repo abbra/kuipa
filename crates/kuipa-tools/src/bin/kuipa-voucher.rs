@@ -193,11 +193,7 @@ fn run(command: Command) -> Result<(), Error> {
                 lease,
                 binding,
             };
-            let request = voucher::request(
-                &kuipa_tools::paths::read(&public)?,
-                &claims,
-                &state,
-            )?;
+            let request = voucher::request(&kuipa_tools::paths::read(&public)?, &claims, &state)?;
             println!("{request}");
         }
         Command::Finish { state } => {

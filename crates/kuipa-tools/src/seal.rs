@@ -756,21 +756,15 @@ impl<'a> SealClient<'a> {
         // This host's pins, windows and freezes included (§1.4, §2): a
         // seal descriptor is fetched through a verified advertisement,
         // and a frozen pin must not fall back to a signature here.
-        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
-        let known = paths::read_epoch_from(&self.host.anchors())?;
+        let pinned = flows::HostPins::load(&self.host.anchors())?;
+        let known = pinned.epoch;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
         let me = cred.principal_name();
         let (reply, _) = flows::exchange_with(
             &Deployment::servers(&public.servers),
             &trust,
-            flows::Pins {
-                realm: &public.realm,
-                anchors: &anchors,
-                heads: &heads,
-                retired: &retired,
-                frozen: &frozen,
-            },
+            pinned.pins(&public.realm),
             known,
             Operation::Seal,
             |adv| {
@@ -792,7 +786,11 @@ impl<'a> SealClient<'a> {
         let mut reply = reply;
         let mut verified = Vec::with_capacity(reply.descriptors.len());
         for d in std::mem::take(&mut reply.descriptors) {
-            let v = d.verify(&public.realm, &anchors, &tang_pqc::Policy::from_system()?)?;
+            let v = d.verify(
+                &public.realm,
+                &pinned.anchors,
+                &tang_pqc::Policy::from_system()?,
+            )?;
             let reference = reference_for(v.seal(), me.as_deref());
             self.user
                 .write(&self.user.seal(&reference, &public.realm)?, &d.to_bytes())?;
@@ -1236,8 +1234,8 @@ impl<'a> SealClient<'a> {
     > {
         use kuipa_enroll::tlog::{LogId, MAX_ANSWER, Query};
 
-        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
-        let known = paths::read_epoch_from(&self.host.anchors())?;
+        let pinned = flows::HostPins::load(&self.host.anchors())?;
+        let known = pinned.epoch;
         let trust = flows::ca_trust(self.host)?;
         let cred = self.cred()?;
         let policy = tang_pqc::Policy::from_system()?;
@@ -1254,13 +1252,7 @@ impl<'a> SealClient<'a> {
             let (answer, _) = flows::exchange_with(
                 &deployment,
                 &trust,
-                flows::Pins {
-                    realm: &public.realm,
-                    anchors: &anchors,
-                    heads: &heads,
-                    retired: &retired,
-                    frozen: &frozen,
-                },
+                pinned.pins(&public.realm),
                 known,
                 Operation::Tlog,
                 |adv| {
@@ -1358,25 +1350,15 @@ impl<'a> SealClient<'a> {
         let public = self.public()?;
         // The whole window travels and a frozen pin is enforced (§1.4,
         // §2): these advertisements are what sealing trusts.
-        let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
-        let known = paths::read_epoch_from(&self.host.anchors())?;
+        let pinned = flows::HostPins::load(&self.host.anchors())?;
+        let known = pinned.epoch;
         let trust = flows::ca_trust(self.host)?;
         let now = tang_pqc::now();
         let mut cache = Vec::new();
         let mut verified = Vec::new();
         for server in &public.servers {
-            let Ok((_, v, _)) = flows::verified(
-                server,
-                &trust,
-                flows::Pins {
-                    realm: &public.realm,
-                    anchors: &anchors,
-                    heads: &heads,
-                    retired: &retired,
-                    frozen: &frozen,
-                },
-                known,
-            ) else {
+            let Ok((_, v, _)) = flows::verified(server, &trust, pinned.pins(&public.realm), known)
+            else {
                 continue;
             };
             // What was just verified is what sealing keeps: no second fetch.

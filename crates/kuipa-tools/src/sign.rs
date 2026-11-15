@@ -81,8 +81,8 @@ pub fn sign_files(
 /// A refusal or any other error.
 pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Vec<Bundle>, Error> {
     let public = PublicState::load(host)?;
-    let (anchors, heads, retired, frozen) = paths::pinned_windows(&host.anchors())?;
-    let known = paths::read_epoch_from(&host.anchors())?;
+    let pinned = flows::HostPins::load(&host.anchors())?;
+    let known = pinned.epoch;
     let trust = flows::ca_trust(host)?;
     let cred = match ccache {
         Some(name) => GssClientCred::from_named_ccache(name)?,
@@ -92,13 +92,7 @@ pub fn request(host: &Paths, ccache: Option<&str>, asked: &Request) -> Result<Ve
     let (bundles, _) = flows::exchange_with(
         &Deployment::servers(&public.servers),
         &trust,
-        flows::Pins {
-            realm: &public.realm,
-            anchors: &anchors,
-            heads: &heads,
-            retired: &retired,
-            frozen: &frozen,
-        },
+        pinned.pins(&public.realm),
         known,
         Operation::Sign,
         |adv| flows::kerberos_request(adv, Operation::Sign, &public.fqdn, &cred, &[], &extra),
