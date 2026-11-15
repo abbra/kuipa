@@ -12,7 +12,6 @@
 //!
 //! Requests and responses travel as base64url text, so any channel will do.
 
-use std::fs::OpenOptions;
 use std::io::Seek;
 use std::path::Path;
 
@@ -105,12 +104,6 @@ impl QuotaGuard {
     }
 }
 
-impl Drop for QuotaGuard {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
 /// Take the issuer's exclusive lock on the quota file at `path`.  The
 /// lock is held until the returned guard drops.
 ///
@@ -118,18 +111,9 @@ impl Drop for QuotaGuard {
 ///
 /// I/O, or the quota file cannot be created or locked.
 fn quota_lock(path: &Path) -> Result<QuotaGuard, Error> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    file.lock()
-        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
-    Ok(QuotaGuard { file })
+    Ok(QuotaGuard {
+        file: crate::paths::lock_file(path)?,
+    })
 }
 
 /// Sign one blinded `request` (base64url) with the voucher key in `key`,

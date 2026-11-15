@@ -287,6 +287,28 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, Error> {
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())).into())
 }
 
+/// Create `path` (and its parent directories) if need be and take an
+/// exclusive advisory lock on it, held until the returned file is dropped.
+/// The file is opened for reading and writing, and kept as it is.
+///
+/// # Errors
+///
+/// I/O errors, or the file cannot be locked.
+pub fn lock_file(path: &Path) -> Result<fs::File, Error> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.lock()
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    Ok(file)
+}
+
 /// Remove a file if it exists.
 ///
 /// # Errors

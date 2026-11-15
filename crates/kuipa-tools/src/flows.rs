@@ -1428,19 +1428,8 @@ fn write_windows(
 /// and a key rotation) never merge against a stale copy and overwrite each
 /// other.
 fn locked_pins<T>(paths: &Paths, f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
-    let anchors = paths.anchors();
-    if let Some(dir) = anchors.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(anchors.with_extension("lock"))?;
-    lock.lock()?;
-    let out = f();
-    let _ = lock.unlock();
-    out
+    let _lock = paths::lock_file(&paths.anchors().with_extension("lock"))?;
+    f()
 }
 
 /// Advertisements of every server of the realm that answers and describes
@@ -3055,32 +3044,11 @@ fn trust_lock_file(paths: &Paths, realm: &str) -> std::path::PathBuf {
         .with_file_name(format!("{realm}.kuipa-lock"))
 }
 
-/// The exclusive lock on one realm's trust files, held until the guard
+/// The exclusive lock on one realm's trust files, held until the file
 /// drops: two concurrent refreshes of the same realm must not interleave
 /// the CA, anchors and snippet of different advertisements.
-struct TrustLock {
-    file: std::fs::File,
-}
-
-impl Drop for TrustLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-fn trust_lock(paths: &Paths, realm: &str) -> Result<TrustLock, Error> {
-    let path = trust_lock_file(paths, realm);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    file.lock()
-        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
-    Ok(TrustLock { file })
+fn trust_lock(paths: &Paths, realm: &str) -> Result<fs::File, Error> {
+    paths::lock_file(&trust_lock_file(paths, realm))
 }
 
 /// Write a trusted realm's files from its verified advertisement.  The
