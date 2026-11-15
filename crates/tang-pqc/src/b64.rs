@@ -96,9 +96,93 @@ pub fn decode_array<const N: usize>(text: &str) -> Result<[u8; N]> {
         .map_err(|_| Error::Malformed("base64url"))
 }
 
+/// `#[serde(with = "tang_pqc::b64::bytes")]`: a byte string, or anything
+/// that converts to and from one (`[u8; N]`, `Vec<u8>`), as a base64url
+/// string.
+pub mod bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+
+    /// Serialize as an unpadded base64url string.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `s` fails with.
+    pub fn serialize<T: AsRef<[u8]>, S: Serializer>(v: &T, s: S) -> Result<S::Ok, S::Error> {
+        super::encode(v.as_ref()).serialize(s)
+    }
+
+    /// Deserialize strictly from a base64url string.
+    ///
+    /// # Errors
+    ///
+    /// Not canonical base64url, or the length the target refuses.
+    pub fn deserialize<'de, T, D>(d: D) -> Result<T, D::Error>
+    where
+        T: TryFrom<Vec<u8>>,
+        D: Deserializer<'de>,
+    {
+        let bytes = super::decode(&String::deserialize(d)?).map_err(D::Error::custom)?;
+        T::try_from(bytes).map_err(|_| D::Error::custom("wrong length"))
+    }
+}
+
+/// `#[serde(with = "tang_pqc::b64::bytes_vec")]`: a list of byte strings as
+/// a list of base64url strings.
+pub mod bytes_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serialize as a list of unpadded base64url strings.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `s` fails with.
+    pub fn serialize<S: Serializer>(v: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter().map(|b| super::encode(b)))
+    }
+
+    /// Deserialize strictly from a list of base64url strings.
+    ///
+    /// # Errors
+    ///
+    /// Any entry that is not canonical base64url.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .iter()
+            .map(|t| super::decode(t).map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serde_helpers_use_base64url_strings() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct S {
+            #[serde(with = "super::bytes")]
+            fixed: [u8; 3],
+            #[serde(with = "super::bytes")]
+            var: Vec<u8>,
+            #[serde(with = "super::bytes_vec")]
+            many: Vec<Vec<u8>>,
+        }
+        let s = S {
+            fixed: *b"foo",
+            var: vec![0xfb, 0xff],
+            many: vec![b"f".to_vec(), vec![]],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"fixed":"Zm9v","var":"-_8","many":["Zg",""]}"#);
+        assert_eq!(serde_json::from_str::<S>(&json).unwrap(), s);
+        for bad in [
+            r#"{"fixed":"Zm9","var":"","many":[]}"#,
+            r#"{"fixed":"Zm9v","var":"Zg==","many":[]}"#,
+        ] {
+            assert!(serde_json::from_str::<S>(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn decode_array_checks_the_length() {

@@ -17,7 +17,8 @@ fn system_policy() -> Result<&'static SystemPolicy> {
 ///
 /// ML-KEM-512 is deliberately not offered: binding ciphertexts sit on disk
 /// for the lifetime of the encrypted volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Variants are ordered by strength.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KemAlg {
     /// ML-KEM-768 (NIST category 3).
     MlKem768,

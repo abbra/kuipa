@@ -135,6 +135,19 @@ impl FromStr for Thumbprint {
     }
 }
 
+impl serde::Serialize for Thumbprint {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Thumbprint {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 // ── Exchange keys (ML-KEM) ──────────────────────────────────────────────────
 
 /// A server's public ML-KEM encapsulation key, as found in an advertisement.
@@ -743,6 +756,9 @@ mod tests {
         assert_eq!(kid.to_string().len(), 43);
         assert_eq!(kid.to_string().parse::<Thumbprint>().unwrap(), kid);
         assert!("abcd".parse::<Thumbprint>().is_err());
+        let json = serde_json::to_value(kid).unwrap();
+        assert_eq!(json, serde_json::Value::String(kid.to_string()));
+        assert_eq!(serde_json::from_value::<Thumbprint>(json).unwrap(), kid);
     }
 
     #[test]
