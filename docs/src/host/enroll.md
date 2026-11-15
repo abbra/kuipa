@@ -109,6 +109,23 @@ If the keytab contains multiple principals, `kuipa status` reports enrollment
 but cannot report its key version, and `kuipa rotate-keys` and `kuipa protect`
 refuse it rather than discard the other principals.
 
+`realm-info --trust-first-use` replaces the enrollment string and pins:
+it trusts the advertisement as the server serves it, and warns that
+nothing was checked. It exists for `realm-info` only; enrollment always
+needs a pinned anchor.
+
+**A host that already has its keytab** (installed by `ipa-client-install`,
+say) is adopted, not enrolled:
+
+```sh
+kuipa adopt --enrollment-file string.txt --server ipa1.example.test
+```
+
+The realm is verified through the string's pins and the keytab must get a
+ticket from the KDC as `host/<fqdn>`. `kuipa` records its state and leaves
+the keytab untouched; nothing is rekeyed. Run `kuipa rotate-keys` or
+`kuipa protect` afterwards when you want kuipa's keys.
+
 **With a voucher**, for autoscalers and image pipelines:
 
 ```sh
@@ -124,6 +141,7 @@ for the whole voucher workflow.
 
 ```sh
 kuipa prepare                                    # mode A: make a key, report it
+kuipa prepare --tpm                              # the same, key held by this host's TPM
 kuipa enroll --bundle web5.bundle --enrollment-file string.txt
 ```
 

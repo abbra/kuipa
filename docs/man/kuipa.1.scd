@@ -81,11 +81,19 @@ nameserver *$KUIPA_DNS* names (see there).
 
 # COMMANDS
 
-## prepare [--new] [--hostname _FQDN_]
+## prepare [--new] [--tpm [--tpm-pcrs _PCRS_]] [--hostname _FQDN_]
 
 Prepare an offline bundle with the machine key for a system with _FQDN_.
 The bundle is sealed with this key. *--new* creates a new machine key, replacing
-the existing one.
+the existing one. *--tpm* keeps the key as a TPM credential
+(*systemd-creds*(1)) instead of a file; *kuipa enroll --bundle* opens it on
+this host's TPM. *--tpm-pcrs* lists the PCRs to bind to.
+
+## adopt --enrollment-file _FILE_ [--server _S_]... [--hostname _FQDN_]
+
+Record *kuipa*'s state for a host that already holds its keytab. The realm is
+verified through the enrollment string's pins and the keytab must get a ticket
+from the KDC as *host/*_FQDN_. Nothing is rekeyed and the keytab is untouched.
 
 ## enroll [_enrollment-flags_] [_flags_]
 
@@ -129,12 +137,17 @@ one of authenticated methods above.
 Write the ephemeral key that binds a voucher to this host; print its
 binding, for *kuipa-voucher*(1)'s *--binding*.
 
-## realm-info --krb5-dir _DIR_
+## realm-info --krb5-dir _DIR_ [--trust-first-use]
 
 Print, and write into _DIR_, the Kerberos configuration derived from
 the verified advertisement (*krb5.conf* and the realm's PKINIT
 anchors), so an armoured *kinit*(1) can obtain the ticket to use
 with the *--use-ccache* enrollemnt option.
+
+*--trust-first-use*
+	Trust the advertisement as the server serves it, with no enrollment
+	string or pinned anchors, and warn. Refused with *--realm* or
+	*--enrollment-file*.
 
 ## complete
 
@@ -147,7 +160,7 @@ New host keys; refresh the pins and the recorded servers; reseal the
 keytab and the protected files where needed.  *kuipa-rotate.timer*
 runs it monthly.
 
-## protect [--keytab _FILE_] [--file _FILE_]
+## protect [--keytab _FILE_] [--file _FILE_] [--tpm [--tpm-pcrs _PCRS_]]
 
 Seal on disk: the host keytab when neither flag is given - */etc/krb5.keytab*
 becomes */etc/ipa/krb5.keytab.sealed* and a symlink to */run/ipa/krb5.keytab*,
@@ -156,7 +169,11 @@ keytab (a service's or a user's, sealed for its own principal), or any file
 (sealed for the principal of *--keytab*, default the host). The original path of
 a protected keytab or file becomes a symlink to an unsealed copy under
 */run/ipa/kuipa/*, so readers see the old path. Run again to reseal what is
-there now; every key rotation reseals too.
+there now; every key rotation reseals too. *--tpm* also binds the seal to this
+host's TPM through a *systemd-creds*(1) credential, so a copy cannot open on
+another machine; it fails on a host without a TPM. *--tpm-pcrs* lists the PCRs
+to bind to (none by default). A reseal keeps the factor; *unprotect* then
+*protect* drops it.
 
 ## unprotect [--keytab _FILE_] [--file _FILE_]
 
@@ -297,6 +314,10 @@ passphrase) if this host has none:
 
 *--pkcs11* _URI_
 	Register an ML-KEM key on a token instead, as a *pkcs11:* URI.
+
+*--tpm*
+	Keep the device key as a user-scoped TPM credential, opened with no
+	passphrase and only on this host.
 
 *--module* _PATH_
 	The token's PKCS#11 module (default:

@@ -25,6 +25,21 @@ systemctl enable kuipa-unseal.service kuipa-rotate.timer
 
 `kuipa unprotect` writes the plain keytab back.
 
+## Binding to the host's TPM
+
+```sh
+kuipa protect --tpm [--tpm-pcrs 7]
+```
+
+Adds a second factor the servers never see: a share kept as a
+`systemd-creds` credential on this host's TPM. A disk copied or a snapshot
+restored on another machine cannot open the sealed object, whatever the
+servers answer. A host without a TPM fails instead of falling back. No PCRs
+are bound unless `--tpm-pcrs` names them. A reseal or `rotate-keys` keeps
+the factor; only `unprotect` then `protect` removes it. It works with
+`--keytab` and `--file` too. Unsealing fails with a plain error, not a
+retry, when the TPM does not open the credential.
+
 ## A service's keytab
 
 ```sh
