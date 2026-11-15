@@ -514,7 +514,13 @@ mod tests {
         assert!(!verify(&long[0], 0, 4, &shortened, &r));
         assert!(!verify(&short[0], 0, 4, &p, &r));
         let old = root(&short[..2]).unwrap();
-        assert!(!verify_consistency(2, &old, 4, &r, &consistency(&long, 2).unwrap()));
+        assert!(!verify_consistency(
+            2,
+            &old,
+            4,
+            &r,
+            &consistency(&long, 2).unwrap()
+        ));
         // Lengths name algorithms; nothing else is a hash.
         assert!(Hash::from_slice(&[0; 33]).is_err());
         assert!(Hash::from_slice(&[]).is_err());

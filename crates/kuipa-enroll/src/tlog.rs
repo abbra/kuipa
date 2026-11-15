@@ -623,7 +623,13 @@ impl Head {
     ///
     /// An OpenSSL error.
     pub fn includes(&self, leaf: &Leaf, index: u64, path: &[Hash]) -> Result<bool> {
-        Ok(merkle::verify(&leaf.hash()?, index, self.size, path, &self.root))
+        Ok(merkle::verify(
+            &leaf.hash()?,
+            index,
+            self.size,
+            path,
+            &self.root,
+        ))
     }
 }
 
@@ -1328,11 +1334,7 @@ mod tests {
         assert!(log.is_retired(1) && !log.is_retired(0));
         // The new head extends the old one.
         let after = log.head(T + 9).unwrap();
-        assert!(
-            after
-                .extends(&before, &log.consistency(3).unwrap())
-                
-        );
+        assert!(after.extends(&before, &log.consistency(3).unwrap()));
 
         // Not twice, not a tombstone, not beyond the log.
         for target in [1, 3, 9] {
@@ -1483,11 +1485,7 @@ mod tests {
         // small, or one without the leaf does not.
         log.append(&leaf(Kind::CLAIM, 9)).unwrap();
         let head = log.head(T + 1).unwrap();
-        assert!(
-            receipt
-                .proven_by(&head, &log.inclusion(2).unwrap())
-                
-        );
+        assert!(receipt.proven_by(&head, &log.inclusion(2).unwrap()));
         let (small, _) = log_of(2);
         let small_head = small.head(T).unwrap();
         assert!(!receipt.proven_by(&small_head, &[]));
@@ -1495,11 +1493,7 @@ mod tests {
             log: LogId(crate::merkle::test_hash(9)),
             ..head
         };
-        assert!(
-            !receipt
-                .proven_by(&other, &log.inclusion(2).unwrap())
-                
-        );
+        assert!(!receipt.proven_by(&other, &log.inclusion(2).unwrap()));
         let (_, others) = log_of(4);
         let broken = Receipt {
             leaf: others[3].hash().unwrap(),

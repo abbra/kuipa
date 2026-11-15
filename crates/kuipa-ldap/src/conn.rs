@@ -1085,8 +1085,12 @@ mod tests {
     fn connect_to_nonexistent_host_returns_error() {
         // ldap_initialize merely parses the URI; the error surfaces on first I/O.
         // A search against a host that is not listening should fail quickly.
-        let mut conn =
-            LdapConnection::connect("ldap://127.0.0.1:38999", Tls::Off, Some(Duration::from_secs(5))).expect("initialize");
+        let mut conn = LdapConnection::connect(
+            "ldap://127.0.0.1:38999",
+            Tls::Off,
+            Some(Duration::from_secs(5)),
+        )
+        .expect("initialize");
         let err = conn
             .search("dc=test", Scope::Base, "(objectClass=*)", &[])
             .expect_err("search to closed port should fail");
@@ -1119,8 +1123,12 @@ mod tests {
 
     #[test]
     fn nul_byte_in_argument_is_rejected() {
-        let mut conn =
-            LdapConnection::connect("ldap://127.0.0.1:38999", Tls::Off, Some(Duration::from_secs(5))).expect("initialize");
+        let mut conn = LdapConnection::connect(
+            "ldap://127.0.0.1:38999",
+            Tls::Off,
+            Some(Duration::from_secs(5)),
+        )
+        .expect("initialize");
         let err = conn
             .delete_s("uid=a\0,dc=test")
             .expect_err("NUL byte must be rejected");
@@ -1174,7 +1182,8 @@ mod tests {
     #[test]
     fn search_entry_lookup_ignores_case() {
         let mut e = SearchEntry::default();
-        e.attrs.insert("memberof".into(), vec!["a".into(), "b".into()]);
+        e.attrs
+            .insert("memberof".into(), vec!["a".into(), "b".into()]);
         e.bin_attrs.insert("memberof".into(), vec![b"a".to_vec()]);
         assert_eq!(e.values("memberOf"), ["a", "b"]);
         assert_eq!(e.first("MEMBEROF"), Some("a"));

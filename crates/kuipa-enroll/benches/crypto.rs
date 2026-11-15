@@ -172,7 +172,6 @@ fn trees(c: &mut Criterion) {
                     black_box(&path),
                     black_box(&root),
                 )
-                
             });
         });
     }

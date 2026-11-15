@@ -305,7 +305,10 @@ fn the_whole_way_a_passphrase_then_shares_then_the_seed_back() {
     );
     assert_ne!(
         made.public().kid(),
-        recovery_key(&SEED, tang_pqc::KemAlg::MlKem768).unwrap().public().kid()
+        recovery_key(&SEED, tang_pqc::KemAlg::MlKem768)
+            .unwrap()
+            .public()
+            .kid()
     );
 }
 

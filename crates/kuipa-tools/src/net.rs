@@ -18,8 +18,8 @@
 
 use std::time::{Duration, Instant};
 
-use reqwest::StatusCode;
 use kuipa_enroll::delegation::MAX_WANTED;
+use reqwest::StatusCode;
 use tang_pqc::b64;
 
 /// How to authenticate the server's TLS certificate.
