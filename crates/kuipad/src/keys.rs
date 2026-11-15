@@ -9,11 +9,15 @@
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use kuipa_enroll::keys::{KeysAnswer, KeysFetch, MAX_VALUE, Namespace};
+
+use crate::Error;
 
 /// One namespace's handler (§18.5).
 #[derive(Clone, Debug)]
@@ -30,18 +34,6 @@ pub struct Keys {
     handlers: Vec<(Namespace, Handler)>,
     broker: Option<PathBuf>,
 }
-
-/// A handler run failed.
-#[derive(Debug)]
-pub struct HandlerError(pub String);
-
-impl std::fmt::Display for HandlerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for HandlerError {}
 
 /// Magic of a broker request.
 const BROKER_MAGIC: &[u8; 4] = b"IPKB";
@@ -63,27 +55,21 @@ pub struct BrokerRequest {
 }
 
 impl BrokerRequest {
-    fn to_bytes(&self) -> Result<Vec<u8>, HandlerError> {
-        let len =
-            u32::try_from(self.token.len()).map_err(|_| HandlerError("token too large".into()))?;
+    fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let len = u32::try_from(self.token.len()).map_err(|_| "token too large")?;
         let mut out = BROKER_MAGIC.to_vec();
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&self.token);
         out.extend_from_slice(&self.cb);
-        out.extend_from_slice(
-            &self
-                .fetch
-                .to_bytes()
-                .map_err(|e| HandlerError(e.to_string()))?,
-        );
+        out.extend_from_slice(&self.fetch.to_bytes().map_err(|e| e.to_string())?);
         if out.len() > MAX_BROKER_REQUEST {
-            return Err(HandlerError("custody request too large".into()));
+            return Err("custody request too large".into());
         }
         Ok(out)
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, HandlerError> {
-        let bad = || HandlerError("malformed custody request".into());
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let bad = || Error::from("malformed custody request");
         let rest = bytes.strip_prefix(BROKER_MAGIC).ok_or_else(bad)?;
         let (len, rest) = rest.split_first_chunk::<4>().ok_or_else(bad)?;
         let len = usize::try_from(u32::from_be_bytes(*len)).map_err(|_| bad())?;
@@ -92,7 +78,7 @@ impl BrokerRequest {
         Ok(Self {
             token: token.to_vec(),
             cb: *cb,
-            fetch: KeysFetch::from_bytes(fetch).map_err(|e| HandlerError(e.to_string()))?,
+            fetch: KeysFetch::from_bytes(fetch).map_err(|e| e.to_string())?,
         })
     }
 }
@@ -120,9 +106,9 @@ impl BrokerAnswer {
         out
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, HandlerError> {
-        let bad = || HandlerError("invalid custody broker response".into());
-        let field = |rest: &mut &[u8]| -> Result<Vec<u8>, HandlerError> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let bad = || Error::from("invalid custody broker response");
+        let field = |rest: &mut &[u8]| -> Result<Vec<u8>, Error> {
             let (len, tail) = rest.split_first_chunk::<2>().ok_or_else(bad)?;
             let (part, tail) = tail
                 .split_at_checked(usize::from(u16::from_be_bytes(*len)))
@@ -171,23 +157,19 @@ impl Keys {
     ///
     /// # Errors
     ///
-    /// A [`HandlerError`]: no broker is configured, it cannot be reached, or
+    /// An error: no broker is configured, it cannot be reached, or
     /// it refused.
     pub fn fetch_via_broker(
         &self,
         fetch: &KeysFetch,
         token: &[u8],
         cb: &[u8; 32],
-    ) -> Result<BrokerAnswer, HandlerError> {
-        let path = self
-            .broker
-            .as_ref()
-            .ok_or_else(|| HandlerError("no custody broker".into()))?;
-        let mut stream =
-            UnixStream::connect(path).map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+    ) -> Result<BrokerAnswer, Error> {
+        let path = self.broker.as_ref().ok_or("no custody broker")?;
+        let mut stream = UnixStream::connect(path).map_err(|e| format!("custody broker: {e}"))?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-            .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+            .map_err(|e| format!("custody broker: {e}"))?;
         let request = BrokerRequest {
             token: token.to_vec(),
             cb: *cb,
@@ -197,19 +179,18 @@ impl Keys {
         stream
             .write_all(&request)
             .and_then(|()| stream.shutdown(Shutdown::Write))
-            .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+            .map_err(|e| format!("custody broker: {e}"))?;
         let mut response = Vec::new();
         stream
             .take((MAX_VALUE + 4097) as u64)
             .read_to_end(&mut response)
-            .map_err(|e| HandlerError(format!("custody broker: {e}")))?;
+            .map_err(|e| format!("custody broker: {e}"))?;
         match response.split_first() {
             Some((0, answer)) => BrokerAnswer::from_bytes(answer),
-            Some((1, message)) if message.len() <= 4096 => Err(HandlerError(format!(
-                "custody broker: {}",
-                String::from_utf8_lossy(message)
-            ))),
-            _ => Err(HandlerError("invalid custody broker response".into())),
+            Some((1, message)) if message.len() <= 4096 => {
+                Err(format!("custody broker: {}", String::from_utf8_lossy(message)).into())
+            }
+            _ => Err("invalid custody broker response".into()),
         }
     }
 
@@ -223,15 +204,15 @@ impl Keys {
     ///
     /// # Errors
     ///
-    /// A [`HandlerError`] naming what failed: no handler for the
+    /// An error naming what failed: no handler for the
     /// namespace, the user does not exist, the handler failed, or its
     /// value is too large.
-    pub fn fetch(&self, fetch: &KeysFetch) -> Result<KeysAnswer, HandlerError> {
+    pub fn fetch(&self, fetch: &KeysFetch) -> Result<KeysAnswer, Error> {
         let (_, handler) = self
             .handlers
             .iter()
             .find(|(n, _)| *n == fetch.namespace)
-            .ok_or_else(|| HandlerError(format!("no handler for {}", fetch.namespace.label())))?;
+            .ok_or_else(|| format!("no handler for {}", fetch.namespace.label()))?;
         let mut cmd = Command::new(&handler.command);
         cmd.args(["--export", "-"])
             .stdin(Stdio::null())
@@ -239,8 +220,9 @@ impl Keys {
             .stderr(Stdio::piped());
         if let Some(user) = &handler.runas {
             // The broker runs configured handlers as their required identities.
-            if !same_user(user) {
-                runas(&mut cmd, user)?;
+            let (uid, gid) = passwd_ids(user)?;
+            if uid != std::fs::metadata("/proc/self")?.uid() {
+                cmd.uid(uid).gid(gid);
             }
         }
         // The NSS handlers take the nickname as a flag; `ca_wrapped` also
@@ -262,18 +244,19 @@ impl Keys {
         }
         let out = cmd
             .output()
-            .map_err(|e| HandlerError(format!("{}: {e}", handler.command.display())))?;
+            .map_err(|e| format!("{}: {e}", handler.command.display()))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(HandlerError(format!(
+            return Err(format!(
                 "{} failed ({}): {}",
                 handler.command.display(),
                 out.status,
                 stderr.trim()
-            )));
+            )
+            .into());
         }
         if out.stdout.len() > MAX_VALUE {
-            return Err(HandlerError("handler value too large".into()));
+            return Err("handler value too large".into());
         }
         Ok(KeysAnswer { value: out.stdout })
     }
@@ -286,7 +269,7 @@ impl Keys {
     /// A listener failure.
     pub fn serve_broker(
         listener: &UnixListener,
-        handle: &dyn Fn(&BrokerRequest) -> Result<BrokerAnswer, HandlerError>,
+        handle: &dyn Fn(&BrokerRequest) -> Result<BrokerAnswer, Error>,
     ) -> std::io::Result<()> {
         for stream in listener.incoming() {
             if let Err(error) = Self::serve_request(stream?, handle) {
@@ -298,18 +281,18 @@ impl Keys {
 
     fn serve_request(
         mut stream: UnixStream,
-        handle: &dyn Fn(&BrokerRequest) -> Result<BrokerAnswer, HandlerError>,
+        handle: &dyn Fn(&BrokerRequest) -> Result<BrokerAnswer, Error>,
     ) -> std::io::Result<()> {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(60)))?;
-        let result = (|| -> Result<BrokerAnswer, HandlerError> {
+        let result = (|| -> Result<BrokerAnswer, Error> {
             let mut request = Vec::new();
             (&mut stream)
                 .take(MAX_BROKER_REQUEST as u64 + 1)
                 .read_to_end(&mut request)
-                .map_err(|e| HandlerError(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             if request.len() > MAX_BROKER_REQUEST {
-                return Err(HandlerError("custody request too large".into()));
+                return Err("custody request too large".into());
             }
             handle(&BrokerRequest::from_bytes(&request)?)
         })();
@@ -337,49 +320,20 @@ pub(crate) fn audit(line: &str) {
     eprintln!("kuipad: keys: {line}");
 }
 
-/// Whether `user` names our own uid (no privilege change needed).
-fn same_user(user: &str) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    let uid = std::fs::metadata("/proc/self").map_or(0, |m| m.uid());
-    let name = user_name(uid);
-    name.as_deref().is_some_and(|n| n == user)
-}
-
-/// The name of `uid`, from `/etc/passwd` (no libc dependency).
-fn user_name(uid: u32) -> Option<String> {
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-    passwd.lines().find_map(|line| {
-        let fields: Vec<&str> = line.split(':').collect();
-        match fields.as_slice() {
-            [name, _, id, ..] if id.parse::<u32>().is_ok_and(|i| i == uid) => {
-                Some((*name).to_owned())
-            }
-            _ => None,
-        }
-    })
-}
-
-/// The uid of `user`, and set both uid and gid (the user's primary group)
-/// on `cmd`, as the direct-runas spawn of §18.5.
-fn runas(cmd: &mut Command, user: &str) -> Result<(), HandlerError> {
-    use std::os::unix::process::CommandExt as _;
-    let passwd = std::fs::read_to_string("/etc/passwd")
-        .map_err(|e| HandlerError(format!("reading /etc/passwd: {e}")))?;
-    let (uid, gid) = passwd
+/// The uid and primary gid of `user`, from `/etc/passwd` (no libc
+/// dependency).
+fn passwd_ids(user: &str) -> Result<(u32, u32), Error> {
+    let passwd =
+        std::fs::read_to_string("/etc/passwd").map_err(|e| format!("reading /etc/passwd: {e}"))?;
+    passwd
         .lines()
         .find_map(|line| {
-            let fields: Vec<&str> = line.split(':').collect();
-            match fields.as_slice() {
-                [name, _, uid, _, _, _, _] if *name == user => Some((
-                    uid.parse::<u32>().ok()?,
-                    line.split(':').nth(3)?.parse::<u32>().ok()?,
-                )),
-                _ => None,
-            }
+            let mut fields = line.split(':');
+            let (name, uid, gid) = (fields.next()?, fields.nth(1)?, fields.next()?);
+            (name == user).then_some(())?;
+            Some((uid.parse().ok()?, gid.parse().ok()?))
         })
-        .ok_or_else(|| HandlerError(format!("no such user: {user}")))?;
-    cmd.uid(uid).gid(gid);
-    Ok(())
+        .ok_or_else(|| format!("no such user: {user}").into())
 }
 
 #[cfg(test)]

@@ -247,20 +247,30 @@ impl LdapDirectory {
         Ok(conn)
     }
 
-    /// Accept a one-leg GSS-API token bound to `cb`; return the principal
-    /// and the binding the client's context derives too (§5.1).
-    fn accept_bound(
+    /// Accept a one-leg GSS-API token bound to `cb`: the principal, the
+    /// binding the client's context derives too (§5.1), and the credential
+    /// the caller delegated, if any.
+    fn accept_kerberos(
         &self,
         token: &[u8],
         cb: &[u8; 32],
-    ) -> Result<(String, KerberosBinding), DirectoryError> {
-        let (principal, derived) = kuipa_gssapi::accept_bound(
+    ) -> Result<(String, Vec<u8>, Option<GssClientCred>), DirectoryError> {
+        Ok(kuipa_gssapi::accept_bound_delegated(
             &self.server_cred,
             token,
             cb,
             &kerberos_prf_input(cb),
             KERBEROS_BINDING_LEN,
-        )?;
+        )?)
+    }
+
+    /// [`accept_kerberos`](Self::accept_kerberos) without the delegation.
+    fn accept_bound(
+        &self,
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<(String, KerberosBinding), DirectoryError> {
+        let (principal, derived, _) = self.accept_kerberos(token, cb)?;
         Ok((principal, KerberosBinding::new(&derived)?))
     }
 
@@ -274,13 +284,7 @@ impl LdapDirectory {
         token: &[u8],
         cb: &[u8; 32],
     ) -> Result<(String, KerberosBinding, Option<LdapConnection>), DirectoryError> {
-        let (caller, derived, delegated) = kuipa_gssapi::accept_bound_delegated(
-            &self.server_cred,
-            token,
-            cb,
-            &kerberos_prf_input(cb),
-            KERBEROS_BINDING_LEN,
-        )?;
+        let (caller, derived, delegated) = self.accept_kerberos(token, cb)?;
         let binding = KerberosBinding::new(&derived)?;
         let conn = match delegated {
             Some(cred) => {
@@ -291,14 +295,6 @@ impl LdapDirectory {
             None => None,
         };
         Ok((caller, binding, conn))
-    }
-
-    /// Accept a one-leg GSS-API token bound to `cb`; return the principal.
-    fn accept(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
-        match kuipa_gssapi::accept_token(&self.server_cred, token, Some(cb))? {
-            AcceptStep::Complete { principal, .. } => Ok(principal),
-            AcceptStep::Continue { .. } => Err("GSS-API exchange needs more than one token".into()),
-        }
     }
 
     /// A connection bound as `principal`, through constrained delegation.
@@ -984,7 +980,10 @@ impl Directory for LdapDirectory {
     }
 
     fn accept_peer(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
-        self.accept(token, cb)
+        match kuipa_gssapi::accept_token(&self.server_cred, token, Some(cb))? {
+            AcceptStep::Complete { principal, .. } => Ok(principal),
+            AcceptStep::Continue { .. } => Err("GSS-API exchange needs more than one token".into()),
+        }
     }
 
     fn accept_user(&self, token: &[u8], cb: &[u8; 32]) -> Result<Accepted, DirectoryError> {
@@ -1047,9 +1046,7 @@ impl Directory for LdapDirectory {
             ));
             return Err(reason.into());
         }
-        let answer = keys
-            .fetch(fetch)
-            .map_err(|e| DirectoryError::from(e.to_string()))?;
+        let answer = keys.fetch(fetch)?;
         crate::keys::audit(&format!(
             "ALLOWED: {principal} fetched {}/{}",
             fetch.namespace.label(),
@@ -1067,9 +1064,7 @@ impl Directory for LdapDirectory {
         let Some(keys) = self.keys.as_ref().filter(|k| k.has_broker()) else {
             return Ok(None);
         };
-        let answer = keys
-            .fetch_via_broker(fetch, token, cb)
-            .map_err(|e| DirectoryError::from(e.to_string()))?;
+        let answer = keys.fetch_via_broker(fetch, token, cb)?;
         Ok(Some(BrokeredKey {
             principal: answer.principal,
             binding: KerberosBinding::new(&answer.binding)?,
@@ -2020,24 +2015,16 @@ impl LdapDirectory {
     pub fn broker_fetch(
         &self,
         request: &crate::keys::BrokerRequest,
-    ) -> Result<crate::keys::BrokerAnswer, crate::keys::HandlerError> {
-        let refuse = |e: &dyn std::fmt::Display| crate::keys::HandlerError(e.to_string());
-        let (principal, derived) = kuipa_gssapi::accept_bound(
-            &self.server_cred,
-            &request.token,
-            &request.cb,
-            &kerberos_prf_input(&request.cb),
-            KERBEROS_BINDING_LEN,
-        )
-        .map_err(|e| refuse(&e))?;
-        let caller: Principal = principal.parse().map_err(|e| refuse(&e))?;
+    ) -> Result<crate::keys::BrokerAnswer, crate::Error> {
+        let (principal, binding, _) = self.accept_kerberos(&request.token, &request.cb)?;
+        let caller: Principal = principal.parse()?;
         if caller.realm() != self.cfg.realm {
-            return Err(refuse(&"caller of another realm"));
+            return Err("caller of another realm".into());
         }
-        let value = Directory::fetch_key(self, &caller, &request.fetch).map_err(|e| refuse(&e))?;
+        let value = Directory::fetch_key(self, &caller, &request.fetch)?;
         Ok(crate::keys::BrokerAnswer {
             principal,
-            binding: derived,
+            binding,
             value,
         })
     }
