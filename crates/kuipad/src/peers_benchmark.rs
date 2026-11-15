@@ -615,7 +615,7 @@ async fn measure_scheduler_repair() {
                 }
                 node.exchange.store.store_peer_state(&state).unwrap();
             }
-            let source = nodes[0].engine.durable_snapshot().await.unwrap();
+            let source = nodes[0].durable.snapshot().await.unwrap().1;
             let source_digest = source.digest().unwrap();
             let mut expected = source;
             if anchor_count > 0 {
@@ -692,7 +692,7 @@ async fn measure_scheduler_repair() {
                 let elapsed = started.elapsed();
                 let mut converged = 0;
                 for node in &nodes {
-                    let mut actual = node.engine.durable_snapshot().await.unwrap();
+                    let mut actual = node.durable.snapshot().await.unwrap().1;
                     // An identical snapshot normalizes identically; skip its signature checks.
                     if actual.digest().unwrap() == source_digest {
                         converged += 1;

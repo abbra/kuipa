@@ -21,10 +21,7 @@ use agirru_engine::repair::{self, IndexCache, RepairError, Replica};
 use agirru_engine::snapshot::{
     self, SnapshotLimits, SnapshotReplica, SnapshotRequest, SnapshotResponse, SnapshotServer,
 };
-use agirru_engine::{
-    CborCodec, Codec, DurableState, GossipConfig, GossipEngine, GossipHooks, GossipRuntime,
-    Membership, SendOutcome, Storage, Transport,
-};
+use agirru_engine::{CborCodec, Codec, DurableState, Storage};
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::anchors::{self, AnchorState, Entry, PeerSync, Trust};
 use kuipa_enroll::delegation::{
@@ -498,8 +495,6 @@ pub(crate) struct Exchange {
     failures: Mutex<BTreeMap<String, String>>,
 }
 
-type Engine = GossipEngine<AnchorState, String, Runtime, Arc<Exchange>>;
-
 /// Scheduler counters and manual-round control that tests and the loopback
 /// benchmark read; absent from release builds.
 #[cfg(test)]
@@ -519,7 +514,8 @@ struct Probe {
 /// The running exchange.
 pub struct Peers {
     exchange: Arc<Exchange>,
-    engine: Arc<Engine>,
+    /// The state, persisted through the [`Exchange`] as it merges.
+    durable: Arc<DurableState<AnchorState, Arc<Exchange>>>,
     /// The repair index of the durable state, kept current incrementally.
     index: IndexCache<anchors::EntryId, Sha256>,
     #[cfg(test)]
@@ -619,19 +615,10 @@ impl Peers {
         let (state, clock) = (exchange.state.clone(), exchange.clock.clone());
         let exchange = Arc::new(exchange);
         exchange.server.publish_epoch(chain);
-        let config = GossipConfig {
-            round_interval: exchange.settings.interval,
-            ..GossipConfig::default()
-        };
-        let durable = DurableState::new(state, clock, exchange.clone());
-        let engine = Arc::new(GossipEngine::new(
-            Arc::new(durable),
-            Runtime(exchange.clone(), CborCodec),
-            config,
-        ));
+        let durable = Arc::new(DurableState::new(state, clock, exchange.clone()));
         Ok(Arc::new(Self {
             exchange,
-            engine,
+            durable,
             index: IndexCache::new(),
             #[cfg(test)]
             probe: Probe::default(),
@@ -1185,7 +1172,7 @@ impl Replica<str> for Peers {
     async fn index(&self) -> Result<repair::SharedIndex<anchors::EntryId, Sha256>, RepairError> {
         self.index
             .get(
-                self.engine.durable(),
+                &self.durable,
                 || repair::Index::new(Sha256, INDEX_DOMAIN),
                 |state: &AnchorState, since| match since {
                     None => state.clone(),
@@ -1196,26 +1183,21 @@ impl Replica<str> for Peers {
             .await
     }
 
-    async fn admit(&self, peer: &str, entries: Vec<WireEntry>) -> Result<(), RepairError> {
+    async fn admit(&self, _peer: &str, entries: Vec<WireEntry>) -> Result<(), RepairError> {
         let clock = GenerationClock::new();
         let mut inbound = AnchorState::default();
         for e in &entries {
             let part = AnchorState::from_bytes(&e.0).map_err(to_entry)?;
             agirru_crdt::Merge::merge(&mut inbound, &part, &clock);
         }
-        self.engine
-            .merge_inbound(&peer.to_owned(), inbound)
-            .await
-            .map_err(to_storage)?;
-        Ok(())
+        self.admit_inbound(inbound).await
     }
 
     async fn entries(
         &self,
         ids: Vec<anchors::EntryId>,
     ) -> Result<Vec<Option<WireEntry>>, RepairError> {
-        self.engine
-            .durable()
+        self.durable
             .read(|state, _| {
                 ids.iter()
                     .map(|id| {
@@ -1239,8 +1221,7 @@ impl Replica<str> for Peers {
 impl SnapshotReplica<str> for Peers {
     async fn snapshot(&self) -> Result<(repair::Hash, Arc<Vec<u8>>), RepairError> {
         let bytes = self
-            .engine
-            .durable()
+            .durable
             .read(|state, _| state.to_bytes())
             .await
             .map_err(to_storage)?;
@@ -1252,12 +1233,21 @@ impl SnapshotReplica<str> for Peers {
         anchors::state_digest(bytes).map_err(to_entry)
     }
 
-    async fn admit_snapshot(&self, peer: &str, bytes: Vec<u8>) -> Result<(), RepairError> {
+    async fn admit_snapshot(&self, _peer: &str, bytes: Vec<u8>) -> Result<(), RepairError> {
         let inbound = AnchorState::from_bytes(&bytes).map_err(to_entry)?;
-        self.engine
-            .merge_inbound(&peer.to_owned(), inbound)
-            .await
-            .map_err(to_storage)?;
+        self.admit_inbound(inbound).await
+    }
+}
+
+impl Peers {
+    /// Admit what a peer sent and merge it durably, waking the maintenance
+    /// loop when it changed the state.
+    async fn admit_inbound(&self, mut inbound: AnchorState) -> Result<(), RepairError> {
+        self.exchange.filter_inbound(&mut inbound).await;
+        let changed = self.durable.merge(&inbound).await.into_result();
+        if changed.map_err(to_storage)?.is_some() {
+            self.exchange.changed.notify_one();
+        }
         Ok(())
     }
 }
@@ -1601,40 +1591,6 @@ fn store_epoch_page(
     Ok(())
 }
 
-impl Transport<String> for Exchange {
-    type Error = PeerError;
-
-    async fn send_recv(&self, peer: &String, envelope: Vec<u8>) -> Result<Vec<u8>, PeerError> {
-        let own = {
-            let state = self.state.read().await;
-            self.own_delegation(&state)?
-        };
-        let result = self.sync(peer, envelope, own).await;
-        self.note(peer, &result);
-        result
-    }
-
-    fn classify_error(&self, err: &PeerError) -> SendOutcome {
-        match err {
-            PeerError::Rejected => SendOutcome::AuthRejected,
-            PeerError::Busy | PeerError::NeedContext | PeerError::Failed(_) => SendOutcome::Failed,
-        }
-    }
-}
-
-impl Membership<String> for Exchange {
-    fn peers(&self) -> impl Future<Output = Vec<String>> + Send {
-        let me = &self.settings.me;
-        std::future::ready(
-            self.members()
-                .iter()
-                .filter(|m| *m != me)
-                .cloned()
-                .collect(),
-        )
-    }
-}
-
 impl Storage<AnchorState> for Exchange {
     type Error = PeerError;
 
@@ -1658,11 +1614,11 @@ impl Storage<AnchorState> for Exchange {
     }
 }
 
-impl GossipHooks<String, AnchorState> for Exchange {
-    /// Keep only entries that check against the keys received and known,
-    /// for members, and no vouch by this server's own anchor: it is the
-    /// only source of those.
-    async fn filter_inbound(&self, _sender: &String, inbound: &mut AnchorState) {
+impl Exchange {
+    /// Keep only entries of `inbound` that check against the keys received
+    /// and known, for members, and no vouch by this server's own anchor: it
+    /// is the only source of those.
+    async fn filter_inbound(&self, inbound: &mut AnchorState) {
         let local = self.state.read().await.clone();
         inbound.admit(
             &local,
@@ -1672,14 +1628,6 @@ impl GossipHooks<String, AnchorState> for Exchange {
             &self.policy,
             now(),
         );
-    }
-
-    async fn on_merged(&self, _peer: &String, _changes: &AnchorState) {
-        self.changed.notify_one();
-    }
-
-    async fn on_auth_rejected(&self, peer: &String) {
-        tracing::warn!("anchor exchange: {peer} refused our sync");
     }
 }
 
@@ -1881,29 +1829,6 @@ fn epoch_window(chain: &[SignedEpoch]) -> Result<Vec<Vec<u8>>, Error> {
     }
     window.reverse();
     Ok(window)
-}
-
-/// The agirru runtime: every part is the [`Exchange`].
-pub(crate) struct Runtime(Arc<Exchange>, CborCodec);
-
-impl GossipRuntime<AnchorState, String> for Runtime {
-    type Transport = Exchange;
-    type Membership = Exchange;
-    type Hooks = Exchange;
-    type Codec = CborCodec;
-
-    fn transport(&self) -> &Exchange {
-        &self.0
-    }
-    fn membership(&self) -> &Exchange {
-        &self.0
-    }
-    fn hooks(&self) -> &Exchange {
-        &self.0
-    }
-    fn codec(&self) -> &CborCodec {
-        &self.1
-    }
 }
 
 /// Asks a voucher's home server to spend or release its salt (§9), over the
@@ -2703,7 +2628,7 @@ mod tests {
             KeyStore::new(dir),
         )
         .unwrap();
-        assert_eq!(reopened.engine.durable_snapshot().await.unwrap(), saved);
+        assert_eq!(reopened.durable.snapshot().await.unwrap().1, saved);
     }
 
     struct PeerTestRoutes {
@@ -3129,8 +3054,8 @@ mod tests {
             .expect("stalled peer was not contacted");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if sender.engine.durable_snapshot().await.unwrap()
-                    == peers.engine.durable_snapshot().await.unwrap()
+                if sender.durable.snapshot().await.unwrap().1
+                    == peers.durable.snapshot().await.unwrap().1
                 {
                     break;
                 }
@@ -3196,7 +3121,7 @@ mod tests {
         } = routes;
         // Writes to a node's state carry that node's generation clock.
         let clock = &sender.exchange.clock;
-        let mut large = sender.engine.durable_snapshot().await.unwrap();
+        let mut large = sender.durable.snapshot().await.unwrap().1;
         for i in 0..20_000 {
             let mut claim = peer_claim.clone();
             claim.exp += i;
@@ -3229,7 +3154,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            peers.engine.durable_snapshot().await.unwrap(),
+            peers.durable.snapshot().await.unwrap().1,
             before_restart,
             "partial upload must not survive restart as a merge"
         );
@@ -3244,8 +3169,8 @@ mod tests {
             .await
             .expect("large upload should reconcile after restart");
         assert_eq!(
-            sender.engine.durable_snapshot().await.unwrap(),
-            peers.engine.durable_snapshot().await.unwrap()
+            sender.durable.snapshot().await.unwrap().1,
+            peers.durable.snapshot().await.unwrap().1
         );
         peers
     }
@@ -3266,7 +3191,7 @@ mod tests {
             ..
         } = routes;
         let clock = &peers.exchange.clock;
-        let mut large = peers.engine.durable_snapshot().await.unwrap();
+        let mut large = peers.durable.snapshot().await.unwrap().1;
         for i in 20_000..40_000 {
             let mut claim = peer_claim.clone();
             claim.exp += i;
@@ -3279,7 +3204,7 @@ mod tests {
             peers.exchange.store.store_peer_state(&large).unwrap();
             *state = large;
         }
-        let before_pull = sender.engine.durable_snapshot().await.unwrap();
+        let before_pull = sender.durable.snapshot().await.unwrap().1;
         pause_chunk.store(1, Ordering::SeqCst);
         let in_flight = {
             let sender = sender.clone();
@@ -3298,7 +3223,7 @@ mod tests {
             peers.exchange.store.store_peer_state(&state).unwrap();
         }
         assert_eq!(
-            sender.engine.durable_snapshot().await.unwrap(),
+            sender.durable.snapshot().await.unwrap().1,
             before_pull,
             "a partial download must not merge"
         );
@@ -3310,11 +3235,11 @@ mod tests {
             .await
             .unwrap()
             .expect("a pinned download completes across a concurrent write");
-        let pulled = sender.engine.durable_snapshot().await.unwrap();
+        let pulled = sender.durable.snapshot().await.unwrap().1;
         assert_ne!(pulled, before_pull, "the download merged");
         assert_ne!(
             pulled,
-            peers.engine.durable_snapshot().await.unwrap(),
+            peers.durable.snapshot().await.unwrap().1,
             "the concurrent write is not part of the pinned snapshot"
         );
         // The concurrent write is one entry: the next repair moves it alone.
