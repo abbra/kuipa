@@ -7,10 +7,10 @@ use std::process::Command;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use tang_pqc::{SignatureAlg, SigningKey, unix_seconds};
 
-/// Run `kuipa enroll` with an OTP enrollment string for EXAMPLE.TEST and
-/// `args`; the only server is unreachable.  Returns the exit status and
-/// standard error.
-fn enroll(name: &str, args: &[&str]) -> (i32, String) {
+/// Run `kuipa enroll` with an OTP enrollment string for EXAMPLE.TEST against
+/// ipa1.example.test, after `configure` has added to the command.  Returns
+/// the exit status and standard error.
+fn enroll_run(name: &str, configure: impl FnOnce(&mut Command)) -> (i32, String) {
     let dir = std::env::temp_dir().join(format!("kuipa-cli-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -23,23 +23,29 @@ fn enroll(name: &str, args: &[&str]) -> (i32, String) {
     );
     let file = dir.join("enrollment");
     std::fs::write(&file, string.encode().as_ref()).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
-        .args(["enroll", "--server", "ipa1.example.test"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuipa"));
+    cmd.args(["enroll", "--server", "ipa1.example.test"])
         .args(["--hostname", "web1.example.test"])
         .arg("--enrollment-file")
         .arg(&file)
-        .args(args)
         .env("KUIPA_ROOT", &dir)
-        .env("KUIPA_ENDPOINTS", "ipa1.example.test=http://127.0.0.1:9")
         .env_remove("KUIPA_ENROLLMENT_FILE")
-        .env_remove("KUIPA_TRACE")
-        .output()
-        .unwrap();
+        .env_remove("KUIPA_TRACE");
+    configure(&mut cmd);
+    let out = cmd.output().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     (
         out.status.code().unwrap(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// [`enroll_run`] with `args`, the only server unreachable.
+fn enroll(name: &str, args: &[&str]) -> (i32, String) {
+    enroll_run(name, |cmd| {
+        cmd.args(args)
+            .env("KUIPA_ENDPOINTS", "ipa1.example.test=http://127.0.0.1:9");
+    })
 }
 
 #[test]
@@ -489,52 +495,27 @@ fn proxy() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     (url, seen)
 }
 
-/// Run `kuipa enroll` against ipa1.example.test with `env` and no other
-/// proxy settings; returns the exit status and standard error.
+/// [`enroll_run`] with `env` and no other proxy settings.
 fn enroll_with(name: &str, env: &[(&str, &str)]) -> (i32, String) {
-    let dir = std::env::temp_dir().join(format!("kuipa-cli-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-    let string = EnrollmentString::new(
-        "EXAMPLE.TEST",
-        *anchor.public().thumbprint(),
-        unix_seconds(std::time::SystemTime::now()) + 86_400,
-        Some(Secret::new(b"Secret123")),
-    );
-    let file = dir.join("enrollment");
-    std::fs::write(&file, string.encode().as_ref()).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuipa"));
-    cmd.args(["enroll", "--server", "ipa1.example.test"])
-        .args(["--hostname", "web1.example.test"])
-        .arg("--enrollment-file")
-        .arg(&file)
-        .env("KUIPA_ROOT", &dir)
-        .env_remove("KUIPA_ENDPOINTS")
-        .env_remove("KUIPA_ENROLLMENT_FILE")
-        .env_remove("KUIPA_TRACE");
-    for var in [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-        "REQUEST_METHOD",
-    ] {
-        cmd.env_remove(var);
-    }
-    for (var, value) in env {
-        cmd.env(var, value);
-    }
-    let out = cmd.output().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    (
-        out.status.code().unwrap(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    enroll_run(name, |cmd| {
+        cmd.env_remove("KUIPA_ENDPOINTS");
+        for var in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "REQUEST_METHOD",
+        ] {
+            cmd.env_remove(var);
+        }
+        for (var, value) in env {
+            cmd.env(var, value);
+        }
+    })
 }
 
 /// HTTPS to a server goes through `$HTTPS_PROXY` as a `CONNECT` tunnel, and
