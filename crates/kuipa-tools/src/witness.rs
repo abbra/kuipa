@@ -16,7 +16,7 @@ use std::path::Path;
 use kuipa_enroll::tlog::{self, Head};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tang_pqc::{Policy, SigningKey, Thumbprint, b64, unix_seconds};
+use tang_pqc::{Policy, SigningKey, Thumbprint, b64};
 
 use crate::net::{Endpoint, NetError, Trust};
 use crate::paths::{self, Error, Paths};
@@ -218,7 +218,7 @@ fn one(
     if head.cosignatures.iter().any(|c| c.witness == me) {
         return Ok(row("unchanged", head.head.size));
     }
-    let now = unix_seconds(std::time::SystemTime::now());
+    let now = tang_pqc::now();
     match tlog::witness(
         key,
         &log_key,

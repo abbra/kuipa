@@ -5,7 +5,7 @@
 use std::process::Command;
 
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
-use tang_pqc::{SignatureAlg, SigningKey, unix_seconds};
+use tang_pqc::{SignatureAlg, SigningKey};
 
 /// Run `kuipa enroll` with an OTP enrollment string for EXAMPLE.TEST against
 /// ipa1.example.test, after `configure` has added to the command.  Returns
@@ -18,7 +18,7 @@ fn enroll_run(name: &str, configure: impl FnOnce(&mut Command)) -> (i32, String)
     let string = EnrollmentString::new(
         "EXAMPLE.TEST",
         *anchor.public().thumbprint(),
-        unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         Some(Secret::new(b"Secret123")),
     );
     let file = dir.join("enrollment");
@@ -102,7 +102,7 @@ fn an_enrolled_host_verifies_with_its_pins_not_the_strings() {
     let string = EnrollmentString::new(
         "EXAMPLE.TEST",
         *string_anchor.public().thumbprint(),
-        unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         Some(Secret::new(b"Secret123")),
     );
     let file = dir.join("enrollment");

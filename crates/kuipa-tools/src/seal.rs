@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tang_pqc::primitives;
 use tang_pqc::wire::{Reader, Writer};
-use tang_pqc::{ExchangeKeyPair, KemAlg, SignedAdvertisement, Thumbprint, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, KemAlg, SignedAdvertisement, Thumbprint};
 
 use crate::flows::{self, Outcome};
 use crate::net::Endpoint;
@@ -893,7 +893,7 @@ impl<'a> SealClient<'a> {
     /// The user's IPA passkeys, as the realm lists them (cached for an
     /// hour), else as it last listed them.
     fn passkey_info(&self) -> Result<PasskeyInfo, Error> {
-        let now = unix_seconds(flows::now());
+        let now = tang_pqc::now();
         let cached: Option<CachedPasskeys> = fs::read(self.user.passkeys())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
@@ -1047,7 +1047,7 @@ impl<'a> SealClient<'a> {
             Ok(LiveSession { token, key, epochs })
         })();
         match parsed {
-            Ok(live) if live.token.not_after() >= unix_seconds(flows::now()) => Some(live),
+            Ok(live) if live.token.not_after() >= tang_pqc::now() => Some(live),
             _ => {
                 let _ = paths::remove(&path);
                 None
@@ -1347,7 +1347,7 @@ impl<'a> SealClient<'a> {
     /// Seal `name`'s descriptor, fresh enough to seal with: the stored
     /// one, else one fetched now.
     fn descriptor(&self, name: &str) -> Result<VerifiedDescriptor, Error> {
-        let now = unix_seconds(flows::now());
+        let now = tang_pqc::now();
         if let Some(d) = self.stored(name)?
             && d.fresh_at(now)
         {
@@ -1370,7 +1370,7 @@ impl<'a> SealClient<'a> {
         let (anchors, heads, retired, frozen) = paths::pinned_windows(&self.host.anchors())?;
         let known = paths::read_epoch_from(&self.host.anchors())?;
         let trust = flows::ca_trust(self.host)?;
-        let now = unix_seconds(flows::now());
+        let now = tang_pqc::now();
         let mut cache = Vec::new();
         let mut verified = Vec::new();
         for server in &public.servers {
@@ -1413,7 +1413,7 @@ impl<'a> SealClient<'a> {
         let cache: Vec<CachedAdvertisement> = serde_json::from_slice(&bytes)?;
         let public = self.public()?;
         let anchors = paths::read_anchors(self.host)?;
-        let now = unix_seconds(flows::now());
+        let now = tang_pqc::now();
         Ok(cache
             .iter()
             .filter(|c| now.saturating_sub(c.fetched) <= max_age)
@@ -1786,11 +1786,7 @@ impl<'a> SealClient<'a> {
     /// A file of another kind, a seal without approvals, a refusal.
     pub fn request(&self, name: &str, sealed: &[u8], reason: &str) -> Result<Value, Error> {
         let file = SealedFile::from_bytes(sealed)?;
-        let bindings = file
-            .bindings()?
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let bindings = file.bindings()?.iter().map(ToString::to_string).collect();
         let requests = self
             .op_with_session(&SealOp::Request {
                 name: name.into(),
@@ -2448,9 +2444,8 @@ impl<'a> SealClient<'a> {
         add: &[kuipa_enroll::escrow::BindingHash],
         retire: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), Error> {
-        let hex = |v: &[kuipa_enroll::escrow::BindingHash]| {
-            v.iter().map(ToString::to_string).collect()
-        };
+        let hex =
+            |v: &[kuipa_enroll::escrow::BindingHash]| v.iter().map(ToString::to_string).collect();
         self.op(&SealOp::Register {
             name: name.into(),
             add: hex(add),

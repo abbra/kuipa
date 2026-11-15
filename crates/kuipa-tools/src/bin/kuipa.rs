@@ -1134,9 +1134,7 @@ impl PolicyInput {
             .expires
             .map(|days| {
                 days.checked_mul(86_400)
-                    .and_then(|s| {
-                        tang_pqc::unix_seconds(std::time::SystemTime::now()).checked_add(s)
-                    })
+                    .and_then(|s| tang_pqc::now().checked_add(s))
                     .ok_or_else(|| "--expires is too large".to_string())
             })
             .transpose()?;

@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::bundle::{Bundle, Recipient};
@@ -23,7 +22,7 @@ use kuipa_tools::paths::Paths;
 use kuipad::http::{App, router};
 use kuipad::limit::{Limiter, Limits, Rate};
 use native_ossl::util::SecretBuf;
-use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, now};
 
 const REALM: &str = "EXAMPLE.TEST";
 const HOST: &str = "web1.example.test";
@@ -117,10 +116,6 @@ impl Directory for Dir {
     fn servers(&self) -> Result<Vec<String>, DirectoryError> {
         Ok(vec!["ipa1.example.test".into(), "ipa2.example.test".into()])
     }
-}
-
-fn now() -> u64 {
-    unix_seconds(SystemTime::now())
 }
 
 thread_local! {
@@ -286,7 +281,7 @@ fn string(anchor: &SigningKey, secret: &[u8]) -> EnrollmentString {
     EnrollmentString::new(
         REALM,
         *anchor.public().thumbprint(),
-        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         Some(Secret::new(secret)),
     )
 }
@@ -301,7 +296,7 @@ fn string_with_head(
         REALM,
         *anchor.public().thumbprint(),
         Some(head),
-        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         Some(Secret::new(secret)),
     )
 }
@@ -1455,7 +1450,7 @@ fn offline_enrollment_from_a_bundle() {
     let s = EnrollmentString::new(
         REALM,
         *anchor.public().thumbprint(),
-        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         None,
     );
     let result =
@@ -1578,7 +1573,7 @@ fn ldap_otp_enrollment_and_kerberos_bootstrap() {
     let s = EnrollmentString::new(
         REALM,
         *anchor.public().thumbprint(),
-        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         None,
     );
 
@@ -4117,7 +4112,7 @@ fn log_event(
 ) {
     use kuipa_enroll::server::Ledger;
 
-    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    let now = tang_pqc::now();
     let opening = kuipa_enroll::tlog::Opening::new(kind, now, subject, event.to_vec()).unwrap();
     ledger.append(opening).unwrap();
 }

@@ -12,11 +12,10 @@ use crate::paths::Error;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
-use std::time::SystemTime;
 
 use kuipa_enroll::delegation::{Delegation, HeadPin};
 use kuipa_enroll::server::ClaimLogPage;
-use tang_pqc::{Policy, SignedAdvertisement, Thumbprint, unix_seconds};
+use tang_pqc::{Policy, SignedAdvertisement, Thumbprint};
 
 use crate::net::Endpoint;
 
@@ -154,7 +153,7 @@ pub fn sync(origin: &Endpoint, cache: &Cache) -> Result<(), Error> {
         .collect();
     // The heads this advertisement proves; a page may be cached only
     // under one of them.
-    let heads = signed_heads(&bytes, unix_seconds(SystemTime::now()));
+    let heads = signed_heads(&bytes, tang_pqc::now());
     let mut walked = Vec::new();
 
     // Every anchor's claim log, page by page; the head is the page's,
@@ -377,14 +376,13 @@ mod tests {
     use kuipa_enroll::server::{ClaimLogPage, EnrollServer, MAX_CLAIM_LOG_PAGE};
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
-    use std::time::SystemTime;
-    use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, Thumbprint, unix_seconds};
+    use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, Thumbprint};
 
     /// A one-anchor realm whose claim log is the claim's own leaf.
     fn test_server() -> (EnrollServer, Thumbprint) {
         let anchor = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
         let signing = SigningKey::generate(SignatureAlg::MlDsa65).unwrap();
-        let at = unix_seconds(SystemTime::now());
+        let at = tang_pqc::now();
         let delegation = Delegation::issue(
             &anchor,
             "EXAMPLE.TEST",
@@ -436,7 +434,7 @@ mod tests {
             anchor: anchor.to_owned(),
             size,
             root: root.to_vec(),
-            exp: unix_seconds(SystemTime::now()) + 3600,
+            exp: tang_pqc::now() + 3600,
             leaves: (0..leaves)
                 .map(|i| tang_pqc::b64::encode(&[u8::try_from(i).unwrap_or(255); 32]))
                 .collect(),
@@ -518,7 +516,7 @@ mod tests {
     fn the_page_check_rejects_unsigned_and_forged_pages() {
         let (server, thp) = test_server();
         let adv = server.advertisement(&[]).unwrap().to_json().into_bytes();
-        let heads = signed_heads(&adv, unix_seconds(SystemTime::now()));
+        let heads = signed_heads(&adv, tang_pqc::now());
         assert!(
             heads.iter().any(|h| h.anchor == thp),
             "the advertisement proves its anchor's head"
@@ -590,7 +588,7 @@ mod tests {
     fn an_unparsable_anchor_is_skipped_and_the_others_sync() {
         let (server, thp) = test_server();
         let adv = server.advertisement(&[]).unwrap().to_json().into_bytes();
-        let heads = signed_heads(&adv, unix_seconds(SystemTime::now()));
+        let heads = signed_heads(&adv, tang_pqc::now());
         let cache = Cache::default();
         let fetch = |a: &Thumbprint, from: u64| {
             server

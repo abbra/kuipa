@@ -43,8 +43,7 @@ use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
 use tang_pqc::{
-    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, Thumbprint, VerifyingKey,
-    unix_seconds,
+    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, Thumbprint, VerifyingKey, now,
 };
 
 const REALM: &str = "EXAMPLE.TEST";
@@ -85,10 +84,6 @@ impl Preauth for Scripted {
     fn secret(&self, label: &str) -> Result<Vec<u8>, GssError> {
         self.prompt(label)
     }
-}
-
-fn now() -> u64 {
-    unix_seconds(SystemTime::now())
 }
 
 /// Serve the daemon's router on `listener`, and run its anchor exchange.
@@ -224,7 +219,7 @@ fn enrollment_string(anchor: Thumbprint, secret: Option<&[u8]>) -> EnrollmentStr
     EnrollmentString::new(
         REALM,
         anchor,
-        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         secret.map(Secret::new),
     )
 }

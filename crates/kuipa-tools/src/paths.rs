@@ -489,7 +489,7 @@ pub fn read_anchors(paths: &Paths) -> Result<Vec<tang_pqc::Thumbprint>, Error> {
 ///
 /// I/O errors or a malformed line.
 pub fn read_anchors_from(path: &Path) -> Result<Vec<tang_pqc::Thumbprint>, Error> {
-    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    let now = tang_pqc::now();
     Ok(read_anchor_pins(path)?
         .into_iter()
         .filter(|p| p.exp.is_none_or(|e| now <= e.saturating_add(CLOCK_SKEW)))
@@ -505,7 +505,7 @@ pub fn read_anchors_from(path: &Path) -> Result<Vec<tang_pqc::Thumbprint>, Error
 ///
 /// I/O errors or a malformed line.
 fn live_pins(path: &Path) -> Result<Vec<Pin>, Error> {
-    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    let now = tang_pqc::now();
     Ok(read_pins_or_none(path)?
         .into_iter()
         .filter(|p| p.exp.is_none_or(|e| now <= e.saturating_add(CLOCK_SKEW)))
@@ -1089,7 +1089,7 @@ mod tests {
             tang_pqc::Thumbprint::from_bytes([2; 32]),
             tang_pqc::Thumbprint::from_bytes([3; 32]),
         );
-        let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+        let now = tang_pqc::now();
         let head = tang_pqc::b64::encode(&[9; 48]);
         let text = format!(
             "# provisioned\n{a}\n\n{b} {}\n{c} {}\nepoch 7 {head}\n",
@@ -1141,7 +1141,7 @@ mod tests {
     fn malformed_anchor_lines_are_refused() {
         let (dir, path) = scratch_anchors("malformed");
         let a = tang_pqc::Thumbprint::from_bytes([1; 32]);
-        let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+        let now = tang_pqc::now();
         let root = |n: u8| tang_pqc::Thumbprint::from_bytes([n; 32]);
         for bad in [
             format!("{a} soon\n"),
@@ -1193,7 +1193,7 @@ mod tests {
         let (dir, path) = scratch_anchors("written");
         let a = tang_pqc::Thumbprint::from_bytes([1; 32]);
         let b = tang_pqc::Thumbprint::from_bytes([2; 32]);
-        let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+        let now = tang_pqc::now();
         // Written lists carry no expiry and read back unchanged.
         write_anchor_pins(
             &path,
@@ -1287,7 +1287,7 @@ mod tests {
         let path = dir.join("pq-anchors");
         let live = tang_pqc::Thumbprint::from_bytes([1; 32]);
         let expired = tang_pqc::Thumbprint::from_bytes([2; 32]);
-        let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+        let now = tang_pqc::now();
         let pins = [
             Pin {
                 anchor: live,

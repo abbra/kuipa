@@ -27,7 +27,7 @@ use kuipa_enroll::realm::{
 use kuipa_gssapi::{GssClientCred, GssError, is_mit_kerberos};
 use native_ossl::util::SecretBuf;
 use serde_json::{Value, json};
-use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, b64, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, b64};
 
 use crate::net::{Endpoint, NetError, Trust};
 use crate::paths::{self, Contents, Error, Holder, Paths, Pin, Protected, State};
@@ -101,10 +101,6 @@ impl Outcome {
 
 pub(crate) fn now() -> SystemTime {
     SystemTime::now()
-}
-
-fn now_secs() -> u64 {
-    unix_seconds(now())
 }
 
 /// The host's FQDN from the kernel.
@@ -427,8 +423,8 @@ fn watermark_after(
 
 fn trace_advertisement(server: &str, adv: &VerifiedRealm) {
     let info = adv.info();
-    let days = adv.delegation_expires().saturating_sub(now_secs()) / 86400;
-    let vouch_days = adv.vouched_until().saturating_sub(now_secs()) / 86400;
+    let days = adv.delegation_expires().saturating_sub(tang_pqc::now()) / 86400;
+    let vouch_days = adv.vouched_until().saturating_sub(tang_pqc::now()) / 86400;
     tracing::debug!(
         server = %server,
         "advertisement verified: {} of {}, signed by {}, delegation by anchor {} (claim: {days} days left, vouch: {vouch_days} days left)",
@@ -802,7 +798,7 @@ fn armoured_ticket(
     let dir = std::env::temp_dir().join(format!(
         "kuipa-kinit-{}-{}-{seq}",
         std::process::id(),
-        now_secs()
+        tang_pqc::now()
     ));
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let result = (|| {
@@ -845,7 +841,7 @@ fn armoured_ticket(
 ///
 /// The string has expired.
 pub fn check_string(string: &EnrollmentString) -> Result<(), Error> {
-    let now = now_secs();
+    let now = tang_pqc::now();
     string.check_valid(now).map_err(|_| {
         let days = now.saturating_sub(string.exp()) / 86400;
         format!(
@@ -1110,7 +1106,7 @@ pub fn enroll_bundle(
     if expected_fqdn.is_some_and(|f| f != fqdn) {
         return Err(format!("bundle is for {fqdn}").into());
     }
-    if verified.bundle().not_after() < now_secs() {
+    if verified.bundle().not_after() < tang_pqc::now() {
         return Err(Outcome::NeedsAdmin(format!(
             "bundle for {fqdn} expired; stage the host again"
         ))
@@ -2275,11 +2271,11 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
 /// (§4.9) — so the half-life warning does not apply to it.
 fn server_health(server: &str, adv: &VerifiedRealm) -> (Vec<String>, Value) {
     let mut problems = Vec::new();
-    let days = adv.delegation_expires().saturating_sub(now_secs()) / 86400;
+    let days = adv.delegation_expires().saturating_sub(tang_pqc::now()) / 86400;
     let vouch_hours = adv
         .head_anchor()
         .is_none()
-        .then(|| adv.vouched_until().saturating_sub(now_secs()) / 3600);
+        .then(|| adv.vouched_until().saturating_sub(tang_pqc::now()) / 3600);
     if days < 14 {
         problems.push(format!("{server}: its claim expires in {days} days: the server renews it itself, so check its anchor exchange"));
     }
@@ -2697,7 +2693,7 @@ fn advertisement_detail(
 ) -> Result<Value, Error> {
     let landmarks = landmark_chain(endpoint, adv, realm, anchors)?;
     let info = adv.info();
-    let now = now_secs();
+    let now = tang_pqc::now();
     let kid = |k: Result<&tang_pqc::ExchangeKey, _>| {
         k.map_or_else(|_| "-".into(), |k| k.kid().to_string())
     };

@@ -53,7 +53,7 @@ use kuipad::keystore::KeyStore;
 use kuipad::peers::{KeytabInitiator, Peers, Settings};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
-use tang_pqc::{ExchangeKeyPair, Policy, SignatureAlg, SigningKey, Thumbprint, b64, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, Policy, SignatureAlg, SigningKey, Thumbprint, b64, now};
 
 const REALM: &str = "EXAMPLE.TEST";
 const DOMAIN: &str = "example.test";
@@ -80,10 +80,6 @@ const CHAIN_SERVERS: [&str; 3] = [
 const TOKEN_MODULE: &str = "/usr/lib64/pkcs11/libkryoptic_pkcs11.so";
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
-
-fn now() -> u64 {
-    unix_seconds(SystemTime::now())
-}
 
 fn option(args: &[String], name: &str) -> Option<String> {
     args.iter()

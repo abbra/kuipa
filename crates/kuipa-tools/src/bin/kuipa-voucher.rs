@@ -37,7 +37,7 @@ use kuipa_enroll::voucher::{Claims, Voucher};
 use kuipa_tools::paths::Error;
 use kuipa_tools::voucher;
 use native_ossl::util::SecretBuf;
-use tang_pqc::{SignatureAlg, b64, unix_seconds};
+use tang_pqc::{SignatureAlg, b64};
 
 #[derive(Parser)]
 #[command(
@@ -182,7 +182,7 @@ fn run(command: Command) -> Result<(), Error> {
                     .ok_or("--binding is not a binding")?,
                 None => Vec::new(),
             };
-            let now = unix_seconds(std::time::SystemTime::now());
+            let now = tang_pqc::now();
             let validity = days
                 .checked_mul(86400)
                 .and_then(|s| now.checked_add(s))

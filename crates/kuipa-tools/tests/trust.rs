@@ -13,7 +13,6 @@ mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use kuipa_enroll::EnrollServer;
 use kuipa_enroll::delegation::Delegation;
@@ -26,17 +25,13 @@ use kuipa_tools::paths::{self, Paths};
 use kuipad::http::{App, router};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
-use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, Thumbprint, unix_seconds};
+use tang_pqc::{ExchangeKeyPair, KemAlg, SignatureAlg, SigningKey, Thumbprint, now};
 
 const A: &str = "A.TEST";
 const B: &str = "B.TEST";
 const SERVER_A: &str = "ipa1.a.test";
 const SERVER_B: &str = "ipa1.b.test";
 const HOST: &str = "web1.a.test";
-
-fn now() -> u64 {
-    unix_seconds(SystemTime::now())
-}
 
 /// One server of `realm`, with its own anchor, serving the daemon's router
 /// on `listener`.
@@ -253,7 +248,7 @@ fn enroll_host(s: &Setup) -> Paths {
     let mut string = EnrollmentString::new(
         A,
         s.anchor_a,
-        tang_pqc::unix_seconds(std::time::SystemTime::now()) + 86_400,
+        tang_pqc::now() + 86_400,
         Some(Secret::new(b"Secret123")),
     );
     let otp = string.take_secret().unwrap();

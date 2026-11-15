@@ -27,16 +27,10 @@ use kuipa_tools::voucher;
 use kuipad::http::{App, router};
 use support::directory::KdcDirectory;
 use support::kdc::Realm;
-use tang_pqc::{
-    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, VerifyingKey, b64, unix_seconds,
-};
+use tang_pqc::{ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SigningKey, VerifyingKey, b64, now};
 
 const REALM: &str = "VOUCHER.TEST";
 const SERVER: &str = "ipa1.voucher.test";
-
-fn now() -> u64 {
-    unix_seconds(SystemTime::now())
-}
 
 fn claims(fqdn: &str, binding: Vec<u8>) -> Claims {
     Claims {
@@ -163,7 +157,7 @@ impl Ipa {
         let string = EnrollmentString::new(
             REALM,
             *anchor.public().thumbprint(),
-            tang_pqc::unix_seconds(SystemTime::now()) + 86_400,
+            tang_pqc::now() + 86_400,
             None,
         );
         Self {
