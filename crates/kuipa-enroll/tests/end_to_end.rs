@@ -27,19 +27,15 @@ use kuipa_enroll::server::{
 };
 use kuipa_enroll::tlog::{self, Head, Leaf, Log, LogId, SealAction, SealEvent, SignedHead};
 use kuipa_enroll::{EnrollServer, Error};
+use kuipa_perf::dir::{fake_binding, gss_token};
 use native_ossl::util::SecretBuf;
 use tang_pqc::{
-    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SignedAdvertisement, SigningKey, Thumbprint,
-    unix_seconds,
+    ExchangeKeyPair, KemAlg, Policy, SignatureAlg, SignedAdvertisement, SigningKey, Thumbprint, now,
 };
 
 const REALM: &str = "EXAMPLE.TEST";
 const HOST: &str = "web1.example.test";
 const CA: &[u8] = include_bytes!("data/ipa-ca.der");
-
-fn now() -> u64 {
-    unix_seconds(SystemTime::now())
-}
 
 /// A fake directory.  GSS tokens are modelled as `principal ‖ cb`, so a
 /// token only "verifies" with the channel binding it was made for, and the
@@ -90,23 +86,6 @@ struct MemoryDirectory {
     passkeys: RefCell<HashMap<String, Vec<String>>>,
     /// Whether the realm requires user verification.
     passkey_uv: std::cell::Cell<bool>,
-}
-
-/// A stand-in for the GSS-API pseudo-random output both ends of a context
-/// share.
-fn fake_binding(principal: &str, cb: &[u8; 32]) -> KerberosBinding {
-    let mut b = *cb;
-    for (i, c) in principal.bytes().enumerate() {
-        b[i % 32] ^= c;
-    }
-    KerberosBinding::new(&b).unwrap()
-}
-
-fn gss_token(principal: &str, cb: &[u8; 32]) -> Vec<u8> {
-    let mut t = principal.as_bytes().to_vec();
-    t.push(0);
-    t.extend_from_slice(cb);
-    t
 }
 
 impl MemoryDirectory {
@@ -1683,7 +1662,7 @@ fn delegated_tickets(c: &SealCase) {
         },
     );
     assert!(c.open(ALICE, Some(device)).is_err(), "not leased");
-    let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+    let now = now();
     c.r.dir.leases.borrow_mut().insert(ALICE.into(), now + 3600);
     assert!(c.open(ALICE, Some(device)).is_ok());
     c.r.dir.leases.borrow_mut().insert(ALICE.into(), now - 1);
