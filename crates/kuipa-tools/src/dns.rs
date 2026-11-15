@@ -143,38 +143,13 @@ impl Nameserver {
     }
 }
 
-/// A resolver for `nameservers`, or the system's.
-fn resolver(nameservers: Option<&Nameservers>) -> Result<TokioResolver, Error> {
+/// A resolver for `nameservers`, or the system's.  `DoT` and `DoH` servers
+/// are verified against `KUIPA_DNS_CA`'s PEM certificates (Merkle Tree CAs
+/// included) if set, the system roots otherwise.
+fn resolver(nameservers: Option<&[Nameserver]>) -> Result<TokioResolver, Error> {
     let Some(nameservers) = nameservers else {
         return Ok(Resolver::builder_tokio()?.build()?);
     };
-    if nameservers.secure() {
-        let Nameservers::Secure(list) = nameservers else {
-            unreachable!("secure nameservers");
-        };
-        return tls_resolver(list);
-    }
-    let servers = nameservers
-        .plain()
-        .iter()
-        .map(|addr| {
-            let mut udp = ConnectionConfig::udp();
-            udp.port = addr.port();
-            let mut tcp = ConnectionConfig::tcp();
-            tcp.port = addr.port();
-            NameServerConfig::new(addr.ip(), false, vec![udp, tcp])
-        })
-        .collect();
-    Ok(fast_fail(Resolver::builder_with_config(
-        ResolverConfig::from_name_servers(servers),
-        TokioRuntimeProvider::default(),
-    )))
-}
-
-/// A resolver with `DoT` or `DoH` `nameservers`: certificates verified against
-/// `KUIPA_DNS_CA`'s PEM certificates (Merkle Tree CAs included) if set,
-/// the system roots otherwise.
-fn tls_resolver(nameservers: &[Nameserver]) -> Result<TokioResolver, Error> {
     let servers = nameservers
         .iter()
         .map(|ns| NameServerConfig::new(ns.addr().ip(), false, ns.connections()))
@@ -183,35 +158,13 @@ fn tls_resolver(nameservers: &[Nameserver]) -> Result<TokioResolver, Error> {
         ResolverConfig::from_name_servers(servers),
         TokioRuntimeProvider::default(),
     );
-    if std::env::var_os("KUIPA_DNS_CA").is_some() {
+    let secure = nameservers
+        .iter()
+        .any(|ns| !matches!(ns, Nameserver::Plain(_)));
+    if secure && std::env::var_os("KUIPA_DNS_CA").is_some() {
         builder = builder.with_tls_config(tls_config()?);
     }
     Ok(fast_fail(builder))
-}
-
-/// The nameservers a lookup uses: the system's (`None`), or the one
-/// `KUIPA_DNS` names.
-#[derive(Debug)]
-enum Nameservers {
-    /// Plain DNS to one address.
-    Plain(Vec<SocketAddr>),
-    /// `DoT` or `DoH`.
-    Secure(Vec<Nameserver>),
-}
-
-impl Nameservers {
-    /// Whether any nameserver is `DoT` or `DoH`.
-    fn secure(&self) -> bool {
-        matches!(self, Self::Secure(_))
-    }
-
-    /// The plain nameservers, empty for `DoT`/`DoH`.
-    fn plain(&self) -> &[SocketAddr] {
-        match self {
-            Self::Plain(addrs) => addrs,
-            Self::Secure(_) => &[],
-        }
-    }
 }
 
 /// Apply the fast-fail options for a configured nameserver (tests, the
@@ -259,18 +212,18 @@ fn tls_config() -> Result<rustls::ClientConfig, Error> {
 }
 
 /// The nameserver from `KUIPA_DNS`, if set.
-fn configured() -> Result<Option<Nameservers>, Error> {
+fn configured() -> Result<Option<Vec<Nameserver>>, Error> {
     match std::env::var("KUIPA_DNS") {
-        Ok(value) => Ok(Some(matched_nameservers(&value)?)),
+        Ok(value) => Ok(Some(vec![configured_nameserver(&value)?])),
         Err(_) => Ok(None),
     }
 }
 
-/// `KUIPA_DNS` as [`Nameservers`]: a `doh://` or `dot://` name resolves
+/// `KUIPA_DNS` as a [`Nameserver`]: a `doh://` or `dot://` name resolves
 /// through the system configuration, but never circularly through itself.
-fn matched_nameservers(value: &str) -> Result<Nameservers, Error> {
+fn configured_nameserver(value: &str) -> Result<Nameserver, Error> {
     if value.starts_with("dot://") || value.starts_with("doh://") {
-        let ns = Nameserver::parse(value, &|host| {
+        return Nameserver::parse(value, &|host| {
             // Resolve a server *name* (not address) through the system
             // resolver only: if the system configuration itself needs the
             // SRV records being looked up, that is the deployment's knot
@@ -278,8 +231,7 @@ fn matched_nameservers(value: &str) -> Result<Nameservers, Error> {
             std::net::ToSocketAddrs::to_socket_addrs(&(host, 0))
                 .ok()?
                 .find(|_| true)
-        })?;
-        return Ok(Nameservers::Secure(vec![ns]));
+        });
     }
     if value.contains("://") {
         return Err(format!(
@@ -287,13 +239,13 @@ fn matched_nameservers(value: &str) -> Result<Nameservers, Error> {
         )
         .into());
     }
-    Ok(Nameservers::Plain(vec![value.parse().map_err(|_| {
+    Ok(Nameserver::Plain(value.parse().map_err(|_| {
         format!("KUIPA_DNS={value:?} is not an address:port")
-    })?]))
+    })?))
 }
 
 /// The SRV records for `name`; an empty list when there are none.
-fn lookup(name: &str, nameservers: Option<&Nameservers>) -> Result<Vec<Srv>, Error> {
+fn lookup(name: &str, nameservers: Option<&[Nameserver]>) -> Result<Vec<Srv>, Error> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -330,7 +282,7 @@ fn lookup(name: &str, nameservers: Option<&Nameservers>) -> Result<Vec<Srv>, Err
 ///
 /// A failed lookup, or no usable records.
 pub fn ipa_servers(domain: &str) -> Result<Vec<String>, Error> {
-    servers(domain, configured()?.as_ref())
+    servers(domain, configured()?.as_deref())
 }
 
 /// [`ipa_servers`], asking `nameservers`.
@@ -338,11 +290,13 @@ pub fn ipa_servers(domain: &str) -> Result<Vec<String>, Error> {
 /// # Errors
 ///
 /// A failed lookup, or no usable records.
+#[cfg(feature = "testing")]
 pub fn ipa_servers_from(domain: &str, nameservers: &[SocketAddr]) -> Result<Vec<String>, Error> {
-    servers(domain, Some(&Nameservers::Plain(nameservers.to_vec())))
+    let plain: Vec<_> = nameservers.iter().copied().map(Nameserver::Plain).collect();
+    servers(domain, Some(&plain))
 }
 
-fn servers(domain: &str, nameservers: Option<&Nameservers>) -> Result<Vec<String>, Error> {
+fn servers(domain: &str, nameservers: Option<&[Nameserver]>) -> Result<Vec<String>, Error> {
     let name = format!("_ldap._tcp.{}.", domain.trim_end_matches('.'));
     let mut records = lookup(&name, nameservers)?;
     records.sort_by(|a, b| (a.priority, b.weight).cmp(&(b.priority, a.weight)));
