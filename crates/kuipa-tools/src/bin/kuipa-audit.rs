@@ -27,6 +27,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use kuipa_tools::audit;
+use kuipa_tools::text::{Rows, sanitize};
 
 #[derive(Parser)]
 #[command(
@@ -359,72 +360,4 @@ fn format_head(head: &serde_json::Value) -> String {
         head["size"].as_u64().unwrap_or(0),
         sanitize(head["root"].as_str().unwrap_or("?"))
     )
-}
-
-/// Server-supplied strings print as given except for control
-/// characters: a malicious server must not drive the auditor's
-/// terminal with escape sequences smuggled into an anchor, root or
-/// leaf string.
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { '…' } else { c })
-        .collect()
-}
-
-/// The plain labelled rows the other tools print: label, two spaces,
-/// value; the width of the widest label.
-#[derive(Default)]
-struct Rows {
-    width: usize,
-    lines: Vec<(String, String)>,
-}
-
-impl Rows {
-    fn row(&mut self, label: &str, value: String) {
-        self.width = self.width.max(label.len());
-        self.lines.push((label.to_string(), value));
-    }
-
-    fn field(&mut self, label: &str, value: &serde_json::Value) {
-        if matches!(value, serde_json::Value::Null) {
-            return;
-        }
-        let text = match value {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Number(n) => n.to_string(),
-            other => other.to_string(),
-        };
-        self.row(label, sanitize(&text));
-    }
-
-    /// A Unix time a row names, as a date: `vouch expires` is read by a
-    /// person deciding whether to trust a log, not by a clock.  Out of
-    /// range the seconds are kept, and anything else prints as it is.
-    fn until(&mut self, label: &str, value: &serde_json::Value) {
-        if value.is_null() {
-            return;
-        }
-        let text = match value.as_u64() {
-            Some(secs) => kuipa_tools::text::date(secs).unwrap_or_else(|| secs.to_string()),
-            None => value.to_string(),
-        };
-        self.row(label, sanitize(&text));
-    }
-
-    fn print(&self) {
-        for (label, value) in &self.lines {
-            println!("{label:width$}  {value}", width = self.width);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sanitize;
-
-    #[test]
-    fn control_characters_never_reach_the_terminal() {
-        assert_eq!(sanitize("thp\u{1b}[2J\u{7}root\nleaf"), "thp…[2J…root…leaf");
-        assert_eq!(sanitize("plain 43-char anchor"), "plain 43-char anchor");
-    }
 }

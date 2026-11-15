@@ -113,6 +113,7 @@ use kuipa_enroll::realm::Deployment;
 use kuipa_tools::flows::{self, Auth, Outcome};
 use kuipa_tools::paths::{self, Error, Paths};
 use kuipa_tools::preauth::prompt;
+use kuipa_tools::text::Rows;
 use native_ossl::util::SecretBuf;
 use serde_json::Value;
 use tang_pqc::Thumbprint;
@@ -1793,108 +1794,6 @@ fn krb5_config_fallback(paths: &Paths) {
 // which server vouched for what.  The JSON keys alone read the same on
 // every host and never say where a value came from.
 
-/// The rows of one block: labels are ours, values are the flow's.  Labels
-/// are right-aligned to one column, so the values line up under it while
-/// each row still reads `label: value` — `grep` for a label and its value
-/// matches whatever else the block contains.  `Null` and a false flag are
-/// not shown; an empty name or list says `none`, a list of names goes on
-/// one line.
-#[derive(Default)]
-struct Rows {
-    indent: usize,
-    width: usize,
-    lines: Vec<(String, String)>,
-}
-
-impl Rows {
-    fn row(&mut self, label: &str, value: String) {
-        self.width = self.width.max(label.len());
-        self.lines.push((label.to_string(), value));
-    }
-
-    fn field(&mut self, label: &str, value: &Value) {
-        if matches!(value, Value::Null | Value::Bool(false)) {
-            return;
-        }
-        let text = match value {
-            Value::Bool(true) => "yes".to_string(),
-            Value::String(s) if s.is_empty() => "none".to_string(),
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            Value::Array(items) if items.iter().all(Value::is_string) => {
-                let names: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
-                if names.is_empty() {
-                    "none".to_string()
-                } else {
-                    names.join(", ")
-                }
-            }
-            other => other.to_string(),
-        };
-        self.row(label, text);
-    }
-
-    /// A duration a flow measured against this host's clock, with its unit.
-    fn left(&mut self, label: &str, value: &Value, unit: &str) {
-        if value.is_null() {
-            return;
-        }
-        self.row(
-            label,
-            format!("{} {unit} left", value.as_u64().unwrap_or_default()),
-        );
-    }
-
-    /// A Unix time a flow recorded, as a date.  `synta`'s `GeneralizedTime`
-    /// does the civil-date arithmetic, in UTC.
-    fn until(&mut self, label: &str, value: &Value) {
-        let Some(secs) = value.as_u64() else { return };
-        let text = kuipa_tools::text::date(secs).unwrap_or_else(|| secs.to_string());
-        self.row(label, text);
-    }
-
-    /// A file on this host.
-    fn path(&mut self, label: &str, path: &std::path::Path) {
-        self.row(label, path.display().to_string());
-    }
-
-    /// Rows are only printed once the block is complete: the column width
-    /// is the widest label it holds.  On a terminal the labels are
-    /// emphasised, as `clap` emphasises its help; the padding is written
-    /// before the escape codes, so the column is identical either way.
-    fn print(&self) {
-        if emphasise() {
-            for (label, value) in &self.lines {
-                println!(
-                    "{:>indent$}{}\x1b[1m{label}\x1b[0m: {value}",
-                    "",
-                    " ".repeat(self.width - label.len()),
-                    indent = self.indent,
-                );
-            }
-        } else {
-            for (label, value) in &self.lines {
-                println!(
-                    "{:>indent$}{:>width$}: {value}",
-                    "",
-                    label,
-                    indent = self.indent,
-                    width = self.width,
-                );
-            }
-        }
-    }
-}
-
-/// Whether to emphasise labels: `anstream`'s decision, the same one `clap`
-/// applies to its own help (`$NO_COLOR`, `$CLICOLOR`, `$CLICOLOR_FORCE`,
-/// `$TERM`, whether standard output is a terminal), so `kuipa --help` and a
-/// rendered block agree on where emphasis goes.  Anything that is not an
-/// ANSI terminal — a pipe, a Windows wincon console — gets plain labels.
-fn emphasise() -> bool {
-    anstream::AutoStream::choice(&std::io::stdout()) == anstream::ColorChoice::Always
-}
-
 /// Strings a flow collected, one per line under `heading`'s indent.
 fn items(values: &Value, indent: &str) {
     for item in values.as_array().into_iter().flatten() {
@@ -2148,10 +2047,7 @@ fn identity_rows(rows: &mut Rows, value: &Value) {
 /// Files a command wrote on this host, as a nested block.
 fn installed_rows(rows: &Rows, paths: &Paths) {
     println!("{:>indent$}installed here:", "", indent = rows.indent);
-    let mut files = Rows {
-        indent: rows.indent + 2,
-        ..Rows::default()
-    };
+    let mut files = Rows::indented(rows.indent + 2);
     files.path("host keys", &paths.keytab());
     files.path("IPA CA", &paths.ca());
     files.path("pinned anchors", &paths.anchors());
@@ -2167,10 +2063,7 @@ fn pending_rows(value: &Value, done: &str) {
         return;
     };
     println!("  {done} for {}:", pending["fqdn"]);
-    let mut rows = Rows {
-        indent: 2,
-        ..Rows::default()
-    };
+    let mut rows = Rows::indented(2);
     rows.until("the staged bundle is usable until", &pending["not_after"]);
     rows.print();
     println!("{:>2}deferred steps:", "");
@@ -2315,10 +2208,7 @@ fn render_advertisement(value: &Value, paths: &Paths) {
                 l["head"].as_str().unwrap_or(""),
                 l["prev"].as_str().unwrap_or("")
             );
-            let mut entry = Rows {
-                indent: 4,
-                ..Rows::default()
-            };
+            let mut entry = Rows::indented(4);
             entry.field("anchors then current", &l["anchors"]);
             entry.field("successions then current", &l["successions"]);
             entry.print();
@@ -2352,10 +2242,7 @@ fn anchor_index_rows(value: &Value) {
         return;
     }
     println!("  every key these servers named, and what it belongs to:");
-    let mut rows = Rows {
-        indent: 2,
-        ..Rows::default()
-    };
+    let mut rows = Rows::indented(2);
     for a in anchors {
         let key = a["key"].as_str().unwrap_or("key");
         let mut what: Vec<String> = Vec::new();
@@ -2504,10 +2391,7 @@ fn render_check(value: &Value, paths: &Paths) {
             continue;
         }
         println!("    {server}: advertisement verified");
-        let mut health = Rows {
-            indent: 8,
-            ..Rows::default()
-        };
+        let mut health = Rows::indented(8);
         health.left("delegation", &s["delegation_days_left"], "days");
         health.left("the anchor's vouch", &s["vouch_hours_left"], "hours");
         health.field(
@@ -2516,10 +2400,7 @@ fn render_check(value: &Value, paths: &Paths) {
         );
         health.print();
     }
-    let mut host = Rows {
-        indent: 2,
-        ..Rows::default()
-    };
+    let mut host = Rows::indented(2);
     host.row(
         "a ticket with the host keys",
         if value["kinit"].as_bool().unwrap_or(false) {
