@@ -187,13 +187,8 @@ impl KeysFetch {
     /// [`Error::Malformed`] for a nickname over [`MAX_NICKNAME`] bytes, or
     /// a wrap algorithm outside `ca_wrapped`.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        if self.nickname.len() > MAX_NICKNAME {
-            return Err(Error::Malformed("nickname"));
-        }
+        self.validate()?;
         let alg = self.alg.map_or(0, WrapAlg::id);
-        if self.alg.is_some() && self.namespace != Namespace::CaWrapped {
-            return Err(Error::Malformed("wrap algorithm outside ca_wrapped"));
-        }
         Ok(Writer::new(FETCH_MAGIC)
             .u8(self.namespace.id())
             .str(&self.nickname)
@@ -210,9 +205,6 @@ impl KeysFetch {
         let mut r = Reader::new(bytes, FETCH_MAGIC, "keys fetch")?;
         let namespace = Namespace::from_id(r.u8()?)?;
         let nickname = r.str()?.to_owned();
-        if nickname.len() > MAX_NICKNAME {
-            return Err(Error::Malformed("nickname"));
-        }
         let alg = r.u8()?;
         r.finish()?;
         let alg = if alg == 0 {
@@ -220,14 +212,23 @@ impl KeysFetch {
         } else {
             Some(WrapAlg::from_id(alg)?)
         };
-        if alg.is_some() && namespace != Namespace::CaWrapped {
-            return Err(Error::Malformed("wrap algorithm outside ca_wrapped"));
-        }
-        Ok(Self {
+        let fetch = Self {
             namespace,
             nickname,
             alg,
-        })
+        };
+        fetch.validate()?;
+        Ok(fetch)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.nickname.len() > MAX_NICKNAME {
+            return Err(Error::Malformed("nickname"));
+        }
+        if self.alg.is_some() && self.namespace != Namespace::CaWrapped {
+            return Err(Error::Malformed("wrap algorithm outside ca_wrapped"));
+        }
+        Ok(())
     }
 }
 
