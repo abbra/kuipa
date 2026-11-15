@@ -182,6 +182,29 @@ pub struct LdapDirectory {
 /// policy, the session keys and the devices, each as JSON.
 type SealAttrs = (String, Vec<String>, &'static str, Vec<String>);
 
+/// `unix` as an LDAP generalized time; `what` names it in the error.
+fn ldap_time(unix: u64, what: &str) -> Result<String, DirectoryError> {
+    Ok(
+        synta::GeneralizedTime::from_unix(i64::try_from(unix).unwrap_or(i64::MAX))
+            .ok_or_else(|| format!("{what} is out of range"))?
+            .to_string(),
+    )
+}
+
+/// `(|(attr=value)…)` for every attribute and every value, escaped; none
+/// when there are no values.
+fn or_filter<S: AsRef<str>>(attrs: &[&str], values: impl IntoIterator<Item = S>) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut terms = String::new();
+    for value in values {
+        let value = filter_escape(value.as_ref());
+        for attr in attrs {
+            let _ = write!(terms, "({attr}={value})");
+        }
+    }
+    (!terms.is_empty()).then(|| format!("(|{terms})"))
+}
+
 impl LdapDirectory {
     /// Acquire the daemon's acceptor credential.
     ///
@@ -222,6 +245,29 @@ impl LdapDirectory {
             dn_escape(fqdn),
             self.cfg.basedn
         )
+    }
+
+    /// `cn=<rdn>,cn=kuipa,cn=etc,<base>`: the daemon's own containers.
+    fn kuipa_dn(&self, rdn: &str) -> String {
+        format!("cn={rdn},cn=kuipa,cn=etc,{}", self.cfg.basedn)
+    }
+
+    fn masters_dn(&self) -> String {
+        format!("cn=masters,cn=ipa,cn=etc,{}", self.cfg.basedn)
+    }
+
+    /// The IPA servers, from `cn=masters`.
+    fn masters(&self, conn: &mut LdapConnection) -> Result<Vec<String>, DirectoryError> {
+        let entries = conn.search(
+            &self.masters_dn(),
+            Scope::OneLevel,
+            "(objectClass=*)",
+            &["cn"],
+        )?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|e| e.attrs.get("cn").and_then(|v| v.first().cloned()))
+            .collect())
     }
 
     fn connect(&self) -> Result<LdapConnection, DirectoryError> {
@@ -354,7 +400,7 @@ impl LdapDirectory {
     }
 
     fn seals_dn(&self) -> String {
-        format!("cn=seals,cn=kuipa,cn=etc,{}", self.cfg.basedn)
+        self.kuipa_dn("seals")
     }
 
     fn seal_dn(&self, id: &SealId) -> String {
@@ -515,7 +561,7 @@ impl LdapDirectory {
     }
 
     fn trusts_dn(&self) -> String {
-        format!("cn=trusts,cn=kuipa,cn=etc,{}", self.cfg.basedn)
+        self.kuipa_dn("trusts")
     }
 
     /// The values of `attr` on the trusts entry.
@@ -656,11 +702,11 @@ impl LdapDirectory {
             )?;
             return Ok(entries.into_iter().next());
         }
-        let name = filter_escape(&principal.to_string());
+        let name = principal.to_string();
         let entries = conn.search(
             &format!("cn=accounts,{}", self.cfg.basedn),
             Scope::Subtree,
-            &format!("(|(krbPrincipalName={name})(krbCanonicalName={name}))"),
+            &or_filter(&["krbPrincipalName", "krbCanonicalName"], [&name]).unwrap_or_default(),
             attrs,
         )?;
         Ok(entries.into_iter().next())
@@ -703,7 +749,7 @@ impl LdapDirectory {
         name: &str,
         attr: &str,
     ) -> Result<Option<T>, DirectoryError> {
-        let dn = format!("cn={name},cn=kuipa,cn=etc,{}", self.cfg.basedn);
+        let dn = self.kuipa_dn(name);
         let entries =
             self.service_conn()?
                 .search_if_exists(&dn, Scope::Base, "(objectClass=*)", &[attr])?;
@@ -745,10 +791,7 @@ impl Directory for LdapDirectory {
         if caller == self.host_principal(fqdn) {
             return Ok((self.rekey_host(fqdn, &caller, enctypes)?, binding));
         }
-        let mut conn = match presented {
-            Some(conn) => conn,
-            None => self.conn_as(&caller)?,
-        };
+        let mut conn = presented.map_or_else(|| self.conn_as(&caller), Ok)?;
         let principal = Self::join(&mut conn, fqdn)?;
         Ok((self.new_keys(&mut conn, &principal, enctypes)?, binding))
     }
@@ -773,10 +816,7 @@ impl Directory for LdapDirectory {
         staged: &Staged,
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
         let (caller, binding, presented) = self.accept_conn(token, cb)?;
-        let mut conn = match presented {
-            Some(conn) => conn,
-            None => self.conn_as(&caller)?,
-        };
+        let mut conn = presented.map_or_else(|| self.conn_as(&caller), Ok)?;
         let host = self.host_principal(fqdn);
         // The host entry must exist (ipa host-add); joining it records
         // enrolledBy and sets the principal name, as ipa-join does.
@@ -787,10 +827,7 @@ impl Directory for LdapDirectory {
             "recipient": staged.recipient.map(|t| t.to_string()),
         })
         .to_string();
-        let expiration =
-            synta::GeneralizedTime::from_unix(i64::try_from(staged.not_after).unwrap_or(i64::MAX))
-                .ok_or("staging expiration is out of range")?
-                .to_string();
+        let expiration = ldap_time(staged.not_after, "staging expiration")?;
         conn.modify_s(
             &self.host_dn(fqdn),
             &[
@@ -909,22 +946,19 @@ impl Directory for LdapDirectory {
     }
 
     fn servers(&self) -> Result<Vec<String>, DirectoryError> {
-        let base = format!("cn=masters,cn=ipa,cn=etc,{}", self.cfg.basedn);
-        let entries =
-            self.service_conn()?
-                .search(&base, Scope::OneLevel, "(objectClass=*)", &["cn"])?;
-        Ok(entries
-            .into_iter()
-            .filter_map(|e| e.attrs.get("cn").and_then(|v| v.first().cloned()))
-            .collect())
+        self.masters(&mut self.service_conn()?)
     }
 
     fn topology_peers(&self, hostname: &str) -> Result<Vec<String>, DirectoryError> {
         let hostname = hostname.to_ascii_lowercase();
-        let escaped = filter_escape(&hostname);
         let base = format!("cn=topology,cn=ipa,cn=etc,{}", self.cfg.basedn);
         let filter = format!(
-            "(&(objectClass=ipaReplTopoSegment)(|(ipaReplTopoSegmentLeftNode={escaped})(ipaReplTopoSegmentRightNode={escaped})))"
+            "(&(objectClass=ipaReplTopoSegment){})",
+            or_filter(
+                &["ipaReplTopoSegmentLeftNode", "ipaReplTopoSegmentRightNode"],
+                [&hostname]
+            )
+            .unwrap_or_default()
         );
         let entries = self.service_conn()?.search(
             &base,
@@ -987,12 +1021,8 @@ impl Directory for LdapDirectory {
         // (§18.2): the server list (`cn=masters`) and, for the CA-only
         // namespaces, the enabled CA role on the caller's own entry.
         let mut conn = self.service_conn()?;
-        let base = format!("cn=masters,cn=ipa,cn=etc,{}", self.cfg.basedn);
-        let masters: Vec<String> = conn
-            .search(&base, Scope::OneLevel, "(objectClass=*)", &["cn"])?
-            .iter()
-            .filter_map(|e| e.attrs.get("cn").and_then(|v| v.first().cloned()))
-            .collect();
+        let masters = self.masters(&mut conn)?;
+        let base = self.masters_dn();
         let needs_ca = matches!(
             fetch.namespace,
             kuipa_enroll::keys::Namespace::CaWrapped | kuipa_enroll::keys::Namespace::LwcaStore
@@ -1142,7 +1172,7 @@ impl Directory for LdapDirectory {
             }
         }
         // Spent records outlive their host, but not their voucher.
-        let spent_base = format!("cn=vouchers,cn=kuipa,cn=etc,{}", self.cfg.basedn);
+        let spent_base = self.kuipa_dn("vouchers");
         let records = conn.search_if_exists(
             &spent_base,
             Scope::OneLevel,
@@ -1200,15 +1230,11 @@ impl Directory for LdapDirectory {
             "cn=KUIPA Seal Administrators,cn=privileges,cn=pbac,{}",
             self.cfg.basedn
         );
-        let members: String = std::iter::once(&entry.dn)
-            .chain(entry.attrs.get("memberof").into_iter().flatten())
-            .fold(String::new(), |mut acc, dn| {
-                acc.push_str("(member=");
-                acc.push_str(&filter_escape(dn));
-                acc.push(')');
-                acc
-            });
-        let membership = format!("(|{members})");
+        let membership = or_filter(
+            &["member"],
+            std::iter::once(&entry.dn).chain(entry.attrs.get("memberof").into_iter().flatten()),
+        )
+        .ok_or("no member DN")?;
         Ok(!conn
             .search(&privilege, Scope::Base, &membership, &["1.1"])?
             .is_empty())
@@ -1344,21 +1370,14 @@ impl Directory for LdapDirectory {
         principal: &Principal,
         groups: &[String],
     ) -> Result<Vec<Seal>, DirectoryError> {
-        let any: String = Members::matching_entries(principal, groups)
-            .iter()
-            .flat_map(|e| {
-                let e = filter_escape(e);
-                [
-                    format!("({SEAL_MANAGER_ATTR}={e})"),
-                    format!("({SEAL_MEMBER_ATTR}={e})"),
-                    format!("({SEAL_DEPOSITOR_ATTR}={e})"),
-                ]
-            })
-            .collect();
-        if any.is_empty() {
+        let entries = Members::matching_entries(principal, groups);
+        let Some(filter) = or_filter(
+            &[SEAL_MANAGER_ATTR, SEAL_MEMBER_ATTR, SEAL_DEPOSITOR_ATTR],
+            &entries,
+        ) else {
             return Ok(Vec::new());
-        }
-        self.seals_matching(&format!("(|{any})"))
+        };
+        self.seals_matching(&filter)
     }
 
     fn deposit_add(&self, deposit: &Deposit) -> Result<(), DirectoryError> {
@@ -1488,18 +1507,11 @@ impl Directory for LdapDirectory {
         principal: &Principal,
         groups: &[String],
     ) -> Result<Vec<Seal>, DirectoryError> {
-        let any = Members::matching_entries(principal, groups).iter().fold(
-            String::new(),
-            |mut any, e| {
-                use std::fmt::Write as _;
-                let _ = write!(any, "({SEAL_APPROVER_ATTR}={})", filter_escape(e));
-                any
-            },
-        );
-        if any.is_empty() {
+        let entries = Members::matching_entries(principal, groups);
+        let Some(filter) = or_filter(&[SEAL_APPROVER_ATTR], &entries) else {
             return Ok(Vec::new());
-        }
-        self.seals_matching(&format!("(|{any})"))
+        };
+        self.seals_matching(&filter)
     }
 
     fn release_add(&self, request: &ReleaseRequest) -> Result<(), DirectoryError> {
@@ -1636,7 +1648,7 @@ impl Directory for LdapDirectory {
     }
 
     fn escrow_servers(&self) -> Result<Vec<(String, tang_pqc::ExchangeKey)>, DirectoryError> {
-        let base = format!("cn=masters,cn=ipa,cn=etc,{}", self.cfg.basedn);
+        let base = self.masters_dn();
         let entries = self.service_conn()?.search(
             &base,
             Scope::OneLevel,
@@ -1667,11 +1679,7 @@ impl Directory for LdapDirectory {
         server: &str,
         key: &tang_pqc::ExchangeKey,
     ) -> Result<(), DirectoryError> {
-        let dn = format!(
-            "cn={},cn=masters,cn=ipa,cn=etc,{}",
-            dn_escape(server),
-            self.cfg.basedn
-        );
+        let dn = format!("cn={},{}", dn_escape(server), self.masters_dn());
         let value = format!(
             "{} {}",
             key.alg().id(),
@@ -1779,10 +1787,7 @@ impl Directory for LdapDirectory {
         // The KDC issues a leased host no ticket after its lease.
         let lease = lease
             .map(|end| -> Result<(String, String), DirectoryError> {
-                let expiration =
-                    synta::GeneralizedTime::from_unix(i64::try_from(end).unwrap_or(i64::MAX))
-                        .ok_or("the lease ends out of range")?
-                        .to_string();
+                let expiration = ldap_time(end, "the lease end")?;
                 Ok((expiration, end.to_string()))
             })
             .transpose()
@@ -2018,11 +2023,7 @@ impl LdapDirectory {
     }
 
     fn spent_dn(&self, spent: &str) -> String {
-        format!(
-            "cn={},cn=vouchers,cn=kuipa,cn=etc,{}",
-            dn_escape(spent),
-            self.cfg.basedn
-        )
+        format!("cn={},{}", dn_escape(spent), self.kuipa_dn("vouchers"))
     }
 
     /// Replace `partner`'s value on the trusts entry, or add it.
