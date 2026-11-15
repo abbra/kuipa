@@ -185,9 +185,6 @@ fn cached_advertisement(dir: &std::path::Path, url: &str) -> Option<(String, Vec
     Some((tag, bytes[at + 1..].to_vec()))
 }
 
-/// This process's cache writes so far, naming each one's temporary file.
-static CACHE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Keep `body`, tagged `tag`, as the advertisement for `url`: the tag on
 /// the first line, the bytes after it.  Best effort: a cache that cannot
 /// be written only costs the next fetch.
@@ -199,23 +196,11 @@ fn cache_advertisement(dir: &std::path::Path, url: &str, tag: &str, body: &[u8])
     record.extend_from_slice(tag.as_bytes());
     record.push(b'\n');
     record.extend_from_slice(body);
-    // A temporary file of this write's own, renamed into place whole: two
-    // writers at once (two kuipa runs, two threads) never mix one's tag
-    // with the other's bytes.
-    let n = CACHE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = dir.join(cache_name(url));
-    let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
-    // `create_new` (O_EXCL) never follows a link planted at the temporary name.
-    if std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, &record))
-        .and_then(|()| std::fs::rename(&tmp, &path))
-        .is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    // Renamed into place whole: two writers at once (two kuipa runs, two
+    // threads) never mix one's tag with the other's bytes.
+    let _ = crate::paths::write_atomic(&dir.join(cache_name(url)), 0o644, |f| {
+        Ok(std::io::Write::write_all(f, &record)?)
+    });
 }
 
 /// A cache file's name: the hex SHA-256 of the URL it answers, so each

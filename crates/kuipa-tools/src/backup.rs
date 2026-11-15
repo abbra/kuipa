@@ -5,8 +5,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kuipa_enroll::backup::{self, Recipient};
 use kuipa_enroll::shards::{self, Share};
@@ -15,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tang_pqc::{ExchangeKey, ExchangeKeyPair, KemAlg, Policy};
 
-use crate::paths::{Error, write_file};
+use crate::paths::{Error, write_atomic, write_file};
 use crate::seal::SealClient;
 
 /// What a host needs to seal backups: public data only.  `kuipa backup key
@@ -168,39 +167,13 @@ pub fn check(words: &[String], recovery: &[u8], file: &RecipientFile) -> Result<
     Ok(json!({ "recovery_key": file.key_id, "repaired": report }))
 }
 
-/// A sibling of `path` the stream is written to before it replaces `path`.
-fn part(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".part");
-    PathBuf::from(name)
-}
-
-/// Write what `fill` produces to `path`, mode 0600, atomically: the file
-/// appears whole or not at all.
-fn atomic(path: &Path, fill: impl FnOnce(&mut fs::File) -> Result<(), Error>) -> Result<(), Error> {
-    let tmp = part(path);
-    let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    let done = fill(&mut f).and_then(|()| Ok(f.sync_all()?));
-    if let Err(e) = done {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// Seal `input` to the recipients into the file `out`.
 ///
 /// # Errors
 ///
 /// No recipients, I/O or a crypto error; `out` is not left behind.
 pub fn seal_file(recipients: &[Recipient], input: impl Read, out: &Path) -> Result<(), Error> {
-    atomic(out, |f| {
+    write_atomic(out, 0o600, |f| {
         backup::seal_stream(recipients, backup::DEFAULT_CHUNK_LOG2, input, f).map_err(Into::into)
     })
 }
@@ -227,7 +200,7 @@ fn opened(e: kuipa_enroll::Error) -> Error {
 /// A container that is not one, one the key is not a recipient of, or one
 /// that does not authenticate; `out` is not left behind.
 pub fn open_file(key: &ExchangeKeyPair, input: impl Read, out: &Path) -> Result<(), Error> {
-    atomic(out, |f| backup::open_stream(key, input, f).map_err(opened))
+    write_atomic(out, 0o600, |f| backup::open_stream(key, input, f).map_err(opened))
 }
 
 /// Open a sealed backup into `out`, which cannot be taken back (a pipe):
@@ -257,7 +230,7 @@ mod tests {
         let sealed = dir.join("b.kuipa");
         let data = vec![7u8; 200_000];
         seal_file(&[file.recipient().unwrap()], &data[..], &sealed).unwrap();
-        assert!(!part(&sealed).exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temporary file left");
 
         let phrase = b"six honest words to open the papers";
         assert!(check(&words(&set, &[0, 2]), phrase, &file).is_ok());
@@ -281,7 +254,8 @@ mod tests {
         fs::write(&sealed, bad).unwrap();
         let out2 = dir.join("c.tar");
         assert!(open_file(&pair, fs::File::open(&sealed).unwrap(), &out2).is_err());
-        assert!(!out2.exists() && !part(&out2).exists());
+        assert!(!out2.exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "no temporary file left");
         fs::remove_dir_all(&dir).unwrap();
     }
 

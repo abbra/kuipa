@@ -213,36 +213,66 @@ impl Paths {
 /// Errors from the tools.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// `path` with `suffix` appended to its file name (`a.b` + `.c` = `a.b.c`),
+/// where `with_extension` would replace `b`.
+#[must_use]
+pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// This process's atomic writes so far, naming each one's temporary file.
+static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write what `fill` produces to `path` with `mode`, creating parent
+/// directories: the file appears whole or not at all, and a symlink at
+/// `path` is replaced, never followed.  The temporary file is this write's
+/// own, so two writers at once never mix their bytes.
+///
+/// # Errors
+///
+/// I/O errors, or those of `fill`; nothing is left behind.
+pub fn write_atomic(
+    path: &Path,
+    mode: u32,
+    fill: impl FnOnce(&mut fs::File) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = with_suffix(path, &format!(".{}.{n}.kuipa-tmp", std::process::id()));
+    // `create_new` (O_EXCL) never follows a link planted at the temporary name.
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)?;
+    let done = (|| {
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
+        fill(&mut f)?;
+        f.sync_all()?;
+        if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            fs::remove_file(path)?;
+        }
+        Ok::<(), Error>(fs::rename(&tmp, path)?)
+    })();
+    if done.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    done?;
+    tracing::debug!("wrote {} (mode {mode:o})", path.display());
+    Ok(())
+}
+
 /// Write `data` atomically with `mode`, creating parent directories.
 ///
 /// # Errors
 ///
 /// I/O errors.
 pub fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), Error> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("kuipa-tmp");
-    let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)?;
-    f.set_permissions(fs::Permissions::from_mode(mode))?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    // Replace a symlink itself, never its target.
-    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        fs::remove_file(path)?;
-    }
-    fs::rename(&tmp, path)?;
-    tracing::debug!(
-        "wrote {} ({} bytes, mode {mode:o})",
-        path.display(),
-        data.len()
-    );
-    Ok(())
+    write_atomic(path, mode, |f| Ok(f.write_all(data)?))
 }
 
 /// Remove a file if it exists.
@@ -276,9 +306,7 @@ pub enum Holder {
 /// keytab is kept sealed (§7.5).
 #[must_use]
 pub fn sealed_for(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".sealed");
-    PathBuf::from(name)
+    with_suffix(path, ".sealed")
 }
 
 /// What a [`Protected`] entry holds.

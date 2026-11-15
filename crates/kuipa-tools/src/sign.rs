@@ -21,9 +21,7 @@ use crate::paths::{self, Error, Paths, PublicState};
 /// The bundle file for `file`: `<file>.kusig`.
 #[must_use]
 pub fn bundle_path(file: &Path) -> PathBuf {
-    let mut name = file.as_os_str().to_owned();
-    name.push(".kusig");
-    PathBuf::from(name)
+    paths::with_suffix(file, ".kusig")
 }
 
 /// `kuipa sign blob`: one statement for `files` for `purpose`, by the
