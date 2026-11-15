@@ -25,12 +25,10 @@ use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use kuipa_enroll::sign::{Bundle, Digest, DigestAlg, Request};
-use kuipa_tools::paths::{Paths, PublicState};
+use kuipa_tools::paths::{Error, Paths, PublicState};
 
 const BEGIN: &str = "-----BEGIN SIGNED MESSAGE-----";
 const END: &str = "-----END SIGNED MESSAGE-----";
-
-type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Armor `bytes` the way git recognises an x509 signature.
 fn armor(bytes: &[u8]) -> String {

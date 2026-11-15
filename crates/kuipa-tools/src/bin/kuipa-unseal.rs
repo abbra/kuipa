@@ -80,18 +80,22 @@ fn write_memfd(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn unseal_one(
-    paths: &Paths,
-    sealed: &Path,
-    out: Option<Output<'_>>,
-    memfd: bool,
-) -> Result<(), Error> {
+/// Where an unsealed file goes.
+enum Dest<'a> {
+    /// The loader protocol's memfd (fd 3).
+    Memfd,
+    /// The file or standard output the caller named.
+    Out(Output<'a>),
+    /// Where `kuipa` protected it: the run copy.
+    Unsealed,
+}
+
+fn unseal_one(paths: &Paths, sealed: &Path, dest: Dest<'_>) -> Result<(), Error> {
     let bytes = flows::unseal_file(paths, sealed)?;
-    if memfd {
-        return write_memfd(bytes.as_ref());
-    }
-    if let Some(out) = out {
-        return out.write(bytes.as_ref());
+    match dest {
+        Dest::Memfd => return write_memfd(bytes.as_ref()),
+        Dest::Out(out) => return out.write(bytes.as_ref()),
+        Dest::Unsealed => {}
     }
     let state = State::load(paths)?;
     let item = state
@@ -118,7 +122,12 @@ fn run(args: &Args) -> Result<(), Error> {
             .as_deref()
             .map(|o| Output::check(o, args.force))
             .transpose()?;
-        return unseal_one(&paths, &sealed, out, args.memfd);
+        let dest = match (args.memfd, out) {
+            (true, _) => Dest::Memfd,
+            (false, Some(out)) => Dest::Out(out),
+            (false, None) => Dest::Unsealed,
+        };
+        return unseal_one(&paths, &sealed, dest);
     }
     let keytab = flows::unseal(&paths)?;
     let bytes = keytab.to_mit()?;
