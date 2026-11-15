@@ -36,7 +36,7 @@ use kuipa_tools::flows::{self, Auth, Outcome, Target};
 use kuipa_tools::net::{Endpoint, Trust};
 use kuipa_tools::passkey::soft::SoftFido2;
 use kuipa_tools::paths::{self, Paths};
-use kuipa_tools::seal::{SealClient, UserPaths};
+use kuipa_tools::seal::{Decision, OldDevice, SealClient, Session, UserPaths};
 use kuipad::http::{App, router};
 use kuipad::keystore::KeyStore;
 use kuipad::peers::{Initiator, KeytabInitiator, Peers, Settings};
@@ -812,7 +812,9 @@ fn daily_session(world: &Scenario, alice: &Alice) {
     client.add_device("daily", b"correct horse").unwrap();
     let note = client.seal("daily", b"daily note").unwrap();
     assert!(client.open(&note, None).is_err(), "no session yet");
-    let started = client.unlock("daily", b"correct horse", false).unwrap();
+    let started = client
+        .unlock("daily", b"correct horse", Session::Online)
+        .unwrap();
     assert!(started["session_until"].as_u64().is_some(), "{started}");
     assert!(SealClient::in_session(&note));
     // In the session neither the passphrase nor Alice's ticket is used:
@@ -861,7 +863,9 @@ fn offline_session(world: &Scenario, alice: &Alice) {
         client.open(&pass, Some(b"correct horse")).is_err(),
         "no session yet"
     );
-    let started = client.unlock("travel", b"correct horse", true).unwrap();
+    let started = client
+        .unlock("travel", b"correct horse", Session::Offline)
+        .unwrap();
     assert_eq!(started["offline"], true);
     assert!(SealClient::in_session(&pass));
     assert_eq!(client.open(&pass, None).unwrap().as_ref(), b"boarding pass");
@@ -1044,12 +1048,12 @@ fn break_glass(world: &Scenario, alice: &Alice) {
     let carol = SealClient::new(a, &carol_home, Some(&carol_cc));
     let pending = bob.pending(None).unwrap();
     assert_eq!(pending["requests"][0]["id"], id.as_str(), "{pending}");
-    bob.decide("alice/glass", &id, false).unwrap();
+    bob.decide("alice/glass", &id, Decision::Approve).unwrap();
     assert!(
         client.open_with(&sealed, Some(pass), Some(&id)).is_err(),
         "one of two"
     );
-    carol.decide("alice/glass", &id, false).unwrap();
+    carol.decide("alice/glass", &id, Decision::Approve).unwrap();
     assert_eq!(
         client
             .open_with(&sealed, Some(pass), Some(&id))
@@ -1100,7 +1104,7 @@ fn lost_laptop(world: &Scenario, alice: &Alice) {
     );
     // Finishing reseals to the new laptop's own device and retires the old.
     let (done, again) = on_new
-        .recover_finish(pass, std::slice::from_ref(&note), true)
+        .recover_finish(pass, std::slice::from_ref(&note), OldDevice::Retire)
         .unwrap();
     assert_eq!(done["resealed"], 1, "{done}");
     assert!(!fresh.recovered_key().exists());
@@ -1335,7 +1339,7 @@ fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
     let rq = asked["requests"][0]["id"].as_str().unwrap().to_owned();
     let bob_home = UserPaths::new(realm.dir.join("bob-helpdesk"));
     SealClient::new(a, &bob_home, Some(&alice.bob_cc))
-        .decide("carol/escrow", &rq, false)
+        .decide("carol/escrow", &rq, Decision::Approve)
         .unwrap();
     let pass: &[u8] = b"carol pass";
     carol
@@ -1353,7 +1357,7 @@ fn helpdesk_recovery(world: &Scenario, alice: &Alice) {
         b"door=4711"
     );
     let (_, again) = new
-        .recover_finish(b"new pass", std::slice::from_ref(&note), true)
+        .recover_finish(b"new pass", std::slice::from_ref(&note), OldDevice::Retire)
         .unwrap();
     assert_eq!(
         new.open(&again[0], Some(b"new pass")).unwrap().as_ref(),
@@ -1451,7 +1455,7 @@ fn paper_keys(world: &Scenario, alice: &Alice) {
     // Finishing moves the files to the new desk's own device and retires
     // the old one.
     let (done, again) = on_new
-        .recover_finish(pass, std::slice::from_ref(&note), true)
+        .recover_finish(pass, std::slice::from_ref(&note), OldDevice::Retire)
         .unwrap();
     assert_eq!(done["resealed"], 1, "{done}");
     assert_eq!(
@@ -1614,7 +1618,7 @@ fn passkeys(world: &Scenario, alice: &Alice) {
         .insert(me.clone(), vec![ml_dsa.clone()]);
     // A session starts with the passkey, then stands in for it: only the
     // session's own start touches the key.
-    client.unlock("pk", b"4321", false).unwrap();
+    client.unlock("pk", b"4321", Session::Online).unwrap();
     let touched = key.touches();
     assert!(!client.needs_passkey(&note));
     assert_eq!(

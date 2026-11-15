@@ -2014,10 +2014,7 @@ fn render_tlog(value: &Value) {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     if value.get("seal").is_none() {
         // `kuipa tlog witnesses`
-        let list = value["witnesses"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let list = value["witnesses"].as_array().cloned().unwrap_or_default();
         for w in &list {
             println!("witness {}", text(w));
         }
@@ -2135,10 +2132,7 @@ fn pending_rows(value: &Value, done: &str) {
         indent: 2,
         ..Rows::default()
     };
-    rows.until(
-        "the staged bundle is usable until",
-        &pending["not_after"],
-    );
+    rows.until("the staged bundle is usable until", &pending["not_after"]);
     rows.print();
     println!("{:>2}deferred steps:", "");
     items(&pending["steps"], "    ");
@@ -2152,9 +2146,7 @@ fn render_enroll(value: &Value, paths: &Paths) {
         "Enrolled {} in {}: its keys, the realm's anchors, CA and Kerberos configuration all taken from {}'s verified advertisement.",
         summary["principal"].as_str().unwrap_or("this host"),
         summary["realm"].as_str().unwrap_or(""),
-        summary["issuer"]
-            .as_str()
-            .unwrap_or("the issuing server")
+        summary["issuer"].as_str().unwrap_or("the issuing server")
     );
     let mut rows = Rows::default();
     identity_rows(&mut rows, summary);
@@ -2228,10 +2220,7 @@ fn render_advertisement(value: &Value, paths: &Paths) {
         println!();
         let server = s["server"].as_str().unwrap_or("server");
         if s["ok"] == Value::Bool(false) {
-            println!(
-                "{server}: {}",
-                s["error"].as_str().unwrap_or("unusable")
-            );
+            println!("{server}: {}", s["error"].as_str().unwrap_or("unusable"));
             continue;
         }
         let mut rows = Rows::default();
@@ -2260,10 +2249,7 @@ fn render_advertisement(value: &Value, paths: &Paths) {
                     .filter_map(Value::as_str)
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!(
-                    "{} (anchors: {anchors})",
-                    t["realm"].as_str().unwrap_or("")
-                )
+                format!("{} (anchors: {anchors})", t["realm"].as_str().unwrap_or(""))
             })
             .collect::<Vec<_>>()
             .join("; ");
@@ -2532,9 +2518,7 @@ fn render_complete(value: &Value) {
 fn render_rotated(value: &Value, what: &str) {
     println!(
         "{what}, issued by {}:",
-        value["issuer"]
-            .as_str()
-            .unwrap_or("the issuing server")
+        value["issuer"].as_str().unwrap_or("the issuing server")
     );
     let mut rows = Rows::default();
     identity_rows(&mut rows, value);
@@ -2560,9 +2544,7 @@ fn render_protect(value: &Value) {
     let rotated = &value["rotated"];
     println!(
         "Keys reissued before sealing, issued by {}:",
-        rotated["issuer"]
-            .as_str()
-            .unwrap_or("the issuing server")
+        rotated["issuer"].as_str().unwrap_or("the issuing server")
     );
     let mut rows = Rows::default();
     identity_rows(&mut rows, rotated);
@@ -3081,7 +3063,15 @@ fn run_recover(
                 .iter()
                 .map(std::fs::read)
                 .collect::<Result<Vec<_>, _>>()?;
-            let (value, again) = client.recover_finish(pass.as_ref(), &files, *retire_old)?;
+            let (value, again) = client.recover_finish(
+                pass.as_ref(),
+                &files,
+                if *retire_old {
+                    kuipa_tools::seal::OldDevice::Retire
+                } else {
+                    kuipa_tools::seal::OldDevice::Keep
+                },
+            )?;
             for (path, bytes) in sealed.iter().zip(again) {
                 paths::write_file(std::path::Path::new(path), &bytes, 0o600)?;
             }
@@ -3185,7 +3175,8 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             let needed = client.seal_needs_passkey(seal);
             let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
             for path in sealed {
-                let again = client.reseal(seal, &kuipa_tools::paths::read(path)?, Some(pass.as_ref()))?;
+                let again =
+                    client.reseal(seal, &kuipa_tools::paths::read(path)?, Some(pass.as_ref()))?;
                 paths::write_file(std::path::Path::new(path), &again, 0o600)?;
             }
             Ok(serde_json::json!({ "seal": seal, "resealed": sealed }))
@@ -3199,7 +3190,15 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             let pass = passphrase(passphrase_file.as_deref(), false)?;
             let needed = client.seal_needs_passkey(seal);
             let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
-            client.unlock(seal, pass.as_ref(), *offline)
+            client.unlock(
+                seal,
+                pass.as_ref(),
+                if *offline {
+                    kuipa_tools::seal::Session::Offline
+                } else {
+                    kuipa_tools::seal::Session::Online
+                },
+            )
         }
         SealCommand::Lock { seal } => client.lock(seal),
         SealCommand::Retire { seal, sealed } => {
@@ -3218,8 +3217,12 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             client.recovery_code(passphrase(passphrase_file.as_deref(), false)?.as_ref())
         }
         SealCommand::Recover { action } => run_recover(&client, &user, action),
-        SealCommand::Approve { seal, id } => client.decide(seal, id, false),
-        SealCommand::Deny { seal, id } => client.decide(seal, id, true),
+        SealCommand::Approve { seal, id } => {
+            client.decide(seal, id, kuipa_tools::seal::Decision::Approve)
+        }
+        SealCommand::Deny { seal, id } => {
+            client.decide(seal, id, kuipa_tools::seal::Decision::Deny)
+        }
         SealCommand::Show { seal } => client.show(seal),
         SealCommand::List => client.list(),
         SealCommand::RecoveryShards { action } => run_recovery_shards(&client, action),
@@ -3444,10 +3447,7 @@ fn render_seal(value: &Value) {
             rows.until("expires", &policy["not_after"]);
             rows.field("unlocks so far", &v["unlocks"]);
             rows.field("unlocks allowed", &policy["max_unlocks"]);
-            rows.field(
-                "longest session (seconds)",
-                &policy["sessions"]["reauth"],
-            );
+            rows.field("longest session (seconds)", &policy["sessions"]["reauth"]);
             rows.field("delegated tickets", &policy["ticket_delegation"]);
             if policy["ticket_leased"] == true {
                 rows.field("tickets", &Value::from("of leased hosts only"));

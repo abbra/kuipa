@@ -528,6 +528,34 @@ struct TokenConfig {
     uri: String,
 }
 
+/// What `kuipa seal approve` or `deny` does with a release request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Approve it.
+    Approve,
+    /// Deny it.
+    Deny,
+}
+
+/// Which kind of re-authentication session `kuipa seal unlock` starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Session {
+    /// Ordinary: files open through the server.
+    Online,
+    /// Offline: the seal's released epoch keys are kept for opening without
+    /// a server.
+    Offline,
+}
+
+/// What `recover finish` does with the device it recovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OldDevice {
+    /// Leave it in its seals.
+    Keep,
+    /// Also remove it from them.
+    Retire,
+}
+
 /// This host's device key: a passphrase-protected file, or a token.
 enum HostDevice {
     File(ExchangeKeyPair),
@@ -535,6 +563,16 @@ enum HostDevice {
 }
 
 impl HostDevice {
+    /// The key file's key, for what only a file key can do (`what`).
+    fn into_file(self, what: &str) -> Result<ExchangeKeyPair, Error> {
+        match self {
+            Self::File(key) => Ok(key),
+            Self::Token(_) => {
+                Err(format!("a token's key never leaves the token: it has no {what}").into())
+            }
+        }
+    }
+
     fn public(&self) -> &tang_pqc::ExchangeKey {
         match self {
             Self::File(k) => k.public(),
@@ -673,7 +711,11 @@ impl<'a> SealClient<'a> {
     /// one as the host itself, with a ticket from that keytab and the kuipa
     /// directory `user` (`kuipa escrow`, run as root).
     #[must_use]
-    pub(crate) fn for_keytab(host: &'a Paths, user: &'a UserPaths, keytab: Option<&'a Path>) -> Self {
+    pub(crate) fn for_keytab(
+        host: &'a Paths,
+        user: &'a UserPaths,
+        keytab: Option<&'a Path>,
+    ) -> Self {
         Self {
             host,
             user,
@@ -770,7 +812,8 @@ impl<'a> SealClient<'a> {
     ///
     /// A wrong passphrase, a policy without sessions, no runtime
     /// directory, or any other error.
-    pub fn unlock(&self, name: &str, passphrase: &[u8], offline: bool) -> Result<Value, Error> {
+    pub fn unlock(&self, name: &str, passphrase: &[u8], session: Session) -> Result<Value, Error> {
+        let offline = session == Session::Offline;
         let key = self.user.device(passphrase, self.authenticator)?;
         // A session stands in for the passkey: starting one takes it, over
         // this exchange's challenge.
@@ -1781,8 +1824,8 @@ impl<'a> SealClient<'a> {
     /// # Errors
     ///
     /// A refusal or any other error.
-    pub fn decide(&self, name: &str, id: &str, deny: bool) -> Result<Value, Error> {
-        let op = if deny {
+    pub fn decide(&self, name: &str, id: &str, decision: Decision) -> Result<Value, Error> {
+        let op = if decision == Decision::Deny {
             SealOp::Deny {
                 name: name.into(),
                 id: id.into(),
@@ -1811,9 +1854,10 @@ impl<'a> SealClient<'a> {
         if self.user.token().is_some() {
             return Err("a token's key never leaves the token: it has no recovery code".into());
         }
-        let HostDevice::File(key) = self.user.device(passphrase, self.authenticator)? else {
-            return Err("a token's key never leaves the token: it has no recovery code".into());
-        };
+        let key = self
+            .user
+            .device(passphrase, self.authenticator)?
+            .into_file("recovery code")?;
         let code = new_recovery_code()?;
         let blob = protect_key(&key, recovery_secret(&code)?.as_ref())?;
         let device = key.public().kid().to_string();
@@ -1876,9 +1920,10 @@ impl<'a> SealClient<'a> {
         threshold: u8,
         shares: u8,
     ) -> Result<Value, Error> {
-        let HostDevice::File(key) = self.user.device(device, self.authenticator)? else {
-            return Err("a token's key never leaves the token: it has no shards".into());
-        };
+        let key = self
+            .user
+            .device(device, self.authenticator)?
+            .into_file("shards")?;
         let mut seed = [0u8; 32];
         Rand::fill_private(&mut seed)?;
         let params = shards::SetParams::new(threshold, shares, false);
@@ -1897,8 +1942,7 @@ impl<'a> SealClient<'a> {
             public: pair.public().to_jwk_json(),
         };
         let device = key.public().kid().to_string();
-        let blob =
-            kuipa_enroll::seal::seal_delivery(pair.public(), &key)?;
+        let blob = kuipa_enroll::seal::seal_delivery(pair.public(), &key)?;
         self.op_with_session(&SealOp::EscrowShards {
             registration: registration.clone(),
             blobs: vec![(device.clone(), tang_pqc::b64::encode(&blob))],
@@ -1930,9 +1974,10 @@ impl<'a> SealClient<'a> {
     ///
     /// A token's key, no registered set, a refusal.
     pub fn recovery_shards_enroll(&self, passphrase: &[u8]) -> Result<Value, Error> {
-        let HostDevice::File(key) = self.user.device(passphrase, self.authenticator)? else {
-            return Err("a token's key never leaves the token: it has no shards".into());
-        };
+        let key = self
+            .user
+            .device(passphrase, self.authenticator)?
+            .into_file("shards")?;
         let rows = self.op_with_session(&SealOp::RecoverShards)?.reply.escrows;
         let registration = registration_of(&rows).ok_or("no recovery shard set is registered")?;
         let public = tang_pqc::ExchangeKey::from_jwk_json(registration.public.as_bytes())?;
@@ -2107,8 +2152,9 @@ impl<'a> SealClient<'a> {
         &self,
         passphrase: &[u8],
         sealed: &[Vec<u8>],
-        retire_old: bool,
+        old_device: OldDevice,
     ) -> Result<(Value, Vec<Vec<u8>>), Error> {
+        let retire_old = old_device == OldDevice::Retire;
         let old = self
             .user
             .recovered(passphrase, self.authenticator)?
