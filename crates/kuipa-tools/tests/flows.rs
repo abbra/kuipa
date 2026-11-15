@@ -2943,10 +2943,7 @@ fn audit_reports_coverage_and_split_views() {
     let pin = *anchor.public().thumbprint();
     let (keys, _, mut delegation) = server_keys(&anchor, "audit1.example.test");
     let signing = SigningKey::from_jwk(keys.signing.to_jwk().unwrap().as_ref()).unwrap();
-    let info = RealmInfo {
-        servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
-        ..info_for("audit1.example.test", &anchor)
-    };
+    let info = audit_info_of(&anchor);
     let claim = delegation.claim().unwrap();
     let v1 = SignedVouch::issue(
         &anchor,
@@ -3032,10 +3029,7 @@ fn audit_reports_coverage_and_split_views() {
             vouchers: Vec::new(),
             retired: Vec::new(),
         },
-        RealmInfo {
-            servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
-            ..info_for("audit1.example.test", &anchor)
-        },
+        audit_info_of(&anchor),
         forked,
     ));
     server2.publish(delegation.clone(), vec![pin], forked_vouches);
@@ -3087,6 +3081,14 @@ fn info_named(server: &str, anchors: &[tang_pqc::Thumbprint]) -> RealmInfo {
         heads: Vec::new(),
         trusts: Vec::new(),
         kdc_proxy: None,
+    }
+}
+
+/// The realm info of two audited servers.
+fn audit_info_of(anchor: &SigningKey) -> RealmInfo {
+    RealmInfo {
+        servers: vec!["audit1.example.test".into(), "audit2.example.test".into()],
+        ..info_for("audit1.example.test", anchor)
     }
 }
 

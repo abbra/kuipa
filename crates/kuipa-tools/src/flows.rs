@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use kuipa_enroll::Enrollment;
@@ -100,6 +101,10 @@ impl Outcome {
 
 pub(crate) fn now() -> SystemTime {
     SystemTime::now()
+}
+
+fn now_secs() -> u64 {
+    unix_seconds(now())
 }
 
 /// The host's FQDN from the kernel.
@@ -422,8 +427,8 @@ fn watermark_after(
 
 fn trace_advertisement(server: &str, adv: &VerifiedRealm) {
     let info = adv.info();
-    let days = adv.delegation_expires().saturating_sub(unix_seconds(now())) / 86400;
-    let vouch_days = adv.vouched_until().saturating_sub(unix_seconds(now())) / 86400;
+    let days = adv.delegation_expires().saturating_sub(now_secs()) / 86400;
+    let vouch_days = adv.vouched_until().saturating_sub(now_secs()) / 86400;
     tracing::debug!(
         server = %server,
         "advertisement verified: {} of {}, signed by {}, delegation by anchor {} (claim: {days} days left, vouch: {vouch_days} days left)",
@@ -797,7 +802,7 @@ fn armoured_ticket(
     let dir = std::env::temp_dir().join(format!(
         "kuipa-kinit-{}-{}-{seq}",
         std::process::id(),
-        unix_seconds(now())
+        now_secs()
     ));
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let result = (|| {
@@ -840,7 +845,7 @@ fn armoured_ticket(
 ///
 /// The string has expired.
 pub fn check_string(string: &EnrollmentString) -> Result<(), Error> {
-    let now = unix_seconds(now());
+    let now = now_secs();
     string.check_valid(now).map_err(|_| {
         let days = now.saturating_sub(string.exp()) / 86400;
         format!(
@@ -1105,7 +1110,7 @@ pub fn enroll_bundle(
     if expected_fqdn.is_some_and(|f| f != fqdn) {
         return Err(format!("bundle is for {fqdn}").into());
     }
-    if verified.bundle().not_after() < unix_seconds(now()) {
+    if verified.bundle().not_after() < now_secs() {
         return Err(Outcome::NeedsAdmin(format!(
             "bundle for {fqdn} expired; stage the host again"
         ))
@@ -1153,12 +1158,9 @@ pub fn enroll_bundle(
 /// or without one from this host's live keytab, for the host's principal.
 /// The credential comes from GSS-API (`client_keytab` in the credential
 /// store): this process does not read the keytab, so gssproxy can hold it.
-pub(crate) fn keytab_cred(
-    paths: &Paths,
-    keytab: Option<&std::path::Path>,
-) -> Result<GssClientCred, Error> {
+pub(crate) fn keytab_cred(paths: &Paths, keytab: Option<&Path>) -> Result<GssClientCred, Error> {
     let state = State::load(paths)?;
-    let path = keytab.map_or_else(|| live_keytab(paths, &state), std::path::Path::to_path_buf);
+    let path = keytab.map_or_else(|| live_keytab(paths, &state), Path::to_path_buf);
     let cred = GssClientCred::from_client_keytab(
         path.to_str().ok_or("non-UTF-8 keytab path")?,
         None,
@@ -1178,7 +1180,7 @@ pub(crate) fn keytab_cred(
     Ok(cred)
 }
 
-fn live_keytab(paths: &Paths, state: &State) -> std::path::PathBuf {
+fn live_keytab(paths: &Paths, state: &State) -> PathBuf {
     match state.holder {
         Holder::None => paths.keytab(),
         Holder::File => paths.run_keytab(),
@@ -1468,7 +1470,7 @@ pub(crate) fn all_servers(
 /// The TPM share of the protected sealed object at `sealed`, if it has one.
 /// A seal that is gone or unreadable is an error: reading it as "no TPM
 /// factor" would reseal with a weaker policy.
-fn existing_tpm(sealed: &std::path::Path) -> Result<Option<kuipa_enroll::escrow::TpmShare>, Error> {
+fn existing_tpm(sealed: &Path) -> Result<Option<kuipa_enroll::escrow::TpmShare>, Error> {
     let bytes = fs::read(sealed).map_err(|e| {
         format!(
             "{}: {e} (the seal that sets the TPM factor is needed to reseal; \
@@ -1710,7 +1712,7 @@ pub fn unseal(paths: &Paths) -> Result<Keytab, Error> {
 ///
 /// [`Outcome::RetryLater`] if no server could unseal it, a plain error if
 /// this host's TPM does not open its share, or a malformed file.
-pub fn unseal_file(paths: &Paths, sealed: &std::path::Path) -> Result<SecretBuf, Error> {
+pub fn unseal_file(paths: &Paths, sealed: &Path) -> Result<SecretBuf, Error> {
     let what = sealed.display().to_string();
     let sealed = Sealed::from_bytes(&paths::read(sealed)?)?;
     let share = open_tpm_share(&sealed, &what)?;
@@ -1781,14 +1783,14 @@ pub enum Target {
     Host,
     /// Another keytab, a service's or a user's, sealed for its own
     /// principal (§7.5).
-    Keytab(std::path::PathBuf),
+    Keytab(PathBuf),
     /// Any file, sealed for the principal of `keytab` (default: the host
     /// keytab), whose keys authenticate its registrations (§7.5).
     File {
         /// The file.
-        path: std::path::PathBuf,
+        path: PathBuf,
         /// The keytab of the principal to seal it for.
-        keytab: Option<std::path::PathBuf>,
+        keytab: Option<PathBuf>,
     },
 }
 
@@ -1920,9 +1922,7 @@ fn kind_of(contents: Contents) -> Kind {
 
 /// The bindings of the seal in `sealed`, to retire; none if it is gone or
 /// unreadable.
-fn sealed_bindings(
-    sealed: &std::path::Path,
-) -> Result<Vec<kuipa_enroll::escrow::BindingHash>, Error> {
+fn sealed_bindings(sealed: &Path) -> Result<Vec<kuipa_enroll::escrow::BindingHash>, Error> {
     Ok(fs::read(sealed)
         .ok()
         .and_then(|b| Sealed::from_bytes(&b).ok())
@@ -1933,13 +1933,13 @@ fn sealed_bindings(
 
 /// `path` made absolute without resolving symlinks: a protected path is
 /// one.
-fn absolute(path: &std::path::Path) -> Result<std::path::PathBuf, Error> {
+fn absolute(path: &Path) -> Result<PathBuf, Error> {
     Ok(std::path::absolute(path)?)
 }
 
 /// Is `path` the host keytab (or, once protected, its unsealed copy)?
-fn is_host_keytab(paths: &Paths, path: &std::path::Path) -> bool {
-    let same = |a: &std::path::Path, b: &std::path::Path| {
+fn is_host_keytab(paths: &Paths, path: &Path) -> bool {
+    let same = |a: &Path, b: &Path| {
         a == b || fs::canonicalize(a).is_ok_and(|a| fs::canonicalize(b).is_ok_and(|b| a == b))
     };
     same(path, &paths.keytab()) || same(path, &paths.run_keytab())
@@ -1950,7 +1950,7 @@ fn is_host_keytab(paths: &Paths, path: &std::path::Path) -> bool {
 fn register(
     paths: &Paths,
     state: &State,
-    keytab: &std::path::Path,
+    keytab: &Path,
     params: &RegisterParams,
     bindings: &[kuipa_enroll::escrow::BindingHash],
 ) -> Result<String, Error> {
@@ -2007,7 +2007,7 @@ fn with_tpm_factor(
     sealer: Sealer,
     tpm: Option<&str>,
     resealing: bool,
-    current: &std::path::Path,
+    current: &Path,
 ) -> Result<Sealer, Error> {
     let pcrs = match (tpm, resealing) {
         (Some(p), _) => Some(p.to_owned()),
@@ -2029,8 +2029,8 @@ fn with_tpm_factor(
 fn protect_other(
     paths: &Paths,
     contents: Contents,
-    path: &std::path::Path,
-    keytab: Option<&std::path::Path>,
+    path: &Path,
+    keytab: Option<&Path>,
     tpm: Option<&str>,
 ) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
@@ -2167,7 +2167,7 @@ fn unprotect_host(paths: &Paths) -> Result<Value, Error> {
     Ok(json!({ "holder": "none" }))
 }
 
-fn unprotect_other(paths: &Paths, path: &std::path::Path) -> Result<Value, Error> {
+fn unprotect_other(paths: &Paths, path: &Path) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
     let path = absolute(path)?;
     let i = state
@@ -2275,11 +2275,11 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
 /// (§4.9) — so the half-life warning does not apply to it.
 fn server_health(server: &str, adv: &VerifiedRealm) -> (Vec<String>, Value) {
     let mut problems = Vec::new();
-    let days = adv.delegation_expires().saturating_sub(unix_seconds(now())) / 86400;
+    let days = adv.delegation_expires().saturating_sub(now_secs()) / 86400;
     let vouch_hours = adv
         .head_anchor()
         .is_none()
-        .then(|| adv.vouched_until().saturating_sub(unix_seconds(now())) / 3600);
+        .then(|| adv.vouched_until().saturating_sub(now_secs()) / 3600);
     if days < 14 {
         problems.push(format!("{server}: its claim expires in {days} days: the server renews it itself, so check its anchor exchange"));
     }
@@ -2557,7 +2557,7 @@ pub fn advertisements(
         match detail {
             Ok(value) => servers.push(value),
             Err(e) => {
-                servers.push(json!({ "server": server, "ok": false, "error": e.to_string() }))
+                servers.push(json!({ "server": server, "ok": false, "error": e.to_string() }));
             }
         }
     }
@@ -2697,7 +2697,7 @@ fn advertisement_detail(
 ) -> Result<Value, Error> {
     let landmarks = landmark_chain(endpoint, adv, realm, anchors)?;
     let info = adv.info();
-    let now = unix_seconds(now());
+    let now = now_secs();
     let kid = |k: Result<&tang_pqc::ExchangeKey, _>| {
         k.map_or_else(|_| "-".into(), |k| k.kid().to_string())
     };
@@ -2825,7 +2825,7 @@ pub fn realm_info(
     anchors: &[Thumbprint],
     heads: &[HeadPin],
     deployment: &Deployment,
-    dir: &std::path::Path,
+    dir: &Path,
 ) -> Result<Value, Error> {
     realm_info_with(deployment, dir, |server| {
         // Before enrollment: the heads come from the enrollment string,
@@ -2855,10 +2855,7 @@ pub fn realm_info(
 /// # Errors
 ///
 /// As [`realm_info`].
-pub fn realm_info_first_use(
-    deployment: &Deployment,
-    dir: &std::path::Path,
-) -> Result<Value, Error> {
+pub fn realm_info_first_use(deployment: &Deployment, dir: &Path) -> Result<Value, Error> {
     realm_info_with(deployment, dir, |server| {
         let (realm, anchors) = first_use_anchors(server)?;
         verified(
@@ -2994,7 +2991,7 @@ fn first_use_anchors(server: &str) -> Result<(String, Vec<Thumbprint>), Error> {
 /// configuration into `dir`; `verify` checks one server's advertisement.
 fn realm_info_with(
     deployment: &Deployment,
-    dir: &std::path::Path,
+    dir: &Path,
     verify: impl Fn(&str) -> Result<VerifiedRealm, Error>,
 ) -> Result<Value, Error> {
     let mut skipped = Vec::new();
@@ -3038,7 +3035,7 @@ fn trust_kdc_proxy<'a>(t: &'a TrustedRealm, adv: &'a VerifiedRealm) -> Option<&'
 
 /// The lock file of a realm's trust installation: a sibling of its
 /// install directory, so the directory stays removable.
-fn trust_lock_file(paths: &Paths, realm: &str) -> std::path::PathBuf {
+fn trust_lock_file(paths: &Paths, realm: &str) -> PathBuf {
     paths
         .trust_dir(realm)
         .with_file_name(format!("{realm}.kuipa-lock"))

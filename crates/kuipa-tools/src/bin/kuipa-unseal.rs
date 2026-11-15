@@ -81,6 +81,7 @@ fn write_memfd(bytes: &[u8]) -> Result<(), Error> {
 }
 
 /// Where an unsealed file goes.
+#[derive(Clone, Copy)]
 enum Dest<'a> {
     /// The loader protocol's memfd (fd 3).
     Memfd,
