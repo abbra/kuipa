@@ -2022,7 +2022,7 @@ impl EnrollServer {
         }
         let token = body.authenticator.as_ref();
         let binding = directory.register_with_gss(&params, &body.registrations, token, &call.cb)?;
-        Ok(call.reply(&binding, &params.acknowledgement())?)
+        call.reply(&binding, &params.acknowledgement())
     }
 
     /// Answer a seal operation (§7.6): authenticate the caller by their
@@ -2304,7 +2304,7 @@ impl EnrollServer {
             receipts,
             ..side
         };
-        Ok(call.reply(&binding, &reply.to_bytes()?)?)
+        call.reply(&binding, &reply.to_bytes()?)
     }
 
     /// Refuse a caller that is neither of this realm nor a user of a trusted
@@ -2416,7 +2416,7 @@ impl EnrollServer {
         )?;
         let answer = crate::keys::KeysAnswer { value };
         let payload = answer.to_bytes()?;
-        Ok(call.reply(&binding, &payload)?)
+        call.reply(&binding, &payload)
     }
 
     /// Answer a signing request (`DESIGN-sign.md`): authenticate the
@@ -2478,7 +2478,7 @@ impl EnrollServer {
         let signed =
             crate::sign::SignedStatement::sign(&self.keys.signing, &self.delegation(), statement)?;
         let answer = crate::sign::Answer::new(&asked, signed)?;
-        Ok(call.reply(&binding, &answer.to_bytes())?)
+        call.reply(&binding, &answer.to_bytes())
     }
 
     /// Answer a pins refresh (§4.5): this realm's anchors and their heads,
@@ -2497,7 +2497,7 @@ impl EnrollServer {
             heads,
         };
         let bytes = answer.to_bytes()?;
-        Ok(call.reply(&binding, &bytes)?)
+        call.reply(&binding, &bytes)
     }
 
     /// Answer a `tlog` lookup (`DESIGN-tlog.md` §6): the caller's own
@@ -2541,7 +2541,7 @@ impl EnrollServer {
             head,
             entries,
         };
-        Ok(call.reply(&binding, &answer.to_bytes())?)
+        call.reply(&binding, &answer.to_bytes())
     }
 
     /// Every server's escrow key, this one's own current key included
