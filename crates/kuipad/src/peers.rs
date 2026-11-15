@@ -1430,15 +1430,18 @@ impl Exchange {
                 .await
                 .map_err(failed)?
                 .map_err(failed)?;
-            let own_bytes = own_attached
-                .value
-                .as_ref()
-                .map_or(0, |o| o.0.to_json().len());
-            let chain_bytes: usize = chain_attached
-                .value
-                .as_ref()
-                .map_or(0, |c| c.0.iter().map(Vec::len).sum());
-            let token_bytes = token.len();
+            // A full JSON serialization: only when sizes are being logged.
+            let sizes = measure.then(|| {
+                let own_bytes = own_attached
+                    .value
+                    .as_ref()
+                    .map_or(0, |o| o.0.to_json().len());
+                let chain_bytes: usize = chain_attached
+                    .value
+                    .as_ref()
+                    .map_or(0, |c| c.0.iter().map(Vec::len).sum());
+                (own_bytes, chain_bytes, token.len())
+            });
             let body = PeerSync {
                 sender: me.clone(),
                 receiver: target.clone(),
@@ -1459,7 +1462,9 @@ impl Exchange {
                 Ok(response) => {
                     self.own_sent.delivered(&target, own_hash);
                     self.chain_sent.delivered(&target, chain_hash);
-                    if let Some(started) = started {
+                    if let (Some(started), Some((own_bytes, chain_bytes, token_bytes))) =
+                        (started, sizes)
+                    {
                         eprintln!(
                             "kuipad: peer sync size: peer={peer} request={request_bytes} payload={payload_bytes} delegation={own_bytes} token={token_bytes} epochs={chain_bytes} response={} elapsed_ms={}",
                             response.len(),
