@@ -103,6 +103,7 @@
 //! another error, 2 usage.
 
 use std::io::{IsTerminal, Read};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -385,7 +386,7 @@ enum BackupAction {
         file: std::path::PathBuf,
         /// Where to write it (`-` for standard output).
         #[arg(long, short, value_name = "FILE")]
-        out: String,
+        out: PathBuf,
         /// With `--out -`, write to standard output even when it is a
         /// terminal.
         #[arg(long)]
@@ -498,7 +499,7 @@ enum KeysAction {
         alg: Option<String>,
         /// Write the value to a file (mode 0600) instead of standard output.
         #[arg(long, value_name = "FILE", default_value = "-")]
-        out: String,
+        out: PathBuf,
         /// With `--out -`, write to standard output even when it is a
         /// terminal.
         #[arg(long)]
@@ -581,10 +582,10 @@ enum SealCommand {
     /// Open a sealed file.
     Open {
         /// The sealed file.
-        sealed: String,
+        sealed: PathBuf,
         /// Where to write the plaintext: a file, or `-` for standard output.
         #[arg(long, value_name = "FILE")]
-        out: String,
+        out: PathBuf,
         /// With `--out -`, write to standard output even when it is a
         /// terminal.
         #[arg(long)]
@@ -623,7 +624,7 @@ enum SealCommand {
         /// The seal.
         seal: String,
         /// The sealed file.
-        sealed: String,
+        sealed: PathBuf,
         /// Why, for the approvers.
         #[arg(long, value_name = "TEXT")]
         reason: String,
@@ -654,7 +655,7 @@ enum SealCommand {
         /// The seal.
         seal: String,
         /// The sealed files, rewritten in place.
-        sealed: Vec<String>,
+        sealed: Vec<PathBuf>,
         #[command(flatten)]
         pw: DevicePass,
         /// Read the PIN of the security key holding your IPA passkey from
@@ -689,7 +690,7 @@ enum SealCommand {
         /// The seal.
         seal: String,
         /// The sealed files.
-        sealed: Vec<String>,
+        sealed: Vec<PathBuf>,
     },
     /// Describe a seal.
     Show {
@@ -819,7 +820,7 @@ enum DepositAction {
         id: String,
         /// Where to write the sealed file.
         #[arg(long, value_name = "FILE")]
-        out: String,
+        out: PathBuf,
     },
     /// Remove a deposit: your own, or any as a manager.
     Retire {
@@ -876,7 +877,7 @@ enum RecoverAction {
     /// recovered device.
     Finish {
         /// Sealed files, rewritten in place.
-        sealed: Vec<String>,
+        sealed: Vec<PathBuf>,
         /// Remove the recovered device from your seals and forget it here:
         /// files not resealed now stop opening.
         #[arg(long)]
@@ -1017,7 +1018,7 @@ enum DeviceAction {
             requires = "pkcs11",
             default_value = "/usr/lib64/p11-kit-proxy.so"
         )]
-        module: String,
+        module: PathBuf,
     },
     /// Remove a device from a seal.
     Remove {
@@ -1029,6 +1030,44 @@ enum DeviceAction {
     },
 }
 
+/// A factor named by `--require`.
+#[derive(Clone)]
+enum Factor {
+    Device(kuipa_enroll::seal::Level),
+    Ticket,
+    Passkey,
+}
+
+impl std::str::FromStr for Factor {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        use kuipa_enroll::seal::Level;
+        match s.trim() {
+            "device" | "device=any" => Ok(Self::Device(Level::Any)),
+            "device=hardware-wrapped" => Ok(Self::Device(Level::HardwareWrapped)),
+            "device=hardware-bound" => Ok(Self::Device(Level::HardwareBound)),
+            "ticket" => Ok(Self::Ticket),
+            "passkey" => Ok(Self::Passkey),
+            other => Err(format!("unknown factor {other:?}")),
+        }
+    }
+}
+
+/// `--ticket-delegation`.
+#[derive(Clone, clap::ValueEnum)]
+enum Delegation {
+    Allow,
+    Refuse,
+}
+
+/// `--sealing`.
+#[derive(Clone, clap::ValueEnum)]
+enum Sealing {
+    Offline,
+    Registered,
+}
+
 /// A seal policy on the command line.
 #[derive(clap::Args)]
 struct PolicyInput {
@@ -1036,13 +1075,13 @@ struct PolicyInput {
     /// `device=hardware-wrapped`, `device=hardware-bound`), `ticket`;
     /// comma-separated or repeated.
     #[arg(long, value_name = "FACTORS", value_delimiter = ',', required = true)]
-    require: Vec<String>,
+    require: Vec<Factor>,
     /// How many days the seal lives (default: the realm's limit).
     #[arg(long, value_name = "DAYS")]
     expires: Option<u64>,
     /// Which delegated tickets satisfy `ticket`: `allow` or `refuse`.
     #[arg(long, value_name = "allow|refuse", conflicts_with = "ticket_via")]
-    ticket_delegation: Option<String>,
+    ticket_delegation: Option<Delegation>,
     /// Accept delegated tickets only through these services.
     #[arg(long, value_name = "SERVICE")]
     ticket_via: Vec<String>,
@@ -1066,7 +1105,7 @@ struct PolicyInput {
     /// `registered`: sealing needs a server, and resealing or `kuipa seal
     /// retire` makes old copies unopenable (default: `offline`).
     #[arg(long, value_name = "offline|registered")]
-    sealing: Option<String>,
+    sealing: Option<Sealing>,
     /// Releases need this many approvals (`kuipa seal approve`) from the
     /// approvers, besides the factors.
     #[arg(long, value_name = "M")]
@@ -1107,28 +1146,19 @@ impl PolicyInput {
     }
 
     fn policy(&self) -> Result<kuipa_enroll::seal::Policy, Error> {
-        use kuipa_enroll::seal::{Factors, Level, Policy, TicketDelegation};
+        use kuipa_enroll::seal::{Factors, Policy, TicketDelegation};
         let mut factors = Factors::default();
         for f in &self.require {
-            match f.trim() {
-                "device" | "device=any" => factors.device = Some(Level::Any),
-                "device=hardware-wrapped" => factors.device = Some(Level::HardwareWrapped),
-                "device=hardware-bound" => factors.device = Some(Level::HardwareBound),
-                "ticket" => factors.ticket = true,
-                "passkey" => factors.passkey = true,
-                other => return Err(format!("unknown factor {other:?}").into()),
+            match f {
+                Factor::Device(level) => factors.device = Some(*level),
+                Factor::Ticket => factors.ticket = true,
+                Factor::Passkey => factors.passkey = true,
             }
         }
-        let ticket_delegation = match (
-            self.ticket_delegation.as_deref(),
-            self.ticket_via.is_empty(),
-        ) {
+        let ticket_delegation = match (&self.ticket_delegation, self.ticket_via.is_empty()) {
             (_, false) => TicketDelegation::Via(self.ticket_via.clone()),
-            (None | Some("allow"), true) => TicketDelegation::Allow,
-            (Some("refuse"), true) => TicketDelegation::Refuse,
-            (Some(other), true) => {
-                return Err(format!("--ticket-delegation {other:?}: allow or refuse").into());
-            }
+            (None | Some(Delegation::Allow), true) => TicketDelegation::Allow,
+            (Some(Delegation::Refuse), true) => TicketDelegation::Refuse,
         };
         let not_after = self
             .expires
@@ -1138,10 +1168,9 @@ impl PolicyInput {
                     .ok_or_else(|| "--expires is too large".to_string())
             })
             .transpose()?;
-        let sealing = match self.sealing.as_deref() {
-            None | Some("offline") => kuipa_enroll::seal::Sealing::Offline,
-            Some("registered") => kuipa_enroll::seal::Sealing::Registered,
-            Some(other) => return Err(format!("--sealing {other:?}: offline or registered").into()),
+        let sealing = match self.sealing {
+            None | Some(Sealing::Offline) => kuipa_enroll::seal::Sealing::Offline,
+            Some(Sealing::Registered) => kuipa_enroll::seal::Sealing::Registered,
         };
         Ok(Policy {
             factors,
@@ -1677,7 +1706,7 @@ fn run(args: &Args) -> Result<Value, Error> {
         }
         "voucher-key" => {
             let out = args.option("out").ok_or("--out is required")?;
-            let binding = kuipa_tools::voucher::ephemeral(std::path::Path::new(out))?;
+            let binding = kuipa_tools::voucher::ephemeral(Path::new(out))?;
             Ok(serde_json::json!({ "binding": tang_pqc::b64::encode(&binding) }))
         }
         "adopt" => {
@@ -1698,7 +1727,7 @@ fn run(args: &Args) -> Result<Value, Error> {
         "realm-info" => {
             let dir = args.option("krb5-dir").ok_or("--krb5-dir is required")?;
             let deployment = args.deployment()?;
-            let dir = std::path::Path::new(dir);
+            let dir = Path::new(dir);
             if args.flag("trust-first-use") {
                 if args.option("realm").is_some() || args.enrollment_file().is_some() {
                     Err("--trust-first-use is refused with --realm or --enrollment-file: those pin the anchors".into())
@@ -2760,7 +2789,7 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
             no_verify,
             recovery_file,
         } => {
-            let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
+            let target = kuipa_tools::output::Output::check(out, *force)?;
             let mut verified = Vec::new();
             if !no_verify {
                 let pins = pins(realm.as_deref(), anchor)?;
@@ -2843,7 +2872,7 @@ fn run_keys(paths: &Paths, action: &KeysAction) -> Result<Value, Error> {
         out,
         force,
     } = action;
-    let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
+    let target = kuipa_tools::output::Output::check(out, *force)?;
     target.write(&flows::keys_fetch(paths, name, alg.as_deref())?)?;
     Ok(serde_json::json!({ "quiet": matches!(target, kuipa_tools::output::Output::Stdout) }))
 }
@@ -2865,7 +2894,7 @@ fn run_open(
     else {
         unreachable!("only open");
     };
-    let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
+    let target = kuipa_tools::output::Output::check(out, *force)?;
     let bytes = kuipa_tools::paths::read(sealed)?;
     let pass = kuipa_tools::seal::SealClient::needs_secret(&bytes)
         .then(|| passphrase(pw.passphrase_file.as_deref(), false))
@@ -2890,7 +2919,7 @@ fn run_deposit(
     match action {
         DepositAction::Put { seal, file, name } => {
             let name = name.clone().unwrap_or_else(|| {
-                std::path::Path::new(file)
+                Path::new(file)
                     .file_name()
                     .map_or_else(|| file.clone(), |n| n.to_string_lossy().into_owned())
             });
@@ -2905,7 +2934,7 @@ fn run_deposit(
         DepositAction::List { seal } => client.deposits(seal),
         DepositAction::Fetch { seal, id, out } => {
             let sealed = client.deposit_file(seal, id)?;
-            paths::write_file(std::path::Path::new(out), &sealed, 0o600)?;
+            paths::write_file(out, &sealed, 0o600)?;
             Ok(serde_json::json!({ "seal": seal, "file": id, "sealed": out }))
         }
         DepositAction::Retire { seal, id } => client.retire_deposit(seal, id),
@@ -3052,7 +3081,7 @@ fn run_recover(
                 },
             )?;
             for (path, bytes) in sealed.iter().zip(again) {
-                paths::write_file(std::path::Path::new(path), &bytes, 0o600)?;
+                paths::write_file(path, &bytes, 0o600)?;
             }
             Ok(value)
         }
@@ -3102,7 +3131,7 @@ fn run_seal_device(
                 client.add_passkey_device(seal, pin.as_ref())
             } else if let Some(uri) = pkcs11 {
                 let pin = passphrase(pw.passphrase_file.as_deref(), false)?;
-                client.add_token_device(seal, std::path::Path::new(module), uri, pin.as_ref())
+                client.add_token_device(seal, module, uri, pin.as_ref())
             } else {
                 let first = !user.device_key().exists() && !user.token_device().exists();
                 let pass = passphrase(pw.passphrase_file.as_deref(), first)?;
@@ -3140,7 +3169,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             } else {
                 client.seal(seal, &contents)?
             };
-            paths::write_file(std::path::Path::new(&out), &sealed, 0o600)?;
+            paths::write_file(Path::new(&out), &sealed, 0o600)?;
             Ok(serde_json::json!({ "seal": seal, "file": file, "sealed": out }))
         }
         open @ SealCommand::Open { .. } => run_open(client, &user, open),
@@ -3156,7 +3185,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             for path in sealed {
                 let again =
                     client.reseal(seal, &kuipa_tools::paths::read(path)?, Some(pass.as_ref()))?;
-                paths::write_file(std::path::Path::new(path), &again, 0o600)?;
+                paths::write_file(path, &again, 0o600)?;
             }
             Ok(serde_json::json!({ "seal": seal, "resealed": sealed }))
         }
