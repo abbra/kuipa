@@ -6,51 +6,42 @@
 
 use std::ops::{Add, AddAssign, Mul};
 
-use crate::clmul::clmul64;
-use crate::gf128::halves;
+use crate::clmul::clmul128;
+use crate::field::Field;
 
 /// An element of GF(2²⁵⁶).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Gf256(pub [u128; 2]);
+pub(crate) struct Gf256(pub(crate) [u128; 2]);
 
-impl Gf256 {
-    /// Addition: XOR.
-    #[must_use]
-    fn xor(self, other: Self) -> Self {
-        Self([self.0[0] ^ other.0[0], self.0[1] ^ other.0[1]])
-    }
-
-    /// 0.
-    pub const ZERO: Self = Self([0, 0]);
-    /// 1.
-    pub const ONE: Self = Self([1, 0]);
-
-    /// `xᵗ`, for `t < 256`.
-    #[must_use]
-    pub const fn x_pow(t: usize) -> Self {
+impl Field for Gf256 {
+    const BITS: usize = 256;
+    const ZERO: Self = Self([0, 0]);
+    fn x_pow(t: usize) -> Self {
         if t < 128 {
             Self([1 << t, 0])
         } else {
             Self([0, 1 << (t - 128)])
         }
     }
-
-    /// `self` if `bit`, else 0, without a branch.
-    #[must_use]
-    pub const fn times_bit(self, bit: bool) -> Self {
-        let mask = 0u128.wrapping_sub(bit as u128);
+    fn times_bit(self, bit: bool) -> Self {
+        let mask = 0u128.wrapping_sub(u128::from(bit));
         Self([self.0[0] & mask, self.0[1] & mask])
     }
-
-    /// The coefficient of `xⁱ`, for `i < 256`.
-    #[must_use]
-    pub const fn bit(self, i: usize) -> bool {
+    fn bit(self, i: usize) -> bool {
         (self.0[i / 128] >> (i % 128)) & 1 == 1
     }
+    fn to_vec(self) -> Vec<u8> {
+        self.to_bytes().to_vec()
+    }
+    fn from_slice(bytes: &[u8]) -> Self {
+        Self::from_bytes(bytes.try_into().expect("32 bytes"))
+    }
+}
 
+impl Gf256 {
     /// The little-endian bytes.
     #[must_use]
-    pub fn to_bytes(self) -> [u8; 32] {
+    pub(crate) fn to_bytes(self) -> [u8; 32] {
         let mut out = [0u8; 32];
         out[..16].copy_from_slice(&self.0[0].to_le_bytes());
         out[16..].copy_from_slice(&self.0[1].to_le_bytes());
@@ -63,7 +54,7 @@ impl Gf256 {
     ///
     /// Never: both halves are 16 bytes of a 32-byte array.
     #[must_use]
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         let half = |s: &[u8]| u128::from_le_bytes(s.try_into().expect("16 bytes"));
         Self([half(&bytes[..16]), half(&bytes[16..])])
     }
@@ -73,24 +64,14 @@ impl Gf256 {
 impl Add for Gf256 {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        self.xor(other)
+        Self([self.0[0] ^ other.0[0], self.0[1] ^ other.0[1]])
     }
 }
 
 impl AddAssign for Gf256 {
     fn add_assign(&mut self, other: Self) {
-        *self = self.xor(other);
+        *self = *self + other;
     }
-}
-
-/// 128×128 → 256 carry-less multiplication by Karatsuba, as `(lo, hi)`.
-fn clmul128(a: u128, b: u128) -> (u128, u128) {
-    let (a0, a1) = halves(a);
-    let (b0, b1) = halves(b);
-    let z0 = clmul64(a0, b0);
-    let z2 = clmul64(a1, b1);
-    let z1 = clmul64(a0 ^ a1, b0 ^ b1) ^ z0 ^ z2;
-    (z0 ^ (z1 << 64), z2 ^ (z1 >> 64))
 }
 
 /// The low 256 bits of `h · xᵏ`, for `0 < k < 128`, and the `k` bits
@@ -131,6 +112,7 @@ impl Mul for Gf256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clmul::halves;
 
     /// Schoolbook multiplication with reduction, bit by bit.
     fn reference(a: Gf256, b: Gf256) -> Gf256 {
@@ -168,7 +150,7 @@ mod tests {
         assert_eq!(Gf256::x_pow(255) * Gf256::x_pow(1), Gf256([0x425, 0]));
         let all = Gf256([u128::MAX, u128::MAX]);
         assert_eq!(all * all, reference(all, all));
-        assert_eq!(all * Gf256::ONE, all);
+        assert_eq!(all * Gf256::x_pow(0), all);
         assert_eq!(Gf256([5, 7]) * Gf256::ZERO, Gf256::ZERO);
         assert_eq!(Gf256([9, 1]).times_bit(false), Gf256::ZERO);
         let x = Gf256::from_bytes(all.to_bytes());

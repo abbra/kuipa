@@ -38,9 +38,9 @@ use crate::primitives::{Hash, Prg, Seed, Transcript, hash};
 use crate::{Error, Result};
 
 /// Tree depth: 8 bits of `Δ` per tree, so `λ/8` trees.
-pub const DEPTH: usize = 8;
+pub(crate) const DEPTH: usize = 8;
 /// Leaves per tree.
-pub const LEAVES: usize = 1 << DEPTH;
+pub(crate) const LEAVES: usize = 1 << DEPTH;
 const DOMAIN: &str = "ml-dsa-zk/v1 proof";
 const MAGIC: &[u8; 5] = b"IPZK\x01";
 

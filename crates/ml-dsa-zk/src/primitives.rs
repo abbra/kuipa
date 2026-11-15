@@ -12,13 +12,13 @@ use native_ossl::digest::{DigestAlg, DigestCtx};
 use crate::Result;
 
 /// A 256-bit seed: an AES-256 key.
-pub type Seed = [u8; 32];
+pub(crate) type Seed = [u8; 32];
 
 /// A SHA-512 output.
-pub type Hash = [u8; 64];
+pub(crate) type Hash = [u8; 64];
 
 /// AES-256-CTR under `key`, IV zero: the PRG.
-pub struct Prg {
+pub(crate) struct Prg {
     alg: CipherAlg,
 }
 
@@ -28,7 +28,7 @@ impl Prg {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             alg: CipherAlg::fetch(c"AES-256-CTR", None)?,
         })
@@ -39,7 +39,7 @@ impl Prg {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn expand(&self, key: &Seed, out: &mut [u8]) -> Result<()> {
+    pub(crate) fn expand(&self, key: &Seed, out: &mut [u8]) -> Result<()> {
         out.fill(0);
         let mut ctx = self.alg.encrypt(key, &[0u8; 16], None)?;
         ctx.update_in_place(out)?;
@@ -51,7 +51,7 @@ impl Prg {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn children(&self, node: &Seed) -> Result<(Seed, Seed)> {
+    pub(crate) fn children(&self, node: &Seed) -> Result<(Seed, Seed)> {
         let mut out = [0u8; 64];
         self.expand(node, &mut out)?;
         let mut left = [0u8; 32];
@@ -83,7 +83,7 @@ fn finish(ctx: &mut DigestCtx) -> Result<Hash> {
 /// # Errors
 ///
 /// An OpenSSL error.
-pub fn hash(domain: &str, parts: &[&[u8]]) -> Result<Hash> {
+pub(crate) fn hash(domain: &str, parts: &[&[u8]]) -> Result<Hash> {
     let mut ctx = sha512()?;
     absorb(&mut ctx, domain.as_bytes())?;
     for p in parts {
@@ -96,7 +96,7 @@ pub fn hash(domain: &str, parts: &[&[u8]]) -> Result<Hash> {
 /// absorbed, length prefixed under a label.  A challenge is the counter
 /// mode `SHA-512(state ‖ label ‖ i)`, `i = 0, 1, …`, over a copy of the
 /// state, and is absorbed in turn, so later challenges depend on it.
-pub struct Transcript {
+pub(crate) struct Transcript {
     ctx: DigestCtx,
 }
 
@@ -106,7 +106,7 @@ impl Transcript {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn new(domain: &str) -> Result<Self> {
+    pub(crate) fn new(domain: &str) -> Result<Self> {
         let mut ctx = sha512()?;
         absorb(&mut ctx, domain.as_bytes())?;
         Ok(Self { ctx })
@@ -117,7 +117,7 @@ impl Transcript {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn absorb(&mut self, label: &str, data: &[u8]) -> Result<()> {
+    pub(crate) fn absorb(&mut self, label: &str, data: &[u8]) -> Result<()> {
         absorb(&mut self.ctx, label.as_bytes())?;
         absorb(&mut self.ctx, data)
     }
@@ -127,7 +127,7 @@ impl Transcript {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn challenge(&mut self, label: &str, out: &mut [u8]) -> Result<()> {
+    pub(crate) fn challenge(&mut self, label: &str, out: &mut [u8]) -> Result<()> {
         for (i, chunk) in out.chunks_mut(64).enumerate() {
             let mut copy = self.ctx.fork()?;
             absorb(&mut copy, label.as_bytes())?;

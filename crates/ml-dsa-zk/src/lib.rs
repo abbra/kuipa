@@ -12,7 +12,7 @@
 //! * [`circuit`]: boolean circuits (XOR, NOT, AND).
 //! * [`proof`]: [`prove`] and [`verify`].
 //! * [`keccak`]: Keccak-f\[1600\] as a circuit.
-//! * [`field`]: the proof's field GF(2^λ), and the [`Level`] λ.
+//! * [`Level`]: the proof's security level λ, which picks its field GF(2^λ).
 //!
 //! The system crypto policy picks λ, as it picks ML-DSA parameter sets:
 //! λ = 128 while it allows ML-DSA-44 or 65, λ = 256 when it allows only
@@ -26,11 +26,11 @@
 
 pub mod circuit;
 mod clmul;
-pub mod field;
-pub mod gf128;
-pub mod gf256;
+mod field;
+mod gf128;
+mod gf256;
 pub mod keccak;
-pub mod primitives;
+mod primitives;
 pub mod proof;
 
 pub use circuit::{Circuit, Gate, Wire};

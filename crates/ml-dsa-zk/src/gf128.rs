@@ -5,86 +5,70 @@
 
 use std::ops::{Add, AddAssign, Mul};
 
-use crate::clmul::clmul64;
+use crate::clmul::clmul128;
+use crate::field::Field;
 
 /// An element of GF(2¹²⁸).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Gf(pub u128);
+pub(crate) struct Gf(pub(crate) u128);
 
 impl Gf {
-    /// Addition: XOR.
-    #[must_use]
-    fn xor(self, other: Self) -> Self {
-        Self(self.0 ^ other.0)
-    }
-
-    /// 0.
-    pub const ZERO: Self = Self(0);
-    /// 1.
-    pub const ONE: Self = Self(1);
-
-    /// `xᵗ`, for `t < 128`.
-    #[must_use]
-    pub const fn x_pow(t: usize) -> Self {
-        Self(1 << t)
-    }
-
-    /// `self` if `bit`, else 0, without a branch.
-    #[must_use]
-    pub const fn times_bit(self, bit: bool) -> Self {
-        Self(self.0 & (0u128.wrapping_sub(bit as u128)))
-    }
-
     /// The little-endian bytes.
     #[must_use]
-    pub const fn to_bytes(self) -> [u8; 16] {
+    pub(crate) const fn to_bytes(self) -> [u8; 16] {
         self.0.to_le_bytes()
     }
 
     /// From little-endian bytes.
     #[must_use]
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(u128::from_le_bytes(bytes))
     }
 }
 
+impl Field for Gf {
+    const BITS: usize = 128;
+    const ZERO: Self = Self(0);
+    fn x_pow(t: usize) -> Self {
+        Self(1 << t)
+    }
+    fn times_bit(self, bit: bool) -> Self {
+        Self(self.0 & (0u128.wrapping_sub(u128::from(bit))))
+    }
+    fn bit(self, i: usize) -> bool {
+        (self.0 >> i) & 1 == 1
+    }
+    fn to_vec(self) -> Vec<u8> {
+        self.to_bytes().to_vec()
+    }
+    fn from_slice(bytes: &[u8]) -> Self {
+        Self::from_bytes(bytes.try_into().expect("16 bytes"))
+    }
+}
+
 // Addition in characteristic 2 is XOR.
+#[allow(clippy::suspicious_arithmetic_impl)]
 impl Add for Gf {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        self.xor(other)
+        Self(self.0 ^ other.0)
     }
 }
 
 impl AddAssign for Gf {
     fn add_assign(&mut self, other: Self) {
-        *self = self.xor(other);
+        *self = *self + other;
     }
-}
-
-/// The low and high 64-bit halves of `x`.
-pub(crate) fn halves(x: u128) -> (u64, u64) {
-    let lo = u64::try_from(x & u128::from(u64::MAX)).expect("masked to 64 bits");
-    let hi = u64::try_from(x >> 64).expect("shifted to 64 bits");
-    (lo, hi)
 }
 
 impl Mul for Gf {
     type Output = Self;
     fn mul(self, other: Self) -> Self {
-        let (a0, a1) = halves(self.0);
-        let (b0, b1) = halves(other.0);
-        // Karatsuba: the 256-bit product as (hi, lo).
-        let z0 = clmul64(a0, b0);
-        let z2 = clmul64(a1, b1);
-        let z1 = clmul64(a0 ^ a1, b0 ^ b1) ^ z0 ^ z2;
-        let lo = z0 ^ (z1 << 64);
-        let hi = z2 ^ (z1 >> 64);
+        let (lo, hi) = clmul128(self.0, other.0);
         // Reduce: x¹²⁸ = x⁷ + x² + x + 1, twice for what the shifts push out.
         let spill = (hi >> 127) ^ (hi >> 126) ^ (hi >> 121);
         let folded = hi ^ (hi << 1) ^ (hi << 2) ^ (hi << 7);
-        let r = lo ^ folded ^ spill ^ (spill << 1) ^ (spill << 2) ^ (spill << 7);
-        Self(r)
+        Self(lo ^ folded ^ spill ^ (spill << 1) ^ (spill << 2) ^ (spill << 7))
     }
 }
 
@@ -122,7 +106,7 @@ mod tests {
         }
         // x¹²⁷ · x = x⁷ + x² + x + 1.
         assert_eq!((Gf::x_pow(127) * Gf::x_pow(1)).0, 0x87);
-        assert_eq!(Gf(u128::MAX) * Gf::ONE, Gf(u128::MAX));
+        assert_eq!(Gf(u128::MAX) * Gf::x_pow(0), Gf(u128::MAX));
         assert_eq!(Gf(5) * Gf::ZERO, Gf::ZERO);
         assert_eq!(Gf(9).times_bit(false), Gf::ZERO);
         assert_eq!(Gf(9).times_bit(true), Gf(9));

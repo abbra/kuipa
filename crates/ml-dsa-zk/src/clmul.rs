@@ -23,6 +23,23 @@ pub(crate) fn clmul64(a: u64, b: u64) -> u128 {
     portable(a, b)
 }
 
+/// The low and high 64-bit halves of `x`.
+pub(crate) fn halves(x: u128) -> (u64, u64) {
+    let lo = u64::try_from(x & u128::from(u64::MAX)).expect("masked to 64 bits");
+    let hi = u64::try_from(x >> 64).expect("shifted to 64 bits");
+    (lo, hi)
+}
+
+/// 128×128 → 256 carry-less multiplication by Karatsuba, as `(lo, hi)`.
+pub(crate) fn clmul128(a: u128, b: u128) -> (u128, u128) {
+    let (a0, a1) = halves(a);
+    let (b0, b1) = halves(b);
+    let z0 = clmul64(a0, b0);
+    let z2 = clmul64(a1, b1);
+    let z1 = clmul64(a0 ^ a1, b0 ^ b1) ^ z0 ^ z2;
+    (z0 ^ (z1 << 64), z2 ^ (z1 >> 64))
+}
+
 /// The loop: one masked shift per bit of `b`.
 fn portable(a: u64, b: u64) -> u128 {
     let a = u128::from(a);
