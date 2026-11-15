@@ -21,9 +21,9 @@
 
 use serde::{Deserialize, Serialize};
 use tang_pqc::wire::{Reader, Writer};
-use tang_pqc::{Policy as CryptoPolicy, SigningKey, Thumbprint, VerifyingKey};
+use tang_pqc::{Policy as CryptoPolicy, SigningKey, Thumbprint};
 
-use crate::delegation::{Delegation, VerifiedDelegation};
+use crate::delegation::{DelegatedSig, Delegation, VerifiedDelegation};
 use crate::error::{Error, Result};
 use crate::keytab::Principal;
 use crate::merkle::{self, Hash, TreeHash};
@@ -325,16 +325,14 @@ impl Statement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedStatement {
     statement: Statement,
-    delegation: Vec<u8>,
-    signer_key: Vec<u8>,
-    signature: Vec<u8>,
+    sig: DelegatedSig,
 }
 
 impl SignedStatement {
-    fn signed_part(statement: &Statement, delegation: &[u8], signer_key: &[u8]) -> Vec<u8> {
+    fn signed_part(statement: &Statement, sig: &DelegatedSig) -> Vec<u8> {
         let mut w = Writer::new(STATEMENT_MAGIC);
         statement.write(&mut w);
-        w.bytes(delegation).bytes(signer_key);
+        sig.write_signed(&mut w);
         w.finish()
     }
 
@@ -348,18 +346,13 @@ impl SignedStatement {
         delegation: &Delegation,
         statement: Statement,
     ) -> Result<Self> {
-        let delegation = delegation.to_json().into_bytes();
-        let signer_key = signing.public().to_jwk_json().into_bytes();
-        let signature = signing.sign_with_context(
-            &Self::signed_part(&statement, &delegation, &signer_key),
+        let mut sig = DelegatedSig::new(signing, delegation);
+        sig.sign(
+            signing,
             STATEMENT_CONTEXT,
+            &Self::signed_part(&statement, &sig),
         )?;
-        Ok(Self {
-            statement,
-            delegation,
-            signer_key,
-            signature,
-        })
+        Ok(Self { statement, sig })
     }
 
     /// The statement, **unverified**.
@@ -382,28 +375,22 @@ impl SignedStatement {
         policy: &CryptoPolicy,
     ) -> Result<VerifiedDelegation> {
         let s = &self.statement;
-        let delegation =
-            Delegation::from_json(&self.delegation)?.verify_at(anchors, policy, s.iat)?;
+        let (delegation, key) = self.sig.verify(
+            anchors,
+            policy,
+            s.iat,
+            STATEMENT_CONTEXT,
+            "statement signer",
+            &Self::signed_part(s, &self.sig),
+        )?;
         if delegation.realm != realm || s.realm != realm {
             return Err(Error::WrongRealm);
-        }
-        let key = VerifyingKey::from_jwk_json(&self.signer_key)?;
-        if key.thumbprint() != &delegation.key {
-            return Err(Error::Mismatch("statement signer"));
-        }
-        if !policy.allows_signature(key.alg()) {
-            return Err(Error::UntrustedAnchor);
         }
         // The batch and the log are hashed as the signer's key decides.
         let tree = TreeHash::for_signer(key.alg());
         if s.batch_root.alg() != tree || s.log.alg() != tree {
             return Err(Error::Mismatch("statement hash"));
         }
-        key.verify_with_context(
-            &Self::signed_part(s, &self.delegation, &self.signer_key),
-            STATEMENT_CONTEXT,
-            &self.signature,
-        )?;
         // The realm's own signature says who signed: a user of this realm, or
         // of a trusted one that the realm's directory knows (an ID override).
         s.principal.parse::<Principal>()?;
@@ -413,10 +400,8 @@ impl SignedStatement {
     fn write(&self, w: &mut Writer) {
         let mut inner = Writer::new(STATEMENT_MAGIC);
         self.statement.write(&mut inner);
-        w.bytes(&inner.finish())
-            .bytes(&self.delegation)
-            .bytes(&self.signer_key)
-            .bytes(&self.signature);
+        w.bytes(&inner.finish());
+        self.sig.write(w);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
@@ -429,9 +414,7 @@ impl SignedStatement {
         };
         Ok(Self {
             statement,
-            delegation: r.bytes()?.to_vec(),
-            signer_key: r.bytes()?.to_vec(),
-            signature: r.bytes()?.to_vec(),
+            sig: DelegatedSig::read(r)?,
         })
     }
 }

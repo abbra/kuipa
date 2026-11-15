@@ -25,10 +25,10 @@ use tang_pqc::primitives::{self, Domain};
 use tang_pqc::wire::{Reader, Writer};
 use tang_pqc::{
     BindingContext, ExchangeKey, ExchangeKeyPair, KemAlg, Policy as CryptoPolicy, RecoveryResponse,
-    SigningKey, Thumbprint, VerifyingKey, b64,
+    SigningKey, Thumbprint, b64,
 };
 
-use crate::delegation::{Delegation, VerifiedDelegation};
+use crate::delegation::{DelegatedSig, Delegation, VerifiedDelegation};
 use crate::error::{Error, Result};
 use crate::escrow::{self, BindingHash, EscrowRequest, SealId, Slot, commitment_data};
 use crate::keytab::Principal;
@@ -1338,9 +1338,7 @@ struct DescriptorBody {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Descriptor {
     body: Box<[u8]>,
-    delegation: Box<[u8]>,
-    signer_key: Box<[u8]>,
-    signature: Box<[u8]>,
+    sig: DelegatedSig,
 }
 
 impl fmt::Debug for Descriptor {
@@ -1370,24 +1368,17 @@ impl Descriptor {
             max_age,
         })
         .map_err(|_| Error::Malformed("seal descriptor"))?;
-        let mut d = Self {
-            body: body.into(),
-            delegation: delegation.to_json().into_bytes().into(),
-            signer_key: signing.public().to_jwk_json().into_bytes().into(),
-            signature: Box::default(),
-        };
-        d.signature = signing
-            .sign_with_context(&d.signed_part(), DESCRIPTOR_CONTEXT)?
-            .into();
-        Ok(d)
+        let body: Box<[u8]> = body.into();
+        let mut sig = DelegatedSig::new(signing, delegation);
+        sig.sign(signing, DESCRIPTOR_CONTEXT, &Self::signed_part(&body, &sig))?;
+        Ok(Self { body, sig })
     }
 
-    fn signed_part(&self) -> Vec<u8> {
-        Writer::new(DESCRIPTOR_MAGIC)
-            .bytes(&self.body)
-            .bytes(&self.delegation)
-            .bytes(&self.signer_key)
-            .finish()
+    fn signed_part(body: &[u8], sig: &DelegatedSig) -> Vec<u8> {
+        let mut w = Writer::new(DESCRIPTOR_MAGIC);
+        w.bytes(body);
+        sig.write_signed(&mut w);
+        w.finish()
     }
 
     /// Verify the signature and the delegation as of the descriptor's own
@@ -1405,19 +1396,17 @@ impl Descriptor {
     ) -> Result<VerifiedDescriptor> {
         let body: DescriptorBody =
             serde_json::from_slice(&self.body).map_err(|_| Error::Malformed("seal descriptor"))?;
-        let delegation =
-            Delegation::from_json(&self.delegation)?.verify_at(anchors, policy, body.iat)?;
+        let (delegation, _) = self.sig.verify(
+            anchors,
+            policy,
+            body.iat,
+            DESCRIPTOR_CONTEXT,
+            "descriptor signer",
+            &Self::signed_part(&self.body, &self.sig),
+        )?;
         if delegation.realm != realm || body.realm != realm {
             return Err(Error::WrongRealm);
         }
-        let key = VerifyingKey::from_jwk_json(&self.signer_key)?;
-        if key.thumbprint() != &delegation.key {
-            return Err(Error::Mismatch("descriptor signer"));
-        }
-        if !policy.allows_signature(key.alg()) {
-            return Err(Error::UntrustedAnchor);
-        }
-        key.verify_with_context(&self.signed_part(), DESCRIPTOR_CONTEXT, &self.signature)?;
         // The owner may be a user of a trusted realm the realm permits
         // (`Limits::trusted_owners`): the realm vouches for the descriptor.
         let owner: Principal = body.seal.owner.parse()?;
@@ -1434,10 +1423,8 @@ impl Descriptor {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(DESCRIPTOR_MAGIC);
-        w.bytes(&self.body)
-            .bytes(&self.delegation)
-            .bytes(&self.signer_key)
-            .bytes(&self.signature);
+        w.bytes(&self.body);
+        self.sig.write(&mut w);
         w.finish()
     }
 
@@ -1450,9 +1437,7 @@ impl Descriptor {
         let mut r = Reader::new(bytes, DESCRIPTOR_MAGIC, "seal descriptor")?;
         let d = Self {
             body: r.bytes()?.into(),
-            delegation: r.bytes()?.into(),
-            signer_key: r.bytes()?.into(),
-            signature: r.bytes()?.into(),
+            sig: DelegatedSig::read(&mut r)?,
         };
         r.finish()?;
         Ok(d)
@@ -2146,9 +2131,7 @@ pub struct SessionToken {
     holder: String,
     device: Thumbprint,
     not_after: u64,
-    delegation: Box<[u8]>,
-    signer_key: Box<[u8]>,
-    signature: Box<[u8]>,
+    sig: DelegatedSig,
 }
 
 /// The seal, holder and device a session must be for.
@@ -2185,30 +2168,46 @@ impl SessionToken {
         device: Thumbprint,
         not_after: u64,
     ) -> Result<Self> {
-        let mut t = Self {
+        let holder = holder.to_owned();
+        let mut sig = DelegatedSig::new(signing, delegation);
+        sig.sign(
+            signing,
+            SESSION_CONTEXT,
+            &Self::signed_part(&seal, &holder, &device, not_after, &sig),
+        )?;
+        Ok(Self {
             seal,
-            holder: holder.to_owned(),
+            holder,
             device,
             not_after,
-            delegation: delegation.to_json().into_bytes().into(),
-            signer_key: signing.public().to_jwk_json().into_bytes().into(),
-            signature: Box::default(),
-        };
-        t.signature = signing
-            .sign_with_context(&t.signed_part(), SESSION_CONTEXT)?
-            .into();
-        Ok(t)
+            sig,
+        })
     }
 
-    fn signed_part(&self) -> Vec<u8> {
-        Writer::new(SESSION_MAGIC)
-            .fixed(self.seal.as_bytes())
-            .str(&self.holder)
-            .fixed(self.device.as_bytes())
-            .u64(self.not_after)
-            .bytes(&self.delegation)
-            .bytes(&self.signer_key)
-            .finish()
+    fn signed_part(
+        seal: &SealId,
+        holder: &str,
+        device: &Thumbprint,
+        not_after: u64,
+        sig: &DelegatedSig,
+    ) -> Vec<u8> {
+        let mut w = Writer::new(SESSION_MAGIC);
+        w.fixed(seal.as_bytes())
+            .str(holder)
+            .fixed(device.as_bytes())
+            .u64(not_after);
+        sig.write_signed(&mut w);
+        w.finish()
+    }
+
+    fn own_signed_part(&self) -> Vec<u8> {
+        Self::signed_part(
+            &self.seal,
+            &self.holder,
+            &self.device,
+            self.not_after,
+            &self.sig,
+        )
     }
 
     /// Check the signature and its delegation against `anchors` of
@@ -2235,19 +2234,17 @@ impl SessionToken {
         if now > self.not_after {
             return Err(Error::Expired);
         }
-        let delegation =
-            Delegation::from_json(&self.delegation)?.verify_at(anchors, policy, now)?;
+        let (delegation, _) = self.sig.verify(
+            anchors,
+            policy,
+            now,
+            SESSION_CONTEXT,
+            "session signer",
+            &self.own_signed_part(),
+        )?;
         if delegation.realm != realm {
             return Err(Error::WrongRealm);
         }
-        let key = VerifyingKey::from_jwk_json(&self.signer_key)?;
-        if key.thumbprint() != &delegation.key {
-            return Err(Error::Mismatch("session signer"));
-        }
-        if !policy.allows_signature(key.alg()) {
-            return Err(Error::UntrustedAnchor);
-        }
-        key.verify_with_context(&self.signed_part(), SESSION_CONTEXT, &self.signature)?;
         Ok(())
     }
 
@@ -2267,7 +2264,7 @@ impl SessionToken {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new(SESSION_MAGIC);
-        w.bytes(&self.signed_part()).bytes(&self.signature);
+        w.bytes(&self.own_signed_part()).bytes(self.sig.signature());
         w.finish()
     }
 
@@ -2279,7 +2276,7 @@ impl SessionToken {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut outer = Reader::new(bytes, SESSION_MAGIC, "seal session")?;
         let signed = outer.bytes()?;
-        let signature = outer.bytes()?.into();
+        let signature: Box<[u8]> = outer.bytes()?.into();
         outer.finish()?;
         let mut r = Reader::new(signed, SESSION_MAGIC, "seal session")?;
         let t = Self {
@@ -2287,9 +2284,7 @@ impl SessionToken {
             holder: r.str()?.to_owned(),
             device: Thumbprint::from_bytes(r.fixed()?),
             not_after: r.u64()?,
-            delegation: r.bytes()?.into(),
-            signer_key: r.bytes()?.into(),
-            signature,
+            sig: DelegatedSig::read_signed(&mut r, signature)?,
         };
         r.finish()?;
         Ok(t)

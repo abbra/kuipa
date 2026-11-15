@@ -16,9 +16,9 @@ use native_ossl::rand::Rand;
 use native_ossl::util::SecretBuf;
 use tang_pqc::primitives;
 use tang_pqc::wire::{Reader, Writer};
-use tang_pqc::{ExchangeKey, ExchangeKeyPair, KemAlg, Policy, Thumbprint, VerifyingKey};
+use tang_pqc::{ExchangeKey, ExchangeKeyPair, KemAlg, Policy, Thumbprint};
 
-use crate::delegation::{Delegation, VerifiedDelegation};
+use crate::delegation::{DelegatedSig, Delegation, VerifiedDelegation};
 use crate::enrollment::Secret;
 use crate::error::{Error, Result};
 use crate::join::DOMAIN;
@@ -155,10 +155,7 @@ pub struct Bundle {
     signer: [u8; 32],
     ciphertext: Box<[u8]>,
     sealed: Box<[u8]>,
-    delegation: Box<[u8]>,
-    /// The server signing key (JWK JSON).
-    signer_key: Box<[u8]>,
-    signature: Box<[u8]>,
+    sig: DelegatedSig,
 }
 
 impl std::fmt::Debug for Bundle {
@@ -219,9 +216,7 @@ impl Bundle {
             signer: *keys.signing.public().thumbprint().as_bytes(),
             ciphertext: Box::default(),
             sealed: Box::default(),
-            delegation: delegation.to_json().into_bytes().into(),
-            signer_key: keys.signing.public().to_jwk_json().into_bytes().into(),
-            signature: Box::default(),
+            sig: DelegatedSig::new(&keys.signing, delegation),
         };
         let payload = enrollment.to_bytes()?;
         let mut secret = None;
@@ -240,10 +235,8 @@ impl Bundle {
             }
             Recipient::SignedOnly => payload.as_ref().into(),
         };
-        bundle.signature = keys
-            .signing
-            .sign_with_context(&bundle.signed_part(), SIGNATURE_CONTEXT)?
-            .into();
+        let signed = bundle.signed_part();
+        bundle.sig.sign(&keys.signing, SIGNATURE_CONTEXT, &signed)?;
         Ok((bundle, secret))
     }
 
@@ -277,9 +270,8 @@ impl Bundle {
         let mut w = Writer::new(MAGIC);
         w.fixed(&self.header().finish()[5..])
             .bytes(&self.ciphertext)
-            .bytes(&self.sealed)
-            .bytes(&self.delegation)
-            .bytes(&self.signer_key);
+            .bytes(&self.sealed);
+        self.sig.write_signed(&mut w);
         w.finish()
     }
 
@@ -287,12 +279,9 @@ impl Bundle {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = self.signed_part();
-        out.extend_from_slice(
-            &u32::try_from(self.signature.len())
-                .unwrap_or(0)
-                .to_be_bytes(),
-        );
-        out.extend_from_slice(&self.signature);
+        let signature = self.sig.signature();
+        out.extend_from_slice(&u32::try_from(signature.len()).unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(signature);
         out
     }
 
@@ -317,9 +306,7 @@ impl Bundle {
             signer: r.fixed()?,
             ciphertext: r.bytes()?.into(),
             sealed: r.bytes()?.into(),
-            delegation: r.bytes()?.into(),
-            signer_key: r.bytes()?.into(),
-            signature: r.bytes()?.into(),
+            sig: DelegatedSig::read(&mut r)?,
         };
         r.finish()?;
         let ct_len = if mode == Mode::MachineKey {
@@ -367,24 +354,23 @@ impl Bundle {
     /// [`Error::Mismatch`] (signed by another key than the delegated one),
     /// or [`Error::Crypto`] for a bad signature.
     pub fn verify(self, anchors: &[Thumbprint], policy: &Policy) -> Result<VerifiedBundle> {
-        let delegation =
-            Delegation::from_json(&self.delegation)?.verify_at(anchors, policy, self.iat)?;
+        let (delegation, _) = self.sig.verify(
+            anchors,
+            policy,
+            self.iat,
+            SIGNATURE_CONTEXT,
+            "bundle signer",
+            &self.signed_part(),
+        )?;
         if delegation.realm != self.realm {
             return Err(Error::WrongRealm);
         }
-        let key = VerifyingKey::from_jwk_json(&self.signer_key)?;
-        if key.thumbprint() != &delegation.key || delegation.key.as_bytes() != &self.signer {
+        if delegation.key.as_bytes() != &self.signer {
             return Err(Error::Mismatch("bundle signer"));
-        }
-        if !policy.allows_signature(key.alg()) {
-            return Err(Error::Crypto(tang_pqc::Error::Policy(
-                "server signing algorithm not allowed",
-            )));
         }
         if self.not_after <= self.iat || self.not_after > delegation.exp {
             return Err(Error::Expired);
         }
-        key.verify_with_context(&self.signed_part(), SIGNATURE_CONTEXT, &self.signature)?;
         Ok(VerifiedBundle {
             bundle: self,
             delegation,

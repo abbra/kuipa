@@ -1066,6 +1066,104 @@ pub struct Delegation {
     successions: Vec<SignedSuccession>,
 }
 
+/// What a server's signature is under: its [`Delegation`], its signing key
+/// (JWK JSON) and the key's signature over a message that covers both.
+/// Shared by every artifact a server signs for offline checking.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DelegatedSig {
+    delegation: Box<[u8]>,
+    signer_key: Box<[u8]>,
+    signature: Box<[u8]>,
+}
+
+impl DelegatedSig {
+    /// The delegation and key of `signing`, not yet signed: the signature
+    /// covers both ([`write_signed`](Self::write_signed)), so they come
+    /// first.
+    pub(crate) fn new(signing: &SigningKey, delegation: &Delegation) -> Self {
+        Self {
+            delegation: delegation.to_json().into_bytes().into(),
+            signer_key: signing.public().to_jwk_json().into_bytes().into(),
+            signature: Box::default(),
+        }
+    }
+
+    /// Sign `signed` under `context`.
+    pub(crate) fn sign(
+        &mut self,
+        signing: &SigningKey,
+        context: &[u8],
+        signed: &[u8],
+    ) -> Result<()> {
+        self.signature = signing.sign_with_context(signed, context)?.into();
+        Ok(())
+    }
+
+    /// The members the signature covers: the delegation and the key.
+    pub(crate) fn write_signed<'w>(&self, w: &'w mut Writer) -> &'w mut Writer {
+        w.bytes(&self.delegation).bytes(&self.signer_key)
+    }
+
+    /// All three members.
+    pub(crate) fn write<'w>(&self, w: &'w mut Writer) -> &'w mut Writer {
+        self.write_signed(w).bytes(&self.signature)
+    }
+
+    /// The signature alone, for encodings that frame it themselves.
+    pub(crate) fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    /// Read the delegation and the key, with `signature` read elsewhere.
+    pub(crate) fn read_signed(r: &mut Reader<'_>, signature: Box<[u8]>) -> Result<Self> {
+        Ok(Self {
+            delegation: r.bytes()?.into(),
+            signer_key: r.bytes()?.into(),
+            signature,
+        })
+    }
+
+    /// Read all three members.
+    pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self> {
+        let (delegation, signer_key) = (r.bytes()?.into(), r.bytes()?.into());
+        Ok(Self {
+            delegation,
+            signer_key,
+            signature: r.bytes()?.into(),
+        })
+    }
+
+    /// Verify the delegation at `at` against `anchors`, that `signed` was
+    /// signed under `context` by the key it delegated to, and that the
+    /// policy allows that key's algorithm.  `what` names the signer in the
+    /// mismatch error.  The caller still checks the realm.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UntrustedAnchor`], [`Error::Expired`], [`Error::Mismatch`]
+    /// or a crypto error.
+    pub(crate) fn verify(
+        &self,
+        anchors: &[Thumbprint],
+        policy: &Policy,
+        at: u64,
+        context: &[u8],
+        what: &'static str,
+        signed: &[u8],
+    ) -> Result<(VerifiedDelegation, VerifyingKey)> {
+        let delegation = Delegation::from_json(&self.delegation)?.verify_at(anchors, policy, at)?;
+        let key = VerifyingKey::from_jwk_json(&self.signer_key)?;
+        if key.thumbprint() != &delegation.key {
+            return Err(Error::Mismatch(what));
+        }
+        if !policy.allows_signature(key.alg()) {
+            return Err(Error::UntrustedAnchor);
+        }
+        key.verify_with_context(signed, context, &self.signature)?;
+        Ok((delegation, key))
+    }
+}
+
 /// The content of a delegation that verified against a pinned anchor.
 #[derive(Clone, Debug)]
 pub struct VerifiedDelegation {
