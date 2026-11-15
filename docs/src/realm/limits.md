@@ -49,6 +49,7 @@ live on `cn=seal-limits,cn=kuipa,cn=etc,<suffix>`, attribute
 | `descriptor_age` | 30 days (seconds) | how long a client may seal offline with a seal's description |
 | `factors` | none | factor sets a policy must meet one of, e.g. `[{"device": "any"}]` |
 | `groups` | none | limits for members of groups, below |
+| `trusted_owners` | none | which users of trusted realms may own seals, below |
 
 Offline sessions hand a key to the user's machine for a while, after which
 the servers can no longer enforce limits on it. They stay off until you
@@ -66,6 +67,32 @@ that never leaves its token, or a ticket and a passkey together:
   { "ticket": true, "passkey": true }
 ]
 ```
+
+### Seals of trusted-realm users
+
+By default only the realm's own users own seals. `trusted_owners` lets
+users of trusted realms (those with an ID override here) own them too:
+
+```json
+"trusted_owners": {
+  "allow": ["AD.EXAMPLE", "*.CORP.TEST", "bob@PARTNER.TEST"],
+  "deny":  ["OLD.CORP.TEST", "mallory@AD.EXAMPLE"]
+}
+```
+
+An entry is a realm, `*.SUFFIX` (any realm ending in `.SUFFIX`, not
+`SUFFIX` itself), `*` (any realm), or one principal (it has an `@`).
+Case is ignored. A user may own seals when an `allow` entry matches and no
+`deny` entry does; `deny` wins. A group in `groups` may carry its own
+`trusted_owners`, which replaces the realm's as a whole, so an allowance can
+be narrowed to one group of override members.
+
+A foreign owner's seal is named `user@REALM/name`. It is checked whenever
+it is used, not only on creation: once its owner is denied, or their
+override is gone or locked, it is refused as if it did not exist, and seal
+administrators can still revoke it. AD holds the real lock state, so a
+disabled AD user keeps their seals until their ticket expires; give
+foreign owners a short `max_lifetime` through a group entry.
 
 ### Limits for groups
 

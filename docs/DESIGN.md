@@ -2008,8 +2008,13 @@ named; services stay the realm's own). Such a user takes part in the
 realm's seals as any user does: member, manager, depositor, approver and
 requester, sessions and devices of their own, the signing policy, a pins
 refresh and a seal administrator's operations when the realm's privilege
-says so (`admit_caller`). They never **own** a seal (`create` refuses
-them): seals, descriptors and files are the realm's. A principal of
+says so (`admit_caller`). They own a seal only where the realm's `trusted_owners` limit
+(§7.6.2) permits them (`create` refuses them otherwise): the limit is
+`allow`/`deny` lists of realms, `*.SUFFIX` and `*` wildcards and single
+principals, deny winning, replaceable per group like the other limits, and
+empty by default. A foreign owner's seal is named `user@REALM/name`;
+`find_seal` treats it as missing once its owner stops being permitted or has
+no usable override, and `AdminRevoke` accepts a foreign owner. A principal of
 another realm with no override is refused as unknown, and a trusted
 realm's host or service is never looked up as an IPA host or service of the
 same name. Names never collide: a bare name in the signing policy is the
