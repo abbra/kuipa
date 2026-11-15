@@ -836,6 +836,42 @@ pub struct SessionKey {
     pub slots: Vec<SessionKeySlot>,
 }
 
+/// The key `label` derives from a KEM `secret` of ciphertext `ct`, bound to
+/// `context` and to `ct` itself, under the suite hash `ct`'s KEM names.
+fn kem_key(secret: &[u8], ct: &[u8], label: &str, context: &[&[u8]]) -> Result<SecretBuf> {
+    let hash = suite(ct)?;
+    let ct_digest = primitives::digest(hash, &[ct])?;
+    let context: Vec<&[u8]> = context.iter().copied().chain([&ct_digest[..]]).collect();
+    Ok(DOMAIN.derive_key(hash, &[secret], label, &context)?)
+}
+
+/// A KEM ciphertext and what was sealed under its key: the shape of
+/// [`ReleasedKeys`] and [`SealAnswer`], which differ in magic and keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KemBox {
+    ciphertext: Box<[u8]>,
+    sealed: Box<[u8]>,
+}
+
+impl KemBox {
+    fn to_bytes(&self, magic: [u8; 4]) -> Vec<u8> {
+        Writer::new(magic)
+            .bytes(&self.ciphertext)
+            .bytes(&self.sealed)
+            .finish()
+    }
+
+    fn from_bytes(bytes: &[u8], magic: [u8; 4], what: &'static str) -> Result<Self> {
+        let mut r = Reader::new(bytes, magic, what)?;
+        let b = Self {
+            ciphertext: r.bytes()?.into(),
+            sealed: r.bytes()?.into(),
+        };
+        r.finish()?;
+        Ok(b)
+    }
+}
+
 fn session_slot_key(
     secret: &[u8],
     seal: &SealId,
@@ -843,18 +879,12 @@ fn session_slot_key(
     server: &str,
     ct: &[u8],
 ) -> Result<SecretBuf> {
-    let hash = suite(ct)?;
-    Ok(DOMAIN.derive_key(
-        hash,
-        &[secret],
+    kem_key(
+        secret,
+        ct,
         "session key",
-        &[
-            seal.as_bytes(),
-            &epoch.to_be_bytes(),
-            server.as_bytes(),
-            &primitives::digest(hash, &[ct])?,
-        ],
-    )?)
+        &[seal.as_bytes(), &epoch.to_be_bytes(), server.as_bytes()],
+    )
 }
 
 impl SessionKey {
@@ -954,19 +984,10 @@ impl SessionKey {
 /// `IPEK(ct, GCM_k([epoch, private JWK]…))`, `k` from the device's
 /// decapsulation of `ct`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReleasedKeys {
-    ciphertext: Box<[u8]>,
-    sealed: Box<[u8]>,
-}
+pub struct ReleasedKeys(KemBox);
 
 fn released_key(secret: &[u8], seal: &SealId, ct: &[u8]) -> Result<SecretBuf> {
-    let hash = suite(ct)?;
-    Ok(DOMAIN.derive_key(
-        hash,
-        &[secret],
-        "released keys",
-        &[seal.as_bytes(), &primitives::digest(hash, &[ct])?],
-    )?)
+    kem_key(secret, ct, "released keys", &[seal.as_bytes()])
 }
 
 impl ReleasedKeys {
@@ -992,10 +1013,10 @@ impl ReleasedKeys {
         let plain = SecretBuf::new(plain.finish());
         let (ct, secret) = device.encapsulate()?;
         let k = released_key(secret.as_ref(), seal, &ct)?;
-        Ok(Self {
+        Ok(Self(KemBox {
             sealed: primitives::seal(k.as_ref(), plain.as_ref())?.into(),
             ciphertext: ct.into(),
-        })
+        }))
     }
 
     /// Open with the device.
@@ -1008,9 +1029,9 @@ impl ReleasedKeys {
         device: &dyn DeviceKey,
         seal: &SealId,
     ) -> Result<Vec<(u64, ExchangeKeyPair)>> {
-        let secret = device.decapsulate(&self.ciphertext)?;
-        let k = released_key(secret.as_ref(), seal, &self.ciphertext)?;
-        let plain = primitives::open(k.as_ref(), &self.sealed).map_err(|_| Error::BadResponse)?;
+        let secret = device.decapsulate(&self.0.ciphertext)?;
+        let k = released_key(secret.as_ref(), seal, &self.0.ciphertext)?;
+        let plain = primitives::open(k.as_ref(), &self.0.sealed).map_err(|_| Error::BadResponse)?;
         let mut r = Reader::new(plain.as_ref(), EPOCH_KEYS_MAGIC, "released keys")?;
         let n = r.u64()?;
         let mut keys = Vec::new();
@@ -1025,10 +1046,7 @@ impl ReleasedKeys {
     /// Encode: `ct sealed`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        Writer::new(EPOCH_KEYS_MAGIC)
-            .bytes(&self.ciphertext)
-            .bytes(&self.sealed)
-            .finish()
+        self.0.to_bytes(EPOCH_KEYS_MAGIC)
     }
 
     /// Decode.
@@ -1037,13 +1055,11 @@ impl ReleasedKeys {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, EPOCH_KEYS_MAGIC, "released keys")?;
-        let k = Self {
-            ciphertext: r.bytes()?.into(),
-            sealed: r.bytes()?.into(),
-        };
-        r.finish()?;
-        Ok(k)
+        Ok(Self(KemBox::from_bytes(
+            bytes,
+            EPOCH_KEYS_MAGIC,
+            "released keys",
+        )?))
     }
 }
 
@@ -1074,17 +1090,12 @@ impl fmt::Debug for SessionSealedFile {
 }
 
 fn epoch_share_key(secret: &[u8], committed: &[u8], epoch: u64, ct: &[u8]) -> Result<SecretBuf> {
-    let hash = suite(ct)?;
-    Ok(DOMAIN.derive_key(
-        hash,
-        &[secret],
+    kem_key(
+        secret,
+        ct,
         "epoch share",
-        &[
-            committed,
-            &epoch.to_be_bytes(),
-            &primitives::digest(hash, &[ct])?,
-        ],
-    )?)
+        &[committed, &epoch.to_be_bytes()],
+    )
 }
 
 impl SessionSealedFile {
@@ -1630,10 +1641,11 @@ pub fn seal_delivery(to: &ExchangeKey, key: &ExchangeKeyPair) -> Result<Vec<u8>>
     let (ct, secret) = to.encapsulate()?;
     let k = delivery_key(secret.as_ref(), to.kid(), &ct)?;
     let sealed = primitives::seal(k.as_ref(), key.to_jwk()?.as_ref())?;
-    Ok(Writer::new(DELIVERY_MAGIC)
-        .bytes(&ct)
-        .bytes(&sealed)
-        .finish())
+    Ok(KemBox {
+        ciphertext: ct.into(),
+        sealed: sealed.into(),
+    }
+    .to_bytes(DELIVERY_MAGIC))
 }
 
 /// The key a delivery holds, opened with the device it was sealed to.
@@ -1642,24 +1654,16 @@ pub fn seal_delivery(to: &ExchangeKey, key: &ExchangeKeyPair) -> Result<Vec<u8>>
 ///
 /// [`Error::Malformed`], or [`Error::BadResponse`] for another device's.
 pub fn open_delivery(bytes: &[u8], device: &dyn DeviceKey) -> Result<ExchangeKeyPair> {
-    let mut r = Reader::new(bytes, DELIVERY_MAGIC, "device delivery")?;
-    let ct = r.bytes()?.to_vec();
-    let sealed = r.bytes()?.to_vec();
-    r.finish()?;
-    let secret = device.decapsulate(&ct)?;
-    let k = delivery_key(secret.as_ref(), &device.id(), &ct)?;
+    let KemBox { ciphertext, sealed } =
+        KemBox::from_bytes(bytes, DELIVERY_MAGIC, "device delivery")?;
+    let secret = device.decapsulate(&ciphertext)?;
+    let k = delivery_key(secret.as_ref(), &device.id(), &ciphertext)?;
     let jwk = primitives::open(k.as_ref(), &sealed).map_err(|_| Error::BadResponse)?;
     ExchangeKeyPair::from_jwk(jwk.as_ref()).map_err(Into::into)
 }
 
 fn delivery_key(secret: &[u8], to: &Thumbprint, ct: &[u8]) -> Result<SecretBuf> {
-    let hash = suite(ct)?;
-    Ok(DOMAIN.derive_key(
-        hash,
-        &[secret],
-        "device delivery",
-        &[to.as_bytes(), &primitives::digest(hash, &[ct])?],
-    )?)
+    kem_key(secret, ct, "device delivery", &[to.as_bytes()])
 }
 
 /// The largest escrowed device key a server keeps, in bytes.
@@ -2288,10 +2292,7 @@ impl DeviceKey for ExchangeKeyPair {
 /// The server's share, encrypted to a registered device: `IPVA(ct, sealed)`
 /// with `k = HKDF(Decaps(ct), "answer", H(request))`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SealAnswer {
-    ciphertext: Box<[u8]>,
-    sealed: Box<[u8]>,
-}
+pub struct SealAnswer(KemBox);
 
 fn answer_key(secret: &[u8], ct: &[u8], request: &EscrowRequest) -> Result<SecretBuf> {
     let hash = suite(ct)?;
@@ -2316,10 +2317,10 @@ impl SealAnswer {
     ) -> Result<Self> {
         let (ciphertext, secret) = device.encapsulate()?;
         let key = answer_key(secret.as_ref(), &ciphertext, request)?;
-        Ok(Self {
+        Ok(Self(KemBox {
             sealed: primitives::seal(key.as_ref(), &response.to_bytes())?.into(),
             ciphertext: ciphertext.into(),
-        })
+        }))
     }
 
     /// Open with the device the request named.
@@ -2332,19 +2333,17 @@ impl SealAnswer {
         device: &dyn DeviceKey,
         request: &EscrowRequest,
     ) -> Result<RecoveryResponse> {
-        let secret = device.decapsulate(&self.ciphertext)?;
-        let key = answer_key(secret.as_ref(), &self.ciphertext, request)?;
-        let plain = primitives::open(key.as_ref(), &self.sealed).map_err(|_| Error::BadResponse)?;
+        let secret = device.decapsulate(&self.0.ciphertext)?;
+        let key = answer_key(secret.as_ref(), &self.0.ciphertext, request)?;
+        let plain =
+            primitives::open(key.as_ref(), &self.0.sealed).map_err(|_| Error::BadResponse)?;
         Ok(RecoveryResponse::from_bytes(plain.as_ref())?)
     }
 
     /// Encode.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        Writer::new(ANSWER_MAGIC)
-            .bytes(&self.ciphertext)
-            .bytes(&self.sealed)
-            .finish()
+        self.0.to_bytes(ANSWER_MAGIC)
     }
 
     /// Decode.
@@ -2353,13 +2352,11 @@ impl SealAnswer {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(bytes, ANSWER_MAGIC, "seal answer")?;
-        let a = Self {
-            ciphertext: r.bytes()?.into(),
-            sealed: r.bytes()?.into(),
-        };
-        r.finish()?;
-        Ok(a)
+        Ok(Self(KemBox::from_bytes(
+            bytes,
+            ANSWER_MAGIC,
+            "seal answer",
+        )?))
     }
 }
 
@@ -2437,13 +2434,7 @@ impl fmt::Debug for SealedFile {
 }
 
 fn device_key(secret: &[u8], committed: &[u8], id: &Thumbprint, ct: &[u8]) -> Result<SecretBuf> {
-    let hash = suite(ct)?;
-    Ok(DOMAIN.derive_key(
-        hash,
-        &[secret],
-        "device",
-        &[committed, id.as_bytes(), &primitives::digest(hash, &[ct])?],
-    )?)
+    kem_key(secret, ct, "device", &[committed, id.as_bytes()])
 }
 
 fn data_key(hash: &std::ffi::CStr, a: &[u8], b: &[u8], committed: &[u8]) -> Result<SecretBuf> {
