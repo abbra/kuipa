@@ -30,9 +30,10 @@ pub const MAX_VALUE: usize = 512 * 1024;
 
 /// The namespaces a `keys` fetch can name (§18.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Namespace {
     /// `dm/DMHash`: the Directory Manager password hash.
-    Dm,
+    Dm = 1,
     /// `ra/ipaCert`: the RA agent key and certificate (PKCS#12).
     Ra,
     /// `ca/<nickname>`: a CA or KRA subsystem key and certificate
@@ -49,17 +50,20 @@ pub enum Namespace {
 }
 
 impl Namespace {
+    /// Every namespace, in wire-id order.
+    pub const ALL: [Self; 6] = [
+        Self::Dm,
+        Self::Ra,
+        Self::Ca,
+        Self::CaWrapped,
+        Self::LwcaStore,
+        Self::Akamu,
+    ];
+
     /// Its wire id (§14).
     #[must_use]
     pub const fn id(self) -> u8 {
-        match self {
-            Self::Dm => 1,
-            Self::Ra => 2,
-            Self::Ca => 3,
-            Self::CaWrapped => 4,
-            Self::LwcaStore => 5,
-            Self::Akamu => 6,
-        }
+        self as u8
     }
 
     /// From its wire id.
@@ -67,16 +71,11 @@ impl Namespace {
     /// # Errors
     ///
     /// [`Error::Malformed`] for any other value.
-    pub const fn from_id(id: u8) -> Result<Self> {
-        Ok(match id {
-            1 => Self::Dm,
-            2 => Self::Ra,
-            3 => Self::Ca,
-            4 => Self::CaWrapped,
-            5 => Self::LwcaStore,
-            6 => Self::Akamu,
-            _ => return Err(Error::Malformed("namespace")),
-        })
+    pub fn from_id(id: u8) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|n| n.id() == id)
+            .ok_or(Error::Malformed("namespace"))
     }
 
     /// Its name, as FreeIPA's key names use it (`dm/DMHash` and so on).
@@ -93,25 +92,48 @@ impl Namespace {
     }
 }
 
+impl std::fmt::Display for Namespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl std::str::FromStr for Namespace {
+    type Err = Error;
+
+    /// By [`label`](Namespace::label); `lwca` also names the lightweight-CA
+    /// store.
+    fn from_str(s: &str) -> Result<Self> {
+        if s == "lwca" {
+            return Ok(Self::LwcaStore);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|n| n.label() == s)
+            .ok_or(Error::Malformed("namespace"))
+    }
+}
+
 /// The wrap algorithm a `ca_wrapped` fetch asks for (§18.3): an
 /// allowlist, not a pass-through of Dogtag's OIDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum WrapAlg {
     /// AES-256-CBC with PKCS#11 padding (`2.16.840.1.101.3.4.1.42`).
-    Aes256CbcPad,
+    Aes256CbcPad = 1,
     /// AES-256 key wrap (`2.16.840.1.101.3.4.1.45`), where Dogtag
     /// supports it.
     Aes256Wrap,
 }
 
 impl WrapAlg {
+    /// Every algorithm, in wire-selector order.
+    pub const ALL: [Self; 2] = [Self::Aes256CbcPad, Self::Aes256Wrap];
+
     /// Its wire selector (§14).
     #[must_use]
     pub const fn id(self) -> u8 {
-        match self {
-            Self::Aes256CbcPad => 1,
-            Self::Aes256Wrap => 2,
-        }
+        self as u8
     }
 
     /// From its wire selector.
@@ -119,12 +141,11 @@ impl WrapAlg {
     /// # Errors
     ///
     /// [`Error::Malformed`] for any other value.
-    pub const fn from_id(id: u8) -> Result<Self> {
-        Ok(match id {
-            1 => Self::Aes256CbcPad,
-            2 => Self::Aes256Wrap,
-            _ => return Err(Error::Malformed("wrap algorithm")),
-        })
+    pub fn from_id(id: u8) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|a| a.id() == id)
+            .ok_or(Error::Malformed("wrap algorithm"))
     }
 
     /// The OID Dogtag's `pki ca-authority-key-export --algorithm` takes.
@@ -288,5 +309,27 @@ impl KeysPolicy {
             }
             _ => Some("principal may not fetch".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespaces_round_trip_by_id_and_name() {
+        for n in Namespace::ALL {
+            assert_eq!(Namespace::from_id(n.id()).unwrap(), n);
+            assert_eq!(n.to_string().parse::<Namespace>().unwrap(), n);
+        }
+        assert_eq!(Namespace::Dm.id(), 1);
+        assert_eq!(Namespace::Akamu.id(), 6);
+        assert_eq!("lwca".parse::<Namespace>().unwrap(), Namespace::LwcaStore);
+        assert!("nope".parse::<Namespace>().is_err());
+        assert!(Namespace::from_id(0).is_err() && Namespace::from_id(7).is_err());
+        for a in WrapAlg::ALL {
+            assert_eq!(WrapAlg::from_id(a.id()).unwrap(), a);
+        }
+        assert_eq!(WrapAlg::Aes256Wrap.id(), 2);
     }
 }

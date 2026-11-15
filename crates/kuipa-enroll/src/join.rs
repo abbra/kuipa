@@ -66,6 +66,19 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Every operation.
+    pub const ALL: [Self; 9] = [
+        Self::Join,
+        Self::Rekey,
+        Self::Stage,
+        Self::Register,
+        Self::Seal,
+        Self::Keys,
+        Self::Tlog,
+        Self::Sign,
+        Self::Pins,
+    ];
+
     /// The endpoint path segment, `/ipa/ku/<path>/{kid}`.
     #[must_use]
     pub const fn path(self) -> &'static str {
