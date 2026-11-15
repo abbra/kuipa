@@ -190,7 +190,7 @@ async fn serve(cfg: Config) -> Result<(), Error> {
     if keys_service.is_some() {
         eprintln!("kuipad: serving the keys operation at /ipa/ku/keys");
     }
-    let mut ldap = LdapDirectory::new(cfg.directory())?;
+    let mut ldap = LdapDirectory::new(&cfg)?;
     if let Some(keys) = &keys_service {
         ldap.serve_keys(keys.clone());
     }
@@ -362,8 +362,7 @@ fn trust_invitation(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), E
         kuipa_enroll::trust::Invitation::new(&cfg.realm, *anchor.public().thumbprint())?;
     let days = args.bounded_days(7)?;
     let not_after = tang_pqc::unix_seconds(std::time::SystemTime::now()) + days.as_secs();
-    LdapDirectory::new(cfg.directory())?
-        .add_trust_invitation(&invitation.secret_hash()?, not_after)?;
+    LdapDirectory::new(cfg)?.add_trust_invitation(&invitation.secret_hash()?, not_after)?;
     println!("{}", String::from_utf8_lossy(invitation.encode().as_ref()));
     Ok(())
 }
@@ -391,7 +390,7 @@ fn establish_trust(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Er
         &cfg.server,
         keys.signing.public(),
     )?;
-    let directory = LdapDirectory::new(cfg.directory())?;
+    let directory = LdapDirectory::new(cfg)?;
     let mut info = cfg.realm_info(
         directory
             .servers()
@@ -481,7 +480,7 @@ fn run(args: &Args) -> Result<(), Error> {
             // Through gssproxy, as the daemon does, but under its own service
             // section (`contrib/gssproxy-kuipad-keys.conf.example`): the broker
             // is the only one that accepts a custody caller's token.
-            let mut directory = LdapDirectory::new(cfg.directory())?;
+            let mut directory = LdapDirectory::new(&cfg)?;
             directory.serve_keys(keys);
             kuipad::keys::Keys::serve_broker(&listener, &|request| {
                 directory.broker_fetch(request)

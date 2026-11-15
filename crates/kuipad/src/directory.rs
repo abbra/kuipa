@@ -147,9 +147,9 @@ const INVITATION_ATTR: &str = "ipaKUTrustInvitation";
 /// Trusted realms, JSON (new schema).
 const TRUSTED_ATTR: &str = "ipaKUTrustedRealm";
 
-/// Daemon configuration for the directory side.
+/// What the directory side takes from the daemon configuration.
 #[derive(Clone, Debug)]
-pub struct Config {
+struct Config {
     /// LDAPI URI, e.g. `ldapi://%2Frun%2Fslapd-EXAMPLE-TEST.socket`.
     pub ldap_uri: String,
     /// Base DN.
@@ -158,8 +158,6 @@ pub struct Config {
     pub realm: String,
     /// The daemon's principal, e.g. `ipa-ku/ipa1.example.test@EXAMPLE.TEST`.
     pub principal: String,
-    /// GSS-API host-based service name, e.g. `ipa-ku@ipa1.example.test`.
-    pub service: String,
     /// The daemon's keytab.
     pub keytab: String,
     /// Obtain credentials through gssproxy.
@@ -190,14 +188,23 @@ impl LdapDirectory {
     /// # Errors
     ///
     /// A GSS-API error (keytab missing or unreadable, wrong principal).
-    pub fn new(cfg: Config) -> Result<Self, DirectoryError> {
+    pub fn new(cfg: &crate::config::Config) -> Result<Self, DirectoryError> {
         let server_cred = if cfg.gssproxy {
             GssServerCred::from_gssproxy(&cfg.service)?
         } else {
             GssServerCred::acquire(&cfg.service, &cfg.keytab)?
         };
         Ok(Self {
-            cfg,
+            cfg: Config {
+                ldap_uri: cfg.ldap_uri.clone(),
+                basedn: cfg.basedn.clone(),
+                realm: cfg.realm.clone(),
+                principal: cfg.principal.clone(),
+                keytab: cfg.keytab.clone(),
+                gssproxy: cfg.gssproxy,
+                ca_file: cfg.ca_file.clone(),
+                enctypes: cfg.enctypes.iter().copied().map(Enctype).collect(),
+            },
             server_cred,
             keys: None,
             initiator: std::sync::Mutex::new(()),

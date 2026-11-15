@@ -9,7 +9,7 @@ use kuipa_enroll::realm::{KdcProxy, ProxyCa, RealmInfo, TrustedRealm};
 use serde::Deserialize;
 use tang_pqc::Thumbprint;
 
-use crate::{Error, directory};
+use crate::Error;
 
 /// Default configuration path.
 pub const DEFAULT_PATH: &str = "/etc/ipa/kuipad.json";
@@ -318,22 +318,6 @@ impl Config {
     /// A malformed anchor or KDC proxy.
     pub fn trusted_realms(&self) -> Result<Vec<TrustedRealm>, Error> {
         self.trusts.iter().map(TrustConfig::trusted_realm).collect()
-    }
-
-    /// The directory side of the configuration.
-    #[must_use]
-    pub fn directory(&self) -> directory::Config {
-        directory::Config {
-            ldap_uri: self.ldap_uri.clone(),
-            basedn: self.basedn.clone(),
-            realm: self.realm.clone(),
-            principal: self.principal.clone(),
-            service: self.service.clone(),
-            keytab: self.keytab.clone(),
-            gssproxy: self.gssproxy,
-            ca_file: self.ca_file.clone(),
-            enctypes: self.enctypes.iter().copied().map(Enctype).collect(),
-        }
     }
 }
 
