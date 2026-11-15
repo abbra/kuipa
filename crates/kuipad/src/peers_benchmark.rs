@@ -546,7 +546,7 @@ async fn measure_scheduler_repair() {
         let mut tasks = Vec::new();
         for node in &nodes {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            *lock(&node.bench_control) = Some(rx);
+            *lock(&node.probe.control) = Some(rx);
             controls.push(tx);
             let node = node.clone();
             tasks.push(tokio::spawn(async move { node.repair_loop().await }));
@@ -637,17 +637,17 @@ async fn measure_scheduler_repair() {
                 );
             }
             for node in &nodes {
-                node.bench_busy.store(busy, Ordering::Relaxed);
+                node.probe.busy.store(busy, Ordering::Relaxed);
             }
             let mut routine_converged = false;
             for round in 1..=rounds + 1 {
                 let sweep = round == rounds + 1 || routine_converged;
                 for node in &nodes {
-                    node.repair_started.store(0, Ordering::Relaxed);
-                    node.repair_completed.store(0, Ordering::Relaxed);
-                    node.repair_failed.store(0, Ordering::Relaxed);
-                    node.repair_peak.store(0, Ordering::Relaxed);
-                    node.bench_retries.store(0, Ordering::Relaxed);
+                    node.probe.started.store(0, Ordering::Relaxed);
+                    node.probe.completed.store(0, Ordering::Relaxed);
+                    node.probe.failed.store(0, Ordering::Relaxed);
+                    node.probe.peak.store(0, Ordering::Relaxed);
+                    node.probe.retries.store(0, Ordering::Relaxed);
                 }
                 for counter in [
                     &counts.requests,
@@ -665,7 +665,7 @@ async fn measure_scheduler_repair() {
                 lock(&counts.kinds).clear();
                 let targets: Vec<_> = nodes
                     .iter()
-                    .map(|node| node.bench_rounds.load(Ordering::Acquire) + 1)
+                    .map(|node| node.probe.rounds.load(Ordering::Acquire) + 1)
                     .collect();
                 let started = Instant::now();
                 for control in &controls {
@@ -675,9 +675,9 @@ async fn measure_scheduler_repair() {
                     loop {
                         if nodes.iter().zip(&targets).all(|(node, target)| {
                             round_drained(
-                                node.bench_rounds.load(Ordering::Acquire),
+                                node.probe.rounds.load(Ordering::Acquire),
                                 *target,
-                                node.bench_idle.load(Ordering::Acquire),
+                                node.probe.idle.load(Ordering::Acquire),
                             )
                         }) {
                             break;
@@ -705,23 +705,23 @@ async fn measure_scheduler_repair() {
                 }
                 let attempts: usize = nodes
                     .iter()
-                    .map(|node| node.repair_started.load(Ordering::Relaxed))
+                    .map(|node| node.probe.started.load(Ordering::Relaxed))
                     .sum();
                 let completed: usize = nodes
                     .iter()
-                    .map(|node| node.repair_completed.load(Ordering::Acquire))
+                    .map(|node| node.probe.completed.load(Ordering::Acquire))
                     .sum();
                 let failures: usize = nodes
                     .iter()
-                    .map(|node| node.repair_failed.load(Ordering::Relaxed))
+                    .map(|node| node.probe.failed.load(Ordering::Relaxed))
                     .sum();
                 let retries: usize = nodes
                     .iter()
-                    .map(|node| node.bench_retries.load(Ordering::Relaxed))
+                    .map(|node| node.probe.retries.load(Ordering::Relaxed))
                     .sum();
                 let peak = nodes
                     .iter()
-                    .map(|node| node.repair_peak.load(Ordering::Relaxed))
+                    .map(|node| node.probe.peak.load(Ordering::Relaxed))
                     .max()
                     .unwrap();
                 println!(

@@ -381,6 +381,22 @@ pub struct Exchange {
 
 type Engine = GossipEngine<AnchorState, String, Runtime, Arc<Exchange>>;
 
+/// Scheduler counters and manual-round control that tests and the loopback
+/// benchmark read; absent from release builds.
+#[cfg(test)]
+#[derive(Default)]
+struct Probe {
+    started: std::sync::atomic::AtomicUsize,
+    completed: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    rounds: std::sync::atomic::AtomicUsize,
+    retries: std::sync::atomic::AtomicUsize,
+    busy: std::sync::atomic::AtomicUsize,
+    idle: AtomicBool,
+    control: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<bool>>>,
+}
+
 /// The running exchange.
 pub struct Peers {
     exchange: Arc<Exchange>,
@@ -388,23 +404,7 @@ pub struct Peers {
     /// The repair index of the durable state, kept current incrementally.
     index: IndexCache<anchors::EntryId, Sha256>,
     #[cfg(test)]
-    repair_started: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    repair_completed: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    repair_failed: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    repair_peak: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    bench_control: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<bool>>>,
-    #[cfg(test)]
-    bench_rounds: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    bench_idle: AtomicBool,
-    #[cfg(test)]
-    bench_retries: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    bench_busy: std::sync::atomic::AtomicUsize,
+    probe: Probe,
 }
 
 /// The delegation to start with: the stored one if it is still for this
@@ -543,23 +543,7 @@ impl Peers {
             engine,
             index: IndexCache::new(),
             #[cfg(test)]
-            repair_started: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            repair_completed: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            repair_failed: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            repair_peak: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            bench_control: Mutex::new(None),
-            #[cfg(test)]
-            bench_rounds: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            bench_idle: AtomicBool::new(false),
-            #[cfg(test)]
-            bench_retries: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            bench_busy: std::sync::atomic::AtomicUsize::new(0),
+            probe: Probe::default(),
         }))
     }
 
@@ -580,7 +564,7 @@ impl Peers {
 
     async fn repair_loop(self: Arc<Self>) {
         #[cfg(test)]
-        let mut control = lock(&self.bench_control).take();
+        let mut control = lock(&self.probe.control).take();
         #[cfg(not(test))]
         let mut control: Option<tokio::sync::mpsc::UnboundedReceiver<bool>> = None;
         #[cfg(test)]
@@ -606,7 +590,7 @@ impl Peers {
         let mut base_concurrency = 1;
         loop {
             #[cfg(test)]
-            self.bench_idle.store(
+            self.probe.idle.store(
                 pending.is_empty() && running.is_empty() && retries.is_empty(),
                 Ordering::Release,
             );
@@ -624,11 +608,11 @@ impl Peers {
                 let task = running.spawn(async move { worker.repair_peer(&name).await });
                 #[cfg(test)]
                 {
-                    self.repair_started.fetch_add(1, Ordering::Relaxed);
+                    self.probe.started.fetch_add(1, Ordering::Relaxed);
                     if retries.contains_key(&peer) {
-                        self.bench_retries.fetch_add(1, Ordering::Relaxed);
+                        self.probe.retries.fetch_add(1, Ordering::Relaxed);
                     }
-                    self.repair_peak.fetch_max(running.len(), Ordering::Relaxed);
+                    self.probe.peak.fetch_max(running.len(), Ordering::Relaxed);
                 }
                 active.insert(task.id(), (peer, Instant::now()));
             }
@@ -640,7 +624,7 @@ impl Peers {
                     match command {
                         Some(sweep) => {
                             #[cfg(test)]
-                            self.bench_idle.store(false, Ordering::Release);
+                            self.probe.idle.store(false, Ordering::Release);
                             Some(sweep)
                         }
                         None => return,
@@ -671,7 +655,7 @@ impl Peers {
             );
             #[cfg(test)]
             if !automatic && sweep.is_some() {
-                self.bench_rounds.fetch_add(1, Ordering::Release);
+                self.probe.rounds.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -720,9 +704,9 @@ impl Peers {
         #[cfg(test)]
         {
             if !matches!(&result, Ok((_, Ok(())))) {
-                self.repair_failed.fetch_add(1, Ordering::Relaxed);
+                self.probe.failed.fetch_add(1, Ordering::Relaxed);
             }
-            self.repair_completed.fetch_add(1, Ordering::Release);
+            self.probe.completed.fetch_add(1, Ordering::Release);
         }
         if let Some((peer, _)) = active.remove(&id) {
             match result {
@@ -961,23 +945,10 @@ impl Peers {
             .map_err(|_| PeerError::Busy)?;
         let (sync, own, sync_chain) = self.authenticate_sync(body).await?;
         #[cfg(test)]
-        let busy = {
-            let mut remaining = self.bench_busy.load(Ordering::Relaxed);
-            loop {
-                if remaining == 0 {
-                    break false;
-                }
-                match self.bench_busy.compare_exchange_weak(
-                    remaining,
-                    remaining - 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break true,
-                    Err(actual) => remaining = actual,
-                }
-            }
-        };
+        #[expect(deprecated, reason = "try_update needs a newer MSRV than 1.89")]
+        let busy = (self.probe.busy)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok();
         #[cfg(test)]
         if busy {
             return Err(PeerError::Busy.into());
@@ -3115,7 +3086,7 @@ mod tests {
         .await
         .expect("healthy peer was not repaired periodically while another peer stalled");
         assert!(
-            sender.repair_peak.load(Ordering::Relaxed) >= 2,
+            sender.probe.peak.load(Ordering::Relaxed) >= 2,
             "a stalled peer must open a progress slot"
         );
         assert_eq!(
