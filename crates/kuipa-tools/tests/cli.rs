@@ -7,6 +7,16 @@ use std::process::Command;
 use kuipa_enroll::enrollment::{EnrollmentString, Secret};
 use tang_pqc::{SignatureAlg, SigningKey};
 
+/// `kuipa` rooted at `root`, with none of the caller's enrollment file or
+/// trace settings.
+fn kuipa(root: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuipa"));
+    cmd.env("KUIPA_ROOT", root)
+        .env_remove("KUIPA_ENROLLMENT_FILE")
+        .env_remove("KUIPA_TRACE");
+    cmd
+}
+
 /// Run `kuipa enroll` with an OTP enrollment string for EXAMPLE.TEST against
 /// ipa1.example.test, after `configure` has added to the command.  Returns
 /// the exit status and standard error.
@@ -23,14 +33,11 @@ fn enroll_run(name: &str, configure: impl FnOnce(&mut Command)) -> (i32, String)
     );
     let file = dir.join("enrollment");
     std::fs::write(&file, string.encode().as_ref()).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuipa"));
+    let mut cmd = kuipa(&dir);
     cmd.args(["enroll", "--server", "ipa1.example.test"])
         .args(["--hostname", "web1.example.test"])
         .arg("--enrollment-file")
-        .arg(&file)
-        .env("KUIPA_ROOT", &dir)
-        .env_remove("KUIPA_ENROLLMENT_FILE")
-        .env_remove("KUIPA_TRACE");
+        .arg(&file);
     configure(&mut cmd);
     let out = cmd.output().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -117,7 +124,7 @@ fn an_enrolled_host_verifies_with_its_pins_not_the_strings() {
     )
     .unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
+    let out = kuipa(&dir)
         .args([
             "enroll",
             "--server",
@@ -127,10 +134,7 @@ fn an_enrolled_host_verifies_with_its_pins_not_the_strings() {
         ])
         .arg("--enrollment-file")
         .arg(&file)
-        .env("KUIPA_ROOT", &dir)
         .env("KUIPA_ENDPOINTS", "ipa1.example.test=http://127.0.0.1:9")
-        .env_remove("KUIPA_ENROLLMENT_FILE")
-        .env_remove("KUIPA_TRACE")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -176,11 +180,8 @@ fn status_names_its_subject_and_where_each_value_lives() {
     let dir = host_state("status");
 
     let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
+        let out = kuipa(&dir)
             .args(args)
-            .env("KUIPA_ROOT", &dir)
-            .env_remove("KUIPA_ENROLLMENT_FILE")
-            .env_remove("KUIPA_TRACE")
             .env_remove("CLICOLOR_FORCE")
             .output()
             .unwrap();
@@ -229,13 +230,7 @@ fn status_names_its_subject_and_where_each_value_lives() {
 fn a_corrupt_pin_file_refuses_not_forgets() {
     let dir = host_state("corrupt-pin");
     std::fs::write(dir.join("etc/ipa/ku-anchors"), "not-a-thumbprint\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_kuipa"))
-        .args(["status"])
-        .env("KUIPA_ROOT", &dir)
-        .env_remove("KUIPA_ENROLLMENT_FILE")
-        .env_remove("KUIPA_TRACE")
-        .output()
-        .unwrap();
+    let out = kuipa(&dir).args(["status"]).output().unwrap();
     assert!(!out.status.success(), "a corrupt pin file must not pass");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("ku-anchors"), "{err}");
@@ -249,11 +244,8 @@ fn a_corrupt_pin_file_refuses_not_forgets() {
 fn emphasised_labels_keep_the_same_column() {
     let dir = host_state("emphasis");
     let status = |env: &[(&str, &str)]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuipa"));
+        let mut cmd = kuipa(&dir);
         cmd.args(["status"])
-            .env("KUIPA_ROOT", &dir)
-            .env_remove("KUIPA_ENROLLMENT_FILE")
-            .env_remove("KUIPA_TRACE")
             .env_remove("CLICOLOR_FORCE")
             .env_remove("CLICOLOR")
             .env_remove("NO_COLOR");
