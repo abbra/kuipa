@@ -414,9 +414,9 @@ wire protocol are kuipa's.
   its claim log) per server. The measurements describe the fixture's log;
   claim renewals and removals append entries and tombstones, so vouches can
   grow over time even if the number of servers stays fixed (§4.9.1).
-  A renewal leads anchors to re-vouch, batched per round. Selective repair moves changed entries and
-  the keys needed to admit vouches; its size limits can instead trigger a
-  whole-state transfer (§4.2.1). Measured traffic is in the sizing reference.
+  A renewal leads anchors to re-vouch, batched per round. Digest-first repair moves only the changed
+  entries and the keys needed to admit vouches; a whole-state transfer replaces it only when the
+  two servers' entry counts differ by more than 4,096 (§4.2.1). Measured traffic is in the sizing reference.
 
 * **Anchor role.** A server configured with `"anchor": false` holds no
   anchor: it makes claims without one (its claim's anchor field is all
@@ -477,7 +477,8 @@ repair (`agirru_engine::repair`, shared with ahdapa and akamu):
 
 Admission and merge are the same as for a whole state, whatever changed in between. If
 the digests still differ after three passes (concurrent changes), the repair is
-attempted again, up to two attempts. If the two states' entry counts differ by more than
+attempted again, up to two attempts; a repair still unreconciled then fails and waits for a later
+round (it never falls back to a whole-state transfer). If the two states' entry counts differ by more than
 4,096, the probe alone decides for a whole-state transfer instead (`agirru_engine::
 snapshot`): the sender downloads the receiver's encoded state (`IPAS`) in chunks of at
 most 128 KiB, each pinned to the digest the download started at — the receiver keeps

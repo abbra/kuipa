@@ -157,8 +157,9 @@ over `POST /ipa/ku/peer/sync`, authenticated with their Kerberos keys.
   1.1 KB, mostly the Kerberos token, and its answer about 70 bytes (measured,
   playground). The delegation and epoch log tail also travel on first contact,
   when changed, or when the receiver has forgotten them, such as after a restart.
-- **Selective repair moves changed entries.** Servers compare adaptive bucket
-  hashes to find a renewal's claim and vouch. Large differences can trigger
+- **Digest-first repair moves changed entries.** Servers compare bucket
+  hashes over entry ids, descending into dense buckets, to find a renewal's
+  claim and vouch. Only an entry-count difference above 4,096 triggers
   whole-state transfer (DESIGN §4.2.1).
 - **What changes.** A server's claim renews at two thirds of its 90-day
   validity, every 60 days, and every anchor then vouches again. Each
