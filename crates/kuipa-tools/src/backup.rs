@@ -38,7 +38,7 @@ impl RecipientFile {
     ///
     /// I/O, a file that is not one, or a key that is not the one named.
     pub fn read(path: &Path) -> Result<Self, Error> {
-        let file: Self = serde_json::from_slice(&fs::read(path)?)
+        let file: Self = serde_json::from_slice(&crate::paths::read(path)?)
             .map_err(|e| format!("{}: not a recipient file: {e}", path.display()))?;
         file.recipient()?;
         Ok(file)

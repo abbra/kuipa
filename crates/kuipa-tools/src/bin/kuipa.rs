@@ -764,7 +764,7 @@ fn run_escrow(paths: &Paths, action: &EscrowAction) -> Result<Value, Error> {
             keytab,
         } => {
             let input = if let Some(path) = key_file {
-                SecretBuf::new(std::fs::read(path)?)
+                SecretBuf::new(kuipa_tools::paths::read(path)?)
             } else {
                 let mut buf = Vec::new();
                 std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
@@ -786,7 +786,7 @@ fn run_escrow(paths: &Paths, action: &EscrowAction) -> Result<Value, Error> {
                 paths,
                 keytab: keytab.as_deref().map(std::path::Path::new),
             };
-            kuipa_tools::escrow::escrow_file(&by, seal, name, &std::fs::read(file)?)
+            kuipa_tools::escrow::escrow_file(&by, seal, name, &kuipa_tools::paths::read(file)?)
         }
     }
 }
@@ -1418,7 +1418,7 @@ impl Args {
         let mut take =
             |file: Option<&String>, what: &str, hidden: bool| -> Result<SecretBuf, Error> {
                 let value = match file {
-                    Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
+                    Some(path) => first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?)),
                     None if interactive => prompt(what, hidden)?,
                     None => piped.next().unwrap_or_else(|| SecretBuf::with_len(0)),
                 };
@@ -1605,7 +1605,7 @@ fn enroll_online_from_args(args: &Args, paths: &Paths) -> Result<Value, Error> {
     let voucher = args.option("voucher-file");
     let auth = match (principal, ccache, secrets.password) {
         _ if voucher.is_some() => Auth::Voucher {
-            voucher: Secret::new(&std::fs::read(voucher.unwrap_or_default())?),
+            voucher: Secret::new(&kuipa_tools::paths::read(voucher.unwrap_or_default())?),
             ephemeral: args
                 .option("ephemeral-key")
                 .map(|f| std::fs::read(f).map(|k| Secret::new(&k)))
@@ -1662,7 +1662,7 @@ fn run(args: &Args) -> Result<Value, Error> {
                 let string = args.optional_string()?;
                 flows::enroll_bundle(
                     &paths,
-                    &std::fs::read(bundle)?,
+                    &kuipa_tools::paths::read(bundle)?,
                     string.as_ref(),
                     args.flag("insecure-signed-only"),
                     args.option("hostname"),
@@ -2642,7 +2642,7 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
         return security_key_pin(file, "security key PIN (empty if none)");
     }
     let value = match file {
-        Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
+        Some(path) => first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?)),
         None if std::io::stdin().is_terminal() => {
             let first = prompt("device key passphrase or token PIN", true)?;
             if confirm && prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
@@ -2662,7 +2662,7 @@ fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
 /// for none, as it is without a terminal.
 fn security_key_pin(file: Option<&str>, what: &str) -> Result<SecretBuf, Error> {
     match file {
-        Some(path) => Ok(first_line(&SecretBuf::new(std::fs::read(path)?))),
+        Some(path) => Ok(first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?))),
         None if std::io::stdin().is_terminal() => Ok(prompt(what, true)?),
         None => Ok(SecretBuf::with_len(0)),
     }
@@ -2897,7 +2897,7 @@ fn run_open(
         unreachable!("only open");
     };
     let target = kuipa_tools::output::Output::check(std::path::Path::new(out), *force)?;
-    let bytes = std::fs::read(sealed)?;
+    let bytes = kuipa_tools::paths::read(sealed)?;
     let pass = kuipa_tools::seal::SealClient::needs_secret(&bytes)
         .then(|| passphrase(passphrase_file.as_deref(), false))
         .transpose()?;
@@ -2928,7 +2928,7 @@ fn run_deposit(
             let subject = std::collections::BTreeMap::from([("name".to_owned(), name)]);
             client.deposit(
                 seal,
-                &std::fs::read(file)?,
+                &kuipa_tools::paths::read(file)?,
                 kuipa_enroll::seal::DepositKind::File,
                 subject,
             )
@@ -2975,7 +2975,7 @@ fn read_words() -> Result<Vec<String>, Error> {
 /// `none` accept a short or empty one, which is the user's risk.
 fn recovery_passphrase(file: Option<&str>, weak: bool, none: bool) -> Result<SecretBuf, Error> {
     let value = match file {
-        Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
+        Some(path) => first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?)),
         None if std::io::stdin().is_terminal() => {
             let first = prompt("recovery passphrase", true)?;
             if prompt("the same passphrase again", true)?.as_ref() != first.as_ref() {
@@ -3049,7 +3049,7 @@ fn run_recover(
             passphrase_file,
         } => {
             let code = match code_file {
-                Some(path) => first_line(&SecretBuf::new(std::fs::read(path)?)),
+                Some(path) => first_line(&SecretBuf::new(kuipa_tools::paths::read(path)?)),
                 None if std::io::stdin().is_terminal() => prompt("recovery code", true)?,
                 None => {
                     return Err("no recovery code: give --code-file or run on a terminal".into());
@@ -3175,7 +3175,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             session,
         } => {
             let out = out.clone().unwrap_or_else(|| format!("{file}.sealed"));
-            let contents = std::fs::read(file)?;
+            let contents = kuipa_tools::paths::read(file)?;
             let sealed = if *session {
                 client.seal_session(seal, &contents)?
             } else {
@@ -3195,7 +3195,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             let needed = client.seal_needs_passkey(seal);
             let client = with_passkey_pin(client, &user, needed, passkey_pin_file.as_deref())?;
             for path in sealed {
-                let again = client.reseal(seal, &std::fs::read(path)?, Some(pass.as_ref()))?;
+                let again = client.reseal(seal, &kuipa_tools::paths::read(path)?, Some(pass.as_ref()))?;
                 paths::write_file(std::path::Path::new(path), &again, 0o600)?;
             }
             Ok(serde_json::json!({ "seal": seal, "resealed": sealed }))
@@ -3214,7 +3214,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
         SealCommand::Lock { seal } => client.lock(seal),
         SealCommand::Retire { seal, sealed } => {
             for path in sealed {
-                client.retire(seal, &std::fs::read(path)?)?;
+                client.retire(seal, &kuipa_tools::paths::read(path)?)?;
             }
             Ok(serde_json::json!({ "seal": seal, "retired": sealed }))
         }
@@ -3222,7 +3222,7 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
             seal,
             sealed,
             reason,
-        } => client.request(seal, &std::fs::read(sealed)?, reason),
+        } => client.request(seal, &kuipa_tools::paths::read(sealed)?, reason),
         SealCommand::Pending { seal } => client.pending(seal.as_deref()),
         SealCommand::RecoveryCode { passphrase_file } => {
             client.recovery_code(passphrase(passphrase_file.as_deref(), false)?.as_ref())

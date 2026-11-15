@@ -106,7 +106,7 @@ pub fn hostname() -> Result<String, Error> {
 }
 
 pub(crate) fn ca_trust(paths: &Paths) -> Result<Trust, Error> {
-    let certs = synta_certificate::pem_to_der(&fs::read(paths.ca())?);
+    let certs = synta_certificate::pem_to_der(&paths::read(paths.ca())?);
     if certs.is_empty() {
         return Err(format!("no certificates in {}", paths.ca().display()).into());
     }
@@ -637,7 +637,7 @@ fn existing_keytab(paths: &Paths) -> Result<Option<SecretBuf>, Error> {
         Err(e) => return Err(e.into()),
         _ => {}
     }
-    let bytes = SecretBuf::new(fs::read(path)?);
+    let bytes = SecretBuf::new(paths::read(path)?);
     let mut rest = bytes.as_ref();
     if !rest.starts_with(&[5, 2]) {
         return Err("unsupported existing keytab format".into());
@@ -1711,7 +1711,7 @@ fn unseal_failed(e: kuipa_enroll::Error, what: &str) -> Error {
 /// [`Outcome::RetryLater`] if no server could unseal it, or a plain error
 /// if this host's TPM does not open its share.
 pub fn unseal(paths: &Paths) -> Result<Keytab, Error> {
-    let sealed = Sealed::from_bytes(&fs::read(paths.sealed())?)?;
+    let sealed = Sealed::from_bytes(&paths::read(paths.sealed())?)?;
     let share = open_tpm_share(&sealed, "the sealed keytab")?;
     let trust = ca_trust(paths)?;
     sealed
@@ -1728,7 +1728,7 @@ pub fn unseal(paths: &Paths) -> Result<Keytab, Error> {
 /// this host's TPM does not open its share, or a malformed file.
 pub fn unseal_file(paths: &Paths, sealed: &std::path::Path) -> Result<SecretBuf, Error> {
     let what = sealed.display().to_string();
-    let sealed = Sealed::from_bytes(&fs::read(sealed)?)?;
+    let sealed = Sealed::from_bytes(&paths::read(sealed)?)?;
     let share = open_tpm_share(&sealed, &what)?;
     let share = share.as_ref().map(AsRef::as_ref);
     let trust = ca_trust(paths)?;
@@ -1919,7 +1919,7 @@ fn protect_host(paths: &Paths, tpm: Option<&str>) -> Result<Value, Error> {
     let rotated = rotate_keys(paths, Some((Holder::File, tpm)))?;
     // Test-unseal before the plaintext keytab goes away.
     let unsealed = unseal(paths)?;
-    let current = Keytab::from_mit(&fs::read(paths.run_keytab())?)?;
+    let current = Keytab::from_mit(&paths::read(paths.run_keytab())?)?;
     if unsealed.kvno() != current.kvno() {
         return Err("test unseal returned other keys; keeping the plaintext keytab".into());
     }
@@ -2070,14 +2070,14 @@ fn protect_other(
         .into());
     }
     // Through the symlink when already protected: the unsealed copy.
-    let plain = SecretBuf::new(fs::read(&path)?);
+    let plain = SecretBuf::new(paths::read(&path)?);
     let owner_keytab = match (contents, existing, keytab) {
         (Contents::Keytab, _, _) => path.clone(),
         (Contents::File, Some(i), None) => state.protected[i].keytab.clone(),
         (Contents::File, _, Some(k)) => absolute(k)?,
         (Contents::File, None, None) => paths.keytab(),
     };
-    let principal = Keytab::from_mit(&fs::read(&owner_keytab)?)?
+    let principal = Keytab::from_mit(&paths::read(&owner_keytab)?)?
         .principal()
         .clone();
     if principal.realm() != state.realm {

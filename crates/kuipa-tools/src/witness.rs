@@ -83,7 +83,7 @@ pub fn manage(
     let mut trusted = Trusted::load(paths)?;
     let changed = add.is_some() || remove.is_some() || required.is_some();
     if let Some(file) = add {
-        let jwk: Value = serde_json::from_slice(&std::fs::read(file)?)?;
+        let jwk: Value = serde_json::from_slice(&crate::paths::read(file)?)?;
         if jwk.get("priv").is_some() {
             return Err("give the witness's public JWK, not its private key".into());
         }

@@ -275,6 +275,18 @@ pub fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), Error> {
     write_atomic(path, mode, |f| Ok(f.write_all(data)?))
 }
 
+/// [`fs::read`], with the path in the error text and its `kind()` kept
+/// (see [`read_pins_or_none`]).
+///
+/// # Errors
+///
+/// I/O errors.
+pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, Error> {
+    let path = path.as_ref();
+    fs::read(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())).into())
+}
+
 /// Remove a file if it exists.
 ///
 /// # Errors

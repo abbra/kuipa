@@ -142,7 +142,7 @@ fn quota_lock(path: &Path) -> Result<QuotaGuard, Error> {
 pub fn sign(key: &Path, quota: &Path, request: &str) -> Result<String, Error> {
     let mut guard = quota_lock(quota)?;
     let request = BlindRequest::from_bytes(&b64::decode(request.trim())?)?;
-    let sk = ml_dsa_blind::SigningKey::from_pem(&std::fs::read(key)?)?;
+    let sk = ml_dsa_blind::SigningKey::from_pem(&crate::paths::read(key)?)?;
     let mut q = read_quota(&mut guard)?;
     if q.issued >= q.limit {
         return Err(format!("quota exhausted ({} of {} issued)", q.issued, q.limit).into());
@@ -245,7 +245,7 @@ pub fn request(public: &[u8], claims: &Claims, state: &Path) -> Result<String, E
 ///
 /// A response that is not a valid signature on the request, or I/O.
 pub fn finish(state: &Path, response: &str) -> Result<Voucher, Error> {
-    let s: State = serde_json::from_slice(SecretBuf::new(std::fs::read(state)?).as_ref())?;
+    let s: State = serde_json::from_slice(SecretBuf::new(crate::paths::read(state)?).as_ref())?;
     let key = VerifyingKey::from_jwk_json(s.key.as_bytes())?;
     let claims = s.claims()?;
     let salt = SecretBuf::new(b64::decode(&s.salt)?);
