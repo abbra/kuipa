@@ -470,19 +470,31 @@ pub fn read_anchors_from(path: &Path) -> Result<Vec<tang_pqc::Thumbprint>, Error
 /// # Errors
 ///
 /// I/O errors or a malformed line.
-pub fn live_pins(path: &Path) -> Result<Vec<Pin>, Error> {
+fn live_pins(path: &Path) -> Result<Vec<Pin>, Error> {
     let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
-    Ok(read_anchor_pins(path)?
+    Ok(read_pins_or_none(path)?
         .into_iter()
         .filter(|p| p.exp.is_none_or(|e| now <= e.saturating_add(CLOCK_SKEW)))
         .collect())
 }
 
-/// Whether a pin-read error is only "no pin file here yet".
-#[must_use]
-pub(crate) fn is_missing(e: &Error) -> bool {
-    e.downcast_ref::<std::io::Error>()
-        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+/// [`read_anchor_pins`], where a missing file is no pins: a malformed one
+/// is still an error, since pins are trust and a corrupt pin file must fail
+/// closed.
+///
+/// # Errors
+///
+/// I/O errors other than "not found", or a malformed line.
+pub fn read_pins_or_none(path: &Path) -> Result<Vec<Pin>, Error> {
+    match read_anchor_pins(path) {
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(Vec::new())
+        }
+        other => other,
+    }
 }
 
 /// What a pin file hands to verification: the live anchors, every head
@@ -508,11 +520,7 @@ pub type Windows = (
 ///
 /// I/O errors or a malformed line.
 pub fn pinned_windows(path: &Path) -> Result<Windows, Error> {
-    let pins = match live_pins(path) {
-        Ok(pins) => pins,
-        Err(e) if is_missing(&e) => return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new())),
-        Err(e) => return Err(e),
-    };
+    let pins = live_pins(path)?;
     let anchors = pins.iter().map(|p| p.anchor).collect();
     let heads = pins
         .iter()
@@ -583,6 +591,21 @@ pub struct Pin {
     pub retired: Vec<Hash>,
 }
 
+impl Pin {
+    /// A pin of `anchor` that does not expire, is not frozen and has
+    /// retired nothing.
+    #[must_use]
+    pub fn new(anchor: tang_pqc::Thumbprint, heads: Vec<(u64, Hash)>) -> Self {
+        Self {
+            anchor,
+            exp: None,
+            heads,
+            frozen: false,
+            retired: Vec::new(),
+        }
+    }
+}
+
 /// Most heads kept in one pin's window (DESIGN-claim-logs.md §1.2):
 /// enough to cover a month of daily re-vouching with room for
 /// refreshes in between, small enough that a pin line stays a line.
@@ -623,11 +646,8 @@ pub fn merge_windows(
         let Some(pin) = out.iter_mut().find(|p| &p.anchor == anchor) else {
             // A new anchor: its pin starts at the new head.
             out.push(Pin {
-                anchor: *anchor,
-                exp: None,
-                heads: head.map_or_else(Vec::new, |h| vec![h]),
-                frozen: false,
                 retired: head.map_or_else(Vec::new, |_| learned(anchor)),
+                ..Pin::new(*anchor, head.map_or_else(Vec::new, |h| vec![h]))
             });
             continue;
         };
@@ -917,71 +937,13 @@ fn parse_root(field: &str, line: &str, path: &Path) -> Result<Hash, Error> {
 ///
 /// I/O errors.
 pub fn write_anchors(paths: &Paths, anchors: &[tang_pqc::Thumbprint]) -> Result<(), Error> {
-    write_anchors_to(&paths.anchors(), "kuipa realm anchors", anchors)
-}
-
-/// Write the pinned anchors and the anchor epoch watermark (§4.8).
-///
-/// # Errors
-///
-/// I/O errors.
-pub fn write_anchors_epoch(
-    paths: &Paths,
-    anchors: &[tang_pqc::Thumbprint],
-    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
-) -> Result<(), Error> {
-    write_anchors_epoch_with_heads(
-        paths,
-        &anchors.iter().map(|a| (*a, None)).collect::<Vec<_>>(),
-        epoch,
-    )
-}
-
-/// [`write_anchors_epoch`] with the anchors'
-/// vouch heads (§4.9), aligned with `anchors`: `None` where the server
-/// knew no head.
-///
-/// # Errors
-///
-/// I/O errors.
-pub fn write_anchors_epoch_with_heads(
-    paths: &Paths,
-    anchors: &[AnchorHead],
-    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
-) -> Result<(), Error> {
-    write_anchor_pins(
-        &paths.anchors(),
-        "kuipa realm anchors",
-        &anchors
-            .iter()
-            .map(|(a, head)| Pin {
-                anchor: *a,
-                exp: None,
-                heads: head.map_or_else(Vec::new, |h| vec![h]),
-                frozen: false,
-                retired: Vec::new(),
-            })
-            .collect::<Vec<_>>(),
-        epoch,
-    )
+    let pins: Vec<Pin> = anchors.iter().map(|a| Pin::new(*a, Vec::new())).collect();
+    write_anchor_pins(&paths.anchors(), "kuipa realm anchors", &pins, None)
 }
 
 /// An anchor with its current vouch head (§4.9), as server responses
 /// deliver them: `None` where the server knew no head.
 pub type AnchorHead = (tang_pqc::Thumbprint, Option<(u64, Hash)>);
-
-/// Write an anchors file with a `# comment` first line.
-///
-/// # Errors
-///
-/// I/O errors.
-pub fn write_anchors_to(
-    path: &Path,
-    comment: &str,
-    anchors: &[tang_pqc::Thumbprint],
-) -> Result<(), Error> {
-    write_anchor_thumbs(path, comment, anchors, None)
-}
 
 /// Write an anchors file with expiry-bearing pins and an optional epoch
 /// watermark (§4.8).
@@ -1020,31 +982,6 @@ pub fn write_anchor_pins(
         for leaf in &pin.retired {
             write!(text, " {}", tang_pqc::b64::encode(leaf)).expect("a String sink never fails");
         }
-        text.push('\n');
-    }
-    write_file(path, text.as_bytes(), 0o644)
-}
-
-/// Write an anchors file with plain thumbprint pins (no expiry, no
-/// head) and an optional epoch watermark (§4.8).
-///
-/// # Errors
-///
-/// I/O errors.
-pub fn write_anchor_thumbs(
-    path: &Path,
-    comment: &str,
-    anchors: &[tang_pqc::Thumbprint],
-    epoch: Option<(u64, kuipa_enroll::epoch::EpochHead)>,
-) -> Result<(), Error> {
-    use std::fmt::Write as _; // appending to a String cannot fail
-    let mut text = format!("# {comment}\n");
-    if let Some((seq, head)) = epoch {
-        writeln!(text, "epoch {seq} {}", tang_pqc::b64::encode(&head))
-            .expect("a String sink never fails");
-    }
-    for a in anchors {
-        text.push_str(&a.to_string());
         text.push('\n');
     }
     write_file(path, text.as_bytes(), 0o644)
@@ -1222,7 +1159,13 @@ mod tests {
         let b = tang_pqc::Thumbprint::from_bytes([2; 32]);
         let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
         // Written lists carry no expiry and read back unchanged.
-        write_anchors_to(&path, "test", &[a, b]).unwrap();
+        write_anchor_pins(
+            &path,
+            "test",
+            &[Pin::new(a, Vec::new()), Pin::new(b, Vec::new())],
+            None,
+        )
+        .unwrap();
         assert_eq!(read_anchors_from(&path).unwrap(), vec![a, b]);
         assert_eq!(
             read_epoch_from(&path).unwrap(),

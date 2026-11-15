@@ -28,15 +28,15 @@ use crate::paths::Error;
 
 /// One SRV record.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Srv {
+struct Srv {
     /// Lower is preferred.
-    pub priority: u16,
+    priority: u16,
     /// Higher is preferred among equal priorities.
-    pub weight: u16,
+    weight: u16,
     /// Port.
-    pub port: u16,
+    port: u16,
     /// Target host name, without the trailing dot.
-    pub target: String,
+    target: String,
 }
 
 /// The default `DoT` and `DoH` ports.
@@ -321,15 +321,6 @@ fn lookup(name: &str, nameservers: Option<&Nameservers>) -> Result<Vec<Srv>, Err
         tracing::debug!("DNS: {} SRV record(s) for {name}", records.len());
         Ok(records)
     })
-}
-
-/// The SRV records for `name`, from `KUIPA_DNS` or the system resolvers.
-///
-/// # Errors
-///
-/// A failed lookup.
-pub fn srv(name: &str) -> Result<Vec<Srv>, Error> {
-    lookup(name, configured()?.as_ref())
 }
 
 /// The IPA servers of `domain` from `_ldap._tcp.<domain>`, by priority,

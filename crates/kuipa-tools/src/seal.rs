@@ -306,20 +306,6 @@ fn write_device_key(
     user.write(&user.device_key(), &protect_key(key, passphrase)?)
 }
 
-/// Read the device key under `passphrase`.
-///
-/// # Errors
-///
-/// No device key, a wrong passphrase, or a malformed file.
-pub fn read_device_key(user: &UserPaths, passphrase: &[u8]) -> Result<ExchangeKeyPair, Error> {
-    let bytes = fs::read(user.device_key())
-        .map_err(|_| "this host has no device key: run `kuipa seal device add SEAL` first")?;
-    if tpm_wrapped(&bytes) {
-        return unprotect_tpm(&bytes);
-    }
-    unprotect_key(&bytes, passphrase)
-}
-
 /// The key `protect_key` protected under `secret`.
 fn unprotect_key(bytes: &[u8], secret: &[u8]) -> Result<ExchangeKeyPair, Error> {
     let mut r = Reader::new(bytes, DEVICE_KEY_MAGIC, "device key")?;

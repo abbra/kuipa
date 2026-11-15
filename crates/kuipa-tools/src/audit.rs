@@ -80,13 +80,7 @@ pub fn coverage(
     } else {
         given
             .iter()
-            .map(|(anchor, size, root)| paths::Pin {
-                anchor: *anchor,
-                exp: None,
-                heads: vec![(*size, *root)],
-                frozen: false,
-                retired: Vec::new(),
-            })
+            .map(|(anchor, size, root)| paths::Pin::new(*anchor, vec![(*size, *root)]))
             .collect()
     };
     let now = SystemTime::now();

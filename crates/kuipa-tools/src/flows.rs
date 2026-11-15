@@ -1196,17 +1196,6 @@ fn payload_epoch(enrollment: &Enrollment) -> Option<Epoch> {
     (enrollment.epoch_seq != 0).then_some((enrollment.epoch_seq, enrollment.epoch_head))
 }
 
-/// The host's pins for a merge: none where there is no pin file, but a
-/// malformed pin file is an error — pins are trust, and an exchange must
-/// not rewrite a file it cannot read (§4.4).
-fn pins_to_merge(path: &std::path::Path) -> Result<Vec<paths::Pin>, Error> {
-    match paths::read_anchor_pins(path) {
-        Ok(pins) => Ok(pins),
-        Err(e) if paths::is_missing(&e) => Ok(Vec::new()),
-        Err(e) => Err(e),
-    }
-}
-
 /// The bound on a window extension's log (§4.9), in claim-log pages: a
 /// head naming more leaves than [`MAX_HEAD_FETCH_PAGES`] pages of the
 /// server's page size (`kuipa_enroll::server::MAX_CLAIM_LOG_PAGE`) is not
@@ -1419,7 +1408,7 @@ fn write_windows(
         None
     };
     locked_pins(paths, || {
-        let pins = pins_to_merge(&paths.anchors())?;
+        let pins = paths::read_pins_or_none(&paths.anchors())?;
         let (heads, learned) = backed(endpoint.as_ref(), realm, &pins, heads, proved);
         // With no pins there is nothing to keep consistent: no pages to read.
         let (mut merged, forked) = match (&endpoint, pins.is_empty()) {
@@ -2261,7 +2250,7 @@ pub fn status(paths: &Paths) -> Result<Value, Error> {
     // The pinned windows and frozen pins (DESIGN-claim-logs.md §1–§2):
     // what a reader can see about this host's trust state.
     // A corrupt pin file is reported, not shown as no windows.
-    let pins = pins_to_merge(&paths.anchors())?;
+    let pins = paths::read_pins_or_none(&paths.anchors())?;
     let windows: Vec<Value> = pins
         .iter()
         .map(|p| {
@@ -3149,14 +3138,10 @@ fn install_trust(
     // pinned stays (a head-wise refresh signs nothing), and
     // [`paths::merge_windows`] grows and trims the windows as the
     // host's own exchange does (§1.2).
-    let previous = match paths::read_anchor_pins(&paths.trust_anchors(&t.realm)) {
-        Ok(pins) => pins
-            .into_iter()
-            .filter(|p| t.anchors.contains(&p.anchor))
-            .collect::<Vec<_>>(),
-        Err(e) if paths::is_missing(&e) => Vec::new(),
-        Err(e) => return Err(e),
-    };
+    let previous: Vec<_> = paths::read_pins_or_none(&paths.trust_anchors(&t.realm))?
+        .into_iter()
+        .filter(|p| t.anchors.contains(&p.anchor))
+        .collect();
     let wanted: Vec<paths::AnchorHead> = t
         .heads
         .iter()
@@ -3174,13 +3159,7 @@ fn install_trust(
     for a in &t.anchors {
         // Every anchor B lists gets a line, head or no head.
         if !pins.iter().any(|p| p.anchor == *a) {
-            pins.push(Pin {
-                anchor: *a,
-                exp: None,
-                heads: Vec::new(),
-                frozen: false,
-                retired: Vec::new(),
-            });
+            pins.push(Pin::new(*a, Vec::new()));
         }
     }
     let (pins, forked) = paths::merge_windows(&pins, &backed_heads, &learned);
@@ -3237,11 +3216,10 @@ fn refresh_trust(
     // whatever the wire carried.
     let heads = t.pins();
     // What this host learned B's logs retired, from its installed pins.
-    let retired: Vec<Hash> = match paths::read_anchor_pins(&paths.trust_anchors(&t.realm)) {
-        Ok(pins) => pins.into_iter().flat_map(|p| p.retired).collect(),
-        Err(e) if paths::is_missing(&e) => Vec::new(),
-        Err(e) => return Err(e),
-    };
+    let retired: Vec<Hash> = paths::read_pins_or_none(&paths.trust_anchors(&t.realm))?
+        .into_iter()
+        .flat_map(|p| p.retired)
+        .collect();
     let found = if errors.is_empty() {
         t.servers.iter().find_map(|s| {
             match verified(
@@ -3445,19 +3423,17 @@ mod tests {
 
     /// A pin of `anchor`; a frozen one needs a head to be frozen to.
     fn pin(anchor: Thumbprint, frozen: bool) -> paths::Pin {
+        let heads = if frozen {
+            vec![(
+                1,
+                kuipa_enroll::merkle::Hash::zero(kuipa_enroll::merkle::TreeHash::Sha256),
+            )]
+        } else {
+            Vec::new()
+        };
         paths::Pin {
-            anchor,
-            exp: None,
-            heads: if frozen {
-                vec![(
-                    1,
-                    kuipa_enroll::merkle::Hash::zero(kuipa_enroll::merkle::TreeHash::Sha256),
-                )]
-            } else {
-                Vec::new()
-            },
             frozen,
-            retired: Vec::new(),
+            ..paths::Pin::new(anchor, heads)
         }
     }
 
