@@ -152,14 +152,14 @@ impl Advertisement {
 /// The ML-DSA algorithm of an advertised signing key, if it is one.
 fn signing_alg(jwk: &Jwk) -> Option<SignatureAlg> {
     jwk.akp_alg()
-        .and_then(SignatureAlg::from_jose_name)
+        .and_then(|name| name.parse().ok())
         .filter(|_| jwk.states(OP_VERIFY))
 }
 
 /// The ML-KEM algorithm of an advertised exchange key, if it is one.
 fn exchange_alg(jwk: &Jwk) -> Option<KemAlg> {
     jwk.akp_alg()
-        .and_then(KemAlg::from_jose_name)
+        .and_then(|name| name.parse().ok())
         .filter(|_| jwk.states(OP_DERIVE_KEY))
 }
 

@@ -63,14 +63,11 @@ fn keygen_from_seed(alg: &CStr, seed: &SecretBuf) -> Result<Pkey<Private>> {
 }
 
 /// Parse a private AKP JWK into `(algorithm, jwk, seed)`.
-fn parse_private_jwk<A>(
-    json: &[u8],
-    alg_from_name: fn(&str) -> Option<A>,
-) -> Result<(A, Jwk, SecretBuf)> {
+fn parse_private_jwk<A: FromStr>(json: &[u8]) -> Result<(A, Jwk, SecretBuf)> {
     let jwk = Jwk::from_json(json)?;
     let alg = jwk
         .akp_alg()
-        .and_then(alg_from_name)
+        .and_then(|name| name.parse().ok())
         .ok_or(Error::UnsupportedKey)?;
     let seed = SecretBuf::new(b64::decode(
         jwk.private
@@ -236,7 +233,7 @@ impl ExchangeKey {
         let jwk = Jwk::from_json(json)?;
         let alg = jwk
             .akp_alg()
-            .and_then(KemAlg::from_jose_name)
+            .and_then(|name| name.parse().ok())
             .ok_or(Error::UnsupportedKey)?;
         if !jwk.states(OP_DERIVE_KEY) {
             return Err(Error::Malformed("JWK: key_ops"));
@@ -343,7 +340,7 @@ impl ExchangeKeyPair {
     /// that does not match the seed; [`Error::UnsupportedKey`] for other
     /// algorithms.
     pub fn from_jwk(json: &[u8]) -> Result<Self> {
-        let (alg, jwk, seed) = parse_private_jwk(json, KemAlg::from_jose_name)?;
+        let (alg, jwk, seed) = parse_private_jwk::<KemAlg>(json)?;
         if seed.len() != KemAlg::SEED_LEN {
             return Err(Error::Malformed("JWK: ML-KEM seed must be 64 bytes"));
         }
@@ -548,7 +545,7 @@ impl VerifyingKey {
         let jwk = Jwk::from_json(json)?;
         let alg = jwk
             .akp_alg()
-            .and_then(SignatureAlg::from_jose_name)
+            .and_then(|name| name.parse().ok())
             .ok_or(Error::UnsupportedKey)?;
         if !jwk.states(OP_VERIFY) {
             return Err(Error::Malformed("JWK: key_ops"));
@@ -640,7 +637,7 @@ impl SigningKey {
     /// that does not match the seed; [`Error::UnsupportedKey`] for other
     /// algorithms.
     pub fn from_jwk(json: &[u8]) -> Result<Self> {
-        let (alg, jwk, seed) = parse_private_jwk(json, SignatureAlg::from_jose_name)?;
+        let (alg, jwk, seed) = parse_private_jwk::<SignatureAlg>(json)?;
         if seed.len() != SignatureAlg::SEED_LEN {
             return Err(Error::Malformed("JWK: ML-DSA seed must be 32 bytes"));
         }

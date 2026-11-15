@@ -4,6 +4,7 @@ use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 use crate::adv::{Lifetime, SignedAdvertisement};
+use crate::alg::{KemAlg, SignatureAlg};
 use crate::error::{Error, Result};
 use crate::keys::{ExchangeKey, ExchangeKeyPair, SigningKey, Thumbprint};
 use crate::primitives::Domain;
@@ -21,21 +22,20 @@ fn sign_advertisement(
     validity: Duration,
     now: u64,
 ) -> Result<SignedAdvertisement> {
-    let mut allowed_signing = Vec::new();
-    for key in signing {
-        if key.public().alg().allowed_by_system()? {
-            allowed_signing.push(key);
-        }
-    }
+    let signature_algs = SignatureAlg::allowed()?;
+    let allowed_signing: Vec<_> = signing
+        .iter()
+        .filter(|key| signature_algs.contains(&key.public().alg()))
+        .collect();
     if allowed_signing.is_empty() {
         return Err(Error::NoAllowedAlgorithm("ML-DSA signing key"));
     }
-    let mut publics = Vec::new();
-    for key in exchange {
-        if key.public().alg().allowed_by_system()? {
-            publics.push(key.public());
-        }
-    }
+    let kems = KemAlg::allowed()?;
+    let publics: Vec<_> = exchange
+        .iter()
+        .map(ExchangeKeyPair::public)
+        .filter(|key| kems.contains(&key.alg()))
+        .collect();
     if publics.is_empty() {
         return Err(Error::NoAllowedAlgorithm("ML-KEM exchange key"));
     }

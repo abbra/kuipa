@@ -57,18 +57,8 @@ impl Policy {
     /// [`Error::SystemPolicy`] if OpenSSL's configuration cannot be read, or
     /// [`Error::NoAllowedAlgorithm`] if it allows no ML-KEM or no ML-DSA.
     pub fn from_system() -> Result<Self> {
-        let mut kems = Vec::new();
-        for alg in KemAlg::ALL {
-            if alg.allowed_by_system()? {
-                kems.push(alg);
-            }
-        }
-        let mut signature_algs = Vec::new();
-        for alg in SignatureAlg::ALL {
-            if alg.allowed_by_system()? {
-                signature_algs.push(alg);
-            }
-        }
+        let kems = KemAlg::allowed()?;
+        let signature_algs = SignatureAlg::allowed()?;
         if kems.is_empty() {
             return Err(Error::NoAllowedAlgorithm("ML-KEM"));
         }

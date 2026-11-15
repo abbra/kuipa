@@ -1,6 +1,8 @@
 //! Algorithm identifiers (FIPS 203 ML-KEM and FIPS 204 ML-DSA).
 
 use std::ffi::CStr;
+use std::fmt;
+use std::str::FromStr;
 
 use native_ossl::pkey::{HasPublic, Pkey};
 use native_ossl::system_policy::SystemPolicy;
@@ -38,46 +40,6 @@ impl KemAlg {
         }
     }
 
-    /// Does the system crypto policy allow this KEM?
-    ///
-    /// ML-KEM-*n* is allowed when any TLS group the policy allows contains
-    /// it, pure or hybrid (see [`SystemPolicy::allows_ml_kem`]).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::SystemPolicy`] if OpenSSL's configuration cannot be read.
-    pub fn allowed_by_system(self) -> Result<bool> {
-        Ok(system_policy()?.allows_ml_kem(self.level()))
-    }
-
-    /// Fail unless the system crypto policy allows this KEM.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::DisabledBySystemPolicy`] or [`Error::SystemPolicy`].
-    pub fn ensure_allowed(self) -> Result<()> {
-        if self.allowed_by_system()? {
-            Ok(())
-        } else {
-            Err(Error::DisabledBySystemPolicy(self.jose_name()))
-        }
-    }
-
-    /// The first KEM in [`PREFERENCE`](Self::PREFERENCE) that the system
-    /// policy allows.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NoAllowedAlgorithm`] if the policy allows none.
-    pub fn preferred() -> Result<Self> {
-        for alg in Self::PREFERENCE {
-            if alg.allowed_by_system()? {
-                return Ok(alg);
-            }
-        }
-        Err(Error::NoAllowedAlgorithm("ML-KEM"))
-    }
-
     /// OpenSSL algorithm name.
     #[must_use]
     pub const fn name(self) -> &'static CStr {
@@ -109,10 +71,6 @@ impl KemAlg {
     /// Length of the FIPS 203 private-key seed `d ‖ z`.
     pub(crate) const SEED_LEN: usize = 64;
 
-    pub(crate) fn from_jose_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| a.jose_name() == name)
-    }
-
     /// Wire identifier.
     #[must_use]
     pub const fn id(self) -> u8 {
@@ -140,6 +98,20 @@ impl KemAlg {
         }
     }
 
+    /// The KEM whose ciphertexts are `len` bytes long.
+    #[must_use]
+    pub fn from_ciphertext_len(len: usize) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.ciphertext_len() == len)
+    }
+
+    /// The KEM whose encapsulation keys are `len` bytes long.
+    #[must_use]
+    pub fn from_key_len(len: usize) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|a| a.encapsulation_key_len() == len)
+    }
+
     /// Inverse of [`id`](Self::id).
     ///
     /// # Errors
@@ -150,10 +122,6 @@ impl KemAlg {
             .into_iter()
             .find(|a| a.id() == id)
             .ok_or(Error::UnsupportedAlgorithm(id))
-    }
-
-    pub(crate) fn of<T: HasPublic>(key: &Pkey<T>) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| key.is_a(a.name()))
     }
 }
 
@@ -186,39 +154,6 @@ impl SignatureAlg {
         }
     }
 
-    /// Does the system crypto policy allow this algorithm (TLS signature
-    /// algorithm `mldsa44`/`mldsa65`/`mldsa87`)?
-    ///
-    /// # Errors
-    ///
-    /// [`Error::SystemPolicy`] if OpenSSL's configuration cannot be read.
-    pub fn allowed_by_system(self) -> Result<bool> {
-        Ok(system_policy()?.allows_ml_dsa(self.level()))
-    }
-
-    pub(crate) fn ensure_allowed(self) -> Result<()> {
-        if self.allowed_by_system()? {
-            Ok(())
-        } else {
-            Err(Error::DisabledBySystemPolicy(self.jose_name()))
-        }
-    }
-
-    /// The first algorithm in [`PREFERENCE`](Self::PREFERENCE) that the
-    /// system policy allows.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NoAllowedAlgorithm`] if the policy allows none.
-    pub fn preferred() -> Result<Self> {
-        for alg in Self::PREFERENCE {
-            if alg.allowed_by_system()? {
-                return Ok(alg);
-            }
-        }
-        Err(Error::NoAllowedAlgorithm("ML-DSA"))
-    }
-
     /// OpenSSL algorithm name.
     #[must_use]
     pub const fn name(self) -> &'static CStr {
@@ -242,10 +177,6 @@ impl SignatureAlg {
     /// Length of the FIPS 204 private-key seed `ξ`.
     pub(crate) const SEED_LEN: usize = 32;
 
-    pub(crate) fn from_jose_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| a.jose_name() == name)
-    }
-
     /// Public key length in bytes.
     #[must_use]
     pub const fn public_key_len(self) -> usize {
@@ -265,8 +196,121 @@ impl SignatureAlg {
             Self::MlDsa87 => 4627,
         }
     }
+}
 
-    pub(crate) fn of<T: HasPublic>(key: &Pkey<T>) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| key.is_a(a.name()))
+/// What [`KemAlg`] and [`SignatureAlg`] share: the system-policy queries,
+/// `of` and the JOSE name as `Display`/`FromStr`.  `$family` names the
+/// algorithm family in errors and `$allows` is its [`SystemPolicy`] query.
+macro_rules! alg_family {
+    ($ty:ident, $family:literal, $allows:ident) => {
+        impl $ty {
+            /// Does the system crypto policy allow this algorithm?
+            ///
+            /// ML-KEM-*n* is allowed when any TLS group the policy allows
+            /// contains it, pure or hybrid; ML-DSA-*n* when it allows the
+            /// TLS signature algorithm `mldsa<n>`.
+            ///
+            /// # Errors
+            ///
+            /// [`Error::SystemPolicy`] if OpenSSL's configuration cannot be read.
+            pub fn allowed_by_system(self) -> Result<bool> {
+                Ok(system_policy()?.$allows(self.level()))
+            }
+
+            /// Fail unless the system crypto policy allows this algorithm.
+            ///
+            /// # Errors
+            ///
+            /// [`Error::DisabledBySystemPolicy`] or [`Error::SystemPolicy`].
+            pub fn ensure_allowed(self) -> Result<()> {
+                if self.allowed_by_system()? {
+                    Ok(())
+                } else {
+                    Err(Error::DisabledBySystemPolicy(self.jose_name()))
+                }
+            }
+
+            /// The algorithms of [`ALL`](Self::ALL) that the system policy allows.
+            ///
+            /// # Errors
+            ///
+            /// [`Error::SystemPolicy`] if OpenSSL's configuration cannot be read.
+            pub fn allowed() -> Result<Vec<Self>> {
+                let mut out = Vec::new();
+                for alg in Self::ALL {
+                    if alg.allowed_by_system()? {
+                        out.push(alg);
+                    }
+                }
+                Ok(out)
+            }
+
+            /// The first algorithm in [`PREFERENCE`](Self::PREFERENCE) that the
+            /// system policy allows.
+            ///
+            /// # Errors
+            ///
+            /// [`Error::NoAllowedAlgorithm`] if the policy allows none.
+            pub fn preferred() -> Result<Self> {
+                for alg in Self::PREFERENCE {
+                    if alg.allowed_by_system()? {
+                        return Ok(alg);
+                    }
+                }
+                Err(Error::NoAllowedAlgorithm($family))
+            }
+
+            pub(crate) fn of<T: HasPublic>(key: &Pkey<T>) -> Option<Self> {
+                Self::ALL.into_iter().find(|a| key.is_a(a.name()))
+            }
+        }
+
+        /// The JOSE `alg` value.
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.jose_name())
+            }
+        }
+
+        impl FromStr for $ty {
+            type Err = Error;
+
+            fn from_str(name: &str) -> Result<Self> {
+                Self::ALL
+                    .into_iter()
+                    .find(|a| a.jose_name() == name)
+                    .ok_or(Error::Malformed("algorithm name"))
+            }
+        }
+    };
+}
+
+alg_family!(KemAlg, "ML-KEM", allows_ml_kem);
+alg_family!(SignatureAlg, "ML-DSA", allows_ml_dsa);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jose_names_round_trip() {
+        for alg in KemAlg::ALL {
+            assert_eq!(alg.to_string().parse::<KemAlg>().unwrap(), alg);
+        }
+        for alg in SignatureAlg::ALL {
+            assert_eq!(alg.to_string().parse::<SignatureAlg>().unwrap(), alg);
+        }
+        assert!("ML-KEM-512".parse::<KemAlg>().is_err());
+        assert!("ML-KEM-768".parse::<SignatureAlg>().is_err());
+    }
+
+    #[test]
+    fn kems_are_found_by_length() {
+        for alg in KemAlg::ALL {
+            assert_eq!(KemAlg::from_key_len(alg.encapsulation_key_len()), Some(alg));
+        }
+        assert_eq!(KemAlg::from_ciphertext_len(1088), Some(KemAlg::MlKem768));
+        assert_eq!(KemAlg::from_ciphertext_len(1568), Some(KemAlg::MlKem1024));
+        assert_eq!(KemAlg::from_ciphertext_len(1), None);
     }
 }
