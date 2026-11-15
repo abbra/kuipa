@@ -57,6 +57,8 @@ struct MemoryDirectory {
     escrow: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     escrow_files: RefCell<HashMap<String, Vec<kuipa_enroll::escrow::BindingHash>>>,
     disabled: RefCell<HashSet<String>>,
+    /// Principals with no entry in the directory (no ID override).
+    unknown: RefCell<HashSet<String>>,
     /// When each leased principal's lease ends.
     leases: RefCell<HashMap<String, u64>>,
     staged: RefCell<HashMap<String, Staged>>,
@@ -350,7 +352,9 @@ impl Directory for MemoryDirectory {
     }
 
     fn principal_locked(&self, principal: &Principal) -> Result<bool, DirectoryError> {
-        Ok(self.disabled.borrow().contains(&principal.to_string()))
+        let p = principal.to_string();
+        // A principal without an entry is locked, as in the daemon.
+        Ok(self.disabled.borrow().contains(&p) || self.unknown.borrow().contains(&p))
     }
 
     fn principal_lease(&self, principal: &Principal) -> Result<Option<u64>, DirectoryError> {
