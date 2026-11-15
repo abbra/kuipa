@@ -45,7 +45,10 @@ use kuipa_enroll::server::{
     BrokeredKey, Directory, DirectoryError, Staged, VoucherJoinError, VoucherRefused,
 };
 use kuipa_gssapi::{AcceptStep, GssClientCred, GssServerCred};
-use kuipa_ldap::{Auth, LdapConnection, ModOp, Scope, SearchEntry, dn_escape, filter_escape};
+use kuipa_ldap::{
+    ALREADY_EXISTS, Auth, LdapConnection, ModOp, NO_SUCH_ATTRIBUTE, NO_SUCH_OBJECT, Scope,
+    SearchEntry, dn_escape, filter_escape,
+};
 use native_ossl::util::SecretBuf;
 
 use crate::getkeytab::{self, JOIN_OID, KEYTAB_GET_OID};
@@ -60,12 +63,6 @@ const STAGED_ATTR: &str = "ipaKUStaged";
 /// The auxiliary class that permits the daemon's attributes on an entry.
 const ESCROW_CLASS: &str = "ipaKUPrincipalEscrow";
 
-/// LDAP result code 16: the attribute to delete is not there.
-const NO_SUCH_ATTRIBUTE: std::ffi::c_int = 16;
-/// LDAP result code 32: the entry is not there.
-const NO_SUCH_OBJECT: std::ffi::c_int = 32;
-/// LDAP result code 68: the entry is there already.
-const ALREADY_EXISTS: std::ffi::c_int = 68;
 /// A spent voucher salt's own entry under `cn=vouchers,cn=kuipa,cn=etc`;
 /// its `ipaKULease` is when the voucher stops being valid, after which it
 /// may be purged.
@@ -422,19 +419,12 @@ impl LdapDirectory {
     /// The seals in the container that match `filter`.
     fn seals_matching(&self, filter: &str) -> Result<Vec<Seal>, DirectoryError> {
         let filter = format!("(&(objectClass={SEAL_CLASS}){filter})");
-        let entries = match self.service_conn()?.search(
+        let entries = self.service_conn()?.search_if_exists(
             &self.seals_dn(),
             Scope::OneLevel,
             &filter,
             SEAL_ATTRS,
-        ) {
-            Ok(e) => e,
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
+        )?;
         entries.iter().map(Self::seal_from).collect()
     }
 
@@ -565,14 +555,11 @@ impl LdapDirectory {
                 ("krbCanonicalName", vec![principal.as_bytes()]),
             ],
         );
-        if let Err(e) = added {
-            // An existing principal (a renewed trust) gets new keys.
-            if conn
-                .search(&dn, Scope::Base, "(objectClass=krbPrincipal)", &["cn"])
-                .map_or(true, |v| v.is_empty())
-            {
-                return Err(e.into());
-            }
+        // An existing principal (a renewed trust) gets new keys.
+        if let Err(e) = added
+            && e.code() != Some(ALREADY_EXISTS)
+        {
+            return Err(e.into());
         }
         let request = getkeytab::encode_keys(principal, &self.cfg.enctypes, Some(password))?;
         conn.extended_operation(KEYTAB_GET_OID, Some(request.as_ref()))?;
@@ -613,10 +600,7 @@ impl LdapDirectory {
         }
         match svc.modify_s(&dn, &[(ModOp::Delete, "userPassword", Vec::new())]) {
             Ok(()) => eprintln!("kuipad: first contact: {host}'s OTP consumed"),
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_ATTRIBUTE,
-                ..
-            }) => {}
+            Err(e) if e.code() == Some(NO_SUCH_ATTRIBUTE) => {}
             Err(e) => return Err(e.into()),
         }
         Ok(keytab)
@@ -714,17 +698,8 @@ impl LdapDirectory {
     ) -> Result<Option<T>, DirectoryError> {
         let dn = format!("cn={name},cn=kuipa,cn=etc,{}", self.cfg.basedn);
         let entries =
-            match self
-                .service_conn()?
-                .search(&dn, Scope::Base, "(objectClass=*)", &[attr])
-            {
-                Ok(e) => e,
-                Err(kuipa_ldap::LdapError::Protocol {
-                    code: NO_SUCH_OBJECT,
-                    ..
-                }) => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
+            self.service_conn()?
+                .search_if_exists(&dn, Scope::Base, "(objectClass=*)", &[attr])?;
         match entries
             .first()
             .and_then(|e| e.attrs.get(&attr.to_lowercase()))
@@ -899,11 +874,8 @@ impl Directory for LdapDirectory {
                         &entry.dn,
                         &[(ModOp::Delete, ESCROW_FILE_ATTR, vec![old.as_bytes()])],
                     ) {
-                        Ok(())
-                        | Err(kuipa_ldap::LdapError::Protocol {
-                            code: NO_SUCH_ATTRIBUTE,
-                            ..
-                        }) => {}
+                        Ok(()) => {}
+                        Err(e) if e.code() == Some(NO_SUCH_ATTRIBUTE) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -1102,10 +1074,7 @@ impl Directory for LdapDirectory {
                 .and_then(|e| e.attrs.get("iparequireuserverification"))
                 .and_then(|v| v.first())
                 .is_none_or(|v| !v.eq_ignore_ascii_case("false")),
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => true,
+            Err(e) if e.code() == Some(NO_SUCH_OBJECT) => true,
             Err(e) => return Err(e.into()),
         };
         Ok(UserPasskeys {
@@ -1167,19 +1136,12 @@ impl Directory for LdapDirectory {
         }
         // Spent records outlive their host, but not their voucher.
         let spent_base = format!("cn=vouchers,cn=kuipa,cn=etc,{}", self.cfg.basedn);
-        let records = match conn.search(
+        let records = conn.search_if_exists(
             &spent_base,
             Scope::OneLevel,
             &format!("(objectClass={SPENT_CLASS})"),
             &[LEASE_ATTR],
-        ) {
-            Ok(r) => r,
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
+        )?;
         for record in records {
             let end: Option<u64> = record
                 .attrs
@@ -1297,19 +1259,13 @@ impl Directory for LdapDirectory {
     }
 
     fn seal_get(&self, id: &SealId) -> Result<Option<Seal>, DirectoryError> {
-        match self.service_conn()?.search(
+        let entries = self.service_conn()?.search_if_exists(
             &self.seal_dn(id),
             Scope::Base,
             &format!("(objectClass={SEAL_CLASS})"),
             SEAL_ATTRS,
-        ) {
-            Ok(entries) => entries.first().map(Self::seal_from).transpose(),
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        )?;
+        entries.first().map(Self::seal_from).transpose()
     }
 
     fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
@@ -1415,19 +1371,12 @@ impl Directory for LdapDirectory {
     }
 
     fn deposits(&self, id: &SealId) -> Result<Vec<Deposit>, DirectoryError> {
-        let entries = match self.service_conn()?.search(
+        let entries = self.service_conn()?.search_if_exists(
             &self.seal_dn(id),
             Scope::OneLevel,
             &format!("(objectClass={DEPOSIT_CLASS})"),
             &[DEPOSIT_ATTR],
-        ) {
-            Ok(e) => e,
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
+        )?;
         entries
             .iter()
             .filter_map(|e| e.attrs.get(&DEPOSIT_ATTR.to_lowercase())?.first().cloned())
@@ -1569,7 +1518,7 @@ impl Directory for LdapDirectory {
     }
 
     fn releases(&self, id: &SealId) -> Result<Vec<ReleaseRequest>, DirectoryError> {
-        let entries = match self.service_conn()?.search(
+        let entries = self.service_conn()?.search_if_exists(
             &self.seal_dn(id),
             Scope::OneLevel,
             &format!("(objectClass={RELEASE_CLASS})"),
@@ -1579,14 +1528,7 @@ impl Directory for LdapDirectory {
                 RELEASE_DENIED_ATTR,
                 RELEASE_USES_ATTR,
             ],
-        ) {
-            Ok(e) => e,
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
+        )?;
         entries.iter().map(Self::release_from).collect()
     }
 
@@ -1785,10 +1727,9 @@ impl Directory for LdapDirectory {
             // Spent for any join, this one included: a repeat is refused, because
             // it cannot tell a lost answer from a host that was made and since
             // deleted.  The redeemer asks for a release when it gives up.
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: ALREADY_EXISTS,
-                ..
-            }) => Err(VoucherRefused("spent voucher").into()),
+            Err(e) if e.code() == Some(ALREADY_EXISTS) => {
+                Err(VoucherRefused("spent voucher").into())
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -2050,20 +1991,15 @@ impl LdapDirectory {
         conn: &mut LdapConnection,
         spent: &str,
     ) -> Result<Option<(String, String)>, DirectoryError> {
-        let found = conn.search(
+        let entries = conn.search_if_exists(
             &self.spent_dn(spent),
             Scope::Base,
             "(objectClass=*)",
             &[SPENT_HOST_ATTR, SPENT_REDEEMER_ATTR],
-        );
-        let entries = match found {
-            Ok(entries) => entries,
-            Err(kuipa_ldap::LdapError::Protocol {
-                code: NO_SUCH_OBJECT,
-                ..
-            }) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
+        )?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
         let first = |e: &SearchEntry, attr: &str| {
             e.attrs
                 .get(&attr.to_ascii_lowercase())
