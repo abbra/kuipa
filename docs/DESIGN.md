@@ -1991,6 +1991,16 @@ realm's host or service is never looked up as an IPA host or service of the
 same name. Names never collide: a bare name in the signing policy is the
 realm's, so `alice` does not admit `alice@AD.REALM`; AD holds the real lock
 state, so a disabled AD user stays admitted until their ticket expires.
+Namespace keys (host and server principals only) stay for the realm's own
+principals. Enrollment *with the user's ticket* (`kuipa enroll --use-ccache`,
+staging) works for them too, by S4U2Proxy: kuipad cannot impersonate them by
+S4U2Self (across a trust that needs a two-way trust, and a Samba AD KDC refuses
+it for the `ipa-ku/` service of another realm: `No matching key in entry`), so
+kuipad binds to LDAP with the ticket the caller presented (S4U2Proxy), for
+every caller, as FreeIPA's API endpoints do (`accept_bound_delegated`); S4U2Self
+remains only the fallback when no ticket can be delegated. A trusted realm's user can also enroll through the
+IPA API (`ipa-client-install -p user@AD.REALM`). Tested against a Samba AD
+trust (`TestKuipaTrustedUserEnrollment`).
 
 #### 7.6.13 Decisions
 

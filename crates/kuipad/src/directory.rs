@@ -265,6 +265,35 @@ impl LdapDirectory {
         Ok((principal, KerberosBinding::new(&derived)?))
     }
 
+    /// [`accept_bound`](Self::accept_bound), and, when the caller presented a
+    /// ticket kuipad can delegate with, a connection bound with it (S4U2Proxy),
+    /// as FreeIPA's API endpoints do. Without one (no delegation configured)
+    /// the caller is impersonated by [`conn_as`](Self::conn_as) (S4U2Self),
+    /// which cannot reach a user of a trusted realm: their KDC is not ours.
+    fn accept_conn(
+        &self,
+        token: &[u8],
+        cb: &[u8; 32],
+    ) -> Result<(String, KerberosBinding, Option<LdapConnection>), DirectoryError> {
+        let (caller, derived, delegated) = kuipa_gssapi::accept_bound_delegated(
+            &self.server_cred,
+            token,
+            cb,
+            &kerberos_prf_input(cb),
+            KERBEROS_BINDING_LEN,
+        )?;
+        let binding = KerberosBinding::new(&derived)?;
+        let conn = match delegated {
+            Some(cred) => {
+                let mut conn = self.connect()?;
+                conn.bind_with_s4u_cred(&cred)?;
+                Some(conn)
+            }
+            None => None,
+        };
+        Ok((caller, binding, conn))
+    }
+
     /// Accept a one-leg GSS-API token bound to `cb`; return the principal.
     fn accept(&self, token: &[u8], cb: &[u8; 32]) -> Result<String, DirectoryError> {
         match kuipa_gssapi::accept_token(&self.server_cred, token, Some(cb))? {
@@ -720,11 +749,14 @@ impl Directory for LdapDirectory {
         cb: &[u8; 32],
         enctypes: &[Enctype],
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-        let (caller, binding) = self.accept_bound(token, cb)?;
+        let (caller, binding, presented) = self.accept_conn(token, cb)?;
         if caller == self.host_principal(fqdn) {
             return Ok((self.rekey_host(fqdn, &caller, enctypes)?, binding));
         }
-        let mut conn = self.conn_as(&caller)?;
+        let mut conn = match presented {
+            Some(conn) => conn,
+            None => self.conn_as(&caller)?,
+        };
         let principal = Self::join(&mut conn, fqdn)?;
         Ok((self.new_keys(&mut conn, &principal, enctypes)?, binding))
     }
@@ -748,8 +780,11 @@ impl Directory for LdapDirectory {
         enctypes: &[Enctype],
         staged: &Staged,
     ) -> Result<(Keytab, KerberosBinding), DirectoryError> {
-        let (caller, binding) = self.accept_bound(token, cb)?;
-        let mut conn = self.conn_as(&caller)?;
+        let (caller, binding, presented) = self.accept_conn(token, cb)?;
+        let mut conn = match presented {
+            Some(conn) => conn,
+            None => self.conn_as(&caller)?,
+        };
         let host = self.host_principal(fqdn);
         // The host entry must exist (ipa host-add); joining it records
         // enrolledBy and sets the principal name, as ipa-join does.
