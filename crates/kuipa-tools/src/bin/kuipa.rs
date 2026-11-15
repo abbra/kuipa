@@ -1889,10 +1889,6 @@ fn this_host(paths: &Paths) -> String {
     }
 }
 
-fn get<'a>(value: &'a Value, key: &str) -> &'a Value {
-    value.get(key).unwrap_or(&Value::Null)
-}
-
 /// Print one command's result: what it is about, where each value came
 /// from, then the values themselves.
 fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
@@ -1910,12 +1906,12 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
         "tlog" => render_tlog(value),
         "sign" => render_sign(value),
         "backup" => render_backup(value),
-        "protect" if get(value, "contents").is_string() => render_protect_other(value),
+        "protect" if value["contents"].is_string() => render_protect_other(value),
         "protect" => render_protect(value),
-        "unprotect" if get(value, "contents").is_string() => render_unprotect_other(value),
+        "unprotect" if value["contents"].is_string() => render_unprotect_other(value),
         "unprotect" => println!(
             "The keytab is plain on disk again; its holder is now {}.",
-            get(value, "holder").as_str().unwrap_or("none")
+            value["holder"].as_str().unwrap_or("none")
         ),
         "leave" => println!(
             "{}: kuipa's own files are removed; the plain keytab is left for ipa-join --unenroll.",
@@ -1927,50 +1923,50 @@ fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
 }
 fn render_sign(value: &Value) {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
-    let when = get(value, "time")
+    let when = value["time"]
         .as_u64()
         .and_then(kuipa_tools::text::date)
         .unwrap_or_default();
-    if let Some(files) = get(value, "signed").as_array() {
+    if let Some(files) = value["signed"].as_array() {
         for f in files {
             println!("{} -> {}", text(&f["file"]), text(&f["signature"]));
         }
         println!(
             "Signed by {} for {} at {when}, stated by {} (log {} #{}).",
-            text(get(value, "principal")),
-            text(get(value, "purpose")),
-            text(get(value, "server")),
-            text(get(value, "log")),
-            get(value, "index")
+            text(&value["principal"]),
+            text(&value["purpose"]),
+            text(&value["server"]),
+            text(&value["log"]),
+            &value["index"]
         );
         return;
     }
-    let verdict = if get(value, "ok") == &Value::Bool(true) {
+    let verdict = if value["ok"] == true {
         "Good signature"
     } else {
         "Signature verifies, but not as asked"
     };
     println!(
         "{verdict}: {} signed by {} for {} at {when}, stated by {} (log {} #{}).",
-        text(get(value, "file")),
-        text(get(value, "principal")),
-        text(get(value, "purpose")),
-        text(get(value, "server")),
-        text(get(value, "log")),
-        get(value, "index")
+        text(&value["file"]),
+        text(&value["principal"]),
+        text(&value["purpose"]),
+        text(&value["server"]),
+        text(&value["log"]),
+        &value["index"]
     );
 }
 
 fn render_backup(value: &Value) {
     let text = |v: &Value| v.as_str().unwrap_or("?").to_owned();
-    if let Some(pages) = get(value, "pages").as_array() {
+    if let Some(pages) = value["pages"].as_array() {
         println!(
             "Backup recovery key {} (set {}) written to {}: {} of {} papers and the recovery passphrase open the realm's backups.",
-            text(get(value, "recovery_key")),
-            text(get(value, "set")),
-            text(get(value, "recipient")),
-            get(value, "threshold").as_u64().unwrap_or(0),
-            get(value, "shares").as_u64().unwrap_or(0),
+            text(&value["recovery_key"]),
+            text(&value["set"]),
+            text(&value["recipient"]),
+            value["threshold"].as_u64().unwrap_or(0),
+            value["shares"].as_u64().unwrap_or(0),
         );
         for page in pages {
             println!();
@@ -1980,24 +1976,24 @@ fn render_backup(value: &Value) {
         println!(
             "Print each page, and keep the pages apart from each other and from the backups. Check them now with `kuipa backup key check` — a paper backup is only as good as the day it was tested. Then run `kuipa backup card` on an enrolled host and keep that page with them."
         );
-    } else if get(value, "card") == &Value::Bool(true) {
-        println!("kuipa backup card for realm {}", text(get(value, "realm")));
-        for a in list(get(value, "anchors")) {
+    } else if value["card"] == true {
+        println!("kuipa backup card for realm {}", text(&value["realm"]));
+        for a in list(&value["anchors"]) {
             println!("  anchor {}", text(a));
         }
-        if let Some(k) = get(value, "recovery_key").as_str() {
-            println!("  recovery key {k} (set {})", text(get(value, "set")));
+        if let Some(k) = value["recovery_key"].as_str() {
+            println!("  recovery key {k} (set {})", text(&value["set"]));
         }
         println!(
             "Keep this page with the papers: `kuipa backup open --realm R --anchor T` needs the anchors."
         );
-    } else if get(value, "sealed").is_string() {
-        println!("Sealed to {}.", text(get(value, "sealed")));
-    } else if get(value, "opened").is_string() {
-        let skipped = get(value, "signature_skipped") == &Value::Bool(true);
+    } else if value["sealed"].is_string() {
+        println!("Sealed to {}.", text(&value["sealed"]));
+    } else if value["opened"].is_string() {
+        let skipped = value["signature_skipped"] == true;
         println!(
             "Opened {}{}.",
-            text(get(value, "opened")),
+            text(&value["opened"]),
             if skipped {
                 ", with no signature checked"
             } else {
@@ -2007,14 +2003,14 @@ fn render_backup(value: &Value) {
     } else {
         println!(
             "Those papers recover the key {}: the passphrase and the key id match.",
-            text(get(value, "recovery_key"))
+            text(&value["recovery_key"])
         );
-        for s in list(get(value, "repaired")) {
+        for s in list(&value["repaired"]) {
             println!(
                 "  paper {}: {} unreadable word(s), {} wrong word(s) repaired",
-                get(s, "index").as_u64().unwrap_or(0),
-                get(s, "erased").as_u64().unwrap_or(0),
-                get(s, "wrong").as_u64().unwrap_or(0)
+                s["index"].as_u64().unwrap_or(0),
+                s["erased"].as_u64().unwrap_or(0),
+                s["wrong"].as_u64().unwrap_or(0)
             );
         }
     }
@@ -2024,7 +2020,7 @@ fn render_tlog(value: &Value) {
     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     if value.get("seal").is_none() {
         // `kuipa tlog witnesses`
-        let list = get(value, "witnesses")
+        let list = value["witnesses"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -2033,13 +2029,13 @@ fn render_tlog(value: &Value) {
         }
         println!(
             "A head needs {} of {} trusted witnesses' cosignatures.",
-            get(value, "required"),
+            &value["required"],
             list.len()
         );
         return;
     }
-    for e in get(value, "events").as_array().into_iter().flatten() {
-        let mark = if e["unexpected"] == Value::Bool(true) {
+    for e in value["events"].as_array().into_iter().flatten() {
+        let mark = if e["unexpected"] == true {
             "UNEXPECTED"
         } else {
             "ok"
@@ -2063,17 +2059,17 @@ fn render_tlog(value: &Value) {
             text(&e["action"]),
         );
     }
-    for f in get(value, "forked").as_array().into_iter().flatten() {
+    for f in value["forked"].as_array().into_iter().flatten() {
         println!("    FORKED  {}: {}", text(&f["server"]), text(&f["error"]));
     }
-    for r in get(value, "relogged").as_array().into_iter().flatten() {
+    for r in value["relogged"].as_array().into_iter().flatten() {
         println!(
             "   NEW LOG  {}: replaces log {} (its key changed category, as a crypto policy change does); read from its start",
             text(&r["server"]),
             text(&r["old_log"])
         );
     }
-    for u in get(value, "unwitnessed").as_array().into_iter().flatten() {
+    for u in value["unwitnessed"].as_array().into_iter().flatten() {
         println!(
             "UNWITNESSED  {}: {} of {} cosignatures; run again after the witnesses' next pass",
             text(&u["server"]),
@@ -2081,42 +2077,42 @@ fn render_tlog(value: &Value) {
             u["required"]
         );
     }
-    for u in get(value, "unreachable").as_array().into_iter().flatten() {
+    for u in value["unreachable"].as_array().into_iter().flatten() {
         println!("   skipped  {}: {}", text(&u["server"]), text(&u["error"]));
     }
-    for s in get(value, "baseline").as_array().into_iter().flatten() {
+    for s in value["baseline"].as_array().into_iter().flatten() {
         println!("  baseline  {}: first watch, history not flagged", text(s));
     }
     println!(
         "Seal {}: {} unexpected.",
-        text(get(value, "seal")),
-        get(value, "unexpected").as_u64().unwrap_or_default()
+        text(&value["seal"]),
+        value["unexpected"].as_u64().unwrap_or_default()
     );
 }
 
 fn render_prepare(value: &Value) {
     println!(
         "A machine key for offline enrollment, made on this host and stored in {}:",
-        get(value, "stored_in").as_str().unwrap_or_default()
+        value["stored_in"].as_str().unwrap_or_default()
     );
     let mut rows = Rows::default();
-    rows.field("machine key thumbprint", get(value, "thumbprint"));
-    if get(value, "tpm").as_bool().unwrap_or(false) {
+    rows.field("machine key thumbprint", &value["thumbprint"]);
+    if value["tpm"].as_bool().unwrap_or(false) {
         rows.field("held by", &Value::from("this host's TPM"));
     }
-    rows.field("its public key", get(value, "public_key"));
+    rows.field("its public key", &value["public_key"]);
     rows.field(
         "the IPA administrator stages it with",
-        get(value, "admin_command"),
+        &value["admin_command"],
     );
     rows.print();
 }
 
 /// Identity and realm values of a join, as one aligned block.
 fn identity_rows(rows: &mut Rows, value: &Value) {
-    rows.field("principal", get(value, "principal"));
-    rows.field("kvno", get(value, "kvno"));
-    rows.field("issuer", get(value, "issuer"));
+    rows.field("principal", &value["principal"]);
+    rows.field("kvno", &value["kvno"]);
+    rows.field("issuer", &value["issuer"]);
 }
 
 /// Files a command wrote on this host, as a nested block.
@@ -2140,18 +2136,18 @@ fn pending_rows(value: &Value, done: &str) {
     let Some(pending) = value.get("pending").filter(|p| !p.is_null()) else {
         return;
     };
-    println!("  {done} for {}:", get(pending, "fqdn"));
+    println!("  {done} for {}:", &pending["fqdn"]);
     let mut rows = Rows {
         indent: 2,
         ..Rows::default()
     };
     rows.until(
         "the staged bundle is usable until",
-        get(pending, "not_after"),
+        &pending["not_after"],
     );
     rows.print();
     println!("{:>2}deferred steps:", "");
-    items(get(pending, "steps"), "    ");
+    items(&pending["steps"], "    ");
 }
 
 fn render_enroll(value: &Value, paths: &Paths) {
@@ -2160,18 +2156,18 @@ fn render_enroll(value: &Value, paths: &Paths) {
     let summary = value.get("enrollment").unwrap_or(value);
     println!(
         "Enrolled {} in {}: its keys, the realm's anchors, CA and Kerberos configuration all taken from {}'s verified advertisement.",
-        get(summary, "principal").as_str().unwrap_or("this host"),
-        get(summary, "realm").as_str().unwrap_or(""),
-        get(summary, "issuer")
+        summary["principal"].as_str().unwrap_or("this host"),
+        summary["realm"].as_str().unwrap_or(""),
+        summary["issuer"]
             .as_str()
             .unwrap_or("the issuing server")
     );
     let mut rows = Rows::default();
     identity_rows(&mut rows, summary);
-    rows.field("realm", get(summary, "realm"));
-    rows.field("IPA servers", get(summary, "servers"));
-    rows.field("domain", get(summary, "domain"));
-    rows.field("LDAP base", get(summary, "basedn"));
+    rows.field("realm", &summary["realm"]);
+    rows.field("IPA servers", &summary["servers"]);
+    rows.field("domain", &summary["domain"]);
+    rows.field("LDAP base", &summary["basedn"]);
     rows.print();
     installed_rows(&rows, paths);
     pending_rows(
@@ -2186,43 +2182,43 @@ fn render_voucher_key(args: &Args, value: &Value) {
         args.option("out").unwrap_or("")
     );
     let mut rows = Rows::default();
-    rows.field("binding for kuipa-voucher --binding", get(value, "binding"));
+    rows.field("binding for kuipa-voucher --binding", &value["binding"]);
     rows.print();
 }
 
 fn render_realm_info(value: &Value) {
     println!(
         "Kerberos configuration for {}, from {}'s verified advertisement:",
-        get(value, "realm").as_str().unwrap_or(""),
-        get(value, "server")
+        value["realm"].as_str().unwrap_or(""),
+        value["server"]
             .as_str()
             .unwrap_or("the first usable server")
     );
     let mut rows = Rows::default();
-    rows.field("realm", get(value, "realm"));
-    rows.field("domain", get(value, "domain"));
-    rows.field("KDCs", get(value, "servers"));
-    rows.field("krb5.conf", get(value, "krb5_conf"));
-    rows.field("PKINIT anchors", get(value, "pkinit_anchors"));
-    rows.field("IPA CA", get(value, "ca"));
+    rows.field("realm", &value["realm"]);
+    rows.field("domain", &value["domain"]);
+    rows.field("KDCs", &value["servers"]);
+    rows.field("krb5.conf", &value["krb5_conf"]);
+    rows.field("PKINIT anchors", &value["pkinit_anchors"]);
+    rows.field("IPA CA", &value["ca"]);
     rows.print();
 }
 
 fn render_trusted_realms(value: &Value, paths: &Paths) {
     println!(
         "Realms {} trusts, each verified through the servers it advertises and installed on this host:",
-        get(value, "realm").as_str().unwrap_or("this realm")
+        value["realm"].as_str().unwrap_or("this realm")
     );
-    for t in list(get(value, "trusted_realms")) {
+    for t in list(&value["trusted_realms"]) {
         println!();
         let mut rows = Rows::default();
-        rows.field("realm", get(t, "realm"));
-        rows.field("what kuipa did", get(t, "status"));
-        rows.field("verified through", get(t, "server"));
-        rows.field("why it is not installed", get(t, "error"));
-        rows.field("krb5.conf.d snippet", get(t, "krb5_conf"));
-        rows.field("KDCs reached through", get(t, "kdc_proxy"));
-        if let Some(realm) = get(t, "realm").as_str() {
+        rows.field("realm", &t["realm"]);
+        rows.field("what kuipa did", &t["status"]);
+        rows.field("verified through", &t["server"]);
+        rows.field("why it is not installed", &t["error"]);
+        rows.field("krb5.conf.d snippet", &t["krb5_conf"]);
+        rows.field("KDCs reached through", &t["kdc_proxy"]);
+        if let Some(realm) = t["realm"].as_str() {
             rows.path("anchors, PKINIT anchors and CA", &paths.trust_dir(realm));
         }
         rows.print();
@@ -2234,45 +2230,45 @@ fn render_advertisement(value: &Value, paths: &Paths) {
         "What each server of the deployment advertises, verified against the anchors pinned in {}:",
         paths.anchors().display()
     );
-    for s in list(get(value, "servers")) {
+    for s in list(&value["servers"]) {
         println!();
-        let server = get(s, "server").as_str().unwrap_or("server");
-        if get(s, "ok") == &Value::Bool(false) {
+        let server = s["server"].as_str().unwrap_or("server");
+        if &s["ok"] == &Value::Bool(false) {
             println!(
                 "{server}: {}",
-                get(s, "error").as_str().unwrap_or("unusable")
+                s["error"].as_str().unwrap_or("unusable")
             );
             continue;
         }
         let mut rows = Rows::default();
-        rows.field("server", get(s, "server"));
-        rows.field("advertises realm", get(s, "realm"));
-        rows.field("domain", get(s, "domain"));
-        rows.field("KDCs", get(s, "kdcs"));
-        rows.field("KDC proxies", get(s, "kdc_proxy"));
-        rows.field("advertisement signed by", get(s, "signer"));
-        rows.field("delegated by this pinned anchor", get(s, "proven_by"));
-        rows.left("its delegation", get(s, "delegation_days_left"), "days");
-        rows.left("the anchor's vouch", get(s, "vouch_hours_left"), "hours");
-        rows.field("anchor successions it names", get(s, "rotated_anchors"));
-        rows.field("join key", get(s, "join_key"));
-        rows.field("escrow key", get(s, "escrow_key"));
-        rows.field("CA certificates offered", get(s, "ca_certs"));
-        rows.field("PKINIT anchors offered", get(s, "pkinit_anchors"));
-        rows.field("its anchors", get(s, "anchors"));
+        rows.field("server", &s["server"]);
+        rows.field("advertises realm", &s["realm"]);
+        rows.field("domain", &s["domain"]);
+        rows.field("KDCs", &s["kdcs"]);
+        rows.field("KDC proxies", &s["kdc_proxy"]);
+        rows.field("advertisement signed by", &s["signer"]);
+        rows.field("delegated by this pinned anchor", &s["proven_by"]);
+        rows.left("its delegation", &s["delegation_days_left"], "days");
+        rows.left("the anchor's vouch", &s["vouch_hours_left"], "hours");
+        rows.field("anchor successions it names", &s["rotated_anchors"]);
+        rows.field("join key", &s["join_key"]);
+        rows.field("escrow key", &s["escrow_key"]);
+        rows.field("CA certificates offered", &s["ca_certs"]);
+        rows.field("PKINIT anchors offered", &s["pkinit_anchors"]);
+        rows.field("its anchors", &s["anchors"]);
         // `REALM (anchors …)`: a trusted realm is only useful to a reader
         // together with the anchors vouched for it (§17).
-        let trusts = list(get(s, "trusts"))
+        let trusts = list(&s["trusts"])
             .into_iter()
             .map(|t| {
-                let anchors = list(get(t, "anchors"))
+                let anchors = list(&t["anchors"])
                     .into_iter()
                     .filter_map(Value::as_str)
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
                     "{} (anchors: {anchors})",
-                    get(t, "realm").as_str().unwrap_or("")
+                    t["realm"].as_str().unwrap_or("")
                 )
             })
             .collect::<Vec<_>>()
@@ -2285,9 +2281,9 @@ fn render_advertisement(value: &Value, paths: &Paths) {
                 trusts
             },
         );
-        rows.field("anchor log head it names", get(s, "anchor_log_head"));
+        rows.field("anchor log head it names", &s["anchor_log_head"]);
         rows.print();
-        let landmarks = list(get(s, "landmarks"));
+        let landmarks = list(&s["landmarks"]);
         if landmarks.is_empty() {
             println!("  anchor log: this server records none");
             continue;
@@ -2296,16 +2292,16 @@ fn render_advertisement(value: &Value, paths: &Paths) {
         for l in landmarks {
             println!(
                 "    sequence {} head {} (follows {})",
-                get(l, "seq"),
-                get(l, "head").as_str().unwrap_or(""),
-                get(l, "prev").as_str().unwrap_or("")
+                &l["seq"],
+                l["head"].as_str().unwrap_or(""),
+                l["prev"].as_str().unwrap_or("")
             );
             let mut entry = Rows {
                 indent: 4,
                 ..Rows::default()
             };
-            entry.field("anchors then current", get(l, "anchors"));
-            entry.field("successions then current", get(l, "successions"));
+            entry.field("anchors then current", &l["anchors"]);
+            entry.field("successions then current", &l["successions"]);
             entry.print();
         }
     }
@@ -2318,14 +2314,14 @@ fn render_advertisement(value: &Value, paths: &Paths) {
 /// thumbprints, all the same width, so the values line up.
 fn anchor_index_rows(value: &Value) {
     let names = |a: &Value, key: &str| {
-        list(get(a, key))
+        list(&a[key])
             .into_iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let anchors = list(get(value, "anchors"));
-    let pinned = list(get(value, "pinned"))
+    let anchors = list(&value["anchors"]);
+    let pinned = list(&value["pinned"])
         .into_iter()
         .filter_map(Value::as_str)
         .collect::<Vec<_>>()
@@ -2342,9 +2338,9 @@ fn anchor_index_rows(value: &Value) {
         ..Rows::default()
     };
     for a in anchors {
-        let key = get(a, "key").as_str().unwrap_or("key");
+        let key = a["key"].as_str().unwrap_or("key");
         let mut what: Vec<String> = Vec::new();
-        if get(a, "pinned") == &Value::Bool(true) {
+        if a["pinned"] == true {
             what.push("pinned on this host".to_string());
         }
         let servers = names(a, "signer_of");
@@ -2359,7 +2355,7 @@ fn anchor_index_rows(value: &Value) {
         if !current.is_empty() {
             what.push(format!("a current anchor of {current}"));
         }
-        let sequences = list(get(a, "log_sequences"))
+        let sequences = list(&a["log_sequences"])
             .into_iter()
             .filter_map(Value::as_u64)
             .map(|n| n.to_string())
@@ -2393,10 +2389,10 @@ fn anchor_index_rows(value: &Value) {
 
 fn render_status(value: &Value, paths: &Paths) {
     println!("What kuipa has installed for {}", this_host(paths));
-    if get(value, "enrolled") == &Value::Bool(false) {
+    if &value["enrolled"] == &Value::Bool(false) {
         println!(
             "  enrolled: no{}",
-            match get(value, "prepared") {
+            match &value["prepared"] {
                 Value::Bool(true) => ", though it is prepared for offline enrollment",
                 _ => "",
             }
@@ -2405,22 +2401,22 @@ fn render_status(value: &Value, paths: &Paths) {
     }
     let mut rows = Rows::default();
     identity_rows(&mut rows, value);
-    rows.field("realm", get(value, "realm"));
-    rows.field("IPA servers", get(value, "servers"));
-    rows.field("anchors pinned here", get(value, "anchors"));
+    rows.field("realm", &value["realm"]);
+    rows.field("IPA servers", &value["servers"]);
+    rows.field("anchors pinned here", &value["anchors"]);
     // The pinned windows (DESIGN-claim-logs.md §1): what each head
     // covers, and whether the pin is frozen (§2).
-    for w in list(get(value, "windows")) {
-        let frozen = get(w, "frozen") == &Value::Bool(true);
-        let heads: Vec<String> = list(get(w, "heads"))
+    for w in list(&value["windows"]) {
+        let frozen = w["frozen"] == true;
+        let heads: Vec<String> = list(&w["heads"])
             .into_iter()
-            .map(|h| format!("{} leaves", get(h, "size").as_u64().unwrap_or(0)))
+            .map(|h| format!("{} leaves", h["size"].as_u64().unwrap_or(0)))
             .collect();
         rows.field(
             "head window",
             &Value::String(format!(
                 "{}: {}{}",
-                get(w, "anchor").as_str().unwrap_or("?"),
+                w["anchor"].as_str().unwrap_or("?"),
                 if heads.is_empty() {
                     "no head".to_owned()
                 } else {
@@ -2434,19 +2430,19 @@ fn render_status(value: &Value, paths: &Paths) {
             )),
         );
     }
-    rows.field("trusted realms installed", get(value, "trusted_realms"));
-    rows.field("keytab held by", get(value, "protection"));
+    rows.field("trusted realms installed", &value["trusted_realms"]);
+    rows.field("keytab held by", &value["protection"]);
     rows.field(
         "also protected",
         &Value::Array(
-            list(get(value, "protected"))
+            list(&value["protected"])
                 .into_iter()
                 .map(|p| {
                     Value::String(format!(
                         "{} ({} for {})",
-                        get(p, "path").as_str().unwrap_or("?"),
-                        get(p, "contents").as_str().unwrap_or("?"),
-                        get(p, "principal").as_str().unwrap_or("?")
+                        p["path"].as_str().unwrap_or("?"),
+                        p["contents"].as_str().unwrap_or("?"),
+                        p["principal"].as_str().unwrap_or("?")
                     ))
                 })
                 .collect(),
@@ -2457,7 +2453,7 @@ fn render_status(value: &Value, paths: &Paths) {
     rows.path("IPA CA", &paths.ca());
     rows.path("PKINIT anchors", &paths.pkinit_anchors());
     rows.path("pinned anchors", &paths.anchors());
-    let allowed: Vec<&str> = get(value, "policy")
+    let allowed: Vec<&str> = value["policy"]
         .as_object()
         .into_iter()
         .flat_map(|flags| flags.iter())
@@ -2479,12 +2475,12 @@ fn render_check(value: &Value, paths: &Paths) {
         paths.anchors().display()
     );
     println!("  servers:");
-    for s in list(get(value, "servers")) {
-        let server = get(s, "server").as_str().unwrap_or("server");
-        if get(s, "ok") == &Value::Bool(false) {
+    for s in list(&value["servers"]) {
+        let server = s["server"].as_str().unwrap_or("server");
+        if &s["ok"] == &Value::Bool(false) {
             println!(
                 "    {server}: {}",
-                get(s, "error").as_str().unwrap_or("unusable")
+                s["error"].as_str().unwrap_or("unusable")
             );
             continue;
         }
@@ -2493,11 +2489,11 @@ fn render_check(value: &Value, paths: &Paths) {
             indent: 8,
             ..Rows::default()
         };
-        health.left("delegation", get(s, "delegation_days_left"), "days");
-        health.left("the anchor's vouch", get(s, "vouch_hours_left"), "hours");
+        health.left("delegation", &s["delegation_days_left"], "days");
+        health.left("the anchor's vouch", &s["vouch_hours_left"], "hours");
         health.field(
             "verified only through rotated anchors",
-            get(s, "rotated_anchors"),
+            &s["rotated_anchors"],
         );
         health.print();
     }
@@ -2507,7 +2503,7 @@ fn render_check(value: &Value, paths: &Paths) {
     };
     host.row(
         "a ticket with the host keys",
-        if get(value, "kinit").as_bool().unwrap_or(false) {
+        if value["kinit"].as_bool().unwrap_or(false) {
             "yes".to_string()
         } else {
             "no".to_string()
@@ -2515,7 +2511,7 @@ fn render_check(value: &Value, paths: &Paths) {
     );
     host.print();
     println!("  problems:");
-    let problems = list(get(value, "problems"));
+    let problems = list(&value["problems"]);
     if problems.is_empty() {
         println!("    none");
     } else {
@@ -2528,21 +2524,21 @@ fn render_check(value: &Value, paths: &Paths) {
 fn render_complete(value: &Value) {
     println!(
         "The offline enrollment is finished: the staged keys were replaced by keys from {}'s KDC.",
-        get(get(value, "rotated"), "issuer")
+        value["rotated"]["issuer"]
             .as_str()
             .unwrap_or("the issuing server")
     );
     let mut rows = Rows::default();
-    identity_rows(&mut rows, get(value, "rotated"));
+    identity_rows(&mut rows, &value["rotated"]);
     rows.print();
     println!("  left for ipa-client-install on this host:");
-    items(get(value, "remaining_for_ipa_client_install"), "    ");
+    items(&value["remaining_for_ipa_client_install"], "    ");
 }
 
 fn render_rotated(value: &Value, what: &str) {
     println!(
         "{what}, issued by {}:",
-        get(value, "issuer")
+        value["issuer"]
             .as_str()
             .unwrap_or("the issuing server")
     );
@@ -2553,7 +2549,7 @@ fn render_rotated(value: &Value, what: &str) {
 
 /// A row naming the PCRs a TPM-bound seal is bound to, if it is bound.
 fn tpm_row(rows: &mut Rows, value: &Value) {
-    if let Some(pcrs) = get(value, "tpm").as_str() {
+    if let Some(pcrs) = value["tpm"].as_str() {
         let text = if pcrs.is_empty() {
             "no PCRs".to_owned()
         } else {
@@ -2567,56 +2563,56 @@ fn render_protect(value: &Value) {
     println!(
         "The keytab is sealed on disk: opening it needs one of the realm's servers, as at boot."
     );
-    let rotated = get(value, "rotated");
+    let rotated = &value["rotated"];
     println!(
         "Keys reissued before sealing, issued by {}:",
-        get(rotated, "issuer")
+        rotated["issuer"]
             .as_str()
             .unwrap_or("the issuing server")
     );
     let mut rows = Rows::default();
     identity_rows(&mut rows, rotated);
-    rows.field("sealed as", get(value, "sealed"));
+    rows.field("sealed as", &value["sealed"]);
     tpm_row(&mut rows, value);
     rows.print();
 }
 
 fn render_protect_other(value: &Value) {
-    let path = get(value, "path").as_str().unwrap_or("the file");
+    let path = value["path"].as_str().unwrap_or("the file");
     println!(
         "{path} is {} on disk: opening it needs one of the realm's servers, as at boot.",
-        if get(value, "resealed").as_bool().unwrap_or(false) {
+        if value["resealed"].as_bool().unwrap_or(false) {
             "sealed again, as it is now"
         } else {
             "sealed"
         }
     );
     let mut rows = Rows::default();
-    rows.field("holds", get(value, "contents"));
-    rows.field("bindings registered for", get(value, "principal"));
-    rows.field("registered by", get(value, "registered_by"));
-    rows.field("servers that can unseal it", get(value, "servers"));
-    rows.field("sealed as", get(value, "sealed"));
+    rows.field("holds", &value["contents"]);
+    rows.field("bindings registered for", &value["principal"]);
+    rows.field("registered by", &value["registered_by"]);
+    rows.field("servers that can unseal it", &value["servers"]);
+    rows.field("sealed as", &value["sealed"]);
     tpm_row(&mut rows, value);
-    rows.field("unsealed copy (tmpfs)", get(value, "unsealed_copy"));
+    rows.field("unsealed copy (tmpfs)", &value["unsealed_copy"]);
     rows.print();
 }
 
 fn render_unprotect_other(value: &Value) {
     println!(
         "{} is plain on disk again.",
-        get(value, "path").as_str().unwrap_or("The file")
+        value["path"].as_str().unwrap_or("The file")
     );
-    if get(value, "retired").as_bool().unwrap_or(false) {
+    if value["retired"].as_bool().unwrap_or(false) {
         println!(
             "  Its bindings for {} are retired: no copy of the sealed file opens any more.",
-            get(value, "principal").as_str().unwrap_or("its principal")
+            value["principal"].as_str().unwrap_or("its principal")
         );
     } else {
         println!(
             "  Its bindings for {} are still registered ({}): a copy of the sealed file (in a backup or an old image) still opens until an administrator clears them, or until it is protected and unprotected again with a server reachable.",
-            get(value, "principal").as_str().unwrap_or("its principal"),
-            get(value, "retire_error")
+            value["principal"].as_str().unwrap_or("its principal"),
+            value["retire_error"]
                 .as_str()
                 .unwrap_or("no server answered")
         );
@@ -2804,7 +2800,7 @@ fn run_backup(paths: &Paths, action: &BackupAction) -> Result<Value, Error> {
                         signer.as_deref(),
                         Some("ipa-backup"),
                     )?;
-                    if get(&v, "ok") != &Value::Bool(true) {
+                    if v["ok"] != true {
                         return Err(format!(
                             "{} is signed, but not by the signer and for the purpose a backup needs: {v}",
                             f.display()
@@ -3240,9 +3236,9 @@ fn run_seal(paths: &Paths, action: &SealCommand) -> Result<Value, Error> {
 
 /// Release requests or deposits; whether `value` was either.
 fn render_listing(value: &Value) -> bool {
-    if let Some(requests) = get(value, "requests").as_array() {
+    if let Some(requests) = value["requests"].as_array() {
         render_requests(requests);
-    } else if let Some(deposits) = get(value, "deposits").as_array() {
+    } else if let Some(deposits) = value["deposits"].as_array() {
         render_deposits(deposits);
     } else {
         return false;
@@ -3256,7 +3252,7 @@ fn render_deposits(deposits: &[Value]) {
         println!("No deposits.");
     }
     for d in deposits {
-        let subject: Vec<String> = get(d, "subject")
+        let subject: Vec<String> = d["subject"]
             .as_object()
             .map(|m| {
                 m.iter()
@@ -3266,20 +3262,20 @@ fn render_deposits(deposits: &[Value]) {
             .unwrap_or_default();
         println!(
             "Deposit {} ({}, {}) by {}",
-            get(d, "id").as_str().unwrap_or("?"),
-            get(d, "kind").as_str().unwrap_or("?"),
+            d["id"].as_str().unwrap_or("?"),
+            d["kind"].as_str().unwrap_or("?"),
             subject.join(", "),
-            get(d, "depositor").as_str().unwrap_or("?"),
+            d["depositor"].as_str().unwrap_or("?"),
         );
     }
 }
 
 /// `kuipa seal recovery-code` and `recover`; whether `value` was one.
 fn render_recovery(value: &Value) -> bool {
-    if let Some(code) = get(value, "recovery_code").as_str() {
+    if let Some(code) = value["recovery_code"].as_str() {
         println!(
             "Recovery code for device {}:",
-            get(value, "device").as_str().unwrap_or("?")
+            value["device"].as_str().unwrap_or("?")
         );
         println!();
         println!("    {code}");
@@ -3287,24 +3283,24 @@ fn render_recovery(value: &Value) -> bool {
         println!(
             "Write it down and keep it away from this host. It is shown only now; with it and your password, `kuipa seal recover code` brings this device's key back on another host."
         );
-    } else if let Some(pages) = get(value, "pages").as_array() {
+    } else if let Some(pages) = value["pages"].as_array() {
         println!(
             "Recovery shard set {} for the key {}; {} of {} papers, and the recovery passphrase you chose, open your device keys.",
-            get(value, "set").as_str().unwrap_or("?"),
-            get(value, "recovery_key").as_str().unwrap_or("?"),
-            get(value, "threshold").as_u64().unwrap_or(0),
-            get(value, "shares").as_u64().unwrap_or(0),
+            value["set"].as_str().unwrap_or("?"),
+            value["recovery_key"].as_str().unwrap_or("?"),
+            value["threshold"].as_u64().unwrap_or(0),
+            value["shares"].as_u64().unwrap_or(0),
         );
         for page in pages {
             println!();
             println!(
                 "kuipa recovery shard {} of {} (any {} are needed)  set {}",
-                get(page, "index").as_u64().unwrap_or(0),
-                get(value, "shares").as_u64().unwrap_or(0),
-                get(value, "threshold").as_u64().unwrap_or(0),
-                get(value, "set").as_str().unwrap_or("?"),
+                page["index"].as_u64().unwrap_or(0),
+                value["shares"].as_u64().unwrap_or(0),
+                value["threshold"].as_u64().unwrap_or(0),
+                value["set"].as_str().unwrap_or("?"),
             );
-            for line in list(get(page, "lines")) {
+            for line in list(&page["lines"]) {
                 println!("{}", line.as_str().unwrap_or("?"));
             }
         }
@@ -3312,58 +3308,58 @@ fn render_recovery(value: &Value) -> bool {
         println!(
             "Print or copy each page onto paper, and keep the pages apart. The words alone are not the key: the passphrase is part of it. Check the papers now with `kuipa seal recovery-shards check` — a paper backup is only as good as the day it was tested."
         );
-    } else if get(value, "repaired").is_array() && !get(value, "recovered").is_string() {
+    } else if value["repaired"].is_array() && !value["recovered"].is_string() {
         println!(
             "Those papers would recover the set for key {}: the passphrase and the key id match.",
-            get(value, "recovery_key").as_str().unwrap_or("?")
+            value["recovery_key"].as_str().unwrap_or("?")
         );
-        for s in list(get(value, "repaired")) {
+        for s in list(&value["repaired"]) {
             println!(
                 "  paper {}: {} unreadable word(s), {} wrong word(s) repaired",
-                get(s, "index").as_u64().unwrap_or(0),
-                get(s, "erased").as_u64().unwrap_or(0),
-                get(s, "wrong").as_u64().unwrap_or(0),
+                s["index"].as_u64().unwrap_or(0),
+                s["erased"].as_u64().unwrap_or(0),
+                s["wrong"].as_u64().unwrap_or(0),
             );
         }
-    } else if get(value, "hint").is_string() {
+    } else if value["hint"].is_string() {
         println!(
             "The set covers several devices ({}): run again with --device.",
-            list(get(value, "devices"))
+            list(&value["devices"])
                 .iter()
                 .map(|d| d.as_str().unwrap_or("?"))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-    } else if let Some(device) = get(value, "helpdesk_device").as_str() {
+    } else if let Some(device) = value["helpdesk_device"].as_str() {
         println!(
             "This host's device is {device}. Give it to the helpdesk, with the id of the lost device; once they have delivered its key, run `kuipa seal recover fetch`."
         );
-    } else if let Some(old) = get(value, "delivered").as_str() {
+    } else if let Some(old) = value["delivered"].as_str() {
         println!(
             "Device {old}'s key is delivered to {}'s device {}: only that device opens it.",
-            get(value, "user").as_str().unwrap_or("?"),
-            get(value, "to_device").as_str().unwrap_or("?")
+            value["user"].as_str().unwrap_or("?"),
+            value["to_device"].as_str().unwrap_or("?")
         );
-    } else if let Some(device) = get(value, "recovered").as_str() {
+    } else if let Some(device) = value["recovered"].as_str() {
         println!(
             "Device {device} is recovered on this host. Run `kuipa seal recover finish FILE.sealed…` to reseal your files to this host's own device."
         );
-        for s in list(get(value, "repaired")) {
+        for s in list(&value["repaired"]) {
             println!(
                 "  paper {}: {} unreadable, {} wrong",
-                get(s, "index").as_u64().unwrap_or(0),
-                get(s, "erased").as_u64().unwrap_or(0),
-                get(s, "wrong").as_u64().unwrap_or(0),
+                s["index"].as_u64().unwrap_or(0),
+                s["erased"].as_u64().unwrap_or(0),
+                s["wrong"].as_u64().unwrap_or(0),
             );
         }
-    } else if get(value, "resealed").is_number() && get(value, "device").is_string() {
+    } else if value["resealed"].is_number() && value["device"].is_string() {
         println!(
             "This host's device {} is registered in {} seal(s), and {} file(s) are resealed to it.",
-            get(value, "device").as_str().unwrap_or("?"),
-            list(get(value, "seals")).len(),
-            get(value, "resealed")
+            value["device"].as_str().unwrap_or("?"),
+            list(&value["seals"]).len(),
+            &value["resealed"]
         );
-        match get(value, "retired").as_str() {
+        match value["retired"].as_str() {
             Some(old) => println!("Device {old} is retired: it opens nothing any more."),
             None => println!(
                 "The recovered device is still registered; once every file is resealed, run again with --retire-old."
@@ -3383,16 +3379,16 @@ fn render_requests(requests: &[Value]) {
     for r in requests {
         println!(
             "Release request {} of seal {}, by {}:",
-            get(r, "id").as_str().unwrap_or("?"),
-            get(r, "seal").as_str().unwrap_or("?"),
-            get(r, "requester").as_str().unwrap_or("?"),
+            r["id"].as_str().unwrap_or("?"),
+            r["seal"].as_str().unwrap_or("?"),
+            r["requester"].as_str().unwrap_or("?"),
         );
         let mut rows = Rows::default();
-        rows.field("reason", get(r, "reason"));
-        rows.field("approved by", get(r, "approvals"));
-        rows.field("denied by", get(r, "denied_by"));
-        rows.until("open until", get(r, "not_after"));
-        rows.field("releases so far", get(r, "uses"));
+        rows.field("reason", &r["reason"]);
+        rows.field("approved by", &r["approvals"]);
+        rows.field("denied by", &r["denied_by"]);
+        rows.until("open until", &r["not_after"]);
+        rows.field("releases so far", &r["uses"]);
         rows.print();
     }
 }
@@ -3400,13 +3396,13 @@ fn render_requests(requests: &[Value]) {
 /// What opening a seal with `factors` needs, in words.
 fn opening_needs(factors: &Value) -> String {
     let mut needs = Vec::new();
-    if let Some(level) = get(factors, "device").as_str() {
+    if let Some(level) = factors["device"].as_str() {
         needs.push(format!("a registered device ({level})"));
     }
-    if get(factors, "ticket").as_bool().unwrap_or(false) {
+    if factors["ticket"].as_bool().unwrap_or(false) {
         needs.push("your Kerberos ticket".to_owned());
     }
-    if get(factors, "passkey").as_bool().unwrap_or(false) {
+    if factors["passkey"].as_bool().unwrap_or(false) {
         needs.push("one of your IPA passkeys".to_owned());
     }
     match needs.split_last() {
@@ -3419,9 +3415,9 @@ fn render_seal(value: &Value) {
     if render_listing(value) || render_recovery(value) {
         return;
     }
-    if let Some(until) = get(value, "session_until").as_u64() {
+    if let Some(until) = value["session_until"].as_u64() {
         let until = kuipa_tools::text::date(until).unwrap_or_else(|| until.to_string());
-        if get(value, "offline").as_bool().unwrap_or(false) {
+        if value["offline"].as_bool().unwrap_or(false) {
             println!(
                 "Offline session started: files sealed with --session open on this host without any server until {until}, or `kuipa seal lock`."
             );
@@ -3431,76 +3427,76 @@ fn render_seal(value: &Value) {
             );
         }
     }
-    if let Some(seals) = get(value, "seals").as_array() {
+    if let Some(seals) = value["seals"].as_array() {
         if seals.is_empty() {
             println!("No seals.");
         }
         for v in seals {
             println!(
                 "Seal {} ({}), {}:",
-                get(v, "name").as_str().unwrap_or("?"),
-                get(v, "owner").as_str().unwrap_or("?"),
-                get(v, "state").as_str().unwrap_or("?")
+                v["name"].as_str().unwrap_or("?"),
+                v["owner"].as_str().unwrap_or("?"),
+                v["state"].as_str().unwrap_or("?")
             );
             let mut rows = Rows::default();
-            rows.field("id", get(v, "id"));
-            let policy = get(v, "policy");
+            rows.field("id", &v["id"]);
+            let policy = &v["policy"];
             for who in ["managers", "members", "depositors"] {
-                if !list(get(v, who)).is_empty() {
-                    rows.field(who, get(v, who));
+                if !list(&v[who]).is_empty() {
+                    rows.field(who, &v[who]);
                 }
             }
-            rows.row("opening needs", opening_needs(get(policy, "factors")));
-            rows.until("expires", get(policy, "not_after"));
-            rows.field("unlocks so far", get(v, "unlocks"));
-            rows.field("unlocks allowed", get(policy, "max_unlocks"));
+            rows.row("opening needs", opening_needs(&policy["factors"]));
+            rows.until("expires", &policy["not_after"]);
+            rows.field("unlocks so far", &v["unlocks"]);
+            rows.field("unlocks allowed", &policy["max_unlocks"]);
             rows.field(
                 "longest session (seconds)",
-                get(get(policy, "sessions"), "reauth"),
+                &policy["sessions"]["reauth"],
             );
-            rows.field("delegated tickets", get(policy, "ticket_delegation"));
-            if get(policy, "ticket_leased") == &Value::Bool(true) {
+            rows.field("delegated tickets", &policy["ticket_delegation"]);
+            if policy["ticket_leased"] == true {
                 rows.field("tickets", &Value::from("of leased hosts only"));
             }
-            let devices: Vec<Value> = list(get(v, "devices"))
+            let devices: Vec<Value> = list(&v["devices"])
                 .into_iter()
                 .map(|d| {
                     Value::String(format!(
                         "{} ({}, {}, {}): {}",
-                        get(d, "label").as_str().unwrap_or("?"),
-                        get(d, "holder").as_str().unwrap_or("?"),
-                        get(d, "type").as_str().unwrap_or("?"),
-                        get(d, "level").as_str().unwrap_or("?"),
-                        get(d, "id").as_str().unwrap_or("?"),
+                        d["label"].as_str().unwrap_or("?"),
+                        d["holder"].as_str().unwrap_or("?"),
+                        d["type"].as_str().unwrap_or("?"),
+                        d["level"].as_str().unwrap_or("?"),
+                        d["id"].as_str().unwrap_or("?"),
                     ))
                 })
                 .collect();
             rows.field("devices", &Value::Array(devices));
-            rows.field("described by", get(v, "signed_by"));
+            rows.field("described by", &v["signed_by"]);
             rows.print();
         }
-    } else if let Some(out) = get(value, "sealed").as_str()
-        && get(value, "file").is_string()
+    } else if let Some(out) = value["sealed"].as_str()
+        && value["file"].is_string()
     {
         println!(
             "{} is sealed to seal {} as {out}.",
-            get(value, "file").as_str().unwrap_or("The file"),
-            get(value, "seal").as_str().unwrap_or("?")
+            value["file"].as_str().unwrap_or("The file"),
+            value["seal"].as_str().unwrap_or("?")
         );
-    } else if get(value, "written").is_string() {
+    } else if value["written"].is_string() {
         println!(
             "{} is open in {}.",
-            get(value, "sealed").as_str().unwrap_or("The file"),
-            get(value, "written").as_str().unwrap_or("?")
+            value["sealed"].as_str().unwrap_or("The file"),
+            value["written"].as_str().unwrap_or("?")
         );
-    } else if get(value, "retired").is_array() {
+    } else if value["retired"].is_array() {
         println!("No copy of these opens any more:");
-        items(get(value, "retired"), "  ");
-    } else if let Some(name) = get(value, "locked").as_str() {
+        items(&value["retired"], "  ");
+    } else if let Some(name) = value["locked"].as_str() {
         println!("Seal {name}'s session on this host has ended.");
-    } else if get(value, "resealed").is_array() {
+    } else if value["resealed"].is_array() {
         println!("Sealed again to the seal's current devices:");
-        items(get(value, "resealed"), "  ");
+        items(&value["resealed"], "  ");
     } else {
         println!("{value}");
     }
