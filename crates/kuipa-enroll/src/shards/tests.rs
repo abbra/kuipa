@@ -90,7 +90,7 @@ fn shares_of_two_sets_or_with_other_parameters_are_not_mixed() {
         Err(Error::Mixed(_))
     ));
     let mut other_kem = a[1].clone();
-    other_kem.header.kem_1024 = true;
+    other_kem.header.kem = tang_pqc::KemAlg::MlKem1024;
     assert!(matches!(
         combine(&[a[0].clone(), other_kem]),
         Err(Error::Mixed(_))
@@ -340,7 +340,7 @@ fn a_share_has_these_words_for_these_parameters() {
     let share = Share {
         header: Header {
             set_id: 0x1_F3A1,
-            kem_1024: true,
+            kem: tang_pqc::KemAlg::MlKem1024,
             threshold: 3,
             shares: 5,
             index: 2,
@@ -387,5 +387,30 @@ fn a_seed_makes_this_key_for_each_kem() {
         let jwk: serde_json::Value =
             serde_json::from_slice(key.to_jwk().unwrap().as_ref()).unwrap();
         assert_eq!(jwk["priv"].as_str().unwrap(), expected);
+    }
+}
+
+#[test]
+fn a_new_set_recovers_its_key_from_any_threshold_of_shares() {
+    for kem in tang_pqc::KemAlg::ALL {
+        let p = SetParams {
+            iterations: 1,
+            ..SetParams::new(2, 3, !matches!(kem, tang_pqc::KemAlg::MlKem1024))
+        };
+        let (shares, pair) = new_set("correct horse battery staple", kem, p).unwrap();
+        assert_eq!(shares.len(), 3);
+        assert_eq!(pair.public().alg(), kem);
+        let got = recover(
+            &[shares[2].clone(), shares[0].clone()],
+            "correct horse battery staple",
+        )
+        .unwrap();
+        assert_eq!(got.public().kid(), pair.public().kid());
+        let wrong = recover(&shares[..2], "another passphrase entirely").unwrap();
+        assert_ne!(wrong.public().kid(), pair.public().kid());
+        assert!(matches!(
+            recover(&shares[..1], "x"),
+            Err(Error::NotEnough { .. })
+        ));
     }
 }

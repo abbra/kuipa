@@ -114,13 +114,22 @@ fn crypto(e: impl fmt::Display) -> Error {
     Error::Crypto(e.to_string())
 }
 
+/// The KEM a header's one bit names.
+fn kem_alg(kem_1024: bool) -> tang_pqc::KemAlg {
+    if kem_1024 {
+        tang_pqc::KemAlg::MlKem1024
+    } else {
+        tang_pqc::KemAlg::MlKem768
+    }
+}
+
 /// What the header of a share says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     /// Identifies the set the share belongs to (19 bits), so shares of two sets are not mixed.
     pub set_id: u32,
-    /// Whether the recovery key is ML-KEM-1024 (CNSA 2.0) and not ML-KEM-768.
-    pub kem_1024: bool,
+    /// The recovery key's KEM.
+    pub kem: tang_pqc::KemAlg,
     /// How many shares recombine the seed.
     pub threshold: u8,
     /// How many shares the set has.
@@ -238,7 +247,7 @@ impl Share {
         let mut w = BitWriter::new();
         w.put(u32::from(VERSION), 4);
         w.put(h.set_id & 0x7_FFFF, 19);
-        w.put(u32::from(h.kem_1024), 1);
+        w.put(u32::from(h.kem == tang_pqc::KemAlg::MlKem1024), 1);
         w.put(u32::from(h.threshold.saturating_sub(1)), 4);
         w.put(u32::from(h.shares.saturating_sub(1)), 4);
         w.put(u32::from(h.index.saturating_sub(1)), 4);
@@ -300,7 +309,7 @@ impl Share {
             return Err(Error::Malformed("unknown format version"));
         }
         let set_id = r.take(19);
-        let kem_1024 = r.take(1) == 1;
+        let kem = kem_alg(r.take(1) == 1);
         let threshold = small(r.take(4) + 1);
         let shares = small(r.take(4) + 1);
         let index = small(r.take(4) + 1);
@@ -322,7 +331,7 @@ impl Share {
         let secret = r.bytes::<32>()?;
         let header = Header {
             set_id,
-            kem_1024,
+            kem,
             threshold,
             shares,
             index,
@@ -442,6 +451,7 @@ fn make_shares_with(
         parity,
         kem_1024,
     } = params;
+    let kem = kem_alg(kem_1024);
     if threshold < 2 {
         return Err(Error::Parameters(
             "the threshold is at least 2: one share would be the whole key",
@@ -471,7 +481,7 @@ fn make_shares_with(
         .map(|(secret, index)| Share {
             header: Header {
                 set_id,
-                kem_1024,
+                kem,
                 threshold,
                 shares,
                 index,
@@ -502,7 +512,7 @@ pub fn combine(shares: &[Share]) -> Result<Combined, Error> {
         if s.header.threshold != h.threshold
             || s.header.shares != h.shares
             || s.header.iterations != h.iterations
-            || s.header.kem_1024 != h.kem_1024
+            || s.header.kem != h.kem
             || s.salt != first.salt
         {
             return Err(Error::Mixed("they disagree about the set's parameters"));
@@ -531,8 +541,43 @@ pub fn combine(shares: &[Share]) -> Result<Combined, Error> {
         salt: first.salt,
         iterations: h.iterations,
         set_id: h.set_id,
-        kem_1024: h.kem_1024,
+        kem_1024: h.kem == tang_pqc::KemAlg::MlKem1024,
     })
+}
+
+/// A new recovery key of `kem`, hidden under `passphrase` and split as `p` says (`p.kem_1024` is
+/// ignored: `kem` decides): the shares to print and the key pair they recover.
+///
+/// # Errors
+///
+/// As [`make_shares`], [`mask`] and [`recovery_key`].
+pub fn new_set(
+    passphrase: &str,
+    kem: tang_pqc::KemAlg,
+    p: SetParams,
+) -> Result<(Vec<Share>, tang_pqc::ExchangeKeyPair), Error> {
+    let params = SetParams {
+        kem_1024: kem == tang_pqc::KemAlg::MlKem1024,
+        ..p
+    };
+    let mut seed = [0u8; 32];
+    random(&mut seed)?;
+    let salt = new_salt()?;
+    let hidden = mask(&seed, passphrase, &salt, params.iterations)?;
+    let shares = make_shares(&hidden, salt, params)?;
+    Ok((shares, recovery_key(&seed, params.kem_1024)?))
+}
+
+/// The recovery key `shares` of one set and `passphrase` make: [`combine`], [`mask`] and
+/// [`recovery_key`].  A wrong passphrase makes another key, which only its identifier can show.
+///
+/// # Errors
+///
+/// As [`combine`], [`mask`] and [`recovery_key`].
+pub fn recover(shares: &[Share], passphrase: &str) -> Result<tang_pqc::ExchangeKeyPair, Error> {
+    let c = combine(shares)?;
+    let seed = mask(&c.hidden, passphrase, &c.salt, c.iterations)?;
+    recovery_key(&seed, c.kem_1024)
 }
 
 /// A new random PBKDF2 salt.
@@ -594,11 +639,7 @@ pub fn mask(
 ///
 /// [`Error::Crypto`] if OpenSSL fails or the system crypto policy disables the KEM.
 pub fn recovery_key(seed: &[u8; 32], kem_1024: bool) -> Result<tang_pqc::ExchangeKeyPair, Error> {
-    let alg = if kem_1024 {
-        tang_pqc::KemAlg::MlKem1024
-    } else {
-        tang_pqc::KemAlg::MlKem768
-    };
+    let alg = kem_alg(kem_1024);
     let mut dz = [0u8; 64];
     RECOVERY_DOMAIN
         .hkdf(alg.hash(), &[seed], "seed", &[], &mut dz)
