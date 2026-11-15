@@ -46,9 +46,8 @@ use std::ffi::c_char;
 use std::ffi::{CStr, CString};
 use std::ptr;
 
-
-pub use error::GssError;
 use error::cstring;
+pub use error::GssError;
 pub use kinit::{ticket, NoPreauth, Preauth};
 
 /// Whether this build links MIT Kerberos (the cfg `build.rs` sets):
@@ -58,6 +57,36 @@ pub use kinit::{ticket, NoPreauth, Preauth};
 #[must_use]
 pub const fn is_mit_kerberos() -> bool {
     cfg!(mit_kerberos)
+}
+
+/// An imported GSS-API name, released on drop.
+#[derive(Debug)]
+struct GssName(ffi::GssNameT);
+
+impl GssName {
+    /// Import `name`, of type `name_type`.
+    fn import(name: &CStr, name_type: &ffi::GssOidDesc) -> Result<Self, GssError> {
+        let buf = ffi::GssBufferDesc::borrowing(name.to_bytes());
+        let mut minor: ffi::OmUint32 = 0;
+        let mut raw: ffi::GssNameT = ptr::null_mut();
+        // SAFETY: buf wraps a live slice, name_type is a well-formed OID
+        // descriptor, raw is a valid output pointer.
+        let major = unsafe {
+            ffi::gss_import_name(&raw mut minor, &raw const buf, name_type, &raw mut raw)
+        };
+        if major != ffi::GSS_S_COMPLETE {
+            return Err(GssError::gss("gss_import_name", major, minor));
+        }
+        Ok(Self(raw))
+    }
+}
+
+impl Drop for GssName {
+    fn drop(&mut self) {
+        let mut minor: ffi::OmUint32 = 0;
+        // SAFETY: returned by gss_import_name, released once.
+        unsafe { ffi::gss_release_name(&raw mut minor, &raw mut self.0) };
+    }
 }
 
 /// Whether an initiator credential also serves as the S4U2Self
@@ -182,23 +211,7 @@ impl GssServerCred {
         let mut minor: ffi::OmUint32 = 0;
 
         // Import "service_name" as a host-based service name.
-        let svc_oid = ffi::gss_c_nt_hostbased_service();
-        let svc_buf = ffi::GssBufferDesc::borrowing(svc_cstr.to_bytes());
-        let mut svc_name: ffi::GssNameT = ptr::null_mut();
-        // SAFETY: all arguments are valid: minor points to a local u32, svc_buf
-        // wraps a valid CString slice, svc_oid is a well-formed OID descriptor,
-        // svc_name is a valid output pointer.
-        let major = unsafe {
-            ffi::gss_import_name(
-                &raw mut minor,
-                &raw const svc_buf,
-                &raw const svc_oid,
-                &raw mut svc_name,
-            )
-        };
-        if major != ffi::GSS_S_COMPLETE {
-            return Err(GssError::gss("gss_import_name", major, minor));
-        }
+        let svc_name = GssName::import(svc_cstr, &ffi::gss_c_nt_hostbased_service())?;
 
         // Build the credential store: {keytab, client_keytab} both pointing at the
         // same file.  The `keytab` entry provides the ACCEPT credential; `client_keytab`
@@ -251,12 +264,12 @@ impl GssServerCred {
         // environment without a reachable KDC), fall back to GSS_C_ACCEPT which
         // is sufficient for SPNEGO validation.
         let mut cred_usage = ffi::GSS_C_BOTH;
-        // SAFETY: svc_name was returned by gss_import_name, cred_store elements
+        // SAFETY: svc_name is a live imported name, cred_store elements
         // point to live CStrings, and the output pointers are valid locals.
         let major = unsafe {
             Self::acquire_cred_both_then_accept(
                 &raw mut minor,
-                svc_name,
+                svc_name.0,
                 &raw const cred_store,
                 &raw mut cred_handle,
                 &raw mut actual_mechs,
@@ -270,14 +283,10 @@ impl GssServerCred {
         // Snapshot the error minor before cleanup calls overwrite it.
         let error_minor = minor;
 
-        // Release the name and the actual_mechs set regardless of success/failure.
-        // SAFETY: svc_name is a valid GssNameT returned by gss_import_name above.
-        unsafe {
-            ffi::gss_release_name(&raw mut minor, &raw mut svc_name);
-            if !actual_mechs.is_null() {
-                // SAFETY: actual_mechs is non-null and was set by gss_acquire_cred_from.
-                ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs);
-            }
+        // Release the actual_mechs set regardless of success/failure.
+        if !actual_mechs.is_null() {
+            // SAFETY: actual_mechs is non-null and was set by gss_acquire_cred_from.
+            unsafe { ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs) };
         }
 
         if major != ffi::GSS_S_COMPLETE {
@@ -811,27 +820,9 @@ impl GssClientCred {
     #[cfg(mit_kerberos)]
     fn from_store_mit(store: &[(&CStr, &CStr)], name: Option<&CStr>) -> Result<Self, GssError> {
         let mut minor: ffi::OmUint32 = 0;
-        let mut desired: ffi::GssNameT = ptr::null_mut();
-        if let Some(name) = name {
-            let buf = ffi::GssBufferDesc {
-                length: name.to_bytes().len(),
-                value: name.as_ptr() as *mut std::ffi::c_void,
-            };
-            let oid = ffi::gss_krb5_nt_principal_name();
-            // SAFETY: buf wraps a live CStr, oid is a well-formed OID
-            // descriptor, desired is a valid output pointer.
-            let major = unsafe {
-                ffi::gss_import_name(
-                    &raw mut minor,
-                    &raw const buf,
-                    &raw const oid,
-                    &raw mut desired,
-                )
-            };
-            if major != ffi::GSS_S_COMPLETE {
-                return Err(GssError::gss("gss_import_name", major, minor));
-            }
-        }
+        let desired = name
+            .map(|n| GssName::import(n, &ffi::gss_krb5_nt_principal_name()))
+            .transpose()?;
         let mut elements: Vec<ffi::GssKeyValueElementDesc> = store
             .iter()
             .map(|(key, value)| ffi::GssKeyValueElementDesc {
@@ -854,7 +845,7 @@ impl GssClientCred {
         let major = unsafe {
             ffi::gss_acquire_cred_from(
                 &raw mut minor,
-                desired,
+                desired.as_ref().map_or(ptr::null_mut(), |n| n.0),
                 0, // GSS_C_INDEFINITE
                 ffi::GSS_C_NO_OID_SET,
                 ffi::GSS_C_INITIATE,
@@ -866,10 +857,6 @@ impl GssClientCred {
         };
 
         let error_minor = minor;
-        if !desired.is_null() {
-            // SAFETY: desired was imported above and is released once.
-            unsafe { ffi::gss_release_name(&raw mut minor, &raw mut desired) };
-        }
 
         // SAFETY: actual_mechs is non-null when set by gss_acquire_cred_from.
         unsafe {
@@ -914,7 +901,7 @@ impl GssClientCred {
     ///   (KDC policy, missing delegation config, or unknown principal).
     pub fn impersonate(initiator: &GssClientCred, user_principal: &str) -> Result<Self, GssError> {
         #[cfg(mit_kerberos)]
-        return Self::impersonate_mit(initiator, user_principal);
+        return Self::impersonate_mit(initiator.raw, user_principal);
         #[cfg(heimdal_kerberos)]
         {
             let _ = (&initiator, user_principal);
@@ -924,42 +911,28 @@ impl GssClientCred {
         }
     }
 
+    /// S4U2Self for `user_principal`, with `impersonator` — an initiator
+    /// credential, or under gssproxy the acceptor credential gssproxy manages.
     #[cfg(mit_kerberos)]
-    fn impersonate_mit(initiator: &GssClientCred, user_principal: &str) -> Result<Self, GssError> {
-        let principal_cstr =
-            cstring(user_principal, "user principal")?;
+    fn impersonate_mit(
+        impersonator: ffi::GssCredIdT,
+        user_principal: &str,
+    ) -> Result<Self, GssError> {
+        let principal_cstr = cstring(user_principal, "user principal")?;
+        let user_name = GssName::import(&principal_cstr, &ffi::gss_krb5_nt_principal_name())?;
+
         let mut minor: ffi::OmUint32 = 0;
-
-        // Import the user principal as a Kerberos principal name.
-        let principal_oid = ffi::gss_krb5_nt_principal_name();
-        let principal_buf = ffi::GssBufferDesc::borrowing(principal_cstr.to_bytes());
-        let mut user_name: ffi::GssNameT = ptr::null_mut();
-        // SAFETY: minor, principal_buf, and principal_oid are valid stack values;
-        // user_name is a valid output pointer.
-        let major = unsafe {
-            ffi::gss_import_name(
-                &raw mut minor,
-                &raw const principal_buf,
-                &raw const principal_oid,
-                &raw mut user_name,
-            )
-        };
-        if major != ffi::GSS_S_COMPLETE {
-            return Err(GssError::gss("gss_import_name", major, minor));
-        }
-
         let mut impersonated: ffi::GssCredIdT = ptr::null_mut();
         let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
         let mut time_rec: ffi::OmUint32 = 0;
 
-        // SAFETY: initiator.raw is a live initiator credential; user_name was
-        // returned by gss_import_name and is still valid; output pointers are
-        // valid locals.
+        // SAFETY: impersonator is a live credential owned by the caller;
+        // user_name is a live imported name; output pointers are valid locals.
         let major = unsafe {
             ffi::gss_acquire_cred_impersonate_name(
                 &raw mut minor,
-                initiator.raw,
-                user_name,
+                impersonator,
+                user_name.0,
                 0, // GSS_C_INDEFINITE
                 ffi::GSS_C_NO_OID_SET,
                 ffi::GSS_C_INITIATE,
@@ -970,14 +943,9 @@ impl GssClientCred {
         };
 
         let error_minor = minor;
-
-        // Release the user name and actual_mechs set regardless of outcome.
-        // SAFETY: user_name was returned by gss_import_name above.
-        unsafe {
-            ffi::gss_release_name(&raw mut minor, &raw mut user_name);
-            if !actual_mechs.is_null() {
-                ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs);
-            }
+        if !actual_mechs.is_null() {
+            // SAFETY: set by gss_acquire_cred_impersonate_name.
+            unsafe { ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs) };
         }
 
         if major != ffi::GSS_S_COMPLETE {
@@ -985,7 +953,11 @@ impl GssClientCred {
                 // SAFETY: impersonated was set by gss_acquire_cred_impersonate_name.
                 unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut impersonated) };
             }
-            return Err(GssError::gss("gss_acquire_cred_impersonate_name", major, error_minor));
+            return Err(GssError::gss(
+                "gss_acquire_cred_impersonate_name",
+                major,
+                error_minor,
+            ));
         }
 
         Ok(GssClientCred { raw: impersonated })
@@ -1388,7 +1360,7 @@ fn acquire_initiator_from_ccache(ccache_name: &CStr) -> Result<ffi::GssCredIdT, 
 #[derive(Debug)]
 pub(crate) struct GssClientContext {
     raw: ffi::GssCtxIdT,
-    target_name: ffi::GssNameT,
+    target_name: GssName,
     /// Use the Kerberos V5 mechanism directly instead of SPNEGO.
     krb5: bool,
 }
@@ -1411,10 +1383,6 @@ impl Drop for GssClientContext {
                 unsafe { ffi::gss_release_buffer(&raw mut minor, &raw mut discard) };
             }
         }
-        if !self.target_name.is_null() {
-            // SAFETY: self.target_name was returned by gss_import_name.
-            unsafe { ffi::gss_release_name(&raw mut minor, &raw mut self.target_name) };
-        }
     }
 }
 
@@ -1433,21 +1401,7 @@ impl GssClientContext {
 
     fn with_name_type(target_service: &str, svc_oid: &ffi::GssOidDesc) -> Result<Self, GssError> {
         let svc_cstr = cstring(target_service, "target service name")?;
-        let mut minor: ffi::OmUint32 = 0;
-        let svc_buf = ffi::GssBufferDesc::borrowing(svc_cstr.to_bytes());
-        let mut target_name: ffi::GssNameT = ptr::null_mut();
-        // SAFETY: svc_buf wraps a live CString; target_name is a valid output pointer.
-        let major = unsafe {
-            ffi::gss_import_name(
-                &raw mut minor,
-                &raw const svc_buf,
-                &raw const *svc_oid,
-                &raw mut target_name,
-            )
-        };
-        if major != ffi::GSS_S_COMPLETE {
-            return Err(GssError::gss("gss_import_name", major, minor));
-        }
+        let target_name = GssName::import(&svc_cstr, svc_oid)?;
         Ok(GssClientContext {
             raw: ffi::GSS_C_NO_CONTEXT,
             target_name,
@@ -1559,7 +1513,7 @@ impl GssClientContext {
                 &raw mut minor,
                 cred.raw,
                 &raw mut self.raw,
-                self.target_name,
+                self.target_name.0,
                 mech, // null or krb5_oid, which lives until after this call
                 // No GSS_C_MUTUAL_FLAG: all callers use HTTPS where TLS
                 // already provides server authentication.  Requesting mutual
@@ -1907,7 +1861,7 @@ pub fn impersonate_with_server_cred(
     user_principal: &str,
 ) -> Result<GssClientCred, GssError> {
     #[cfg(mit_kerberos)]
-    return impersonate_with_server_cred_mit(server, user_principal);
+    return GssClientCred::impersonate_mit(server.raw, user_principal);
     #[cfg(heimdal_kerberos)]
     {
         let _ = (server, user_principal);
@@ -1915,68 +1869,6 @@ pub fn impersonate_with_server_cred(
             feature: "S4U2Self (gss_acquire_cred_impersonate_name)",
         })
     }
-}
-
-#[cfg(mit_kerberos)]
-fn impersonate_with_server_cred_mit(
-    server: &GssServerCred,
-    user_principal: &str,
-) -> Result<GssClientCred, GssError> {
-    let principal_cstr = cstring(user_principal, "user principal")?;
-    let mut minor: ffi::OmUint32 = 0;
-
-    let principal_oid = ffi::gss_krb5_nt_principal_name();
-    let principal_buf = ffi::GssBufferDesc::borrowing(principal_cstr.to_bytes());
-    let mut user_name: ffi::GssNameT = ptr::null_mut();
-    // SAFETY: minor, principal_buf, and principal_oid are valid stack values.
-    let major = unsafe {
-        ffi::gss_import_name(
-            &raw mut minor,
-            &raw const principal_buf,
-            &raw const principal_oid,
-            &raw mut user_name,
-        )
-    };
-    if major != ffi::GSS_S_COMPLETE {
-        return Err(GssError::gss("gss_import_name", major, minor));
-    }
-
-    let mut impersonated: ffi::GssCredIdT = ptr::null_mut();
-    let mut actual_mechs: ffi::GssOidSetT = ptr::null_mut();
-    let mut time_rec: ffi::OmUint32 = 0;
-
-    // SAFETY: server.raw is the gssproxy-managed ACCEPT credential; user_name was
-    // returned by gss_import_name and is still valid; output pointers are valid locals.
-    let major = unsafe {
-        ffi::gss_acquire_cred_impersonate_name(
-            &raw mut minor,
-            server.raw,
-            user_name,
-            0,
-            ffi::GSS_C_NO_OID_SET,
-            ffi::GSS_C_INITIATE,
-            &raw mut impersonated,
-            &raw mut actual_mechs,
-            &raw mut time_rec,
-        )
-    };
-
-    let error_minor = minor;
-    unsafe {
-        ffi::gss_release_name(&raw mut minor, &raw mut user_name);
-        if !actual_mechs.is_null() {
-            ffi::gss_release_oid_set(&raw mut minor, &raw mut actual_mechs);
-        }
-    }
-
-    if major != ffi::GSS_S_COMPLETE {
-        if !impersonated.is_null() {
-            unsafe { ffi::gss_release_cred(&raw mut minor, &raw mut impersonated) };
-        }
-        return Err(GssError::gss("gss_acquire_cred_impersonate_name", major, error_minor));
-    }
-
-    Ok(GssClientCred { raw: impersonated })
 }
 
 // ── init_token ────────────────────────────────────────────────────────────────
@@ -2174,19 +2066,34 @@ mod tests {
     #[test]
     fn acquire_nul_in_service_name_returns_error() {
         let err = GssServerCred::acquire("HTTP\0badname", "/tmp/fake.keytab").unwrap_err();
-        assert!(matches!(err, GssError::Nul { what: "service name" }));
+        assert!(matches!(
+            err,
+            GssError::Nul {
+                what: "service name"
+            }
+        ));
     }
 
     #[test]
     fn acquire_nul_in_keytab_path_returns_error() {
         let err = GssServerCred::acquire("HTTP", "/tmp/\0fake.keytab").unwrap_err();
-        assert!(matches!(err, GssError::Nul { what: "keytab path" }));
+        assert!(matches!(
+            err,
+            GssError::Nul {
+                what: "keytab path"
+            }
+        ));
     }
 
     #[test]
     fn from_keytab_nul_in_path_returns_error() {
         let err = GssClientCred::from_client_keytab("/tmp/\0bad.keytab", None, None).unwrap_err();
-        assert!(matches!(err, GssError::Nul { what: "keytab path" }));
+        assert!(matches!(
+            err,
+            GssError::Nul {
+                what: "keytab path"
+            }
+        ));
     }
 
     #[test]
@@ -2198,7 +2105,12 @@ mod tests {
             raw: ptr::null_mut(),
         };
         let err = init_token(&cred, "HTTP\0bad.host", None).unwrap_err();
-        assert!(matches!(err, GssError::Nul { what: "target service name" }));
+        assert!(matches!(
+            err,
+            GssError::Nul {
+                what: "target service name"
+            }
+        ));
         // Prevent Drop from calling gss_release_cred on a null handle.
         std::mem::forget(cred);
     }

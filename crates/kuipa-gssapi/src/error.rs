@@ -115,7 +115,12 @@ impl GssError {
     pub(crate) fn gss(op: &'static str, major: OmUint32, minor: OmUint32) -> Self {
         let detail = format_gss_status(major, minor);
         tracing::warn!(op, major = %format_args!("{major:#010x}"), minor = %format_args!("{minor:#010x}"), %detail, "GSS-API call failed");
-        Self::Gss { op, major, minor, detail }
+        Self::Gss {
+            op,
+            major,
+            minor,
+            detail,
+        }
     }
 }
 

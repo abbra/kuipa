@@ -150,7 +150,10 @@ static GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES: [u8; 10] =
 pub(crate) fn gss_c_nt_hostbased_service() -> GssOidDesc {
     GssOidDesc {
         length: 6,
-        elements: GSS_C_NT_HOSTBASED_SERVICE_OID_BYTES.as_ptr().cast_mut().cast(),
+        elements: GSS_C_NT_HOSTBASED_SERVICE_OID_BYTES
+            .as_ptr()
+            .cast_mut()
+            .cast(),
     }
 }
 
@@ -158,7 +161,10 @@ pub(crate) fn gss_c_nt_hostbased_service() -> GssOidDesc {
 pub(crate) fn gss_krb5_nt_principal_name() -> GssOidDesc {
     GssOidDesc {
         length: 10,
-        elements: GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES.as_ptr().cast_mut().cast(),
+        elements: GSS_KRB5_NT_PRINCIPAL_NAME_OID_BYTES
+            .as_ptr()
+            .cast_mut()
+            .cast(),
     }
 }
 
@@ -222,8 +228,11 @@ extern "C" {
     ) -> c_int;
     pub(crate) fn krb5_free_principal(context: Krb5Context, val: Krb5Principal);
     #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
-    pub(crate) fn krb5_kt_resolve(context: Krb5Context, name: *const c_char, id: *mut Krb5Keytab)
-        -> c_int;
+    pub(crate) fn krb5_kt_resolve(
+        context: Krb5Context,
+        name: *const c_char,
+        id: *mut Krb5Keytab,
+    ) -> c_int;
     #[cfg(heimdal_kerberos)] // only Heimdal gets a TGT from a keytab by hand
     pub(crate) fn krb5_kt_close(context: Krb5Context, id: Krb5Keytab) -> c_int;
     pub(crate) fn krb5_cc_resolve(
@@ -682,7 +691,8 @@ impl Default for Krb5KtEntry {
 extern "C" {
     /// Read `filenames`, a NULL-terminated array, as the whole configuration,
     /// replacing what the context loaded from the environment.
-    pub(crate) fn krb5_set_config_files(context: Krb5Context, filenames: *mut *mut c_char) -> c_int;
+    pub(crate) fn krb5_set_config_files(context: Krb5Context, filenames: *mut *mut c_char)
+        -> c_int;
 
     /// `krb5_init_creds_context`: one AS exchange, driven step by step.
     pub(crate) fn krb5_init_creds_init(
@@ -795,7 +805,10 @@ extern "C" {
     /// How long the ticket is to live.  Both vendors have this, but only the
     /// Heimdal armour needs it; MIT takes the lifetime from the options of
     /// its one-call exchange.
-    pub(crate) fn krb5_get_init_creds_opt_set_tkt_life(opt: Krb5GetInitCredsOpt, tkt_life: Krb5Deltat);
+    pub(crate) fn krb5_get_init_creds_opt_set_tkt_life(
+        opt: Krb5GetInitCredsOpt,
+        tkt_life: Krb5Deltat,
+    );
     /// Report, through the exchange's prompter, the text the KDC sent back in
     /// its last reply.  `kinit` calls this once the exchange succeeded.
     pub(crate) fn krb5_process_last_request(
@@ -885,10 +898,16 @@ extern "C" {
     pub(crate) fn gss_release_name(minor_status: *mut OmUint32, name: *mut GssNameT) -> OmUint32;
 
     /// Release a buffer allocated by GSSAPI.
-    pub(crate) fn gss_release_buffer(minor_status: *mut OmUint32, buffer: *mut GssBufferDesc) -> OmUint32;
+    pub(crate) fn gss_release_buffer(
+        minor_status: *mut OmUint32,
+        buffer: *mut GssBufferDesc,
+    ) -> OmUint32;
 
     /// Release a credential handle.
-    pub(crate) fn gss_release_cred(minor_status: *mut OmUint32, cred_handle: *mut GssCredIdT) -> OmUint32;
+    pub(crate) fn gss_release_cred(
+        minor_status: *mut OmUint32,
+        cred_handle: *mut GssCredIdT,
+    ) -> OmUint32;
 
     /// Delete a security context, releasing all associated state.
     pub(crate) fn gss_delete_sec_context(
@@ -899,7 +918,10 @@ extern "C" {
 
     /// Release an OID set (e.g. from `gss_acquire_cred_from` `actual_mechs` output).
     #[cfg(mit_kerberos)]
-    pub(crate) fn gss_release_oid_set(minor_status: *mut OmUint32, set: *mut GssOidSetT) -> OmUint32;
+    pub(crate) fn gss_release_oid_set(
+        minor_status: *mut OmUint32,
+        set: *mut GssOidSetT,
+    ) -> OmUint32;
 
     /// Convert a major or minor status code to a human-readable string.
     pub(crate) fn gss_display_status(
