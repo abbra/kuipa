@@ -21,18 +21,18 @@
 pub mod anchors;
 pub mod backup;
 pub mod bundle;
-pub mod certs;
+mod certs;
 pub mod delegation;
 pub mod enrollment;
 pub mod epoch;
-pub mod error;
+mod error;
 pub mod escrow;
 pub mod join;
 pub mod keys;
 pub mod keytab;
 pub mod merkle;
 pub mod passkey;
-pub mod payload;
+mod payload;
 pub mod realm;
 pub mod seal;
 pub mod server;
@@ -46,4 +46,5 @@ pub mod trust;
 pub mod voucher;
 
 pub use error::{Error, Result};
+pub use payload::{Enrollment, PinsAnswer, RealmConfig};
 pub use server::{Directory, EnrollServer};

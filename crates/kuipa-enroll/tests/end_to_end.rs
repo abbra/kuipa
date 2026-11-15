@@ -4700,7 +4700,7 @@ fn pins_refresh(
     adv: &VerifiedRealm,
     caller: &str,
     bound: &str,
-) -> Result<kuipa_enroll::payload::PinsAnswer, ()> {
+) -> Result<kuipa_enroll::PinsAnswer, ()> {
     let p = Prepared::new(
         adv,
         Operation::Pins,
