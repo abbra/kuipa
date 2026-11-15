@@ -75,6 +75,10 @@ kuipa seal file personal ~/.config/app/token     # writes ~/.config/app/token.se
 shred -u ~/.config/app/token
 ```
 
+On a host with a TPM, `kuipa seal device add personal --tpm` keeps the
+device key as a user-scoped TPM credential instead: no passphrase, and it
+opens only on this host.
+
 Later:
 
 ```sh

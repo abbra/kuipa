@@ -15,12 +15,13 @@ usage.
 | command | does |
 |---|---|
 | `enroll` | join the realm online (OTP, `--ldap-otp`, `--principal` with a password, `--use-ccache`, `--voucher-file`) or offline (`--bundle`) |
-| `prepare [--new] [--hostname H]` | make the machine key a mode A bundle is sealed to; print its thumbprint |
+| `prepare [--new] [--hostname H] [--tpm [--tpm-pcrs L]]` | make the machine key a mode A bundle is sealed to; print its thumbprint; `--tpm` keeps the key as a TPM credential |
+| `adopt --enrollment-file F [--server S… \| --domain D] [--hostname H]` | record kuipa's state for a host that already holds its keytab, with no rekey; the keytab must get a ticket as `host/<fqdn>` |
 | `voucher-key --out F` | make the ephemeral key a voucher binds to; print the binding |
-| `realm-info --krb5-dir D` | write a Kerberos configuration from the verified advertisement, for an armoured `kinit` before `--use-ccache` |
+| `realm-info --krb5-dir D [--trust-first-use]` | write a Kerberos configuration from the verified advertisement, for an armoured `kinit` before `--use-ccache`; `--trust-first-use` trusts the advertisement with no pin, and warns |
 | `complete` | finish an offline enrollment at first contact |
 | `rotate-keys` | new host keys; refresh pins and servers; reseal when protected |
-| `protect` / `unprotect` | seal the host keytab on disk, or put it back |
+| `protect [--tpm [--tpm-pcrs L]]` / `unprotect` | seal the host keytab on disk, or put it back; `--tpm` also binds the seal to this host's TPM (also with `--keytab` and `--file`) |
 | `protect` / `unprotect --keytab F` | the same for a service's or user's keytab |
 | `protect` / `unprotect --file F [--keytab K]` | the same for any file, sealed for `K`'s principal (default: the host) |
 | `trusted-realms` | install and refresh the realms this realm trusts; remove the others |
@@ -39,6 +40,7 @@ usage.
 | `policy SEAL …` | replace a seal's policy (same options) |
 | `device add SEAL [--passphrase-file F]` | register this host's device key, made under a passphrase if there is none |
 | `device add SEAL --pkcs11 URI [--module PATH]` | register an ML-KEM key on a PKCS#11 token instead |
+| `device add SEAL --tpm` | keep the device key as a user-scoped TPM credential, opened with no passphrase |
 | `device remove SEAL ID` | remove a device |
 | `file SEAL FILE [--out F] [--session]` | seal a file (offline while the seal's description is recent) |
 | `open SEALED --out F\|- [--force] [--passphrase-file F]` | open a sealed file |
