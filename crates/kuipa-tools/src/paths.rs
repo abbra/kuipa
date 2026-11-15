@@ -103,7 +103,7 @@ impl Paths {
     /// The host's own kuipa data directory for `kuipa escrow`: the seal
     /// descriptors it seals deposits with, root-only.
     #[must_use]
-    pub fn escrow_dir(&self) -> PathBuf {
+    pub(crate) fn escrow_dir(&self) -> PathBuf {
         self.state_dir().join("escrow")
     }
 
@@ -122,7 +122,7 @@ impl Paths {
 
     /// `/etc/ipa/ku/realm.json`: public realm, hostname and servers.
     #[must_use]
-    pub fn public_state(&self) -> PathBuf {
+    pub(crate) fn public_state(&self) -> PathBuf {
         self.at("etc/ipa/ku/realm.json")
     }
 
@@ -621,7 +621,7 @@ impl Pin {
 /// Most heads kept in one pin's window (DESIGN-claim-logs.md §1.2):
 /// enough to cover a month of daily re-vouching with room for
 /// refreshes in between, small enough that a pin line stays a line.
-pub const MAX_HEAD_WINDOW: usize = 4;
+pub(crate) const MAX_HEAD_WINDOW: usize = 4;
 
 /// Merge a verified advertisement's heads into the host's pins
 /// (DESIGN-claim-logs.md §1.2–§1.3, `DESIGN-tlog.md` §8): a head that
@@ -955,7 +955,7 @@ pub fn write_anchors(paths: &Paths, anchors: &[tang_pqc::Thumbprint]) -> Result<
 
 /// An anchor with its current vouch head (§4.9), as server responses
 /// deliver them: `None` where the server knew no head.
-pub type AnchorHead = (tang_pqc::Thumbprint, Option<(u64, Hash)>);
+pub(crate) type AnchorHead = (tang_pqc::Thumbprint, Option<(u64, Hash)>);
 
 /// Write an anchors file with expiry-bearing pins and an optional epoch
 /// watermark (§4.8).

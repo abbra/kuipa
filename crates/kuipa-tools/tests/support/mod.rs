@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-pub mod certs;
-pub mod directory;
-pub mod dns;
-pub mod kdc;
+pub(crate) mod certs;
+pub(crate) mod directory;
+pub(crate) mod dns;
+pub(crate) mod kdc;

@@ -20,7 +20,7 @@ use crate::paths::{self, Error, Paths, PublicState};
 
 /// The bundle file for `file`: `<file>.kusig`.
 #[must_use]
-pub fn bundle_path(file: &Path) -> PathBuf {
+pub(crate) fn bundle_path(file: &Path) -> PathBuf {
     paths::with_suffix(file, ".kusig")
 }
 

@@ -24,7 +24,7 @@ fn provider_module() -> PathBuf {
 
 /// An ML-KEM private key held by a token, with the OpenSSL context and
 /// provider that reach it kept alive as long as it is.
-pub struct TokenKey {
+pub(crate) struct TokenKey {
     pair: ExchangeKeyPair,
     _provider: Provider,
     _ctx: Arc<LibCtx>,
@@ -39,7 +39,7 @@ impl TokenKey {
     ///
     /// The provider, the token or the key cannot be reached, or the key is
     /// not ML-KEM-768 or ML-KEM-1024.
-    pub fn open(module: &Path, uri: &str, pin: &[u8], scratch: &Path) -> Result<Self, Error> {
+    pub(crate) fn open(module: &Path, uri: &str, pin: &[u8], scratch: &Path) -> Result<Self, Error> {
         let ctx = Arc::new(LibCtx::new()?);
         let conf = scratch.join(format!("pkcs11-{}.cnf", std::process::id()));
         std::fs::create_dir_all(scratch)?;
@@ -91,7 +91,7 @@ impl TokenKey {
 
     /// The public key.
     #[must_use]
-    pub fn public(&self) -> &ExchangeKey {
+    pub(crate) fn public(&self) -> &ExchangeKey {
         self.pair.public()
     }
 }

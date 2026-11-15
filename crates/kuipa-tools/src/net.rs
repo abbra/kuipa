@@ -337,7 +337,7 @@ fn endpoint_override(server: &str) -> Option<String> {
 
 /// Is `server` reached over TLS (an FQDN or an `https://` URL)?
 #[must_use]
-pub fn uses_tls(server: &str) -> bool {
+pub(crate) fn uses_tls(server: &str) -> bool {
     server.starts_with("https://") || !(server.contains("://") || server.starts_with("unix:"))
 }
 
@@ -621,7 +621,7 @@ impl Endpoint {
     /// # Errors
     ///
     /// A classified [`NetError`], or a malformed head.
-    pub fn tlog_head(
+    pub(crate) fn tlog_head(
         &self,
         log: &kuipa_enroll::tlog::LogId,
     ) -> Result<Option<kuipa_enroll::tlog::SignedHead>, NetError> {
@@ -643,7 +643,7 @@ impl Endpoint {
     /// # Errors
     ///
     /// A classified [`NetError`], or a malformed leaf.
-    pub fn tlog_leaves(
+    pub(crate) fn tlog_leaves(
         &self,
         log: &kuipa_enroll::tlog::LogId,
         from: u64,
@@ -672,7 +672,7 @@ impl Endpoint {
     /// # Errors
     ///
     /// A classified [`NetError`], or a malformed proof.
-    pub fn tlog_consistency(
+    pub(crate) fn tlog_consistency(
         &self,
         log: &kuipa_enroll::tlog::LogId,
         old: u64,
@@ -703,7 +703,7 @@ impl Endpoint {
     /// # Errors
     ///
     /// A classified [`NetError`].
-    pub fn advertisement_query(&self, query: &str) -> Result<Vec<u8>, NetError> {
+    pub(crate) fn advertisement_query(&self, query: &str) -> Result<Vec<u8>, NetError> {
         let url = format!("{}adv?{query}", self.base);
         self.send("GET", &url, self.client.get(&url), 0)
     }

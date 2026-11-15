@@ -22,12 +22,12 @@ use crate::net::Endpoint;
 /// Pages fetched per anchor per sync round.  A log longer than
 /// `MAX_CLAIM_LOG_PAGE * MAX_PAGES_PER_ANCHOR` leaves is cached in part
 /// and reported `unchecked` by the audit.
-pub const MAX_PAGES_PER_ANCHOR: usize = 64;
+pub(crate) const MAX_PAGES_PER_ANCHOR: usize = 64;
 /// Head queries remembered for the next sync; the oldest are dropped
 /// past this.
-pub const MAX_WANTED: usize = 128;
+pub(crate) const MAX_WANTED: usize = 128;
 /// Head-proof answers cached; the oldest are dropped past this.
-pub const MAX_HEADS: usize = 64;
+pub(crate) const MAX_HEADS: usize = 64;
 
 /// What the mirror holds: the public bytes it serves, and the queries
 /// it has seen (to fetch head answers for at the next sync).
@@ -107,9 +107,10 @@ impl Cache {
             .unwrap_or_else(PoisonError::into_inner)
             .insert((anchor.to_owned(), from), bytes);
     }
+
     /// The pages cached for `anchor`, in `from` order.
-    #[must_use]
-    pub fn cached_pages(&self, anchor: &str) -> Vec<(u64, Vec<u8>)> {
+    #[cfg(test)]
+    fn cached_pages(&self, anchor: &str) -> Vec<(u64, Vec<u8>)> {
         self.claim_log
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -124,7 +125,7 @@ impl Cache {
 /// (DESIGN-claim-logs.md §4): a page whose head is not among them is
 /// the origin's assertion, not the anchor's, and is not cached.
 #[must_use]
-pub fn signed_heads(adv_json: &[u8], at: u64) -> Vec<HeadPin> {
+pub(crate) fn signed_heads(adv_json: &[u8], at: u64) -> Vec<HeadPin> {
     SignedAdvertisement::from_json(adv_json)
         .ok()
         .and_then(|adv| adv.unverified_member("delegation").ok().flatten())

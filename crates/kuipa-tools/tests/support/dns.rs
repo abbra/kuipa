@@ -19,10 +19,10 @@ use synta_certificate::{
 };
 
 /// `(priority, weight, port, target)`.
-pub type Record = (u16, u16, u16, String);
+pub(crate) type Record = (u16, u16, u16, String);
 
 /// The server's address; it runs until the process exits.
-pub fn serve(records: HashMap<String, Vec<Record>>, truncate_udp: bool) -> SocketAddr {
+pub(crate) fn serve(records: HashMap<String, Vec<Record>>, truncate_udp: bool) -> SocketAddr {
     let records = Arc::new(records);
     let (udp, tcp) = loop {
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -108,7 +108,7 @@ fn answer(q: &[u8], records: &HashMap<String, Vec<Record>>, truncate: bool) -> O
 /// per query) or `doh` (RFC 8484, HTTP/2 POSTs of wire-format queries).
 /// The certificate is signed by a freshly generated CA, whose PEM the
 /// caller gives back to the client through `KUIPA_DNS_CA`.
-pub struct TlsDns {
+pub(crate) struct TlsDns {
     /// Where the server listens (853 or 443 semantics; any local port).
     pub addr: SocketAddr,
     /// The CA's PEM, to write where `KUIPA_DNS_CA` points.
@@ -125,7 +125,7 @@ pub struct TlsDns {
 ///
 /// If a listening port, the TLS configuration or the certificate cannot
 /// be made.
-pub fn serve_tls(records: HashMap<String, Vec<Record>>, kind: &str) -> TlsDns {
+pub(crate) fn serve_tls(records: HashMap<String, Vec<Record>>, kind: &str) -> TlsDns {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

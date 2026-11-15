@@ -55,7 +55,7 @@ fn capitalised(what: &str) -> String {
 /// The front end of an armoured AS exchange: every question the KDC offers
 /// is asked here, in place of libkrb5's own POSIX reader, so a challenge and
 /// the answer for it reach the terminal `kuipa` runs on.
-pub struct Terminal;
+pub(crate) struct Terminal;
 
 impl Preauth for Terminal {
     fn prompt(&self, label: &str) -> Result<Vec<u8>, GssError> {
@@ -81,7 +81,7 @@ fn ask(label: &str, hidden: bool) -> Result<Vec<u8>, GssError> {
 /// answers a password with the secret it was given, and a realm that wants a
 /// second factor says so instead of reading from a pipe that holds none.
 #[must_use]
-pub fn for_stdin() -> Box<dyn Preauth> {
+pub(crate) fn for_stdin() -> Box<dyn Preauth> {
     if std::io::stdin().is_terminal() {
         Box::new(Terminal)
     } else {

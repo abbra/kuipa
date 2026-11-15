@@ -12,15 +12,15 @@ use native_ossl::util::SecretBuf;
 use crate::paths::Error;
 
 /// Credential name of a sealed object's TPM share.
-pub const SHARE: &str = "kuipa-share";
+pub(crate) const SHARE: &str = "kuipa-share";
 /// Credential name of the offline-enrollment machine key.
-pub const RECIPIENT: &str = "kuipa-recipient";
+pub(crate) const RECIPIENT: &str = "kuipa-recipient";
 /// Credential name of a user seal's TPM device key.
-pub const DEVICE: &str = "kuipa-device";
+pub(crate) const DEVICE: &str = "kuipa-device";
 
 /// Whose TPM key wraps the credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scope {
+pub(crate) enum Scope {
     /// The host's: `systemd-creds` with the TPM and optionally PCRs.  Root.
     System,
     /// The invoking user's, through systemd's per-user credential service.
@@ -70,7 +70,7 @@ fn creds(scope: Scope, verb: &str, args: &[String], input: &[u8]) -> Result<Vec<
 /// # Errors
 ///
 /// No usable TPM 2.0, no `systemd-creds`, or its failure.
-pub fn encrypt(scope: Scope, name: &str, pcrs: &str, plain: &[u8]) -> Result<Vec<u8>, Error> {
+pub(crate) fn encrypt(scope: Scope, name: &str, pcrs: &str, plain: &[u8]) -> Result<Vec<u8>, Error> {
     let args = match scope {
         // `tpm2` alone: a host without a TPM must fail, not fall back to
         // the host key.
@@ -106,7 +106,7 @@ pub fn encrypt(scope: Scope, name: &str, pcrs: &str, plain: &[u8]) -> Result<Vec
 /// # Errors
 ///
 /// A different TPM, scope or name, no `systemd-creds`, or its failure.
-pub fn decrypt(scope: Scope, name: &str, credential: &[u8]) -> Result<SecretBuf, Error> {
+pub(crate) fn decrypt(scope: Scope, name: &str, credential: &[u8]) -> Result<SecretBuf, Error> {
     let args = [format!("--name={name}"), "--newline=no".to_owned()];
     Ok(SecretBuf::from_slice(&creds(
         scope, "decrypt", &args, credential,
@@ -118,7 +118,7 @@ pub fn decrypt(scope: Scope, name: &str, credential: &[u8]) -> Result<SecretBuf,
 /// # Errors
 ///
 /// As for [`encrypt`].
-pub fn new_share(pcrs: &str) -> Result<(SecretBuf, TpmShare), Error> {
+pub(crate) fn new_share(pcrs: &str) -> Result<(SecretBuf, TpmShare), Error> {
     let mut share = SecretBuf::with_len(32);
     Rand::fill_private(share.as_mut_slice())?;
     let credential = encrypt(Scope::System, SHARE, pcrs, share.as_ref())?.into();
@@ -136,6 +136,6 @@ pub fn new_share(pcrs: &str) -> Result<(SecretBuf, TpmShare), Error> {
 /// # Errors
 ///
 /// As for [`decrypt`].
-pub fn open_share(t: &TpmShare) -> Result<SecretBuf, Error> {
+pub(crate) fn open_share(t: &TpmShare) -> Result<SecretBuf, Error> {
     decrypt(Scope::System, SHARE, &t.credential)
 }

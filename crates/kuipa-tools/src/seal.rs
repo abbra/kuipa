@@ -673,7 +673,7 @@ impl<'a> SealClient<'a> {
     /// one as the host itself, with a ticket from that keytab and the kuipa
     /// directory `user` (`kuipa escrow`, run as root).
     #[must_use]
-    pub fn for_keytab(host: &'a Paths, user: &'a UserPaths, keytab: Option<&'a Path>) -> Self {
+    pub(crate) fn for_keytab(host: &'a Paths, user: &'a UserPaths, keytab: Option<&'a Path>) -> Self {
         Self {
             host,
             user,

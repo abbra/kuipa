@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use super::certs::{KdcChain, kdc_chain};
 
 /// A running test realm.  Stops the KDC and removes its files on drop.
-pub struct Realm {
+pub(crate) struct Realm {
     /// The realm's name, such as `EXAMPLE.TEST`.
     pub name: String,
     pub dir: PathBuf,
@@ -106,7 +106,7 @@ fn write_configs(realm: &str, dir: &Path, socket: &Path, ca_pem: &Path) -> (Path
 impl Realm {
     /// Start a realm, or `None` when the MIT KDC tools are not installed
     /// (a failure instead when `KUIPA_REQUIRE_KDC` is set, as in CI).
-    pub fn start(realm: &str, name: &str) -> Option<Self> {
+    pub(crate) fn start(realm: &str, name: &str) -> Option<Self> {
         if !["krb5kdc", "kdb5_util", "kadmin.local", "kinit"]
             .iter()
             .all(|t| have(t))
@@ -180,7 +180,7 @@ impl Realm {
     }
 
     /// The environment every Kerberos tool and library call needs.
-    pub fn env(&self) -> Vec<(&'static str, String)> {
+    pub(crate) fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("KRB5_CONFIG", self.krb5_conf.display().to_string()),
             ("KRB5_KDC_PROFILE", self.kdc_conf.display().to_string()),
@@ -203,12 +203,12 @@ impl Realm {
     }
 
     /// Run a `kadmin.local` query.
-    pub fn kadmin(&self, query: &[&str]) -> String {
+    pub(crate) fn kadmin(&self, query: &[&str]) -> String {
         self.run("kadmin.local", &["-r", &self.name, "-q", &query.join(" ")])
     }
 
     /// Does `principal` exist?
-    pub fn has(&self, principal: &str) -> bool {
+    pub(crate) fn has(&self, principal: &str) -> bool {
         let out = Command::new("kadmin.local")
             .args(["-r", &self.name, "-q", &format!("getprinc {principal}")])
             .envs(self.env())
@@ -219,7 +219,7 @@ impl Realm {
 
     /// Randomise `principal`'s keys (creating it if needed) and return the
     /// new keytab: server-side key generation, as `KEYTAB_GET` does.
-    pub fn new_keys(&self, principal: &str) -> Vec<u8> {
+    pub(crate) fn new_keys(&self, principal: &str) -> Vec<u8> {
         if !self.has(principal) {
             self.kadmin(&["addprinc", "-randkey", principal]);
         }
@@ -232,7 +232,7 @@ impl Realm {
     }
 
     /// A user with a password.
-    pub fn add_user(&self, principal: &str, password: &str) {
+    pub(crate) fn add_user(&self, principal: &str, password: &str) {
         self.kadmin(&["addprinc", "-pw", password, principal]);
     }
 
@@ -240,7 +240,7 @@ impl Realm {
     /// cross-realm `krbtgt` principals, with keys derived from `secret`
     /// (no spaces).  Both realms doing this with the same secret is what
     /// FreeIPA's `trust-add --trust_secret` does (DESIGN §17.4).
-    pub fn cross_realm(&self, partner: &str, secret: &str) {
+    pub(crate) fn cross_realm(&self, partner: &str, secret: &str) {
         for principal in [
             format!("krbtgt/{partner}@{}", self.name),
             format!("krbtgt/{}@{partner}", self.name),
@@ -251,7 +251,7 @@ impl Realm {
 
     /// `kinit` with a password into `ccache`, optionally armoured with the
     /// ticket in `armor`; `config` overrides the realm's `krb5.conf`.
-    pub fn kinit(
+    pub(crate) fn kinit(
         &self,
         principal: &str,
         password: &str,
@@ -285,7 +285,7 @@ impl Realm {
     }
 
     /// Anonymous PKINIT (`kinit -n`) into `ccache`, with `config`.
-    pub fn kinit_anonymous(&self, ccache: &Path, config: &Path) -> Result<(), String> {
+    pub(crate) fn kinit_anonymous(&self, ccache: &Path, config: &Path) -> Result<(), String> {
         let out = Command::new("kinit")
             .envs(self.env())
             .env("KRB5_CONFIG", config)

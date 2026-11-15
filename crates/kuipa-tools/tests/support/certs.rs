@@ -13,7 +13,7 @@ use synta_certificate::{
 const ID_PKINIT_KPKDC: &[u32] = &[1, 3, 6, 1, 5, 2, 3, 5];
 
 /// A CA and a KDC certificate for a realm, with the KDC's private key.
-pub struct KdcChain {
+pub(crate) struct KdcChain {
     pub ca_der: Vec<u8>,
     pub kdc_der: Vec<u8>,
     pub kdc_key_pem: Vec<u8>,
@@ -108,7 +108,7 @@ fn sign_cert(
 
 /// An EC P-256 CA and a KDC certificate with the PKINIT KDC EKU and the
 /// `krbtgt/REALM@REALM` SAN.
-pub fn kdc_chain(realm: &str) -> KdcChain {
+pub(crate) fn kdc_chain(realm: &str) -> KdcChain {
     let ca_key = ec_key();
     let ca_spki = ca_key.public_key_to_der().unwrap();
     let ca_name = NameBuilder::new()

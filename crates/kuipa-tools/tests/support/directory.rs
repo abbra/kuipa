@@ -20,7 +20,7 @@ use kuipa_gssapi::{AcceptStep, GssServerCred};
 use super::kdc::Realm;
 
 /// The realm's directory, shared by all its servers.
-pub struct KdcDirectory {
+pub(crate) struct KdcDirectory {
     pub realm: Arc<Realm>,
     /// Who may enroll and stage hosts with a ticket or a password.
     pub admins: HashSet<String>,
@@ -85,7 +85,7 @@ pub struct KdcDirectory {
 impl KdcDirectory {
     /// Create the `ipa-ku/<server>` principals and their acceptor
     /// credentials.
-    pub fn new(realm: Arc<Realm>, servers: &[&str], admins: &[&str]) -> Self {
+    pub(crate) fn new(realm: Arc<Realm>, servers: &[&str], admins: &[&str]) -> Self {
         let creds = servers
             .iter()
             .map(|s| {

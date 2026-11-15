@@ -41,7 +41,7 @@ pub trait Authenticator {
 }
 
 /// The FIDO2 authenticators attached to this host.
-pub struct Fido2;
+pub(crate) struct Fido2;
 
 /// The authenticator `kuipa` uses: the security keys attached to this
 /// host, or, built with the `soft-fido2` feature, the software key kept in
@@ -118,7 +118,7 @@ impl Authenticator for Fido2 {
 /// # Errors
 ///
 /// A PIN that is not UTF-8.
-pub fn pin_of(secret: &[u8]) -> Result<Option<&str>, Error> {
+pub(crate) fn pin_of(secret: &[u8]) -> Result<Option<&str>, Error> {
     if secret.is_empty() {
         return Ok(None);
     }
@@ -129,7 +129,7 @@ pub fn pin_of(secret: &[u8]) -> Result<Option<&str>, Error> {
 
 /// Algorithms for a device's credential, the post-quantum ones first as
 /// FreeIPA offers them: only its `hmac-secret` is used, so any will do.
-pub const DEVICE_ALGORITHMS: &[i32] = &[
+pub(crate) const DEVICE_ALGORITHMS: &[i32] = &[
     kuipa_fido2::cose::MLDSA65,
     kuipa_fido2::cose::MLDSA44,
     kuipa_fido2::cose::MLDSA87,
