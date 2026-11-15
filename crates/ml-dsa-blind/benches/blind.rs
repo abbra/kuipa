@@ -6,14 +6,14 @@
 //! the verifier. Sizes sweep the payloads a voucher actually carries.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use kuipa_perf::{Profile, SplitMix64};
+use kuipa_perf::{Profile, ProfileKind, SplitMix64};
 use ml_dsa_blind::{BlindRequest, Context, ParameterSet, Requester, SigningKey, VerifyingKey};
 use std::hint::black_box;
 
 /// Message sizes: a voucher claim body, an enrollment request, and the
 /// largest thing the flow is likely to hide.
 fn sizes() -> Vec<usize> {
-    if Profile::from_env().name == "smoke" {
+    if Profile::from_env().kind == ProfileKind::Smoke {
         vec![64, 1024]
     } else {
         vec![64, 1024, 8192]
