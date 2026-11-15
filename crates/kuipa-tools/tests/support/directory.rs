@@ -709,7 +709,7 @@ impl Directory for KdcDirectory {
     ) -> Result<(), DirectoryError> {
         let mut all = self.escrows.lock().unwrap();
         let mine = all.entry(principal.to_string()).or_default();
-        mine.retain(|e| e.kind != "shards" && e.kind != "shards-key");
+        mine.retain(|e| e.kind != kuipa_enroll::seal::EscrowKind::Shards && e.kind != kuipa_enroll::seal::EscrowKind::ShardsKey);
         mine.extend(rows.iter().cloned());
         Ok(())
     }

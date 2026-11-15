@@ -1679,6 +1679,22 @@ fn delivery_key(secret: &[u8], to: &Thumbprint, ct: &[u8]) -> Result<SecretBuf> 
 /// The largest escrowed device key a server keeps, in bytes.
 pub const MAX_ESCROW_BLOB: usize = 16 * 1024;
 
+/// How a [`DeviceEscrow`] row is protected: `code`, `delivery`, or, for a
+/// recovery shard set's device keys, `shards` (its registration row, not a
+/// protected key but the public one, is `shards-key`; `device` is the key id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EscrowKind {
+    /// Under a key derived from a recovery code.
+    Code,
+    /// Under a key delivered to the device.
+    Delivery,
+    /// A recovery shard set's device key.
+    Shards,
+    /// A recovery shard set's registration.
+    ShardsKey,
+}
+
 /// A device key kept for recovery (`DESIGN-recovery.md` §2), on its
 /// holder's own entry: the private key under a key derived from a
 /// recovery code only the holder has, in the `device.key` format.
@@ -1686,10 +1702,8 @@ pub const MAX_ESCROW_BLOB: usize = 16 * 1024;
 pub struct DeviceEscrow {
     /// The device's id.
     pub device: String,
-    /// How it is protected: `code`, `delivery`, or, for a recovery shard
-    /// set's device keys, `shards` (its registration row, not a protected
-    /// key but the public one, is `shards-key`; `device` is the key id).
-    pub kind: String,
+    /// How it is protected.
+    pub kind: EscrowKind,
     /// The protected key, base64url.
     pub blob: String,
     /// When it was escrowed.
@@ -2715,6 +2729,29 @@ impl SealedFile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn escrow_kind_wire_names_are_pinned() {
+        for (k, name) in [
+            (super::EscrowKind::Code, "code"),
+            (super::EscrowKind::Delivery, "delivery"),
+            (super::EscrowKind::Shards, "shards"),
+            (super::EscrowKind::ShardsKey, "shards-key"),
+        ] {
+            let row = super::DeviceEscrow {
+                device: "d".into(),
+                kind: k,
+                blob: "b".into(),
+                added: 1,
+            };
+            let json = format!(r#"{{"device":"d","kind":"{name}","blob":"b","added":1}}"#);
+            assert_eq!(serde_json::to_string(&row).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<super::DeviceEscrow>(&json).unwrap(),
+                row
+            );
+        }
+    }
+
     use super::*;
 
     const NOW: u64 = 1_800_000_000;

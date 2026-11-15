@@ -39,8 +39,8 @@ use kuipa_enroll::join::{
 use kuipa_enroll::keytab::{Enctype, Keytab, Principal};
 use kuipa_enroll::passkey::UserPasskeys;
 use kuipa_enroll::seal::{
-    Approval, Deposit, Device, DeviceEscrow, Limits, Members, RecoverySettings, ReleaseRequest,
-    Seal, State,
+    Approval, Deposit, Device, DeviceEscrow, EscrowKind, Limits, Members, RecoverySettings,
+    ReleaseRequest, Seal, State,
 };
 use kuipa_enroll::server::Accepted;
 use kuipa_enroll::server::{
@@ -1357,7 +1357,7 @@ impl Directory for LdapDirectory {
             .iter()
             .filter(|v| {
                 serde_json::from_str::<DeviceEscrow>(v)
-                    .is_ok_and(|e| e.kind == "shards" || e.kind == "shards-key")
+                    .is_ok_and(|e| e.kind == EscrowKind::Shards || e.kind == EscrowKind::ShardsKey)
             })
             .collect();
         let mut mods = Vec::new();

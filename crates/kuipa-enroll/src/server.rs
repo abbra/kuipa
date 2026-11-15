@@ -28,9 +28,9 @@ use crate::passkey::{Assertion, PasskeyInfo, UserPasskeys};
 use crate::payload::{Enrollment, RealmConfig};
 use crate::realm::{RealmInfo, ServerKeys, TrustedRealm};
 use crate::seal::{
-    Approval, DEFAULT_EPOCH, Deposit, Descriptor, DeviceEscrow, Limits, Members, Recovered,
-    RecoverySettings, ReleaseRequest, ReleasedKeys, Reply, Role, Seal, SealAnswer, SealOp,
-    SessionFor, SessionKey, SessionToken, ShardsRegistration, State,
+    Approval, DEFAULT_EPOCH, Deposit, Descriptor, DeviceEscrow, EscrowKind, Limits, Members,
+    Recovered, RecoverySettings, ReleaseRequest, ReleasedKeys, Reply, Role, Seal, SealAnswer,
+    SealOp, SessionFor, SessionKey, SessionToken, ShardsRegistration, State,
 };
 use crate::spend::{SpendError, VoucherSpender};
 use crate::tlog::{Entry, Kind, LogId, Opening, Receipt, SealAction, SealEvent, SignedHead};
@@ -2717,7 +2717,7 @@ impl EnrollServer {
         }
         let escrow = DeviceEscrow {
             device,
-            kind: "code".into(),
+            kind: EscrowKind::Code,
             blob,
             added: now,
         };
@@ -2785,7 +2785,7 @@ impl EnrollServer {
         if !directory
             .device_escrows(caller)?
             .iter()
-            .any(|e| e.kind == "shards-key")
+            .any(|e| e.kind == EscrowKind::ShardsKey)
         {
             return Err(Refusal::because("no recovery shard set to join"));
         }
@@ -2799,7 +2799,7 @@ impl EnrollServer {
             delivery_ok(&blob)?;
             let row = DeviceEscrow {
                 device,
-                kind: "shards".into(),
+                kind: EscrowKind::Shards,
                 blob,
                 added: now,
             };
@@ -2825,15 +2825,15 @@ impl EnrollServer {
         let rows: Vec<DeviceEscrow> = directory
             .device_escrows(caller)?
             .into_iter()
-            .filter(|e| e.kind == "shards-key" || e.kind == "shards")
+            .filter(|e| e.kind == EscrowKind::ShardsKey || e.kind == EscrowKind::Shards)
             .collect();
         // Logged before anything is answered.
-        for e in rows.iter().filter(|e| e.kind == "shards") {
+        for e in rows.iter().filter(|e| e.kind == EscrowKind::Shards) {
             log.log(&e.device, SealAction::RecoverShards)?;
         }
         eprintln!(
             "kuipad: {caller} fetched their shard set and {} device key(s)",
-            rows.iter().filter(|e| e.kind == "shards").count()
+            rows.iter().filter(|e| e.kind == EscrowKind::Shards).count()
         );
         Ok(log.reply(rows))
     }
@@ -2916,7 +2916,7 @@ impl EnrollServer {
         }
         let escrow = DeviceEscrow {
             device,
-            kind: "delivery".into(),
+            kind: EscrowKind::Delivery,
             blob,
             added: now,
         };
@@ -3954,7 +3954,7 @@ fn shard_rows(
     }
     let mut rows = vec![DeviceEscrow {
         device: registration.key.clone(),
-        kind: "shards-key".into(),
+        kind: EscrowKind::ShardsKey,
         blob: tang_pqc::b64::encode(&serde_json::to_vec(registration).unwrap_or_default()),
         added: now,
     }];
@@ -3967,7 +3967,7 @@ fn shard_rows(
         delivery_ok(blob)?;
         rows.push(DeviceEscrow {
             device: device.clone(),
-            kind: "shards".into(),
+            kind: EscrowKind::Shards,
             blob: blob.clone(),
             added: now,
         });

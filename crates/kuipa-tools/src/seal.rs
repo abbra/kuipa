@@ -35,8 +35,8 @@ use kuipa_enroll::keytab::Enctype;
 use kuipa_enroll::passkey::PasskeyInfo;
 use kuipa_enroll::realm::{Deployment, VerifiedRealm};
 use kuipa_enroll::seal::{
-    Descriptor, DeviceEscrow, DeviceKey, DeviceType, Policy, SealOp, SealedFile, SessionSealedFile,
-    SessionToken, ShardsRegistration, TicketSource, Unlock, VerifiedDescriptor,
+    Descriptor, DeviceEscrow, DeviceKey, DeviceType, EscrowKind, Policy, SealOp, SealedFile,
+    SessionSealedFile, SessionToken, ShardsRegistration, TicketSource, Unlock, VerifiedDescriptor,
 };
 use kuipa_enroll::shards::{self, Share};
 use kuipa_gssapi::GssClientCred;
@@ -495,10 +495,12 @@ fn recovery_secret(code: &str) -> Result<SecretBuf, Error> {
 
 /// The shard set's registration among the server's rows, if it has one.
 fn registration_of(rows: &[DeviceEscrow]) -> Option<ShardsRegistration> {
-    rows.iter().find(|e| e.kind == "shards-key").and_then(|e| {
-        let json = tang_pqc::b64::decode(&e.blob).ok()?;
-        serde_json::from_slice(&json).ok()
-    })
+    rows.iter()
+        .find(|e| e.kind == EscrowKind::ShardsKey)
+        .and_then(|e| {
+            let json = tang_pqc::b64::decode(&e.blob).ok()?;
+            serde_json::from_slice(&json).ok()
+        })
 }
 
 /// A live session on this host: the server's token, the unwrapped device
@@ -2019,7 +2021,7 @@ impl<'a> SealClient<'a> {
         let (_, rows, pair, report) = self.recovery_key_of(words, recovery)?;
         let opened: Vec<(String, ExchangeKeyPair)> = rows
             .iter()
-            .filter(|e| e.kind == "shards" && device.is_none_or(|d| e.device == d))
+            .filter(|e| e.kind == EscrowKind::Shards && device.is_none_or(|d| e.device == d))
             .filter_map(|e| {
                 let blob = tang_pqc::b64::decode(&e.blob).ok()?;
                 kuipa_enroll::seal::open_delivery(&blob, &pair)
@@ -2317,7 +2319,7 @@ impl<'a> SealClient<'a> {
         let escrows = self.op_with_session(&SealOp::RecoverCode)?.reply.escrows;
         let key = escrows
             .iter()
-            .filter(|e| e.kind == "delivery" && e.device == mine)
+            .filter(|e| e.kind == EscrowKind::Delivery && e.device == mine)
             .find_map(|e| {
                 let blob = tang_pqc::b64::decode(&e.blob).ok()?;
                 kuipa_enroll::seal::open_delivery(&blob, device.as_device()).ok()

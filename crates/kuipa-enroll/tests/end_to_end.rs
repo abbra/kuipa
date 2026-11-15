@@ -3776,7 +3776,10 @@ fn the_helpdesk_delivers(r: &Realm, laptop: &ExchangeKeyPair) {
     let delivered = deliver(CAROL, &blob).unwrap();
     assert_eq!(delivered.receipts.len(), 1, "logged in Alice's seal");
     let escrows = op(ALICE, &SealOp::RecoverCode).unwrap().escrows;
-    let delivery = escrows.iter().find(|e| e.kind == "delivery").unwrap();
+    let delivery = escrows
+        .iter()
+        .find(|e| e.kind == seal::EscrowKind::Delivery)
+        .unwrap();
     let opened =
         seal::open_delivery(&tang_pqc::b64::decode(&delivery.blob).unwrap(), laptop).unwrap();
     assert_eq!(opened.public().kid(), lost.public().kid());
