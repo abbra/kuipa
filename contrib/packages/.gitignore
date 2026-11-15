@@ -1,3 +1,4 @@
 *.src.rpm
 *.tar.gz
 kuipa.spec
+system-crates.txt
