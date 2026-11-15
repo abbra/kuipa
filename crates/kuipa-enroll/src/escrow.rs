@@ -42,6 +42,8 @@ pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 escrow");
 
 const SEALED_MAGIC: [u8; 4] = *b"IPSK";
 const SEALED_FILE_MAGIC: [u8; 4] = *b"IPSF";
+const SEALED_TPM_MAGIC: [u8; 4] = *b"IPTK";
+const SEALED_TPM_FILE_MAGIC: [u8; 4] = *b"IPTF";
 const REQUEST_MAGIC: [u8; 4] = *b"IPEQ";
 const REGISTER_MAGIC: [u8; 4] = *b"IPRP";
 const REGISTERED_MAGIC: [u8; 4] = *b"IPRA";
@@ -63,10 +65,12 @@ pub enum Kind {
 }
 
 impl Kind {
-    const fn magic(self) -> [u8; 4] {
-        match self {
-            Self::Keytab => SEALED_MAGIC,
-            Self::File => SEALED_FILE_MAGIC,
+    const fn magic(self, tpm: bool) -> [u8; 4] {
+        match (self, tpm) {
+            (Self::Keytab, false) => SEALED_MAGIC,
+            (Self::File, false) => SEALED_FILE_MAGIC,
+            (Self::Keytab, true) => SEALED_TPM_MAGIC,
+            (Self::File, true) => SEALED_TPM_FILE_MAGIC,
         }
     }
 
@@ -206,12 +210,35 @@ struct Slot {
     wrapped: Box<[u8]>,
 }
 
+/// The TPM share of a sealed object (§7.1): a 32-byte share kept as a
+/// credential bound to the host's TPM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TpmShare {
+    /// The PCRs the credential is bound to, as `systemd-creds` takes them
+    /// (empty: none).
+    pub pcrs: String,
+    /// The credential, as `systemd-creds` made it.
+    pub credential: Box<[u8]>,
+}
+
+/// The data key of a sealed object that has a TPM share: `a` is what the
+/// servers open, `b` what the TPM opens.
+fn tpm_key(a: &[u8], b: &[u8], kind: Kind, principal: &Principal) -> Result<SecretBuf> {
+    Ok(DOMAIN.derive_key(
+        primitives::SHA384,
+        &[a, b],
+        "tpm dek",
+        &[&[kind.id()], principal.to_string().as_bytes()],
+    )?)
+}
+
 /// A keytab or file sealed to the realm's escrow keys.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Sealed {
     kind: Kind,
     principal: Principal,
     slots: Vec<Slot>,
+    tpm: Option<TpmShare>,
     ciphertext: Box<[u8]>,
 }
 
@@ -221,6 +248,7 @@ impl std::fmt::Debug for Sealed {
             .field("kind", &self.kind)
             .field("principal", &self.principal)
             .field("servers", &self.servers())
+            .field("tpm", &self.tpm.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -243,6 +271,7 @@ pub struct Sealer {
     principal: Principal,
     dek: SecretBuf,
     slots: Vec<Slot>,
+    tpm: Option<(SecretBuf, TpmShare)>,
 }
 
 impl std::fmt::Debug for Sealer {
@@ -313,9 +342,24 @@ impl Sealer {
                 principal: principal.clone(),
                 dek,
                 slots,
+                tpm: None,
             },
             registrations,
         ))
+    }
+
+    /// Also bind the sealed object to this host's TPM: it opens only with
+    /// `share` (32 bytes), of which `tpm` is the TPM-bound copy.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Malformed`] unless `share` is 32 bytes.
+    pub fn with_tpm(mut self, share: SecretBuf, tpm: TpmShare) -> Result<Self> {
+        if share.len() != 32 {
+            return Err(Error::Malformed("TPM share"));
+        }
+        self.tpm = Some((share, tpm));
+        Ok(self)
     }
 
     /// Seal `keytab`.  Consumes the sealer: each data key encrypts once.
@@ -358,11 +402,18 @@ impl Sealer {
         if kind != self.kind {
             return Err(Error::Mismatch("prepared for another kind"));
         }
-        let ciphertext = primitives::seal(self.dek.as_ref(), plain)?.into();
+        let (tpm, ciphertext) = match self.tpm {
+            Some((share, tpm)) => {
+                let key = tpm_key(self.dek.as_ref(), share.as_ref(), kind, &self.principal)?;
+                (Some(tpm), primitives::seal(key.as_ref(), plain)?.into())
+            }
+            None => (None, primitives::seal(self.dek.as_ref(), plain)?.into()),
+        };
         Ok(Sealed {
             kind,
             principal: self.principal,
             slots: self.slots,
+            tpm,
             ciphertext,
         })
     }
@@ -391,6 +442,12 @@ impl Sealed {
     #[must_use]
     pub fn principal(&self) -> &Principal {
         &self.principal
+    }
+
+    /// The TPM share, if this object is bound to a TPM.
+    #[must_use]
+    pub fn tpm(&self) -> Option<&TpmShare> {
+        self.tpm.as_ref()
     }
 
     /// `H(ct)` of each slot's binding: what is registered for it.
@@ -422,8 +479,9 @@ impl Sealed {
     pub fn unseal(
         &self,
         recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
+        tpm_share: Option<&[u8]>,
     ) -> Result<Keytab> {
-        Keytab::from_mit(self.unseal_mit(recover)?.as_ref())
+        Keytab::from_mit(self.unseal_mit(recover, tpm_share)?.as_ref())
     }
 
     /// Unseal a keytab, trying each server in turn, and return it in MIT
@@ -435,11 +493,12 @@ impl Sealed {
     pub fn unseal_mit(
         &self,
         recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
+        tpm_share: Option<&[u8]>,
     ) -> Result<SecretBuf> {
         if self.kind != Kind::Keytab {
             return Err(Error::Mismatch("a sealed file, not a keytab"));
         }
-        let plain = self.unseal_contents(recover)?;
+        let plain = self.unseal_contents(recover, tpm_share)?;
         if Keytab::from_mit(plain.as_ref())?.principal() != &self.principal {
             return Err(Error::Mismatch("sealed keytab principal"));
         }
@@ -451,14 +510,24 @@ impl Sealed {
     /// `recover(server, request)` sends the request to `server` and returns
     /// its response, or `None` if the server could not be reached or
     /// refused.  The first server that answers correctly wins.
+    /// `tpm_share` is the opened TPM share of an object that has one
+    /// ([`tpm`](Self::tpm)).
     ///
     /// # Errors
     ///
-    /// [`Error::Refused`] if no server could unseal it, or a crypto error.
+    /// [`Error::Refused`] if no server could unseal it, [`Error::Missing`]
+    /// for a TPM-bound object and no share, [`Error::Policy`] for a share
+    /// that does not fit, or a crypto error.
     pub fn unseal_contents(
         &self,
         mut recover: impl FnMut(&str, &EscrowRequest) -> Option<RecoveryResponse>,
+        tpm_share: Option<&[u8]>,
     ) -> Result<SecretBuf> {
+        match (&self.tpm, tpm_share) {
+            (Some(_), None) => return Err(Error::Missing("TPM share")),
+            (None, Some(_)) => return Err(Error::Policy("this seal has no TPM share".into())),
+            _ => {}
+        }
         for slot in &self.slots {
             let seal = SealId::machine(&self.principal, self.kind, slot.escrow_key.alg())?;
             let (request, pending) = slot.binding.recovery_request(&slot.escrow_key)?;
@@ -477,8 +546,16 @@ impl Sealed {
             };
             let dek =
                 primitives::open(key.as_ref(), &slot.wrapped).map_err(|_| Error::BadResponse)?;
-            return primitives::open(dek.as_ref(), &self.ciphertext)
-                .map_err(|_| Error::BadResponse);
+            return match tpm_share {
+                Some(share) => {
+                    let key = tpm_key(dek.as_ref(), share, self.kind, &self.principal)?;
+                    primitives::open(key.as_ref(), &self.ciphertext)
+                        .map_err(|_| Error::Policy("the TPM share does not open this seal".into()))
+                }
+                None => {
+                    primitives::open(dek.as_ref(), &self.ciphertext).map_err(|_| Error::BadResponse)
+                }
+            };
         }
         Err(Error::Refused)
     }
@@ -491,7 +568,7 @@ impl Sealed {
     /// count as a `u8`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut w = Writer::new(self.kind.magic());
+        let mut w = Writer::new(self.kind.magic(self.tpm.is_some()));
         w.str(&self.principal.to_string())
             .u8(u8::try_from(self.slots.len()).expect("at most 255 servers"));
         for s in &self.slots {
@@ -500,6 +577,9 @@ impl Sealed {
                 .bytes(s.escrow_key.as_bytes())
                 .fixed(&s.commitment)
                 .bytes(&s.wrapped);
+        }
+        if let Some(t) = &self.tpm {
+            w.str(&t.pcrs).bytes(&t.credential);
         }
         w.bytes(&self.ciphertext).finish()
     }
@@ -510,12 +590,16 @@ impl Sealed {
     ///
     /// [`Error::Malformed`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let kind = if bytes.starts_with(&SEALED_FILE_MAGIC) {
-            Kind::File
-        } else {
-            Kind::Keytab
-        };
-        let mut r = Reader::new(bytes, kind.magic(), "sealed keytab or file")?;
+        let (kind, tpm) = [
+            (Kind::Keytab, false),
+            (Kind::File, false),
+            (Kind::Keytab, true),
+            (Kind::File, true),
+        ]
+        .into_iter()
+        .find(|&(k, t)| bytes.starts_with(&k.magic(t)))
+        .unwrap_or((Kind::Keytab, false));
+        let mut r = Reader::new(bytes, kind.magic(tpm), "sealed keytab or file")?;
         let principal: Principal = r.str()?.parse()?;
         let ctx = context(&principal);
         let slots = (0..r.u8()?)
@@ -538,12 +622,21 @@ impl Sealed {
                 })
             })
             .collect::<Result<_>>()?;
+        let tpm = if tpm {
+            Some(TpmShare {
+                pcrs: r.str()?.to_owned(),
+                credential: r.bytes()?.into(),
+            })
+        } else {
+            None
+        };
         let ciphertext = r.bytes()?.into();
         r.finish()?;
         Ok(Self {
             kind,
             principal,
             slots,
+            tpm,
             ciphertext,
         })
     }

@@ -187,6 +187,8 @@ enum Command {
         /// Create a new machine key, replacing the existing one.
         #[arg(long)]
         new: bool,
+        #[command(flatten)]
+        tpm: TpmInput,
     },
     /// Enroll online: OTP (default), a user's password, an existing
     /// Kerberos ticket, or a voucher; or offline from a prepared bundle.
@@ -255,6 +257,8 @@ enum Command {
     Protect {
         #[command(flatten)]
         target: ProtectTarget,
+        #[command(flatten)]
+        tpm: TpmInput,
     },
     /// Put the host keytab, or another keytab or file, back on disk in
     /// plain form.
@@ -1003,6 +1007,11 @@ enum DeviceAction {
         /// ML-DSA): every use needs a touch, and the PIN if one was given.
         #[arg(long)]
         passkey: bool,
+        /// Make the device key now, kept as a credential of this host's
+        /// TPM (user scope, `systemd-creds --user`): no passphrase, and
+        /// it opens only on this host.
+        #[arg(long, conflicts_with_all = ["pkcs11", "passkey"])]
+        tpm: bool,
         /// The token's PKCS#11 module.
         #[arg(
             long,
@@ -1177,6 +1186,18 @@ struct ProtectTarget {
     file: Option<String>,
 }
 
+/// The TPM factor of `prepare` and `protect`.
+#[derive(clap::Args)]
+struct TpmInput {
+    /// Also bind to this host's TPM.
+    #[arg(long)]
+    tpm: bool,
+    /// PCRs to bind to, as `systemd-creds --tpm2-pcrs` takes them
+    /// (default: none).
+    #[arg(long, value_name = "PCRS", requires = "tpm")]
+    tpm_pcrs: Option<String>,
+}
+
 impl Cli {
     /// Rebuild the loose option bag `run` reads, so the command handlers
     /// do not change with the parser.
@@ -1218,9 +1239,11 @@ impl Command {
 
     fn collect(&self, a: &mut Args) {
         match self {
-            Command::Prepare { hostname, new } => {
+            Command::Prepare { hostname, new, tpm } => {
                 a.set("hostname", hostname.as_deref());
                 a.mark("new", *new);
+                a.mark("tpm", tpm.tpm);
+                a.set("tpm-pcrs", tpm.tpm_pcrs.as_deref());
             }
             Command::Enroll {
                 realm,
@@ -1272,7 +1295,13 @@ impl Command {
                 a.set("hostname", deployment.hostname.as_deref());
             }
             Command::Check { server } => a.set_all("server", server),
-            Command::Protect { target } | Command::Unprotect { target } => {
+            Command::Protect { target, tpm } => {
+                a.set("keytab", target.keytab.as_deref());
+                a.set("file", target.file.as_deref());
+                a.mark("tpm", tpm.tpm);
+                a.set("tpm-pcrs", tpm.tpm_pcrs.as_deref());
+            }
+            Command::Unprotect { target } => {
                 a.set("keytab", target.keytab.as_deref());
                 a.set("file", target.file.as_deref());
             }
@@ -1323,6 +1352,13 @@ impl Args {
 
     fn flag(&self, name: &str) -> bool {
         self.flags.iter().any(|f| f == name)
+    }
+
+    /// `--tpm` and `--tpm-pcrs`: the PCR list to bind to (empty: none),
+    /// if the TPM factor is asked for.
+    fn tpm(&self) -> Option<&str> {
+        self.flag("tpm")
+            .then(|| self.option("tpm-pcrs").unwrap_or(""))
     }
 
     /// `--keytab` and `--file`, for `protect` and `unprotect`.
@@ -1609,7 +1645,7 @@ fn run(args: &Args) -> Result<Value, Error> {
             let fqdn = args
                 .option("hostname")
                 .map_or_else(flows::hostname, |h| Ok(h.to_owned()))?;
-            flows::prepare(&paths, args.flag("new"), &fqdn)
+            flows::prepare(&paths, args.flag("new"), args.tpm(), &fqdn)
         }
         "enroll" => {
             if let Some(bundle) = args.option("bundle") {
@@ -1668,7 +1704,7 @@ fn run(args: &Args) -> Result<Value, Error> {
         }
         "complete" => flows::complete(&paths),
         "rotate-keys" => flows::rotate_keys(&paths, None),
-        "protect" => flows::protect(&paths, &args.protect_target()),
+        "protect" => flows::protect(&paths, &args.protect_target(), args.tpm()),
         "unprotect" => flows::unprotect(&paths, &args.protect_target()),
         "trusted-realms" => flows::trusted_realms(&paths),
         "advertisement" => {
@@ -1851,7 +1887,7 @@ fn get<'a>(value: &'a Value, key: &str) -> &'a Value {
 /// from, then the values themselves.
 fn render(command: &str, args: &Args, value: &Value, paths: &Paths) {
     match command {
-        "prepare" => render_prepare(value, paths),
+        "prepare" => render_prepare(value),
         "enroll" => render_enroll(value, paths),
         "voucher-key" => render_voucher_key(args, value),
         "realm-info" => render_realm_info(value),
@@ -2048,13 +2084,16 @@ fn render_tlog(value: &Value) {
     );
 }
 
-fn render_prepare(value: &Value, paths: &Paths) {
+fn render_prepare(value: &Value) {
     println!(
         "A machine key for offline enrollment, made on this host and stored in {}:",
-        paths.recipient().display()
+        get(value, "stored_in").as_str().unwrap_or_default()
     );
     let mut rows = Rows::default();
     rows.field("machine key thumbprint", get(value, "thumbprint"));
+    if get(value, "tpm").as_bool().unwrap_or(false) {
+        rows.field("held by", &Value::from("this host's TPM"));
+    }
     rows.field("its public key", get(value, "public_key"));
     rows.field(
         "the IPA administrator stages it with",
@@ -2502,6 +2541,18 @@ fn render_rotated(value: &Value, what: &str) {
     rows.print();
 }
 
+/// A row naming the PCRs a TPM-bound seal is bound to, if it is bound.
+fn tpm_row(rows: &mut Rows, value: &Value) {
+    if let Some(pcrs) = get(value, "tpm").as_str() {
+        let text = if pcrs.is_empty() {
+            "no PCRs".to_owned()
+        } else {
+            format!("PCRs {pcrs}")
+        };
+        rows.field("TPM", &Value::from(text));
+    }
+}
+
 fn render_protect(value: &Value) {
     println!(
         "The keytab is sealed on disk: opening it needs one of the realm's servers, as at boot."
@@ -2516,6 +2567,7 @@ fn render_protect(value: &Value) {
     let mut rows = Rows::default();
     identity_rows(&mut rows, rotated);
     rows.field("sealed as", get(value, "sealed"));
+    tpm_row(&mut rows, value);
     rows.print();
 }
 
@@ -2535,6 +2587,7 @@ fn render_protect_other(value: &Value) {
     rows.field("registered by", get(value, "registered_by"));
     rows.field("servers that can unseal it", get(value, "servers"));
     rows.field("sealed as", get(value, "sealed"));
+    tpm_row(&mut rows, value);
     rows.field("unsealed copy (tmpfs)", get(value, "unsealed_copy"));
     rows.print();
 }
@@ -2570,6 +2623,11 @@ fn list(value: &Value) -> Vec<&Value> {
 /// `confirm`).  For a host whose device key a passkey wraps, the security
 /// key's PIN, which may be empty.
 fn passphrase(file: Option<&str>, confirm: bool) -> Result<SecretBuf, Error> {
+    // A TPM device has no passphrase: it is the unattended "this machine"
+    // factor, and the policy adds `ticket` or `passkey` for a human.
+    if kuipa_tools::seal::UserPaths::from_env().is_ok_and(|u| u.tpm_device()) {
+        return Ok(SecretBuf::with_len(0));
+    }
     if kuipa_tools::seal::UserPaths::from_env().is_ok_and(|u| u.passkey_device()) {
         return security_key_pin(file, "security key PIN (empty if none)");
     }
@@ -3061,9 +3119,12 @@ fn run_seal_device(
             passphrase_file,
             pkcs11,
             passkey,
+            tpm,
             module,
         } => {
-            if *passkey {
+            if *tpm {
+                client.add_tpm_device(seal)
+            } else if *passkey {
                 let pin = security_key_pin(
                     passphrase_file.as_deref(),
                     "security key PIN (empty if none)",

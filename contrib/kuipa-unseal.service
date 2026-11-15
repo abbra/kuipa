@@ -1,6 +1,6 @@
 [Unit]
 Description=Unseal the FreeIPA host keytab and other kuipa-protected keytabs and files
-After=network-online.target
+After=network-online.target tpm2.target
 Wants=network-online.target
 Before=sssd.service gssproxy.service certmonger.service
 ConditionPathExists=/var/lib/ipa-client/ku/state.json

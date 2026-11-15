@@ -54,6 +54,7 @@ use crate::flows::{self, Outcome};
 use crate::net::Endpoint;
 use crate::passkey::{Authenticator, Fido2, pin_of};
 use crate::paths::{self, Error, Paths, PublicState};
+use crate::tpm;
 
 const DEVICE_KEY_MAGIC: [u8; 4] = *b"IPDK";
 const SESSION_FILE_MAGIC: [u8; 4] = *b"IPSS";
@@ -61,6 +62,8 @@ const SESSION_FILE_MAGIC: [u8; 4] = *b"IPSS";
 const KDF_PBKDF2_SHA512: u8 = 1;
 /// KDF id 2: a passkey's `hmac-secret` output, through HKDF (§7.6.2).
 const KDF_FIDO2_HMAC_SECRET: u8 = 2;
+/// KDF id 3: a user-scoped systemd credential, bound to this host's TPM.
+const KDF_TPM2: u8 = 3;
 const PBKDF2_ITERATIONS: u64 = 600_000;
 /// How long the user's listed passkeys are used before asking again.
 const PASSKEYS_MAX_AGE: u64 = 3600;
@@ -174,6 +177,13 @@ impl UserPaths {
         self.passkey_wrap().is_some()
     }
 
+    /// Whether this host's device key is wrapped by this host's TPM: it
+    /// has no passphrase.
+    #[must_use]
+    pub fn tpm_device(&self) -> bool {
+        fs::read(self.device_key()).is_ok_and(|b| tpm_wrapped(&b))
+    }
+
     /// `key` protected as this host's keys are: under the passkey that
     /// wraps the device key, else under the passphrase `secret`.
     fn protect(
@@ -182,6 +192,9 @@ impl UserPaths {
         secret: &[u8],
         auth: &dyn Authenticator,
     ) -> Result<Vec<u8>, Error> {
+        if self.tpm_device() {
+            return protect_with_tpm(key);
+        }
         match self.passkey_wrap() {
             Some(wrap) => protect_with_passkey(key, &wrap, pin_of(secret)?, auth),
             None => protect_key(key, secret),
@@ -400,6 +413,32 @@ fn protect_with_passkey(
         .finish())
 }
 
+/// `key` as a user-scoped credential of this host's TPM:
+/// `IPDK kdf(3) credential`.
+fn protect_with_tpm(key: &ExchangeKeyPair) -> Result<Vec<u8>, Error> {
+    let credential = tpm::encrypt(tpm::Scope::User, tpm::DEVICE, "", key.to_jwk()?.as_ref())?;
+    Ok(Writer::new(DEVICE_KEY_MAGIC)
+        .u8(KDF_TPM2)
+        .bytes(&credential)
+        .finish())
+}
+
+/// Is the key file one `protect_with_tpm` made?
+fn tpm_wrapped(bytes: &[u8]) -> bool {
+    Reader::new(bytes, DEVICE_KEY_MAGIC, "device key")
+        .is_ok_and(|mut r| r.u8().is_ok_and(|kdf| kdf == KDF_TPM2))
+}
+
+/// The key in a TPM-wrapped key file (`protect_with_tpm`); no secret.
+fn unprotect_tpm(bytes: &[u8]) -> Result<ExchangeKeyPair, Error> {
+    let mut r = Reader::new(bytes, DEVICE_KEY_MAGIC, "device key")?;
+    r.u8()?;
+    let credential = r.bytes()?;
+    r.finish()?;
+    let jwk = tpm::decrypt(tpm::Scope::User, tpm::DEVICE, credential)?;
+    Ok(ExchangeKeyPair::from_jwk(jwk.as_ref())?)
+}
+
 /// The key in a key file under `secret`: a passphrase, or for a
 /// passkey-wrapped one the security key's PIN (one touch).
 fn unprotect_any(
@@ -407,6 +446,9 @@ fn unprotect_any(
     secret: &[u8],
     auth: &dyn Authenticator,
 ) -> Result<ExchangeKeyPair, Error> {
+    if tpm_wrapped(bytes) {
+        return unprotect_tpm(bytes);
+    }
     let Some(wrap) = PasskeyWrap::of(bytes) else {
         return unprotect_key(bytes, secret);
     };
@@ -1402,6 +1444,8 @@ impl<'a> SealClient<'a> {
         } else if self.user.device_key().exists() {
             let kind = if self.user.passkey_device() {
                 DeviceType::Passkey
+            } else if self.user.tpm_device() {
+                DeviceType::Tpm
             } else {
                 DeviceType::File
             };
@@ -1460,6 +1504,31 @@ impl<'a> SealClient<'a> {
         let wrapped = protect_with_passkey(&key, &wrap, pin, self.authenticator)?;
         self.user.write(&self.user.device_key(), &wrapped)?;
         self.register_device(name, &HostDevice::File(key), DeviceType::Passkey)
+    }
+
+    /// `kuipa seal device add --tpm`: make this host's device key now,
+    /// kept as a user-scoped credential of this host's TPM, and register
+    /// it in seal `name`.  It has no passphrase: it is the unattended
+    /// "this machine" factor.  Nothing is attested, so the device
+    /// registers at level `any`.
+    ///
+    /// # Errors
+    ///
+    /// A device key already here, no usable TPM, a refusal, or any other
+    /// error.
+    pub fn add_tpm_device(&self, name: &str) -> Result<Value, Error> {
+        if self.user.device_key().exists() || self.user.token().is_some() {
+            return Err("this host already has a device key: one device per host".into());
+        }
+        let key = ExchangeKeyPair::generate(KemAlg::MlKem768)?;
+        let path = self.user.device_key();
+        self.user.write(&path, &protect_with_tpm(&key)?)?;
+        let added = self.register_device(name, &HostDevice::File(key), DeviceType::Tpm);
+        if added.is_err() {
+            // So that the next attempt is not refused for a key of its own.
+            let _ = fs::remove_file(&path);
+        }
+        added
     }
 
     /// Register this host's device `key`, of type `kind`, in seal `name`,
