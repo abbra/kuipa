@@ -28,7 +28,7 @@ pub fn prompt(what: &str, hidden: bool) -> Result<SecretBuf, Error> {
                 .ok()
         })
     };
-    eprint!("{}{}: ", what[..1].to_uppercase(), &what[1..]);
+    eprint!("{}: ", capitalised(what));
     if hidden {
         stty("-echo");
     }
@@ -42,6 +42,14 @@ pub fn prompt(what: &str, hidden: bool) -> Result<SecretBuf, Error> {
     let value = SecretBuf::from_slice(line.trim_end_matches(['\n', '\r']).as_bytes());
     drop(SecretBuf::new(line.into_bytes()));
     Ok(value)
+}
+
+/// `what` with its first character upper-cased; the label comes from a KDC,
+/// so it may be empty or start with a multi-byte character.
+fn capitalised(what: &str) -> String {
+    let mut chars = what.chars();
+    let head: String = chars.next().into_iter().flat_map(char::to_uppercase).collect();
+    head + chars.as_str()
 }
 
 /// The front end of an armoured AS exchange: every question the KDC offers
@@ -78,5 +86,18 @@ pub fn for_stdin() -> Box<dyn Preauth> {
         Box::new(Terminal)
     } else {
         Box::new(NoPreauth)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capitalised;
+
+    #[test]
+    fn capitalises_without_panicking() {
+        assert_eq!(capitalised(""), "");
+        assert_eq!(capitalised("password"), "Password");
+        assert_eq!(capitalised("éa"), "Éa");
+        assert_eq!(capitalised("ßx"), "SSx");
     }
 }
