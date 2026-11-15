@@ -46,7 +46,7 @@ use kuipa_enroll::server::Directory as _;
 use kuipad::config::{self, Config};
 use kuipad::directory::LdapDirectory;
 use kuipad::http::{App, router};
-use kuipad::keystore::{Changes, KeyStore, Retire, Rotation};
+use kuipad::keystore::{Changes, KeyStore, Role, Rotation};
 use kuipad::peers::{self, KeytabInitiator, Peers, Settings};
 use kuipad::tang::TangKeys;
 
@@ -556,19 +556,14 @@ fn rotate_anchor(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Erro
 
 fn rotate_keys(store: &KeyStore, args: &Args) -> Result<(), Error> {
     let mut which = Rotation {
-        retire: Retire {
-            join: args.flag("join"),
-            escrow: args.flag("escrow"),
-            trust: args.flag("trust"),
-        },
+        roles: Role::ALL
+            .into_iter()
+            .filter(|role| args.flag(role.name()))
+            .collect(),
         signing: args.flag("signing"),
     };
     if which == Rotation::default() {
-        which.retire = Retire {
-            join: true,
-            escrow: true,
-            trust: true,
-        };
+        which.roles = Role::ALL.to_vec();
     }
     report(&store.rotate(which)?);
     Ok(())

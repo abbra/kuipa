@@ -30,6 +30,7 @@ use tang_pqc::{
 };
 
 use crate::Error;
+use crate::keystore::{dir_files, read_private};
 
 /// The Tang key directory.
 pub struct TangKeys {
@@ -54,29 +55,21 @@ impl TangKeys {
         }
     }
 
+    /// Every key file, and whether it is retired (`.` prefix).
     fn files(&self) -> Result<Vec<(String, bool)>, Error> {
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut names = Vec::new();
-        for entry in entries {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if let Some(stem) = name.strip_suffix(".jwk") {
-                let (retired, _) = stem.strip_prefix('.').map_or((false, stem), |s| (true, s));
-                names.push((name, retired));
-            }
-        }
-        names.sort();
-        Ok(names)
+        Ok(dir_files(&self.dir, "", "jwk")?
+            .into_iter()
+            .map(|name| {
+                let retired = name.starts_with('.');
+                (name, retired)
+            })
+            .collect())
     }
 
     fn load(&self) -> Result<Loaded, Error> {
         let mut keys = Loaded::default();
         for (name, retired) in self.files()? {
-            // Wiping buffer: the bytes hold the private seed.
-            let bytes = native_ossl::util::SecretBuf::new(fs::read(self.dir.join(&name))?);
+            let bytes = read_private(&self.dir.join(&name))?;
             if let Ok(k) = SigningKey::from_jwk(bytes.as_ref()) {
                 if retired {
                     keys.retired_signing.push(k);

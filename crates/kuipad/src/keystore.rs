@@ -34,28 +34,70 @@ use crate::Error;
 
 /// Read a private key file into a wiping buffer: the bytes hold the seed,
 /// and must not linger in freed heap memory once the key is parsed.
-fn read_private(path: PathBuf) -> Result<native_ossl::util::SecretBuf, Error> {
+pub(crate) fn read_private(path: &Path) -> Result<native_ossl::util::SecretBuf, Error> {
     Ok(native_ossl::util::SecretBuf::new(fs::read(path)?))
 }
 
-/// Which retired keys [`KeyStore::rotate`] replaces: the join, escrow and
-/// trust keys, whose old ones are kept for what they answered.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Retire {
-    /// Retire the join keys and create a new one.
-    pub join: bool,
-    /// Retire the escrow keys and create a new one.
-    pub escrow: bool,
-    /// Retire the trust keys and create a new one.
-    pub trust: bool,
+/// The sorted names of the `*.<ext>` files in `dir` that start with
+/// `prefix`; none when the directory is missing.
+pub(crate) fn dir_files(dir: &Path, prefix: &str, ext: &str) -> Result<Vec<String>, Error> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with(prefix) && Path::new(n).extension().is_some_and(|e| e == ext))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// A kind of exchange key, whose old ones are kept for what they answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Join keys.
+    Join,
+    /// Escrow keys.
+    Escrow,
+    /// Trust keys (§17.4).
+    Trust,
+}
+
+impl Role {
+    /// Every role.
+    pub const ALL: [Self; 3] = [Self::Join, Self::Escrow, Self::Trust];
+
+    /// The file name prefix and `rotate-keys` option.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Join => "join",
+            Self::Escrow => "escrow",
+            Self::Trust => "trust",
+        }
+    }
+
+    /// The role of a key file, and whether it is retired (`.` prefix).
+    fn of(file: &str) -> Option<(Self, bool)> {
+        let (retired, name) = file.strip_prefix('.').map_or((false, file), |n| (true, n));
+        Self::ALL
+            .into_iter()
+            .find(|r| {
+                name.strip_prefix(r.name())
+                    .is_some_and(|t| t.starts_with('-'))
+            })
+            .map(|r| (r, retired))
+    }
 }
 
 /// Which keys [`KeyStore::rotate`] replaces, one flag per
 /// `rotate-keys` option.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rotation {
-    /// The join, escrow and trust keys to retire.
-    pub retire: Retire,
+    /// The roles to retire and create new keys for.
+    pub roles: Vec<Role>,
     /// Replace the signing key.  The old one is not kept: it only signs
     /// advertisements and bundles, and the next claim names the new one.
     pub signing: bool,
@@ -83,7 +125,8 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<(), Error> {
     let tmp = path.with_extension("tmp");
     let mut f = fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
         .open(&tmp)?;
     f.write_all(data)?;
@@ -117,7 +160,7 @@ impl KeyStore {
     ///
     /// I/O or a malformed key.
     pub fn load(&self) -> Result<ServerKeys, Error> {
-        let signing = SigningKey::from_jwk(read_private(self.path("signing.jwk"))?.as_ref())?;
+        let signing = SigningKey::from_jwk(read_private(&self.path("signing.jwk"))?.as_ref())?;
         let mut keys = ServerKeys {
             signing,
             join: Vec::new(),
@@ -127,21 +170,14 @@ impl KeyStore {
             retired: Vec::new(),
         };
         for name in self.names()? {
-            let load = || {
-                ExchangeKeyPair::from_jwk(read_private(self.path(&name))?.as_ref())
-                    .map_err(Error::from)
-            };
-            if [".join-", ".escrow-", ".trust-"]
-                .iter()
-                .any(|p| name.starts_with(p))
-            {
-                keys.retired.push(load()?);
-            } else if name.starts_with("join-") {
-                keys.join.push(load()?);
-            } else if name.starts_with("escrow-") {
-                keys.escrow.push(load()?);
-            } else if name.starts_with("trust-") {
-                keys.trust.push(load()?);
+            if let Some((role, retired)) = Role::of(&name) {
+                let key = ExchangeKeyPair::from_jwk(read_private(&self.path(&name))?.as_ref())?;
+                match (retired, role) {
+                    (true, _) => keys.retired.push(key),
+                    (false, Role::Join) => keys.join.push(key),
+                    (false, Role::Escrow) => keys.escrow.push(key),
+                    (false, Role::Trust) => keys.trust.push(key),
+                }
             } else if name.starts_with("voucher-") {
                 keys.vouchers
                     .push(VerifyingKey::from_jwk_json(&fs::read(self.path(&name))?)?);
@@ -161,14 +197,7 @@ impl KeyStore {
     ///
     /// Not a public ML-DSA JWK, or an I/O error.
     pub fn add_voucher_key(&self, jwk: &[u8]) -> Result<Thumbprint, Error> {
-        let value: serde_json::Value = serde_json::from_slice(jwk)?;
-        if value.get("priv").is_some() {
-            return Err("give the voucher key's public JWK, not the private key".into());
-        }
-        let key = VerifyingKey::from_jwk_json(jwk)?;
-        let thp = *key.thumbprint();
-        fs::write(self.path(&format!("voucher-{thp}.jwk")), key.to_jwk_json())?;
-        Ok(thp)
+        self.add_public_key("voucher", jwk)
     }
 
     /// Accept transparency-log cosignatures by the witness whose public
@@ -179,13 +208,17 @@ impl KeyStore {
     ///
     /// Not a public ML-DSA JWK, or an I/O error.
     pub fn add_witness_key(&self, jwk: &[u8]) -> Result<Thumbprint, Error> {
+        self.add_public_key("witness", jwk)
+    }
+
+    fn add_public_key(&self, role: &str, jwk: &[u8]) -> Result<Thumbprint, Error> {
         let value: serde_json::Value = serde_json::from_slice(jwk)?;
         if value.get("priv").is_some() {
-            return Err("give the witness key's public JWK, not the private key".into());
+            return Err(format!("give the {role} key's public JWK, not the private key").into());
         }
         let key = VerifyingKey::from_jwk_json(jwk)?;
         let thp = *key.thumbprint();
-        fs::write(self.path(&format!("witness-{thp}.jwk")), key.to_jwk_json())?;
+        fs::write(self.path(&format!("{role}-{thp}.jwk")), key.to_jwk_json())?;
         Ok(thp)
     }
 
@@ -227,29 +260,22 @@ impl KeyStore {
         write_private(&self.path("anchor.jwk"), anchor.to_jwk()?.as_ref())?;
         let signing = SigningKey::generate_preferred()?;
         write_private(&self.path("signing.jwk"), signing.to_jwk()?.as_ref())?;
-        for role in ["join", "escrow", "trust"] {
-            let key = ExchangeKeyPair::generate_preferred()?;
-            let name = format!("{role}-{}.jwk", key.public().kid());
-            write_private(&self.path(&name), key.to_jwk()?.as_ref())?;
+        for role in Role::ALL {
+            self.create(role)?;
         }
         Ok(anchor)
     }
 
     fn names(&self) -> Result<Vec<String>, Error> {
-        let mut names: Vec<String> = fs::read_dir(&self.dir)?
-            .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| Path::new(n).extension().is_some_and(|e| e == "jwk"))
-            .collect();
-        names.sort();
-        Ok(names)
+        dir_files(&self.dir, "", "jwk")
     }
 
-    fn create(&self, role: &str, changes: &mut Changes) -> Result<(), Error> {
+    /// Create a key for `role`; returns its file name.
+    fn create(&self, role: Role) -> Result<String, Error> {
         let key = ExchangeKeyPair::generate_preferred()?;
-        let name = format!("{role}-{}.jwk", key.public().kid());
+        let name = format!("{}-{}.jwk", role.name(), key.public().kid());
         write_private(&self.path(&name), key.to_jwk()?.as_ref())?;
-        changes.created.push(name);
-        Ok(())
+        Ok(name)
     }
 
     /// Rotate the keys selected by `which`: new join and escrow keys are
@@ -264,19 +290,10 @@ impl KeyStore {
     pub fn rotate(&self, which: Rotation) -> Result<Changes, Error> {
         let mut changes = Changes::default();
         let current = self.names()?;
-        for (role, wanted) in [
-            ("join", which.retire.join),
-            ("escrow", which.retire.escrow),
-            ("trust", which.retire.trust),
-        ] {
-            if !wanted {
-                continue;
-            }
-            self.create(role, &mut changes)?;
-            for name in current
-                .iter()
-                .filter(|n| n.starts_with(&format!("{role}-")))
-            {
+        for role in which.roles {
+            changes.created.push(self.create(role)?);
+            let prefix = format!("{}-", role.name());
+            for name in current.iter().filter(|n| n.starts_with(&prefix)) {
                 let retired = format!(".{name}");
                 fs::rename(self.path(name), self.path(&retired))?;
                 fs::OpenOptions::new()
@@ -288,9 +305,7 @@ impl KeyStore {
         }
         if which.signing {
             let signing = SigningKey::generate_preferred()?;
-            let path = self.path("signing.jwk");
-            let _ = fs::remove_file(path.with_extension("tmp"));
-            write_private(&path, signing.to_jwk()?.as_ref())?;
+            write_private(&self.path("signing.jwk"), signing.to_jwk()?.as_ref())?;
             changes.created.push("signing.jwk".into());
         }
         Ok(changes)
@@ -311,10 +326,10 @@ impl KeyStore {
         let mut changes = Changes::default();
         let now = SystemTime::now();
         for name in self.names()? {
-            let age = match () {
-                () if name.starts_with(".join-") || name.starts_with(".trust-") => join,
-                () if name.starts_with(".escrow-") => escrow,
-                () => continue,
+            let age = match Role::of(&name) {
+                Some((Role::Escrow, true)) => escrow,
+                Some((_, true)) => join,
+                _ => continue,
             };
             let retired = fs::metadata(self.path(&name))?.modified()?;
             if now.duration_since(retired).unwrap_or_default() >= age {
@@ -324,7 +339,7 @@ impl KeyStore {
         }
         // Successions are useless once they expire.
         let at = tang_pqc::unix_seconds(now);
-        for name in self.succession_files()? {
+        for name in dir_files(&self.dir, "succession-", "json")? {
             let expired = serde_json::from_slice::<SignedSuccession>(&fs::read(self.path(&name))?)
                 .ok()
                 .and_then(|s| s.statement().ok())
@@ -363,11 +378,11 @@ impl KeyStore {
             now + validity.as_secs(),
         )?;
         let old = *old.public().thumbprint();
-        self.replace(
-            &format!("succession-{old}.json"),
+        write_private(
+            &self.path(&format!("succession-{old}.json")),
             serde_json::to_string(&succession)?.as_bytes(),
         )?;
-        self.replace("anchor.jwk", new.to_jwk()?.as_ref())?;
+        write_private(&self.path("anchor.jwk"), new.to_jwk()?.as_ref())?;
         Ok((old, *new.public().thumbprint()))
     }
 
@@ -377,22 +392,10 @@ impl KeyStore {
     ///
     /// I/O errors or a malformed file.
     pub fn successions(&self) -> Result<Vec<SignedSuccession>, Error> {
-        self.succession_files()?
+        dir_files(&self.dir, "succession-", "json")?
             .iter()
             .map(|name| Ok(serde_json::from_slice(&fs::read(self.path(name))?)?))
             .collect()
-    }
-
-    fn succession_files(&self) -> Result<Vec<String>, Error> {
-        let mut names: Vec<String> = fs::read_dir(&self.dir)?
-            .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| {
-                n.starts_with("succession-")
-                    && Path::new(n).extension().is_some_and(|e| e == "json")
-            })
-            .collect();
-        names.sort();
-        Ok(names)
     }
 
     /// Load this server's anchor.
@@ -402,7 +405,7 @@ impl KeyStore {
     /// I/O errors or a malformed key.
     pub fn anchor(&self) -> Result<SigningKey, Error> {
         Ok(SigningKey::from_jwk(
-            read_private(self.path("anchor.jwk"))?.as_ref(),
+            read_private(&self.path("anchor.jwk"))?.as_ref(),
         )?)
     }
 
@@ -425,7 +428,10 @@ impl KeyStore {
     ///
     /// I/O errors.
     pub fn store_delegation(&self, delegation: &Delegation) -> Result<(), Error> {
-        self.replace("delegation.json", delegation.to_json().as_bytes())
+        write_private(
+            &self.path("delegation.json"),
+            delegation.to_json().as_bytes(),
+        )
     }
 
     /// The anchor exchange state (empty if none was stored).
@@ -447,7 +453,7 @@ impl KeyStore {
     ///
     /// I/O errors.
     pub fn store_peer_state(&self, state: &AnchorState) -> Result<(), Error> {
-        self.replace("peers.state", &state.to_bytes())
+        write_private(&self.path("peers.state"), &state.to_bytes())
     }
 
     /// The anchor epoch log (§4.8); empty if none was stored.
@@ -469,13 +475,10 @@ impl KeyStore {
     ///
     /// I/O errors.
     pub fn store_epoch(&self, chain: &[SignedEpoch]) -> Result<(), Error> {
-        self.replace("epoch.json", serde_json::to_vec(chain)?.as_slice())
-    }
-
-    fn replace(&self, name: &str, data: &[u8]) -> Result<(), Error> {
-        let path = self.path(name);
-        let _ = fs::remove_file(path.with_extension("tmp"));
-        write_private(&path, data)
+        write_private(
+            &self.path("epoch.json"),
+            serde_json::to_vec(chain)?.as_slice(),
+        )
     }
 }
 
@@ -566,10 +569,7 @@ mod tests {
 
         let changes = store
             .rotate(Rotation {
-                retire: Retire {
-                    join: true,
-                    ..Retire::default()
-                },
+                roles: vec![Role::Join],
                 signing: true,
             })
             .unwrap();
@@ -588,10 +588,7 @@ mod tests {
         // Escrow keys are kept longer than join keys.
         store
             .rotate(Rotation {
-                retire: Retire {
-                    escrow: true,
-                    ..Retire::default()
-                },
+                roles: vec![Role::Escrow],
                 ..Rotation::default()
             })
             .unwrap();
