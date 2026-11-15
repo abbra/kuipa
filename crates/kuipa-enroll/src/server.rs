@@ -10,7 +10,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::SystemTime;
 
 use tang_pqc::wire::Writer;
-use tang_pqc::{Policy, SignedAdvertisement, Thumbprint, VerifyingKey, unix_seconds};
+#[cfg(test)]
+use tang_pqc::{Policy, VerifyingKey};
+use tang_pqc::{SignedAdvertisement, Thumbprint, unix_seconds};
 
 use crate::bundle::{Bundle, Recipient, StageParams};
 use crate::delegation::{Delegation, HeadPin, SignedVouch};
@@ -1130,7 +1132,7 @@ impl From<Error> for Refusal {
 }
 
 /// Default advertisement validity (7 days), re-signed at half life.
-pub const ADVERTISEMENT_VALIDITY: u64 = 7 * 24 * 3600;
+pub(crate) const ADVERTISEMENT_VALIDITY: u64 = 7 * 24 * 3600;
 
 /// Cache key of a signed advertisement: the anchor whose proof it
 /// carries, the anchor its succession chain starts from, the epoch
@@ -1188,7 +1190,8 @@ impl ClaimLogPage {
     /// [`Error::UntrustedAnchor`] for another key or a bad signature,
     /// [`Error::Mismatch`] when the vouch names another anchor or head,
     /// [`Error::Expired`] when the vouch is expired at `at`.
-    pub fn verified_head(
+    #[cfg(test)]
+    pub(crate) fn verified_head(
         &self,
         key: &VerifyingKey,
         policy: &Policy,

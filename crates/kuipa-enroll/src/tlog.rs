@@ -57,12 +57,12 @@ pub const MAX_BODY: usize = 64 * 1024;
 pub const MAX_ANSWER: usize = 1024;
 
 /// Most cosignatures a signed head carries.
-pub const MAX_COSIGNATURES: usize = 16;
+pub(crate) const MAX_COSIGNATURES: usize = 16;
 
 /// The step of a committed leaf's public time: a day.  Every event of a
 /// day shares its time, so a reader who knows when someone acted cannot
 /// pick out their leaf by it; the exact time is in the [`Opening`].
-pub const PUBLIC_TIME_STEP: u64 = 86_400;
+pub(crate) const PUBLIC_TIME_STEP: u64 = 86_400;
 
 /// The length of an opening's salt: the commitment hides the event as long
 /// as the salt cannot be guessed.
@@ -101,7 +101,7 @@ impl Kind {
     /// of users and hosts.  Claims, token keys and tombstones are public
     /// by nature and stay in the clear.
     #[must_use]
-    pub const fn is_committed(self) -> bool {
+    pub(crate) const fn is_committed(self) -> bool {
         matches!(
             self,
             Self::SEAL_DEVICE
@@ -193,7 +193,7 @@ impl Leaf {
 /// The body of a [`Kind::TOMBSTONE`] leaf: the leaf at `target` is no
 /// longer current.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tombstone {
+pub(crate) struct Tombstone {
     /// The index of the leaf it retires.
     pub target: u64,
     /// Why, for auditors.
@@ -474,8 +474,9 @@ impl Log {
     }
 
     /// Whether a tombstone retires the leaf at `index`.
+    #[cfg(test)]
     #[must_use]
-    pub fn is_retired(&self, index: u64) -> bool {
+    pub(crate) fn is_retired(&self, index: u64) -> bool {
         self.retired.contains(&index)
     }
 

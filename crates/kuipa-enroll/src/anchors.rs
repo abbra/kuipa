@@ -202,7 +202,7 @@ pub type EntryId = [u8; 16];
 /// # Errors
 ///
 /// A cryptographic hash operation failed.
-pub fn entry_id(id: &str) -> Result<EntryId> {
+pub(crate) fn entry_id(id: &str) -> Result<EntryId> {
     let hash = primitives::sha256(&[b"ipa-ku/anchor-entry-id/v1\0", id.as_bytes()])?;
     let mut short = [0; 16];
     short.copy_from_slice(&hash[..16]);
@@ -351,7 +351,7 @@ impl AnchorState {
     /// # Errors
     ///
     /// A cryptographic hash operation failed.
-    pub fn entry_summary(&self) -> Result<&BTreeMap<EntryId, EntryVersion>> {
+    pub(crate) fn entry_summary(&self) -> Result<&BTreeMap<EntryId, EntryVersion>> {
         Ok(&self.index()?.summary)
     }
 
@@ -988,7 +988,7 @@ impl Trust {
 
     /// The trusted anchor of `server`.
     #[must_use]
-    pub fn anchor_of(&self, server: &str) -> Option<Thumbprint> {
+    pub(crate) fn anchor_of(&self, server: &str) -> Option<Thumbprint> {
         self.servers.get(server).and_then(|c| c.anchor)
     }
 

@@ -26,7 +26,7 @@ use synta_mtc::types::constants::{is_mtc_ca_extension_oid, is_mtc_proof_oid};
 /// Why a certificate is not one a host may install as a CA: what
 /// [`check_ca`] says, and [`Error::NotCa`](crate::error::Error::NotCa)
 /// reports for a list entry.
-pub type NotCa = &'static str;
+pub(crate) type NotCa = &'static str;
 
 /// Require `der` to be one DER certificate that can act as a CA: basic
 /// constraints with `cA` set, or a Merkle Tree CA.  A key usage extension,
@@ -40,7 +40,7 @@ pub type NotCa = &'static str;
 /// or malformed extension, or not a CA.
 ///
 /// [`Error::NotCa`]: crate::error::Error::NotCa
-pub fn check_ca(der: &[u8]) -> Result<(), NotCa> {
+pub(crate) fn check_ca(der: &[u8]) -> Result<(), NotCa> {
     let mut decoder = synta::Decoder::new(der, synta::Encoding::Der);
     let cert: Certificate<'_> = decoder.decode().map_err(|_| "not a DER certificate")?;
     if !decoder.is_empty() {

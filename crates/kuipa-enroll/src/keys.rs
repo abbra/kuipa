@@ -22,7 +22,7 @@ const FETCH_MAGIC: [u8; 4] = *b"IPKG";
 const ANSWER_MAGIC: [u8; 4] = *b"IPKR";
 
 /// Largest nickname accepted (§18.2: a bounded, opaque string).
-pub const MAX_NICKNAME: usize = 255;
+pub(crate) const MAX_NICKNAME: usize = 255;
 
 /// Largest value a handler may answer with (§11.3's body limit bounds the
 /// sealed form; this bounds the plaintext the daemon will hold).

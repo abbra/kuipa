@@ -31,7 +31,7 @@ const HEADER_MAGIC: [u8; 4] = *b"IPOH";
 
 /// ML-DSA context of bundle signatures, separating them from JWS
 /// signatures (empty context) by the same key.
-pub const SIGNATURE_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 bundle";
+pub(crate) const SIGNATURE_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 bundle";
 
 /// How a bundle is opened (§8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

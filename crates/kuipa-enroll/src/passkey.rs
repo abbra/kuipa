@@ -121,8 +121,9 @@ impl Algorithm {
     }
 
     /// Whether this is a post-quantum algorithm.
+    #[cfg(test)]
     #[must_use]
-    pub const fn is_post_quantum(self) -> bool {
+    pub(crate) const fn is_post_quantum(self) -> bool {
         matches!(self, Self::MlDsa(_))
     }
 }
@@ -153,7 +154,7 @@ impl PasskeyKey {
     ///
     /// [`Error::Malformed`], or [`Error::Passkey`] for a key of an
     /// unsupported algorithm.
-    pub fn from_ipa(value: &str) -> Result<Self> {
+    pub(crate) fn from_ipa(value: &str) -> Result<Self> {
         let rest = value
             .strip_prefix("passkey:")
             .ok_or(Error::Malformed("passkey mapping"))?;
@@ -171,7 +172,7 @@ impl PasskeyKey {
     ///
     /// [`Error::Malformed`], or [`Error::Passkey`] for a key of an
     /// unsupported algorithm.
-    pub fn from_spki(credential_id: Vec<u8>, spki: &[u8]) -> Result<Self> {
+    pub(crate) fn from_spki(credential_id: Vec<u8>, spki: &[u8]) -> Result<Self> {
         if credential_id.is_empty() || credential_id.len() > MAX_CREDENTIAL_ID_LEN {
             return Err(Error::Malformed("passkey credential id"));
         }

@@ -136,7 +136,7 @@ impl SealId {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn machine_kind(
+    pub(crate) fn machine_kind(
         &self,
         principal: &Principal,
         alg: tang_pqc::KemAlg,
@@ -193,7 +193,7 @@ impl std::fmt::Debug for SealId {
 
 /// What a binding commits to: its principal and seal.
 #[must_use]
-pub fn commitment_data(principal: &Principal, seal: &SealId) -> Vec<u8> {
+pub(crate) fn commitment_data(principal: &Principal, seal: &SealId) -> Vec<u8> {
     Writer::new(COMMIT_MAGIC)
         .str(&principal.to_string())
         .fixed(seal.as_bytes())
@@ -708,7 +708,7 @@ impl RegisterParams {
     /// # Errors
     ///
     /// [`Error::Malformed`], or [`Error::Mismatch`] for another principal.
-    pub fn check_acknowledgement(&self, payload: &[u8]) -> Result<()> {
+    pub(crate) fn check_acknowledgement(&self, payload: &[u8]) -> Result<()> {
         let mut r = Reader::new(payload, REGISTERED_MAGIC, "registration answer")?;
         let principal: Principal = r.str()?.parse()?;
         r.finish()?;
@@ -745,7 +745,7 @@ const REQUEST_VERSION_PASSKEY: u8 = 3;
 impl EscrowRequest {
     /// A request for a user seal, answered to `device` if given.
     #[must_use]
-    pub fn for_seal(
+    pub(crate) fn for_seal(
         principal: Principal,
         seal: SealId,
         commitment: [u8; 32],
@@ -780,7 +780,7 @@ impl EscrowRequest {
 
     /// The same request carrying a re-authentication session token.
     #[must_use]
-    pub fn with_session(mut self, token: Vec<u8>) -> Self {
+    pub(crate) fn with_session(mut self, token: Vec<u8>) -> Self {
         self.session = token;
         self
     }
@@ -794,7 +794,7 @@ impl EscrowRequest {
     /// The same request carrying the owner's GSS-API `token`, made with
     /// [`ticket_binding`](Self::ticket_binding) as its channel binding.
     #[must_use]
-    pub fn with_ticket(mut self, token: Vec<u8>) -> Self {
+    pub(crate) fn with_ticket(mut self, token: Vec<u8>) -> Self {
         self.ticket = token;
         self
     }
@@ -815,7 +815,7 @@ impl EscrowRequest {
     /// [`Assertion`](crate::passkey::Assertion)) made over
     /// [`passkey_challenge`](Self::passkey_challenge).
     #[must_use]
-    pub fn with_passkey(mut self, assertion: Vec<u8>) -> Self {
+    pub(crate) fn with_passkey(mut self, assertion: Vec<u8>) -> Self {
         self.passkey = assertion;
         self
     }
@@ -844,7 +844,7 @@ impl EscrowRequest {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn ticket_binding(&self) -> Result<[u8; crate::join::CHANNEL_BINDING_LEN]> {
+    pub(crate) fn ticket_binding(&self) -> Result<[u8; crate::join::CHANNEL_BINDING_LEN]> {
         let digest = primitives::digest(
             self.request.alg().hash(),
             &[b"ipa-ku-enroll/v1 seal unlock", &self.bare()],
@@ -861,7 +861,7 @@ impl EscrowRequest {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn passkey_challenge(&self) -> Result<[u8; 32]> {
+    pub(crate) fn passkey_challenge(&self) -> Result<[u8; 32]> {
         let digest = primitives::digest(
             self.request.alg().hash(),
             &[b"ipa-ku-enroll/v1 seal passkey", &self.bare()],

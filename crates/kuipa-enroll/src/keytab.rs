@@ -85,13 +85,13 @@ pub struct Enctype(pub i32);
 
 impl Enctype {
     /// `aes128-cts-hmac-sha1-96`.
-    pub const AES128_CTS_HMAC_SHA1_96: Self = Self(17);
+    pub(crate) const AES128_CTS_HMAC_SHA1_96: Self = Self(17);
     /// `aes256-cts-hmac-sha1-96`.
     pub const AES256_CTS_HMAC_SHA1_96: Self = Self(18);
     /// `aes128-cts-hmac-sha256-128` (RFC 8009).
-    pub const AES128_CTS_HMAC_SHA256_128: Self = Self(19);
+    pub(crate) const AES128_CTS_HMAC_SHA256_128: Self = Self(19);
     /// `aes256-cts-hmac-sha384-192` (RFC 8009).
-    pub const AES256_CTS_HMAC_SHA384_192: Self = Self(20);
+    pub(crate) const AES256_CTS_HMAC_SHA384_192: Self = Self(20);
 
     /// What clients propose by default: the AES enctypes, strongest first.
     pub const DEFAULT: [Self; 4] = [

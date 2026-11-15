@@ -37,7 +37,7 @@ pub const DEFAULT_CHUNK_LOG2: u8 = 16;
 const MIN_CHUNK_LOG2: u8 = 12;
 const MAX_CHUNK_LOG2: u8 = 24;
 /// The most recipients one container names.
-pub const MAX_RECIPIENTS: usize = 4;
+pub(crate) const MAX_RECIPIENTS: usize = 4;
 const MAX_HEADER: usize = 16 * 1024;
 
 /// A key a backup is sealed to, and the id of the recovery shard set it

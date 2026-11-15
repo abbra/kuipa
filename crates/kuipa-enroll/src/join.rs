@@ -344,7 +344,7 @@ impl std::fmt::Debug for KerberosBinding {
 pub const KERBEROS_BINDING_LEN: usize = 32;
 
 /// The length of every channel binding kuipa hands GSS-API.
-pub const CHANNEL_BINDING_LEN: usize = 32;
+pub(crate) const CHANNEL_BINDING_LEN: usize = 32;
 
 /// A channel binding from `digest`: its first [`CHANNEL_BINDING_LEN`]
 /// bytes (a SHA-256 digest whole, a SHA-384 one truncated, as SP 800-107
@@ -354,7 +354,7 @@ pub const CHANNEL_BINDING_LEN: usize = 32;
 ///
 /// For a digest shorter than a channel binding.
 #[must_use]
-pub fn channel_binding_of(digest: &[u8]) -> [u8; CHANNEL_BINDING_LEN] {
+pub(crate) fn channel_binding_of(digest: &[u8]) -> [u8; CHANNEL_BINDING_LEN] {
     let mut cb = [0u8; CHANNEL_BINDING_LEN];
     cb.copy_from_slice(&digest[..CHANNEL_BINDING_LEN]);
     cb
@@ -638,12 +638,6 @@ impl std::fmt::Debug for PendingJoin {
 }
 
 impl PendingJoin {
-    /// The operation.
-    #[must_use]
-    pub fn operation(&self) -> Operation {
-        self.op
-    }
-
     /// Decrypt the response payload.
     ///
     /// # Errors

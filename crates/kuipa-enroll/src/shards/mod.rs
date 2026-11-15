@@ -37,29 +37,29 @@ const RECOVERY_DOMAIN: tang_pqc::primitives::Domain =
 /// The format version a share's header carries.
 pub const VERSION: u8 = 1;
 /// Words of a share's header.
-pub const HEADER_WORDS: usize = 5;
+pub(crate) const HEADER_WORDS: usize = 5;
 /// Words of a share's salt.
-pub const SALT_WORDS: usize = 13;
+pub(crate) const SALT_WORDS: usize = 13;
 /// Words of a share's secret bytes.
-pub const SECRET_WORDS: usize = 26;
+pub(crate) const SECRET_WORDS: usize = 26;
 /// Words before the check words.
 pub const DATA_WORDS: usize = HEADER_WORDS + SALT_WORDS + SECRET_WORDS;
 /// The fewest and most check words a share may have.
-pub const PARITY_RANGE: std::ops::RangeInclusive<u8> = 4..=200;
+pub(crate) const PARITY_RANGE: std::ops::RangeInclusive<u8> = 4..=200;
 /// The largest set id a share header carries (19 bits).
-pub const MAX_SET_ID: u32 = 0x7_FFFF;
+pub(crate) const MAX_SET_ID: u32 = 0x7_FFFF;
 /// Check words unless asked otherwise.
 pub const DEFAULT_PARITY: u8 = 24;
 /// The most shares in a set.
-pub const MAX_SHARES: u8 = 16;
+pub(crate) const MAX_SHARES: u8 = 16;
 /// PBKDF2 iterations are counted in units of this many.
-pub const ITERATION_UNIT: u32 = 100_000;
+pub(crate) const ITERATION_UNIT: u32 = 100_000;
 /// The iteration count the header's 6 bits allow, in units.
-pub const ITERATION_RANGE: std::ops::RangeInclusive<u8> = 1..=63;
+pub(crate) const ITERATION_RANGE: std::ops::RangeInclusive<u8> = 1..=63;
 /// Iterations (in units) unless asked otherwise: 2 million.
-pub const DEFAULT_ITERATIONS: u8 = 20;
+pub(crate) const DEFAULT_ITERATIONS: u8 = 20;
 /// Words on a printed line.
-pub const WORDS_PER_LINE: usize = 5;
+pub(crate) const WORDS_PER_LINE: usize = 5;
 /// The shortest passphrase `kuipa` accepts without being told to, in characters.
 pub const MIN_PASSPHRASE_CHARS: usize = 16;
 
@@ -548,7 +548,7 @@ pub fn new_salt() -> Result<[u8; 16], Error> {
 
 /// The passphrase as it is used: Unicode NFKC, so that it types the same on any keyboard.
 #[must_use]
-pub fn normalize_passphrase(passphrase: &str) -> String {
+pub(crate) fn normalize_passphrase(passphrase: &str) -> String {
     passphrase.nfkc().collect()
 }
 

@@ -42,7 +42,7 @@ use crate::merkle::{self, Hash, TreeHash};
 pub const CLOCK_SKEW: u64 = 300;
 
 /// Longest claim validity a verifier accepts, in seconds (400 days).
-pub const MAX_VALIDITY: u64 = 400 * 24 * 3600;
+pub(crate) const MAX_VALIDITY: u64 = 400 * 24 * 3600;
 
 /// Default validity of a new claim, in seconds (90 days).
 pub const DEFAULT_VALIDITY: u64 = 90 * 24 * 3600;
@@ -52,7 +52,7 @@ pub const DEFAULT_VALIDITY: u64 = 90 * 24 * 3600;
 pub const VOUCH_VALIDITY: u64 = 7 * 24 * 3600;
 
 /// Longest vouch validity a verifier accepts, in seconds (31 days).
-pub const MAX_VOUCH_VALIDITY: u64 = 31 * 24 * 3600;
+pub(crate) const MAX_VOUCH_VALIDITY: u64 = 31 * 24 * 3600;
 
 const CLAIM_MAGIC: [u8; 4] = *b"IPDC";
 const VOUCH_MAGIC: [u8; 4] = *b"IPVH";
@@ -63,11 +63,12 @@ const SIGNED_SUCCESSION_MAGIC: [u8; 4] = *b"IPSR";
 const SUCCESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 succession";
 
 /// Most successions a verifier follows from a pinned anchor.
-pub const MAX_SUCCESSION_HOPS: usize = 4;
+pub(crate) const MAX_SUCCESSION_HOPS: usize = 4;
 
 /// Default validity of a succession, in seconds (400 days): it must
 /// outlive the enrollment strings and images that pin the old anchor.
-pub const DEFAULT_SUCCESSION_VALIDITY: u64 = MAX_VALIDITY;
+#[cfg(test)]
+pub(crate) const DEFAULT_SUCCESSION_VALIDITY: u64 = MAX_VALIDITY;
 
 fn check_period(iat: u64, exp: u64, max: u64, what: &'static str) -> Result<()> {
     if exp <= iat || exp - iat > max {
@@ -504,7 +505,7 @@ impl SignedVouch {
     /// # Errors
     ///
     /// An OpenSSL error.
-    pub fn head_proof(
+    pub(crate) fn head_proof(
         &self,
         claim: &Claim,
         anchor: &Thumbprint,
@@ -770,7 +771,7 @@ impl SignedSuccession {
     /// The base64 statement: the ordering key for canonical succession
     /// lists (the anchor epoch, §4.8).
     #[must_use]
-    pub fn order_key(&self) -> &str {
+    pub(crate) fn order_key(&self) -> &str {
         &self.statement
     }
 
@@ -797,7 +798,7 @@ impl SignedSuccession {
     ///
     /// [`Error::Malformed`], [`Error::WrongRealm`], or
     /// [`Error::UntrustedAnchor`] for another key or a bad signature.
-    pub fn check_signature(&self, realm: &str, policy: &Policy) -> Result<Succession> {
+    pub(crate) fn check_signature(&self, realm: &str, policy: &Policy) -> Result<Succession> {
         let statement = b64::decode(&self.statement)?;
         let succession = Succession::from_bytes(&statement)?;
         let key = VerifyingKey::from_jwk_json(self.from.to_string().as_bytes())?;
@@ -1205,7 +1206,7 @@ struct Pins<'a> {
 /// How many distinct anchors' proofs an advertisement carries for a client
 /// that pins several: a client's quorum (§4.4), so one fetch proves the
 /// claim twice.
-pub const SERVED_PROOFS: usize = 2;
+pub(crate) const SERVED_PROOFS: usize = 2;
 
 impl Delegation {
     /// `claim` without proofs.
@@ -1269,7 +1270,7 @@ impl Delegation {
     /// Add `proof`s (for this claim), at most one per anchor; the head
     /// proofs replace a signature proof by the same anchor, which they
     /// subsume for a client that can check them (§4.9).
-    pub fn add_head_proofs(&mut self, proofs: impl IntoIterator<Item = HeadProof>) {
+    pub(crate) fn add_head_proofs(&mut self, proofs: impl IntoIterator<Item = HeadProof>) {
         for p in proofs {
             if self
                 .head_proofs
@@ -1384,7 +1385,7 @@ impl Delegation {
 
     /// Whether `other` has the same claim.
     #[must_use]
-    pub fn same_claim(&self, other: &Self) -> bool {
+    pub(crate) fn same_claim(&self, other: &Self) -> bool {
         self.claim == other.claim
     }
 
@@ -1414,7 +1415,7 @@ impl Delegation {
 
     /// [`select`](Self::select) with the client's pinned vouch heads.
     #[must_use]
-    pub fn select_with_heads(&self, wanted: &[Thumbprint], heads: &[HeadPin]) -> Self {
+    pub(crate) fn select_with_heads(&self, wanted: &[Thumbprint], heads: &[HeadPin]) -> Self {
         let own = self.claim().ok().and_then(|c| c.anchor);
         let by = |a: &Thumbprint| self.proofs.iter().find(|p| p.signer() == Some(*a));
         let proofs = self.head_proofs();
@@ -1562,7 +1563,7 @@ impl Delegation {
     /// # Errors
     ///
     /// As [`verify_at`](Self::verify_at).
-    pub fn verify_at_with_heads(
+    pub(crate) fn verify_at_with_heads(
         &self,
         anchors: &[Thumbprint],
         heads: &[HeadPin],
@@ -1710,7 +1711,7 @@ impl Delegation {
     /// # Errors
     ///
     /// [`Error::Malformed`].
-    pub fn expires_unverified(&self) -> Result<u64> {
+    pub(crate) fn expires_unverified(&self) -> Result<u64> {
         Ok(self.claim()?.exp)
     }
 
@@ -1720,7 +1721,7 @@ impl Delegation {
     ///
     /// Never: the value holds only strings and plain JSON types.
     #[must_use]
-    pub fn to_value(&self) -> Value {
+    pub(crate) fn to_value(&self) -> Value {
         serde_json::to_value(self).expect("serialisable")
     }
 

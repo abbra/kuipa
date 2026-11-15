@@ -18,13 +18,13 @@ use crate::delegation::{Delegation, HeadPin, HeadProof, VerifiedDelegation};
 use crate::error::{Error, Result};
 
 /// JWK member naming a key's role.
-pub const ROLE_MEMBER: &str = "ipa_use";
+pub(crate) const ROLE_MEMBER: &str = "ipa_use";
 /// Role of join (and rekey and stage) keys.
-pub const ROLE_JOIN: &str = "join";
+pub(crate) const ROLE_JOIN: &str = "join";
 /// Role of sealed-keytab escrow keys.
-pub const ROLE_ESCROW: &str = "escrow";
+pub(crate) const ROLE_ESCROW: &str = "escrow";
 /// Role of the keys trust requests from other realms are sealed to (§17.4).
-pub const ROLE_TRUST: &str = "trust";
+pub(crate) const ROLE_TRUST: &str = "trust";
 
 const MEMBER_IPA: &str = "ipa";
 const MEMBER_DELEGATION: &str = "delegation";
@@ -147,7 +147,7 @@ impl KdcProxy {
 /// `~` and `/` only — nothing that could end the `kdc` value or start
 /// another relation.
 #[must_use]
-pub fn is_safe_proxy_url(url: &str) -> bool {
+pub(crate) fn is_safe_proxy_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
@@ -555,7 +555,7 @@ impl ServerKeys {
 
     /// A trust key by id, advertised or retired.
     #[must_use]
-    pub fn trust_key(&self, kid: &Thumbprint) -> Option<&ExchangeKeyPair> {
+    pub(crate) fn trust_key(&self, kid: &Thumbprint) -> Option<&ExchangeKeyPair> {
         self.trust
             .iter()
             .chain(&self.retired)
@@ -590,7 +590,7 @@ impl Deployment {
 
     /// Whether `name` is one of the servers.
     #[must_use]
-    pub fn has_server(&self, name: &str) -> bool {
+    pub(crate) fn has_server(&self, name: &str) -> bool {
         self.servers.iter().any(|s| same_name(s, name))
     }
 }
@@ -879,7 +879,7 @@ impl VerifiedRealm {
     /// # Errors
     ///
     /// [`Error::Mismatch`].
-    pub fn check_ca_certs(&self, certs: &[Vec<u8>]) -> Result<()> {
+    pub(crate) fn check_ca_certs(&self, certs: &[Vec<u8>]) -> Result<()> {
         if certs.is_empty() || certs.iter().any(|c| !self.info.ca_certs.contains(c)) {
             return Err(Error::Mismatch("CA chain"));
         }
@@ -897,7 +897,7 @@ impl VerifiedRealm {
     ///
     /// [`Error::Mismatch`] for an anchor the advertisement does not vouch
     /// for.
-    pub fn check_anchors(&self, anchors: &[Thumbprint]) -> Result<()> {
+    pub(crate) fn check_anchors(&self, anchors: &[Thumbprint]) -> Result<()> {
         // The anchors this advertisement makes believable: the realm's
         // advertised set, plus every succession end the delegation proved
         // on the way to it (old pinned ends included, so a rotation in
@@ -920,7 +920,7 @@ impl VerifiedRealm {
     ///
     /// [`Error::Mismatch`] when the server named an epoch and the
     /// enrollment carries a different one.
-    pub fn check_epoch(&self, epoch: (u64, crate::epoch::EpochHead)) -> Result<()> {
+    pub(crate) fn check_epoch(&self, epoch: (u64, crate::epoch::EpochHead)) -> Result<()> {
         if self.epoch.is_some_and(|e| e != epoch) {
             return Err(Error::Mismatch("anchor epoch"));
         }
@@ -966,7 +966,7 @@ impl VerifiedRealm {
     /// sent to a KDC (a password, an OTP) only go to hosts the client was
     /// told to use.
     #[must_use]
-    pub fn kdcs_within<'a>(&'a self, deployment: &Deployment) -> Vec<&'a str> {
+    pub(crate) fn kdcs_within<'a>(&'a self, deployment: &Deployment) -> Vec<&'a str> {
         let server = self.server();
         let mut kdcs = vec![server];
         kdcs.extend(

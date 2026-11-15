@@ -68,7 +68,7 @@ impl TreeHash {
 
     /// The algorithm whose output is `len` bytes.
     #[must_use]
-    pub const fn of_len(len: usize) -> Option<Self> {
+    pub(crate) const fn of_len(len: usize) -> Option<Self> {
         match len {
             SHA256_LEN => Some(Self::Sha256),
             SHA384_LEN => Some(Self::Sha384),

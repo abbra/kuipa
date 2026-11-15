@@ -39,7 +39,7 @@ use crate::error::{Error, Result};
 pub const SIGN_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 voucher";
 
 /// The role of voucher keys in the advertisement.
-pub const ROLE_VOUCHER: &str = "voucher";
+pub(crate) const ROLE_VOUCHER: &str = "voucher";
 
 /// Length of the blinding salt.
 pub const SALT_LEN: usize = 32;
@@ -59,7 +59,7 @@ pub struct VoucherSettings {
 impl VoucherSettings {
     /// The longest lease a voucher may give its host.
     #[must_use]
-    pub fn max_lease(&self) -> u64 {
+    pub(crate) fn max_lease(&self) -> u64 {
         self.max_lease.unwrap_or(DEFAULT_MAX_LEASE)
     }
 }
@@ -273,7 +273,7 @@ impl Voucher {
     /// # Errors
     ///
     /// As [`verify`](Self::verify), for everything but the binding.
-    pub fn verify_for_spend(
+    pub(crate) fn verify_for_spend(
         &self,
         key: &VerifyingKey,
         realm: &str,

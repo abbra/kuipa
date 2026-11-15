@@ -217,7 +217,7 @@ fn count(r: &mut Reader<'_>, what: &'static str) -> Result<usize> {
 /// [`crate::delegation::Proof`], so a fetched chain verifies from
 /// thumbprints alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EpochSignature {
+pub(crate) struct EpochSignature {
     /// The anchor's public key (JWK).
     anchor: Value,
     /// The signature (base64url).

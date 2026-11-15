@@ -37,10 +37,10 @@ const LEAF_MAGIC: [u8; 4] = *b"IPGL";
 const STATEMENT_CONTEXT: &[u8] = b"ipa-ku-sign/v1 statement";
 
 /// Most digests one statement covers.
-pub const MAX_DIGESTS: usize = 256;
+pub(crate) const MAX_DIGESTS: usize = 256;
 
 /// Longest purpose name.
-pub const MAX_PURPOSE: usize = 64;
+pub(crate) const MAX_PURPOSE: usize = 64;
 
 /// A digest algorithm a statement may cover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +89,7 @@ impl DigestAlg {
     /// digest of this algorithm: never one shorter than the tree hash, so
     /// a SHA-384 (CNSA) signer covers SHA-384 and SHA-512 digests only.
     #[must_use]
-    pub const fn fits(self, tree: TreeHash) -> bool {
+    pub(crate) const fn fits(self, tree: TreeHash) -> bool {
         self.output_len() >= tree.output_len()
     }
 
@@ -314,7 +314,7 @@ impl Statement {
     /// index stands for the principal.  `IPGS ‖ 1 ‖ purpose ‖ batch_size ‖
     /// batch_root(32) ‖ iat`.
     #[must_use]
-    pub fn log_body(purpose: &str, batch_size: u64, batch_root: &Hash, iat: u64) -> Vec<u8> {
+    pub(crate) fn log_body(purpose: &str, batch_size: u64, batch_root: &Hash, iat: u64) -> Vec<u8> {
         Writer::new(STATEMENT_MAGIC)
             .str(purpose)
             .u64(batch_size)
@@ -793,7 +793,7 @@ impl Signers {
     /// without one, or a service of another realm.  A user of another
     /// realm is kept as named: a trusted realm's user (an ID override in
     /// FreeIPA's default trust view) is a user like any other.
-    pub fn normalized(&self, realm: &str) -> Result<Self> {
+    pub(crate) fn normalized(&self, realm: &str) -> Result<Self> {
         let full = |name: &str, service: bool| -> Result<String> {
             let (base, at) = match name.rsplit_once('@') {
                 Some((b, r)) if r == realm || (!service && !r.is_empty()) => (b, r),

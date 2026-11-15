@@ -40,10 +40,10 @@ use crate::tlog::Receipt;
 pub const DOMAIN: Domain = Domain::new("ipa-ku-enroll/v1 seal");
 
 /// ML-DSA context of descriptor signatures.
-pub const DESCRIPTOR_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 seal descriptor";
+pub(crate) const DESCRIPTOR_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 seal descriptor";
 
 /// ML-DSA context of session token signatures.
-pub const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 seal session";
+pub(crate) const SESSION_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 seal session";
 
 const DESCRIPTOR_MAGIC: [u8; 4] = *b"IPVD";
 const REPLY_MAGIC: [u8; 4] = *b"IPVR";
@@ -177,7 +177,7 @@ impl Factors {
     /// Whether these factors include all of `least`'s: its device factor at
     /// its level or above, its ticket, its passkey.
     #[must_use]
-    pub fn meets(&self, least: &Self) -> bool {
+    pub(crate) fn meets(&self, least: &Self) -> bool {
         least
             .device
             .is_none_or(|l| self.device.is_some_and(|d| d >= l))
@@ -270,13 +270,13 @@ pub struct Policy {
 
 /// How long a release request waits for approvals and is then usable,
 /// unless the policy says.
-pub const DEFAULT_APPROVAL_WINDOW: u64 = 86_400;
+pub(crate) const DEFAULT_APPROVAL_WINDOW: u64 = 86_400;
 
 /// The longest approval window a policy may set.
-pub const MAX_APPROVAL_WINDOW: u64 = 7 * 86_400;
+pub(crate) const MAX_APPROVAL_WINDOW: u64 = 7 * 86_400;
 
 /// The longest reason a release request may give, in bytes.
-pub const MAX_REASON: usize = 512;
+pub(crate) const MAX_REASON: usize = 512;
 
 /// A seal's approvals (`DESIGN-approvals.md` §1): `m` people of `from`,
 /// other than the requester, approve a release before a server answers.
@@ -574,7 +574,7 @@ impl Limits {
     /// of the matching group with the lowest priority over the realm's,
     /// or the realm's.  The result names no groups.
     #[must_use]
-    pub fn for_groups(&self, groups: &[String]) -> Self {
+    pub(crate) fn for_groups(&self, groups: &[String]) -> Self {
         let mut out = Self {
             groups: Vec::new(),
             ..self.clone()
@@ -693,7 +693,7 @@ impl Device {
 
     /// The same device, held by `holder`.
     #[must_use]
-    pub fn held_by(mut self, holder: &str) -> Self {
+    pub(crate) fn held_by(mut self, holder: &str) -> Self {
         self.holder = Some(holder.to_owned());
         self
     }
@@ -800,7 +800,7 @@ pub fn split_ref(reference: &str) -> (Option<&str>, &str) {
 }
 
 /// The most bindings a seal keeps registered.
-pub const MAX_BINDINGS: usize = 4096;
+pub(crate) const MAX_BINDINGS: usize = 4096;
 
 /// A binding hash as the seal stores it.
 #[must_use]
@@ -894,7 +894,7 @@ impl SessionKey {
     /// # Errors
     ///
     /// A crypto error.
-    pub fn add_slots(
+    pub(crate) fn add_slots(
         &mut self,
         seal: &SealId,
         pair: &ExchangeKeyPair,
@@ -1301,12 +1301,6 @@ impl Seal {
             .is_some_and(|r| r >= Role::Member)
     }
 
-    /// Whether anyone besides the owner shares it.
-    #[must_use]
-    pub fn is_shared(&self) -> bool {
-        !self.managers.is_empty() || !self.members.is_empty() || !self.depositors.is_empty()
-    }
-
     /// Who shares it, as the transparency log digests it after a share or
     /// an unshare.
     #[must_use]
@@ -1563,14 +1557,14 @@ pub struct ReleaseRequest {
 impl ReleaseRequest {
     /// Whether approvals and releases may still be made with it at `now`.
     #[must_use]
-    pub fn is_open(&self, now: u64) -> bool {
+    pub(crate) fn is_open(&self, now: u64) -> bool {
         self.denied.is_none() && now <= self.not_after
     }
 
     /// What the transparency log digests for the request: everything but
     /// what the directory adds later.
     #[must_use]
-    pub fn log_bytes(&self) -> Vec<u8> {
+    pub(crate) fn log_bytes(&self) -> Vec<u8> {
         let core = Self {
             approvals: Vec::new(),
             denied: None,
@@ -1599,7 +1593,7 @@ impl ReleaseRequest {
 }
 
 /// The largest deposit a server keeps, in bytes of its sealed file.
-pub const MAX_DEPOSIT: usize = 16 * 1024;
+pub(crate) const MAX_DEPOSIT: usize = 16 * 1024;
 
 /// What a deposit holds (`DESIGN-recovery.md` §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
