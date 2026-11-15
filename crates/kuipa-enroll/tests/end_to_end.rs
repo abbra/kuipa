@@ -3230,6 +3230,51 @@ fn requests_end(c: &BreakGlass) {
     assert!(seal_op(&c.r, &c.r.verify(0), BOB, &by_bob).is_err());
 }
 
+/// A user of a trusted realm (an ID override in FreeIPA) approves like any
+/// other member of the group, while the realm refuses one it does not know
+/// and one who would own a seal.
+#[test]
+fn a_trusted_realms_user_approves_and_owns_nothing() {
+    let c = BreakGlass::new();
+    let (ada, zed) = ("ada@AD.TEST", "zed@AD.TEST");
+    for who in [ada, zed] {
+        c.r.dir
+            .groups
+            .borrow_mut()
+            .insert(who.into(), vec!["oncall".into()]);
+    }
+    c.r.dir.unknown.borrow_mut().insert(zed.into());
+    let id = c.request(&c.password);
+    assert!(c.decide(zed, &id, false).is_err(), "unknown here");
+    c.decide(ada, &id, false).unwrap();
+    c.decide(BOB, &id, false).unwrap();
+    assert_eq!(
+        c.open(&c.password, Some(&id)).unwrap().as_ref(),
+        b"root password"
+    );
+    let create = SealOp::Create {
+        name: "mine".into(),
+        policy: seal::Policy::default(),
+    };
+    assert!(seal_op(&c.r, &c.r.verify(0), ada, &create).is_err());
+    // Shared by name, she is a member like any other: she sees the seal.
+    let share = |who: &str| SealOp::Share {
+        name: "break-glass".into(),
+        managers: seal::Members::default(),
+        members: seal::Members {
+            users: vec![who.into()],
+            ..seal::Members::default()
+        },
+        depositors: seal::Members::default(),
+    };
+    let adv = c.r.verify(0);
+    seal_op(&c.r, &adv, ALICE, &share("ada@AD.TEST")).unwrap();
+    let listed = seal_op(&c.r, &adv, "ada@AD.TEST", &SealOp::List).unwrap();
+    assert_eq!(listed.len(), 1);
+    // but a user of another realm the directory does not know sees nothing.
+    assert!(seal_op(&c.r, &adv, zed, &SealOp::List).is_err());
+}
+
 #[test]
 fn releases_wait_for_approvals_from_others() {
     let c = BreakGlass::new();

@@ -1972,6 +1972,26 @@ kuipa seal share SEAL [--manager] [--user U…] [--group G…] [--host FQDN…] 
 kuipa seal unshare SEAL [--manager] [--user U…] [--group G…] [--host FQDN…] [--service S…]
 ```
 
+**Users of a trusted realm (implemented).** In FreeIPA, an Active Directory
+user with an ID override in the default trust view is a user of the IPA
+directory: the KDC accepts their ticket, and 389-ds binds them to the
+override entry (`ipaOriginalUid=name@AD.REALM`, the SASL mapping of
+`71-idviews-sasl-mapping.update`). kuipad finds that entry for a user
+principal of another realm, so the override's `memberOf` decides group
+names (managers, members, approvers, signers), and a user may be named by
+`user@AD.REALM` (`Signers::normalized` keeps another realm's users as
+named; services stay the realm's own). Such a user takes part in the
+realm's seals as any user does: member, manager, depositor, approver and
+requester, sessions and devices of their own, the signing policy, a pins
+refresh and a seal administrator's operations when the realm's privilege
+says so (`admit_caller`). They never **own** a seal (`create` refuses
+them): seals, descriptors and files are the realm's. A principal of
+another realm with no override is refused as unknown, and a trusted
+realm's host or service is never looked up as an IPA host or service of the
+same name. Names never collide: a bare name in the signing policy is the
+realm's, so `alice` does not admit `alice@AD.REALM`; AD holds the real lock
+state, so a disabled AD user stays admitted until their ticket expires.
+
 #### 7.6.13 Decisions
 
 Settled with the design: the threat model of §7.6.1; factors configurable

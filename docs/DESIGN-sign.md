@@ -83,7 +83,7 @@ verifier checks four things:
   of the statement's `iat`**, as offline enrollment bundles do (§8.4),
   and its key is the statement's signer, with an algorithm the policy
   allows;
-- the principal is in the realm.
+- the principal parses: the realm vouches for who signed, a user of a trusted realm too.
 
 A statement therefore stays verifiable after the server's key rotates
 or its delegation ends. The log entry it names, at `(log, index)`,

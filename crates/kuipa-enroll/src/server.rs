@@ -1969,10 +1969,14 @@ impl EnrollServer {
             .accept_user(body.authenticator.as_ref(), &cb)
             .map_err(Refusal)?;
         let caller: Principal = accepted.principal.parse()?;
-        if caller.realm() != self.info.realm {
+        let op = SealOp::from_bytes(&body.extra)?;
+        // A user of a trusted realm owns no seal (seals, their descriptors and
+        // their files are this realm's), but may administer them when the
+        // realm's privilege says so.
+        if caller.realm() != self.info.realm && matches!(op, SealOp::Create { .. }) {
             return Err(Refusal::because("wrong realm"));
         }
-        let op = SealOp::from_bytes(&body.extra)?;
+        self.admit_caller(&caller, directory)?;
         let now = unix_seconds(SystemTime::now());
         let mut event = seal_event(&op);
         // Whoever loses a device or their membership must not open files
@@ -2055,6 +2059,23 @@ impl EnrollServer {
             ..side
         };
         Ok(request.respond(ss, t, Some(&accepted.binding), &reply.to_bytes()?)?)
+    }
+
+    /// Refuse a caller that is neither of this realm nor a user of a trusted
+    /// realm the directory knows: FreeIPA's ID override in the default trust
+    /// view, which makes them a user here (`principal_locked` is true for the
+    /// unknown). Operations that give the caller more than a user's part in
+    /// the realm (keys, enrollment, owning seals) refuse the other realm
+    /// before this.
+    fn admit_caller(&self, caller: &Principal, directory: &dyn Directory) -> Result<(), Refusal> {
+        if caller.realm() != self.info.realm
+            && directory.principal_locked(caller).map_err(Refusal)?
+        {
+            return Err(Refusal::because(format!(
+                "wrong realm: {caller} has no ID override here"
+            )));
+        }
+        Ok(())
     }
 
     /// Settle a seal a seal operation touched: whoever has no part in it
@@ -2182,18 +2203,15 @@ impl EnrollServer {
             .accept_user(body.authenticator.as_ref(), &cb)
             .map_err(Refusal)?;
         let caller: Principal = accepted.principal.parse()?;
-        if caller.realm() != self.info.realm {
-            return Err(Refusal::because("wrong realm"));
-        }
         if directory.principal_locked(&caller).map_err(Refusal)? {
             return Err(Refusal::because(format!("{caller} is locked or gone")));
         }
-        let asked = crate::sign::Request::from_bytes(&body.extra)?;
-        let groups = directory.principal_groups(&caller).map_err(Refusal)?;
-        directory
-            .sign_policy()
-            .map_err(Refusal)?
-            .check(&caller, &groups, &asked.purpose)?;
+        directory.sign_policy().map_err(Refusal)?.check(
+            &self.info.realm,
+            &caller,
+            &groups,
+            &asked.purpose,
+        )?;
         let tree = self.tree_hash();
         if let Some(d) = asked.digests.iter().find(|d| !d.alg.fits(tree)) {
             return Err(Refusal::because(format!(
@@ -2248,9 +2266,7 @@ impl EnrollServer {
             .accept_user(body.authenticator.as_ref(), &cb)
             .map_err(Refusal)?;
         let caller: Principal = accepted.principal.parse()?;
-        if caller.realm() != self.info.realm {
-            return Err(Refusal::because("wrong realm"));
-        }
+        self.admit_caller(&caller, directory)?;
         let (anchors, heads) = self.anchors_and_heads();
         let answer = crate::payload::PinsAnswer {
             realm: self.info.realm.clone(),
@@ -2280,9 +2296,7 @@ impl EnrollServer {
             .accept_user(body.authenticator.as_ref(), &cb)
             .map_err(Refusal)?;
         let caller: Principal = accepted.principal.parse()?;
-        if caller.realm() != self.info.realm {
-            return Err(Refusal::because("wrong realm"));
-        }
+        self.admit_caller(&caller, directory)?;
         let query = crate::tlog::Query::from_bytes(&body.extra)?;
         let subject = if query.seal.is_empty() {
             caller.to_string().into_bytes()
