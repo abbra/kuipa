@@ -57,6 +57,8 @@ const ESCROW_ATTR: &str = "ipaKUEscrowBinding";
 const ESCROW_FILE_ATTR: &str = "ipaKUEscrowFileBinding";
 /// Attribute recording staging (new schema), JSON.
 const STAGED_ATTR: &str = "ipaKUStaged";
+/// The auxiliary class that permits the daemon's attributes on an entry.
+const ESCROW_CLASS: &str = "ipaKUPrincipalEscrow";
 
 /// LDAP result code 16: the attribute to delete is not there.
 const NO_SUCH_ATTRIBUTE: std::ffi::c_int = 16;
@@ -692,6 +694,34 @@ impl LdapDirectory {
         )?;
         Ok(entries.into_iter().next())
     }
+
+    /// [`principal_entry`](Self::principal_entry) for a write of the
+    /// daemon's own attributes: the entry gets `ipaKUPrincipalEscrow` first
+    /// if it lacks it (users and trusted realms' ID overrides start without),
+    /// as the schema and the daemon's ACI require.
+    fn escrow_entry(
+        &self,
+        conn: &mut LdapConnection,
+        principal: &Principal,
+        attrs: &[&str],
+    ) -> Result<SearchEntry, DirectoryError> {
+        let mut want = attrs.to_vec();
+        want.push("objectClass");
+        let entry = self
+            .principal_entry(conn, principal, &want)?
+            .ok_or_else(|| format!("no entry for {principal}"))?;
+        let has = entry
+            .attrs
+            .get("objectclass")
+            .is_some_and(|v| v.iter().any(|c| c.eq_ignore_ascii_case(ESCROW_CLASS)));
+        if !has {
+            conn.modify_s(
+                &entry.dn,
+                &[(ModOp::Add, "objectClass", vec![ESCROW_CLASS.as_bytes()])],
+            )?;
+        }
+        Ok(entry)
+    }
 }
 
 impl LdapDirectory {
@@ -820,9 +850,7 @@ impl Directory for LdapDirectory {
         bindings: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), DirectoryError> {
         let mut svc = self.service_conn()?;
-        let entry = self
-            .principal_entry(&mut svc, principal, &["objectClass"])?
-            .ok_or_else(|| format!("no entry for {principal}"))?;
+        let entry = self.escrow_entry(&mut svc, principal, &[])?;
         let values: Vec<&[u8]> = bindings
             .iter()
             .map(kuipa_enroll::merkle::Hash::as_bytes)
@@ -875,9 +903,7 @@ impl Directory for LdapDirectory {
             );
         }
         let mut svc = self.service_conn()?;
-        let entry = self
-            .principal_entry(&mut svc, principal, &["objectClass"])?
-            .ok_or_else(|| format!("no entry for {principal}"))?;
+        let entry = self.escrow_entry(&mut svc, principal, &[])?;
         let values: Vec<&[u8]> = bindings
             .iter()
             .map(kuipa_enroll::merkle::Hash::as_bytes)
@@ -1442,9 +1468,7 @@ impl Directory for LdapDirectory {
         escrow: &DeviceEscrow,
     ) -> Result<(), DirectoryError> {
         let mut svc = self.service_conn()?;
-        let entry = self
-            .principal_entry(&mut svc, principal, &[DEVICE_ESCROW_ATTR])?
-            .ok_or_else(|| format!("no entry for {principal}"))?;
+        let entry = self.escrow_entry(&mut svc, principal, &[DEVICE_ESCROW_ATTR])?;
         // That device's escrow of this kind goes, the others stay: one
         // device may hold a recovery code and a shard blob at once.
         let old: Vec<&String> = entry
@@ -1492,9 +1516,7 @@ impl Directory for LdapDirectory {
         rows: &[DeviceEscrow],
     ) -> Result<(), DirectoryError> {
         let mut svc = self.service_conn()?;
-        let entry = self
-            .principal_entry(&mut svc, principal, &[DEVICE_ESCROW_ATTR])?
-            .ok_or_else(|| format!("no entry for {principal}"))?;
+        let entry = self.escrow_entry(&mut svc, principal, &[DEVICE_ESCROW_ATTR])?;
         // The whole old set goes, keyed rows and code escrows of other
         // kinds stay.
         let old: Vec<&String> = entry
