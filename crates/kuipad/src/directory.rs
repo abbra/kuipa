@@ -178,9 +178,13 @@ pub struct LdapDirectory {
     initiator: std::sync::Mutex<()>,
 }
 
-/// A seal's attributes as the directory stores them: its name, the
-/// policy, the session keys and the devices, each as JSON.
-type SealAttrs = (String, Vec<String>, &'static str, Vec<String>);
+/// A seal state as the directory stores it.
+fn state_name(state: State) -> &'static str {
+    match state {
+        State::Enabled => "enabled",
+        State::Revoked => "revoked",
+    }
+}
 
 /// `unix` as an LDAP generalized time; `what` names it in the error.
 fn ldap_time(unix: u64, what: &str) -> Result<String, DirectoryError> {
@@ -576,23 +580,32 @@ impl LdapDirectory {
         Ok(request)
     }
 
-    fn seal_attrs(seal: &Seal) -> Result<SealAttrs, DirectoryError> {
-        let policy = serde_json::to_string(&seal.policy)?;
-        let keys = seal
-            .session_keys
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<_, _>>()?;
-        let devices = seal
-            .devices
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<_, _>>()?;
-        let state = match seal.state {
-            State::Enabled => "enabled",
-            State::Revoked => "revoked",
-        };
-        Ok((policy, devices, state, keys))
+    /// A seal's attributes as the directory stores them (everything but its
+    /// owner, name and bindings), each with its values: the policy, the
+    /// session keys and the devices as JSON.
+    fn seal_values(seal: &Seal) -> Result<Vec<(&'static str, Vec<String>)>, DirectoryError> {
+        Ok(vec![
+            (SEAL_POLICY_ATTR, vec![serde_json::to_string(&seal.policy)?]),
+            (SEAL_MANAGER_ATTR, seal.managers.entries()),
+            (SEAL_MEMBER_ATTR, seal.members.entries()),
+            (SEAL_DEPOSITOR_ATTR, seal.depositors.entries()),
+            (SEAL_APPROVER_ATTR, Self::approvers(seal)),
+            (
+                SEAL_DEVICE_ATTR,
+                seal.devices
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<_, _>>()?,
+            ),
+            (SEAL_STATE_ATTR, vec![state_name(seal.state).to_owned()]),
+            (
+                SEAL_SESSION_KEY_ATTR,
+                seal.session_keys
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<_, _>>()?,
+            ),
+        ])
     }
 
     fn trusts_dn(&self) -> String {
@@ -1276,52 +1289,25 @@ impl Directory for LdapDirectory {
     }
 
     fn seal_add(&self, seal: &Seal) -> Result<(), DirectoryError> {
-        let (policy, devices, state, keys) = Self::seal_attrs(seal)?;
-        let (managers, members) = (seal.managers.entries(), seal.members.entries());
-        let approvers = Self::approvers(seal);
-        let depositors = seal.depositors.entries();
+        let values = Self::seal_values(seal)?;
         let id = seal.id.to_string();
-        self.service_conn()?.add_s(
-            &self.seal_dn(&seal.id),
-            &[
-                (
-                    "objectClass",
-                    vec![b"top".as_slice(), SEAL_CLASS.as_bytes()],
-                ),
-                ("cn", vec![id.as_bytes()]),
-                (SEAL_OWNER_ATTR, vec![seal.owner.as_bytes()]),
-                (SEAL_NAME_ATTR, vec![seal.name.as_bytes()]),
-                (SEAL_POLICY_ATTR, vec![policy.as_bytes()]),
-                (
-                    SEAL_MANAGER_ATTR,
-                    managers.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    SEAL_MEMBER_ATTR,
-                    members.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    SEAL_DEPOSITOR_ATTR,
-                    depositors.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    SEAL_APPROVER_ATTR,
-                    approvers.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    SEAL_DEVICE_ATTR,
-                    devices.iter().map(String::as_bytes).collect(),
-                ),
-                (SEAL_STATE_ATTR, vec![state.as_bytes()]),
-                (
-                    SEAL_SESSION_KEY_ATTR,
-                    keys.iter().map(String::as_bytes).collect(),
-                ),
-            ]
-            .into_iter()
-            .filter(|(_, v)| !v.is_empty())
-            .collect::<Vec<_>>(),
-        )?;
+        let mut attrs: Vec<(&str, Vec<&[u8]>)> = vec![
+            (
+                "objectClass",
+                vec![b"top".as_slice(), SEAL_CLASS.as_bytes()],
+            ),
+            ("cn", vec![id.as_bytes()]),
+            (SEAL_OWNER_ATTR, vec![seal.owner.as_bytes()]),
+            (SEAL_NAME_ATTR, vec![seal.name.as_bytes()]),
+        ];
+        attrs.extend(
+            values
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(attr, v)| (*attr, v.iter().map(String::as_bytes).collect())),
+        );
+        self.service_conn()?
+            .add_s(&self.seal_dn(&seal.id), &attrs)?;
         eprintln!("kuipad: {} created seal {id} ({})", seal.owner, seal.name);
         Ok(())
     }
@@ -1337,58 +1323,31 @@ impl Directory for LdapDirectory {
     }
 
     fn seal_update(&self, seal: &Seal) -> Result<(), DirectoryError> {
-        let (policy, devices, state, keys) = Self::seal_attrs(seal)?;
-        let (managers, members) = (seal.managers.entries(), seal.members.entries());
-        let approvers = Self::approvers(seal);
-        let depositors = seal.depositors.entries();
-        self.service_conn()?.modify_s(
-            &self.seal_dn(&seal.id),
-            &[
-                (ModOp::Replace, SEAL_POLICY_ATTR, vec![policy.as_bytes()]),
+        let values = Self::seal_values(seal)?;
+        let mut mods: Vec<(ModOp, &str, Vec<&[u8]>)> = values
+            .iter()
+            .map(|(attr, v)| {
                 (
                     ModOp::Replace,
-                    SEAL_MANAGER_ATTR,
-                    managers.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    ModOp::Replace,
-                    SEAL_MEMBER_ATTR,
-                    members.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    ModOp::Replace,
-                    SEAL_DEPOSITOR_ATTR,
-                    depositors.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    ModOp::Replace,
-                    SEAL_APPROVER_ATTR,
-                    approvers.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    ModOp::Replace,
-                    SEAL_DEVICE_ATTR,
-                    devices.iter().map(String::as_bytes).collect(),
-                ),
-                (ModOp::Replace, SEAL_STATE_ATTR, vec![state.as_bytes()]),
-                (
-                    ModOp::Replace,
-                    SEAL_SESSION_KEY_ATTR,
-                    keys.iter().map(String::as_bytes).collect(),
-                ),
-                (
-                    ModOp::Replace,
-                    SEAL_BINDING_ATTR,
-                    seal.bindings.iter().map(String::as_bytes).collect(),
-                ),
-            ],
-        )?;
+                    *attr,
+                    v.iter().map(String::as_bytes).collect(),
+                )
+            })
+            .collect();
+        mods.push((
+            ModOp::Replace,
+            SEAL_BINDING_ATTR,
+            seal.bindings.iter().map(String::as_bytes).collect(),
+        ));
+        self.service_conn()?
+            .modify_s(&self.seal_dn(&seal.id), &mods)?;
         eprintln!(
-            "kuipad: updated seal {} ({}) owned by {}: {state}, {} device(s)",
+            "kuipad: updated seal {} ({}) owned by {}: {}, {} device(s)",
             seal.id,
             seal.name,
             seal.owner,
-            devices.len()
+            state_name(seal.state),
+            seal.devices.len()
         );
         Ok(())
     }
