@@ -407,10 +407,9 @@ impl SignedStatement {
             STATEMENT_CONTEXT,
             &self.signature,
         )?;
-        let principal: Principal = s.principal.parse()?;
-        if principal.realm() != realm {
-            return Err(Error::WrongRealm);
-        }
+        // The realm's own signature says who signed: a user of this realm, or
+        // of a trusted one that the realm's directory knows (an ID override).
+        s.principal.parse::<Principal>()?;
         Ok(delegation)
     }
 
@@ -791,11 +790,13 @@ impl Signers {
     /// # Errors
     ///
     /// [`Error::Policy`] for an empty name, a user with a `/`, a service
-    /// without one, or a principal of another realm.
+    /// without one, or a service of another realm.  A user of another
+    /// realm is kept as named: a trusted realm's user (an ID override in
+    /// FreeIPA's default trust view) is a user like any other.
     pub fn normalized(&self, realm: &str) -> Result<Self> {
         let full = |name: &str, service: bool| -> Result<String> {
             let (base, at) = match name.rsplit_once('@') {
-                Some((b, r)) if r == realm => (b, r),
+                Some((b, r)) if r == realm || (!service && !r.is_empty()) => (b, r),
                 Some(_) => return Err(Error::Policy(format!("{name} is not of realm {realm}"))),
                 None => (name, realm),
             };
@@ -844,17 +845,33 @@ pub struct SignPolicy {
 }
 
 impl SignPolicy {
-    /// Whether `principal`, a member of `groups`, may sign for `purpose`.
+    /// Whether `principal`, a member of `groups`, may sign for `purpose` in
+    /// `realm`.
     ///
     /// # Errors
     ///
     /// [`Error::Policy`] naming why not.
-    pub fn check(&self, principal: &Principal, groups: &[String], purpose: &str) -> Result<()> {
+    pub fn check(
+        &self,
+        realm: &str,
+        principal: &Principal,
+        groups: &[String],
+        purpose: &str,
+    ) -> Result<()> {
         let signers = self
             .purposes
             .get(purpose)
             .ok_or_else(|| Error::Policy(format!("no signing purpose {purpose:?}")))?;
-        if signers.admits(principal, groups) {
+        // The policy's bare names are this realm's: a user of a trusted realm
+        // matches only the full name or a group, never a bare name that is
+        // someone else's here.
+        let admitted = if principal.realm() == realm {
+            signers.admits(principal, groups)
+        } else {
+            let name = principal.to_string();
+            signers.users.contains(&name) || groups.iter().any(|g| signers.groups.contains(g))
+        };
+        if admitted {
             Ok(())
         } else {
             Err(Error::Policy(format!(
@@ -1099,6 +1116,16 @@ mod tests {
         .normalized(REALM)
         .unwrap();
         assert_eq!(set.users, ["bob@EXAMPLE.TEST"]);
+        let trusted = Signers {
+            users: vec!["ada@AD.TEST".into()],
+            ..Signers::default()
+        };
+        assert_eq!(trusted.normalized(REALM).unwrap().users, ["ada@AD.TEST"]);
+        let foreign_service = Signers {
+            services: vec!["HTTP/ci@AD.TEST".into()],
+            ..Signers::default()
+        };
+        assert!(foreign_service.normalized(REALM).is_err());
         assert_eq!(set.hosts, ["web1.example.test"]);
         assert_eq!(set.services, ["HTTP/ci.example.test@EXAMPLE.TEST"]);
         let entries = set.entries();
@@ -1125,7 +1152,7 @@ mod tests {
         assert!(!set.admits(&p("eve@EXAMPLE.TEST"), &[]));
         for bad in [
             Signers {
-                users: vec!["bob@OTHER.TEST".into()],
+                services: vec!["HTTP/ci@OTHER.TEST".into()],
                 ..Signers::default()
             },
             Signers {
@@ -1158,15 +1185,22 @@ mod tests {
             },
         );
         let p = |s: &str| s.parse::<Principal>().unwrap();
-        policy.check(&p("alice@EXAMPLE.TEST"), &[], "blob").unwrap();
         policy
-            .check(&p("bob@EXAMPLE.TEST"), &["release".into()], "blob")
+            .check(REALM, &p("alice@EXAMPLE.TEST"), &[], "blob")
             .unwrap();
         policy
-            .check(&p("host/ci.example.test@EXAMPLE.TEST"), &[], "blob")
+            .check(REALM, &p("bob@EXAMPLE.TEST"), &["release".into()], "blob")
             .unwrap();
         policy
-            .check(&p("HTTP/build.example.test@EXAMPLE.TEST"), &[], "blob")
+            .check(REALM, &p("host/ci.example.test@EXAMPLE.TEST"), &[], "blob")
+            .unwrap();
+        policy
+            .check(
+                REALM,
+                &p("HTTP/build.example.test@EXAMPLE.TEST"),
+                &[],
+                "blob",
+            )
             .unwrap();
         for (who, groups) in [
             ("bob@EXAMPLE.TEST", vec![]),
@@ -1178,12 +1212,25 @@ mod tests {
             // A service named like a user does not pass as the user.
             ("alice/admin@EXAMPLE.TEST", vec![]),
         ] {
-            assert!(policy.check(&p(who), &groups, "blob").is_err(), "{who}");
+            assert!(
+                policy.check(REALM, &p(who), &groups, "blob").is_err(),
+                "{who}"
+            );
         }
         assert!(
             policy
-                .check(&p("alice@EXAMPLE.TEST"), &[], "git-commit")
+                .check(REALM, &p("alice@EXAMPLE.TEST"), &[], "git-commit")
                 .is_err()
         );
+        // A trusted realm's alice is not this realm's alice; by full name or
+        // by group she is admitted.
+        assert!(
+            policy
+                .check(REALM, &p("alice@AD.TEST"), &[], "blob")
+                .is_err()
+        );
+        policy
+            .check(REALM, &p("alice@AD.TEST"), &["release".into()], "blob")
+            .unwrap();
     }
 }

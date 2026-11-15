@@ -619,6 +619,30 @@ impl LdapDirectory {
         principal: &Principal,
         attrs: &[&str],
     ) -> Result<Option<SearchEntry>, DirectoryError> {
+        if principal.realm() != self.cfg.realm {
+            // A user of a trusted realm is the ID override in the default
+            // trust view that FreeIPA's SASL mapping binds them to
+            // (71-idviews-sasl-mapping.update): groups and permissions are the
+            // override's. AD holds their lock state. Only users: a trusted
+            // realm's host or service is not an IPA host or service of the
+            // same name.
+            if principal.components().len() != 1 {
+                return Ok(None);
+            }
+            let entries = conn.search(
+                &format!(
+                    "cn=default trust view,cn=views,cn=accounts,{}",
+                    self.cfg.basedn
+                ),
+                Scope::OneLevel,
+                &format!(
+                    "(&(ipaOriginalUid={})(objectClass=ipaUserOverride))",
+                    filter_escape(&principal.to_string())
+                ),
+                attrs,
+            )?;
+            return Ok(entries.into_iter().next());
+        }
         if let [service, fqdn] = principal.components()
             && service == "host"
         {

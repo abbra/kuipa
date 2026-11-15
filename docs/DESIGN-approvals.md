@@ -96,6 +96,8 @@ Approvals are never signed by the approvers: as for every other check of
 a release, the servers are trusted to apply the policy, and the log makes
 what they did visible.
 
+**Users of a trusted realm.** See DESIGN.md §7.6.12.
+
 ## 4. The release
 
 The recovery request carries the release request id in `IPEQ` version 2;
