@@ -250,17 +250,14 @@ pub fn path(leaves: &[Hash], index: usize) -> Result<Vec<Hash>> {
 /// Whether `leaf` is at `index` in a tree of `size` leaves with `root`,
 /// given its inclusion `path` (RFC 9162 §2.1.3.2).  A leaf, path or root
 /// of another algorithm than the root's does not verify.
-///
-/// # Errors
-///
-/// None in practice; the signature matches the other tree functions.
-pub fn verify(leaf: &Hash, index: u64, size: u64, path: &[Hash], root: &Hash) -> Result<bool> {
+#[must_use]
+pub fn verify(leaf: &Hash, index: u64, size: u64, path: &[Hash], root: &Hash) -> bool {
     let alg = root.alg();
     if leaf.alg() != alg || path.iter().any(|h| h.alg() != alg) {
-        return Ok(false);
+        return false;
     }
     let path: Vec<Vec<u8>> = path.iter().map(|h| h.to_vec()).collect();
-    Ok(verify_inclusion_proof(alg.backend(), index, size, leaf, &path, root).is_ok())
+    verify_inclusion_proof(alg.backend(), index, size, leaf, &path, root).is_ok()
 }
 
 /// The proof that the tree over the first `old_size` of `leaves` is a
@@ -283,23 +280,20 @@ pub fn consistency(leaves: &[Hash], old_size: u64) -> Result<Vec<Hash>> {
 /// of `old_size` leaves with `old_root`, given the consistency `proof`
 /// (RFC 9162 §2.1.4.2).  Equal sizes need an empty proof and equal roots;
 /// roots or a proof of two algorithms do not verify.
-///
-/// # Errors
-///
-/// None in practice; the signature matches the other tree functions.
+#[must_use]
 pub fn verify_consistency(
     old_size: u64,
     old_root: &Hash,
     new_size: u64,
     new_root: &Hash,
     proof: &[Hash],
-) -> Result<bool> {
+) -> bool {
     let alg = new_root.alg();
     if old_root.alg() != alg || proof.iter().any(|h| h.alg() != alg) {
-        return Ok(false);
+        return false;
     }
     let proof: Vec<Vec<u8>> = proof.iter().map(|h| h.to_vec()).collect();
-    Ok(verify_consistency_proof(
+    verify_consistency_proof(
         alg.backend(),
         old_size,
         old_root,
@@ -307,7 +301,7 @@ pub fn verify_consistency(
         new_root,
         &proof,
     )
-    .is_ok())
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -354,20 +348,20 @@ mod tests {
             for i in 0..n {
                 let p = path(&l, i).unwrap();
                 let (i64, n64) = (i as u64, n as u64);
-                assert!(verify(&l[i], i64, n64, &p, &r).unwrap(), "{i} of {n}");
+                assert!(verify(&l[i], i64, n64, &p, &r), "{i} of {n}");
                 // Wrong index, wrong leaf, truncated or extended path: all
                 // fail.  (A path does not fix the size on its own — the left
                 // edge of trees of 3 and 4 leaves has the same path — so the
                 // size is signed together with the root, as in RFC 9162.)
                 if n > 1 {
-                    assert!(!verify(&l[i], (i64 + 1) % n64, n64, &p, &r).unwrap());
-                    assert!(!verify(&l[(i + 1) % n], i64, n64, &p, &r).unwrap());
+                    assert!(!verify(&l[i], (i64 + 1) % n64, n64, &p, &r));
+                    assert!(!verify(&l[(i + 1) % n], i64, n64, &p, &r));
                 }
                 let mut longer = p.clone();
                 longer.push(Hash::zero(alg));
-                assert!(!verify(&l[i], i64, n64, &longer, &r).unwrap());
+                assert!(!verify(&l[i], i64, n64, &longer, &r));
                 if !p.is_empty() {
-                    assert!(!verify(&l[i], i64, n64, &p[..p.len() - 1], &r).unwrap());
+                    assert!(!verify(&l[i], i64, n64, &p[..p.len() - 1], &r));
                 }
             }
             assert!(path(&l, n).is_err());
@@ -439,7 +433,7 @@ mod tests {
                 let old_root = root(&l[..old]).unwrap();
                 let p = consistency(&l, m).unwrap();
                 assert!(
-                    verify_consistency(m, &old_root, n, &new_root, &p).unwrap(),
+                    verify_consistency(m, &old_root, n, &new_root, &p),
                     "{m} of {n}"
                 );
                 assert!(
@@ -449,20 +443,20 @@ mod tests {
                 // A forked old tree, a tampered or truncated proof: all
                 // fail, under both implementations.
                 let forked = root(&leaves(alg, old + 1)[1..]).unwrap();
-                assert!(!verify_consistency(m, &forked, n, &new_root, &p).unwrap());
+                assert!(!verify_consistency(m, &forked, n, &new_root, &p));
                 assert!(!reference_consistency(m, &forked, n, &new_root, &p));
                 if let Some(first) = p.first() {
                     let mut tampered = p.clone();
                     tampered[0] = node(first, first);
-                    assert!(!verify_consistency(m, &old_root, n, &new_root, &tampered).unwrap());
-                    assert!(!verify_consistency(m, &old_root, n, &new_root, &p[1..]).unwrap());
+                    assert!(!verify_consistency(m, &old_root, n, &new_root, &tampered));
+                    assert!(!verify_consistency(m, &old_root, n, &new_root, &p[1..]));
                 }
                 // A proof does not fix the new size on its own (as with
                 // inclusion paths, the size is signed with the root), but
                 // both implementations judge a wrong one alike.
                 if m < n {
                     assert_eq!(
-                        verify_consistency(m, &old_root, n - 1, &new_root, &p).unwrap(),
+                        verify_consistency(m, &old_root, n - 1, &new_root, &p),
                         reference_consistency(m, &old_root, n - 1, &new_root, &p),
                         "size {} for {m} of {n}",
                         n - 1
@@ -512,15 +506,15 @@ mod tests {
         // never verify — whatever the bytes.
         let r = root(&long).unwrap();
         let p: Vec<Hash> = path(&long, 0).unwrap();
-        assert!(verify(&long[0], 0, 4, &p, &r).unwrap());
+        assert!(verify(&long[0], 0, 4, &p, &r));
         let shortened: Vec<Hash> = p
             .iter()
             .map(|x| Hash::from_slice(&x[..32]).unwrap())
             .collect();
-        assert!(!verify(&long[0], 0, 4, &shortened, &r).unwrap());
-        assert!(!verify(&short[0], 0, 4, &p, &r).unwrap());
+        assert!(!verify(&long[0], 0, 4, &shortened, &r));
+        assert!(!verify(&short[0], 0, 4, &p, &r));
         let old = root(&short[..2]).unwrap();
-        assert!(!verify_consistency(2, &old, 4, &r, &consistency(&long, 2).unwrap()).unwrap());
+        assert!(!verify_consistency(2, &old, 4, &r, &consistency(&long, 2).unwrap()));
         // Lengths name algorithms; nothing else is a hash.
         assert!(Hash::from_slice(&[0; 33]).is_err());
         assert!(Hash::from_slice(&[]).is_err());

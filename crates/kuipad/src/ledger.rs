@@ -742,7 +742,7 @@ mod tests {
             .unwrap();
         assert_eq!(new.head.size, 7);
         let proof = ledger.consistency(old.head.size, new.head.size).unwrap();
-        assert!(new.head.extends(&old.head, &proof).unwrap());
+        assert!(new.head.extends(&old.head, &proof));
         // Proofs against the old, smaller head still verify.
         let leaves = ledger.leaves(0, 10);
         let path = ledger.inclusion(1, old.head.size).unwrap();
@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(h2.head.size, 3);
         assert_eq!(ledger.leaves(0, 10).len(), 3);
         let proof = ledger.consistency(2, 3).unwrap();
-        assert!(h2.head.extends(&h1.head, &proof).unwrap());
+        assert!(h2.head.extends(&h1.head, &proof));
         // A quiet hour is signed again, over the same leaves.
         let h3 = ledger.signed_head(&key, start + 3 * hour).unwrap().unwrap();
         assert_eq!((h3.head.size, h3.head.root), (h2.head.size, h2.head.root));

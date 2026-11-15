@@ -609,15 +609,12 @@ impl Head {
 
     /// Whether this head extends `older`: the same log, no smaller, no
     /// earlier, and consistent by `proof`.
-    ///
-    /// # Errors
-    ///
-    /// None in practice; the signature matches the tree functions.
-    pub fn extends(&self, older: &Self, proof: &[Hash]) -> Result<bool> {
-        if self.log != older.log || self.size < older.size || self.time < older.time {
-            return Ok(false);
-        }
-        merkle::verify_consistency(older.size, &older.root, self.size, &self.root, proof)
+    #[must_use]
+    pub fn extends(&self, older: &Self, proof: &[Hash]) -> bool {
+        self.log == older.log
+            && self.size >= older.size
+            && self.time >= older.time
+            && merkle::verify_consistency(older.size, &older.root, self.size, &self.root, proof)
     }
 
     /// Whether `leaf` is at `index` in this head's tree, by `path`.
@@ -626,7 +623,7 @@ impl Head {
     ///
     /// An OpenSSL error.
     pub fn includes(&self, leaf: &Leaf, index: u64, path: &[Hash]) -> Result<bool> {
-        merkle::verify(&leaf.hash()?, index, self.size, path, &self.root)
+        Ok(merkle::verify(&leaf.hash()?, index, self.size, path, &self.root))
     }
 }
 
@@ -806,7 +803,7 @@ pub fn witness(
 ) -> Result<()> {
     head.verify(log_key, policy)?;
     if let Some(previous) = previous
-        && !head.head.extends(previous, proof)?
+        && !head.head.extends(previous, proof)
     {
         return Err(Error::Mismatch("log head"));
     }
@@ -878,14 +875,11 @@ impl Receipt {
     /// Whether `head` holds the promised leaf, by its inclusion `path`.
     /// A head of the same log that is large enough and does not hold it
     /// proves the server broke its promise.
-    ///
-    /// # Errors
-    ///
-    /// None in practice; the signature matches the tree functions.
-    pub fn proven_by(&self, head: &Head, path: &[Hash]) -> Result<bool> {
-        Ok(head.log == self.log
+    #[must_use]
+    pub fn proven_by(&self, head: &Head, path: &[Hash]) -> bool {
+        head.log == self.log
             && self.index < head.size
-            && merkle::verify(&self.leaf, self.index, head.size, path, &head.root)?)
+            && merkle::verify(&self.leaf, self.index, head.size, path, &head.root)
     }
 
     /// `IPLP ‖ 1 ‖ log ‖ index ‖ leaf ‖ time ‖ signature`, hashes length
@@ -1337,7 +1331,7 @@ mod tests {
         assert!(
             after
                 .extends(&before, &log.consistency(3).unwrap())
-                .unwrap()
+                
         );
 
         // Not twice, not a tombstone, not beyond the log.
@@ -1379,20 +1373,20 @@ mod tests {
         let (small, _) = log_of(4);
         let old = small.head(T - 1).unwrap();
         let proof = log.consistency(4).unwrap();
-        assert!(head.extends(&old, &proof).unwrap());
+        assert!(head.extends(&old, &proof));
         // Another log, an earlier time, a fork: refused.
         let other = Head {
             log: LogId(crate::merkle::test_hash(9)),
             ..old
         };
-        assert!(!head.extends(&other, &proof).unwrap());
+        assert!(!head.extends(&other, &proof));
         let later = Head { time: T + 1, ..old };
-        assert!(!head.extends(&later, &proof).unwrap());
+        assert!(!head.extends(&later, &proof));
         let forked = Log::replay(id(), &[leaf(Kind::TOKEN_KEY, 0), leaf(Kind::TOKEN_KEY, 1)])
             .unwrap()
             .head(T - 1)
             .unwrap();
-        assert!(!head.extends(&forked, &log.consistency(2).unwrap()).unwrap());
+        assert!(!head.extends(&forked, &log.consistency(2).unwrap()));
         assert!(Log::new(id()).head(T).is_err());
     }
 
@@ -1492,11 +1486,11 @@ mod tests {
         assert!(
             receipt
                 .proven_by(&head, &log.inclusion(2).unwrap())
-                .unwrap()
+                
         );
         let (small, _) = log_of(2);
         let small_head = small.head(T).unwrap();
-        assert!(!receipt.proven_by(&small_head, &[]).unwrap());
+        assert!(!receipt.proven_by(&small_head, &[]));
         let other = Head {
             log: LogId(crate::merkle::test_hash(9)),
             ..head
@@ -1504,14 +1498,14 @@ mod tests {
         assert!(
             !receipt
                 .proven_by(&other, &log.inclusion(2).unwrap())
-                .unwrap()
+                
         );
         let (_, others) = log_of(4);
         let broken = Receipt {
             leaf: others[3].hash().unwrap(),
             ..receipt
         };
-        assert!(!broken.proven_by(&head, &log.inclusion(2).unwrap()).unwrap());
+        assert!(!broken.proven_by(&head, &log.inclusion(2).unwrap()));
     }
 
     #[test]
@@ -1548,7 +1542,7 @@ mod tests {
             head.includes(&leaves[4], 4, &log.inclusion(4).unwrap())
                 .unwrap()
         );
-        assert!(head.extends(&old, &log.consistency(3).unwrap()).unwrap());
+        assert!(head.extends(&old, &log.consistency(3).unwrap()));
 
         let signed = SignedHead::issue(&server, head).unwrap();
         signed.verify(server.public(), &Policy::cnsa2()).unwrap();

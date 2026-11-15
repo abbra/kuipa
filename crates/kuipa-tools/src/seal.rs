@@ -1300,7 +1300,7 @@ impl<'a> SealClient<'a> {
                     let proof = endpoint.tlog_consistency(&head.log, w.size, head.size)?;
                     kuipa_enroll::merkle::verify_consistency(
                         w.size, &old_root, head.size, &head.root, &proof,
-                    )?
+                    )
                 }
             };
             if !extends {

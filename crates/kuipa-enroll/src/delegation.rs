@@ -946,7 +946,6 @@ impl Proof {
             &path,
             &vouch.live_root,
         )
-        .ok()?
         .then_some((*key.thumbprint(), vouch))
     }
 }
@@ -1005,7 +1004,7 @@ impl HeadPin {
                 self.size,
                 &proof.path,
                 &self.root,
-            )?)
+            ))
     }
 }
 

@@ -537,13 +537,13 @@ pub struct Verified {
 impl Bundle {
     fn in_batch(&self) -> Result<bool> {
         let s = &self.statement.statement;
-        merkle::verify(
+        Ok(merkle::verify(
             &self.digest.leaf(s.batch_root.alg())?,
             self.index,
             s.batch_size,
             &self.path,
             &s.batch_root,
-        )
+        ))
     }
 
     /// The signed digest.
