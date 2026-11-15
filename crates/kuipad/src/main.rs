@@ -156,7 +156,7 @@ fn open_ledger(
             .with_head_interval(std::time::Duration::from_secs(cfg.tlog_head_interval))
             .with_retention(cfg.tlog_retention_months),
     );
-    ledger.expire(tang_pqc::unix_seconds(std::time::SystemTime::now()))?;
+    ledger.expire(tang_pqc::now())?;
     tracing::info!(
         "transparency log {} at /ipa/ku/tlog ({} leaves)",
         ledger.id(),
@@ -289,7 +289,7 @@ async fn purge_ended_leases(directory: Arc<dyn kuipa_enroll::Directory + Send + 
     loop {
         let directory = directory.clone();
         let purged = tokio::task::spawn_blocking(move || {
-            let now = tang_pqc::unix_seconds(std::time::SystemTime::now());
+            let now = tang_pqc::now();
             directory.purge_leases(now.saturating_sub(3600))
         })
         .await;
@@ -332,7 +332,7 @@ const MAX_STRING_DAYS: u64 = 400;
 /// then checks delegations with no signature at all.
 fn enrollment_string(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), Error> {
     let days = args.bounded_days(7)?;
-    let exp = tang_pqc::unix_seconds(std::time::SystemTime::now()) + days.as_secs();
+    let exp = tang_pqc::now() + days.as_secs();
     let head = args.flag("head").then(|| head_of(store)).transpose()?;
     let string = kuipa_enroll::enrollment::EnrollmentString::with_head(
         &cfg.realm,
@@ -361,7 +361,7 @@ fn trust_invitation(cfg: &Config, store: &KeyStore, args: &Args) -> Result<(), E
     let invitation =
         kuipa_enroll::trust::Invitation::new(&cfg.realm, *anchor.public().thumbprint())?;
     let days = args.bounded_days(7)?;
-    let not_after = tang_pqc::unix_seconds(std::time::SystemTime::now()) + days.as_secs();
+    let not_after = tang_pqc::now() + days.as_secs();
     LdapDirectory::new(cfg)?.add_trust_invitation(&invitation.secret_hash()?, not_after)?;
     println!("{}", String::from_utf8_lossy(invitation.encode().as_ref()));
     Ok(())

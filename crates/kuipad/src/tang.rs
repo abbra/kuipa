@@ -21,12 +21,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
-use std::time::SystemTime;
 
 use tang_pqc::{
     AdvertisementBuilder, DEFAULT_ADVERTISEMENT_VALIDITY, ExchangeKey, ExchangeKeyPair,
     RecoveryRequest, RecoveryResponse, Server, SignedAdvertisement, SigningKey, Thumbprint,
-    unix_seconds,
 };
 
 use crate::Error;
@@ -221,7 +219,7 @@ impl Tang {
         else {
             return Ok(None);
         };
-        let now = unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let validity = DEFAULT_ADVERTISEMENT_VALIDITY.as_secs();
         if let Some((adv, iat)) = self
             .countersigned
@@ -275,7 +273,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "kuipa-tang-{}-{}",
             std::process::id(),
-            unix_seconds(SystemTime::now())
+            tang_pqc::now()
         ));
         let _ = fs::remove_dir_all(&d);
         d

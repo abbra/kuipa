@@ -369,7 +369,7 @@ impl KeyStore {
     ) -> Result<(Thumbprint, Thumbprint), Error> {
         let old = self.anchor()?;
         let new = SigningKey::generate_preferred()?;
-        let now = tang_pqc::unix_seconds(SystemTime::now());
+        let now = tang_pqc::now();
         let succession = SignedSuccession::issue(
             &old,
             realm,
@@ -511,7 +511,7 @@ mod tests {
         );
         let successions = store.successions().unwrap();
         assert_eq!(successions.len(), 1);
-        let at = tang_pqc::unix_seconds(SystemTime::now());
+        let at = tang_pqc::now();
         let s = successions[0]
             .check("R", &tang_pqc::Policy::default(), at)
             .unwrap();
