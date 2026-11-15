@@ -1066,16 +1066,6 @@ pub trait Ledger: Send + Sync + fmt::Debug {
     }
 }
 
-/// A ledger that records nothing: the default, for servers without a log.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoLedger;
-
-impl Ledger for NoLedger {
-    fn append(&self, _: Opening) -> Result<Option<Appended>, DirectoryError> {
-        Ok(None)
-    }
-}
-
 /// A refused request.  Send the client an empty `403`; log the reason.
 #[derive(Debug)]
 pub struct Refusal(DirectoryError);
@@ -1262,7 +1252,7 @@ pub struct EnrollServer {
     keys: ServerKeys,
     info: RealmInfo,
     policy: tang_pqc::Policy,
-    ledger: Arc<dyn Ledger>,
+    ledger: Option<Arc<dyn Ledger>>,
     spender: std::sync::OnceLock<Arc<dyn VoucherSpender>>,
     published: RwLock<Published>,
 }
@@ -1279,7 +1269,7 @@ impl EnrollServer {
             keys,
             info,
             policy: tang_pqc::Policy::default(),
-            ledger: Arc::new(NoLedger),
+            ledger: None,
             spender: std::sync::OnceLock::new(),
             published: RwLock::new(Published {
                 delegation,
@@ -1301,10 +1291,10 @@ impl EnrollServer {
     }
 
     /// Record seal, escrow and Keys events in `ledger`; the default
-    /// records nothing ([`NoLedger`]).
+    /// records nothing.
     #[must_use]
     pub fn with_ledger(mut self, ledger: Arc<dyn Ledger>) -> Self {
-        self.ledger = ledger;
+        self.ledger = Some(ledger);
         self
     }
 
@@ -1324,9 +1314,12 @@ impl EnrollServer {
     /// Append an event about `subject` to the ledger, committed, and sign
     /// a receipt for where it landed (none when the ledger keeps no log).
     fn record(&self, kind: Kind, subject: &[u8], body: &[u8]) -> Result<Option<Receipt>, Refusal> {
+        let Some(ledger) = &self.ledger else {
+            return Ok(None);
+        };
         let now = tang_pqc::now();
         let opening = Opening::new(kind, now, subject, body.to_vec())?;
-        let Some(a) = self.ledger.append(opening)? else {
+        let Some(a) = ledger.append(opening)? else {
             return Ok(None);
         };
         Ok(Some(Receipt::issue(
@@ -2191,7 +2184,13 @@ impl EnrollServer {
             caller.to_string().as_bytes(),
             crate::sign::Statement::log_body(&asked.purpose, leaves.len() as u64, &batch_root, now),
         )?;
-        let Some(appended) = self.ledger.append(opening)? else {
+        let Some(appended) = self
+            .ledger
+            .as_ref()
+            .map(|l| l.append(opening))
+            .transpose()?
+            .flatten()
+        else {
             return Err(Refusal::because(
                 "this server keeps no transparency log: it states nothing it cannot show",
             ));
@@ -2268,13 +2267,18 @@ impl EnrollServer {
                 .to_vec()
         };
         let now = tang_pqc::now();
-        let head = self.ledger.signed_head(&self.keys.signing, now)?;
-        let entries = match &head {
-            Some(h) => {
-                self.ledger
-                    .find(&subject, query.from, h.head.size, crate::tlog::MAX_ANSWER)?
+        let (head, entries) = match &self.ledger {
+            Some(ledger) => {
+                let head = ledger.signed_head(&self.keys.signing, now)?;
+                let entries = match &head {
+                    Some(h) => {
+                        ledger.find(&subject, query.from, h.head.size, crate::tlog::MAX_ANSWER)?
+                    }
+                    None => Vec::new(),
+                };
+                (head, entries)
             }
-            None => Vec::new(),
+            None => (None, Vec::new()),
         };
         let answer = crate::tlog::Answer {
             signer: self.keys.signing.public().clone(),

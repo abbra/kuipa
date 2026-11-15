@@ -2074,12 +2074,6 @@ fn delegated_admin_revoke_is_authorized_and_logged_before_update() {
     r.dir.seal_admin_lookup_fails.set(true);
     assert!(seal_op(&r, &adv, BOB, &revoke).is_err());
     r.dir.seal_admin_lookup_fails.set(false);
-    let first = r
-        .servers
-        .remove(0)
-        .with_ledger(Arc::new(kuipa_enroll::server::NoLedger));
-    r.servers.insert(0, first);
-    assert!(seal_op(&r, &adv, BOB, &revoke).is_err());
     let first = r.servers.remove(0).with_ledger(Arc::new(BrokenLedger));
     r.servers.insert(0, first);
     assert!(seal_op(&r, &adv, BOB, &revoke).is_err());
