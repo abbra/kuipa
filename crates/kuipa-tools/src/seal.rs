@@ -1789,7 +1789,7 @@ impl<'a> SealClient<'a> {
         let bindings = file
             .bindings()?
             .iter()
-            .map(kuipa_enroll::seal::binding_hex)
+            .map(ToString::to_string)
             .collect();
         let requests = self
             .op_with_session(&SealOp::Request {
@@ -2449,7 +2449,7 @@ impl<'a> SealClient<'a> {
         retire: &[kuipa_enroll::escrow::BindingHash],
     ) -> Result<(), Error> {
         let hex = |v: &[kuipa_enroll::escrow::BindingHash]| {
-            v.iter().map(kuipa_enroll::seal::binding_hex).collect()
+            v.iter().map(ToString::to_string).collect()
         };
         self.op(&SealOp::Register {
             name: name.into(),

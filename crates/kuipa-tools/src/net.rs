@@ -209,15 +209,8 @@ fn cache_advertisement(dir: &std::path::Path, url: &str, tag: &str, body: &[u8])
 /// A cache file's name: the hex SHA-256 of the URL it answers, so each
 /// server and each choice of pins and heads has its own.
 fn cache_name(url: &str) -> String {
-    use std::fmt::Write as _;
-
     tang_pqc::primitives::sha256(&[url.as_bytes()])
-        .map(|h| {
-            h.iter().fold(String::new(), |mut hex, b| {
-                let _ = write!(hex, "{b:02x}");
-                hex
-            })
-        })
+        .map(native_ossl::util::hex_encode)
         .unwrap_or_default()
 }
 
