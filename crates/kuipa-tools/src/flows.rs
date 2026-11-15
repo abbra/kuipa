@@ -1007,7 +1007,7 @@ pub fn enroll_online(
 fn recipient_key(paths: &Paths) -> Result<Option<(ExchangeKeyPair, bool)>, Error> {
     match fs::read(paths.recipient_tpm()) {
         Ok(cred) => {
-            let jwk = tpm::decrypt(tpm::Scope::System, tpm::RECIPIENT, &cred)?;
+            let jwk = tpm::decrypt(tpm::Scope::HOST, tpm::RECIPIENT, &cred)?;
             return Ok(Some((ExchangeKeyPair::from_jwk(jwk.as_ref())?, true)));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1047,9 +1047,10 @@ pub fn prepare(
         let jwk = key.to_jwk()?;
         if on_tpm {
             let cred = tpm::encrypt(
-                tpm::Scope::System,
+                tpm::Scope::System {
+                    pcrs: tpm.unwrap_or(""),
+                },
                 tpm::RECIPIENT,
-                tpm.unwrap_or(""),
                 jwk.as_ref(),
             )?;
             paths::write_file(&paths.recipient_tpm(), &cred, 0o600)?;

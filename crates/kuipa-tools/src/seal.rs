@@ -407,7 +407,7 @@ fn protect_with_passkey(
 /// `key` as a user-scoped credential of this host's TPM:
 /// `IPDK kdf(3) credential`.
 fn protect_with_tpm(key: &ExchangeKeyPair) -> Result<Vec<u8>, Error> {
-    let credential = tpm::encrypt(tpm::Scope::User, tpm::DEVICE, "", key.to_jwk()?.as_ref())?;
+    let credential = tpm::encrypt(tpm::Scope::User, tpm::DEVICE, key.to_jwk()?.as_ref())?;
     Ok(Writer::new(DEVICE_KEY_MAGIC)
         .u8(KDF_TPM2)
         .bytes(&credential)
