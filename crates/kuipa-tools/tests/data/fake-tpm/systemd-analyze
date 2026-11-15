@@ -1,0 +1,2 @@
+#!/bin/sh
+[ "$1" = has-tpm2 ] && { echo yes; exit 0; }; exit 1

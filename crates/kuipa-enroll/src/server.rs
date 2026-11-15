@@ -3429,7 +3429,9 @@ impl EnrollServer {
         };
         let extractable = matches!(
             device.kind,
-            crate::seal::DeviceType::File | crate::seal::DeviceType::Pkcs11Wrapped
+            crate::seal::DeviceType::File
+                | crate::seal::DeviceType::Pkcs11Wrapped
+                | crate::seal::DeviceType::Tpm
         );
         if !settings.required || !extractable {
             return Ok(());

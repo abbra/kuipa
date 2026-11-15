@@ -31,6 +31,7 @@ use tang_pqc::{ExchangeKeyPair, Policy, RecoveryResponse, Thumbprint, b64, unix_
 use crate::net::{Endpoint, NetError, Trust};
 use crate::paths::{self, Contents, Error, Holder, Paths, Pin, Protected, State};
 use crate::preauth;
+use crate::tpm;
 
 /// The anchor epoch watermark (§4.8): sequence number and head hash.
 type Epoch = (u64, kuipa_enroll::epoch::EpochHead);
@@ -1005,23 +1006,62 @@ pub fn enroll_online(
     Ok(summary(&enrollment))
 }
 
-/// `kuipa prepare`: create the mode A machine key (idempotent).
+/// The mode A machine key, if there is one, and whether a TPM holds it.
+fn recipient_key(paths: &Paths) -> Result<Option<(ExchangeKeyPair, bool)>, Error> {
+    match fs::read(paths.recipient_tpm()) {
+        Ok(cred) => {
+            let jwk = tpm::decrypt(tpm::Scope::System, tpm::RECIPIENT, &cred)?;
+            return Ok(Some((ExchangeKeyPair::from_jwk(jwk.as_ref())?, true)));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", paths.recipient_tpm().display()).into()),
+    }
+    match fs::read(paths.recipient()) {
+        Ok(j) => {
+            let jwk = native_ossl::util::SecretBuf::new(j);
+            Ok(Some((ExchangeKeyPair::from_jwk(jwk.as_ref())?, false)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", paths.recipient().display()).into()),
+    }
+}
+
+/// `kuipa prepare`: create the mode A machine key (idempotent).  With
+/// `tpm` (a PCR list, empty for none) the key is kept as a credential of
+/// this host's TPM, which an existing key then also is, unless `replace`.
 ///
 /// # Errors
 ///
-/// I/O or key generation errors.
-pub fn prepare(paths: &Paths, replace: bool, fqdn: &str) -> Result<Value, Error> {
-    let key = match fs::read(paths.recipient()) {
-        Ok(jwk) if !replace => {
-            let jwk = native_ossl::util::SecretBuf::new(jwk);
-            ExchangeKeyPair::from_jwk(jwk.as_ref())?
-        }
-        _ => {
-            let key = ExchangeKeyPair::generate_preferred()?;
-            paths::write_file(&paths.recipient(), key.to_jwk()?.as_ref(), 0o600)?;
-            key
-        }
+/// I/O, TPM or key generation errors.
+pub fn prepare(
+    paths: &Paths,
+    replace: bool,
+    tpm: Option<&str>,
+    fqdn: &str,
+) -> Result<Value, Error> {
+    let loaded = if replace { None } else { recipient_key(paths)? };
+    let on_tpm = tpm.is_some() || loaded.as_ref().is_some_and(|(_, held)| *held);
+    let fresh = loaded.is_none();
+    let key = match loaded {
+        Some((key, _)) => key,
+        None => ExchangeKeyPair::generate_preferred()?,
     };
+    if tpm.is_some() || fresh {
+        let jwk = key.to_jwk()?;
+        if on_tpm {
+            let cred = tpm::encrypt(
+                tpm::Scope::System,
+                tpm::RECIPIENT,
+                tpm.unwrap_or(""),
+                jwk.as_ref(),
+            )?;
+            paths::write_file(&paths.recipient_tpm(), &cred, 0o600)?;
+            paths::remove(&paths.recipient())?;
+        } else {
+            paths::write_file(&paths.recipient(), jwk.as_ref(), 0o600)?;
+            paths::remove(&paths.recipient_tpm())?;
+        }
+    }
     paths::write_file(
         &paths.recipient_public(),
         key.public().to_jwk_json().as_bytes(),
@@ -1031,6 +1071,8 @@ pub fn prepare(paths: &Paths, replace: bool, fqdn: &str) -> Result<Value, Error>
     Ok(json!({
         "thumbprint": key.public().kid().to_string(),
         "public_key": public,
+        "tpm": on_tpm,
+        "stored_in": if on_tpm { paths.recipient_tpm() } else { paths.recipient() },
         "admin_command": format!(
             "ipa host-add {fqdn} --stage --recipient={}", public.display()
         ),
@@ -1074,10 +1116,7 @@ pub fn enroll_bundle(
         ))
         .into());
     }
-    let machine_key = fs::read(paths.recipient())
-        .ok()
-        .map(|j| ExchangeKeyPair::from_jwk(native_ossl::util::SecretBuf::new(j).as_ref()))
-        .transpose()?;
+    let machine_key = recipient_key(paths)?.map(|(key, _)| key);
     let opener = match (
         verified.bundle().mode(),
         string.and_then(EnrollmentString::secret),
@@ -1104,6 +1143,7 @@ pub fn enroll_bundle(
         old_keytab.as_ref().map(AsRef::as_ref),
     )?;
     paths::remove(&paths.recipient())?;
+    paths::remove(&paths.recipient_tpm())?;
     paths::remove(&paths.recipient_public())?;
     let pending = json!({
         "fqdn": fqdn,
@@ -1452,6 +1492,20 @@ pub(crate) fn all_servers(
         .collect()
 }
 
+/// The TPM share of the protected sealed object at `sealed`, if it has one.
+/// A seal that is gone or unreadable is an error: reading it as "no TPM
+/// factor" would reseal with a weaker policy.
+fn existing_tpm(sealed: &std::path::Path) -> Result<Option<kuipa_enroll::escrow::TpmShare>, Error> {
+    let bytes = fs::read(sealed).map_err(|e| {
+        format!(
+            "{}: {e} (the seal that sets the TPM factor is needed to reseal; \
+             run kuipa unprotect, then protect, to start again)",
+            sealed.display()
+        )
+    })?;
+    Ok(Sealed::from_bytes(&bytes)?.tpm().cloned())
+}
+
 /// `kuipa rotate-keys`: new host keys with forward secrecy; reseals and
 /// re-registers when protection is on.  Also used by `complete` and
 /// `protect`.
@@ -1459,9 +1513,9 @@ pub(crate) fn all_servers(
 /// # Errors
 ///
 /// [`Outcome`] or any other error.
-pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Error> {
+pub fn rotate_keys(paths: &Paths, protect: Option<(Holder, Option<&str>)>) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
-    let holder = protect.unwrap_or(state.holder);
+    let holder = protect.map_or(state.holder, |(h, _)| h);
     let (anchors, heads, retired, frozen) = paths::pinned_windows(&paths.anchors())?;
     let known = paths::read_epoch_from(&paths.anchors())?;
     let trust = ca_trust(paths)?;
@@ -1482,7 +1536,17 @@ pub fn rotate_keys(paths: &Paths, protect: Option<Holder>) -> Result<Value, Erro
     } else {
         let servers = all_servers(&state, &trust, &anchors, &heads, &retired, &frozen);
         let refs: Vec<_> = servers.iter().collect();
-        let (sealer, registered) = Sealer::prepare(&principal, Kind::Keytab, &refs)?;
+        let (mut sealer, registered) = Sealer::prepare(&principal, Kind::Keytab, &refs)?;
+        // The TPM factor stays through reseals; the share is fresh.  It is
+        // made before the rekey, so a TPM failure leaves the old keys.
+        let pcrs = match protect {
+            Some((_, t)) => t.map(str::to_owned),
+            None => existing_tpm(&paths.sealed())?.map(|t| t.pcrs),
+        };
+        if let Some(pcrs) = pcrs {
+            let (share, t) = tpm::new_share(&pcrs)?;
+            sealer = sealer.with_tpm(share, t)?;
+        }
         tracing::debug!(
             "sealing to the escrow keys of {:?}; {} binding(s) to register with the rekey",
             servers
@@ -1631,17 +1695,39 @@ fn recover(trust: &Trust) -> impl FnMut(&str, &EscrowRequest) -> Option<Recovery
     }
 }
 
+/// Open the TPM share of `sealed`, if it has one, with this host's TPM.
+/// Retrying a server cannot help when the TPM does not open it.
+fn open_tpm_share(sealed: &Sealed, what: &str) -> Result<Option<SecretBuf>, Error> {
+    sealed
+        .tpm()
+        .map(tpm::open_share)
+        .transpose()
+        .map_err(|e| format!("this host's TPM does not open {what}: {e}").into())
+}
+
+/// What a failed unseal means: a server problem is worth retrying, a TPM
+/// share that does not fit is not.
+fn unseal_failed(e: kuipa_enroll::error::Error, what: &str) -> Error {
+    use kuipa_enroll::error::Error as E;
+    match e {
+        E::Policy(_) | E::Missing(_) => e.into(),
+        _ => Outcome::RetryLater(format!("no server could unseal {what}")).into(),
+    }
+}
+
 /// Unseal the sealed host keytab through any server.
 ///
 /// # Errors
 ///
-/// [`Outcome::RetryLater`] if no server could unseal it.
+/// [`Outcome::RetryLater`] if no server could unseal it, or a plain error
+/// if this host's TPM does not open its share.
 pub fn unseal(paths: &Paths) -> Result<Keytab, Error> {
     let sealed = Sealed::from_bytes(&fs::read(paths.sealed())?)?;
+    let share = open_tpm_share(&sealed, "the sealed keytab")?;
     let trust = ca_trust(paths)?;
     sealed
-        .unseal(recover(&trust))
-        .map_err(|_| Outcome::RetryLater("no server could unseal the keytab".into()).into())
+        .unseal(recover(&trust), share.as_ref().map(AsRef::as_ref))
+        .map_err(|e| unseal_failed(e, "the keytab"))
 }
 
 /// Unseal any sealed keytab or file through any server: a keytab comes
@@ -1649,18 +1735,19 @@ pub fn unseal(paths: &Paths) -> Result<Keytab, Error> {
 ///
 /// # Errors
 ///
-/// [`Outcome::RetryLater`] if no server could unseal it, or a malformed
-/// file.
+/// [`Outcome::RetryLater`] if no server could unseal it, a plain error if
+/// this host's TPM does not open its share, or a malformed file.
 pub fn unseal_file(paths: &Paths, sealed: &std::path::Path) -> Result<SecretBuf, Error> {
     let what = sealed.display().to_string();
     let sealed = Sealed::from_bytes(&fs::read(sealed)?)?;
+    let share = open_tpm_share(&sealed, &what)?;
+    let share = share.as_ref().map(AsRef::as_ref);
     let trust = ca_trust(paths)?;
-    let retry =
-        |_| -> Error { Outcome::RetryLater(format!("no server could unseal {what}")).into() };
     match sealed.kind() {
-        Kind::Keytab => sealed.unseal_mit(recover(&trust)).map_err(retry),
-        Kind::File => sealed.unseal_contents(recover(&trust)).map_err(retry),
+        Kind::Keytab => sealed.unseal_mit(recover(&trust), share),
+        Kind::File => sealed.unseal_contents(recover(&trust), share),
     }
+    .map_err(|e| unseal_failed(e, &what))
 }
 
 /// Write the unsealed copy of `item` with the original file's mode and
@@ -1735,17 +1822,18 @@ pub enum Target {
 }
 
 /// `kuipa protect`: seal the host keytab (file mode, §7.3), or any other
-/// keytab or file (§7.5).
+/// keytab or file (§7.5).  `tpm` (a PCR list, empty for none) also binds
+/// the seal to this host's TPM.
 ///
 /// # Errors
 ///
 /// Any error; the plaintext stays until a test unseal succeeded.
-pub fn protect(paths: &Paths, target: &Target) -> Result<Value, Error> {
+pub fn protect(paths: &Paths, target: &Target, tpm: Option<&str>) -> Result<Value, Error> {
     match target {
-        Target::Host => protect_host(paths),
-        Target::Keytab(path) => protect_other(paths, Contents::Keytab, path, None),
+        Target::Host => protect_host(paths, tpm),
+        Target::Keytab(path) => protect_other(paths, Contents::Keytab, path, None, tpm),
         Target::File { path, keytab } => {
-            protect_other(paths, Contents::File, path, keytab.as_deref())
+            protect_other(paths, Contents::File, path, keytab.as_deref(), tpm)
         }
     }
 }
@@ -1831,12 +1919,15 @@ pub fn keys_fetch(paths: &Paths, name: &str, alg: Option<&str>) -> Result<Vec<u8
     Ok(answer.value)
 }
 
-fn protect_host(paths: &Paths) -> Result<Value, Error> {
+fn protect_host(paths: &Paths, tpm: Option<&str>) -> Result<Value, Error> {
     let state = State::load(paths)?;
     if state.holder != Holder::None {
-        return Err("keytab protection is already on".into());
+        return Err(
+            "keytab protection is already on (run kuipa unprotect first to change the TPM factor)"
+                .into(),
+        );
     }
-    let rotated = rotate_keys(paths, Some(Holder::File))?;
+    let rotated = rotate_keys(paths, Some((Holder::File, tpm)))?;
     // Test-unseal before the plaintext keytab goes away.
     let unsealed = unseal(paths)?;
     let current = Keytab::from_mit(&fs::read(paths.run_keytab())?)?;
@@ -1845,7 +1936,7 @@ fn protect_host(paths: &Paths) -> Result<Value, Error> {
     }
     paths::remove(&paths.keytab())?;
     std::os::unix::fs::symlink(paths.run_keytab(), paths.keytab())?;
-    Ok(json!({ "holder": "file", "rotated": rotated, "sealed": paths.sealed() }))
+    Ok(json!({ "holder": "file", "tpm": tpm, "rotated": rotated, "sealed": paths.sealed() }))
 }
 
 /// Which binding set holds what `contents` names.
@@ -1937,6 +2028,28 @@ fn register(
     Ok(adv.server().to_owned())
 }
 
+/// `sealer` bound to this host's TPM when `tpm` (a PCR list) asks for it.
+/// A reseal keeps the factor and its PCRs of the seal at `current`, and
+/// fails if that seal is gone; dropping the factor means unprotect, then
+/// protect.
+fn with_tpm_factor(
+    sealer: Sealer,
+    tpm: Option<&str>,
+    resealing: bool,
+    current: &std::path::Path,
+) -> Result<Sealer, Error> {
+    let pcrs = match (tpm, resealing) {
+        (Some(p), _) => Some(p.to_owned()),
+        (None, true) => existing_tpm(current)?.map(|t| t.pcrs),
+        (None, false) => None,
+    };
+    let Some(pcrs) = pcrs else {
+        return Ok(sealer);
+    };
+    let (share, t) = tpm::new_share(&pcrs)?;
+    Ok(sealer.with_tpm(share, t)?)
+}
+
 /// Seal `path` (a keytab, or a file for the principal of `keytab`),
 /// register its bindings, test-unseal it, and only then replace it with a
 /// symlink to its unsealed copy.  Protecting it again reseals what is
@@ -1947,6 +2060,7 @@ fn protect_other(
     contents: Contents,
     path: &std::path::Path,
     keytab: Option<&std::path::Path>,
+    tpm: Option<&str>,
 ) -> Result<Value, Error> {
     let mut state = State::load(paths)?;
     let path = absolute(path)?;
@@ -1991,6 +2105,7 @@ fn protect_other(
     let servers = all_servers(&state, &trust, &anchors, &heads, &retired, &frozen);
     let refs: Vec<_> = servers.iter().collect();
     let (sealer, registrations) = Sealer::prepare(&principal, kind_of(contents), &refs)?;
+    let sealer = with_tpm_factor(sealer, tpm, existing.is_some(), &sealed_path)?;
     let bindings: Vec<_> = registrations.iter().map(|r| r.binding).collect();
     let params = RegisterParams {
         principal: principal.clone(),
@@ -2045,6 +2160,7 @@ fn protect_other(
         "sealed": sealed_path,
         "unsealed_copy": paths.run_copy(&path),
         "servers": seal.servers(),
+        "tpm": seal.tpm().map(|t| &t.pcrs),
         "registered_by": registrar,
         "resealed": existing.is_some(),
     }))

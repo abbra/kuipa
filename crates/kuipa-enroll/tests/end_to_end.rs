@@ -1158,15 +1158,20 @@ fn sealed_keytab_with_registration_and_revocation() {
 
     // Any server can unseal.
     let sealed = Sealed::from_bytes(&stored).unwrap();
-    let kt = sealed.unseal(|s, req| recover(by_name(s), req)).unwrap();
+    let kt = sealed
+        .unseal(|s, req| recover(by_name(s), req), None)
+        .unwrap();
     assert_eq!(kt.kvno(), host_keys.kvno());
     // ipa1 down: ipa2 alone suffices.
     let kt = sealed
-        .unseal(|s, req| {
-            (s == "ipa2.example.test")
-                .then(|| recover(1, req))
-                .flatten()
-        })
+        .unseal(
+            |s, req| {
+                (s == "ipa2.example.test")
+                    .then(|| recover(1, req))
+                    .flatten()
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(kt.principal(), host_keys.principal());
 
@@ -1176,7 +1181,7 @@ fn sealed_keytab_with_registration_and_revocation() {
         .borrow_mut()
         .insert(Principal::host(HOST, REALM).to_string());
     assert!(matches!(
-        sealed.unseal(|s, req| recover(by_name(s), req)),
+        sealed.unseal(|s, req| recover(by_name(s), req), None),
         Err(Error::Refused)
     ));
     r.dir.disabled.borrow_mut().clear();
@@ -1187,8 +1192,14 @@ fn sealed_keytab_with_registration_and_revocation() {
     r.dir
         .register_escrow(&Principal::host(HOST, REALM), &hashes)
         .unwrap();
-    assert!(sealed.unseal(|s, req| recover(by_name(s), req)).is_err());
-    resealed.unseal(|s, req| recover(by_name(s), req)).unwrap();
+    assert!(
+        sealed
+            .unseal(|s, req| recover(by_name(s), req), None)
+            .is_err()
+    );
+    resealed
+        .unseal(|s, req| recover(by_name(s), req), None)
+        .unwrap();
 }
 
 /// A registration (§7.5) made with `caller`'s ticket.
@@ -1248,13 +1259,22 @@ fn sealed_file_registered_by_its_principal() {
 
     let first = Sealed::from_bytes(&seal(b"first", Vec::new()).to_bytes()).unwrap();
     assert_eq!(first.kind(), Kind::File);
-    assert_eq!(first.unseal_contents(recover).unwrap().as_ref(), b"first");
-    assert!(matches!(first.unseal(recover), Err(Error::Mismatch(_))));
+    assert_eq!(
+        first.unseal_contents(recover, None).unwrap().as_ref(),
+        b"first"
+    );
+    assert!(matches!(
+        first.unseal(recover, None),
+        Err(Error::Mismatch(_))
+    ));
 
     // A reseal retires the bindings it replaces; the keytab set is untouched.
     let second = seal(b"second", first.bindings().unwrap());
-    assert!(first.unseal_contents(recover).is_err());
-    assert_eq!(second.unseal_contents(recover).unwrap().as_ref(), b"second");
+    assert!(first.unseal_contents(recover, None).is_err());
+    assert_eq!(
+        second.unseal_contents(recover, None).unwrap().as_ref(),
+        b"second"
+    );
     assert!(!r.dir.escrow.borrow().contains_key(&service.to_string()));
 
     // Another principal's ticket cannot register for the service.
@@ -1266,11 +1286,67 @@ fn sealed_file_registered_by_its_principal() {
     let host = Principal::host(HOST, REALM).to_string();
     let (request, _) = register_request(&advs[0], &host, &params, &[]);
     assert!(r.send(0, Operation::Register, &request).is_err());
-    second.unseal_contents(recover).unwrap();
+    second.unseal_contents(recover, None).unwrap();
 
     // Nor can a registration be sent to the rekey endpoint.
     let (request, _) = register_request(&advs[0], &service.to_string(), &params, &[]);
     assert!(r.send(0, Operation::Rekey, &request).is_err());
+}
+
+#[test]
+fn sealed_file_with_a_tpm_share() {
+    use kuipa_enroll::escrow::TpmShare;
+    let r = realm();
+    let advs = [r.verify(0), r.verify(1)];
+    let service: Principal = format!("HTTP/{HOST}@{REALM}").parse().unwrap();
+    let recover = |s: &str, req: &EscrowRequest| {
+        let req = EscrowRequest::from_bytes(&req.to_bytes()).unwrap();
+        r.servers[usize::from(s == "ipa2.example.test")]
+            .recover(&req, &r.dir)
+            .ok()
+            .and_then(Recovered::into_plain)
+    };
+    let (sealer, registrations) =
+        Sealer::prepare(&service, Kind::File, &[&advs[0], &advs[1]]).unwrap();
+    let bindings: Vec<_> = registrations.iter().map(|g| g.binding).collect();
+    let params = RegisterParams {
+        principal: service.clone(),
+        kind: Kind::File,
+        retire: Vec::new(),
+    };
+    let (request, pending) = register_request(&advs[0], &service.to_string(), &params, &bindings);
+    let response = r.send(0, Operation::Register, &request).unwrap();
+    pending
+        .finish_register(&response, &advs[0], &params)
+        .unwrap();
+    let share = [9u8; 32];
+    let tpm = TpmShare {
+        pcrs: "7".into(),
+        credential: b"cred".to_vec().into(),
+    };
+    let bound = sealer
+        .with_tpm(SecretBuf::from_slice(&share), tpm.clone())
+        .unwrap()
+        .seal_file(b"tpm bound")
+        .unwrap();
+    let bytes = bound.to_bytes();
+    assert!(bytes.starts_with(b"IPTF"));
+    let read = Sealed::from_bytes(&bytes).unwrap();
+    assert_eq!(read.tpm(), Some(&tpm));
+    assert_eq!(
+        read.unseal_contents(recover, Some(&share))
+            .unwrap()
+            .as_ref(),
+        b"tpm bound"
+    );
+    assert!(matches!(
+        read.unseal_contents(recover, None),
+        Err(Error::Missing(_))
+    ));
+    assert!(matches!(
+        read.unseal_contents(recover, Some(&[8; 32])),
+        Err(Error::Policy(_))
+    ));
 }
 
 /// `req` presented under another principal and seal, with its own
@@ -1324,10 +1400,13 @@ fn bindings_open_only_under_what_they_commit_to() {
 
     let mut seen = Vec::new();
     sealed
-        .unseal(|_, req| {
-            seen.push(req.clone());
-            answer(req).ok()
-        })
+        .unseal(
+            |_, req| {
+                seen.push(req.clone());
+                answer(req).ok()
+            },
+            None,
+        )
         .unwrap();
     let req = &seen[0];
     assert_eq!(

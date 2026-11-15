@@ -493,7 +493,7 @@ fn enroll_web1_with_otp(world: &Scenario) -> Vec<u32> {
 fn protect_keytab(world: &Scenario, first: &[u32]) {
     let a = &world.web1;
     // ── Keytab protection: rekey with escrow registration, unseal, undo ──
-    flows::protect(a, &Target::Host).unwrap();
+    flows::protect(a, &Target::Host, None).unwrap();
     assert!(
         std::fs::symlink_metadata(a.keytab())
             .unwrap()
@@ -515,7 +515,7 @@ fn protect_other_keytab_and_file(world: &Scenario) -> Copies {
     let http_keys = realm.new_keys(&service);
     std::fs::write(&http, &http_keys).unwrap();
     let as_keytab = Target::Keytab(http.clone());
-    let protected = flows::protect(a, &as_keytab).unwrap();
+    let protected = flows::protect(a, &as_keytab, None).unwrap();
     assert_eq!(protected["principal"], service.as_str(), "{protected}");
     assert!(
         std::fs::symlink_metadata(&http)
@@ -532,7 +532,7 @@ fn protect_other_keytab_and_file(world: &Scenario) -> Copies {
         path: secret.clone(),
         keytab: None,
     };
-    flows::protect(a, &as_file).unwrap();
+    flows::protect(a, &as_file, None).unwrap();
     let host = format!("host/web1.example.test@{REALM}");
     let file_bindings = || directory.escrow_files.lock().unwrap()[&host].clone();
     assert_eq!(file_bindings().len(), 2);
@@ -545,7 +545,7 @@ fn protect_other_keytab_and_file(world: &Scenario) -> Copies {
     // again, which retires the previous seal's bindings.
     let first_seal = std::fs::read(paths::sealed_for(&secret)).unwrap();
     std::fs::write(&secret, b"token=second\n").unwrap();
-    let resealed = flows::protect(a, &as_file).unwrap();
+    let resealed = flows::protect(a, &as_file, None).unwrap();
     assert_eq!(resealed["resealed"], true);
     assert_eq!(file_bindings().len(), 2, "the old seal's bindings retired");
     let stale = realm.dir.join("stale.sealed");
@@ -1665,6 +1665,96 @@ fn unprotect_host(world: &Scenario) {
     flows::rotate_keys(a, None).unwrap();
 }
 
+/// Which fake TPM `systemd-creds` answers for (`tests/data/fake-tpm`): a
+/// credential opens only under the TPM that made it.
+fn use_tpm(world: &Scenario, id: &str) {
+    std::fs::write(world.realm.dir.join("tpm-id"), id).unwrap();
+}
+
+/// The sealed host keytab with a TPM share: kept by a rotation, and not
+/// opened by another TPM, which is no reason to retry a server.
+fn tpm_host(world: &Scenario) {
+    use kuipa_enroll::escrow::Sealed;
+    let a = &world.web1;
+    let tpm_pcrs = || {
+        let bytes = std::fs::read(a.sealed()).unwrap();
+        assert!(bytes.starts_with(b"IPTK"));
+        Sealed::from_bytes(&bytes)
+            .unwrap()
+            .tpm()
+            .unwrap()
+            .pcrs
+            .clone()
+    };
+    flows::protect(a, &Target::Host, Some("7")).unwrap();
+    assert_eq!(tpm_pcrs(), "7");
+    flows::rotate_keys(a, None).unwrap();
+    assert_eq!(tpm_pcrs(), "7");
+    let current = Keytab::from_mit(&std::fs::read(a.run_keytab()).unwrap()).unwrap();
+    assert_eq!(flows::unseal(a).unwrap().kvno(), current.kvno());
+
+    use_tpm(world, "tpm-b");
+    let err = flows::unseal(a).unwrap_err();
+    assert!(err.to_string().contains("TPM"), "{err}");
+    assert!(err.downcast_ref::<Outcome>().is_none(), "{err}");
+    use_tpm(world, "tpm-a");
+
+    flows::unprotect(a, &Target::Host).unwrap();
+    assert!(!a.sealed().exists());
+}
+
+/// A sealed file keeps its TPM factor when resealed.
+fn tpm_file(world: &Scenario) {
+    let a = &world.web1;
+    let file = world.realm.dir.join("tpm-file.conf");
+    std::fs::write(&file, b"tpm=first\n").unwrap();
+    let target = Target::File {
+        path: file.clone(),
+        keytab: None,
+    };
+    let sealed = paths::sealed_for(&file);
+    flows::protect(a, &target, Some("")).unwrap();
+    assert!(std::fs::read(&sealed).unwrap().starts_with(b"IPTF"));
+    std::fs::write(&file, b"tpm=second\n").unwrap();
+    flows::protect(a, &target, None).unwrap();
+    assert!(std::fs::read(&sealed).unwrap().starts_with(b"IPTF"));
+    assert_eq!(
+        flows::unseal_file(a, &sealed).unwrap().as_ref(),
+        b"tpm=second\n"
+    );
+    flows::unprotect(a, &target).unwrap();
+}
+
+/// A user seal whose device key is kept by this host's TPM: no passphrase,
+/// and not opened under another TPM.
+fn tpm_device(world: &Scenario, alice: &Alice) {
+    let a = &world.web1;
+    let home = UserPaths::new(world.realm.dir.join("alice-tpm-home"));
+    let client = SealClient::new(a, &home, Some(&alice.cc));
+    let policy = seal::Policy {
+        factors: seal::Factors {
+            device: Some(seal::Level::Any),
+            ticket: true,
+            passkey: false,
+        },
+        ..seal::Policy::default()
+    };
+    client.create("tpmdev", policy).unwrap();
+    let added = client.add_tpm_device("tpmdev").unwrap();
+    assert_eq!(added["seals"][0]["devices"][0]["type"], "tpm", "{added}");
+    let key = std::fs::read(home.device_key()).unwrap();
+    // Magic, version, then the key derivation: 3 is the TPM's.
+    assert_eq!((&key[..4], key[5]), (&b"IPDK"[..], 3));
+    let sealed = client.seal("tpmdev", b"tpm bound").unwrap();
+    assert_eq!(
+        client.open(&sealed, Some(b"")).unwrap().as_ref(),
+        b"tpm bound"
+    );
+    use_tpm(world, "tpm-b");
+    assert!(client.open(&sealed, Some(b"")).is_err());
+    use_tpm(world, "tpm-a");
+}
+
 fn admin_ticket(world: &Scenario) {
     let realm = &world.realm;
     let servers = &world.servers;
@@ -1865,7 +1955,8 @@ fn offline_enrollment(world: &Scenario) {
     let anchors = &world.anchors;
     // ── Offline: prepare, stage (admin ticket), open the bundle, first contact ──
     let d = root(realm, "web4");
-    flows::prepare(&d, false, "web4.example.test").unwrap();
+    flows::prepare(&d, false, Some(""), "web4.example.test").unwrap();
+    assert!(d.recipient_tpm().exists() && !d.recipient().exists());
     let recipient =
         tang_pqc::ExchangeKey::from_jwk_json(&std::fs::read(d.recipient_public()).unwrap())
             .unwrap();
@@ -1918,6 +2009,7 @@ fn offline_enrollment(world: &Scenario) {
         Some("web4.example.test"),
     )
     .unwrap();
+    assert!(!d.recipient_tpm().exists() && !d.recipient().exists());
     let staged = kvnos(&d.keytab());
     let completed = flows::complete(&d).unwrap();
     assert!(!d.pending().exists(), "{completed}");
@@ -2177,6 +2269,18 @@ fn against_a_real_kdc() {
     )
     .unwrap();
     env.push(("KRYOPTIC_CONF", token_conf.display().to_string()));
+    // A test double for systemd-creds, bound to a TPM id that tests switch.
+    let tpm_id = realm.dir.join("tpm-id");
+    std::fs::write(&tpm_id, "tpm-a").unwrap();
+    env.push(("KUIPA_FAKE_TPM", tpm_id.display().to_string()));
+    env.push((
+        "PATH",
+        format!(
+            "{}/tests/data/fake-tpm:{}",
+            env!("CARGO_MANIFEST_DIR"),
+            std::env::var("PATH").unwrap()
+        ),
+    ));
     set_env(&env);
     realm.add_user(ADMIN, "Admin123");
 
@@ -2199,6 +2303,7 @@ fn against_a_real_kdc() {
     let copies = protect_other_keytab_and_file(&world);
     restore_copies_at_boot(&world, &copies);
     undo_copies(&world, &copies);
+    tpm_file(&world);
     let alice = personal_seal(&world);
     tlog_watch(&world, &alice);
     tlog_diverged(&world, &alice);
@@ -2214,7 +2319,9 @@ fn against_a_real_kdc() {
     helpdesk_recovery(&world, &alice);
     token_device(&world, &alice);
     passkeys(&world, &alice);
+    tpm_device(&world, &alice);
     unprotect_host(&world);
+    tpm_host(&world);
     admin_ticket(&world);
     let conf_path = bootstrap_2fa(&world);
     password_enrollment(&world);

@@ -15,6 +15,7 @@ pub mod preauth;
 pub mod seal;
 pub mod sign;
 pub mod text;
+pub mod tpm;
 pub mod trace;
 pub mod voucher;
 pub mod witness;

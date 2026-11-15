@@ -151,6 +151,12 @@ impl Paths {
         self.state_dir().join("recipient.jwk")
     }
 
+    /// The mode A recipient key as a TPM credential (`prepare --tpm`).
+    #[must_use]
+    pub fn recipient_tpm(&self) -> PathBuf {
+        self.state_dir().join("recipient.cred")
+    }
+
     /// The recipient's public key, for the administrator.
     #[must_use]
     pub fn recipient_public(&self) -> PathBuf {

@@ -100,17 +100,20 @@ fn unseal(c: &mut Criterion) {
         g.bench_function(format!("unseal/{servers}"), |b| {
             b.iter(|| {
                 sealed
-                    .unseal(|name, request| {
-                        if name != server_name(last) {
-                            return None;
-                        }
-                        let request =
-                            EscrowRequest::from_bytes(&request.to_bytes()).expect("parse request");
-                        r.servers[last]
-                            .recover(black_box(&request), r.directory())
-                            .ok()
-                            .and_then(Recovered::into_plain)
-                    })
+                    .unseal(
+                        |name, request| {
+                            if name != server_name(last) {
+                                return None;
+                            }
+                            let request = EscrowRequest::from_bytes(&request.to_bytes())
+                                .expect("parse request");
+                            r.servers[last]
+                                .recover(black_box(&request), r.directory())
+                                .ok()
+                                .and_then(Recovered::into_plain)
+                        },
+                        None,
+                    )
                     .expect("unseal")
             });
         });

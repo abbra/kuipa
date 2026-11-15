@@ -112,6 +112,9 @@ pub enum DeviceType {
     Pkcs11,
     /// A key file wrapped by an AES key on a PKCS#11 token.
     Pkcs11Wrapped,
+    /// A key file wrapped by this host's TPM (a user-scoped systemd
+    /// credential).
+    Tpm,
 }
 
 impl DeviceType {
@@ -120,7 +123,7 @@ impl DeviceType {
     pub const fn highest(self) -> Level {
         match self {
             Self::File => Level::Any,
-            Self::Passkey | Self::Pkcs11Wrapped => Level::HardwareWrapped,
+            Self::Passkey | Self::Pkcs11Wrapped | Self::Tpm => Level::HardwareWrapped,
             Self::Pkcs11 => Level::HardwareBound,
         }
     }

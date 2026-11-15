@@ -9,3 +9,8 @@ nothing.  The same files are in `kuipa-enroll/tests/data`.
 CA ID 32473.1, of the IETF plants WG demo corpus
 (<https://github.com/ietf-plants-wg/merkle-tree-certs>, `plants-06`), as in
 `kuipa-enroll/tests/data`; the playground advertises it in a CA chain.
+
+`fake-tpm/systemd-creds` and `fake-tpm/systemd-analyze` are test doubles for the
+TPM factor (`kdc.rs` puts the directory first in `PATH`): a credential is
+"bound" to the TPM id in the file `$KUIPA_FAKE_TPM`, a scope and a name, and
+opens only under the same three.  A real TPM is checked in ci-freeipa VMs.

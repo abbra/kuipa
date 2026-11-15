@@ -1,0 +1,11 @@
+#!/bin/bash
+# Test double for systemd-creds: "binds" a credential to the TPM id in $KUIPA_FAKE_TPM, the scope and the name.
+set -euo pipefail
+tpm=$(cat "${KUIPA_FAKE_TPM:?}"); op= name= scope=system pcrs= withkey=
+for a; do case $a in encrypt|decrypt) op=$a;; --name=*) name=${a#--name=};; --user) scope=user;; --with-key=*) withkey=${a#--with-key=};; --tpm2-pcrs=*) pcrs=${a#--tpm2-pcrs=};; esac; done
+case $op in
+encrypt) [[ $scope == user || $withkey == tpm2 ]] || { echo "Refusing: system scope needs --with-key=tpm2" >&2; exit 1; }
+  printf 'FAKE %s %s %s %s\n' "$tpm" "$scope" "$name" "${pcrs:--}"; base64 -w0;;
+decrypt) read -r magic t s n _; [[ $magic == FAKE && $t == "$tpm" && $s == "$scope" && $n == "$name" ]] || { echo "Failed to unseal: wrong TPM, scope or name" >&2; exit 1; }; base64 -d;;
+*) exit 2;;
+esac

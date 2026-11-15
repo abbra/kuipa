@@ -1407,7 +1407,7 @@ fn offline_enrollment_from_a_bundle() {
     let paths = root("bundle");
 
     // On the host: prepare a machine key.
-    let prepared = flows::prepare(&paths, false, HOST).unwrap();
+    let prepared = flows::prepare(&paths, false, None, HOST).unwrap();
     assert!(
         prepared["admin_command"]
             .as_str()
@@ -1419,7 +1419,7 @@ fn offline_enrollment_from_a_bundle() {
             .unwrap();
     // Idempotent.
     assert_eq!(
-        flows::prepare(&paths, false, HOST).unwrap()["thumbprint"],
+        flows::prepare(&paths, false, None, HOST).unwrap()["thumbprint"],
         prepared["thumbprint"]
     );
 
@@ -3926,7 +3926,7 @@ fn bundle_enroll(
     heads: Vec<Option<(u64, kuipa_enroll::merkle::Hash)>>,
     issuer: &str,
 ) -> Result<serde_json::Value, kuipa_tools::paths::Error> {
-    let _ = flows::prepare(paths, false, HOST);
+    let _ = flows::prepare(paths, false, None, HOST);
     let public =
         tang_pqc::ExchangeKey::from_jwk_json(&std::fs::read(paths.recipient_public()).unwrap())
             .unwrap();
