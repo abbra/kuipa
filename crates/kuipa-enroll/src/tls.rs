@@ -350,14 +350,7 @@ impl ChainVerifier {
             )
             .map_err(|_| invalid(CertificateError::BadSignature))?;
 
-        let extensions = match &tbs.extensions {
-            Some(raw) => {
-                Extensions::from_der(raw.as_bytes())
-                    .map_err(|_| malformed())?
-                    .0
-            }
-            None => Vec::new(),
-        };
+        let extensions = crate::certs::extensions_of(tbs).map_err(|()| malformed())?;
         let understood: [&[u32]; 4] = [
             oids::KEY_USAGE,
             oids::EXTENDED_KEY_USAGE,

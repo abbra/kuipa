@@ -23,6 +23,17 @@ use synta_mtc::builder::parse_mtc_ca_extension;
 use synta_mtc::crypto::MtcProof;
 use synta_mtc::types::constants::{is_mtc_ca_extension_oid, is_mtc_proof_oid};
 
+/// The extensions of `tbs`, none if it has none.
+pub(crate) fn extensions_of<'a>(
+    tbs: &'a synta_certificate::TBSCertificate<'a>,
+) -> Result<Vec<synta_certificate::Extension<'a>>, ()> {
+    tbs.extensions.as_ref().map_or(Ok(Vec::new()), |raw| {
+        Extensions::from_der(raw.as_bytes())
+            .map(|e| e.0)
+            .map_err(|_| ())
+    })
+}
+
 /// Why a certificate is not one a host may install as a CA: what
 /// [`check_ca`] says, and [`Error::NotCa`](crate::error::Error::NotCa)
 /// reports for a list entry.
@@ -59,14 +70,7 @@ pub(crate) fn check_ca(der: &[u8]) -> Result<(), NotCa> {
     }
 
     let undecodable = "a certificate whose extensions do not decode";
-    let extensions = match &cert.tbs_certificate.extensions {
-        Some(raw) => {
-            Extensions::from_der(raw.as_bytes())
-                .map_err(|_| undecodable)?
-                .0
-        }
-        None => Vec::new(),
-    };
+    let extensions = extensions_of(&cert.tbs_certificate).map_err(|()| undecodable)?;
     let mut is_ca = false;
     let mut mtc_ca = false;
     let mut cert_sign = true;

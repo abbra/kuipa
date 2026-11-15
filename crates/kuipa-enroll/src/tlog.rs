@@ -203,7 +203,7 @@ pub(crate) struct Tombstone {
 impl Tombstone {
     /// `IPLT ‖ 1 ‖ target ‖ reason`.
     #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
         Writer::new(TOMBSTONE_MAGIC)
             .u64(self.target)
             .str(&self.reason)
@@ -215,7 +215,7 @@ impl Tombstone {
     /// # Errors
     ///
     /// [`Error::Malformed`].
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, TOMBSTONE_MAGIC, "tombstone")?;
         let target = r.u64()?;
         let reason = r.str()?.to_owned();
