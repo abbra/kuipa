@@ -322,6 +322,50 @@ fn selected_peers<'a>(
     peers
 }
 
+/// Who this server knows: every member (itself included), the outbound
+/// neighbors, and when the directory was last asked.
+#[derive(Default)]
+struct Topology {
+    members: Arc<BTreeSet<String>>,
+    /// Outbound targets, independently refreshed from replication topology.
+    neighbors: Arc<BTreeSet<String>>,
+    asked: Option<Instant>,
+}
+
+/// `names` and the configured peers, lowercased: directory names are not
+/// case-normalised.
+fn lowercased(names: Vec<String>, configured: &[String]) -> BTreeSet<String> {
+    names
+        .into_iter()
+        .chain(configured.iter().cloned())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+impl Topology {
+    /// The configured peers only, before the directory is asked.
+    fn new(settings: &Settings) -> Self {
+        let neighbors = lowercased(Vec::new(), &settings.peers);
+        let mut members = neighbors.clone();
+        members.insert(settings.me.clone());
+        Self {
+            members: Arc::new(members),
+            neighbors: Arc::new(neighbors),
+            asked: None,
+        }
+    }
+
+    fn set_members(&mut self, servers: Vec<String>, settings: &Settings) {
+        let mut members = lowercased(servers, &settings.peers);
+        members.insert(settings.me.clone());
+        self.members = Arc::new(members);
+    }
+
+    fn set_neighbors(&mut self, peers: Vec<String>, settings: &Settings) {
+        self.neighbors = Arc::new(lowercased(peers, &settings.peers));
+    }
+}
+
 /// The state shared by the gossip engine, the maintenance task and the
 /// sync route.  Implements agirru's transport, membership, storage and
 /// hooks.
@@ -336,11 +380,7 @@ pub(crate) struct Exchange {
     store: KeyStore,
     state: Arc<RwLock<AnchorState>>,
     clock: GenerationClock,
-    /// Every member, this server included, and when the directory was last
-    /// asked.
-    members: Mutex<(BTreeSet<String>, Option<Instant>)>,
-    /// Outbound targets, independently refreshed from replication topology.
-    neighbors: Mutex<BTreeSet<String>>,
+    topology: Mutex<Topology>,
     /// Peers' own delegations from authenticated syncs.
     attested: Mutex<BTreeMap<String, Delegation>>,
     /// The anchor epoch log (§4.8).
@@ -479,46 +519,18 @@ impl Peers {
         initiator: Arc<dyn Initiator>,
         store: KeyStore,
     ) -> Result<Arc<Self>, Error> {
-        let clock = GenerationClock::new();
-        let mut loaded = store.peer_state()?;
-        loaded.rebase_generations(&clock);
-        let state = Arc::new(RwLock::new(loaded));
-        let chain = store.epoch()?;
-        let neighbors: BTreeSet<String> = settings
-            .peers
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        let mut members = neighbors.clone();
-        members.insert(settings.me.clone());
-        let exchange = Arc::new(Exchange {
-            client: http_client(&settings)?,
-            settings,
-            anchor,
-            policy: Policy::from_system()?,
-            server,
-            directory,
-            initiator,
-            store,
-            state: state.clone(),
-            clock: clock.clone(),
-            members: Mutex::new((members, None)),
-            neighbors: Mutex::new(neighbors),
-            attested: Mutex::new(BTreeMap::new()),
-            epoch: Mutex::new(chain.clone()),
-            forked: AtomicBool::new(false),
-            members_known: AtomicBool::new(false),
-            settling: Mutex::new(None),
-            changed: Notify::new(),
-            repair_trigger: Notify::new(),
-            repair_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS),
-            snapshots: SnapshotServer::new(),
-            own_seen: ContextReceiver::new(),
-            chain_seen: ContextReceiver::new(),
-            own_sent: ContextSender::new(),
-            chain_sent: ContextSender::new(),
-            failures: Mutex::new(BTreeMap::new()),
-        });
+        let client = http_client(&settings)?;
+        let mut exchange = Exchange::new(
+            settings, anchor, server, directory, initiator, store, client,
+        );
+        exchange.policy = Policy::from_system()?;
+        let mut loaded = exchange.store.peer_state()?;
+        loaded.rebase_generations(&exchange.clock);
+        exchange.state = Arc::new(RwLock::new(loaded));
+        let chain = exchange.store.epoch()?;
+        exchange.epoch = Mutex::new(chain.clone());
+        let (state, clock) = (exchange.state.clone(), exchange.clock.clone());
+        let exchange = Arc::new(exchange);
         exchange.server.publish_epoch(chain);
         let config = GossipConfig {
             round_interval: exchange.settings.interval,
@@ -1214,13 +1226,53 @@ impl SnapshotReplica<str> for Peers {
 }
 
 impl Exchange {
-    /// Every member, this server included.
-    fn members(&self) -> BTreeSet<String> {
-        lock(&self.members).0.clone()
+    /// An exchange with an empty state and epoch log; the caller loads
+    /// them, and a real crypto policy.
+    fn new(
+        settings: Settings,
+        anchor: Option<SigningKey>,
+        server: Arc<EnrollServer>,
+        directory: Arc<dyn Directory + Send + Sync>,
+        initiator: Arc<dyn Initiator>,
+        store: KeyStore,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            topology: Mutex::new(Topology::new(&settings)),
+            settings,
+            anchor,
+            policy: Policy::default(),
+            server,
+            directory,
+            initiator,
+            store,
+            state: Arc::new(RwLock::new(AnchorState::default())),
+            clock: GenerationClock::new(),
+            attested: Mutex::new(BTreeMap::new()),
+            epoch: Mutex::new(Vec::new()),
+            forked: AtomicBool::new(false),
+            members_known: AtomicBool::new(false),
+            settling: Mutex::new(None),
+            changed: Notify::new(),
+            repair_trigger: Notify::new(),
+            repair_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS),
+            snapshots: SnapshotServer::new(),
+            own_seen: ContextReceiver::new(),
+            chain_seen: ContextReceiver::new(),
+            own_sent: ContextSender::new(),
+            chain_sent: ContextSender::new(),
+            client,
+            failures: Mutex::new(BTreeMap::new()),
+        }
     }
 
-    fn neighbors(&self) -> BTreeSet<String> {
-        lock(&self.neighbors).clone()
+    /// Every member, this server included.
+    fn members(&self) -> Arc<BTreeSet<String>> {
+        lock(&self.topology).members.clone()
+    }
+
+    fn neighbors(&self) -> Arc<BTreeSet<String>> {
+        lock(&self.topology).neighbors.clone()
     }
 
     /// Refresh membership and topology independently; retain either on failure.
@@ -1229,14 +1281,14 @@ impl Exchange {
             return;
         }
         {
-            let mut members = lock(&self.members);
-            if members
-                .1
+            let mut topology = lock(&self.topology);
+            if topology
+                .asked
                 .is_some_and(|t| t.elapsed() < self.settings.interval * 5)
             {
                 return;
             }
-            members.1 = Some(Instant::now());
+            topology.asked = Some(Instant::now());
         }
         let directory = self.directory.clone();
         let hostname = self.settings.me.clone();
@@ -1244,38 +1296,24 @@ impl Exchange {
             (directory.servers(), directory.topology_peers(&hostname))
         })
         .await;
-        let mut members = lock(&self.members);
+        let mut topology = lock(&self.topology);
         match result {
-            Ok((servers, topology)) => {
-                if let Ok(servers) = servers {
-                    let mut set: BTreeSet<String> = servers
-                        .into_iter()
-                        .chain(self.settings.peers.iter().cloned())
-                        .map(|s| s.to_ascii_lowercase())
-                        .collect();
-                    set.insert(self.settings.me.clone());
-                    members.0 = set;
-                    self.members_known.store(true, Ordering::Relaxed);
-                } else if let Err(e) = servers {
-                    eprintln!("kuipad: anchor exchange: cannot list servers: {e}");
-                }
-                match topology {
-                    Ok(peers) => {
-                        *lock(&self.neighbors) = peers
-                            .into_iter()
-                            .chain(self.settings.peers.iter().cloned())
-                            .map(|s| s.to_ascii_lowercase())
-                            .collect();
+            Ok((servers, peers)) => {
+                match servers {
+                    Ok(servers) => {
+                        topology.set_members(servers, &self.settings);
+                        self.members_known.store(true, Ordering::Relaxed);
                     }
+                    Err(e) => eprintln!("kuipad: anchor exchange: cannot list servers: {e}"),
+                }
+                match peers {
+                    Ok(peers) => topology.set_neighbors(peers, &self.settings),
                     Err(e) => eprintln!("kuipad: anchor exchange: cannot list topology peers: {e}"),
                 }
-                members.1 = Some(Instant::now());
             }
-            Err(e) => {
-                eprintln!("kuipad: anchor exchange: {e}");
-                members.1 = Some(Instant::now());
-            }
+            Err(e) => eprintln!("kuipad: anchor exchange: {e}"),
         }
+        topology.asked = Some(Instant::now());
     }
 
     fn base(&self, peer: &str) -> String {
@@ -1545,7 +1583,13 @@ impl Transport<String> for Exchange {
 impl Membership<String> for Exchange {
     fn peers(&self) -> impl Future<Output = Vec<String>> + Send {
         let me = &self.settings.me;
-        std::future::ready(self.members().into_iter().filter(|m| m != me).collect())
+        std::future::ready(
+            self.members()
+                .iter()
+                .filter(|m| *m != me)
+                .cloned()
+                .collect(),
+        )
     }
 }
 
@@ -2850,8 +2894,8 @@ mod tests {
             Delegation::new(&claim),
         ));
         let _ = rustls_native_ossl::default_provider().install_default();
-        let exchange = Arc::new(Exchange {
-            settings: Settings {
+        let mut exchange = Exchange::new(
+            Settings {
                 me: "local".into(),
                 realm: "R".into(),
                 peers: vec!["peer".into()],
@@ -2861,32 +2905,15 @@ mod tests {
                 ca_certs: vec![],
                 vouch_interval: Duration::ZERO,
             },
-            anchor: None,
-            policy: Policy::default(),
-            server: server.clone(),
-            directory: Arc::new(UnusedDirectory),
-            initiator: Arc::new(UnusedInitiator),
-            store: KeyStore::new(dir),
-            state: Arc::new(RwLock::new(AnchorState::default())),
-            clock: GenerationClock::new(),
-            members: Mutex::new((BTreeSet::new(), None)),
-            neighbors: Mutex::new(BTreeSet::new()),
-            attested: Mutex::new(BTreeMap::new()),
-            epoch: Mutex::new(Vec::new()),
-            forked: AtomicBool::new(false),
-            members_known: AtomicBool::new(false),
-            settling: Mutex::new(None),
-            changed: Notify::new(),
-            repair_trigger: Notify::new(),
-            repair_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_REPAIRS),
-            snapshots: SnapshotServer::new(),
-            own_seen: ContextReceiver::new(),
-            chain_seen: ContextReceiver::new(),
-            own_sent: ContextSender::new(),
-            chain_sent: ContextSender::new(),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            failures: Mutex::new(BTreeMap::new()),
-        });
+            None,
+            server.clone(),
+            Arc::new(UnusedDirectory),
+            Arc::new(UnusedInitiator),
+            KeyStore::new(dir),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        );
+        exchange.topology = Mutex::new(Topology::default());
+        let exchange = Arc::new(exchange);
         (server, exchange)
     }
 
@@ -2900,25 +2927,28 @@ mod tests {
         let x = Arc::get_mut(&mut exchange).unwrap();
         x.settings.discover = true;
         x.directory = directory.clone();
-        *lock(&x.members) = (BTreeSet::from(["local".into(), "peer".into()]), None);
-        *lock(&x.neighbors) = BTreeSet::from(["peer".into()]);
+        {
+            let mut topology = lock(&x.topology);
+            topology.members = Arc::new(BTreeSet::from(["local".into(), "peer".into()]));
+            topology.neighbors = Arc::new(BTreeSet::from(["peer".into()]));
+        }
 
         exchange.refresh_members().await;
         assert_eq!(
-            exchange.members(),
+            *exchange.members(),
             BTreeSet::from(["local".into(), "near".into(), "far".into(), "peer".into()])
         );
         assert_eq!(
-            exchange.neighbors(),
+            *exchange.neighbors(),
             BTreeSet::from(["peer".into()]),
             "initial failure must not select all masters"
         );
 
         *lock(&directory.peers) = Some(vec!["NEAR".into()]);
-        lock(&exchange.members).1 = None;
+        lock(&exchange.topology).asked = None;
         exchange.refresh_members().await;
         assert_eq!(
-            exchange.neighbors(),
+            *exchange.neighbors(),
             BTreeSet::from(["near".into(), "peer".into()])
         );
         let mut cursor = None;
@@ -2934,19 +2964,19 @@ mod tests {
         );
 
         *lock(&directory.peers) = None;
-        lock(&exchange.members).1 = None;
+        lock(&exchange.topology).asked = None;
         exchange.refresh_members().await;
         assert_eq!(
-            exchange.neighbors(),
+            *exchange.neighbors(),
             selected,
             "failure preserves the previous neighbors"
         );
 
         *lock(&directory.peers) = Some(vec![]);
-        lock(&exchange.members).1 = None;
+        lock(&exchange.topology).asked = None;
         exchange.refresh_members().await;
         assert_eq!(
-            exchange.neighbors(),
+            *exchange.neighbors(),
             BTreeSet::from(["peer".into()]),
             "successful empty topology removes old neighbors"
         );
