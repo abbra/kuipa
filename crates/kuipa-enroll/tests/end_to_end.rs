@@ -3337,7 +3337,14 @@ fn a_trusted_realms_user_approves_and_owns_nothing() {
     );
     let create = SealOp::Create {
         name: "mine".into(),
-        policy: seal::Policy::default(),
+        policy: seal::Policy {
+            factors: Factors {
+                device: Some(Level::Any),
+                ticket: true,
+                passkey: false,
+            },
+            ..seal::Policy::default()
+        },
     };
     assert!(seal_op(&c.r, &c.r.verify(0), ada, &create).is_err());
     // Shared by name, she is a member like any other: she sees the seal.
@@ -3356,6 +3363,90 @@ fn a_trusted_realms_user_approves_and_owns_nothing() {
     assert_eq!(listed.len(), 1);
     // but a user of another realm the directory does not know sees nothing.
     assert!(seal_op(&c.r, &adv, zed, &SealOp::List).is_err());
+}
+
+/// The realm lets users of a trusted realm own seals only as its
+/// `trusted_owners` limit says, and takes the seals back when it stops.
+#[test]
+fn trusted_owners_follow_the_realm_policy() {
+    let (r, _) = logged_realm();
+    let adv = r.verify(0);
+    let (ada, eve, zed) = ("ada@AD.TEST", "eve@AD.TEST", "zed@AD.TEST");
+    let create = SealOp::Create {
+        name: "mine".into(),
+        policy: seal::Policy {
+            factors: Factors {
+                device: None,
+                ticket: true,
+                passkey: false,
+            },
+            ..seal::Policy::default()
+        },
+    };
+    let show = SealOp::Show {
+        name: "ada@AD.TEST/mine".into(),
+    };
+    assert!(
+        seal_op(&r, &adv, ada, &create).is_err(),
+        "closed by default"
+    );
+    r.dir.limits.borrow_mut().trusted_owners = seal::TrustedOwners {
+        allow: vec!["AD.TEST".into()],
+        deny: vec![eve.into()],
+    };
+    seal_op(&r, &adv, ada, &create).unwrap();
+    assert!(seal_op(&r, &adv, eve, &create).is_err(), "denied user");
+    r.dir.unknown.borrow_mut().insert(zed.into());
+    assert!(seal_op(&r, &adv, zed, &create).is_err(), "no ID override");
+    let shown = seal_op(&r, &adv, ada, &show).unwrap();
+    assert_eq!(shown.len(), 1);
+    // Clients verify the descriptor of a seal a trusted-realm user owns.
+    let anchors = r.anchors();
+    let verified = shown[0]
+        .verify(REALM, &anchors, &Policy::default())
+        .unwrap();
+    assert_eq!(verified.owner().to_string(), ada);
+    // The owner seals a file and opens it with her ticket, until denied.
+    let advs = [r.verify(0), r.verify(1)];
+    let sealed = SealedFile::seal(&verified, &[&advs[0], &advs[1]], b"ad secret").unwrap();
+    let open = |sealed: &SealedFile| {
+        let mut ticket = |_: &str, cb: &[u8; 32]| Some(gss_token(ada, cb));
+        sealed.open(
+            Unlock {
+                device: None,
+                session: None,
+                ticket: Some(&mut ticket),
+                release: None,
+                passkey: None,
+            },
+            |s, req| ask_server(&r, s, req),
+        )
+    };
+    assert_eq!(open(&sealed).unwrap().as_ref(), b"ad secret");
+    r.dir
+        .limits
+        .borrow_mut()
+        .trusted_owners
+        .deny
+        .push("AD.TEST".into());
+    assert!(seal_op(&r, &adv, ada, &show).is_err(), "denied later");
+    assert!(open(&sealed).is_err(), "and her file stays shut");
+    // Seal administrators still revoke it.
+    let revoke = SealOp::AdminRevoke {
+        owner: ada.into(),
+        name: "mine".into(),
+    };
+    assert!(seal_op(&r, &adv, ALICE, &revoke).is_err(), "not an admin");
+    r.dir.seal_admins.borrow_mut().insert(BOB.into());
+    seal_op(&r, &adv, BOB, &revoke).unwrap();
+    assert!(
+        r.dir
+            .seals
+            .borrow()
+            .values()
+            .any(|s| s.owner == ada && s.state == seal::State::Revoked),
+        "revoked"
+    );
 }
 
 #[test]
