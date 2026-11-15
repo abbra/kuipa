@@ -28,20 +28,20 @@ pub const MAX_SPEND_BYTES: usize = 16 * 1024;
 
 /// What the redeemer asks of the home server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SpendOp {
     /// Record the salt as spent for this redeemer and host.
-    Spend,
+    Spend = 1,
     /// Remove the record the redeemer wrote, because the host it made does
     /// not exist.
     Release,
 }
 
 impl SpendOp {
+    const ALL: [Self; 2] = [Self::Spend, Self::Release];
+
     fn code(self) -> u8 {
-        match self {
-            Self::Spend => 1,
-            Self::Release => 2,
-        }
+        self as u8
     }
 }
 
@@ -106,11 +106,11 @@ impl SpendRequest {
     /// [`Error::Malformed`].
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::with_version(buf, SPEND_MAGIC, SPEND_VERSION, "voucher spend")?;
-        let op = match r.u8()? {
-            1 => SpendOp::Spend,
-            2 => SpendOp::Release,
-            _ => return Err(Error::Malformed("voucher spend operation")),
-        };
+        let code = r.u8()?;
+        let op = SpendOp::ALL
+            .into_iter()
+            .find(|o| o.code() == code)
+            .ok_or(Error::Malformed("voucher spend operation"))?;
         let request = Self {
             op,
             sender: r.str()?.into(),

@@ -106,9 +106,10 @@ impl Operation {
 
 /// How the request is authorised (§5.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum AuthType {
     /// One-time password.
-    Otp,
+    Otp = 1,
     /// GSS-API initial token with channel bindings.
     Kerberos,
     /// Enrollment voucher.
@@ -116,23 +117,19 @@ pub enum AuthType {
 }
 
 impl AuthType {
+    const ALL: [Self; 3] = [Self::Otp, Self::Kerberos, Self::Voucher];
+
     const fn id(self) -> u8 {
-        match self {
-            Self::Otp => 1,
-            Self::Kerberos => 2,
-            Self::Voucher => 3,
-        }
+        self as u8
     }
 
+    // 4 was a principal and password sealed to the server; password joins
+    // now get a ticket on the host instead (§5.3).
     fn from_id(id: u8) -> Result<Self> {
-        match id {
-            1 => Ok(Self::Otp),
-            2 => Ok(Self::Kerberos),
-            3 => Ok(Self::Voucher),
-            // 4 was a principal and password sealed to the server; password
-            // joins now get a ticket on the host instead (§5.3).
-            _ => Err(Error::Malformed("auth type")),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|a| a.id() == id)
+            .ok_or(Error::Malformed("auth type"))
     }
 }
 

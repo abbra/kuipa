@@ -972,6 +972,30 @@ pub enum SealAction {
 }
 
 impl SealAction {
+    const ALL: [Self; 21] = [
+        Self::Create,
+        Self::SetPolicy,
+        Self::Revoke,
+        Self::AddDevice,
+        Self::RemoveDevice,
+        Self::Session,
+        Self::OfflineSession,
+        Self::Release,
+        Self::Share,
+        Self::Unshare,
+        Self::Request,
+        Self::Approve,
+        Self::Deny,
+        Self::EscrowCode,
+        Self::RecoverCode,
+        Self::Deposit,
+        Self::RetireDeposit,
+        Self::Deliver,
+        Self::EscrowShards,
+        Self::EnrollShards,
+        Self::RecoverShards,
+    ];
+
     /// The kind of leaf that records it.
     #[must_use]
     pub const fn kind(self) -> Kind {
@@ -1001,30 +1025,10 @@ impl SealAction {
     }
 
     fn from_code(code: u8) -> Result<Self> {
-        Ok(match code {
-            1 => Self::Create,
-            2 => Self::SetPolicy,
-            3 => Self::Revoke,
-            4 => Self::AddDevice,
-            5 => Self::RemoveDevice,
-            6 => Self::Session,
-            7 => Self::OfflineSession,
-            8 => Self::Release,
-            9 => Self::Share,
-            10 => Self::Unshare,
-            11 => Self::Request,
-            12 => Self::Approve,
-            13 => Self::Deny,
-            14 => Self::EscrowCode,
-            15 => Self::RecoverCode,
-            16 => Self::Deposit,
-            17 => Self::RetireDeposit,
-            18 => Self::Deliver,
-            19 => Self::EscrowShards,
-            20 => Self::EnrollShards,
-            21 => Self::RecoverShards,
-            _ => return Err(Error::Malformed("seal event action")),
-        })
+        Self::ALL
+            .into_iter()
+            .find(|a| *a as u8 == code)
+            .ok_or(Error::Malformed("seal event action"))
     }
 }
 

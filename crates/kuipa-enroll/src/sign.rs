@@ -45,9 +45,10 @@ pub(crate) const MAX_PURPOSE: usize = 64;
 /// A digest algorithm a statement may cover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[repr(u8)]
 pub enum DigestAlg {
     /// SHA-256.
-    Sha256,
+    Sha256 = 1,
     /// SHA-384.
     Sha384,
     /// SHA-512.
@@ -55,21 +56,17 @@ pub enum DigestAlg {
 }
 
 impl DigestAlg {
+    const ALL: [Self; 3] = [Self::Sha256, Self::Sha384, Self::Sha512];
+
     const fn id(self) -> u8 {
-        match self {
-            Self::Sha256 => 1,
-            Self::Sha384 => 2,
-            Self::Sha512 => 3,
-        }
+        self as u8
     }
 
     fn from_id(id: u8) -> Result<Self> {
-        Ok(match id {
-            1 => Self::Sha256,
-            2 => Self::Sha384,
-            3 => Self::Sha512,
-            _ => return Err(Error::Malformed("digest algorithm")),
-        })
+        Self::ALL
+            .into_iter()
+            .find(|a| a.id() == id)
+            .ok_or(Error::Malformed("digest algorithm"))
     }
 
     /// The digest a client should use where `policy` holds: SHA-256 while

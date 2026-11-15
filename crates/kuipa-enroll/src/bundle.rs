@@ -35,9 +35,10 @@ pub(crate) const SIGNATURE_CONTEXT: &[u8] = b"ipa-ku-enroll/v1 bundle";
 
 /// How a bundle is opened (§8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Mode {
     /// A: encrypted to an ML-KEM key the target generated.
-    MachineKey,
+    MachineKey = 1,
     /// B: encrypted under a secret delivered by a second channel.
     Secret,
     /// C: signed only; requires an explicit opt-in to open (DESIGN.md
@@ -47,21 +48,17 @@ pub enum Mode {
 }
 
 impl Mode {
+    const ALL: [Self; 3] = [Self::MachineKey, Self::Secret, Self::SignedOnly];
+
     const fn id(self) -> u8 {
-        match self {
-            Self::MachineKey => 1,
-            Self::Secret => 2,
-            Self::SignedOnly => 3,
-        }
+        self as u8
     }
 
     fn from_id(id: u8) -> Result<Self> {
-        match id {
-            1 => Ok(Self::MachineKey),
-            2 => Ok(Self::Secret),
-            3 => Ok(Self::SignedOnly),
-            _ => Err(Error::Malformed("bundle mode")),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|m| m.id() == id)
+            .ok_or(Error::Malformed("bundle mode"))
     }
 }
 

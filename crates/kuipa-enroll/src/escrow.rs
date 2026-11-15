@@ -55,9 +55,10 @@ fn context(principal: &Principal) -> BindingContext {
 /// What a sealed object holds, and so which of its principal's binding
 /// sets opens it (§7.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Kind {
     /// The principal's keytab.  Its bindings are replaced at every seal.
-    Keytab,
+    Keytab = 1,
     /// Any other file.  Its bindings are added beside the others', and
     /// retired one seal at a time.
     File,
@@ -73,19 +74,17 @@ impl Kind {
         }
     }
 
+    const ALL: [Self; 2] = [Self::Keytab, Self::File];
+
     const fn id(self) -> u8 {
-        match self {
-            Self::Keytab => 1,
-            Self::File => 2,
-        }
+        self as u8
     }
 
     fn from_id(id: u8) -> Result<Self> {
-        match id {
-            1 => Ok(Self::Keytab),
-            2 => Ok(Self::File),
-            _ => Err(Error::Malformed("binding set")),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|k| k.id() == id)
+            .ok_or(Error::Malformed("binding set"))
     }
 }
 
