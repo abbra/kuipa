@@ -187,6 +187,70 @@ fn aes_256_gcm() -> Result<CipherAlg> {
 /// derived from a fresh ML-KEM encapsulation.
 const NONCE: [u8; 12] = [0; 12];
 
+fn check_key(key: &[u8]) -> Result<()> {
+    if key.len() == 32 {
+        Ok(())
+    } else {
+        Err(Error::Malformed("AES-256-GCM key"))
+    }
+}
+
+/// AES-256-GCM encryption under a 32-byte key with the given `nonce` and
+/// optional associated data; returns `ct ‖ tag`.  Never reuse a
+/// `(key, nonce)` pair.
+///
+/// # Errors
+///
+/// [`Error::Malformed`] for a key that is not 32 bytes, or an OpenSSL error.
+pub fn seal_with(
+    key: &[u8],
+    nonce: &[u8; 12],
+    aad: Option<&[u8]>,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    check_key(key)?;
+    let mut ctx = AeadEncryptCtx::new(&aes_256_gcm()?, key, nonce, None)?;
+    if let Some(aad) = aad {
+        ctx.set_aad(aad)?;
+    }
+    let mut out = vec![0u8; plaintext.len() + TAG_LEN];
+    let n = ctx.update(plaintext, &mut out)?;
+    let n = n + ctx.finalize(&mut out[n..])?;
+    ctx.tag(&mut out[n..n + TAG_LEN])?;
+    out.truncate(n + TAG_LEN);
+    Ok(out)
+}
+
+/// Inverse of [`seal_with`].
+///
+/// # Errors
+///
+/// [`Error::RecoveryFailed`] if the ciphertext is truncated or does not
+/// authenticate.
+pub fn open_with(
+    key: &[u8],
+    nonce: &[u8; 12],
+    aad: Option<&[u8]>,
+    sealed: &[u8],
+) -> Result<SecretBuf> {
+    check_key(key)?;
+    let split = sealed
+        .len()
+        .checked_sub(TAG_LEN)
+        .ok_or(Error::RecoveryFailed)?;
+    let (ciphertext, tag) = sealed.split_at(split);
+    let mut ctx = AeadDecryptCtx::new(&aes_256_gcm()?, key, nonce, None)?;
+    if let Some(aad) = aad {
+        ctx.set_aad(aad)?;
+    }
+    let mut out = SecretBuf::with_len(ciphertext.len());
+    let n = ctx.update(ciphertext, out.as_mut_slice())?;
+    ctx.set_tag(tag)?;
+    ctx.finalize(&mut out.as_mut_slice()[n..])
+        .map_err(|_| Error::RecoveryFailed)?;
+    Ok(out)
+}
+
 /// AES-256-GCM encryption under a **single-use** 32-byte key; returns
 /// `ct ‖ tag`.  The nonce is fixed, so never encrypt twice under one key.
 ///
@@ -194,16 +258,7 @@ const NONCE: [u8; 12] = [0; 12];
 ///
 /// [`Error::Malformed`] for a key that is not 32 bytes, or an OpenSSL error.
 pub fn seal(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    if key.len() != 32 {
-        return Err(Error::Malformed("AES-256-GCM key"));
-    }
-    let mut ctx = AeadEncryptCtx::new(&aes_256_gcm()?, key, &NONCE, None)?;
-    let mut out = vec![0u8; plaintext.len() + TAG_LEN];
-    let n = ctx.update(plaintext, &mut out)?;
-    let n = n + ctx.finalize(&mut out[n..])?;
-    ctx.tag(&mut out[n..n + TAG_LEN])?;
-    out.truncate(n + TAG_LEN);
-    Ok(out)
+    seal_with(key, &NONCE, None, plaintext)
 }
 
 /// Inverse of [`seal`].
@@ -213,21 +268,7 @@ pub fn seal(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
 /// [`Error::RecoveryFailed`] if the ciphertext is truncated or does not
 /// authenticate.
 pub fn open(key: &[u8], sealed: &[u8]) -> Result<SecretBuf> {
-    if key.len() != 32 {
-        return Err(Error::Malformed("AES-256-GCM key"));
-    }
-    let split = sealed
-        .len()
-        .checked_sub(TAG_LEN)
-        .ok_or(Error::RecoveryFailed)?;
-    let (ciphertext, tag) = sealed.split_at(split);
-    let mut ctx = AeadDecryptCtx::new(&aes_256_gcm()?, key, &NONCE, None)?;
-    let mut out = SecretBuf::with_len(ciphertext.len());
-    let n = ctx.update(ciphertext, out.as_mut_slice())?;
-    ctx.set_tag(tag)?;
-    ctx.finalize(&mut out.as_mut_slice()[n..])
-        .map_err(|_| Error::RecoveryFailed)?;
-    Ok(out)
+    open_with(key, &NONCE, None, sealed)
 }
 
 /// The nonce of chunk `counter` of a stream: a 4-byte per-stream prefix and
@@ -263,17 +304,8 @@ pub fn seal_chunk(
     last: bool,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    if key.len() != 32 {
-        return Err(Error::Malformed("AES-256-GCM key"));
-    }
-    let mut ctx = AeadEncryptCtx::new(&aes_256_gcm()?, key, &chunk_nonce(*prefix, counter), None)?;
-    ctx.set_aad(&chunk_aad(header, last))?;
-    let mut out = vec![0u8; plaintext.len() + TAG_LEN];
-    let n = ctx.update(plaintext, &mut out)?;
-    let n = n + ctx.finalize(&mut out[n..])?;
-    ctx.tag(&mut out[n..n + TAG_LEN])?;
-    out.truncate(n + TAG_LEN);
-    Ok(out)
+    let aad = chunk_aad(header, last);
+    seal_with(key, &chunk_nonce(*prefix, counter), Some(&aad), plaintext)
 }
 
 /// Inverse of [`seal_chunk`].
@@ -290,22 +322,8 @@ pub fn open_chunk(
     last: bool,
     sealed: &[u8],
 ) -> Result<SecretBuf> {
-    if key.len() != 32 {
-        return Err(Error::Malformed("AES-256-GCM key"));
-    }
-    let split = sealed
-        .len()
-        .checked_sub(TAG_LEN)
-        .ok_or(Error::RecoveryFailed)?;
-    let (ciphertext, tag) = sealed.split_at(split);
-    let mut ctx = AeadDecryptCtx::new(&aes_256_gcm()?, key, &chunk_nonce(*prefix, counter), None)?;
-    ctx.set_aad(&chunk_aad(header, last))?;
-    let mut out = SecretBuf::with_len(ciphertext.len());
-    let n = ctx.update(ciphertext, out.as_mut_slice())?;
-    ctx.set_tag(tag)?;
-    ctx.finalize(&mut out.as_mut_slice()[n..])
-        .map_err(|_| Error::RecoveryFailed)?;
-    Ok(out)
+    let aad = chunk_aad(header, last);
+    open_with(key, &chunk_nonce(*prefix, counter), Some(&aad), sealed)
 }
 
 /// ML-KEM encapsulation; returns `(ciphertext, shared secret)`.
