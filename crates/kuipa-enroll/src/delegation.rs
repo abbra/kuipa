@@ -2355,6 +2355,36 @@ mod tests {
         assert_eq!(HeadPin::from_json(&head.to_json()).unwrap(), head);
     }
 
+    /// The JSON members of a head pin and a head proof, byte for byte
+    /// (keys sorted, as the `Value` form wrote them).
+    #[test]
+    fn head_json_is_pinned() {
+        let pin = HeadPin {
+            anchor: Thumbprint::from_bytes([1; 32]),
+            size: 3,
+            root: Hash::from_slice(&[2; 32]).unwrap(),
+        };
+        let pin_json = serde_json::json!({"anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "size": 3, "root": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"});
+        assert_eq!(pin.to_json(), pin_json);
+        assert_eq!(HeadPin::from_json(&pin_json).unwrap(), pin);
+        let proof_json = serde_json::json!({
+            "anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "index": 1, "size": 3, "path": ["AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"],
+        });
+        let proof = HeadProof::from_json(&proof_json).unwrap();
+        assert_eq!(proof.to_json(), proof_json);
+        assert_eq!(proof.to_json().to_string(), format!(
+            r#"{{"anchor":"{}","index":1,"path":["{}","{}"],"size":3}}"#,
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+        ));
+        for bad in [
+            serde_json::json!({"anchor": "x", "size": 3, "root": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"}),
+            serde_json::json!({"anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "size": 3, "root": "Zm9v"}),
+            serde_json::json!({"anchor": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "root": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"}),
+        ] {
+            assert!(HeadPin::from_json(&bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn issue_and_verify() {
         let (anchor, server) = (key(), key());

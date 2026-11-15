@@ -1198,6 +1198,79 @@ pub(crate) mod tests {
         }
     }
 
+    /// The JSON forms of the realm metadata, byte for byte.
+    #[test]
+    fn json_forms_are_pinned() {
+        let anchor = Thumbprint::from_bytes([1; 32]);
+        let head = HeadPin {
+            anchor,
+            size: 3,
+            root: crate::merkle::Hash::from_slice(&[2; 32]).unwrap(),
+        };
+        let proxy = KdcProxy {
+            urls: vec!["https://ipa1.b.test/KdcProxy".into()],
+            ca: ProxyCa::System,
+        };
+        let trusted = TrustedRealm {
+            heads: vec![head],
+            kdc_proxy: Some(proxy.clone()),
+            ..trusted("B.TEST", anchor)
+        };
+        let trusted_json = concat!(
+            r#"{"realm":"B.TEST","domain":"b.test","servers":["ipa1.b.test"],"#,
+            r#""anchors":["@A"],"heads":[{"anchor":"@A","root":"@R","size":3}],"#,
+            r#""kdc_proxy":{"urls":["https://ipa1.b.test/KdcProxy"],"ca":"system"}}"#,
+        )
+        .replace("@A", "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE")
+        .replace("@R", "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI");
+        assert_eq!(trusted.to_json(), trusted_json);
+        assert_eq!(
+            TrustedRealm::from_json(trusted_json.as_bytes()).unwrap(),
+            trusted
+        );
+        for bad in [
+            trusted_json.replace(r#""size":3"#, r#""size":"3""#),
+            trusted_json.replace("system", "other"),
+            trusted_json.replace(r#""urls":[""#, r#""urls":[1,""#),
+            trusted_json.replace("AgIC", "AgI"),
+        ] {
+            assert!(TrustedRealm::from_json(bad.as_bytes()).is_err(), "{bad}");
+        }
+
+        let mut info = RealmInfo {
+            realm: "EXAMPLE.TEST".into(),
+            domain: "example.test".into(),
+            basedn: "dc=example,dc=test".into(),
+            server: "ipa1.example.test".into(),
+            servers: vec!["ipa1.example.test".into()],
+            ca_certs: vec![b"ca-der".to_vec()],
+            pkinit_anchors: Vec::new(),
+            anchors: vec![anchor],
+            heads: vec![head],
+            trusts: vec![trusted],
+            kdc_proxy: Some(proxy),
+        };
+        let info_json = format!(
+            r#"{{"realm":"EXAMPLE.TEST","domain":"example.test","basedn":"dc=example,dc=test","server":"ipa1.example.test","servers":["ipa1.example.test"],"ca_certs":["Y2EtZGVy"],"pkinit_anchors":[],"anchors":["@A"],"heads":[{{"anchor":"@A","root":"@R","size":3}}],"trusts":[{trusted_json}],"kdc_proxy":{{"urls":["https://ipa1.b.test/KdcProxy"],"ca":"system"}}}}"#,
+        )
+        .replace("@A", "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE")
+        .replace("@R", "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI");
+        assert_eq!(
+            info.to_value(),
+            serde_json::from_str::<serde_json::Value>(&info_json).unwrap()
+        );
+        // Older advertisements have no heads, trusts or proxy.
+        info.ca_certs.clear();
+        info.heads.clear();
+        info.trusts.clear();
+        info.kdc_proxy = None;
+        let old = r#"{"realm":"EXAMPLE.TEST","domain":"example.test","basedn":"dc=example,dc=test","server":"ipa1.example.test","servers":["ipa1.example.test"],"ca_certs":[],"pkinit_anchors":[],"anchors":["@A"]}"#
+            .replace("@A", "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE");
+        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        assert_eq!(info.to_value(), old);
+        assert_eq!(RealmInfo::from_value(&old).unwrap(), info);
+    }
+
     #[test]
     fn trusted_realms_are_separate_realms() {
         let mut t = test_realm("ipa1.example.test");
