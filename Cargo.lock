@@ -1067,7 +1067,6 @@ dependencies = [
 name = "kuipa-fido2"
 version = "0.1.0"
 dependencies = [
- "libc",
  "native-ossl",
  "pkg-config",
  "thiserror",
@@ -1077,7 +1076,6 @@ dependencies = [
 name = "kuipa-gssapi"
 version = "0.1.0"
 dependencies = [
- "libc",
  "native-ossl",
  "pkg-config",
  "thiserror",
@@ -1153,14 +1151,12 @@ dependencies = [
  "agirru-crdt",
  "agirru-engine",
  "axum",
- "ciborium",
  "kuipa-enroll",
  "kuipa-gssapi",
  "kuipa-ldap",
  "listenfd",
  "native-ossl",
  "reqwest",
- "rustls",
  "rustls-native-ossl",
  "serde",
  "serde_json",
@@ -1168,6 +1164,8 @@ dependencies = [
  "synta-certificate",
  "tang-pqc",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
