@@ -472,10 +472,7 @@ impl Answer {
         self.statement.write(&mut w);
         w.u64(self.paths.len() as u64);
         for p in &self.paths {
-            w.u8(u8::try_from(p.len()).expect("short paths"));
-            for h in p {
-                w.bytes(h);
-            }
+            crate::merkle::write_path(&mut w, p);
         }
         w.finish()
     }
@@ -493,11 +490,7 @@ impl Answer {
             .filter(|n| *n <= MAX_DIGESTS)
             .ok_or(Error::Malformed("signing answer"))?;
         let paths = (0..n)
-            .map(|_| -> Result<Vec<Hash>> {
-                (0..r.u8()?)
-                    .map(|_| Hash::from_slice(r.bytes()?))
-                    .collect::<Result<_>>()
-            })
+            .map(|_| crate::merkle::read_path(&mut r))
             .collect::<Result<_>>()?;
         r.finish()?;
         Ok(Self { statement, paths })
@@ -648,11 +641,8 @@ impl Bundle {
         let mut w = Writer::new(BUNDLE_MAGIC);
         self.statement.write(&mut w);
         self.digest.write(&mut w);
-        w.u64(self.index)
-            .u8(u8::try_from(self.path.len()).expect("short paths"));
-        for h in &self.path {
-            w.bytes(h);
-        }
+        w.u64(self.index);
+        crate::merkle::write_path(&mut w, &self.path);
         w.finish()
     }
 
@@ -666,9 +656,7 @@ impl Bundle {
         let statement = SignedStatement::read(&mut r)?;
         let digest = Digest::read(&mut r)?;
         let index = r.u64()?;
-        let path = (0..r.u8()?)
-            .map(|_| Hash::from_slice(r.bytes()?))
-            .collect::<Result<_>>()?;
+        let path = crate::merkle::read_path(&mut r)?;
         r.finish()?;
         Ok(Self {
             statement,

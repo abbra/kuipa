@@ -1165,10 +1165,7 @@ impl Answer {
             .u64(self.entries.len() as u64);
         for e in &self.entries {
             w.u64(e.index).bytes(&e.leaf.to_bytes());
-            w.u8(u8::try_from(e.path.len()).expect("short paths"));
-            for h in &e.path {
-                w.bytes(h);
-            }
+            crate::merkle::write_path(&mut w, &e.path);
             w.bytes(
                 &e.opening
                     .as_ref()
@@ -1200,9 +1197,7 @@ impl Answer {
         for _ in 0..n {
             let index = r.u64()?;
             let leaf = Leaf::from_bytes(r.bytes()?)?;
-            let path = (0..r.u8()?)
-                .map(|_| Hash::from_slice(r.bytes()?))
-                .collect::<Result<_>>()?;
+            let path = crate::merkle::read_path(&mut r)?;
             let opening = match r.bytes()? {
                 [] => None,
                 b => Some(Opening::from_bytes(b)?),

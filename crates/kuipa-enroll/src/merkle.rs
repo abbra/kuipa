@@ -167,6 +167,18 @@ impl std::fmt::Debug for Hash {
     }
 }
 
+/// A Merkle path: a `u8` count, then each hash length prefixed.
+pub(crate) fn write_path(w: &mut tang_pqc::wire::Writer, path: &[Hash]) {
+    w.u8(u8::try_from(path.len()).expect("short paths"));
+    for h in path {
+        w.bytes(h);
+    }
+}
+
+pub(crate) fn read_path(r: &mut tang_pqc::wire::Reader<'_>) -> Result<Vec<Hash>> {
+    (0..r.u8()?).map(|_| Hash::from_slice(r.bytes()?)).collect()
+}
+
 /// A SHA-256-sized hash of `byte`s, for tests.
 #[cfg(test)]
 pub(crate) fn test_hash(byte: u8) -> Hash {
