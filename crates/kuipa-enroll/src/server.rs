@@ -2589,7 +2589,7 @@ impl EnrollServer {
         let mut id = [0u8; 16];
         native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
         let request = ReleaseRequest {
-            id: hex(&id),
+            id: native_ossl::util::hex_encode(id),
             seal: seal.id,
             requester: caller.to_string(),
             bindings,
@@ -3094,7 +3094,7 @@ impl EnrollServer {
         let mut id = [0u8; 16];
         native_ossl::rand::Rand::fill(&mut id).map_err(Error::from)?;
         let deposit = Deposit {
-            id: hex(&id),
+            id: native_ossl::util::hex_encode(id),
             seal: seal.id,
             depositor: me,
             kind,
@@ -3108,11 +3108,7 @@ impl EnrollServer {
             .into_iter()
             .collect::<Vec<_>>();
         if seal.policy.sealing == crate::seal::Sealing::Registered {
-            let add = file
-                .bindings()?
-                .iter()
-                .map(crate::seal::binding_hex)
-                .collect();
+            let add = file.bindings()?.iter().map(ToString::to_string).collect();
             register_bindings(&mut seal, add, &[])?;
             directory.seal_update(&seal)?;
         }
@@ -3145,7 +3141,7 @@ impl EnrollServer {
                 .ok()
                 .and_then(|b| crate::seal::SealedFile::from_bytes(&b).ok());
             if let Some(file) = file {
-                retired.extend(file.bindings()?.iter().map(crate::seal::binding_hex));
+                retired.extend(file.bindings()?.iter().map(ToString::to_string));
             }
         }
         if seal.policy.sealing == crate::seal::Sealing::Registered && !retired.is_empty() {
@@ -3181,7 +3177,7 @@ impl EnrollServer {
         };
         let id = request
             .release()
-            .map(|id| hex(id))
+            .map(native_ossl::util::hex_encode)
             .ok_or_else(|| Refusal::because("the seal needs an approved release request"))?;
         let release = directory
             .releases(&seal.id)?
@@ -3878,9 +3874,8 @@ impl EnrollServer {
                 return Err(Refusal::because("the device's level is too low"));
             }
         }
-        let binding = crate::seal::binding_hex(&BindingHash::from_slice(
-            &opened.ciphertext_hash().map_err(Error::from)?,
-        )?);
+        let binding =
+            BindingHash::from_slice(&opened.ciphertext_hash().map_err(Error::from)?)?.to_string();
         if seal.policy.sealing == crate::seal::Sealing::Registered
             && !seal.bindings.contains(&binding)
         {
@@ -4019,15 +4014,6 @@ fn normalize_approvers(policy: &mut crate::seal::Policy, realm: &str) -> Result<
         approvals.from = approvals.from.normalized(realm)?;
     }
     Ok(())
-}
-
-/// Lower-case hex of `bytes`.
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 /// Whether `seal`'s approvals admit `principal` as an approver.

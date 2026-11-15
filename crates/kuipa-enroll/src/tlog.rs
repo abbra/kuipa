@@ -371,7 +371,7 @@ impl LogId {
 impl std::fmt::Display for LogId {
     /// Lowercase hex, as in the log's directory and routes.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+        std::fmt::Display::fmt(&self.0, f)
     }
 }
 
@@ -379,20 +379,10 @@ impl std::str::FromStr for LogId {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let bytes = s.as_bytes();
-        // Hex digits only: from_str_radix would also take a sign.  Two per
-        // byte of a SHA-256 or SHA-384 id.
-        let digits = bytes.len() / 2;
-        if !bytes.len().is_multiple_of(2)
-            || TreeHash::of_len(digits).is_none()
-            || !bytes.iter().all(u8::is_ascii_hexdigit)
-        {
+        let id = native_ossl::util::hex_decode(s).map_err(|_| Error::Malformed("log id"))?;
+        // The id of a SHA-256 or SHA-384 log.
+        if TreeHash::of_len(id.len()).is_none() {
             return Err(Error::Malformed("log id"));
-        }
-        let mut id = vec![0u8; bytes.len() / 2];
-        for (out, pair) in id.iter_mut().zip(bytes.as_chunks::<2>().0) {
-            let pair = std::str::from_utf8(pair).map_err(|_| Error::Malformed("log id"))?;
-            *out = u8::from_str_radix(pair, 16).map_err(|_| Error::Malformed("log id"))?;
         }
         Ok(Self(Hash::from_slice(&id)?))
     }

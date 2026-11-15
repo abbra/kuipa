@@ -805,11 +805,7 @@ pub(crate) const MAX_BINDINGS: usize = 4096;
 /// A binding hash as the seal stores it.
 #[must_use]
 pub fn binding_hex(hash: &BindingHash) -> String {
-    use std::fmt::Write as _;
-    hash.iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    hash.to_string()
 }
 
 /// One server's way into a session key: the key's private JWK sealed to
@@ -1580,15 +1576,10 @@ impl ReleaseRequest {
     ///
     /// [`Error::Malformed`] for an id that is not 32 hex digits.
     pub fn id_bytes(id: &str) -> Result<[u8; 16]> {
-        let mut out = [0u8; 16];
-        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::Malformed("release request id"));
-        }
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&id[2 * i..2 * i + 2], 16)
-                .map_err(|_| Error::Malformed("release request id"))?;
-        }
-        Ok(out)
+        native_ossl::util::hex_decode(id)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or(Error::Malformed("release request id"))
     }
 }
 

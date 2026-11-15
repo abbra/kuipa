@@ -152,7 +152,7 @@ impl SealId {
 
 impl std::fmt::Display for SealId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+        f.write_str(&native_ossl::util::hex_encode(self.0))
     }
 }
 
@@ -160,15 +160,11 @@ impl std::str::FromStr for SealId {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::Malformed("seal id"));
-        }
-        let mut id = [0u8; 16];
-        for (i, byte) in id.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)
-                .map_err(|_| Error::Malformed("seal id"))?;
-        }
-        Ok(Self(id))
+        native_ossl::util::hex_decode(s)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .map(Self)
+            .ok_or(Error::Malformed("seal id"))
     }
 }
 
