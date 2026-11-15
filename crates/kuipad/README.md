@@ -26,10 +26,11 @@ repairs are limited to 16. Busy responses (HTTP 503 or source-rate-limit 429)
 receive up to three delayed retries; later rounds and sweeps retry failures.
 
 A repair compares state digests, then bucket hashes, and exchanges only
-the entries that differ (DESIGN §4.2.1). If either state exceeds 4,096
-entries or a summary or selection exceeds its bound, it transfers the whole
-snapshot in authenticated chunks of at most 128 KiB, subject to a 1 MiB
-per-message limit and a 64 MiB snapshot limit.
+the entries that differ (DESIGN §4.2.1). If the two states' entry counts
+differ by more than 4,096, it transfers the whole snapshot instead, in
+authenticated chunks of at most 128 KiB, subject to a 1 MiB per-message
+limit and a 64 MiB snapshot limit. A repair still unreconciled after its
+attempts fails and waits for a later round.
 Incomplete uploads reserve at most 64 MiB of declared snapshot size in
 total and expire after two minutes of inactivity. Only a complete
 digest-verified snapshot is admitted and durably merged. A repair that
