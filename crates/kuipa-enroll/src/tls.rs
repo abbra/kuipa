@@ -22,8 +22,11 @@
 use std::sync::Arc;
 
 use native_ossl::x509::X509;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{CertificateError, Error as TlsError};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
+};
 use rustls_native_ossl::cert_verifier::{
     CertChainVerifier, OsslChainVerifier, OsslServerCertVerifier,
 };
@@ -74,6 +77,85 @@ pub fn server_verifier(ca_certs: &[Vec<u8>]) -> Result<OsslServerCertVerifier, T
         OsslServerCertVerifier::builder_with_verifier(Arc::new(ChainVerifier { signed, mtc }))
             .build(),
     )
+}
+
+/// Accepts any server certificate, but still checks handshake signatures:
+/// for the first contact with a realm, before its CA is known.  Whatever is
+/// fetched that way is untrusted until it verifies by other means.
+#[derive(Debug)]
+pub struct FirstContact(Arc<rustls::crypto::CryptoProvider>);
+
+impl FirstContact {
+    /// A verifier checking handshake signatures with `provider`.
+    #[must_use]
+    pub fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+        Self(provider)
+    }
+}
+
+impl ServerCertVerifier for FirstContact {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// A client TLS configuration with `rustls-native-ossl`'s provider that
+/// verifies servers against `ca` (DER, [`server_verifier`]), or accepts any
+/// certificate ([`FirstContact`]) without one.
+///
+/// # Errors
+///
+/// A rustls error if a certificate in `ca` does not parse, as for
+/// [`server_verifier`].
+pub fn client_config(ca: Option<&[Vec<u8>]>) -> Result<ClientConfig, TlsError> {
+    let provider = Arc::new(rustls_native_ossl::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?
+        .dangerous();
+    let config = match ca {
+        Some(certs) => builder.with_custom_certificate_verifier(Arc::new(server_verifier(certs)?)),
+        None => builder.with_custom_certificate_verifier(Arc::new(FirstContact::new(provider))),
+    };
+    Ok(config.with_no_client_auth())
 }
 
 fn invalid(e: CertificateError) -> TlsError {
@@ -394,7 +476,7 @@ impl ChainVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::server_verifier;
+    use super::{FirstContact, client_config, server_verifier};
     use native_ossl::pkey::{KeygenCtx, Pkey, Private};
     use rustls::client::danger::ServerCertVerifier;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -412,6 +494,32 @@ mod tests {
     /// The demo corpus's CA cosigner key (cosigner 32473.1), a published
     /// test vector (`tests/data/README.md`).
     const DEMO_CA_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgthrguld6LZNJw6UMbhyTkML7u3BMcdEyomQIwB+N2o6hRANCAAR6nKeTu+M2OxL7HCjH/i0+lnIx7OE0b3DnXWVue+5TBVDq8aG6KqFq+xprV5ll6QtPJb+TTBp+Kv1IRpDxMpxt";
+
+    #[test]
+    fn first_contact_accepts_any_certificate_and_client_config_picks_the_verifier() {
+        let provider = std::sync::Arc::new(rustls_native_ossl::default_provider());
+        let first = FirstContact::new(provider);
+        let junk = CertificateDer::from(vec![1, 2, 3]);
+        let name = ServerName::try_from("a.example").unwrap();
+        first
+            .verify_server_cert(
+                &junk,
+                &[],
+                &name,
+                &[],
+                UnixTime::since_unix_epoch(std::time::Duration::ZERO),
+            )
+            .unwrap();
+        assert!(
+            first
+                .supported_verify_schemes()
+                .contains(&rustls::SignatureScheme::ECDSA_NISTP256_SHA256)
+        );
+
+        client_config(None).unwrap();
+        client_config(Some(&[demo_ca()])).unwrap();
+        assert!(client_config(Some(&[vec![1, 2, 3]])).is_err());
+    }
 
     fn pem(bytes: &[u8]) -> Vec<u8> {
         synta_certificate::pem_to_der(bytes).remove(0)
