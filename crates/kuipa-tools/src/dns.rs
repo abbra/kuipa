@@ -22,7 +22,6 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
 use hickory_resolver::{Resolver, TokioResolver};
 use kuipa_enroll::realm::is_safe_name;
-use kuipa_enroll::tls::server_verifier;
 
 use crate::paths::Error;
 
@@ -203,12 +202,8 @@ fn tls_config() -> Result<rustls::ClientConfig, Error> {
     if cas.is_empty() {
         return Err(format!("KUIPA_DNS_CA={path:?}: no PEM certificates").into());
     }
-    let verifier = server_verifier(&cas).map_err(|e| format!("KUIPA_DNS_CA={path:?}: {e}"))?;
-    Ok(rustls_native_ossl::client_config_builder()
-        .map_err(|e| format!("TLS for DNS: {e}"))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth())
+    Ok(kuipa_enroll::tls::client_config(Some(&cas))
+        .map_err(|e| format!("KUIPA_DNS_CA={path:?}: {e}"))?)
 }
 
 /// The nameserver from `KUIPA_DNS`, if set.

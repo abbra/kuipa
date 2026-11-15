@@ -16,13 +16,9 @@
 //! server's name and port, never the protocol.  A Unix socket is never
 //! proxied.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use tang_pqc::b64;
 
 /// How to authenticate the server's TLS certificate.
@@ -63,55 +59,6 @@ impl std::fmt::Display for NetError {
 
 impl std::error::Error for NetError {}
 
-/// Accepts any server certificate, but still checks handshake signatures.
-#[derive(Debug)]
-struct FirstContact(Arc<rustls::crypto::CryptoProvider>);
-
-impl ServerCertVerifier for FirstContact {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 /// Make `rustls-native-ossl` the process-wide rustls provider, so nothing
 /// in the dependency tree falls back to another one.
 fn install_provider() {
@@ -122,22 +69,11 @@ fn install_provider() {
 }
 
 fn tls_config(trust: &Trust) -> Result<rustls::ClientConfig, NetError> {
-    let provider = Arc::new(rustls_native_ossl::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| NetError::Other(format!("TLS versions: {e}")))?
-        .dangerous();
-    let config = match trust {
-        Trust::FirstContact => {
-            builder.with_custom_certificate_verifier(Arc::new(FirstContact(provider)))
-        }
-        Trust::Ca(certs) => {
-            let verifier = kuipa_enroll::tls::server_verifier(certs)
-                .map_err(|e| NetError::Other(format!("IPA CA: {e}")))?;
-            builder.with_custom_certificate_verifier(Arc::new(verifier))
-        }
+    let ca = match trust {
+        Trust::FirstContact => None,
+        Trust::Ca(certs) => Some(certs.as_slice()),
     };
-    Ok(config.with_no_client_auth())
+    kuipa_enroll::tls::client_config(ca).map_err(|e| NetError::Other(format!("TLS: {e}")))
 }
 
 /// Where advertisements are kept between runs, if anywhere: see
