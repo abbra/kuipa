@@ -155,9 +155,10 @@ pub fn cache_advertisements_in(dir: std::path::PathBuf) {
     let _ = ADVERTISEMENT_CACHE.set(dir);
 }
 
+#[cfg(feature = "testing")]
 thread_local! {
     /// The advertisement cache for the current thread only, ahead of
-    /// [`cache_advertisements_in`]: see [`set_thread_advertisement_cache`].
+    /// [`cache_advertisements_in`]: see `set_thread_advertisement_cache`.
     static THREAD_ADVERTISEMENT_CACHE: std::cell::RefCell<Option<std::path::PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -165,16 +166,18 @@ thread_local! {
 /// Keep advertisements in `dir` for the current thread only, as
 /// [`cache_advertisements_in`] does for the whole process: for tests that
 /// run in parallel.
-#[doc(hidden)]
+#[cfg(feature = "testing")]
 pub fn set_thread_advertisement_cache(dir: Option<std::path::PathBuf>) {
     THREAD_ADVERTISEMENT_CACHE.with_borrow_mut(|d| *d = dir);
 }
 
 /// Where this thread keeps advertisements, if anywhere.
 fn advertisement_cache() -> Option<std::path::PathBuf> {
-    THREAD_ADVERTISEMENT_CACHE
-        .with_borrow(Clone::clone)
-        .or_else(|| ADVERTISEMENT_CACHE.get().cloned())
+    #[cfg(feature = "testing")]
+    if let Some(dir) = THREAD_ADVERTISEMENT_CACHE.with_borrow(Clone::clone) {
+        return Some(dir);
+    }
+    ADVERTISEMENT_CACHE.get().cloned()
 }
 
 /// The cached advertisement for `url`: its tag and its bytes.
@@ -218,9 +221,10 @@ fn cache_name(url: &str) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(feature = "testing")]
 thread_local! {
     /// Endpoint overrides for the current thread only, ahead of
-    /// `KUIPA_ENDPOINTS`: see [`set_thread_endpoint`].
+    /// `KUIPA_ENDPOINTS`: see `set_thread_endpoint`.
     static THREAD_ENDPOINTS: std::cell::RefCell<Vec<(String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -236,7 +240,7 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// thread, as `KUIPA_ENDPOINTS` does for the whole process.  For tests that
 /// run in parallel: each maps the server names of its deployment to its
 /// own test servers, which the environment cannot do safely.
-#[doc(hidden)]
+#[cfg(feature = "testing")]
 pub fn set_thread_endpoint(server: &str, target: &str) {
     THREAD_ENDPOINTS.with_borrow_mut(|map| {
         map.retain(|(name, _)| name != server);
@@ -245,10 +249,10 @@ pub fn set_thread_endpoint(server: &str, target: &str) {
 }
 
 /// Forget every endpoint this thread mapped (see
-/// [`set_thread_endpoint`]): a test that replaces the bindings of
+/// `set_thread_endpoint`): a test that replaces the bindings of
 /// shared server names ends with this, so a later test on the same
 /// thread starts from its own.
-#[doc(hidden)]
+#[cfg(feature = "testing")]
 pub fn clear_thread_endpoints() {
     THREAD_ENDPOINTS.with_borrow_mut(Vec::clear);
 }
@@ -312,10 +316,11 @@ fn chain(e: &dyn std::error::Error) -> String {
 }
 
 /// Where to reach `server` instead of `https://<server>/`: from
-/// [`set_thread_endpoint`], else `KUIPA_ENDPOINTS` (`fqdn=target,…`, target
+/// `set_thread_endpoint` (the `testing` feature), else `KUIPA_ENDPOINTS` (`fqdn=target,…`, target
 /// as for [`Endpoint::new`]), for talking to a daemon's socket directly, or
 /// to test servers.
 fn endpoint_override(server: &str) -> Option<String> {
+    #[cfg(feature = "testing")]
     if let Some(target) = THREAD_ENDPOINTS.with_borrow(|map| {
         map.iter()
             .find(|(name, _)| name == server)

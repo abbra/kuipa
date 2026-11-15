@@ -74,9 +74,10 @@ pub struct UserPaths {
     dir: PathBuf,
 }
 
+#[cfg(feature = "testing")]
 thread_local! {
     /// The user directory for the current thread only, ahead of the
-    /// environment: see [`set_thread_user_dir`].
+    /// environment: see `set_thread_user_dir`.
     static THREAD_USER_DIR: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -84,7 +85,7 @@ thread_local! {
 /// Use `dir` as the user data directory on the current thread only, so
 /// parallel tests neither share nor touch the real one (`net::set_thread_endpoint`
 /// does the same for servers).
-#[doc(hidden)]
+#[cfg(feature = "testing")]
 pub fn set_thread_user_dir(dir: Option<PathBuf>) {
     THREAD_USER_DIR.with_borrow_mut(|d| *d = dir);
 }
@@ -96,6 +97,7 @@ impl UserPaths {
     ///
     /// Without any of those variables or `$HOME`.
     pub fn from_env() -> Result<Self, Error> {
+        #[cfg(feature = "testing")]
         if let Some(d) = THREAD_USER_DIR.with_borrow(Clone::clone) {
             return Ok(Self::new(d));
         }

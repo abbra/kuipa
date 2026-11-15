@@ -39,10 +39,13 @@ anstream = "1.0"
 # A software security key for `kuipa` (`$KUIPA_SOFT_FIDO2`): the
 # playground's, and the tests'.  Never in a build for real hosts.
 soft-fido2 = ["kuipa-enroll/testing"]
+# Per-thread endpoint, advertisement-cache and user-directory overrides, so
+# parallel tests need not share the environment.  Tests only.
+testing = []
 
 [dev-dependencies]
 # The tests and the playground use the software security key.
-kuipa-tools = { path = ".", features = ["soft-fido2"] }
+kuipa-tools = { path = ".", features = ["soft-fido2", "testing"] }
 # The DoT/DoH test server: HTTP/2 over rustls (as hickory's client).
 h2 = "0.4"
 http = "1"

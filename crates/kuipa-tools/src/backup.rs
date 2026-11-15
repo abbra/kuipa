@@ -3,7 +3,6 @@
 //!
 //! Nothing here talks to a server: a recovery must work with the realm gone.
 
-use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -216,6 +215,7 @@ pub fn open_stream(key: &ExchangeKeyPair, input: impl Read, out: impl Write) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn words(set: &NewSet, which: &[usize]) -> Vec<String> {
         which.iter().map(|&i| set.pages[i].clone()).collect()
