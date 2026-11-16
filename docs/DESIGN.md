@@ -2453,7 +2453,7 @@ released, rebind with `clevis luks bind` and remove the old slot with
 | command | does |
 |---|---|
 | `tang-pqc adv URL [--ca F]` | list the signing-key thumbprints `URL` advertises, to choose `thp` |
-| `tang-pqc encrypt CONFIG < IN > JWE`, `clevis encrypt tang-pqc CONFIG` | fetch `URL/adv`, verify it against `thp` (falling back to `URL/adv/{thp}` after a rotation), provision a binding, and encrypt `IN` as a compact JWE |
+| `tang-pqc encrypt CONFIG < IN > JWE`, `clevis encrypt kuipa CONFIG` | fetch `URL/adv`, verify it against `thp` (falling back to `URL/adv/{thp}` after a rotation), provision a binding, and encrypt `IN` as a compact JWE |
 | `tang-pqc decrypt < JWE > OUT`, `clevis decrypt` | fetch the binding's exchange key at `URL/key/{kid}`, recover the key with a sealed request to `URL/rec/{kid}`, and decrypt |
 
 * **Configuration:** `url` (required), `thp` (required: there is no trust
