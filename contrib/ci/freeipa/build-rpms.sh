@@ -26,7 +26,7 @@ snapdate="$(date -u +%Y%m%d%H%M)"
 make -C "$pkgs" sources srpm SNAPDATE="$snapdate"
 srpm="$(ls -t "$pkgs"/kuipa-*.src.rpm | head -n1)"
 
-# --without clevis: the tang-pqc Clevis pin is not what a FreeIPA realm tests.
+# --without clevis: the kuipa Clevis pin is not what a FreeIPA realm tests.
 # --without check: the unit tests have their own jobs (ci.yml).
 rb=(rpmbuild --rebuild --without check --without clevis
     --define "_topdir $top" "$srpm")

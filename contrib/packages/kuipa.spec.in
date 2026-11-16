@@ -202,7 +202,7 @@ depends on a classical signature algorithm.
 
 This package provides the 'tang-pqc' command (server key management, the
 'thp' key fingerprint, seal and unseal.  The Clevis pin and its dracut
-module are in clevis-pin-tang-pqc.  The library crate is bundled in %name.
+module are in clevis-pin-kuipa.  The library crate is bundled in %name.
 
 %files -n tang-pqc
 %license LICENSE
@@ -211,26 +211,26 @@ module are in clevis-pin-tang-pqc.  The library crate is bundled in %name.
 
 # ── Subpackage: Clevis pin ───────────────────────────────────────────────────
 %if %{with clevis}
-%package -n clevis-pin-tang-pqc
+%package -n clevis-pin-kuipa
 Summary:        Clevis pin that seals with a post-quantum Tang binding
 BuildArch:      noarch
 Requires:       tang-pqc = %{version}-%{release}
 Requires:       clevis-luks
 
-%description -n clevis-pin-tang-pqc
-clevis-pin-tang-pqc adds the 'tang-pqc' pin to Clevis: the tang-pqc binary,
-invoked through the clevis-encrypt-tang-pqc and clevis-decrypt-tang-pqc
+%description -n clevis-pin-kuipa
+clevis-pin-kuipa adds the 'kuipa' pin to Clevis: the tang-pqc binary,
+invoked through the clevis-encrypt-kuipa and clevis-decrypt-kuipa
 names.  A LUKS volume sealed with this pin opens with a post-quantum Tang
 binding, including from the initramfs (the dracut module ships here, in the
 directory layout clevis uses for its own pins).
 
 Disable the pin with: rpmbuild --without clevis
 
-%files -n clevis-pin-tang-pqc
-%{_bindir}/clevis-encrypt-tang-pqc
-%{_bindir}/clevis-decrypt-tang-pqc
-%dir %{_prefix}/lib/dracut/modules.d/60clevis-pin-tang-pqc
-%{_prefix}/lib/dracut/modules.d/60clevis-pin-tang-pqc/module-setup.sh
+%files -n clevis-pin-kuipa
+%{_bindir}/clevis-encrypt-kuipa
+%{_bindir}/clevis-decrypt-kuipa
+%dir %{_prefix}/lib/dracut/modules.d/60clevis-pin-kuipa
+%{_prefix}/lib/dracut/modules.d/60clevis-pin-kuipa/module-setup.sh
 %endif
 
 
@@ -350,10 +350,10 @@ install -Dpm 0644 %{SOURCE13} %{buildroot}%{_sysusersdir}/kuipad.conf
 # The Clevis pin is the same binary, chosen by its name (as in
 # contrib/clevis/install.sh); the dracut module brings it into the initramfs.
 %if %{with clevis}
-ln -s tang-pqc %{buildroot}%{_bindir}/clevis-encrypt-tang-pqc
-ln -s tang-pqc %{buildroot}%{_bindir}/clevis-decrypt-tang-pqc
-install -Dpm 0755 contrib/clevis/dracut/60clevis-pin-tang-pqc/module-setup.sh \
-    %{buildroot}%{_prefix}/lib/dracut/modules.d/60clevis-pin-tang-pqc/module-setup.sh
+ln -s tang-pqc %{buildroot}%{_bindir}/clevis-encrypt-kuipa
+ln -s tang-pqc %{buildroot}%{_bindir}/clevis-decrypt-kuipa
+install -Dpm 0755 contrib/clevis/dracut/60clevis-pin-kuipa/module-setup.sh \
+    %{buildroot}%{_prefix}/lib/dracut/modules.d/60clevis-pin-kuipa/module-setup.sh
 %endif
 
 

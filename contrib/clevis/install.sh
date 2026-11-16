@@ -10,8 +10,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 bin="$destdir$prefix/bin"
 install -D -m 0755 "${TANG_PQC_BIN:-$here/../../target/release/tang-pqc}" "$bin/tang-pqc"
 # The pin is the same binary, chosen by its name.
-ln -sf tang-pqc "$bin/clevis-encrypt-tang-pqc"
-ln -sf tang-pqc "$bin/clevis-decrypt-tang-pqc"
+ln -sf tang-pqc "$bin/clevis-encrypt-kuipa"
+ln -sf tang-pqc "$bin/clevis-decrypt-kuipa"
 # Unlocking at boot: the dracut module brings the pin into the initramfs.
-dracut="$destdir$prefix/lib/dracut/modules.d/60clevis-pin-tang-pqc"
-install -D -m 0755 "$here/dracut/60clevis-pin-tang-pqc/module-setup.sh" "$dracut/module-setup.sh"
+dracut="$destdir$prefix/lib/dracut/modules.d/60clevis-pin-kuipa"
+install -D -m 0755 "$here/dracut/60clevis-pin-kuipa/module-setup.sh" "$dracut/module-setup.sh"
