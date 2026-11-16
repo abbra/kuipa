@@ -25,9 +25,10 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       cross-realm ticket through them (§11.4, §17.4).
 - [ ] Unlock a LUKS2 volume at boot with the `tang-pqc` pin from the dracut
       module (§10.7). `clevis luks bind`, `unlock`, refusal and rotation
-      are tested in `test_kuipa_clevis.py`; stock Clevis's `luks regen`,
-      `list` and `unbind` do not know the pin (needs a Clevis change or
-      kuipa-side wrapper).
+      are tested in `test_kuipa_clevis.py`. `luks list` and `regen` need
+      the Clevis patch (`kuipa-support` branch of ~/src/clevis, tested
+      with the real pin and a Tang server); send it upstream. `unbind`
+      failed once in the VM test with Fedora's Clevis 24, cause not found.
 - [ ] Check emitted log heads and cosignatures with a C2SP
       tlog-witness implementation, once the ML-DSA note format is
       settled (`DESIGN-tlog.md` §6).

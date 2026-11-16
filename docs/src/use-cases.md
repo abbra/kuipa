@@ -139,8 +139,9 @@ network, but Tang's key exchange is classical.
 `clevis luks bind`, unlocks it with `clevis luks unlock`, refuses a wrong
 thumbprint and a stopped server, and survives `kuipad tang-rotate` (a
 retired key still unlocks; a rebind moves to the new key). Stock Clevis
-cannot `list`, `regen` or `unbind` this pin, so rebinding uses
-`cryptsetup` for the removal. The dracut module is checked to put the pin
+cannot `list` or `regen` this pin (it prints "unknown pin"), so rebinding
+uses `bind` and `cryptsetup`; a Clevis patch that fixes both is ready. The
+dracut module is checked to put the pin
 in an initramfs, but unlocking a volume at boot has not been tried. See
 [Keys and rotation](realm/keys.md#tang).
 

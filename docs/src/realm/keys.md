@@ -90,7 +90,7 @@ systemctl restart kuipad
 
 Retired Tang exchange keys keep answering existing bindings. They are never
 pruned automatically: delete their `.`-files from `/var/lib/ipa/ku/tang`
-once every client has rebound. Stock Clevis cannot read this pin in
-`clevis luks list`, `regen` or `unbind`, so rebind with `clevis luks bind`
-and remove the old slot with `cryptsetup token remove` and `cryptsetup
-luksKillSlot`.
+once every client has rebound. Stock Clevis prints "unknown pin" for this
+pin in `clevis luks list`, which `regen` reads, so until Clevis lists it
+(a patch is in preparation), rebind with `clevis luks bind` and remove the
+old slot with `cryptsetup token remove` and `cryptsetup luksKillSlot`.

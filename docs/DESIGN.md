@@ -2441,10 +2441,13 @@ daemon's, §11.5, or another `tang-pqc` server) and the Clevis pin
 `tang-pqc`. It is one binary: as `tang-pqc` it takes commands, and linked
 as `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` it is the pin, so
 `clevis encrypt`, `clevis decrypt`, `clevis luks bind` and `clevis luks
-unlock` use it like the `tang` pin. Stock Clevis (24) knows only its own
-pins in `clevis luks list`, `regen`, `unbind` and `edit` ("unknown pin
-'tang-pqc'"), so those do not work with this pin: rebind with `clevis
-luks bind` and remove the old binding with `cryptsetup`.
+unlock` use it like the `tang` pin. Stock Clevis (24) prints "unknown pin
+'tang-pqc'" in `clevis luks list`, and `regen` reads the pin from that
+list, so `list` and `regen` need the Clevis change that lists the pin's
+`url`, `thp` and `ca` (the `kuipa-support` branch of Clevis; until it is
+released, rebind with `clevis luks bind` and remove the old slot with
+`cryptsetup`). Clevis runs the pin as `CONFIG -y` from `luks bind -y` and
+`regen`, so the pin accepts and ignores `-y`.
 
 | command | does |
 |---|---|
