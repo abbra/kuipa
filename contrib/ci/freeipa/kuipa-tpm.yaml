@@ -1,0 +1,35 @@
+# FreeIPA master and two clients with a TPM each, on qemu VMs (Fedora 45), IPA
+# and gssproxy 0.9.3 from the abbra/pqc COPR.  client1 keeps its keytabs and
+# TLS key sealed with kuipa's TPM factor and serves HTTPS with an Akamu
+# certificate through nginx and gssproxy; see docs/DESIGN-ci-tpm-service.md.
+# Like kuipa-ipa.yaml: `freeipa-env up|run|down FILE --workdir DIR`, with the
+# kuipa RPMs upgraded by upgrade-kuipa.sh in between.
+#
+# The control node needs swtpm and edk2-ovmf: a VM with `tpm: true` is a
+# swtpm TPM 2.0 behind UEFI, and its state is discarded at `down`.
+name: kuipa-tpm
+domain: ipa.test
+provider: nested
+inner: external
+hosts:
+  - {role: master, name: master1}
+  - {role: client, name: client1}
+  - {role: client, name: client2}
+resources:
+  master: {memory: 2500m, memory-swap: 5000m}
+  client: {memory: 3072m, memory-swap: 4000m}
+run:
+  mode: integration
+  tests:
+    - test_integration/test_kuipa_tpm_service.py
+vm:
+  backend: qemu
+  image: containerdisk:ghcr.io/freeipa/ci-freeipa-vm-images/fedora-45:latest
+  cpus: 4
+  disk: 40G
+  selinux: enforcing
+  copr: [abbra/pqc]
+  vms:
+    - {name: client1, tpm: true}
+    - {name: client2, tpm: true}
+  guest_packages: [ipa-distro, ipacta]
