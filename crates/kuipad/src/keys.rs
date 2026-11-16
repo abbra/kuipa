@@ -444,7 +444,10 @@ mod tests {
                     Ok(BrokerAnswer {
                         principal: "host/ipa1.example.test@EXAMPLE.TEST".into(),
                         binding: vec![9; 32],
-                        value: keys.fetch(&request.fetch)?.value,
+                        value: keys
+                            .fetch(&request.fetch)
+                            .inspect_err(|e| eprintln!("test handler: {e}"))?
+                            .value,
                     })
                 })
                 .expect("reply");
