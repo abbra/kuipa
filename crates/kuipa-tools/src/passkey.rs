@@ -17,7 +17,7 @@ use kuipa_fido2::{Assertion, AssertionRequest, Credential, CredentialRequest, De
 use crate::paths::Error;
 
 /// The authenticators an assertion or a credential comes from: the FIDO2
-/// keys attached to this host ([`Fido2`]), or a software one in tests.
+/// keys attached to this host (`Fido2`), or a software one in tests.
 pub trait Authenticator {
     /// An assertion from whichever authenticator holds one of
     /// `req.allow`, the user verified with `pin` when given.

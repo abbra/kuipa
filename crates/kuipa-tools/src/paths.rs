@@ -622,7 +622,7 @@ pub fn read_anchor_pins(path: &Path) -> Result<Vec<Pin>, Error> {
 ///
 /// The heads are a **window** (DESIGN-claim-logs.md §1): every head
 /// the host verified for the anchor, oldest first, at most
-/// [`MAX_HEAD_WINDOW`] of them.  A claim under any of them verifies
+/// `MAX_HEAD_WINDOW` of them.  A claim under any of them verifies
 /// head-wise, since every prefix of the claim log is the tree an
 /// earlier vouch signed; a claim older than the oldest falls back to a
 /// signature proof — unless the pin is frozen, which removes the
@@ -671,7 +671,7 @@ pub(crate) const MAX_HEAD_WINDOW: usize = 4;
 /// Merge a verified advertisement's heads into the host's pins
 /// (DESIGN-claim-logs.md §1.2–§1.3, `DESIGN-tlog.md` §8): a head that
 /// extends a pin's window is appended (the window trimmed to
-/// [`MAX_HEAD_WINDOW`], the oldest dropped first), with the claims its
+/// `MAX_HEAD_WINDOW`, the oldest dropped first), with the claims its
 /// log retired; a head already in the window keeps it, and one of the same
 /// size with another root is a fork, reported and not pinned.  A head whose
 /// size is lower is a log that no longer extends what the host pinned —

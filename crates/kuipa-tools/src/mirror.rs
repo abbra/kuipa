@@ -69,7 +69,7 @@ impl Cache {
         self.read(|c| c.heads.get(query).cloned())
     }
     /// Remember a `head=` query for the next sync, dropping the oldest
-    /// past [`MAX_WANTED`].
+    /// past `MAX_WANTED`.
     pub fn remember_wanted(&self, query: &str) {
         self.write(|c| {
             c.wanted.insert(query.to_owned());
