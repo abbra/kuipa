@@ -176,8 +176,8 @@ comes from the system crypto policy (`Policy::from_system`).
 
 ## 6. Producers and receipts
 
-`EnrollServer` takes a `Ledger` (`with_ledger`). The default,
-`NoLedger`, records nothing; `kuipad` implements one over its store
+`EnrollServer` takes an optional `Ledger` (`with_ledger`). With none it
+records nothing; `kuipad` implements one over its store
 (§5). The server makes each event's opening, with its exact time and a
 fresh salt, and the ledger appends its leaf and keeps the opening. Each
 event is appended after the operation's checks pass and before anything
@@ -373,7 +373,7 @@ takes this log's rules instead:
   the head's signed vouch from the claim-log page, checks that its
   first `size` entries make the pinned root
   (`SignedVouch::retired_at`), and records the claims they retired as
-  a `retired` line beside the pin. `verify_with_heads` refuses a head
+  a `retired` line beside the pin. `VerifiedRealm::verify_pinned` refuses a head
   proof for a retired claim. A head whose retired claims cannot be
   read is not pinned.
 - **Forks.** A log shorter than the window's newest head is refused

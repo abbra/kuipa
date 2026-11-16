@@ -148,7 +148,6 @@ the rest, and those raise `GssError::Unsupported` rather than half-working:
 | MIT-only | Effect on a Heimdal build |
 | --- | --- |
 | OTP, passkey, IdP and RADIUS prompts (`krb5_responder_*`) | no responder callback; those preauth types cannot be answered |
-| Thread-local ccache stores (`kuipa_gssapi::thread_ccache`) | the module is compiled out |
 | S4U2Self / S4U2Proxy credentials | `impersonate()` returns an error |
 | gssproxy credential stores (`gss_acquire_cred_from`) | no credential-store argument |
 | MIT-only credential-usage flags | those usages return an error |

@@ -27,9 +27,9 @@ usage.
 | `trusted-realms` | install and refresh the realms this realm trusts; remove the others |
 | `advertisement` | what each server advertises, verified, and an index of every anchor and key it names; writes nothing |
 | `status` | the host's state, from its files |
-| `check [--server S]` | every server, the delegations, a `kinit`, the sealed keytabs and files; then refreshes the pinned anchors and heads from a Kerberos-bound answer; exit 1 on a problem |
+| `check [--server S…]` | every server (or those named), the delegations, a `kinit`, the sealed keytabs and files; then refreshes the pinned anchors and heads from a Kerberos-bound answer; exit 1 on a problem |
 | `leave` | remove kuipa's state, writing protected keytabs and files back in plain form |
-| `keys fetch NAMESPACE/NICKNAME [--out F] [--alg A]` | on a new IPA replica: fetch a named secret (`dm`, `ra`, `ca`, `ca_wrapped`, `lwca`) by the host's keytab |
+| `keys fetch NAMESPACE/NICKNAME [--out F\|-] [--force] [--alg A]` | on a new IPA replica: fetch a named secret (`dm`, `ra`, `ca`, `ca_wrapped`, `lwca`) by the host's keytab; the file is written with mode 0600, and an existing file or a terminal needs `--force` |
 | `tlog witnesses [--add JWK] [--remove THP] [--required N]` | the transparency-log witnesses this host trusts, and how many must cosign a head (changes need root) |
 
 ## kuipa seal (users)
@@ -65,7 +65,7 @@ usage.
 | `backup key create --realm R -o FILE` | make the backup recovery key; print its papers; write the recipient file |
 | `backup key check --recipient FILE` | check papers read from standard input |
 | `backup seal --recipient FILE… -o FILE` | seal standard input to the recovery keys |
-| `backup open FILE -o OUT [--also F…] [--realm R --anchor T…]` | verify the signature, read papers, open the backup |
+| `backup open FILE -o OUT\|- [--force] [--also F…] [--realm R --anchor T…]` | verify the signature, read papers, open the backup; the output is checked like `seal open`'s |
 | `backup card [--recipient FILE]` | print the realm, its anchors and the key id, to keep with the papers |
 
 ## kuipa-gitsign
@@ -116,13 +116,13 @@ keys, no writes; exit status 2 for a split view):
 | invocation | does |
 |---|---|
 | `keygen --key F [--alg ml-dsa-44]` | make a witness key; print its public JWK for `kuipad add-witness-key` and `kuipa tlog witnesses --add` |
-| `run --key F --state F --server S… [--once] [--interval N]` | cosign each server's transparency-log head once it extends the last one this witness cosigned |
+| `run --key F --state F --server S… [--once] [--interval N]` | cosign each server's transparency-log head once it extends the last one this witness cosigned (`N` at least 1) |
 
 ## kuipa-mirror
 
 | invocation | does |
 |---|---|
-| `--origin URL --listen ADDR [--data DIR] [--interval N]` | sync one server's public endpoints and serve them read-only: advertisements (head-proof answers cached), the anchor log, claim-log pages. No keys, no authenticated route; port 0 in `--listen` picks a free port and prints it |
+| `--origin URL --listen ADDR [--data DIR] [--interval N]` | sync one server's public endpoints and serve them read-only: advertisements (head-proof answers cached), the anchor log, claim-log pages. No keys, no authenticated route; port 0 in `--listen` picks a free port and prints it (`N` at least 1) |
 
 ## kuipad (IPA servers)
 
