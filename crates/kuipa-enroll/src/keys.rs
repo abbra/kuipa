@@ -184,7 +184,7 @@ impl KeysFetch {
     ///
     /// # Errors
     ///
-    /// [`Error::Malformed`] for a nickname over [`MAX_NICKNAME`] bytes, or
+    /// [`Error::Malformed`] for a nickname over `MAX_NICKNAME` bytes, or
     /// a wrap algorithm outside `ca_wrapped`.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;

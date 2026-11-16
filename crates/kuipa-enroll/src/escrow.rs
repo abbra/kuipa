@@ -881,7 +881,7 @@ impl EscrowRequest {
         &self.seal
     }
 
-    /// The binding's commitment to [`commitment_data`] of the principal and
+    /// The binding's commitment to `commitment_data` of the principal and
     /// seal.
     #[must_use]
     pub fn commitment(&self) -> &[u8; 32] {

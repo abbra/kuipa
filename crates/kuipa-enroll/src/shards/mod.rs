@@ -127,7 +127,7 @@ pub struct Header {
     pub shares: u8,
     /// This share's place, from 1; it is also Shamir's x-coordinate.
     pub index: u8,
-    /// PBKDF2 iterations, in units of [`ITERATION_UNIT`].
+    /// PBKDF2 iterations, in units of `ITERATION_UNIT`.
     pub iterations: u8,
     /// Check words after the data words.
     pub parity: u8,
@@ -394,9 +394,9 @@ fn random(buf: &mut [u8]) -> Result<(), Error> {
 pub struct SetParams {
     /// How many shares recombine the seed (2 to `shares`).
     pub threshold: u8,
-    /// How many shares to make (at most [`MAX_SHARES`]).
+    /// How many shares to make (at most `MAX_SHARES`).
     pub shares: u8,
-    /// PBKDF2 iterations, in units of [`ITERATION_UNIT`].
+    /// PBKDF2 iterations, in units of `ITERATION_UNIT`.
     pub iterations: u8,
     /// Check words per share.
     pub parity: u8,
@@ -533,7 +533,7 @@ fn combine(shares: &[Share]) -> Result<Combined, Error> {
 ///
 /// # Errors
 ///
-/// As [`make_shares_with`], [`mask`] and [`recovery_key`].
+/// As `make_shares_with`, `mask` and `recovery_key`.
 pub fn new_set(
     passphrase: &str,
     kem: tang_pqc::KemAlg,
@@ -547,12 +547,12 @@ pub fn new_set(
     Ok((shares, recovery_key(&seed, kem)?))
 }
 
-/// The recovery key `shares` of one set and `passphrase` make: [`combine`], [`mask`] and
-/// [`recovery_key`].  A wrong passphrase makes another key, which only its identifier can show.
+/// The recovery key `shares` of one set and `passphrase` make: `combine`, `mask` and
+/// `recovery_key`.  A wrong passphrase makes another key, which only its identifier can show.
 ///
 /// # Errors
 ///
-/// As [`combine`], [`mask`] and [`recovery_key`].
+/// As `combine`, `mask` and `recovery_key`.
 pub fn recover(shares: &[Share], passphrase: &str) -> Result<tang_pqc::ExchangeKeyPair, Error> {
     let c = combine(shares)?;
     let seed = mask(&c.hidden, passphrase, &c.salt, c.iterations)?;
@@ -628,7 +628,7 @@ fn recovery_key(
     tang_pqc::ExchangeKeyPair::from_seed_bytes(alg, &dz).map_err(crypto)
 }
 
-/// The words of a share as printed: numbered lines of [`WORDS_PER_LINE`], `01  word word ...`.
+/// The words of a share as printed: numbered lines of `WORDS_PER_LINE`, `01  word word ...`.
 #[must_use]
 pub fn format_lines(symbols: &[u16]) -> Vec<String> {
     symbols

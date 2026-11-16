@@ -83,7 +83,7 @@ pub struct RealmInfo {
     /// The realm's servers (KDCs), for a bootstrap `krb5.conf`.
     pub servers: Vec<String>,
     /// The IPA CA chain (DER), each a CA certificate
-    /// ([`check_ca`](crate::certs::check_ca)).
+    /// (`check_ca`).
     #[serde(with = "b64::bytes_vec")]
     pub ca_certs: Vec<Vec<u8>>,
     /// The PKINIT trust anchors (DER) clients need for anonymous PKINIT,
@@ -168,7 +168,7 @@ const MAX_KDC_PROXIES: usize = 16;
 
 impl KdcProxy {
     /// Check that there are one to 16 URLs, each safe in generated
-    /// Kerberos configuration ([`is_safe_proxy_url`]).
+    /// Kerberos configuration (`is_safe_proxy_url`).
     ///
     /// # Errors
     ///
@@ -339,7 +339,7 @@ impl RealmInfo {
     /// Check the names, certificates and trusted realms: every name must be
     /// safe for generated configuration ([`is_safe_name`]), every CA
     /// certificate and PKINIT anchor a CA certificate
-    /// ([`certs::check_ca`](crate::certs::check_ca)), and every trusted
+    /// (`certs::check_ca`), and every trusted
     /// realm clearly separate — not this realm, not listed twice, with
     /// servers, and with anchors of its own, none of them this realm's.
     /// KDC proxies, this realm's and its trusted realms', must be
@@ -944,7 +944,7 @@ impl VerifiedRealm {
     }
 
     /// A `krb5.conf` for bootstrapping Kerberos before enrollment (§5.4),
-    /// with the KDCs of [`Self::kdcs_within`] `deployment`: see
+    /// with the KDCs of `Self::kdcs_within` `deployment`: see
     /// [`krb5_conf`].
     #[must_use]
     pub fn krb5_conf(&self, pkinit_anchors_file: &str, deployment: &Deployment) -> String {
@@ -1006,7 +1006,7 @@ pub fn krb5_realm_section(
 /// [`ProxyCa::Realm`], or the system trust store for
 /// [`ProxyCa::System`].  MIT Kerberos only: Heimdal does not speak
 /// MS-KKDCP.  A URL that is not safe in generated configuration
-/// ([`is_safe_proxy_url`]) is left out rather than interpolated.
+/// (`is_safe_proxy_url`) is left out rather than interpolated.
 #[must_use]
 pub fn krb5_proxied_realm_section(
     realm: &str,

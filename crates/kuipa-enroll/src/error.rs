@@ -49,7 +49,7 @@ pub enum Error {
     Frozen(tang_pqc::Thumbprint),
     /// An advertised CA certificate or PKINIT anchor is not a certificate a
     /// host may install as a CA: which list, which entry (from 1), and
-    /// what it is instead ([`check_ca`](crate::certs::check_ca)).
+    /// what it is instead (`check_ca`).
     NotCa {
         /// `"CA certificate"` or `"PKINIT anchor"`.
         list: &'static str,

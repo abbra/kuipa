@@ -27,7 +27,7 @@
 //!   which the old private key is deleted.  A delegation may carry the
 //!   successions that lead from an anchor the client pins to the anchor of
 //!   its proof; [`Delegation::verify_at`] follows at most
-//!   [`MAX_SUCCESSION_HOPS`] of them.  They use the context
+//!   `MAX_SUCCESSION_HOPS` of them.  They use the context
 //!   `ipa-ku-enroll/v1 succession`.
 
 use std::fmt;
@@ -1442,7 +1442,7 @@ impl Delegation {
     /// The same claim with the proofs a client pinning `wanted` needs: by
     /// the first anchor in `wanted` that has one, else by the server's own
     /// anchor, else the first; then by further anchors in `wanted`, until
-    /// [`SERVED_PROOFS`] distinct anchors prove it, so the client counts
+    /// `SERVED_PROOFS` distinct anchors prove it, so the client counts
     /// its quorum (§4.4) from one advertisement.
     ///
     /// Advertisements carry these, chosen from the anchors the client
@@ -1457,7 +1457,7 @@ impl Delegation {
     /// over everything: no signature is needed for their anchors, and none
     /// is served.  A client that pins a head for an anchor that also has a
     /// signature proof served gets the head proof only; signatures are
-    /// added only for other wanted anchors, up to [`SERVED_PROOFS`].
+    /// added only for other wanted anchors, up to `SERVED_PROOFS`.
     #[must_use]
     pub fn select(&self, wanted: &[Thumbprint]) -> Self {
         self.select_with_heads(wanted, &[])

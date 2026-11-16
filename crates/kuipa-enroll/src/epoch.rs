@@ -19,7 +19,7 @@
 //! does, so a fetched chain can be verified from the pinned thumbprints
 //! alone.  A key is *proven* when it is pinned, or is the new end of a
 //! [`SignedSuccession`] the chain lists whose old end is proven — at most
-//! [`MAX_SUCCESSION_HOPS`] deep, as in [`crate::delegation`].  A part of
+//! `MAX_SUCCESSION_HOPS` deep, as in [`crate::delegation`].  A part of
 //! the chain is believed only when signed by a proven key: §4.2's trust
 //! rule, transplanted.  A new anchor therefore enters either behind a
 //! succession signed by the anchor it replaces, or behind a signature

@@ -208,7 +208,7 @@ pub struct Request {
     /// The purpose (`blob`, `git-commit`, …): lowercase letters, digits
     /// and `-`.
     pub purpose: String,
-    /// The digests, at most [`MAX_DIGESTS`].
+    /// The digests, at most `MAX_DIGESTS`.
     pub digests: Vec<Digest>,
 }
 
@@ -735,7 +735,7 @@ impl Signers {
     }
 
     /// The `kind:name` values that would admit `principal`, a member of
-    /// `groups`, written as [`normalized`](Self::normalized) writes them:
+    /// `groups`, written as `normalized` writes them:
     /// what to search a directory for.
     #[must_use]
     pub fn matching_entries(principal: &Principal, groups: &[String]) -> Vec<String> {

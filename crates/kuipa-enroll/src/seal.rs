@@ -283,7 +283,7 @@ pub struct Approvals {
     /// Who may approve, named as a shared seal's members are.
     pub from: Members,
     /// How long a request may wait for approvals and then be used, in
-    /// seconds (default [`DEFAULT_APPROVAL_WINDOW`]).
+    /// seconds (default `DEFAULT_APPROVAL_WINDOW`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
     /// Releases one approved request covers (default 1).
@@ -418,11 +418,11 @@ pub struct Limits {
     /// How old a descriptor may be when a client seals with it, in seconds.
     pub descriptor_age: u64,
     /// The factors a policy needs at least: it must meet one of these
-    /// sets ([`Factors::meets`]).  Empty: any non-empty combination.
+    /// sets (`Factors::meets`).  Empty: any non-empty combination.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub factors: Vec<Factors>,
     /// Limits for the members of groups, in place of these where they
-    /// say otherwise ([`Limits::for_groups`]).
+    /// say otherwise (`Limits::for_groups`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupLimits>,
     /// Which users of trusted realms may own seals (§7.6.2).
@@ -2496,12 +2496,12 @@ pub struct Unlock<'a> {
     /// A re-authentication session, in place of the ticket.
     pub session: Option<&'a SessionToken>,
     /// A GSS-API token for `ipa-ku@<server>` bound to the request's
-    /// [`EscrowRequest::ticket_binding`], when the seal needs a ticket.
+    /// `EscrowRequest::ticket_binding`, when the seal needs a ticket.
     pub ticket: Option<TicketSource<'a>>,
     /// The approved release request, for a seal with approvals.
     pub release: Option<[u8; 16]>,
     /// A passkey assertion over the request's
-    /// [`EscrowRequest::passkey_challenge`], when the seal needs one.
+    /// `EscrowRequest::passkey_challenge`, when the seal needs one.
     pub passkey: Option<PasskeySource<'a>>,
 }
 

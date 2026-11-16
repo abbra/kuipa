@@ -94,7 +94,7 @@ impl Kind {
     pub const KEYS_FETCH: Self = Self(6);
     /// A token key epoch.
     pub const TOKEN_KEY: Self = Self(7);
-    /// A leaf that is no longer current ([`Tombstone`]).
+    /// A leaf that is no longer current (`Tombstone`).
     pub const TOMBSTONE: Self = Self(0xFFFF);
 
     /// Whether leaves of this kind are committed ([`Opening`]): the events
@@ -235,7 +235,7 @@ impl Tombstone {
 /// subject, in a lookup ([`Entry::opening`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Opening {
-    /// The leaf's kind; [`Kind::is_committed`].
+    /// The leaf's kind; `Kind::is_committed`.
     pub kind: Kind,
     /// When the server logged it (Unix seconds).
     pub time: u64,
@@ -703,7 +703,7 @@ impl SignedHead {
     /// # Errors
     ///
     /// An OpenSSL error, the system policy refusing the key, or
-    /// [`Error::Malformed`] past [`MAX_COSIGNATURES`].
+    /// [`Error::Malformed`] past `MAX_COSIGNATURES`.
     pub fn cosign(&mut self, witness: &SigningKey, time: u64) -> Result<()> {
         let signature = witness.sign_with_context(
             &Cosignature::statement(time, &self.head),
