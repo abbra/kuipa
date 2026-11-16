@@ -34,7 +34,7 @@ source tree.
 | [Rotate host keys automatically](#rotate-host-keys-automatically) | host admins | works |
 | [Keep keytabs useless in backups and snapshots](#keep-keytabs-useless-in-backups-and-snapshots) | host admins | works |
 | [Seal any file to a host](#seal-any-file-to-a-host) | host admins | works |
-| [Unlock encrypted disks with a post-quantum Tang](#unlock-encrypted-disks-with-a-post-quantum-tang) | host admins | works, not yet tested with real Clevis and LUKS |
+| [Unlock encrypted disks with a post-quantum Tang](#unlock-encrypted-disks-with-a-post-quantum-tang) | host admins | works, tested with Clevis and LUKS2; the initramfs unlock at boot is not |
 | [Deliver CA bundles without trusting DNS or TLS](#deliver-ca-bundles-without-trusting-dns-or-tls) | realm admins, host admins | partly |
 | [Give CI runners short-lived identities](#give-ci-runners-short-lived-identities) | platform teams | works |
 | [Accept users of a trusted realm](#accept-users-of-a-trusted-realm) | realm admins | works |
@@ -135,8 +135,13 @@ network, but Tang's key exchange is classical.
 **What kuipa does.** `kuipad` serves a post-quantum Tang, and the
 `tang-pqc` Clevis pin binds a disk to it with ML-KEM.
 
-**Status:** works as a command and over HTTP. It is **not yet tested
-under real Clevis, with LUKS2, or in an initramfs**. See
+**Status:** works. A FreeIPA integration test binds a LUKS2 volume with
+`clevis luks bind`, unlocks it with `clevis luks unlock`, refuses a wrong
+thumbprint and a stopped server, and survives `kuipad tang-rotate` (a
+retired key still unlocks; a rebind moves to the new key). Stock Clevis
+cannot `list`, `regen` or `unbind` this pin, so rebinding uses
+`cryptsetup` for the removal. The dracut module is checked to put the pin
+in an initramfs, but unlocking a volume at boot has not been tried. See
 [Keys and rotation](realm/keys.md#tang).
 
 ### Deliver CA bundles without trusting DNS or TLS

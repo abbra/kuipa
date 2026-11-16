@@ -2440,8 +2440,11 @@ channel will do.
 daemon's, §11.5, or another `tang-pqc` server) and the Clevis pin
 `tang-pqc`. It is one binary: as `tang-pqc` it takes commands, and linked
 as `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` it is the pin, so
-`clevis encrypt`, `clevis decrypt` and `clevis luks bind/unlock/regen` use
-it like the `tang` pin.
+`clevis encrypt`, `clevis decrypt`, `clevis luks bind` and `clevis luks
+unlock` use it like the `tang` pin. Stock Clevis (24) knows only its own
+pins in `clevis luks list`, `regen`, `unbind` and `edit` ("unknown pin
+'tang-pqc'"), so those do not work with this pin: rebind with `clevis
+luks bind` and remove the old binding with `cryptsetup`.
 
 | command | does |
 |---|---|
@@ -2454,8 +2457,7 @@ it like the `tang` pin.
   `adv` (an advertisement file, for offline provisioning), `ca` (a PEM file
   to verify an `https` server; without it any certificate is accepted, as
   the advertisement is verified and the exchange needs no transport
-  security). Other members are ignored, so `clevis luks regen` can pass the
-  old header's pin object back.
+  security). Other members are ignored.
 * **JWE:** `"alg": "dir"`, `"enc": "A256GCM"`, the binding's 32-byte key as
   the content key, a random 96-bit IV, and the protected header as AAD. The
   header's `clevis.tang-pqc` holds `url`, `thp`, the binding (base64url)
@@ -2631,7 +2633,7 @@ protocol domain. A server serves Tang once it has Tang keys
 * **Rotation**, as `tangd-rotate-keys`: `tang-rotate` retires every current
   key and creates new ones. Retired exchange keys are never pruned
   automatically: delete their `.`-files once every client has rebound
-  (`clevis luks regen`).
+  (a new `clevis luks bind`, then removing the old slot).
 
 Like Tang, the service is stateless: anyone holding a binding can recover
 its key, so it belongs where Tang would be deployed, on a network that
