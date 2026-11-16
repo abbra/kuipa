@@ -420,6 +420,19 @@ mod tests {
         .expect("write handler");
         std::fs::set_permissions(&handler, std::fs::Permissions::from_mode(0o700))
             .expect("make handler executable");
+        // Another test's fork can hold the write descriptor of the script
+        // for a moment, and exec then fails with ETXTBSY (os error 26).
+        for _ in 0..500 {
+            match std::process::Command::new(&handler)
+                .args(["--export", "-"])
+                .output()
+            {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         let path = dir.join("broker.sock");
         let listener = UnixListener::bind(&path).expect("bind broker");
         let thread = std::thread::spawn(move || {
