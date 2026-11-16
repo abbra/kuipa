@@ -21,11 +21,11 @@ attacks on RSA and elliptic curves.  It talks to the Tang service
 *kuipad*(8) serves at */ipa/ku/tang*, or any server speaking the same
 protocol.
 
-Installed by *contrib/clevis/install.sh* as *clevis-encrypt-tang-pqc*
-and *clevis-decrypt-tang-pqc* — with the dracut module that brings the
-pin into the initramfs — the same binary is the Clevis pin *tang-pqc*:
+Installed by *contrib/clevis/install.sh* as *clevis-encrypt-kuipa*
+and *clevis-decrypt-kuipa* — with the dracut module that brings the
+pin into the initramfs — the same binary is the Clevis pin *kuipa*:
 
-	clevis luks bind -d /dev/vda2 tang-pqc '{"url":…,"thp":…}'
+	clevis luks bind -d /dev/vda2 kuipa '{"url":…,"thp":…}'
 
 # COMMANDS
 
@@ -65,7 +65,7 @@ Encrypt a passphrase for it:
 
 Bind a LUKS volume through the pin, then unlock it in the initramfs:
 
-	clevis luks bind -d /dev/vda2 tang-pqc '{"url":"https://ipa1.example.test/ipa/ku/tang","thp":"<THP>"}'
+	clevis luks bind -d /dev/vda2 kuipa '{"url":"https://ipa1.example.test/ipa/ku/tang","thp":"<THP>"}'
 
 # SEE ALSO
 

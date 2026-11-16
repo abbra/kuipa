@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! {"alg":"dir","enc":"A256GCM",
-//!  "clevis":{"pin":"tang-pqc","tang-pqc":{"url":…,"thp":…,"binding":…[,"ca":…]}}}
+//!  "clevis":{"pin":"kuipa","kuipa":{"url":…,"thp":…,"binding":…[,"ca":…]}}}
 //! ```
 //!
 //! `decrypt` fetches the binding's exchange key from `URL/key/{kid}` (the
@@ -42,7 +42,7 @@ use tang_pqc::primitives::{TAG_LEN, open_with, seal_with};
 use tang_pqc::{Binding, ExchangeKey, RecoveryResponse, SignedAdvertisement, Thumbprint, b64};
 
 /// The pin's name, in the JWE header.
-pub const PIN: &str = "tang-pqc";
+pub const PIN: &str = "kuipa";
 
 /// Errors.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -299,7 +299,7 @@ struct Jwe {
 }
 
 fn parse(jwe: &str) -> Result<Jwe, Error> {
-    let malformed = || -> Error { "not a tang-pqc JWE".into() };
+    let malformed = || -> Error { "not a kuipa JWE".into() };
     let parts: Vec<&str> = jwe.trim().split('.').collect();
     let [protected, key, iv, ciphertext, tag] = parts[..] else {
         return Err(malformed());
@@ -332,7 +332,7 @@ fn parse(jwe: &str) -> Result<Jwe, Error> {
 ///
 /// # Errors
 ///
-/// Not a tang-pqc JWE, a server that cannot recover the key, or a JWE that
+/// Not a kuipa JWE, a server that cannot recover the key, or a JWE that
 /// does not authenticate.
 pub fn decrypt(jwe: &str) -> Result<SecretBuf, Error> {
     let jwe = parse(jwe)?;
@@ -340,9 +340,9 @@ pub fn decrypt(jwe: &str) -> Result<SecretBuf, Error> {
         .iv
         .as_slice()
         .try_into()
-        .map_err(|_| "not a tang-pqc JWE")?;
+        .map_err(|_| "not a kuipa JWE")?;
     if jwe.tag.len() != TAG_LEN {
-        return Err("not a tang-pqc JWE".into());
+        return Err("not a kuipa JWE".into());
     }
     let http = client(jwe.ca.as_deref())?;
     let base = jwe.url.trim_end_matches('/');

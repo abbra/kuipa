@@ -1,5 +1,5 @@
 //! The `tang-pqc` binary, as a command and as the Clevis pin (invoked
-//! through `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` links),
+//! through `clevis-encrypt-kuipa` / `clevis-decrypt-kuipa` links),
 //! against a plain `tang-pqc` server over HTTP.
 
 use std::io::Write;
@@ -83,7 +83,7 @@ fn links() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tang-pqc-pin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    for name in ["clevis-encrypt-tang-pqc", "clevis-decrypt-tang-pqc"] {
+    for name in ["clevis-encrypt-kuipa", "clevis-decrypt-kuipa"] {
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tang-pqc"), dir.join(name)).unwrap();
     }
     dir
@@ -106,8 +106,8 @@ fn pin_and_command_against_a_tang_server() {
     let (url, thp) = serve();
     let dir = links();
     let tool = Path::new(env!("CARGO_BIN_EXE_tang-pqc"));
-    let encrypt = dir.join("clevis-encrypt-tang-pqc");
-    let decrypt = dir.join("clevis-decrypt-tang-pqc");
+    let encrypt = dir.join("clevis-encrypt-kuipa");
+    let decrypt = dir.join("clevis-decrypt-kuipa");
     let secret = b"a disk passphrase\n";
 
     // Clevis lists pins with --summary.
