@@ -665,7 +665,7 @@ impl SigningKey {
     /// # Errors
     ///
     /// [`Error::SeedUnavailable`] if the seed is unknown (e.g. a key wrapped
-    /// with [`from_pkey`](Self::from_pkey) that was imported in expanded form).
+    /// with `from_pkey` that was imported in expanded form).
     pub fn to_jwk(&self) -> Result<SecretBuf> {
         let exported;
         let seed = if let Some(seed) = &self.seed {
