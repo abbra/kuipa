@@ -4,7 +4,7 @@
 //! system crypto policy picks.
 //!
 //! 1. **VOLE.** For each of `λ/8` trees the prover expands a GGM tree of
-//!    [`LEAVES`] leaves and each leaf to `L` pseudorandom bits.  Tree `i`
+//!    `LEAVES` leaves and each leaf to `L` pseudorandom bits.  Tree `i`
 //!    gives `uᵢ = ⊕ rₓ` and the columns `⊕_{x: bitᵦ(x)} rₓ`; the
 //!    corrections `cᵢ = u₀ ⊕ uᵢ` make one `u` for all, and the λ columns
 //!    make each row `vⱼ ∈ GF(2^λ)`.  Once the verifier knows `Δ` and
