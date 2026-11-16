@@ -11,7 +11,7 @@
 //! the day and a commitment.  The openings say what each commits to and
 //! never leave the server except in a lookup, to their subject.  A
 //! month's openings are deleted once it is older than the retention
-//! ([`RETENTION_MONTHS`] by default): its leaves stay in the log and keep
+//! (`RETENTION_MONTHS` by default): its leaves stay in the log and keep
 //! verifying, but nobody, the server included, can say any more what they
 //! were or whom they were about.
 //!
@@ -167,7 +167,7 @@ impl FileLedger {
     }
 
     /// Keep `months` months of openings (at least one, the current); the
-    /// default is [`RETENTION_MONTHS`].  Older months are deleted by
+    /// default is `RETENTION_MONTHS`.  Older months are deleted by
     /// [`expire`](Self::expire), which the first append of each month
     /// runs.
     #[must_use]
@@ -362,7 +362,7 @@ impl Ledger for FileLedger {
     /// appended before the period began: the leaves of the period itself
     /// wait for the next.  With an interval of zero, the head covers
     /// every leaf and is re-signed when the log grows or the signature is
-    /// older than [`HEAD_INTERVAL`].
+    /// older than `HEAD_INTERVAL`.
     ///
     /// An error for an OpenSSL failure, or a key of another category than
     /// the log's.
