@@ -45,7 +45,7 @@ is blocked, enrollment fails.
 Sealing protects copies taken *out of* reach of your servers. A recent
 snapshot restored *inside* your network still opens while the host is
 enabled. Delete hosts you retire, and rotate keys on the timer. Binding
-keytabs to the machine's TPM, which closes the gap, is planned.
+keytabs to the machine's TPM (`kuipa protect --tpm`) closes the gap.
 
 `ipa host-disable` today removes keys but does not lock the entry, so
 sealed *files* of a disabled host still open. Delete the host, or lock it,

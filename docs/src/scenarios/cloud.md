@@ -175,7 +175,7 @@ instance *inside* your network, while the host is still enabled, gets the
 host's identity, just as the original instance would. Rotation narrows the
 window to a month at most; disabling hosts on termination closes it for
 deleted instances. Binding the keytab to the instance's virtual TPM closes
-it fully and is planned (below).
+it fully (below).
 
 ### Protect service keytabs on the instance
 
@@ -315,13 +315,16 @@ mistake, or to a keytab copied off a runner after its lease
 
 ### Bind identities to the instance's virtual TPM
 
-**planned**
+**available** (not yet run on a cloud vTPM)
 
 Clouds offer a virtual TPM per instance (shielded or trusted-launch VMs,
-NitroTPM). With the planned TPM factor, a sealed keytab or file opens only
+NitroTPM). With the TPM factor (`kuipa protect --tpm`, `kuipa prepare
+--tpm`), a sealed keytab or file opens only
 with both an IPA server and *this instance's* vTPM. A snapshot restored as
 a new instance, even inside your network, gets a different vTPM and cannot
-open it. This closes the gap described under snapshots above.
+open it. This closes the gap described under snapshots above. Reading a
+TPM-sealed keytab through gssproxy's loader under SELinux enforcing is not
+checked yet.
 
 ### Your own secrets on a cloud development VM
 
@@ -376,5 +379,5 @@ What you get, and what it rests on:
 | deliver application secrets | `kuipa protect --file` | available |
 | encrypt data volumes | Clevis `tang-pqc` pin against kuipad | available |
 | invalidate a terminated instance | `ipa host-del` in a termination hook | available |
-| defeat snapshot restores inside the network | vTPM factor | planned |
+| defeat snapshot restores inside the network | vTPM factor (`kuipa protect --tpm`) | available |
 | let users seal their own files | `kuipa seal` | available |

@@ -49,7 +49,7 @@ source tree.
 | [Sign files and commits under your login](#sign-files-and-commits-under-your-login) | developers, release engineers, CI | works |
 | [Have independent witnesses watch the logs](#have-independent-witnesses-watch-the-logs) | auditors, partner sites | works |
 | [Log in offline without a crackable password cache](#log-in-offline-without-a-crackable-password-cache) | laptop users | planned |
-| [Tie secrets to a TPM, passkey or attested hardware](#tie-secrets-to-a-tpm-passkey-or-attested-hardware) | users, fleet owners | planned |
+| [Tie secrets to a TPM, passkey or attested hardware](#tie-secrets-to-a-tpm-passkey-or-attested-hardware) | users, fleet owners | partly |
 | [Anonymous tokens: surveys, reports, access](#anonymous-tokens-surveys-reports-access) | everyone | research |
 
 Every use case follows the host's system crypto policy. Under a CNSA 2.0
@@ -256,9 +256,31 @@ opens only under rules you choose. The rules can require your device's
 key, your Kerberos login, and an answer from one of the realm's servers.
 Your files never leave your machine.
 
-**Status:** partly: devices with passphrase-protected keys or a PKCS#11
-token, Kerberos, sessions and unlock limits work. Passkeys and attested
-hardware do not yet. See [Sealing your own files](user/sealing.md).
+**Status:** works: devices with passphrase-protected keys, a passkey, a TPM or
+a PKCS#11 token, Kerberos, sessions and unlock limits. Hardware attestation
+(the `hardware-*` device levels) is not built yet. See
+[Sealing your own files](user/sealing.md).
+
+### Tie secrets to a TPM, passkey or attested hardware
+
+**Why.** A device key on disk can be copied. One inside a TPM, a passkey
+or a security key cannot.
+
+**What kuipa does.** Passkeys are a seal factor (`passkey`, classical and
+ML-DSA) and can wrap a device key (`kuipa seal device add --passkey`). A
+TPM factor binds sealed keytabs and files to the host (`kuipa protect
+--tpm`, `kuipa prepare --tpm`) and holds a user seal's device key
+(`kuipa seal device add --tpm`), through `systemd-creds`. A PKCS#11 token
+can hold the device key.
+
+**Status:** partly. Passkeys, TPM and PKCS#11 work; the passkey code is
+tested with a software authenticator, not yet a real security key.
+Checked hardware attestation, so that a policy can demand keys that
+cannot leave the hardware, is planned, and keys register at level `any`
+until then. TPM-sealed keytabs read through gssproxy's loader under
+SELinux enforcing are not checked yet. See
+[Binding to the host's TPM](host/protect.md#binding-to-the-hosts-tpm) and
+[Sealing your own files](user/sealing.md).
 
 ### See who touched your seal
 
@@ -358,15 +380,6 @@ laptop: the realm signs an offline grant for one user, one machine and a
 time window. The password check moves into the laptop's TPM, which
 limits guesses and works only on that machine and only within the
 window. The disk holds nothing to guess against.
-
-### Tie secrets to a TPM, passkey or attested hardware
-
-**Why.** A device key on disk can be copied. One inside a TPM, a passkey
-or a security key cannot.
-
-**What kuipa would do.** Passkeys as a seal factor, a TPM factor for
-sealed keytabs and machine seals, and checked hardware attestation, so
-a policy can demand keys that cannot leave the hardware.
 
 ### Anonymous tokens: surveys, reports, access
 
