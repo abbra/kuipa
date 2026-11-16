@@ -1,10 +1,10 @@
 # tang-pqc-clevis
 
 A command-line client for post-quantum Tang servers, and the Clevis pin
-`tang-pqc`. It is built on [`tang-pqc`](../tang-pqc).
+`kuipa`. It is built on [`tang-pqc`](../tang-pqc).
 
 The binary is called `tang-pqc`. When installed as
-`clevis-encrypt-tang-pqc` and `clevis-decrypt-tang-pqc`, it also works as
+`clevis-encrypt-kuipa` and `clevis-decrypt-kuipa`, it also works as
 a Clevis pin. It can unlock LUKS volumes and other Clevis-protected data
 with any server that implements `tang-pqc`, including `kuipad`.
 
@@ -20,7 +20,7 @@ tang-pqc adv https://tang.example.test
 Encrypt and decrypt through Clevis:
 
 ```sh
-clevis encrypt tang-pqc '{"url":"https://tang.example.test","thp":"<thumbprint>"}' < secret > secret.jwe
+clevis encrypt kuipa '{"url":"https://tang.example.test","thp":"<thumbprint>"}' < secret > secret.jwe
 clevis decrypt < secret.jwe
 ```
 

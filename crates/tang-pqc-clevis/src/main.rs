@@ -6,13 +6,13 @@
 //! tang-pqc decrypt < JWE > OUT         recover the key and decrypt
 //! ```
 //!
-//! Installed (or linked) as `clevis-encrypt-tang-pqc` and
-//! `clevis-decrypt-tang-pqc`, it is the Clevis pin `tang-pqc`:
+//! Installed (or linked) as `clevis-encrypt-kuipa` and
+//! `clevis-decrypt-kuipa`, it is the Clevis pin `kuipa`:
 //!
 //! ```text
-//! clevis encrypt tang-pqc '{"url":"https://ipa1.example.test/ipa/ku/tang","thp":"…"}' < IN > JWE
+//! clevis encrypt kuipa '{"url":"https://ipa1.example.test/ipa/ku/tang","thp":"…"}' < IN > JWE
 //! clevis decrypt < JWE > OUT
-//! clevis luks bind -d /dev/vda2 tang-pqc '{"url":…,"thp":…}'
+//! clevis luks bind -d /dev/vda2 kuipa '{"url":…,"thp":…}'
 //! ```
 //!
 //! Exit status: 0 success, 1 error, 2 usage.
@@ -27,11 +27,11 @@ use tang_pqc_clevis::{Config, Error};
 #[derive(Parser)]
 #[command(
     about = "Post-quantum Tang from the command line (the Tang side of the \
-tang-pqc Clevis pin).",
-    long_about = "Installed (or linked) as clevis-encrypt-tang-pqc and \
-clevis-decrypt-tang-pqc, the same binary is the Clevis pin `tang-pqc`:\n  \
-clevis encrypt tang-pqc '{\"url\":…,\"thp\":…}' < IN > JWE\n  clevis decrypt < JWE \
-> OUT\n  clevis luks bind -d /dev/vda2 tang-pqc '{\"url\":…,\"thp\":…}'",
+kuipa Clevis pin).",
+    long_about = "Installed (or linked) as clevis-encrypt-kuipa and \
+clevis-decrypt-kuipa, the same binary is the Clevis pin `kuipa`:\n  \
+clevis encrypt kuipa '{\"url\":…,\"thp\":…}' < IN > JWE\n  clevis decrypt < JWE \
+> OUT\n  clevis luks bind -d /dev/vda2 kuipa '{\"url\":…,\"thp\":…}'",
     after_help = "Exit status: 0 success, 1 error, 2 usage."
 )]
 struct Cli {
@@ -62,7 +62,7 @@ enum Command {
     /// Recover the key from the JWE on standard input; print the plaintext.
     Decrypt,
 }
-const ENCRYPT_USAGE: &str = r"Usage: clevis encrypt tang-pqc CONFIG [-y] < PLAINTEXT > JWE
+const ENCRYPT_USAGE: &str = r"Usage: clevis encrypt kuipa CONFIG [-y] < PLAINTEXT > JWE
 
 Encrypts using a post-quantum Tang (tang-pqc) binding server policy
 
@@ -119,7 +119,7 @@ fn main() -> ExitCode {
         .unwrap_or_default();
     args.remove(0);
     let (prog, result) = match name.as_str() {
-        "clevis-encrypt-tang-pqc" => {
+        "clevis-encrypt-kuipa" => {
             if args.first().map(String::as_str) == Some("--summary") {
                 println!("Encrypts using a post-quantum Tang (tang-pqc) binding server policy");
                 return ExitCode::SUCCESS;
@@ -138,7 +138,7 @@ fn main() -> ExitCode {
             }
             (name.clone(), encrypt(&args[0]))
         }
-        "clevis-decrypt-tang-pqc" => (name.clone(), decrypt()),
+        "clevis-decrypt-kuipa" => (name.clone(), decrypt()),
         _ => {
             let cli = Cli::parse();
             let result = match cli.command {
