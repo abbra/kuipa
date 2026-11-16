@@ -23,7 +23,7 @@ libraries only through the borrowed FFI crates. No RustCrypto crates
       group, `ipaKUVoucherSpent`); trust invitations and the cross-realm
       `krbtgt` principals created with `KEYTAB_GET` and a password, and a
       cross-realm ticket through them (§11.4, §17.4).
-- [ ] Unlock a LUKS2 volume at boot with the `tang-pqc` pin from the dracut
+- [ ] Unlock a LUKS2 volume at boot with the `kuipa` pin from the dracut
       module (§10.7). `clevis luks bind`, `unlock`, refusal and rotation
       are tested in `test_kuipa_clevis.py`. `luks list` and `regen` need
       the Clevis patch (`kuipa-support` branch of ~/src/clevis, tested

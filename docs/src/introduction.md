@@ -48,7 +48,7 @@ SHA-2 from OpenSSL, within the system's crypto policy.
 | `kuipa` | enrolled hosts and their users | enrolls the host, rotates its keys, protects keytabs and files, checks health; `kuipa seal` for users' own files |
 | `kuipa-unseal` | enrolled hosts | opens sealed keytabs and files at boot, or for gssproxy, without a human |
 | `kuipa-voucher` | wherever vouchers are issued | issues and requests single-use enrollment vouchers |
-| `tang-pqc` | any Clevis client | a post-quantum Tang client and Clevis pin, for disk encryption |
+| `tang-pqc` | any Clevis client | a post-quantum Tang client and the Clevis pin `kuipa`, for disk encryption |
 
 ```mermaid
 flowchart LR

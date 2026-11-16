@@ -253,11 +253,11 @@ machines share; it protects what one machine holds.
 
 Attach an encrypted data volume and have it unlock automatically, but only
 where the IPA servers answer. kuipad doubles as a post-quantum Tang server,
-and the `tang-pqc` Clevis pin binds LUKS volumes to it:
+and the `kuipa` Clevis pin binds LUKS volumes to it:
 
 ```sh
 tang-pqc adv https://ipa1.example.test/ipa/ku/tang     # note a signing-key thumbprint
-clevis luks bind -d /dev/nvme1n1 sss '{"t":1,"pins":{"tang-pqc":[
+clevis luks bind -d /dev/nvme1n1 sss '{"t":1,"pins":{"kuipa":[
     {"url":"https://ipa1.example.test/ipa/ku/tang","thp":"<thp1>"},
     {"url":"https://ipa2.example.test/ipa/ku/tang","thp":"<thp2>"}]}}'
 ```
@@ -377,7 +377,7 @@ What you get, and what it rests on:
 | protect service keytabs | `kuipa protect --keytab` | available |
 | keep service keytabs off every filesystem | gssproxy `keytab_loader` | available, needs a gssproxy built from main (PR merged, awaiting release) |
 | deliver application secrets | `kuipa protect --file` | available |
-| encrypt data volumes | Clevis `tang-pqc` pin against kuipad | available |
+| encrypt data volumes | Clevis `kuipa` pin against kuipad | available |
 | invalidate a terminated instance | `ipa host-del` in a termination hook | available |
 | defeat snapshot restores inside the network | vTPM factor (`kuipa protect --tpm`) | available |
 | let users seal their own files | `kuipa seal` | available |
