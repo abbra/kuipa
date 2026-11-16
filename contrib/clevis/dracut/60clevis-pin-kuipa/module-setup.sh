@@ -1,10 +1,10 @@
 #!/bin/bash
-# dracut module: the tang-pqc Clevis pin in the initramfs, so
+# dracut module: the kuipa Clevis pin in the initramfs, so
 # clevis-luks-askpass can unlock volumes bound with `clevis luks bind ...
-# tang-pqc` once the network is up (as the classic tang pin does).
+# kuipa` once the network is up (as the classic tang pin does).
 
 check() {
-    require_binaries tang-pqc clevis-decrypt-tang-pqc || return 1
+    require_binaries tang-pqc clevis-decrypt-kuipa || return 1
     return 255
 }
 
@@ -14,7 +14,7 @@ depends() {
 }
 
 install() {
-    inst_multiple tang-pqc clevis-decrypt-tang-pqc
+    inst_multiple tang-pqc clevis-decrypt-kuipa
     # The system crypto policy decides which ML-KEM and ML-DSA sets the
     # pin may use; without it OpenSSL's defaults apply.
     inst_multiple -o /etc/pki/tls/openssl.cnf \

@@ -58,7 +58,7 @@ Two build switches, for `rpmbuild` and `mock --with/--without`:
 | Switch | Default | Effect |
 |---|---|---|
 | `check` | on | skip `%check` (the test suite) |
-| `clevis` | on | skip the `tang-pqc` Clevis pin and its dracut module |
+| `clevis` | on | skip the `kuipa` Clevis pin and its dracut module |
 
 ## Subpackages
 
@@ -67,7 +67,7 @@ Two build switches, for `rpmbuild` and `mock --with/--without`:
 | `kuipa` | host-side binaries (`/usr/sbin/kuipa`, `/usr/libexec/kuipa-unseal`, `/usr/bin/kuipa-{voucher,witness,audit,mirror,gitsign}`), the unseal / client-complete / rotate units and timer, and the gssproxy keytab snippet example |
 | `kuipa-server` | `/usr/libexec/kuipad`, the `kuipad` system account, its socket-activated daemon and privileged custody broker units, and `ipa/kuipad.json.example` — the `/ipa/ku/` httpd snippet is shipped by FreeIPA |
 | `tang-pqc` | the post-quantum Tang client |
-| `clevis-pin-tang-pqc` | the `clevis-*-tang-pqc` pin links and the dracut module (noarch; `rpmbuild --without clevis` skips it) |
+| `clevis-pin-kuipa` | the `clevis-*-kuipa` pin links and the dracut module (noarch; `rpmbuild --without clevis` skips it) |
 
 ## Subpackage layout and binaries
 

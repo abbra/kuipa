@@ -634,8 +634,8 @@ step 0 "Get a ticket for web1 as the B.TEST user" 'pq_trusted kvno "host/$PQ_HOS
     "host/web1.example.test@EXAMPLE.TEST"
 
 section "Post-quantum Tang" \
-    "ipa1 also serves post-quantum Tang: a secret encrypted with the tang-pqc pin is recovered with ipa1's help."
-step 0 "Encrypt a secret with the tang-pqc pin" 'echo "a secret" | tang-pqc encrypt "$(pq_tang)" > "$KUIPA_PLAYGROUND/secret.jwe"'
+    "ipa1 also serves post-quantum Tang: a secret encrypted with the kuipa pin is recovered with ipa1's help."
+step 0 "Encrypt a secret with the kuipa pin" 'echo "a secret" | tang-pqc encrypt "$(pq_tang)" > "$KUIPA_PLAYGROUND/secret.jwe"'
 step 0 "Decrypt it through ipa1" 'tang-pqc decrypt < "$KUIPA_PLAYGROUND/secret.jwe"' \
     "a secret"
 
