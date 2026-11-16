@@ -76,7 +76,7 @@ which algorithms are used.
 | [`kuipa-ldap`](crates/kuipa-ldap) | OpenLDAP bindings |
 | [`kuipa-fido2`](crates/kuipa-fido2) | libfido2 bindings: passkey assertions and `hmac-secret`, classical and ML-DSA |
 | [`tang-pqc`](crates/tang-pqc) | Post-quantum Tang/Clevis-style key escrow with ML-KEM and ML-DSA |
-| [`tang-pqc-clevis`](crates/tang-pqc-clevis) | A post-quantum Tang client and the Clevis pin `tang-pqc` |
+| [`tang-pqc-clevis`](crates/tang-pqc-clevis) | A post-quantum Tang client and the Clevis pin `kuipa` |
 | [`ml-dsa-blind`](crates/ml-dsa-blind) | Blind signing with stock FIPS 204 ML-DSA |
 | [`ml-dsa-zk`](crates/ml-dsa-zk) | VOLE-in-the-head zero-knowledge proofs over boolean circuits (a research prototype toward unlinkable blind signatures) |
 | [`kuipa-perf`](crates/kuipa-perf) | Benchmark and test fixtures: synthetic realms, keytabs and certificate authorities |

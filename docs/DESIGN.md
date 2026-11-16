@@ -90,7 +90,7 @@ flowchart LR
     host -- "kuipa-unseal: POST /ipa/ku/rec/{kid}" --> httpd
     host -- "protect: POST /ipa/ku/register/{kid}" --> httpd
     admin["Administrator"] -- "POST /ipa/ku/stage/{kid}" --> httpd
-    clevis["Clevis (tang-pqc)"] -- "GET/POST /ipa/ku/tang/… (Tang keys only, §11.5)" --> httpd
+    clevis["Clevis (kuipa pin)"] -- "GET/POST /ipa/ku/tang/… (Tang keys only, §11.5)" --> httpd
     httpd -- "Unix socket; socket-activated" --> kuipad["kuipad"]
     kuipad -- "LDAPI, GSSAPI: bind, join,<br/>KEYTAB_GET, attributes" --> ds["389-ds"]
     provisioner["Provisioner"] <-- "blinded μ / σ, out of band" --> issuer["Voucher issuer (kuipa-voucher, §9)"]
@@ -108,7 +108,7 @@ Each depends only on crates in rows above it:
 |---|---|---|---|
 | cryptographic building blocks, no IPA knowledge | `tang-pqc` | ML-KEM/ML-DSA Tang escrow: advertisements, keys, bindings, sealed recovery, plus protocol domains, binding context, advertisement extensions and public primitives for protocols built on it (§15) | — |
 | | `ml-dsa-blind` | blind (message-hiding) signing with stock FIPS 204 ML-DSA through OpenSSL's external μ, for vouchers (§9) | — |
-| | `tang-pqc-clevis` | the `tang-pqc` binary: a client for any post-quantum Tang server and the Clevis pin `tang-pqc` (§10.7) | `tang-pqc` |
+| | `tang-pqc-clevis` | the `tang-pqc` binary: a client for any post-quantum Tang server and the Clevis pin `kuipa` (§10.7) | `tang-pqc` |
 | IPA protocol | `kuipa-enroll` | the protocol, without I/O or `unsafe`: delegations and the anchor exchange state, realm advertisements, join/rekey/stage, vouchers, trust establishment, bundles, sealed keytabs and escrow, MIT keytabs, `Directory` and `EnrollServer` | `tang-pqc` |
 | system bindings | `kuipa-gssapi` | GSSAPI bindings (from ahdapa-gssapi) | — |
 | | `kuipa-ldap` | OpenLDAP bindings (from ahdapa-ldap), with extended operations | `kuipa-gssapi` |
@@ -143,7 +143,7 @@ with the `rustls-native-ossl` provider.
 | `kuipa` | `kuipa-tools` | hosts | root, from `ipa-client-install`, an administrator or a unit (§10.1) |
 | `/usr/libexec/kuipa-unseal` | `kuipa-tools` | hosts with a sealed keytab or file | `init_t` at boot, `gssproxy_t` as keytab loader (§10.5) |
 | `kuipa-voucher` | `kuipa-tools` | the voucher issuer's and the provisioner's machines | their users (§10.6) |
-| `tang-pqc`, linked as `clevis-{en,de}crypt-tang-pqc` | `tang-pqc-clevis` | any Clevis client, initramfs included | the Clevis pin or a command (§10.7) |
+| `tang-pqc`, linked as `clevis-{en,de}crypt-kuipa` | `tang-pqc-clevis` | any Clevis client, initramfs included | the Clevis pin or a command (§10.7) |
 
 The host-side programs are split only where SELinux needs different domains
 (SELinux picks a domain by executable file type, not by arguments; FreeIPA
@@ -2434,15 +2434,16 @@ is contacted. Exit 0, 75 (no server could unseal) or 1.
 Requests and responses are base64url text (87 and about 4.4 KB), so any
 channel will do.
 
-### 10.7 `tang-pqc` and the Clevis pin
+### 10.7 `tang-pqc` and the Clevis pin `kuipa`
 
 `crates/tang-pqc-clevis` is a client for any post-quantum Tang server (the
 daemon's, §11.5, or another `tang-pqc` server) and the Clevis pin
-`tang-pqc`. It is one binary: as `tang-pqc` it takes commands, and linked
-as `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` it is the pin, so
+`kuipa`. The pin has its own name so it reads clearly beside stock `tang`.
+It is one binary: as `tang-pqc` it takes commands, and linked
+as `clevis-encrypt-kuipa` / `clevis-decrypt-kuipa` it is the pin, so
 `clevis encrypt`, `clevis decrypt`, `clevis luks bind` and `clevis luks
-unlock` use it like the `tang` pin. Stock Clevis (24) prints "unknown pin
-'tang-pqc'" in `clevis luks list`, and `regen` reads the pin from that
+unlock` use it like the `tang` pin. Stock Clevis (24) cannot list or regen
+it: it prints "unknown pin 'kuipa'" in `clevis luks list`, and `regen` reads the pin from that
 list, so `list` and `regen` need the Clevis change that lists the pin's
 `url`, `thp` and `ca` (the `kuipa-support` branch of Clevis; until it is
 released, rebind with `clevis luks bind` and remove the old slot with
@@ -2463,11 +2464,11 @@ released, rebind with `clevis luks bind` and remove the old slot with
   security). Other members are ignored.
 * **JWE:** `"alg": "dir"`, `"enc": "A256GCM"`, the binding's 32-byte key as
   the content key, a random 96-bit IV, and the protected header as AAD. The
-  header's `clevis.tang-pqc` holds `url`, `thp`, the binding (base64url)
+  header's `clevis.kuipa` holds `url`, `thp`, the binding (base64url)
   and `ca` if set: about 2.5 KB in all, well within a LUKS2 token. Any JWE
   library decrypts it given the key.
 * **Boot:** `contrib/clevis/install.sh` installs the binary, the two pin
-  links and a dracut module (`60clevis-pin-tang-pqc`: the pin, `clevis` and
+  links and a dracut module (`60clevis-pin-kuipa`: the pin, `clevis` and
   `network`, plus the crypto-policy files, so the initramfs applies the same
   algorithm policy).
 
@@ -3225,7 +3226,7 @@ daemon's.  The IPA installer writes both sections.
 | secrets transport (§18): the `keys` operation, handler execution with runas, `kuipa keys fetch`, the `cn=masters` and CA-role policy, a promotion scenario in the playground | implemented, tested; the LDAP policy check **not yet run against a FreeIPA server**; sealed lightweight-CA artifacts (§18.3) designed |
 | TPM factor for sealed keytabs and files (§7.1), `prepare --tpm` (§8.2), the user-seal `tpm` device (§7.6.2) | implemented; tested in `kdc.rs` with a test double for `systemd-creds` (the factor kept through rotation and resealing, another TPM refused without a retry, the TPM-held machine key through `enroll --bundle`, the device key), and on a real swtpm vTPM in ci-freeipa VMs (`protect --tpm`, a restart, `rotate-keys`, `check`, a copied disk refused on another vTPM, `prepare --tpm`, `seal device add --tpm` as an unprivileged user); **not yet**: `enroll --bundle` of a TPM-held machine key on FreeIPA (`host-add --stage` is not in the FreeIPA build), the gssproxy loader under SELinux enforcing, PCR-bound seals surviving a firmware or kernel update |
 | post-quantum Tang service (§11.5): `adv`, `adv/{thp}`, `key/{kid}`, `rec/{kid}`, Tang-style key directory and rotation | implemented, tested over HTTP |
-| `tang-pqc` client and Clevis pin (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
+| `tang-pqc` client and Clevis pin `kuipa` (§10.7), installer, dracut module | implemented, tested as a command and through the pin's names over HTTP; **not yet run under `clevis` itself, with LUKS2, or in an initramfs** |
 | user seals, unified recovery (§7.6): seal model and descriptor, devices (passphrase files, passkey-wrapped files, PKCS#11 tokens), the ticket and passkey factors (classical and ML-DSA passkeys), sessions, offline sessions, unlock counts, registered sealing, shared seals (§7.6.12), release approvals (DESIGN-approvals.md), machine seals for host and service escrow, `kuipa seal` | implemented, tested against a real KDC; **not yet**: attestation for the `hardware-*` levels, PAC delegation info for `ticket.delegation`; the LDAP side **not yet run against FreeIPA** |
 | gssproxy holder (§7.4) | `kuipa-unseal --memfd` implemented; the gssproxy change merged as gssapi/gssproxy#135, **awaiting an upstream release** |
 | FreeIPA integration (schema `ipaKUEscrowBinding`, `ipaKUEscrowFileBinding`, `ipaKUStaged`, `ipaKUVoucherSpent`, `ipaKUTrustInvitation`, `ipaKUTrustedRealm` and the `cn=trusts,cn=kuipa,cn=etc` entry; ACIs letting the daemon add hosts, host-group members and cross-realm `krbtgt` principals and write their keys; framework commands, installers, `ipa-client-install` options) | designed |
@@ -3242,7 +3243,7 @@ daemon's.  The IPA installer writes both sections.
 | `crates/kuipa-tools/tests/cli.rs` | the `kuipa` binary: `--realm` with an enrollment string for another realm (or another case) is an error before any server is contacted; with the same realm the join goes ahead; no help text, rendered result, or error message cites a DESIGN section; labels are plain when output is captured or `$NO_COLOR` is set, emphasised when `$CLICOLOR_FORCE` asks for colour; `status` shows the pinned head windows and freezes, and a corrupt pin file refuses (naming the file) rather than reading as nothing pinned; `kuipa-unseal` refuses `--out /dev/stdout` and a symlink target before reading anything, and accepts `--out -` to a pipe, and stripping the emphasis gives byte-for-byte the plain rows |
 | `crates/kuipa-tools/tests/flows.rs` | the client flows against the daemon's router over HTTP: OTP enrollment with failover (and its trace: the steps are there, the OTP is not), refusal and retry-later exits, OTP guessing stopped by the per-host limit (`429`, exit 75), wrong anchor, a stolen anchor: two pinned anchors demand two distinct proofs, so the single-vouched server is skipped and the exchange-vouched one serves the join, alone it stops at exit 75 naming the reason, and one pinned anchor takes it (§4.4), the anchor epoch watermark: a proper rotation moves it forward through the public anchor log, a log longer than one page is followed to the advertised head, and one pinned anchor refuses both a server whose log stops behind it (naming both sequences) and a log forked at it (§4.8), the LDAP-checked OTP, `realm-info` (its KDCs limited to the servers to use), pre-provisioned pins (one is enough; a second unrelated one makes the host refuse the realm), a string naming a rotated anchor verified through the succession, expired strings refused, offline bundles; advertisements for another server or domain than the deployment's refused (needs an administrator) without failing over, before any request, armoured kinit or `realm-info` file; the post-quantum Tang service with `tang-pqc`'s client (provision against the pinned thumbprint, recovery through `key/{kid}`, Tang's error statuses, rotation: the old binding still opens (its retired key still served at `key/{kid}`) and `adv/{old}` lets the old pin verify the new keys; no keys, no service), and the pin against it: encrypt and decrypt, a header pointing elsewhere refused, encryption with the old pin after a rotation |
 | `crates/kuipa-tools/tests/flows.rs` (claim-log services) | DESIGN-claim-logs.md over the daemon's router: an expired pin is trusted no more than an absent one, a corrupt pin file errors rather than reading as empty, a partner head no signature proves is not pinned (§3), a frozen pin refuses a claim its own head does not prove — naming the freeze — and two frozen anchors must each prove the claim by head (§2), the whole window travels on `?head=` so a claim under only the newest head is proven (§1.4), an enrollment head nothing signed is not pinned and one a signature proves is (§4), an advertised tree larger than the fetch bound is refused with the window kept (§1.3), `kuipa-audit` coverage (current, stale, restarted, unsigned head as split) and `split-view` over two servers with forked logs, `kuipa-mirror` serving cached advertisement, claim-log pages, anchor-log heads and head-proof answers with no authenticated route |
-| `crates/tang-pqc-clevis` unit and `tests/pin.rs` | the binary as `tang-pqc` and as `clevis-encrypt-tang-pqc` / `clevis-decrypt-tang-pqc` against a `tang-pqc` server: `--summary`, `adv`, refusal without or with a wrong `thp` (naming the advertised keys), round trips, fresh bindings per encryption, tampered header or ciphertext refused, the `regen` configuration, usage exits; configuration parsing, foreign JWEs |
+| `crates/tang-pqc-clevis` unit and `tests/pin.rs` | the binary as `tang-pqc` and as `clevis-encrypt-kuipa` / `clevis-decrypt-kuipa` against a `tang-pqc` server: `--summary`, `adv`, refusal without or with a wrong `thp` (naming the advertised keys), round trips, fresh bindings per encryption, tampered header or ciphertext refused, the `regen` configuration, usage exits; configuration parsing, foreign JWEs |
 | `crates/kuipa-tools/tests/dns.rs` | SRV discovery against a stub DNS server over UDP and TCP (truncated answers) and over DoT and DoH (TLS, `KUIPA_DNS_CA`): priority and weight order, unsafe and duplicate names dropped, no records, no answer, untrusted certificate rejected |
 | `crates/kuipa-tools/tests/voucher.rs` | against a real MIT KDC: issuer key and quota, blinded request (64 bytes), unblinding, the voucher key in the advertisement; a bearer voucher creates its host in its host group once and not another host; a bound voucher needs its ephemeral key; an unknown voucher key is refused; the quota runs out |
 | `crates/kuipa-tools/tests/trust.rs` | against two real MIT KDCs, realms A and B: B invites A and A's server establishes the trust over HTTP (both directories record it, the invitation is single use, A publishes B refreshed from B's advertisement); a host of A installs B from A's `trusts` (B's anchors apart from A's, B's chain, a `krb5.conf.d` snippet without `[libdefaults]`), gets anonymous-PKINIT armour from B's KDC, and gets none without B's chain or with A's chain instead; with the cross-realm keys the establishment created in both KDCs, a user of B logs in with that armour and gets a ticket for the A host; refresh, an unreachable B keeping its files, a trust entry with A's own anchor refused, removal, `leave` |

@@ -133,7 +133,7 @@ keytab, and services can read it once at start-up.
 network, but Tang's key exchange is classical.
 
 **What kuipa does.** `kuipad` serves a post-quantum Tang, and the
-`tang-pqc` Clevis pin binds a disk to it with ML-KEM.
+`kuipa` Clevis pin binds a disk to it with ML-KEM.
 
 **Status:** works. A FreeIPA integration test binds a LUKS2 volume with
 `clevis luks bind`, unlocks it with `clevis luks unlock`, refuses a wrong
@@ -177,7 +177,7 @@ bundle, kept current:
 - install them into the system trust store (`update-ca-trust`, with
   distrusted keys in the blocklist), and into containers at start;
 - carry the pinned anchors and the last verified bundle into the
-  initramfs (a dracut module, as `tang-pqc` has), so early-boot HTTPS
+  initramfs (a dracut module, as the `kuipa` Clevis pin has), so early-boot HTTPS
   (network root, provisioning, `tang-pqc` over `https`) trusts what the
   realm decided, verified before the root file system is mounted.
 

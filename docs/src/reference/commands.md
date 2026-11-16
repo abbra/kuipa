@@ -151,4 +151,4 @@ Restart the daemon after changing keys.
 | `tang-pqc adv URL [--ca F]` | list the signing-key thumbprints a Tang server advertises |
 | `tang-pqc encrypt CONFIG < IN > JWE` | encrypt to a Tang server (`{"url": …, "thp": …}`) |
 | `tang-pqc decrypt < JWE > OUT` | decrypt through the server |
-| `clevis luks bind -d DEV tang-pqc CONFIG` | the same as a Clevis pin, for LUKS (install with `contrib/clevis/install.sh`) |
+| `clevis luks bind -d DEV kuipa CONFIG` | the same as a Clevis pin, for LUKS (install with `contrib/clevis/install.sh`) |
