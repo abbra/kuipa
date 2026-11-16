@@ -387,8 +387,8 @@ What the P2 and P3 gaps mean in practice:
   migration. Each kind of client verifies only the signatures it
   understands.
 * **Clevis pin:** implemented as `crates/tang-pqc-clevis`, one binary that
-  is the `tang-pqc` command and, linked as `clevis-encrypt-tang-pqc` /
-  `clevis-decrypt-tang-pqc`, the Clevis pin `tang-pqc`
+  is the `tang-pqc` command and, linked as `clevis-encrypt-kuipa` /
+  `clevis-decrypt-kuipa`, the Clevis pin `kuipa`
   (`docs/DESIGN.md` §10.7).
   * **Configuration:** `{"url": …, "thp": …}`, plus `adv` (an advertisement
     file, for offline provisioning) and `ca` (a PEM file to verify an
@@ -396,7 +396,7 @@ What the P2 and P3 gaps mean in practice:
   * **Encrypt:** fetch `URL/adv`, verify it against `thp` (falling back to
     `URL/adv/{thp}` after a rotation), provision a binding, and write a
     compact JWE: `"alg": "dir"`, `"enc": "A256GCM"`, `K` as the content key,
-    and the protected header as AAD. The header's `clevis.tang-pqc` holds
+    and the protected header as AAD. The header's `clevis.kuipa` holds
     `url`, `thp`, the binding (base64url) and `ca` if set, about 2.5 KB. The
     advertisement is **not** embedded, unlike the classic Tang pin (see §3.4
     for the LUKS2 size limit).
@@ -410,7 +410,7 @@ What the P2 and P3 gaps mean in practice:
     file and still does not store it. The file must be unexpired, so fetch
     it shortly before use.
   * **Boot:** `contrib/clevis/install.sh` installs the binary, the pin links
-    and the dracut module `60clevis-pin-tang-pqc`, which also carries the
+    and the dracut module `60clevis-pin-kuipa`, which also carries the
     crypto-policy files so the initramfs enforces the same policy (§6.1).
 * **Hybrid transition:** combine with classical MR by setting
   `ikm = ss ‖ K_MR ‖ r`, so the key is safe if *either* system holds. This
