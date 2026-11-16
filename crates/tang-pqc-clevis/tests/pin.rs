@@ -185,6 +185,13 @@ fn pin_and_command_against_a_tang_server() {
     let regen = format!(r#"{{"url":"{url}","thp":"{thp}","binding":"AAAA"}}"#);
     let out = run(&encrypt, &[&regen], secret);
     assert!(out.status.success());
+    // `clevis luks bind -y` and `regen` pass `-y` after the configuration.
+    let out = run(&encrypt, &[&regen, "-y"], secret);
+    assert!(out.status.success());
+    assert_eq!(
+        run(&encrypt, &[&regen, "-x"], secret).status.code(),
+        Some(2)
+    );
 
     // Usage errors exit 2.
     assert_eq!(run(&encrypt, &[], b"").status.code(), Some(2));

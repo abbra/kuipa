@@ -62,7 +62,7 @@ enum Command {
     /// Recover the key from the JWE on standard input; print the plaintext.
     Decrypt,
 }
-const ENCRYPT_USAGE: &str = r"Usage: clevis encrypt tang-pqc CONFIG < PLAINTEXT > JWE
+const ENCRYPT_USAGE: &str = r"Usage: clevis encrypt tang-pqc CONFIG [-y] < PLAINTEXT > JWE
 
 Encrypts using a post-quantum Tang (tang-pqc) binding server policy
 
@@ -124,7 +124,15 @@ fn main() -> ExitCode {
                 println!("Encrypts using a post-quantum Tang (tang-pqc) binding server policy");
                 return ExitCode::SUCCESS;
             }
-            if std::io::stdin().is_terminal() || args.len() != 1 {
+            // Clevis passes `-y` (skip the advertisement trust prompt) from
+            // `clevis luks bind -y` and `regen`; the thumbprint is always
+            // required here, so there is nothing to skip.
+            let extra = args.get(1).map(String::as_str);
+            if std::io::stdin().is_terminal()
+                || args.is_empty()
+                || args.len() > 2
+                || extra.is_some_and(|a| a != "-y")
+            {
                 eprint!("{ENCRYPT_USAGE}");
                 return ExitCode::from(2);
             }
