@@ -1,0 +1,7 @@
+# SELinux file contexts for the kuipa enrollment daemon.
+# Install this module with: semodule -i kuipad.pp
+# Relabel files with:       restorecon -R /usr/libexec/kuipad /var/lib/ipa/ku
+# /etc/ipa/kuipad.keytab is labeled ipa_http_keytab_t by the ipa policy.
+
+/usr/libexec/kuipad			--	gen_context(system_u:object_r:kuipad_exec_t,s0)
+/var/lib/ipa/ku(/.*)?			gen_context(system_u:object_r:kuipad_var_lib_t,s0)

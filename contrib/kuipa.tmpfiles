@@ -1,0 +1,4 @@
+# The directory of unsealed copies of kuipa-protected files and keytabs.
+# It is in tmpfs; its SELinux label (kuipa_run_t) is made here, and the files
+# that kuipa puts in it inherit it.
+d /run/ipa/kuipa 0700 root root -

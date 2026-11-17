@@ -54,7 +54,7 @@ SYSTEM_CRATES := system-crates.txt
 EXTRA_SOURCES := kuipad.service kuipad.socket kuipa-unseal.service \
                  ipa-client-complete.service kuipa-rotate.service \
                  kuipa-rotate.timer kuipad.json.example kuipad-keys.service \
-                 kuipad-keys.socket kuipad.sysusers
+                 kuipad-keys.socket kuipad.sysusers kuipa.tmpfiles
 
 # Git ref used for the tarball and the snapshot release identifiers.
 # Defaults to HEAD so snapshots reflect the current branch tip.

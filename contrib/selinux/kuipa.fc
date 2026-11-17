@@ -1,0 +1,5 @@
+# SELinux file contexts for the kuipa client tools.
+# Install this module with: semodule -i kuipa.pp
+# Relabel files with:       restorecon -R /run/ipa/kuipa
+
+/run/ipa/kuipa(/.*)?				gen_context(system_u:object_r:kuipa_run_t,s0)
