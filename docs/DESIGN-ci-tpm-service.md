@@ -176,10 +176,11 @@ discarded at `down` anyway).
 - **certbot.** `certonly --csr` does not support `renew`. The deploy hook
   re-runs the issuance. A later test can use `certbot renew` with a
   `--key-path` hook if Akamu's renewal flow needs it.
-- **Time.** Two reboots, two issuances and the realm install take roughly
-  as long as `test_kuipa_server_enrollment`. The suite is not added to the
-  default `kuipa-ipa.yaml` run; it has its own preset and a separate job
-  step, so a TPM or swtpm problem cannot hide the other three suites.
+- **Time and memory.** Two reboots, two issuances and the client installs
+  add to the realm install of `test_kuipa_server_enrollment`. The clients
+  have 2.5 GB each with the TPM, so the four VMs need about 10 GB of the
+  runner's 16 GB. The suite runs in the main job: a TPM or swtpm problem
+  fails the whole job, and the logs of each test stay separate.
 - **Hardware limits.** swtpm is a software TPM: it proves the flows and the
   binding, not hardware resistance, and has no PCR policy beyond what
   `--tpm-pcrs` selects. A PCR-bound variant (`--tpm-pcrs 7`) is a follow-up:
@@ -189,9 +190,11 @@ discarded at `down` anyway).
 
 - `freeipa-kuipa-integration/ipatests/test_integration/test_kuipa_tpm_service.py`
   with the helper script embedded as a string.
-- `contrib/ci/freeipa/kuipa-tpm.yaml`, the preset above.
-- A step in `.github/workflows/freeipa.yml` that installs `swtpm` and
-  `edk2-ovmf`, brings up this preset after the same RPM upgrade
-  (`upgrade-kuipa.sh`) and a gssproxy 0.9.3 install, and runs it.
+- `contrib/ci/freeipa/kuipa-ipa.yaml`, the main CI preset: its clients are
+  the two TPM VMs, and the test runs after the three other suites.
+- `.github/workflows/freeipa.yml` installs `swtpm`, `swtpm-tools` and `ovmf`
+  on the runner, and links the firmware to the path ci-freeipa expects
+  (`/usr/share/edk2/ovmf/OVMF_CODE.fd`). The RPM upgrade
+  (`upgrade-kuipa.sh`) runs before the tests as for the other suites.
 - Until abbra/pqc's ipatests carries the new file, the test is copied to the
   controller by hand, as `test_kuipa_clevis.py` was.
