@@ -106,7 +106,7 @@ with `mod_auth_gssapi` removes the helper and changes nothing else.
 7. gssproxy: IPA installs its own unit drop-in (`ipa.conf`: network,
    `IPAddressDeny=` cleared, `CAP_SYS_PTRACE`) on servers and clients, since
    0.9.3 sandboxes the daemon. The test adds only `PrivateDevices=no` for the
-   TPM, and an SELinux module (see Risks).
+   TPM; the SELinux policy comes with the kuipa package.
 
 ## Tests (in this order; the last one destroys the TPM state)
 
@@ -166,9 +166,12 @@ discarded at `down` anyway).
   and `program =` sections (kuipad-keys) never match.
 - **SELinux (found by the test).** `gssproxy_t` may not run the loader, open
   `/dev/tpmrm0`, read the memfd or connect to port 443, and `httpd_t` may not
-  read the unsealed key copy under `/run/ipa`. The test installs a small
-  policy module; the fix belongs in selinux-policy. The test keeps SELinux
-  enforcing.
+  read the unsealed key copy under `/run/ipa`. The kuipa package ships the
+  policy (`contrib/selinux`): `kuipa.pp` for the client side (the
+  `kuipa_run_t` label of `/run/ipa/kuipa`, made by a tmpfiles.d snippet, the
+  gssproxy rules, and an interface for services that read an unsealed file)
+  and `kuipad.pp` for the daemon. A host without `kuipa.pp` fails the test's
+  precondition. The test keeps SELinux enforcing.
 - **nginx and the sealed key.** nginx reads the key at start and on reload,
   so reload after reseal is covered by test 6. The key file is a link to
   `/run`; whether nginx's unit sandboxing lets it follow the link is
