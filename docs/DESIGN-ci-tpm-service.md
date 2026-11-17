@@ -88,19 +88,25 @@ with `mod_auth_gssapi` removes the helper and changes nothing else.
    `euid = spnego`, `cred_store = keytab:MEMORY:http` and `keytab_loader =
    /usr/libexec/kuipa-unseal --memfd --sealed /etc/nginx/http.keytab.sealed`.
    The path of the sealed file is read from `kuipa status`, not assumed.
-5. Certificate from Akamu: generate the key and a CSR in `/run` (tmpfs),
-   run `certbot certonly --csr … --webroot -w /usr/share/nginx/html
-   --server https://master1.ipa.test/acme/directory` (the IPA CA is already
-   in the client's trust store; the `http-01` challenge needs nginx on port
-   80, so nginx starts first with a plain `server`). Install the key at
+5. Certificate from Akamu: generate the key and a CSR in `/run` (tmpfs). The
+   host gets EAB credentials with its keytab (`kinit -k`, then `curl
+   --negotiate https://master1.ipa.test/akamu/acme/eab`) and runs `certbot
+   certonly --standalone --csr … --eab-kid … --eab-hmac-key … --server
+   https://master1.ipa.test/akamu/acme/directory`. Akamu is under `/akamu`;
+   `/acme` is Dogtag's own responder. The `http-01` challenge needs port 80
+   on the client, so nginx is stopped, and the firewall allows http and
+   https (`firewall-offline-cmd`: firewalld may start only at the next boot).
+   Akamu on the master needs `http_validation_allow_private_ips = true` in
+   `[server]`, since the test network is RFC 1918. Install the key at
    `/etc/pki/tls/private/client1.key` and `kuipa protect --file … --tpm`
-   it; delete the tmpfs copy. A `--deploy-hook` script does the same on
-   re-issue.
+   it; delete the tmpfs copy.
 6. nginx: TLS server using the certificate and the sealed key, the
    `auth_request` location, and the systemd drop-in `After=kuipa-unseal.service
    Wants=kuipa-unseal.service` from `docs/src/host/protect.md`.
-7. gssproxy drop-in for the sandbox, if test 3 below shows it is needed
-   (see Risks).
+7. gssproxy: IPA installs its own unit drop-in (`ipa.conf`: network,
+   `IPAddressDeny=` cleared, `CAP_SYS_PTRACE`) on servers and clients, since
+   0.9.3 sandboxes the daemon. The test adds only `PrivateDevices=no` for the
+   TPM, and an SELinux module (see Risks).
 
 ## Tests (in this order; the last one destroys the TPM state)
 
@@ -152,17 +158,17 @@ discarded at `down` anyway).
 
 ## Risks and expected findings
 
-- **gssproxy's unit sandbox.** The 0.9.3 unit sets `PrivateDevices=yes` and
-  `ProtectSystem=strict`. `keytab_loader` runs inside that sandbox, where
-  `/dev/tpmrm0` does not exist, so `systemd-creds decrypt` for a TPM-sealed
-  keytab will fail. The likely fix is a drop-in (`PrivateDevices=no`,
-  `DeviceAllow=/dev/tpmrm0 rw`) shipped by kuipa or documented, or a change
-  in the loader protocol (kuipa-unseal talks to a socket of a process outside
-  the sandbox). Test 3 decides which; the design assumes the drop-in first.
-- **SELinux.** `gssproxy_t` running `systemd-creds` and reaching
-  `/dev/tpmrm0` has no known policy. Test 5 turns a silent permissive-mode
-  pass into a visible failure. A first run may need a selinux-policy change;
-  the test keeps enforcing and records AVCs so the policy request has text.
+- **gssproxy's unit sandbox (found by the test).** The 0.9.3 unit sets
+  `PrivateDevices=yes`, `PrivateNetwork=yes`, `IPAddressDeny=any` and a
+  capability bound of `CAP_DAC_OVERRIDE`. The loader needs `/dev/tpmrm0` (the
+  test's `PrivateDevices=no`) and the IPA servers (IPA's drop-in). Without
+  `CAP_SYS_PTRACE`, gssproxy cannot read `/proc/PID/exe` of a root client
+  and `program =` sections (kuipad-keys) never match.
+- **SELinux (found by the test).** `gssproxy_t` may not run the loader, open
+  `/dev/tpmrm0`, read the memfd or connect to port 443, and `httpd_t` may not
+  read the unsealed key copy under `/run/ipa`. The test installs a small
+  policy module; the fix belongs in selinux-policy. The test keeps SELinux
+  enforcing.
 - **nginx and the sealed key.** nginx reads the key at start and on reload,
   so reload after reseal is covered by test 6. The key file is a link to
   `/run`; whether nginx's unit sandboxing lets it follow the link is
