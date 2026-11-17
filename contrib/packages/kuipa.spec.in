@@ -41,6 +41,10 @@
 # The tang-pqc Clevis pin subpackage and its dracut module.
 # Disable with: rpmbuild --without clevis
 %bcond clevis 1
+# The SELinux modules of kuipa (client side) and kuipad (server daemon).
+# Disable with: rpmbuild --without selinux
+%bcond selinux 1
+%global selinuxtype targeted
 
 # Force --locked for all cargo invocations.  Without it, cargo resolves the
 # dependency graph from scratch in the offline build environment and fails to
@@ -77,6 +81,7 @@ Source10:       system-crates.txt
 Source11:       kuipad-keys.service
 Source12:       kuipad-keys.socket
 Source13:       kuipad.sysusers
+Source14:       kuipa.tmpfiles
 
 ExclusiveArch:  %{rust_arches}
 
@@ -106,6 +111,10 @@ BuildRequires:  libfido2-devel
 # which re-exports ring-native-ossl.
 BuildRequires:  rust-hickory-resolver-devel
 BuildRequires:  rust-rustls-platform-verifier-devel
+%if %{with selinux}
+BuildRequires:  selinux-policy-devel
+%{?selinux_requires}
+%endif
 # synta* and agirru* are packaged in COPR abbra/rust-deps (an Additional repo
 # of this project); install them into the chroot before rebuilding.
 BuildRequires:  rust-synta-devel
@@ -154,6 +163,10 @@ systemd units that run them.  kuipa-server provides the IPA server daemon.
 %{_unitdir}/kuipa-rotate.service
 %{_unitdir}/kuipa-rotate.timer
 %doc contrib/gssproxy-kuipa.conf.example
+%{_tmpfilesdir}/kuipa.conf
+%if %{with selinux}
+%{_datadir}/selinux/packages/kuipa.pp
+%endif
 
 
 # ── Subpackage: server daemon ────────────────────────────────────────────────
@@ -165,6 +178,10 @@ Requires:       util-linux
 Provides:       kuipa-admin-revoke = 1
 Provides:       kuipa-host-self-enroll = 1
 # Fronted by httpd on /ipa/ku/; an IPA server already has it.
+%if %{with selinux}
+Requires(post):   policycoreutils
+Requires(postun): policycoreutils
+%endif
 %{?systemd_requires}
 
 %description server
@@ -188,6 +205,9 @@ Install this package on IPA servers; ipa-server-install configures it.
 %doc docs/DESIGN.md
 %doc docs/DESIGN-schema.md
 %doc contrib/gssproxy-kuipad-keys.conf.example
+%if %{with selinux}
+%{_datadir}/selinux/packages/kuipad.pp
+%endif
 
 
 # ── Subpackage: post-quantum Tang bindings (library + server tool) ───────────
@@ -309,6 +329,11 @@ for page in kuipa.1 kuipa-voucher.1 kuipa-unseal.8 kuipad.8 tang-pqc.1; do
     scdoc < docs/man/$page.scd | gzip -9 > $page.gz
 done
 
+# SELinux modules (contrib/selinux: .te + .fc + .if -> .pp).
+%if %{with selinux}
+make -C contrib/selinux -f /usr/share/selinux/devel/Makefile kuipa.pp kuipad.pp
+%endif
+
 
 # ── Install ────────────────────────────────────────────────────────────────────
 %install
@@ -346,6 +371,15 @@ install -Dpm 0644 %{SOURCE8} %{buildroot}%{_sysconfdir}/ipa/kuipad.json.example
 install -Dpm 0644 %{SOURCE11} %{buildroot}%{_unitdir}/kuipad-keys.service
 install -Dpm 0644 %{SOURCE12} %{buildroot}%{_unitdir}/kuipad-keys.socket
 install -Dpm 0644 %{SOURCE13} %{buildroot}%{_sysusersdir}/kuipad.conf
+install -Dpm 0644 %{SOURCE14} %{buildroot}%{_tmpfilesdir}/kuipa.conf
+
+# SELinux modules: the client side (kuipa) and the server daemon (kuipad).
+%if %{with selinux}
+install -Dpm 0644 contrib/selinux/kuipa.pp \
+    %{buildroot}%{_datadir}/selinux/packages/kuipa.pp
+install -Dpm 0644 contrib/selinux/kuipad.pp \
+    %{buildroot}%{_datadir}/selinux/packages/kuipad.pp
+%endif
 
 # The Clevis pin is the same binary, chosen by its name (as in
 # contrib/clevis/install.sh); the dracut module brings it into the initramfs.
@@ -367,17 +401,43 @@ install -Dpm 0755 contrib/clevis/dracut/60clevis-pin-kuipa/module-setup.sh \
 %endif
 
 
-# ── Systemd scriptlets ─────────────────────────────────────────────────────────
+# ── Scriptlets ─────────────────────────────────────────────────────────────────
+%if %{with selinux}
+%pre
+%selinux_relabel_pre -s %{selinuxtype}
+%endif
+
 %post
+%if %{with selinux}
+%selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/kuipa.pp
+%selinux_relabel_post -s %{selinuxtype}
+%endif
+# the directory of unsealed copies gets its label from the policy
+systemd-tmpfiles --create %{_tmpfilesdir}/kuipa.conf || :
 %systemd_post kuipa-unseal.service ipa-client-complete.service kuipa-rotate.timer
 
 %preun
 %systemd_preun kuipa-unseal.service ipa-client-complete.service kuipa-rotate.timer
 
 %postun
+%if %{with selinux}
+if [ $1 -eq 0 ]; then
+    %selinux_modules_uninstall -s %{selinuxtype} kuipa
+    %selinux_relabel_post -s %{selinuxtype}
+fi
+%endif
 %systemd_postun_with_restart kuipa-unseal.service
 
+%if %{with selinux}
+%pre server
+%selinux_relabel_pre -s %{selinuxtype}
+%endif
+
 %post server
+%if %{with selinux}
+%selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/kuipad.pp
+%selinux_relabel_post -s %{selinuxtype}
+%endif
 %sysusers_create %{_sysusersdir}/kuipad.conf
 %systemd_post kuipad.socket kuipad.service kuipad-keys.socket kuipad-keys.service
 
@@ -385,6 +445,12 @@ install -Dpm 0755 contrib/clevis/dracut/60clevis-pin-kuipa/module-setup.sh \
 %systemd_preun kuipad.socket kuipad.service kuipad-keys.socket kuipad-keys.service
 
 %postun server
+%if %{with selinux}
+if [ $1 -eq 0 ]; then
+    %selinux_modules_uninstall -s %{selinuxtype} kuipad
+    %selinux_relabel_post -s %{selinuxtype}
+fi
+%endif
 %systemd_postun_with_restart kuipad.service kuipad-keys.service
 
 # The rotate timer is not restarted on upgrade: it is a monthly calendar timer,

@@ -1,0 +1,20 @@
+## <summary>kuipa client: sealed keytabs and files</summary>
+
+########################################
+## <summary>
+##	Read the unsealed copies of kuipa-protected files and keytabs.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`kuipa_read_unsealed',`
+	gen_require(`
+		type kuipa_run_t;
+	')
+
+	allow $1 kuipa_run_t:dir search;
+	allow $1 kuipa_run_t:file { getattr lock open read };
+')

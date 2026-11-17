@@ -1,0 +1,19 @@
+## <summary>kuipa post-quantum enrollment daemon</summary>
+
+########################################
+## <summary>
+##	Execute kuipad in the kuipad domain.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed to transition.
+##	</summary>
+## </param>
+#
+interface(`kuipad_domtrans',`
+	gen_require(`
+		type kuipad_t, kuipad_exec_t;
+	')
+
+	domtrans_pattern($1, kuipad_exec_t, kuipad_t)
+')

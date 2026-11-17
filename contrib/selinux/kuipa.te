@@ -1,0 +1,50 @@
+policy_module(kuipa, 0.1.0)
+
+########################################
+#
+# Declarations
+#
+
+# unsealed copies of kuipa-protected files and keytabs (/run/ipa/kuipa), in
+# tmpfs: they are gone at power off
+type kuipa_run_t;
+files_pid_file(kuipa_run_t)
+
+########################################
+#
+# gssproxy keytab_loader
+#
+# `keytab_loader = /usr/libexec/kuipa-unseal --memfd ...` runs in gssproxy's
+# domain. It unseals the service keytab with the TPM (through systemd-creds),
+# asks the IPA servers for the share over https, and writes the keys to the
+# memory file that gssproxy hands it.
+
+optional_policy(`
+  gen_require(`
+    type gssproxy_t, tpm_device_t, tmpfs_t, httpd_config_t;
+  ')
+
+  # the loader (kuipa-unseal) and systemd-creds are programs in bin_t
+  corecmd_exec_bin(gssproxy_t)
+  kuipa_read_unsealed(gssproxy_t)
+
+  allow gssproxy_t tpm_device_t:chr_file { open read write };
+  corenet_tcp_connect_http_port(gssproxy_t)
+  # the memfd is a tmpfs file
+  allow gssproxy_t tmpfs_t:file { getattr lock open read write };
+  # the sealed keytab of a web server sits in its configuration directory
+  allow gssproxy_t httpd_config_t:file getattr;
+')
+
+########################################
+#
+# Services that use an unsealed file
+#
+
+# a web server reads its TLS key from /run/ipa/kuipa
+optional_policy(`
+  gen_require(`
+    type httpd_t;
+  ')
+  kuipa_read_unsealed(httpd_t)
+')
