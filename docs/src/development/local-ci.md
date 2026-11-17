@@ -183,11 +183,17 @@ parallel. One builds the kuipa and kuipa-server RPMs of the commit
 (`contrib/ci/freeipa/build-rpms.sh`, in a Fedora 45 container with COPR
 `abbra/pqc`). The other starts four qemu VMs with
 [ci-freeipa](https://github.com/freeipa/ci-freeipa): a FreeIPA master, a
-replica and two clients. FreeIPA and kuipa come from `abbra/pqc` and the CA is
-`ipacta` rather than Dogtag. When the RPMs are uploaded, the job downloads them
-and `contrib/ci/freeipa/upgrade-kuipa.sh` upgrades kuipa on every VM, which
-tests the package upgrade; then it runs the `test_kuipa_*` tests of
-`python3-ipatests`. The topology, packages and tests are in
+replica and two clients with a software TPM each. FreeIPA and kuipa come from
+`abbra/pqc` and the CA is `ipacta` rather than Dogtag. When the RPMs are
+uploaded, the job downloads them and `contrib/ci/freeipa/upgrade-kuipa.sh`
+upgrades kuipa on every VM, which tests the package upgrade; then it runs
+`test_kuipa_realm.py` of `python3-ipatests`. That is one deployment for
+every kuipa area (server enrollment, cert approval, seal administration,
+enrollment, Clevis, the TPM service): the classes of the other
+`test_kuipa_*.py` files are mixins of `TestKuipaRealm`, which runs them in
+order, the TPM service last. `test_kuipa_trust.py` (AD trust) and
+`test_kuipa_backup.py` (it reinstalls the master) need their own
+deployments. The topology, packages and tests are in
 `contrib/ci/freeipa/kuipa-ipa.yaml`; the workflow uses the main
 branch of ci-freeipa. It needs `/dev/kvm`, podman and qemu, which the GitHub runner has. On
 a workstation with those, run `freeipa-env up` on the preset, then
